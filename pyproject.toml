@@ -57,5 +57,13 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+[tool.pyright]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false
+reportPrivateImportUsage = false
+reportMissingImports = "warning"
+include = ["pawn"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

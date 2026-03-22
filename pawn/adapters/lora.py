@@ -90,9 +90,10 @@ class LoRACLM(nn.Module):
             p.requires_grad = False
 
         # Inject LoRA into selected layers
-        for layer_idx, block in enumerate(backbone.layers):
+        for layer_idx in range(len(backbone.layers)):
             if layer_idx not in self.adapted_layers:
                 continue
+            block = backbone.get_block(layer_idx)
 
             attn: Attention = block.attn
             for proj_name in self.attn_targets:
@@ -182,9 +183,9 @@ class LoRACLM(nn.Module):
             rope_sin = bb.rope_sin[:, :, :T_new, :]
 
         new_kv_cache = []
-        for i, layer in enumerate(bb.layers):
+        for i in range(len(bb.layers)):
             layer_cache = kv_cache[i] if kv_cache is not None else None
-            x, new_cache = layer.forward_kv(x, rope_cos, rope_sin, layer_cache)
+            x, new_cache = bb.get_block(i).forward_kv(x, rope_cos, rope_sin, layer_cache)
             new_kv_cache.append(new_cache)
 
         x = bb.final_norm(x[:, -1:, :])
@@ -215,8 +216,8 @@ class LoRACLM(nn.Module):
     def lora_weight_report(self) -> dict[str, float]:
         """Per-layer LoRA weight norms for monitoring."""
         report = {}
-        for layer_idx, block in enumerate(self.backbone.layers):
-            attn = block.attn
+        for layer_idx in range(len(self.backbone.layers)):
+            attn = self.backbone.get_block(layer_idx).attn
             for proj_name in self.attn_targets:
                 module = getattr(attn, proj_name)
                 if isinstance(module, LoRALinear):
@@ -224,7 +225,7 @@ class LoRACLM(nn.Module):
                     report[f"layer{layer_idx}.{proj_name}.B"] = module.lora_B.data.norm().item()
 
             if self.adapt_ffn:
-                ffn = block.ffn
+                ffn = self.backbone.get_block(layer_idx).ffn
                 for proj_name in _FFN_TARGETS:
                     module = getattr(ffn, proj_name)
                     if isinstance(module, LoRALinear):

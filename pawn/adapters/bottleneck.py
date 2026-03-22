@@ -80,18 +80,18 @@ class BottleneckCLM(nn.Module):
         for p in backbone.parameters():
             p.requires_grad = False
 
-        # Create adapter modules (None for non-adapted layers)
+        # Create adapter modules (Identity for non-adapted layers)
         self.attn_adapters = nn.ModuleList()
         self.ffn_adapters = nn.ModuleList()
         for i in range(n_layers):
             if i in self._attn_set:
                 self.attn_adapters.append(BottleneckAdapter(cfg.d_model, bottleneck_dim))
             else:
-                self.attn_adapters.append(None)
+                self.attn_adapters.append(nn.Identity())
             if i in self._ffn_set:
                 self.ffn_adapters.append(BottleneckAdapter(cfg.d_model, bottleneck_dim))
             else:
-                self.ffn_adapters.append(None)
+                self.ffn_adapters.append(nn.Identity())
 
     @property
     def cfg(self) -> CLMConfig:
@@ -106,16 +106,15 @@ class BottleneckCLM(nn.Module):
         rope_cos = bb.rope_cos[:, :, :T, :]
         rope_sin = bb.rope_sin[:, :, :T, :]
 
-        for i, block in enumerate(bb.layers):
+        for i in range(len(bb.layers)):
+            block = bb.get_block(i)
             # Attention sublayer + adapter
             x = x + block.attn(block.attn_norm(x), rope_cos, rope_sin, None)
-            if self.attn_adapters[i] is not None:
-                x = self.attn_adapters[i](x)
+            x = self.attn_adapters[i](x)
 
             # FFN sublayer + adapter
             x = x + block.ffn(block.ffn_norm(x))
-            if self.ffn_adapters[i] is not None:
-                x = self.ffn_adapters[i](x)
+            x = self.ffn_adapters[i](x)
 
         return bb.final_norm(x)
 
@@ -143,14 +142,13 @@ class BottleneckCLM(nn.Module):
         rope_cos = bb.rope_cos[:, :, :T, :]
         rope_sin = bb.rope_sin[:, :, :T, :]
 
-        for i, block in enumerate(bb.layers):
+        for i in range(len(bb.layers)):
+            block = bb.get_block(i)
             x = x + block.attn(block.attn_norm(x), rope_cos, rope_sin, mask)
-            if self.attn_adapters[i] is not None:
-                x = self.attn_adapters[i](x)
+            x = self.attn_adapters[i](x)
 
             x = x + block.ffn(block.ffn_norm(x))
-            if self.ffn_adapters[i] is not None:
-                x = self.ffn_adapters[i](x)
+            x = self.ffn_adapters[i](x)
 
         x = bb.final_norm(x)
         return self.project_head(x)
@@ -174,20 +172,19 @@ class BottleneckCLM(nn.Module):
             rope_sin = bb.rope_sin[:, :, :T_new, :]
 
         new_kv_cache = []
-        for i, block in enumerate(bb.layers):
+        for i in range(len(bb.layers)):
+            block = bb.get_block(i)
             # KV-cache forward for attention
             layer_cache = kv_cache[i] if kv_cache is not None else None
             attn_out, new_cache = block.attn.forward_kv(
                 block.attn_norm(x), rope_cos, rope_sin, layer_cache,
             )
             x = x + attn_out
-            if self.attn_adapters[i] is not None:
-                x = self.attn_adapters[i](x)
+            x = self.attn_adapters[i](x)
             new_kv_cache.append(new_cache)
 
             x = x + block.ffn(block.ffn_norm(x))
-            if self.ffn_adapters[i] is not None:
-                x = self.ffn_adapters[i](x)
+            x = self.ffn_adapters[i](x)
 
         x = bb.final_norm(x[:, -1:, :])
         logits = bb.lm_head(x)
@@ -218,12 +215,12 @@ class BottleneckCLM(nn.Module):
         """Per-layer adapter weight norms for monitoring."""
         report = {}
         for i in range(len(self.backbone.layers)):
-            if self.attn_adapters[i] is not None:
-                a = self.attn_adapters[i]
+            a = self.attn_adapters[i]
+            if isinstance(a, BottleneckAdapter):
                 report[f"adapter/layer{i}.attn.down"] = a.down.weight.data.norm().item()
                 report[f"adapter/layer{i}.attn.up"] = a.up.weight.data.norm().item()
-            if self.ffn_adapters[i] is not None:
-                a = self.ffn_adapters[i]
+            a = self.ffn_adapters[i]
+            if isinstance(a, BottleneckAdapter):
                 report[f"adapter/layer{i}.ffn.down"] = a.down.weight.data.norm().item()
                 report[f"adapter/layer{i}.ffn.up"] = a.up.weight.data.norm().item()
         return report

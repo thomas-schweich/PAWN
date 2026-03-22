@@ -20,7 +20,12 @@ from __future__ import annotations
 
 import gc
 import multiprocessing as mp
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pawn.model import PAWNCLM
 
 # Use "spawn" so the child gets a clean process with no inherited GPU state.
 _ctx = mp.get_context("spawn")
@@ -31,11 +36,11 @@ _ctx = mp.get_context("spawn")
 # ---------------------------------------------------------------------------
 
 
-def _worker_entry(fn, args, kwargs):
+def _worker_entry(fn: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
     return fn(*args, **kwargs)
 
 
-def run_in_worker(fn, *args, timeout: float | None = None, **kwargs):
+def run_in_worker(fn: Callable[..., Any], *args: Any, timeout: float | None = None, **kwargs: Any) -> Any:
     """Run fn(*args, **kwargs) in an isolated worker process.
 
     On KeyboardInterrupt, the worker is terminated and the interrupt is
@@ -55,7 +60,7 @@ def run_in_worker(fn, *args, timeout: float | None = None, **kwargs):
 # ---------------------------------------------------------------------------
 
 
-def _load_model(checkpoint_path: str, device: str):
+def _load_model(checkpoint_path: str, device: str) -> PAWNCLM:
     """Load and freeze a PAWNCLM checkpoint. Runs inside worker processes."""
     import torch
     from pawn.config import CLMConfig
@@ -83,8 +88,8 @@ def _load_corpus(corpus_dir: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _probes_worker(checkpoint_path, device, n_train, n_val, n_epochs,
-                   seed_train, seed_val):
+def _probes_worker(checkpoint_path: str, device: str, n_train: int, n_val: int,
+                   n_epochs: int, seed_train: int, seed_val: int) -> dict:
     from pawn.eval_suite.probes import extract_probe_data, train_all_probes
     model = _load_model(checkpoint_path, device)
     train_data = extract_probe_data(n_train, max_ply=256, seed=seed_train)
@@ -94,7 +99,7 @@ def _probes_worker(checkpoint_path, device, n_train, n_val, n_epochs,
 
 
 def run_probes(
-    checkpoint_path,
+    checkpoint_path: str | Path,
     device: str,
     n_train: int = 5_000,
     n_val: int = 1_000,
@@ -110,7 +115,8 @@ def run_probes(
     )
 
 
-def _signal_test_worker(checkpoint_path, device, n_per_outcome, mask_conditions):
+def _signal_test_worker(checkpoint_path: str, device: str, n_per_outcome: int,
+                         mask_conditions: list[bool]) -> dict:
     from pawn.eval_suite.generation import outcome_signal_test
     model = _load_model(checkpoint_path, device)
     return outcome_signal_test(model, device, n_per_outcome=n_per_outcome,
@@ -118,7 +124,7 @@ def _signal_test_worker(checkpoint_path, device, n_per_outcome, mask_conditions)
 
 
 def run_outcome_signal_test(
-    checkpoint_path,
+    checkpoint_path: str | Path,
     device: str,
     n_per_outcome: int = 1000,
     mask_conditions: tuple[bool, ...] = (False, True),
@@ -130,8 +136,9 @@ def run_outcome_signal_test(
     )
 
 
-def _prefix_continuation_worker(checkpoint_path, corpus_dir, device,
-                                 n_per_bucket, prefix_pcts, absolute_plies):
+def _prefix_continuation_worker(checkpoint_path: str, corpus_dir: str, device: str,
+                                 n_per_bucket: int, prefix_pcts: list[float],
+                                 absolute_plies: list[int]) -> dict:
     from pawn.eval_suite.generation import prefix_continuation_test
     model = _load_model(checkpoint_path, device)
     corpus = _load_corpus(corpus_dir)
@@ -142,8 +149,8 @@ def _prefix_continuation_worker(checkpoint_path, corpus_dir, device,
 
 
 def run_prefix_continuation_test(
-    checkpoint_path,
-    corpus_dir,
+    checkpoint_path: str | Path,
+    corpus_dir: str | Path,
     device: str,
     n_per_bucket: int = 200,
     prefix_pcts: tuple[float, ...] = (0.1, 0.5, 0.9),
@@ -157,8 +164,8 @@ def run_prefix_continuation_test(
     )
 
 
-def _poisoned_prefix_worker(checkpoint_path, corpus_dir, device,
-                             n_per_pair, prefix_pct):
+def _poisoned_prefix_worker(checkpoint_path: str, corpus_dir: str, device: str,
+                             n_per_pair: int, prefix_pct: float) -> dict:
     from pawn.eval_suite.generation import poisoned_prefix_test
     model = _load_model(checkpoint_path, device)
     corpus = _load_corpus(corpus_dir)
@@ -167,8 +174,8 @@ def _poisoned_prefix_worker(checkpoint_path, corpus_dir, device,
 
 
 def run_poisoned_prefix_test(
-    checkpoint_path,
-    corpus_dir,
+    checkpoint_path: str | Path,
+    corpus_dir: str | Path,
     device: str,
     n_per_pair: int = 500,
     prefix_pct: float = 0.5,
@@ -180,7 +187,8 @@ def run_poisoned_prefix_test(
     )
 
 
-def _impossible_task_worker(checkpoint_path, corpus_dir, device, n_per_scenario):
+def _impossible_task_worker(checkpoint_path: str, corpus_dir: str, device: str,
+                             n_per_scenario: int) -> dict:
     from pawn.eval_suite.generation import impossible_task_test
     model = _load_model(checkpoint_path, device)
     corpus = _load_corpus(corpus_dir)
@@ -188,8 +196,8 @@ def _impossible_task_worker(checkpoint_path, corpus_dir, device, n_per_scenario)
 
 
 def run_impossible_task_test(
-    checkpoint_path,
-    corpus_dir,
+    checkpoint_path: str | Path,
+    corpus_dir: str | Path,
     device: str,
     n_per_scenario: int = 200,
 ) -> dict:
@@ -200,7 +208,8 @@ def run_impossible_task_test(
     )
 
 
-def _improbable_task_worker(checkpoint_path, corpus_dir, device, n_per_scenario):
+def _improbable_task_worker(checkpoint_path: str, corpus_dir: str, device: str,
+                             n_per_scenario: int) -> dict:
     from pawn.eval_suite.generation import improbable_task_test
     model = _load_model(checkpoint_path, device)
     corpus = _load_corpus(corpus_dir)
@@ -208,8 +217,8 @@ def _improbable_task_worker(checkpoint_path, corpus_dir, device, n_per_scenario)
 
 
 def run_improbable_task_test(
-    checkpoint_path,
-    corpus_dir,
+    checkpoint_path: str | Path,
+    corpus_dir: str | Path,
     device: str,
     n_per_scenario: int = 200,
 ) -> dict:
@@ -220,8 +229,9 @@ def run_improbable_task_test(
     )
 
 
-def _diagnostic_worker(checkpoint_path, corpus_dir, device, min_per_category,
-                        max_per_category, n_samples, batch_size):
+def _diagnostic_worker(checkpoint_path: str, corpus_dir: str, device: str,
+                        min_per_category: int, max_per_category: int,
+                        n_samples: int, batch_size: int) -> dict:
     from pawn.eval_suite.diagnostics import (
         extract_diagnostic_positions, evaluate_diagnostic_positions,
     )
@@ -240,8 +250,8 @@ def _diagnostic_worker(checkpoint_path, corpus_dir, device, min_per_category,
 
 
 def run_diagnostic_eval(
-    checkpoint_path,
-    corpus_dir,
+    checkpoint_path: str | Path,
+    corpus_dir: str | Path,
     device: str,
     min_per_category: int = 2000,
     max_per_category: int = 5000,

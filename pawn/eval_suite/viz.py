@@ -3,6 +3,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+from matplotlib.axes import Axes
 import seaborn as sns
 
 # Consistent style
@@ -26,11 +27,12 @@ GRID_PAWN_BASELINES = {
 # ---------------------------------------------------------------------------
 
 
-def plot_game_length_distribution(stats: dict, ax=None) -> plt.Figure:
+def plot_game_length_distribution(stats: dict, ax: Axes | None = None) -> plt.Figure:
     """Histogram of game lengths."""
     fig = None
     if ax is None:
         fig, ax = plt.subplots(figsize=FIGSIZE)
+    assert ax is not None
     counts = stats["game_length"]["histogram_counts"]
     edges = stats["game_length"]["histogram_edges"]
     centers = [(edges[i] + edges[i + 1]) / 2 for i in range(len(counts))]
@@ -44,11 +46,12 @@ def plot_game_length_distribution(stats: dict, ax=None) -> plt.Figure:
     return fig or ax.figure
 
 
-def plot_legal_move_distribution(bounds: dict, ax=None) -> plt.Figure:
+def plot_legal_move_distribution(bounds: dict, ax: Axes | None = None) -> plt.Figure:
     """Histogram of legal move counts (K) from pre-computed histogram data."""
     fig = None
     if ax is None:
         fig, ax = plt.subplots(figsize=FIGSIZE)
+    assert ax is not None
     k_hist = bounds["k_histogram"]
     k_vals = np.array(k_hist["values"])
     k_counts = np.array(k_hist["counts"], dtype=np.float64)
@@ -64,11 +67,12 @@ def plot_legal_move_distribution(bounds: dict, ax=None) -> plt.Figure:
     return fig or ax.figure
 
 
-def plot_outcome_rates(stats: dict, ax=None) -> plt.Figure:
+def plot_outcome_rates(stats: dict, ax: Axes | None = None) -> plt.Figure:
     """Bar chart of outcome base rates."""
     fig = None
     if ax is None:
         fig, ax = plt.subplots(figsize=FIGSIZE)
+    assert ax is not None
     rates = stats["outcome_rates"]
     names = list(rates.keys())
     values = [rates[n] * 100 for n in names]
@@ -82,11 +86,12 @@ def plot_outcome_rates(stats: dict, ax=None) -> plt.Figure:
     return fig or ax.figure
 
 
-def plot_k_by_phase(bounds: dict, ax=None) -> plt.Figure:
+def plot_k_by_phase(bounds: dict, ax: Axes | None = None) -> plt.Figure:
     """E[1/K] by game phase."""
     fig = None
     if ax is None:
         fig, ax = plt.subplots(figsize=FIGSIZE)
+    assert ax is not None
     phase_data = bounds["phase_bounds"]
     names = list(phase_data.keys())
     e_inv_k = [phase_data[n]["e_1_over_k"] * 100 for n in names]
@@ -104,11 +109,12 @@ def plot_k_by_phase(bounds: dict, ax=None) -> plt.Figure:
     return fig or ax.figure
 
 
-def plot_prefix_histogram(sanity: dict, ax=None) -> plt.Figure:
+def plot_prefix_histogram(sanity: dict, ax: Axes | None = None) -> plt.Figure:
     """Histogram of common prefix lengths."""
     fig = None
     if ax is None:
         fig, ax = plt.subplots(figsize=FIGSIZE)
+    assert ax is not None
     hist = sanity["prefix_length_histogram"]
     ks = sorted(hist.keys())
     vs = [hist[k] for k in ks]

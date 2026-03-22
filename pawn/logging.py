@@ -72,7 +72,7 @@ class MetricsLogger:
             record_type: Record type (train, eval, batch, etc.)
             include_resources: Whether to include memory/CPU stats
         """
-        record = {"type": record_type}
+        record: dict[str, object] = {"type": record_type}
 
         if step is not None:
             record["step"] = step
@@ -119,14 +119,14 @@ class MetricsLogger:
     def close(self) -> None:
         self._file.close()
 
-    def __enter__(self):
+    def __enter__(self) -> "MetricsLogger":
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: object) -> None:
         self.close()
 
 
-def _sanitize(obj):
+def _sanitize(obj: object) -> object:
     """Replace NaN/Inf with None for valid JSON."""
     if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
         return None

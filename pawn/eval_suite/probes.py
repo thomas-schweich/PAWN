@@ -295,7 +295,7 @@ def _extract_targets(
 # ---------------------------------------------------------------------------
 
 
-def _compute_loss(logits, targets, loss_type, n_outputs):
+def _compute_loss(logits: torch.Tensor, targets: torch.Tensor, loss_type: str, n_outputs: int) -> torch.Tensor:
     if loss_type == "ce":
         return F.cross_entropy(logits, targets)
     elif loss_type == "ce_per_square":
@@ -308,7 +308,7 @@ def _compute_loss(logits, targets, loss_type, n_outputs):
         raise ValueError(f"Unknown loss type: {loss_type}")
 
 
-def _compute_accuracy(logits, targets, loss_type, n_outputs):
+def _compute_accuracy(logits: torch.Tensor, targets: torch.Tensor, loss_type: str, n_outputs: int) -> float:
     if loss_type == "ce":
         preds = logits.argmax(dim=-1)
         return (preds == targets).float().mean().item()
@@ -328,7 +328,7 @@ def _compute_accuracy(logits, targets, loss_type, n_outputs):
         raise ValueError(f"Unknown loss type: {loss_type}")
 
 
-def _compute_mae(logits, targets):
+def _compute_mae(logits: torch.Tensor, targets: torch.Tensor) -> float:
     """Mean absolute error for regression probes."""
     return (logits - targets).abs().mean().item()
 
@@ -427,7 +427,7 @@ def train_single_probe(
     )
 
 
-def _eval_in_batches(probe, h, t, loss_type, n_outputs, device, batch_size):
+def _eval_in_batches(probe: LinearProbe, h: torch.Tensor, t: torch.Tensor, loss_type: str, n_outputs: int, device: str, batch_size: int) -> float:
     """Accuracy in mini-batches."""
     total_correct = 0.0
     total = 0
@@ -441,7 +441,7 @@ def _eval_in_batches(probe, h, t, loss_type, n_outputs, device, batch_size):
     return total_correct / total if total > 0 else 0.0
 
 
-def _eval_loss_in_batches(probe, h, t, loss_type, n_outputs, device, batch_size):
+def _eval_loss_in_batches(probe: LinearProbe, h: torch.Tensor, t: torch.Tensor, loss_type: str, n_outputs: int, device: str, batch_size: int) -> float:
     """Loss in mini-batches (returns scalar)."""
     total_loss = 0.0
     total = 0
@@ -455,7 +455,7 @@ def _eval_loss_in_batches(probe, h, t, loss_type, n_outputs, device, batch_size)
     return total_loss / total if total > 0 else 0.0
 
 
-def _eval_mae_in_batches(probe, h, t, device, batch_size):
+def _eval_mae_in_batches(probe: LinearProbe, h: torch.Tensor, t: torch.Tensor, device: str, batch_size: int) -> float:
     """MAE in mini-batches."""
     total_ae = 0.0
     total = 0

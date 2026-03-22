@@ -140,10 +140,11 @@ class FiLMCLM(nn.Module):
             rope_sin = bb.rope_sin[:, :, :T_new, :]
 
         new_kv_cache = []
-        for i, (layer, film) in enumerate(zip(bb.layers, self.hidden_films)):
+        for i in range(len(bb.layers)):
+            block = bb.get_block(i)
             layer_cache = kv_cache[i] if kv_cache is not None else None
-            x, new_cache = layer.forward_kv(x, rope_cos, rope_sin, layer_cache)
-            x = film(x)
+            x, new_cache = block.forward_kv(x, rope_cos, rope_sin, layer_cache)
+            x = self.hidden_films[i](x)
             new_kv_cache.append(new_cache)
 
         x = bb.final_norm(x[:, -1:, :])
@@ -182,8 +183,9 @@ class FiLMCLM(nn.Module):
         """Per-layer FiLM deviation from identity, for monitoring."""
         report = {}
         for i, film in enumerate(self.hidden_films):
-            report[f"hidden_{i}/gamma_dev"] = (film.gamma - 1.0).norm().item()
-            report[f"hidden_{i}/beta_norm"] = film.beta.norm().item()
+            if isinstance(film, FiLMLayer):
+                report[f"hidden_{i}/gamma_dev"] = (film.gamma - 1.0).norm().item()
+                report[f"hidden_{i}/beta_norm"] = film.beta.norm().item()
         if self.output_film is not None:
             report["output/gamma_dev"] = (self.output_film.gamma - 1.0).norm().item()
             report["output/beta_norm"] = self.output_film.beta.norm().item()

@@ -38,12 +38,12 @@ class CosineWithWarmup:
         self._step = 0
         self._apply_lr(0)
 
-    def _apply_lr(self, step: int):
+    def _apply_lr(self, step: int) -> None:
         lr_scale = self._compute_lr_scale(step)
         for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
             pg["lr"] = base_lr * lr_scale
 
-    def step(self):
+    def step(self) -> None:
         self._step += 1
         self._apply_lr(self._step)
 
@@ -59,10 +59,10 @@ class CosineWithWarmup:
     def get_lr(self) -> float:
         return self.optimizer.param_groups[0]["lr"]
 
-    def state_dict(self):
+    def state_dict(self) -> dict[str, int]:
         return {"step": self._step}
 
-    def load_state_dict(self, state):
+    def load_state_dict(self, state: dict[str, int]) -> None:
         self._step = state["step"]
         self._apply_lr(self._step)
 
@@ -208,8 +208,9 @@ class CLMTrainer:
         self._jsonl_path = os.path.join(self.run_dir, "metrics.jsonl")
         self._jsonl_file = None
 
-        self.model = PAWNCLM(model_cfg).to(self.device)
-        param_count = sum(p.numel() for p in self.model.parameters())
+        self._model = PAWNCLM(model_cfg).to(self.device)
+        self.model = self._model
+        param_count = sum(p.numel() for p in self._model.parameters())
         print(f"Model parameters: {param_count:,}")
         print(f"Run directory: {self.run_dir}")
 
@@ -345,7 +346,7 @@ class CLMTrainer:
 
     def optimizer_step(self) -> float:
         self.scaler.unscale_(self.optimizer)
-        grad_norm = _get_grad_norm(self.model)
+        grad_norm = _get_grad_norm(self._model)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.max_grad_norm)
         self.scaler.step(self.optimizer)
         self.scaler.update()
@@ -354,7 +355,7 @@ class CLMTrainer:
         return grad_norm
 
     def _eager_model(self) -> PAWNCLM:
-        return self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+        return self._model
 
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
@@ -535,9 +536,7 @@ class CLMTrainer:
         if dirname:
             os.makedirs(dirname, exist_ok=True)
 
-        model = self.model
-        if hasattr(model, "_orig_mod"):
-            model = model._orig_mod
+        model: PAWNCLM = self._eager_model()
 
         torch.save(
             {
@@ -561,9 +560,7 @@ class CLMTrainer:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.global_step = ckpt["global_step"]
 
-        model = self.model
-        if hasattr(model, "_orig_mod"):
-            model = model._orig_mod
+        model: PAWNCLM = self._eager_model()
 
         model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])

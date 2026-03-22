@@ -24,6 +24,8 @@ class SparseLinear(nn.Module):
     output = F.linear(x, W_frozen + delta * mask, bias)
     """
 
+    mask: torch.Tensor
+
     def __init__(self, frozen_linear: nn.Linear, mask: torch.Tensor):
         super().__init__()
         self.frozen = frozen_linear
@@ -82,9 +84,10 @@ class SparseCLM(nn.Module):
         gen = torch.Generator().manual_seed(seed)
 
         # Inject sparse adapters
-        for layer_idx, block in enumerate(backbone.layers):
+        for layer_idx in range(len(backbone.layers)):
             if layer_idx not in self.adapted_layers:
                 continue
+            block = backbone.get_block(layer_idx)
 
             attn: Attention = block.attn
             for proj_name in self.attn_targets:
@@ -166,9 +169,9 @@ class SparseCLM(nn.Module):
             rope_sin = bb.rope_sin[:, :, :T_new, :]
 
         new_kv_cache = []
-        for i, layer in enumerate(bb.layers):
+        for i in range(len(bb.layers)):
             layer_cache = kv_cache[i] if kv_cache is not None else None
-            x, new_cache = layer.forward_kv(x, rope_cos, rope_sin, layer_cache)
+            x, new_cache = bb.get_block(i).forward_kv(x, rope_cos, rope_sin, layer_cache)
             new_kv_cache.append(new_cache)
 
         x = bb.final_norm(x[:, -1:, :])
@@ -184,7 +187,8 @@ class SparseCLM(nn.Module):
     def n_active_params(self) -> int:
         """Count of actually active (masked-in) parameters."""
         total = 0
-        for block in self.backbone.layers:
+        for layer_idx in range(len(self.backbone.layers)):
+            block = self.backbone.get_block(layer_idx)
             for proj_name in self.attn_targets:
                 module = getattr(block.attn, proj_name)
                 if isinstance(module, SparseLinear):
@@ -215,7 +219,8 @@ class SparseCLM(nn.Module):
     def sparse_weight_report(self) -> dict[str, float]:
         """Per-layer sparse delta norms for monitoring."""
         report = {}
-        for layer_idx, block in enumerate(self.backbone.layers):
+        for layer_idx in range(len(self.backbone.layers)):
+            block = self.backbone.get_block(layer_idx)
             for proj_name in self.attn_targets:
                 module = getattr(block.attn, proj_name)
                 if isinstance(module, SparseLinear):

@@ -1,9 +1,13 @@
 """Autoregressive generation for outcome token signal tests (§6)."""
 
+from __future__ import annotations
+
 import gc
+from typing import Protocol
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 import chess_engine as engine
@@ -12,13 +16,32 @@ from pawn.config import PAD_TOKEN, WHITE_CHECKMATES, PLY_LIMIT, CLMConfig
 from pawn.data import _map_termination_to_outcome
 
 
+class GenerativeModel(Protocol):
+    """Structural type for models usable in autoregressive generation."""
+
+    def eval(self) -> nn.Module: ...
+
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        hidden_only: bool = ...,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]: ...
+
+    def forward_generate(
+        self,
+        input_ids: torch.Tensor,
+        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = ...,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]: ...
+
+
 # ---------------------------------------------------------------------------
 # Core autoregressive generation
 # ---------------------------------------------------------------------------
 
 
 def autoregressive_generate(
-    model,
+    model: GenerativeModel,
     outcome_token: int,
     n_games: int,
     device: str,
@@ -28,7 +51,7 @@ def autoregressive_generate(
     max_seq_len: int = 256,
     temperature: float = 1.0,
     batch_size: int = 64,
-) -> dict:
+) -> dict[str, np.ndarray]:
     """Generate games autoregressively from a trained PAWN.
 
     Args:
@@ -74,9 +97,16 @@ def autoregressive_generate(
 
 @torch.no_grad()
 def _generate_batch(
-    model, outcome_token, n_games, device, mask_illegal,
-    prefix_moves, prefix_lengths, max_seq_len, temperature,
-) -> dict:
+    model: GenerativeModel,
+    outcome_token: int,
+    n_games: int,
+    device: str,
+    mask_illegal: bool,
+    prefix_moves: np.ndarray | None,
+    prefix_lengths: np.ndarray | None,
+    max_seq_len: int,
+    temperature: float,
+) -> dict[str, np.ndarray]:
     """Generate a batch of games using batch Rust engine for state management."""
     cfg_vocab_size = CLMConfig.vocab_size  # 4278
     max_move_positions = max_seq_len - 1  # position 0 is outcome token
@@ -264,7 +294,7 @@ OUTCOME_TOKENS = {
 
 
 def outcome_signal_test(
-    model,
+    model: GenerativeModel,
     device: str,
     n_per_outcome: int = 1000,
     mask_conditions: tuple[bool, ...] = (False, True),
@@ -354,7 +384,7 @@ def _analyze_generated_games(gen: dict, conditioned_outcome: str) -> dict:
 
 
 def prefix_continuation_test(
-    model,
+    model: GenerativeModel,
     corpus: dict,
     device: str,
     n_per_bucket: int = 200,
@@ -475,7 +505,7 @@ def prefix_continuation_test(
     return results
 
 
-def _outcome_mask(term_codes, game_lengths, outcome_name):
+def _outcome_mask(term_codes: np.ndarray, game_lengths: np.ndarray, outcome_name: str) -> np.ndarray:
     """Create a boolean mask for games matching the given outcome."""
     if outcome_name == "WHITE_CHECKMATES":
         return (term_codes == 0) & (game_lengths % 2 == 1)
@@ -503,7 +533,7 @@ POISONING_PAIRS = [
 
 
 def poisoned_prefix_test(
-    model,
+    model: GenerativeModel,
     corpus: dict,
     device: str,
     n_per_pair: int = 500,
@@ -566,7 +596,7 @@ def poisoned_prefix_test(
 
 
 def impossible_task_test(
-    model,
+    model: GenerativeModel,
     corpus: dict,
     device: str,
     n_per_scenario: int = 200,
@@ -652,7 +682,7 @@ def impossible_task_test(
 
 
 def improbable_task_test(
-    model,
+    model: GenerativeModel,
     corpus: dict,
     device: str,
     n_per_scenario: int = 200,

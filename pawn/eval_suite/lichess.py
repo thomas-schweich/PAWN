@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 import chess_engine as engine
 
@@ -119,7 +120,7 @@ def _extract_elos_from_pgn(pgn_path: Path, max_games: int) -> list[tuple[int, in
 
 @torch.no_grad()
 def evaluate_on_lichess(
-    model,
+    model: nn.Module,
     lichess_data: dict,
     device: str,
     max_seq_len: int = 256,

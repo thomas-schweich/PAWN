@@ -308,10 +308,10 @@ class LichessDataset(torch.utils.data.Dataset):
         self.game_lengths = torch.from_numpy(np.array(self.game_lengths)).share_memory_()
         return self
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.input_ids)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor | int]:
         return {
             "input_ids": self.input_ids[idx],
             "targets": self.targets[idx],

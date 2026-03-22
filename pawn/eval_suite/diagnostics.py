@@ -2,6 +2,7 @@
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 import chess_engine as engine
@@ -39,7 +40,7 @@ def extract_diagnostic_positions(
     corpus: dict,
     min_per_category: int = 2000,
     max_per_category: int = 5000,
-) -> dict:
+) -> dict[str, list[dict]]:
     """Extract diagnostic positions from corpus.
 
     Returns dict[category_name] -> list of dicts with:
@@ -140,7 +141,7 @@ def _term_code_to_outcome_name(tc: int, gl: int) -> str:
 
 @torch.no_grad()
 def evaluate_diagnostic_positions(
-    model,
+    model: nn.Module,
     positions: dict,
     corpus: dict,
     device: str,

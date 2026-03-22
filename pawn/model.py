@@ -179,6 +179,11 @@ class SwiGLUFFN(nn.Module):
 
 
 class TransformerBlock(nn.Module):
+    attn_norm: RMSNorm
+    attn: Attention
+    ffn_norm: RMSNorm
+    ffn: SwiGLUFFN
+
     def __init__(self, cfg: CLMConfig):
         super().__init__()
         self.attn_norm = RMSNorm(cfg.d_model)
@@ -219,6 +224,8 @@ class CLMEmbedding(nn.Module):
     Move tokens use factored embedding: src_embed[s] + dst_embed[d] + promo_embed[p].
     PAD and outcome tokens use standalone embeddings.
     """
+
+    decomp_table: torch.Tensor
 
     def __init__(self, cfg: CLMConfig):
         super().__init__()
@@ -273,6 +280,14 @@ class PAWNCLM(nn.Module):
     full vocabulary. No factored output head, no grid, no BCE.
     """
 
+    rope_cos: torch.Tensor
+    rope_sin: torch.Tensor
+    causal_mask: torch.Tensor
+    embed: CLMEmbedding
+    layers: nn.ModuleList
+    final_norm: RMSNorm
+    lm_head: nn.Linear
+
     def __init__(self, cfg: CLMConfig):
         super().__init__()
         self.cfg = cfg
@@ -299,6 +314,10 @@ class PAWNCLM(nn.Module):
         )
 
         self._init_weights()
+
+    def get_block(self, i: int) -> TransformerBlock:
+        """Typed accessor for transformer layers (avoids ModuleList type erasure)."""
+        return self.layers[i]  # type: ignore[return-value]
 
     def _init_weights(self):
         for p in self.parameters():
@@ -425,9 +444,9 @@ class PAWNCLM(nn.Module):
             rope_sin = self.rope_sin[:, :, :T_new, :]
 
         new_kv_cache = []
-        for i, layer in enumerate(self.layers):
+        for i in range(len(self.layers)):
             layer_cache = kv_cache[i] if kv_cache is not None else None
-            x, new_cache = layer.forward_kv(x, rope_cos, rope_sin, layer_cache)
+            x, new_cache = self.get_block(i).forward_kv(x, rope_cos, rope_sin, layer_cache)
             new_kv_cache.append(new_cache)
 
         x = self.final_norm(x[:, -1:, :])

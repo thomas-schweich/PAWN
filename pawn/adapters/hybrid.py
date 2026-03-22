@@ -65,9 +65,11 @@ class HybridCLM(nn.Module):
             p.requires_grad = False
 
         # Inject LoRA
-        for layer_idx, block in enumerate(backbone.layers):
+        for layer_idx in range(n_layers):
             if layer_idx not in self.lora_layer_set:
                 continue
+            block = backbone.get_block(layer_idx)
+
             attn: Attention = block.attn
             for proj_name in self.attn_targets:
                 original = getattr(attn, proj_name)
@@ -78,14 +80,14 @@ class HybridCLM(nn.Module):
                     original = getattr(ffn, proj_name)
                     setattr(ffn, proj_name, LoRALinear(original, lora_rank, self.lora_alpha))
 
-        # Create FiLM layers (identity for non-adapted layers)
+        # Create FiLM layers (Identity for non-adapted layers)
         if use_film:
             self.hidden_films = nn.ModuleList()
             for i in range(n_layers):
                 if i in self.film_layer_set:
                     self.hidden_films.append(FiLMLayer(cfg.d_model))
                 else:
-                    self.hidden_films.append(None)
+                    self.hidden_films.append(nn.Identity())
         else:
             self.hidden_films = None
 
@@ -109,7 +111,7 @@ class HybridCLM(nn.Module):
 
         for i, layer in enumerate(bb.layers):
             x = layer(x, rope_cos, rope_sin, None)  # LoRA happens inside
-            if self.hidden_films is not None and self.hidden_films[i] is not None:
+            if self.hidden_films is not None:
                 x = self.hidden_films[i](x)
 
         return bb.final_norm(x)
@@ -143,7 +145,7 @@ class HybridCLM(nn.Module):
 
         for i, layer in enumerate(bb.layers):
             x = layer(x, rope_cos, rope_sin, mask)
-            if self.hidden_films is not None and self.hidden_films[i] is not None:
+            if self.hidden_films is not None:
                 x = self.hidden_films[i](x)
 
         x = bb.final_norm(x)
@@ -168,10 +170,11 @@ class HybridCLM(nn.Module):
             rope_sin = bb.rope_sin[:, :, :T_new, :]
 
         new_kv_cache = []
-        for i, layer in enumerate(bb.layers):
+        for i in range(len(bb.layers)):
+            block = bb.get_block(i)
             layer_cache = kv_cache[i] if kv_cache is not None else None
-            x, new_cache = layer.forward_kv(x, rope_cos, rope_sin, layer_cache)
-            if self.hidden_films is not None and self.hidden_films[i] is not None:
+            x, new_cache = block.forward_kv(x, rope_cos, rope_sin, layer_cache)
+            if self.hidden_films is not None:
                 x = self.hidden_films[i](x)
             new_kv_cache.append(new_cache)
 
@@ -187,7 +190,8 @@ class HybridCLM(nn.Module):
     def lora_parameters(self) -> list[nn.Parameter]:
         """Return only LoRA A/B parameters."""
         params = []
-        for block in self.backbone.layers:
+        for layer_idx in range(len(self.backbone.layers)):
+            block = self.backbone.get_block(layer_idx)
             for proj_name in self.attn_targets:
                 module = getattr(block.attn, proj_name)
                 if isinstance(module, LoRALinear):
@@ -206,7 +210,7 @@ class HybridCLM(nn.Module):
         params = []
         if self.hidden_films is not None:
             for film in self.hidden_films:
-                if film is not None:
+                if isinstance(film, FiLMLayer):
                     params.extend(film.parameters())
         if self.output_film is not None:
             params.extend(self.output_film.parameters())
@@ -233,7 +237,8 @@ class HybridCLM(nn.Module):
         report = {}
 
         # LoRA norms
-        for layer_idx, block in enumerate(self.backbone.layers):
+        for layer_idx in range(len(self.backbone.layers)):
+            block = self.backbone.get_block(layer_idx)
             for proj_name in self.attn_targets:
                 module = getattr(block.attn, proj_name)
                 if isinstance(module, LoRALinear):
@@ -247,7 +252,7 @@ class HybridCLM(nn.Module):
         # FiLM norms
         if self.hidden_films is not None:
             for i, film in enumerate(self.hidden_films):
-                if film is not None:
+                if isinstance(film, FiLMLayer):
                     report[f"film/hidden_{i}/gamma_dev"] = (film.gamma - 1.0).norm().item()
                     report[f"film/hidden_{i}/beta_norm"] = film.beta.norm().item()
         if self.output_film is not None:

@@ -3,6 +3,7 @@
 import os
 import threading
 import time
+from collections.abc import Iterator
 
 import numpy as np
 import torch
@@ -19,7 +20,7 @@ from pawn.config import (
 )
 
 
-_positions_cache: dict = {}
+_positions_cache: dict[tuple[str, int], torch.Tensor] = {}
 
 
 
@@ -130,10 +131,10 @@ class CLMDataset(torch.utils.data.IterableDataset):
         self._start_step = 0
         self._main_pid = os.getpid()
 
-    def set_start_step(self, step: int):
+    def set_start_step(self, step: int) -> None:
         self._start_step = step
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info else 0
         num_workers = worker_info.num_workers if worker_info else 1

@@ -10,6 +10,7 @@ Storage layout:
 
 import json
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +33,7 @@ def _popcount_u64(arr: np.ndarray) -> np.ndarray:
     return result
 
 
-def _count_legal_moves(move_ids, game_lengths):
+def _count_legal_moves(move_ids: np.ndarray, game_lengths: np.ndarray) -> np.ndarray:
     """Legal move count per ply via bit-packed grids + promo mask."""
     grid, promo_mask = engine.compute_legal_move_masks(move_ids, game_lengths)
     grid_counts = np.zeros(grid.shape[:2], dtype=np.uint32)
@@ -384,7 +385,7 @@ _PHASES = [("ply_1_20", 0, 20), ("ply_21_80", 20, 80),
            ("ply_81_150", 80, 150), ("ply_150_plus", 150, 9999)]
 
 
-def _iter_position_parts(corpus: dict):
+def _iter_position_parts(corpus: dict) -> Iterator[pl.DataFrame]:
     """Yield each position parquet part as an eager DataFrame."""
     from pathlib import Path
     # Find corpus dir from the LazyFrame's file path
@@ -395,7 +396,7 @@ def _iter_position_parts(corpus: dict):
         yield pl.read_parquet(f)
 
 
-def _new_accumulator() -> dict:
+def _new_accumulator() -> dict[str, int | float | np.ndarray]:
     return {
         "n": 0, "sum_k": 0.0, "sum_k_sq": 0.0, "k_min": 999, "k_max": 0,
         "sum_inv_k": 0.0, "sum_inv_k_sq": 0.0,
@@ -408,7 +409,7 @@ def _new_accumulator() -> dict:
     }
 
 
-def _accumulate(acc: dict, df: pl.DataFrame):
+def _accumulate(acc: dict, df: pl.DataFrame) -> None:
     """Accumulate stats from one chunk (already filtered to k > 0)."""
     k = df["k"].to_numpy().astype(np.float64)
     ply = df["ply"].to_numpy()
@@ -455,7 +456,7 @@ def _accumulate(acc: dict, df: pl.DataFrame):
     del k, ply, chk, inv_k, ln_k, top5
 
 
-def _finalize_k_stats(acc):
+def _finalize_k_stats(acc: dict) -> dict[str, float | int]:
     N = acc["n"]
     mean = acc["sum_k"] / N
     var = acc["sum_k_sq"] / N - mean ** 2
@@ -466,13 +467,13 @@ def _finalize_k_stats(acc):
             "min": acc["k_min"], "max": acc["k_max"]}
 
 
-def _finalize_k_hist(acc):
+def _finalize_k_hist(acc: dict) -> dict:
     h = acc["k_hist"]
     nz = h > 0
     return {"values": np.arange(300)[nz].tolist(), "counts": h[nz].tolist(), "total": acc["n"]}
 
 
-def _finalize_phases(acc):
+def _finalize_phases(acc: dict) -> dict:
     result = {}
     for name, _, _ in _PHASES:
         c = acc[f"{name}_n"]
@@ -486,7 +487,7 @@ def _finalize_phases(acc):
     return result
 
 
-def _finalize_checks(acc):
+def _finalize_checks(acc: dict) -> dict:
     N = acc["n"]
     result = {}
     for label in ("chk", "nochk"):
