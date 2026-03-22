@@ -1,0 +1,37 @@
+# Checkpoints and logs
+checkpoints/
+logs/
+
+# Training data
+data/
+
+# Deployment artifacts
+deploy/pawn-deploy/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+*.so
+
+# Rust
+target/
+*.d
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# uv (track root lockfile only)
+engine/uv.lock
