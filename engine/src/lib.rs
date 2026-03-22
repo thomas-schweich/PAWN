@@ -141,19 +141,24 @@ fn generate_checkmate_training_batch<'py>(
 
 /// Generate random games without labels. Spec §7.3.
 #[pyfunction]
-#[pyo3(signature = (n_games, max_ply=256, seed=42))]
+#[pyo3(signature = (n_games, max_ply=256, seed=42, discard_ply_limit=false))]
 fn generate_random_games<'py>(
     py: Python<'py>,
     n_games: usize,
     max_ply: usize,
     seed: u64,
+    discard_ply_limit: bool,
 ) -> PyResult<(
     Bound<'py, PyArray2<i16>>,
     Bound<'py, PyArray1<i16>>,
     Bound<'py, PyArray1<u8>>,
 )> {
     let result = py.allow_threads(|| {
-        batch::generate_random_games(n_games, max_ply, seed)
+        if discard_ply_limit {
+            batch::generate_completed_games(n_games, max_ply, seed)
+        } else {
+            batch::generate_random_games(n_games, max_ply, seed)
+        }
     });
 
     let move_ids = numpy::PyArray::from_vec(py, result.move_ids)

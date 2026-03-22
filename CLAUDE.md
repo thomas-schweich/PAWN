@@ -1,0 +1,124 @@
+# PAWN (Playstyle-Agnostic World-model Network for Chess)
+
+A causal transformer trained on random chess games, designed as a testbed for finetuning and augmentation methods at small scales. Apache 2.0.
+
+## Repository Structure
+
+```
+pawn/
+├── engine/          # Rust chess engine with PyO3 bindings (via shakmaty)
+├── pawn/            # Core Python package
+│   ├── config.py    # CLMConfig (small/base/large), TrainingConfig
+│   ├── model.py     # PAWNCLM transformer (RMSNorm, SwiGLU, RoPE, factored embeddings)
+│   ├── data.py      # On-the-fly random game data pipeline
+│   ├── lichess_data.py  # Lichess PGN data pipeline + legal mask computation
+│   ├── trainer.py   # Pretraining loop
+│   ├── gpu.py       # GPU auto-detection (compile/AMP/SDPA backend)
+│   ├── logging.py   # MetricsLogger (JSONL output)
+│   ├── adapters/    # Bottleneck, LoRA, FiLM, sparse, hybrid
+│   ├── eval_suite/  # Probes, generation tests, diagnostics, lichess eval
+│   └── dashboard/   # Solara training dashboard (metrics, charts, runner)
+├── scripts/         # Training and evaluation entry points
+├── tests/           # Unit tests
+├── deploy/          # Runpod deployment scripts
+└── docs/            # Architecture, training, adapter docs
+```
+
+## Building
+
+This is a uv workspace. The root project is the `pawn` Python package; `engine/` is the sole workspace member.
+
+```bash
+# Build the Rust chess engine (required before anything else)
+cd engine && uv run --with maturin maturin develop --release && cd ..
+
+# Install Python deps:
+uv sync --extra rocm      # AMD (ROCm 7.1)
+uv sync --extra cu128     # NVIDIA (CUDA 12.8)
+uv sync --extra dev       # + pytest, ipykernel
+
+# Run tests
+uv run pytest tests/
+
+# Pretrain from scratch
+uv run python scripts/train.py --variant base
+```
+
+## Engine (`engine/`)
+
+**Single source of truth** for all chess logic. All game simulation, move generation, legality checks, tokenization, PGN parsing, and board state extraction happen in Rust. No Python chess libraries.
+
+- Uses rayon for parallel game generation (~43K games/sec, 150M+/hr)
+- PyO3 bindings expose `chess_engine` module to Python
+- Key functions: `generate_random_games()`, `parse_pgn_file()`, `compute_legal_token_masks_sparse()`, `extract_board_states()`, `export_move_vocabulary()`
+
+## Model (`pawn/`)
+
+### Architecture
+- Decoder-only transformer, next-token prediction over 4278 tokens
+- Token vocabulary: 1 PAD + 4096 grid (64x64 src/dst) + 176 promotions + 5 outcomes
+- Factored embeddings: `src_embed[s] + dst_embed[d] + promo_embed[p]`
+- Sequence format: `[outcome] [ply_1] ... [ply_N] [PAD] ... [PAD]` (256 tokens)
+
+### Variants
+- `CLMConfig.small()`: d=256, 8 layers, 4 heads, ~9.5M params
+- `CLMConfig.base()`: d=512, 8 layers, 8 heads, ~35.8M params (default)
+- `CLMConfig.large()`: d=640, 10 layers, 8 heads, ~68.4M params
+- `CLMConfig.toy()`: d=64, 2 layers, for tests only
+
+### Key Patterns
+
+- **Sparse logit projection**: `forward_hidden()` returns `(B,T,d_model)`, then only loss-masked positions project through `lm_head` -- avoids full `(B,T,V)` materialization
+- **Legal mask via Rust**: `LegalMaskBuilder` replays games in Rust, returns sparse indices scattered into a pre-allocated GPU buffer
+- **DataLoader workers**: Must use `multiprocessing_context='spawn'` -- the engine uses rayon, and fork after rayon init causes deadlocks
+- **GPU auto-detection**: `pawn.gpu.configure_gpu()` selects compile/AMP/SDPA settings. ROCm uses MATH SDPA backend (flash attention backward has stride issues with torch.compile)
+- **SDPA backend global**: `pawn.model.SDPA_BACKEND` is set by `apply_gpu_config()` and used in `Attention.forward()` via `sdpa_kernel()` context
+
+## Adapters (`pawn/adapters/`)
+
+All adapters freeze the backbone and initialize to identity (zero-init or gamma=1, beta=0):
+- `bottleneck.py` -- Houlsby-style down/up MLP, best parameter efficiency below ~1M params
+- `lora.py` -- Low-rank attention projection adapters
+- `film.py` -- Feature-wise Linear Modulation (lightest, ~17K params)
+- `sparse.py` -- Random binary mask on frozen weights
+- `hybrid.py` -- LoRA + FiLM combined
+
+## Scripts (`scripts/`)
+
+- `train.py` -- Pretrain from scratch (`--variant small|base|large|toy`)
+- `train_bottleneck.py`, `train_film.py`, `train_lora.py`, `train_sparse.py`, `train_hybrid.py` -- Adapter behavioral cloning on Lichess PGN
+- `train_tiny.py` -- Standalone tiny transformer baseline (no frozen backbone)
+- `eval_accuracy.py` -- MAIA-compatible evaluation (per-phase, per-ply accuracy)
+
+## Deploy (`deploy/`)
+
+Scripts for Runpod GPU VM deployment:
+- `setup.sh` -- One-time pod setup (Rust, uv, engine build, `uv sync --extra cu128`)
+- `build.sh` -- Package repo for transfer (`--checkpoint PATH`, `--data-dir PATH`)
+- `pod.sh` -- Pod lifecycle (create/start/stop/delete/ssh/deploy/launch)
+
+Pod configs cached in `~/.config/pawn/pods/`. Working directory on pods: `/workspace/pawn/`.
+
+## Dashboard (`pawn/dashboard/`)
+
+Solara-based training dashboard. Reads `metrics.jsonl` files, no dependency on training packages.
+
+```bash
+uv sync --extra dashboard
+python -m pawn.dashboard --log-dir logs
+```
+
+- `metrics.py` -- Load runs, parse JSONL, detect run type from config record
+- `charts.py` -- Plotly chart builders (loss, accuracy, LR, GPU, adapter-specific diagnostics)
+- `sol.py` -- Solara components: RunSelector, ConfigSummary, MetricsCharts, Runner, Dashboard
+- `__main__.py` -- CLI entry point, sets `PAWN_LOG_DIR` env var, launches `solara run`
+
+Auto-detects run type from config fields (`run_type`, `formulation`, `pgn_file`). Dashboard requires restart for code changes (no hot reload).
+
+## Checkpoints
+
+Stored in `checkpoints/` (gitignored). Pre-trained weights downloadable from HuggingFace Hub / GitHub Releases.
+
+## Logs
+
+Training metrics in `logs/` (gitignored). Each run gets a timestamped directory with `metrics.jsonl`.

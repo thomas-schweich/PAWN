@@ -123,11 +123,13 @@ class CLMDataset(torch.utils.data.IterableDataset):
     base_seed + step * num_workers + worker_id.
     """
 
-    def __init__(self, batch_size: int, max_ply: int, base_seed: int):
+    def __init__(self, batch_size: int, max_ply: int, base_seed: int,
+                 discard_ply_limit: bool = False):
         super().__init__()
         self.batch_size = batch_size
         self.max_ply = max_ply
         self.base_seed = base_seed
+        self.discard_ply_limit = discard_ply_limit
         self._start_step = 0
         self._main_pid = os.getpid()
 
@@ -160,14 +162,16 @@ class CLMDataset(torch.utils.data.IterableDataset):
         while True:
             seed = self.base_seed + step * num_workers + worker_id
             move_ids, game_lengths, term_codes = engine.generate_random_games(
-                self.batch_size, engine_max_ply, seed
+                self.batch_size, engine_max_ply, seed,
+                discard_ply_limit=self.discard_ply_limit,
             )
             yield _to_clm_batch(move_ids, game_lengths, term_codes, self.max_ply)
             step += 1
 
 
 def create_validation_set(
-    n_games: int, max_ply: int, seed: int
+    n_games: int, max_ply: int, seed: int,
+    discard_ply_limit: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Generate a fixed validation set.
 
@@ -178,7 +182,7 @@ def create_validation_set(
     """
     engine_max_ply = max_ply - 1
     move_ids, game_lengths, term_codes = engine.generate_random_games(
-        n_games, engine_max_ply, seed
+        n_games, engine_max_ply, seed, discard_ply_limit=discard_ply_limit,
     )
     batch = _to_clm_batch(move_ids, game_lengths, term_codes, max_ply)
 

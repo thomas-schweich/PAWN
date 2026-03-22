@@ -170,6 +170,56 @@ pub fn generate_checkmate_training_batch(
     }
 }
 
+/// Generate random games, discarding any that hit the ply limit.
+/// Only keeps games that ended naturally (checkmate, stalemate, draw rules).
+pub fn generate_completed_games(n_games: usize, max_ply: usize, seed: u64) -> GameBatch {
+    let batch_size = 4096.max(n_games * 2);
+    let mut collected: Vec<(Vec<u16>, u16, Termination)> = Vec::with_capacity(n_games);
+    let mut game_seed = seed;
+
+    while collected.len() < n_games {
+        let seeds = derive_game_seeds(game_seed, batch_size);
+        let results: Vec<(Vec<u16>, u16, Termination)> = seeds
+            .into_par_iter()
+            .map(|s| generate_one_game(s, max_ply))
+            .collect();
+
+        game_seed += batch_size as u64;
+
+        for result in results {
+            if result.2 != Termination::PlyLimit {
+                collected.push(result);
+                if collected.len() >= n_games {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut move_ids = vec![0i16; n_games * max_ply];
+    let mut game_lengths = Vec::with_capacity(n_games);
+    let mut termination_codes = Vec::with_capacity(n_games);
+
+    for (b, (moves, length, term)) in collected.iter().enumerate() {
+        game_lengths.push(*length as i16);
+        termination_codes.push(term.as_u8());
+        for t in 0..(*length as usize) {
+            move_ids[b * max_ply + t] = moves[t] as i16;
+        }
+        if (*length as usize) < max_ply {
+            move_ids[b * max_ply + *length as usize] = vocab::EOG_TOKEN as i16;
+        }
+    }
+
+    GameBatch {
+        move_ids,
+        game_lengths,
+        termination_codes,
+        n_games,
+        max_ply,
+    }
+}
+
 /// Generate checkmate-only games with target counts per winner color.
 /// Generates games in parallel batches, discarding non-checkmates in real time.
 pub fn generate_checkmate_games(

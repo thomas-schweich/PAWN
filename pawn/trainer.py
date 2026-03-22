@@ -227,10 +227,14 @@ class CLMTrainer:
         )
         self.scaler = torch.amp.GradScaler(self.device, enabled=train_cfg.use_amp)
 
-        self.dataset = CLMDataset(train_cfg.batch_size, train_cfg.max_ply, train_cfg.base_seed)
+        self.dataset = CLMDataset(
+            train_cfg.batch_size, train_cfg.max_ply, train_cfg.base_seed,
+            discard_ply_limit=train_cfg.discard_ply_limit,
+        )
         print("Generating validation set...")
         self.val_data = create_validation_set(
-            train_cfg.val_games, train_cfg.max_ply, train_cfg.val_seed
+            train_cfg.val_games, train_cfg.max_ply, train_cfg.val_seed,
+            discard_ply_limit=train_cfg.discard_ply_limit,
         )
 
         # W&B
@@ -261,12 +265,28 @@ class CLMTrainer:
         else:
             print("Skipping torch.compile on CPU")
 
+        import subprocess
+        try:
+            git_hash = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+            ).strip()
+        except Exception:
+            git_hash = None
+        try:
+            git_tag = subprocess.check_output(
+                ["git", "tag", "--points-at", "HEAD"], stderr=subprocess.DEVNULL, text=True
+            ).strip() or None
+        except Exception:
+            git_tag = None
+
         config_data = {
             "model": model_cfg.__dict__,
             "training": train_cfg.__dict__,
             "param_count": param_count,
             "compiled": self._compiled,
             "formulation": "clm",
+            "git_hash": git_hash,
+            "git_tag": git_tag,
         }
 
         config_path = os.path.join(self.run_dir, "config.json")

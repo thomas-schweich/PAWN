@@ -71,6 +71,7 @@ class TrainingConfig:
     # Batch
     batch_size: int = 256
     max_ply: int = 256  # Rust engine max_ply (games up to 255 actual moves)
+    discard_ply_limit: bool = False  # Only train on games that ended naturally
     num_workers: int = 4
 
     # Precision

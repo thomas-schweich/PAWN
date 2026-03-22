@@ -18,7 +18,17 @@ To aid in exploring how model size affects different finetuning methods, we trai
 | **PAWN-Small** | 256 | 8 | 4 | ~9.5M | [pawn-small.pt]() |
 | **PAWN-Large** | 640 | 10 | 8 | ~68.4M | [pawn-large.pt]() |
 
-All variants share the same architecture: RMSNorm, SwiGLU FFN, RoPE, factored move embeddings, and a 4278-token vocabulary covering all possible (src, dst) pairs for an 8x8 chess board plus promotions (one per promotion piece type per square on 1st or 8th rank), along with a token for each game outcome (white wins, black wins, stalemate, draw, ply limit) and a padding token. Notably, the vocabulary includes impossible moves like `(a1, a1)`. PAWN learns to avoid these as part of its understanding of legality.
+
+All variants share the same architecture: RMSNorm, SwiGLU FFN, RoPE, factored move embeddings, and a 4278-token vocabulary covering:
+
+- all possible (src, dst) pairs for an 8x8 grid (the chess board),
+- promotion moves (one per promotion piece type per square on 1st or 8th rank), 
+- a token for each game outcome (white wins, black wins, stalemate, draw, ply limit),
+- and a padding token.
+
+Notably, the vocabulary includes impossible moves like `a1a1` and `b1a5`. PAWN naturally learns to avoid these during training.
+
+Conceptually, each token is best thought of as a move in UCI notation--they are effectively coordinates. They do not include any information on the type of peice, side to play, or any direct geometric or board state information[^1]. `e2e4` is the token that represents the king's pawn opening but only when it's the first ply in the sequence--moving a rook between from e2 to e4 in the late game would use the same token). `e7e8`
 
 ## Quickstart
 
@@ -54,6 +64,9 @@ The context window of all variants is 256 tokens wide. Training examples all inc
 
 During training, examples are retroactively prepended with their actual outcome. During inference, the outcome token has a measurable impact on subsequent completions.
 
+The models predictions are not masked to legal moves during training; it has to determine what moves are currently legal based on the seqeunce of moves so far.
+
+No attempt is made to provide the model with information about other peices. In other words, it only thinks in moves. There is no equivalent of 7-dimensional manifold board representation used by e.g. Alpha Zero and Lc0. Any and all state representation is learned by the model internally.
 
 ## Adapter Methods
 

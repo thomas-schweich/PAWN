@@ -1,0 +1,15 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.mypy_cache
+engine/target
+data/
+checkpoints/
+logs/
+deploy/
+*.so
+CLAUDE.md
+docs/

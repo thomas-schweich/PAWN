@@ -28,6 +28,8 @@ def parse_args():
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Override checkpoint dir")
     parser.add_argument("--log-dir", type=str, default=None, help="Override log directory")
+    parser.add_argument("--discard-ply-limit", action="store_true",
+                        help="Only train on games that ended naturally (no ply limit truncation)")
     return parser.parse_args()
 
 
@@ -65,6 +67,8 @@ def main():
         train_cfg.checkpoint_dir = args.checkpoint_dir
     if args.log_dir:
         train_cfg.log_dir = args.log_dir
+    if args.discard_ply_limit:
+        train_cfg.discard_ply_limit = True
 
     print(f"Model config: {model_cfg}")
     print(f"Training config: {train_cfg}")

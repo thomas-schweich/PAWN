@@ -16,6 +16,7 @@ dependencies = [
 rocm = ["torch~=2.10.0", "triton-rocm>=3.6.0"]
 cu128 = ["torch~=2.10.0"]
 eval = ["seaborn>=0.13.2", "matplotlib>=3.10.8", "polars>=1.39.0", "pyarrow>=23.0.1"]
+dashboard = ["solara>=1.0.0", "plotly>=5.18.0", "pandas>=2.0.0", "anywidget>=0.9.21"]
 dev = ["pytest~=9.0.0", "ipykernel>=7.2.0"]
 
 [build-system]

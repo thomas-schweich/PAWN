@@ -75,7 +75,8 @@ load_pod_config() {
 }
 
 list_local_pods() {
-    for f in "$POD_DIR"/*.env 2>/dev/null; do
+    local files=("$POD_DIR"/*.env)
+    for f in "${files[@]}"; do
         [ -f "$f" ] || continue
         local n="$(basename "${f%.env}")"
         source "$f"
@@ -303,6 +304,7 @@ case "${1:-}" in
     setup)   shift; cmd_setup "$@" ;;
     deploy)  shift; cmd_deploy "$@" ;;
     launch)  shift; cmd_launch "$@" ;;
+    sync)    shift; bash "$REPO/deploy/sync.sh" "$@" ;;
     *)
         echo "PAWN Pod Manager"
         echo ""
@@ -321,6 +323,7 @@ case "${1:-}" in
         echo "  setup  <name>            Run setup.sh on the pod"
         echo "  deploy <name>            Build + transfer + setup (full deploy)"
         echo "  launch <name> <cmd>      Run a training command via nohup"
+        echo "  sync   [name]            Sync logs/checkpoints from pod(s)"
         echo ""
         echo "GPU shortcuts: a5000, a40, a6000, 4090, 5090, l40s, h100"
         echo ""
