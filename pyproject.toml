@@ -11,14 +11,25 @@ dependencies = [
     "safetensors>=0.4.0",
     "tqdm~=4.67.0",
     "wandb~=0.25.0",
+    "huggingface-hub>=0.20.0",
+    # Eval + probes
+    "seaborn>=0.13.2",
+    "matplotlib>=3.10.8",
+    "polars>=1.39.0",
+    "pyarrow>=23.0.1",
+    # Dashboard
+    "solara>=1.0.0",
+    "plotly>=5.18.0",
+    "pandas>=2.0.0",
+    "anywidget>=0.9.21",
+    # Dev
+    "pytest~=9.0.0",
+    "ipykernel>=7.2.0",
 ]
 
 [project.optional-dependencies]
 rocm = ["torch~=2.10.0", "triton-rocm>=3.6.0"]
 cu128 = ["torch~=2.10.0"]
-eval = ["seaborn>=0.13.2", "matplotlib>=3.10.8", "polars>=1.39.0", "pyarrow>=23.0.1"]
-dashboard = ["solara>=1.0.0", "plotly>=5.18.0", "pandas>=2.0.0", "anywidget>=0.9.21"]
-dev = ["pytest~=9.0.0", "ipykernel>=7.2.0"]
 
 [build-system]
 requires = ["hatchling"]
