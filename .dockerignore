@@ -10,6 +10,7 @@ data/
 checkpoints/
 logs/
 deploy/
+!deploy/entrypoint-run.sh
 *.so
 CLAUDE.md
 docs/
