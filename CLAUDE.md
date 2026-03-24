@@ -41,7 +41,7 @@ uv sync --extra dev       # + pytest, ipykernel
 uv run pytest tests/
 
 # Pretrain from scratch
-uv run python scripts/train.py --variant base
+uv run python scripts/train.py --variant base --local-checkpoints
 ```
 
 ## Engine (`engine/`)
@@ -86,18 +86,24 @@ All adapters freeze the backbone and initialize to identity (zero-init or gamma=
 ## Scripts (`scripts/`)
 
 - `train.py` -- Pretrain from scratch (`--variant small|base|large|toy`)
+- `train_all.py` -- Train small/base/large simultaneously on shared data batches
 - `train_bottleneck.py`, `train_film.py`, `train_lora.py`, `train_sparse.py`, `train_hybrid.py` -- Adapter behavioral cloning on Lichess PGN
 - `train_tiny.py` -- Standalone tiny transformer baseline (no frozen backbone)
 - `eval_accuracy.py` -- MAIA-compatible evaluation (per-phase, per-ply accuracy)
+- `eval_probes.py` -- Run linear probes on all checkpoints
+- `export_hf_repo.py` -- Convert training run to HuggingFace repo format (safetensors + metrics)
+
+All training scripts require `--hf-repo REPO` or `--local-checkpoints`.
 
 ## Deploy (`deploy/`)
 
-Scripts for Runpod GPU VM deployment:
-- `setup.sh` -- One-time pod setup (Rust, uv, engine build, `uv sync --extra cu128`)
-- `build.sh` -- Package repo for transfer (`--checkpoint PATH`, `--data-dir PATH`)
-- `pod.sh` -- Pod lifecycle (create/start/stop/delete/ssh/deploy/launch)
+Docker-based deployment to Runpod GPU VMs:
+- `Dockerfile` -- Multi-target build: `interactive` (SSH+Jupyter, default) and `runner` (auto-stop)
+- `entrypoint-run.sh` -- Runner entrypoint, pulls from HF via `PAWN_MODEL` env var
+- `sync.sh` -- Pull latest checkpoints/metrics from HuggingFace submodules
+- `pod.sh` -- Pod lifecycle (create/start/stop/delete/ssh)
 
-Pod configs cached in `~/.config/pawn/pods/`. Working directory on pods: `/workspace/pawn/`.
+Code lives at `/opt/pawn` on pods (outside the `/workspace` volume mount).
 
 ## Dashboard (`pawn/dashboard/`)
 

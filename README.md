@@ -52,13 +52,17 @@ uv sync --extra cu128   # NVIDIA GPU (or --extra rocm for AMD)
 uv sync --extra dev --extra eval --extra dashboard
 
 # Train an adapter on a pre-trained checkpoint
+git submodule update --init checkpoints/pawn-base
 uv run python scripts/train_bottleneck.py \
-    --checkpoint checkpoints/pawn-base.pt \
+    --checkpoint checkpoints/pawn-base \
     --pgn data/lichess_1800_1900.pgn \
-    --bottleneck-dim 32 --lr 1e-4
+    --bottleneck-dim 32 --lr 1e-4 --local-checkpoints
 
 # Or pretrain a PAWN variant from scratch (generates random games on-the-fly; no dataset required)
-uv run python scripts/train.py --variant base
+uv run python scripts/train.py --variant base --local-checkpoints
+
+# Or train all three variants simultaneously on shared data
+uv run python scripts/train_all.py --local-checkpoints
 
 # Launch the real-time monitoring dashboard (optional dashboard dependency must be installed)
 uv run python -m pawn.dashboard --log-dir logs --port 8765
