@@ -84,3 +84,51 @@ def detect_run_type(config: dict) -> str:
 def col(records: list[dict], key: str) -> list:
     """Extract a column from records, skipping missing/None values."""
     return [r[key] for r in records if key in r and r[key] is not None]
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace metrics sync
+# ---------------------------------------------------------------------------
+
+HF_REPOS = ["thomas-schweich/pawn-small", "thomas-schweich/pawn-base", "thomas-schweich/pawn-large"]
+
+
+def sync_hf_metrics(log_dir: Path) -> list[str]:
+    """Pull metrics.jsonl from all active HF run branches into log_dir.
+
+    Returns list of synced run names.
+    """
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+    except ImportError:
+        return []
+
+    api = HfApi()
+    synced = []
+    for repo in HF_REPOS:
+        try:
+            branches = [
+                b.name for b in api.list_repo_refs(repo, repo_type="model").branches
+                if b.name.startswith("run/")
+            ]
+        except Exception:
+            continue
+
+        for branch in branches:
+            # Branch name: run/run_YYYYMMDD_HHMMSS_variant
+            run_name = branch.removeprefix("run/")
+            run_dir = log_dir / run_name
+            run_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                local_path = hf_hub_download(
+                    repo_id=repo, filename="metrics.jsonl",
+                    revision=branch, repo_type="model",
+                    local_dir=str(run_dir), local_dir_use_symlinks=False,
+                )
+                # Also try config.json from metrics (first line has config)
+                synced.append(run_name)
+            except Exception:
+                continue
+
+    return synced

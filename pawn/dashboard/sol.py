@@ -14,7 +14,7 @@ from pathlib import Path
 import solara
 
 from . import charts
-from .metrics import detect_run_type, get_run_hostname, get_run_meta, load_metrics, load_runs
+from .metrics import detect_run_type, get_run_hostname, get_run_meta, load_metrics, load_runs, sync_hf_metrics
 
 # ---------------------------------------------------------------------------
 # Global reactive state
@@ -98,6 +98,14 @@ def RunSelector(auto_refresh: bool = False, on_auto_refresh=None, interval: floa
             on_click=lambda: metrics_tick.set(metrics_tick.value + 1),
             icon_name="mdi-refresh",
         )
+
+        def _sync_hf():
+            synced = sync_hf_metrics(log_dir.value)
+            if synced:
+                print(f"Synced {len(synced)} runs from HF")
+            metrics_tick.set(metrics_tick.value + 1)
+
+        solara.Button("Sync HF", on_click=_sync_hf, icon_name="mdi-cloud-download")
         solara.Switch(label="All", value=show_all, on_value=set_show_all)
         if on_auto_refresh is not None:
             solara.Switch(label="Live", value=auto_refresh, on_value=on_auto_refresh)

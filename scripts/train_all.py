@@ -199,6 +199,31 @@ class ModelSlot:
 
         self._hf_push_future = self._hf_push_pool.submit(_push)
 
+    def push_metrics_to_hf(self):
+        """Push just metrics.jsonl to HF (lightweight, no checkpoint)."""
+        if not self.hf_repo or not self.hf_branch:
+            return
+
+        def _push_metrics():
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi()
+                api.create_branch(self.hf_repo, repo_type="model",
+                                  branch=self.hf_branch, exist_ok=True)
+                api.upload_file(
+                    path_or_fileobj=self.jsonl_path,
+                    path_in_repo="metrics.jsonl",
+                    repo_id=self.hf_repo,
+                    repo_type="model",
+                    revision=self.hf_branch,
+                    commit_message=f"Metrics through step {self.global_step}",
+                )
+            except Exception as e:
+                print(f"  [{self.name}] WARNING: metrics push failed: {e}")
+
+        # Fire and forget on the push pool (queued behind any checkpoint push)
+        self._hf_push_pool.submit(_push_metrics)
+
     def wait_for_push(self):
         """Block until any in-flight HF push completes."""
         if self._hf_push_future is not None:
@@ -569,6 +594,10 @@ def main():
                     slot.patience_counter = 0
                 else:
                     slot.patience_counter += 1
+
+            # Push metrics to HF after eval (lightweight, background)
+            for slot in slots:
+                slot.push_metrics_to_hf()
 
             # Early stop when ALL slots have exhausted patience
             if args.patience > 0 and all(s.patience_counter >= args.patience for s in slots):
