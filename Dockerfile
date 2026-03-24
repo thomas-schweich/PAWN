@@ -4,7 +4,10 @@
 # start automatically via the base image's /start.sh entrypoint.
 #
 # Build:
-#   docker build --platform linux/amd64 -t pawn:v1.0 .
+#   docker build --platform linux/amd64 \
+#     --build-arg GIT_HASH=$(git rev-parse HEAD) \
+#     --build-arg GIT_TAG=$(git tag --points-at HEAD) \
+#     -t pawn:<tag> .
 #
 # Runpod BYOC:
 #   Push to a registry, then set as the container image in a Pod template.
@@ -58,6 +61,14 @@ COPY pawn/ pawn/
 COPY scripts/ scripts/
 COPY tests/ tests/
 
-# Persist PYTHONPATH for SSH sessions (Docker ENV doesn't propagate)
-RUN echo 'export PYTHONPATH=/opt/pawn' >> /etc/environment && \
-    echo 'export PYTHONPATH=/opt/pawn' >> /root/.bashrc
+# Bake git version info for trainer config.json
+ARG GIT_HASH=""
+ARG GIT_TAG=""
+ENV PAWN_GIT_HASH=${GIT_HASH} \
+    PAWN_GIT_TAG=${GIT_TAG}
+
+# Persist env vars for SSH sessions (Docker ENV doesn't propagate)
+RUN echo "export PYTHONPATH=/opt/pawn" >> /etc/environment && \
+    echo "export PAWN_GIT_HASH=${GIT_HASH}" >> /etc/environment && \
+    echo "export PAWN_GIT_TAG=${GIT_TAG}" >> /etc/environment && \
+    cat /etc/environment >> /root/.bashrc

@@ -271,13 +271,13 @@ class CLMTrainer:
                 ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
             ).strip()
         except Exception:
-            git_hash = None
+            git_hash = os.environ.get("PAWN_GIT_HASH")
         try:
             git_tag = subprocess.check_output(
                 ["git", "tag", "--points-at", "HEAD"], stderr=subprocess.DEVNULL, text=True
             ).strip() or None
         except Exception:
-            git_tag = None
+            git_tag = os.environ.get("PAWN_GIT_TAG")
 
         config_data = {
             "model": model_cfg.__dict__,
