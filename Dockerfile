@@ -83,12 +83,12 @@ RUN echo "export PYTHONPATH=/opt/pawn" >> /etc/environment && \
     echo "export PAWN_GIT_TAG=${GIT_TAG}" >> /etc/environment && \
     cat /etc/environment >> /root/.bashrc
 
-# ── Interactive (default) — SSH + Jupyter, stays alive ───────────────
-FROM runtime-base AS interactive
-# Inherits /start.sh entrypoint from Runpod base image
-
 # ── Runner — executes command then exits (pod auto-stops) ────────────
 FROM runtime-base AS runner
 COPY deploy/entrypoint-run.sh /entrypoint-run.sh
 RUN chmod +x /entrypoint-run.sh
 ENTRYPOINT ["/entrypoint-run.sh"]
+
+# ── Interactive (default) — SSH + Jupyter, stays alive ───────────────
+FROM runtime-base AS interactive
+# Inherits /start.sh entrypoint from Runpod base image
