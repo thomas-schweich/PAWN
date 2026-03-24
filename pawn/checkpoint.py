@@ -5,6 +5,10 @@ Replaces monolithic torch.save() .pt files with directory-based checkpoints:
   - optimizer.safetensors — flattened optimizer state tensors
   - training_state.json — scalars, scheduler, scaler, RNG, optimizer metadata
   - config.json — model and training configuration
+  - .complete — SHA-256 hashes of all files (integrity sentinel)
+
+Writes are atomic: files are written to a .tmp directory, then renamed.
+Loads always verify the .complete sentinel and SHA-256 hashes.
 
 Backward compatible: all load functions transparently handle legacy .pt files.
 """
@@ -12,7 +16,10 @@ Backward compatible: all load functions transparently handle legacy .pt files.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import os
+import shutil
 from pathlib import Path
 
 import torch
@@ -21,6 +28,120 @@ from safetensors.torch import save_file, load_file
 
 CHECKPOINT_FORMAT_VERSION = 1
 LEGACY_EXTENSIONS = {".pt", ".pth"}
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class IncompleteCheckpointError(Exception):
+    """Raised when a checkpoint directory is missing its .complete sentinel."""
+    pass
+
+
+class CheckpointIntegrityError(Exception):
+    """Raised when a checkpoint file's SHA-256 hash doesn't match .complete."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# SHA-256 helpers
+# ---------------------------------------------------------------------------
+
+def _sha256_file(path: Path) -> str:
+    """Compute SHA-256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):  # 1MB chunks
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_complete_sentinel(directory: Path) -> None:
+    """Write .complete sentinel with SHA-256 hashes of all checkpoint files."""
+    hashes = {}
+    for f in sorted(directory.iterdir()):
+        if f.name == ".complete" or f.is_dir():
+            continue
+        hashes[f.name] = _sha256_file(f)
+
+    sentinel = {"format_version": CHECKPOINT_FORMAT_VERSION, "files": hashes}
+    with open(directory / ".complete", "w") as f:
+        json.dump(sentinel, f, indent=2)
+
+
+def _verify_complete_sentinel(directory: Path) -> None:
+    """Verify .complete sentinel exists and all hashes match.
+
+    Raises IncompleteCheckpointError if sentinel is missing.
+    Raises CheckpointIntegrityError if any hash mismatches.
+    """
+    sentinel_path = directory / ".complete"
+    if not sentinel_path.exists():
+        raise IncompleteCheckpointError(
+            f"Checkpoint {directory} is missing .complete sentinel — "
+            f"likely a partial write from a crashed or interrupted save."
+        )
+
+    with open(sentinel_path) as f:
+        sentinel = json.load(f)
+
+    for filename, expected_hash in sentinel["files"].items():
+        filepath = directory / filename
+        if not filepath.exists():
+            raise CheckpointIntegrityError(
+                f"File {filename} listed in .complete but missing from {directory}"
+            )
+        actual_hash = _sha256_file(filepath)
+        if actual_hash != expected_hash:
+            raise CheckpointIntegrityError(
+                f"SHA-256 mismatch for {filename} in {directory}: "
+                f"expected {expected_hash[:16]}..., got {actual_hash[:16]}..."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Atomic directory write
+# ---------------------------------------------------------------------------
+
+def _atomic_directory_write(target: Path):
+    """Context manager for atomic directory writes.
+
+    Usage:
+        with _atomic_directory_write(Path("step_00001")) as tmp:
+            save_file(tensors, tmp / "model.safetensors")
+            ...
+        # Directory is now at step_00001/ with .complete sentinel
+    """
+    class _AtomicDir:
+        def __init__(self, target: Path):
+            self.target = target
+            self.tmp = target.parent / f"{target.name}.tmp"
+
+        def __enter__(self) -> Path:
+            # Clean up any leftover .tmp from a previous crash
+            if self.tmp.exists():
+                shutil.rmtree(self.tmp)
+            self.tmp.mkdir(parents=True, exist_ok=True)
+            return self.tmp
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if exc_type is not None:
+                # Error during write — clean up temp dir
+                if self.tmp.exists():
+                    shutil.rmtree(self.tmp)
+                return False
+
+            # Write .complete sentinel with hashes
+            _write_complete_sentinel(self.tmp)
+
+            # Atomic rename (same filesystem)
+            if self.target.exists():
+                shutil.rmtree(self.target)
+            os.rename(self.tmp, self.target)
+            return False
+
+    return _AtomicDir(target)
 
 
 # ---------------------------------------------------------------------------
@@ -76,12 +197,7 @@ def _json_to_rng(data: dict) -> tuple[torch.Tensor | None, torch.Tensor | None]:
 def _flatten_optimizer_state(
     opt_state_dict: dict,
 ) -> tuple[dict[str, torch.Tensor], dict]:
-    """Flatten optimizer state into safetensors-compatible tensors + JSON metadata.
-
-    AdamW state: state[param_id] = {"step": tensor, "exp_avg": tensor, "exp_avg_sq": tensor}
-    Flattened: "state.{param_id}.exp_avg" etc. in the tensors dict.
-    param_groups (pure Python) go into metadata.
-    """
+    """Flatten optimizer state into safetensors-compatible tensors + JSON metadata."""
     tensors: dict[str, torch.Tensor] = {}
     scalars: dict[str, float | int] = {}
 
@@ -90,7 +206,6 @@ def _flatten_optimizer_state(
             flat_key = f"state.{param_id}.{key}"
             if isinstance(val, torch.Tensor):
                 t = val.cpu().contiguous()
-                # safetensors requires at least 1 dim
                 if t.ndim == 0:
                     t = t.unsqueeze(0)
                 tensors[flat_key] = t
@@ -114,7 +229,6 @@ def _unflatten_optimizer_state(
     scalars = meta.get("scalars") or {}
 
     for flat_key, val in tensors.items():
-        # "state.{param_id}.{key}"
         parts = flat_key.split(".", 2)
         if len(parts) != 3 or parts[0] != "state":
             continue
@@ -123,12 +237,10 @@ def _unflatten_optimizer_state(
         if param_id not in state:
             state[param_id] = {}
         t = val.to(device)
-        # Undo the unsqueeze for scalar tensors (step counters)
         if t.shape == (1,) and key == "step":
             t = t.squeeze(0)
         state[param_id][key] = t
 
-    # Restore any non-tensor scalars
     for flat_key, val in scalars.items():
         parts = flat_key.split(".", 2)
         if len(parts) != 3:
@@ -173,43 +285,46 @@ def save_pretrain_checkpoint(
     model_config: dict,
     training_config: dict,
 ) -> None:
-    """Save a pretraining checkpoint as a directory of safetensors + JSON files."""
+    """Save a pretraining checkpoint atomically.
+
+    Writes to {path}.tmp/, then renames to {path}/ with .complete sentinel.
+    """
     path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
 
-    # 1. Model weights
-    state_dict = {k: v.cpu().contiguous() for k, v in model.state_dict().items()}
-    save_file(state_dict, path / "model.safetensors")
+    with _atomic_directory_write(path) as tmp:
+        # 1. Model weights
+        state_dict = {k: v.cpu().contiguous() for k, v in model.state_dict().items()}
+        save_file(state_dict, tmp / "model.safetensors")
 
-    # 2. Optimizer tensors
-    opt_tensors, opt_meta = _flatten_optimizer_state(optimizer.state_dict())
-    if opt_tensors:
-        save_file(opt_tensors, path / "optimizer.safetensors")
+        # 2. Optimizer tensors
+        opt_tensors, opt_meta = _flatten_optimizer_state(optimizer.state_dict())
+        if opt_tensors:
+            save_file(opt_tensors, tmp / "optimizer.safetensors")
 
-    # 3. Training state (JSON)
-    training_state = {
-        "format_version": CHECKPOINT_FORMAT_VERSION,
-        "global_step": global_step,
-        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
-        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
-        "optimizer_meta": opt_meta,
-        **_rng_to_json(
-            torch.get_rng_state(),
-            torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-        ),
-    }
-    with open(path / "training_state.json", "w") as f:
-        json.dump(training_state, f, indent=2, default=_json_default)
+        # 3. Training state (JSON)
+        training_state = {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "global_step": global_step,
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+            "optimizer_meta": opt_meta,
+            **_rng_to_json(
+                torch.get_rng_state(),
+                torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            ),
+        }
+        with open(tmp / "training_state.json", "w") as f:
+            json.dump(training_state, f, indent=2, default=_json_default)
 
-    # 4. Config
-    config = {
-        "format_version": CHECKPOINT_FORMAT_VERSION,
-        "checkpoint_type": "pretrain",
-        "model_config": model_config,
-        "training_config": training_config,
-    }
-    with open(path / "config.json", "w") as f:
-        json.dump(config, f, indent=2, default=_json_default)
+        # 4. Config
+        config = {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "checkpoint_type": "pretrain",
+            "model_config": model_config,
+            "training_config": training_config,
+        }
+        with open(tmp / "config.json", "w") as f:
+            json.dump(config, f, indent=2, default=_json_default)
 
 
 def load_pretrain_checkpoint(
@@ -220,9 +335,10 @@ def load_pretrain_checkpoint(
     scaler=None,
     device: str = "cpu",
 ) -> dict:
-    """Load a pretraining checkpoint. Returns metadata dict with global_step, configs, etc.
+    """Load a pretraining checkpoint with integrity verification.
 
     Handles both legacy .pt files and new directory format.
+    New format: verifies .complete sentinel and SHA-256 hashes.
     """
     path = Path(path)
 
@@ -245,7 +361,9 @@ def load_pretrain_checkpoint(
             "training_config": ckpt.get("training_config"),
         }
 
-    # New directory format
+    # New directory format — verify integrity first
+    _verify_complete_sentinel(path)
+
     weights = load_file(path / "model.safetensors", device=device)
     model.load_state_dict(weights)
 
@@ -295,58 +413,54 @@ def save_adapter_checkpoint(
     scaler=None,
     extra: dict | None = None,
 ) -> None:
-    """Save an adapter checkpoint as a directory of safetensors + JSON files."""
+    """Save an adapter checkpoint atomically."""
     path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
 
-    # 1. Adapter weights
-    tensors = {k: v.cpu().contiguous() for k, v in adapter_state_dict.items()}
-    save_file(tensors, path / "adapter.safetensors")
+    with _atomic_directory_write(path) as tmp:
+        # 1. Adapter weights
+        tensors = {k: v.cpu().contiguous() for k, v in adapter_state_dict.items()}
+        save_file(tensors, tmp / "adapter.safetensors")
 
-    # 2. Optimizer tensors (if provided)
-    opt_meta = None
-    if optimizer is not None:
-        opt_tensors, opt_meta = _flatten_optimizer_state(optimizer.state_dict())
-        if opt_tensors:
-            save_file(opt_tensors, path / "optimizer.safetensors")
+        # 2. Optimizer tensors (if provided)
+        opt_meta = None
+        if optimizer is not None:
+            opt_tensors, opt_meta = _flatten_optimizer_state(optimizer.state_dict())
+            if opt_tensors:
+                save_file(opt_tensors, tmp / "optimizer.safetensors")
 
-    # 3. Training state
-    training_state: dict = {
-        "format_version": CHECKPOINT_FORMAT_VERSION,
-        "epoch": epoch,
-        "step": step,
-        "val_metrics": val_metrics,
-    }
-    if opt_meta is not None:
-        training_state["optimizer_meta"] = opt_meta
-    if scheduler is not None:
-        training_state["scheduler_state_dict"] = scheduler.state_dict()
-    if scaler is not None:
-        training_state["scaler_state_dict"] = scaler.state_dict()
-    if extra:
-        training_state.update(extra)
+        # 3. Training state
+        training_state: dict = {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "epoch": epoch,
+            "step": step,
+            "val_metrics": val_metrics,
+        }
+        if opt_meta is not None:
+            training_state["optimizer_meta"] = opt_meta
+        if scheduler is not None:
+            training_state["scheduler_state_dict"] = scheduler.state_dict()
+        if scaler is not None:
+            training_state["scaler_state_dict"] = scaler.state_dict()
+        if extra:
+            training_state.update(extra)
 
-    with open(path / "training_state.json", "w") as f:
-        json.dump(training_state, f, indent=2, default=_json_default)
+        with open(tmp / "training_state.json", "w") as f:
+            json.dump(training_state, f, indent=2, default=_json_default)
 
-    # 4. Config
-    with open(path / "config.json", "w") as f:
-        json.dump(config, f, indent=2, default=_json_default)
+        # 4. Config
+        with open(tmp / "config.json", "w") as f:
+            json.dump(config, f, indent=2, default=_json_default)
 
 
 def load_adapter_checkpoint(
     path: str | Path,
     device: str = "cpu",
 ) -> dict:
-    """Load an adapter checkpoint. Returns dict with adapter weights, config, metrics, etc.
-
-    Handles both legacy .pt files and new directory format.
-    """
+    """Load an adapter checkpoint with integrity verification."""
     path = Path(path)
 
     if is_legacy_checkpoint(path):
         ckpt = _load_legacy_pt(path, device)
-        # Find the adapter state dict key (varies by adapter type)
         adapter_key = None
         for key in ("lora_state_dict", "bottleneck_state_dict", "film_state_dict",
                      "sparse_state_dict", "adapter_state_dict", "model_state_dict"):
@@ -369,7 +483,9 @@ def load_adapter_checkpoint(
             "patience_counter": ckpt.get("patience_counter"),
         }
 
-    # New directory format
+    # New directory format — verify integrity first
+    _verify_complete_sentinel(path)
+
     adapter_weights = load_file(path / "adapter.safetensors", device=device)
 
     with open(path / "config.json") as f:
@@ -414,12 +530,12 @@ def load_backbone_weights(
     path: str | Path,
     device: str = "cpu",
 ) -> tuple[dict[str, torch.Tensor], dict | None]:
-    """Load model weights and config for inference. No optimizer/scheduler.
+    """Load model weights and config for inference with integrity verification.
 
     Works with:
     - Legacy .pt files (extracts model_state_dict + model_config)
-    - New checkpoint directories (reads model.safetensors + config.json)
-    - Bare model.safetensors files
+    - New checkpoint directories (reads model.safetensors + config.json, verifies .complete)
+    - Bare model.safetensors files (no .complete check — used for HF downloads)
 
     Returns (state_dict, model_config_dict_or_None).
     """
@@ -434,6 +550,9 @@ def load_backbone_weights(
         sf_path = path / "model.safetensors"
         if not sf_path.exists():
             raise FileNotFoundError(f"No model.safetensors in {path}")
+        # Verify integrity if .complete exists (new format checkpoints)
+        if (path / ".complete").exists():
+            _verify_complete_sentinel(path)
         weights = load_file(sf_path, device=device)
         config = None
         config_path = path / "config.json"

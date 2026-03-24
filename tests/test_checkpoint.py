@@ -9,6 +9,8 @@ import torch.nn as nn
 
 from pawn.config import CLMConfig
 from pawn.model import PAWNCLM
+import pytest
+
 from pawn.checkpoint import (
     save_pretrain_checkpoint,
     load_pretrain_checkpoint,
@@ -16,10 +18,13 @@ from pawn.checkpoint import (
     load_adapter_checkpoint,
     load_backbone_weights,
     is_legacy_checkpoint,
+    IncompleteCheckpointError,
+    CheckpointIntegrityError,
     _flatten_optimizer_state,
     _unflatten_optimizer_state,
     _rng_to_json,
     _json_to_rng,
+    _verify_complete_sentinel,
 )
 
 
@@ -259,3 +264,96 @@ def test_config_json_contents():
         assert config["checkpoint_type"] == "pretrain"
         assert config["model_config"]["d_model"] == cfg.d_model
         assert config["training_config"]["lr"] == 1e-3
+
+
+def test_complete_sentinel_written():
+    """Verify .complete sentinel is created with SHA-256 hashes."""
+    model, cfg = _make_toy_model()
+    opt = _make_optimizer(model)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = Path(tmpdir) / "step_00000001"
+        save_pretrain_checkpoint(
+            ckpt_path, model, opt, FakeScheduler(), FakeScaler(),
+            global_step=1, model_config=cfg.__dict__, training_config={},
+        )
+
+        sentinel_path = ckpt_path / ".complete"
+        assert sentinel_path.exists()
+
+        with open(sentinel_path) as f:
+            sentinel = json.load(f)
+
+        assert "files" in sentinel
+        assert "model.safetensors" in sentinel["files"]
+        assert "config.json" in sentinel["files"]
+        assert "training_state.json" in sentinel["files"]
+        # Each hash should be a 64-char hex string
+        for name, h in sentinel["files"].items():
+            assert len(h) == 64, f"Bad hash length for {name}: {len(h)}"
+
+
+def test_no_tmp_directory_after_save():
+    """Verify .tmp directory is cleaned up after successful save."""
+    model, cfg = _make_toy_model()
+    opt = _make_optimizer(model)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = Path(tmpdir) / "step_00000001"
+        save_pretrain_checkpoint(
+            ckpt_path, model, opt, FakeScheduler(), FakeScaler(),
+            global_step=1, model_config=cfg.__dict__, training_config={},
+        )
+
+        tmp_path = Path(tmpdir) / "step_00000001.tmp"
+        assert not tmp_path.exists(), ".tmp directory should be removed after rename"
+
+
+def test_incomplete_checkpoint_raises():
+    """Loading a checkpoint without .complete raises IncompleteCheckpointError."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = Path(tmpdir) / "step_bad"
+        ckpt_path.mkdir()
+        # Write some files but no .complete
+        (ckpt_path / "model.safetensors").touch()
+        (ckpt_path / "config.json").write_text("{}")
+
+        with pytest.raises(IncompleteCheckpointError):
+            _verify_complete_sentinel(ckpt_path)
+
+
+def test_corrupted_file_raises():
+    """Loading a checkpoint with a tampered file raises CheckpointIntegrityError."""
+    model, cfg = _make_toy_model()
+    opt = _make_optimizer(model)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = Path(tmpdir) / "step_00000001"
+        save_pretrain_checkpoint(
+            ckpt_path, model, opt, FakeScheduler(), FakeScaler(),
+            global_step=1, model_config=cfg.__dict__, training_config={},
+        )
+
+        # Corrupt a file after save
+        config_path = ckpt_path / "config.json"
+        config_path.write_text("CORRUPTED DATA")
+
+        with pytest.raises(CheckpointIntegrityError):
+            _verify_complete_sentinel(ckpt_path)
+
+
+def test_adapter_checkpoint_has_sentinel():
+    """Adapter checkpoints also get .complete sentinel."""
+    adapter_weights = {"down.weight": torch.randn(8, 64)}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = Path(tmpdir) / "best"
+        save_adapter_checkpoint(
+            ckpt_path, adapter_weights,
+            config={"checkpoint_type": "bottleneck"},
+            epoch=1, step=100, val_metrics={"loss": 3.0},
+        )
+
+        assert (ckpt_path / ".complete").exists()
+        # Should not raise
+        _verify_complete_sentinel(ckpt_path)

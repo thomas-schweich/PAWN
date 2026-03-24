@@ -36,6 +36,9 @@ Thumbs.db
 # uv (track root lockfile only)
 engine/uv.lock
 
+# Local working files
+local/
+
 # Misc
 runpodctl.tar.gz
 .claude/

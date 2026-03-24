@@ -439,12 +439,13 @@ class CLMTrainer:
             prefetch_factor=1 if num_workers > 0 else None,
         )
 
+        _shutdown_requested = False
+        _shutdown_signal = None
+
         def _graceful_exit(signum, frame):
-            print(f"\nReceived signal {signum}, saving checkpoint and exiting...")
-            self.save_checkpoint()
-            if self._jsonl_file:
-                self._jsonl_file.close()
-            sys.exit(128 + signum)
+            nonlocal _shutdown_requested, _shutdown_signal
+            _shutdown_requested = True
+            _shutdown_signal = signum
 
         old_term = signal.signal(signal.SIGTERM, _graceful_exit)
         old_int = signal.signal(signal.SIGINT, _graceful_exit)
@@ -534,6 +535,12 @@ class CLMTrainer:
 
                 if self.global_step >= self.cfg.total_steps:
                     print(f"Training complete at step {self.global_step}")
+                    self.save_checkpoint()
+                    break
+
+                if _shutdown_requested:
+                    print(f"\nShutdown requested (signal {_shutdown_signal}), "
+                          f"saving checkpoint at step {self.global_step}...")
                     self.save_checkpoint()
                     break
 
