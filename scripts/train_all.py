@@ -15,9 +15,11 @@ import argparse
 import json
 import math
 import os
+import shutil
 import signal
 import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.multiprocessing as mp
@@ -26,7 +28,7 @@ from torch.utils.data import DataLoader
 from pawn.config import CLMConfig, TrainingConfig
 from pawn.model import PAWNCLM, clm_loss
 from pawn.data import CLMDataset, create_validation_set
-from pawn.gpu import configure_gpu, apply_gpu_config
+from pawn.gpu import configure_gpu
 from pawn.checkpoint import save_pretrain_checkpoint, push_checkpoint_to_hf
 
 
@@ -44,12 +46,14 @@ class ModelSlot:
         train_cfg: TrainingConfig,
         device: str,
         hf_repo: str | None,
+        shm_checkpoints: bool = False,
     ):
         self.name = name
         self.model_cfg = model_cfg
         self.train_cfg = train_cfg
         self.device = device
         self.hf_repo = hf_repo
+        self.shm_checkpoints = shm_checkpoints
 
         self.model = PAWNCLM(model_cfg).to(device)
         param_count = sum(p.numel() for p in self.model.parameters())
@@ -70,9 +74,14 @@ class ModelSlot:
 
         self.scaler = torch.amp.GradScaler(device, enabled=train_cfg.use_amp)
 
-        # Run directory
+        # Run directory (logs always on persistent disk)
         self.run_dir = _make_run_dir(train_cfg.log_dir, name)
-        self.checkpoint_dir = os.path.join(self.run_dir, "checkpoints")
+
+        # Checkpoint directory: /dev/shm if requested, else under run_dir
+        if shm_checkpoints:
+            self.checkpoint_dir = f"/dev/shm/pawn_checkpoints/{name}"
+        else:
+            self.checkpoint_dir = os.path.join(self.run_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
         self.jsonl_path = os.path.join(self.run_dir, "metrics.jsonl")
@@ -80,6 +89,13 @@ class ModelSlot:
 
         self.hf_branch = f"run/{os.path.basename(self.run_dir)}" if hf_repo else None
         self.global_step = 0
+        self.best_val_step = 0
+        self.best_val_loss = float("inf")
+
+        # Background HF push (one thread per slot, so pushes don't block training)
+        from concurrent.futures import ThreadPoolExecutor
+        self._hf_push_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"hf-{name}")
+        self._hf_push_future = None
 
         # Write config
         import subprocess
@@ -133,23 +149,55 @@ class ModelSlot:
         self.scheduler.step()
         return grad_norm
 
+    def _unwrapped_model(self):
+        """Return the unwrapped model (strips torch.compile wrapper)."""
+        m = self.model
+        while hasattr(m, '_orig_mod'):
+            m = m._orig_mod
+        return m
+
     def save_checkpoint(self):
         path = os.path.join(self.checkpoint_dir, f"step_{self.global_step:08d}")
         save_pretrain_checkpoint(
-            path, self.model, self.optimizer, self.scheduler, self.scaler,
+            path, self._unwrapped_model(), self.optimizer, self.scheduler, self.scaler,
             self.global_step, self.model_cfg.__dict__, self.train_cfg.__dict__,
         )
         print(f"  [{self.name}] Checkpoint saved: {path}")
 
         if self.hf_repo and self.hf_branch:
+            self._push_to_hf_async(path, self.global_step)
+
+    def _push_to_hf_async(self, ckpt_path: str, step: int):
+        """Push checkpoint to HuggingFace in a background thread."""
+        # Wait for any previous push to finish before starting a new one
+        if self._hf_push_future is not None:
+            self._hf_push_future.result()  # raises if previous push failed
+
+        def _push():
             try:
                 push_checkpoint_to_hf(
-                    path, self.hf_repo, self.hf_branch,
-                    metrics_path=self.jsonl_path, step=self.global_step,
+                    ckpt_path, self.hf_repo, self.hf_branch,
+                    metrics_path=self.jsonl_path, step=step,
                 )
                 print(f"  [{self.name}] Pushed to HF: {self.hf_repo}@{self.hf_branch}")
+
+                # On /dev/shm, clean up old checkpoints after successful push.
+                # Keep the latest (just saved) and the best (for post-training evals).
+                if self.shm_checkpoints:
+                    keep = {Path(ckpt_path).name, f"step_{self.best_val_step:08d}"}
+                    for old in sorted(Path(self.checkpoint_dir).glob("step_*")):
+                        if old.name not in keep:
+                            shutil.rmtree(old, ignore_errors=True)
             except Exception as e:
                 print(f"  [{self.name}] WARNING: HF push failed: {e}")
+
+        self._hf_push_future = self._hf_push_pool.submit(_push)
+
+    def wait_for_push(self):
+        """Block until any in-flight HF push completes."""
+        if self._hf_push_future is not None:
+            self._hf_push_future.result()
+            self._hf_push_future = None
 
     @torch.no_grad()
     def evaluate(self, val_data: dict[str, torch.Tensor]) -> dict[str, float]:
@@ -182,6 +230,8 @@ class ModelSlot:
         self._jsonl_file.flush()
 
     def close(self):
+        self.wait_for_push()
+        self._hf_push_pool.shutdown(wait=True)
         if self._jsonl_file:
             self._jsonl_file.close()
             self._jsonl_file = None
@@ -215,11 +265,119 @@ def parse_args():
     ckpt_group.add_argument("--hf-repo", type=str, default=None,
                             help="HF repo prefix (appends -{variant}). E.g. thomas-schweich/pawn")
     ckpt_group.add_argument("--local-checkpoints", action="store_true")
+
+    p.add_argument("--shm-checkpoints", action="store_true",
+                    help="Write checkpoints to /dev/shm (RAM-backed, instant writes). "
+                         "Requires --hf-repo since /dev/shm is volatile.")
+
+    p.add_argument("--run-evals", action="store_true",
+                    help="Run probes, diagnostics, and Lichess eval after training completes")
+    p.add_argument("--lichess-pgn", type=str, default=None,
+                    help="Path to Lichess PGN file for eval (required with --run-evals)")
+    p.add_argument("--publish-results", action="store_true",
+                    help="Push eval results to HuggingFace (requires --hf-repo and --run-evals)")
     return p.parse_args()
+
+
+def _run_post_training_evals(slots: list[ModelSlot], args):
+    """Run probes, diagnostics, and Lichess eval on best checkpoint per variant."""
+    import tempfile
+    from pawn.eval_suite.probes import extract_probe_data, train_all_probes
+    from pawn.eval_suite.corpus import generate_corpus, load_corpus
+    from pawn.eval_suite.diagnostics import extract_diagnostic_positions, evaluate_diagnostic_positions
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    for slot in slots:
+        print(f"\n--- Evaluating {slot.name} ---")
+
+        # Use tracked best val step (kept on /dev/shm if shm_checkpoints)
+        best_step = slot.best_val_step
+        best_loss = slot.best_val_loss
+
+        ckpt_path = os.path.join(slot.checkpoint_dir, f"step_{best_step:08d}")
+        if not os.path.isdir(ckpt_path):
+            # Fall back to latest
+            ckpts = sorted(Path(slot.checkpoint_dir).glob("step_*"))
+            ckpt_path = str(ckpts[-1]) if ckpts else None
+
+        if not ckpt_path:
+            print(f"  No checkpoint found, skipping")
+            continue
+
+        print(f"  Best checkpoint: {ckpt_path} (val_loss={best_loss:.4f})")
+
+        # Load model (unwrapped)
+        from pawn.checkpoint import load_backbone_weights
+        state_dict, _ = load_backbone_weights(ckpt_path)
+        model = PAWNCLM(slot.model_cfg).to(device)
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        results = {}
+
+        # 1. Probes
+        print("  Running probes...")
+        train_data = extract_probe_data(2048, 256, seed=12345)
+        val_data = extract_probe_data(512, 256, seed=54321)
+        probe_results = train_all_probes(
+            model, train_data, val_data, device=device,
+            per_layer=True, n_epochs=20, verbose=True,
+        )
+        results["probes"] = probe_results
+        del train_data, val_data
+
+        # 2. Diagnostics
+        print("  Running diagnostics...")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            corpus_path = generate_corpus(tmpdir, n_games=2048, max_ply=255, seed=99999, batch_size=2048)
+            corpus = load_corpus(corpus_path)
+            positions = extract_diagnostic_positions(corpus, min_per_category=200, max_per_category=1000)
+            diag_results = evaluate_diagnostic_positions(model, positions, corpus, device=device)
+            results["diagnostics"] = diag_results
+
+        # 3. Lichess eval (if PGN provided)
+        if args.lichess_pgn:
+            print("  Running Lichess eval...")
+            from pawn.eval_suite.lichess import prepare_lichess_corpus, evaluate_on_lichess
+            lichess_data = prepare_lichess_corpus(args.lichess_pgn, max_games_per_band=1000)
+            lichess_results = evaluate_on_lichess(model, lichess_data, device=device)
+            results["lichess"] = lichess_results
+
+        # Save results
+        results_path = os.path.join(slot.run_dir, "eval_results.json")
+        with open(results_path, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"  Results saved: {results_path}")
+
+        # Publish to HF
+        if args.publish_results and slot.hf_repo and slot.hf_branch:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            try:
+                api.upload_file(
+                    path_or_fileobj=results_path,
+                    path_in_repo="eval_results.json",
+                    repo_id=slot.hf_repo,
+                    repo_type="model",
+                    revision=slot.hf_branch,
+                    commit_message=f"Eval results (best step {best_step})",
+                )
+                print(f"  Published to {slot.hf_repo}@{slot.hf_branch}")
+            except Exception as e:
+                print(f"  WARNING: HF publish failed: {e}")
+
+        del model, state_dict
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def main():
     args = parse_args()
+
+    if args.shm_checkpoints and not args.hf_repo:
+        print("ERROR: --shm-checkpoints requires --hf-repo (HF is the only durable store)")
+        sys.exit(1)
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     if device == "cuda":
@@ -239,6 +397,8 @@ def main():
     print(f"Device: {device}")
     print(f"Batch size: {args.batch_size}")
     print(f"Total steps: {args.total_steps}")
+    if args.shm_checkpoints:
+        print("Checkpoints: /dev/shm (volatile, HF push is durable store)")
     print()
 
     slots: list[ModelSlot] = []
@@ -256,7 +416,8 @@ def main():
         train_cfg.use_wandb = args.wandb
 
         hf_repo = f"{args.hf_repo}-{name}" if args.hf_repo else None
-        slots.append(ModelSlot(name, model_cfg, train_cfg, device, hf_repo))
+        slots.append(ModelSlot(name, model_cfg, train_cfg, device, hf_repo,
+                               shm_checkpoints=args.shm_checkpoints))
 
     # Shared dataset and validation set
     max_ply = 256
@@ -362,6 +523,11 @@ def main():
                     "timestamp": time.time(),
                     **val_metrics,
                 })
+                # Track best for eval and /dev/shm cleanup
+                vl = val_metrics["val/loss"]
+                if vl < slot.best_val_loss:
+                    slot.best_val_loss = vl
+                    slot.best_val_step = global_step
 
         # Checkpoint
         if global_step % args.checkpoint_interval == 0:
@@ -388,6 +554,13 @@ def main():
     # Cleanup
     for slot in slots:
         slot.close()
+
+    # Post-training evals
+    if args.run_evals:
+        print("\n" + "=" * 60)
+        print("POST-TRAINING EVALUATION")
+        print("=" * 60)
+        _run_post_training_evals(slots, args)
 
     print("\nAll done.")
 

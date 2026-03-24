@@ -61,7 +61,11 @@ def main():
         run_dir = config_path.parent
         if args.run and run_dir.name != args.run:
             continue
-        checkpoints = sorted(run_dir.glob("checkpoints/step_*.pt"))
+        # Find checkpoints: directory-based (safetensors) or legacy .pt
+        checkpoints = sorted(
+            [d for d in run_dir.glob("checkpoints/step_*") if d.is_dir()]
+            or list(run_dir.glob("checkpoints/step_*.pt"))
+        )
         if not checkpoints:
             continue
         latest = checkpoints[-1]

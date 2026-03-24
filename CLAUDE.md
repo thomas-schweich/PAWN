@@ -86,7 +86,7 @@ All adapters freeze the backbone and initialize to identity (zero-init or gamma=
 ## Scripts (`scripts/`)
 
 - `train.py` -- Pretrain from scratch (`--variant small|base|large|toy`)
-- `train_all.py` -- Train small/base/large simultaneously on shared data batches
+- `train_all.py` -- Train small/base/large simultaneously on shared data batches. Supports `--run-evals` for automatic post-training probes, diagnostics, and Lichess eval, and `--publish-results` to push eval results to HF.
 - `train_bottleneck.py`, `train_film.py`, `train_lora.py`, `train_sparse.py`, `train_hybrid.py` -- Adapter behavioral cloning on Lichess PGN
 - `train_tiny.py` -- Standalone tiny transformer baseline (no frozen backbone)
 - `eval_accuracy.py` -- MAIA-compatible evaluation (per-phase, per-ply accuracy)
@@ -151,7 +151,9 @@ All training scripts require one of:
 - `--hf-repo REPO_ID` — push checkpoints to a HuggingFace branch as they're written (durable)
 - `--local-checkpoints` — save locally only (for development without an HF account)
 
-HF mode creates a `run/{run_id}` branch. Squash-merge into main when satisfied.
+HF mode creates a `run/{run_id}` branch. HF pushes happen in background threads (one per model slot) so training is not blocked by uploads. Squash-merge into main when satisfied.
+
+Optional: `--shm-checkpoints` writes checkpoints to `/dev/shm` (RAM-backed filesystem, instant writes). Requires `--hf-repo` since `/dev/shm` is volatile. Old checkpoints are cleaned up after successful HF push, keeping only the latest and the best (by val loss) for post-training evals.
 
 ### Data Integrity
 
