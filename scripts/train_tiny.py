@@ -428,18 +428,22 @@ def main():
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 patience_counter = 0
-                torch.save({
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "scaler_state_dict": scaler.state_dict() if scaler else None,
-                    "epoch": epoch, "step": global_step,
-                    "val_loss": val_metrics["loss"],
-                    "val_top1": val_metrics["top1_accuracy"],
-                    "best_val_loss": best_val_loss,
-                    "patience_counter": patience_counter,
-                    "config": vars(args),
-                }, ckpt_dir / "best.pt")
+                from pawn.checkpoint import save_pretrain_checkpoint
+                save_pretrain_checkpoint(
+                    ckpt_dir / "best",
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    global_step=global_step,
+                    model_config={
+                        "d_model": args.d_model,
+                        "n_layers": args.n_layers,
+                        "n_heads": args.n_heads,
+                        "d_ff": args.d_ff,
+                    },
+                    training_config=vars(args),
+                )
             else:
                 patience_counter += 1
                 if patience_counter >= args.patience:

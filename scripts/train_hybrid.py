@@ -95,11 +95,12 @@ def parse_args():
 
 
 def load_backbone(checkpoint_path: str, device: str) -> PAWNCLM:
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg = CLMConfig(**ckpt["model_config"]) if "model_config" in ckpt else CLMConfig()
+    from pawn.checkpoint import load_backbone_weights
+    state_dict, model_config = load_backbone_weights(checkpoint_path, device)
+    cfg = CLMConfig(**model_config) if model_config else CLMConfig()
     model = PAWNCLM(cfg).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    del ckpt
+    model.load_state_dict(state_dict)
+    del state_dict
     gc.collect()
     model.eval()
     return model
@@ -394,28 +395,30 @@ def main():
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 patience_counter = 0
-                torch.save({
-                    "adapter_state_dict": model.adapter_state_dict(),
-                    "epoch": epoch,
-                    "step": global_step,
-                    "val_loss": val_metrics["loss"],
-                    "val_top1": val_metrics["top1_accuracy"],
-                    "config": vars(args),
-                }, ckpt_dir / "best.pt")
+                from pawn.checkpoint import save_adapter_checkpoint
+                save_adapter_checkpoint(
+                    ckpt_dir / "best",
+                    model.adapter_state_dict(),
+                    config=vars(args),
+                    epoch=epoch,
+                    step=global_step,
+                    val_metrics=val_metrics,
+                )
             else:
                 patience_counter += 1
                 if patience_counter >= args.patience:
                     print(f"\n  Early stopping at epoch {epoch} (patience={args.patience})")
                     break
 
-    torch.save({
-        "adapter_state_dict": model.adapter_state_dict(),
-        "epoch": epoch,
-        "step": global_step,
-        "val_loss": val_metrics["loss"],
-        "val_top1": val_metrics["top1_accuracy"],
-        "config": vars(args),
-    }, ckpt_dir / "final.pt")
+    from pawn.checkpoint import save_adapter_checkpoint
+    save_adapter_checkpoint(
+        ckpt_dir / "final",
+        model.adapter_state_dict(),
+        config=vars(args),
+        epoch=epoch,
+        step=global_step,
+        val_metrics=val_metrics,
+    )
 
     print(f"\nDone. Best val_loss={best_val_loss:.4f}")
     print(f"Checkpoints saved to {out_dir}")

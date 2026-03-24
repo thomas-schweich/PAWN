@@ -547,49 +547,35 @@ class CLMTrainer:
             self._jsonl_file = None
 
     def save_checkpoint(self, path: str | None = None):
+        from pawn.checkpoint import save_pretrain_checkpoint
+
         if path is None:
             path = os.path.join(
-                self.cfg.checkpoint_dir, f"step_{self.global_step:08d}.pt"
+                self.cfg.checkpoint_dir, f"step_{self.global_step:08d}"
             )
-
-        dirname = os.path.dirname(path)
-        if dirname:
-            os.makedirs(dirname, exist_ok=True)
 
         model: PAWNCLM = self._eager_model()
 
-        torch.save(
-            {
-                "global_step": self.global_step,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": self.scheduler.state_dict(),
-                "scaler_state_dict": self.scaler.state_dict(),
-                "model_config": self.model_cfg.__dict__,
-                "training_config": self.cfg.__dict__,
-                "torch_rng_state": torch.get_rng_state(),
-                "cuda_rng_state": (
-                    torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-                ),
-            },
+        save_pretrain_checkpoint(
             path,
+            model,
+            self.optimizer,
+            self.scheduler,
+            self.scaler,
+            self.global_step,
+            self.model_cfg.__dict__,
+            self.cfg.__dict__,
         )
         print(f"Checkpoint saved: {path}")
 
     def load_checkpoint(self, path: str):
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.global_step = ckpt["global_step"]
+        from pawn.checkpoint import load_pretrain_checkpoint
 
         model: PAWNCLM = self._eager_model()
 
-        model.load_state_dict(ckpt["model_state_dict"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        self.scaler.load_state_dict(ckpt["scaler_state_dict"])
-
-        if ckpt.get("torch_rng_state") is not None:
-            torch.set_rng_state(ckpt["torch_rng_state"].cpu().byte())
-        if ckpt.get("cuda_rng_state") is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state(ckpt["cuda_rng_state"].cpu().byte())
-
+        meta = load_pretrain_checkpoint(
+            path, model, self.optimizer, self.scheduler, self.scaler,
+            device=self.device,
+        )
+        self.global_step = meta["global_step"]
         print(f"Resumed from step {self.global_step}")
