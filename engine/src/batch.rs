@@ -49,23 +49,18 @@ pub fn generate_training_batch(batch_size: usize, max_ply: usize, seed: u64) -> 
         game_lengths.push(record.game_length as i16);
         termination_codes.push(record.termination.as_u8());
 
-        // Copy move_ids with padding
+        // Copy move_ids (remaining positions are already 0 = PAD)
         for t in 0..length {
             move_ids[b * max_ply + t] = record.move_ids[t] as i16;
         }
-        // Place EOG token at position game_length
-        if length < max_ply {
-            move_ids[b * max_ply + length] = vocab::EOG_TOKEN as i16;
-        }
 
-        // Copy legal move grids
+        // Copy legal move grids (positions beyond game_length are already 0)
         for t in 0..length {
             let grid_offset = (b * max_ply + t) * 64;
             debug_assert_eq!(record.legal_grids[t].len(), 64);
             legal_move_grid[grid_offset..grid_offset + 64]
                 .copy_from_slice(&record.legal_grids[t]);
         }
-        // EOG position: all zeros (already initialized)
 
         // Copy promotion masks (contiguous layout: [[bool; 4]; 44] = [bool; 176])
         for t in 0..length {
@@ -108,9 +103,6 @@ pub fn generate_random_games(n_games: usize, max_ply: usize, seed: u64) -> GameB
         for t in 0..(*length as usize) {
             move_ids[b * max_ply + t] = moves[t] as i16;
         }
-        if (*length as usize) < max_ply {
-            move_ids[b * max_ply + *length as usize] = vocab::EOG_TOKEN as i16;
-        }
     }
 
     GameBatch {
@@ -151,9 +143,6 @@ pub fn generate_checkmate_training_batch(
         game_lengths.push(ex.game_length as i16);
         for t in 0..(ex.game_length as usize).min(max_ply) {
             move_ids[b * max_ply + t] = ex.move_ids[t] as i16;
-        }
-        if (ex.game_length as usize) < max_ply {
-            move_ids[b * max_ply + ex.game_length as usize] = vocab::EOG_TOKEN as i16;
         }
         checkmate_targets[b * 64..(b + 1) * 64].copy_from_slice(&ex.checkmate_grid);
         legal_grids[b * 64..(b + 1) * 64].copy_from_slice(&ex.legal_grid);
@@ -205,9 +194,6 @@ pub fn generate_completed_games(n_games: usize, max_ply: usize, seed: u64) -> Ga
         termination_codes.push(term.as_u8());
         for t in 0..(*length as usize) {
             move_ids[b * max_ply + t] = moves[t] as i16;
-        }
-        if (*length as usize) < max_ply {
-            move_ids[b * max_ply + *length as usize] = vocab::EOG_TOKEN as i16;
         }
     }
 
@@ -281,9 +267,6 @@ pub fn generate_checkmate_games(
         for t in 0..(*length as usize) {
             move_ids[b * max_ply + t] = moves[t] as i16;
         }
-        if (*length as usize) < max_ply {
-            move_ids[b * max_ply + *length as usize] = vocab::EOG_TOKEN as i16;
-        }
     }
 
     (GameBatch {
@@ -293,6 +276,97 @@ pub fn generate_checkmate_games(
         n_games,
         max_ply,
     }, total_generated)
+}
+
+/// Output of CLM (Causal Language Model) batch generation.
+///
+/// Contains ready-to-train tensors in the format:
+///   input_ids = [outcome, ply_1, ply_2, ..., ply_N, PAD, ..., PAD]
+///   targets   = [ply_1,   ply_2, ply_3, ..., PAD,   PAD, ..., PAD]
+///   loss_mask = [true,    true,  true,  ..., true,   false, ..., false]
+///
+/// Also includes raw move_ids and game_lengths for replay operations
+/// (legal mask computation, board state extraction, validation).
+pub struct CLMBatch {
+    pub input_ids: Vec<i16>,        // [batch_size * seq_len]
+    pub targets: Vec<i16>,          // [batch_size * seq_len]
+    pub loss_mask: Vec<bool>,       // [batch_size * seq_len]
+    pub move_ids: Vec<i16>,         // [batch_size * max_ply] raw for replay
+    pub game_lengths: Vec<i16>,     // [batch_size]
+    pub termination_codes: Vec<u8>, // [batch_size]
+    pub batch_size: usize,
+    pub seq_len: usize,
+    pub max_ply: usize,
+}
+
+/// Generate a CLM training batch: random games packed into model-ready format.
+///
+/// `seq_len` is the total sequence length (256). Games are generated with up to
+/// `seq_len - 1` plies, leaving position 0 for the outcome token.
+pub fn generate_clm_batch(
+    batch_size: usize,
+    seq_len: usize,
+    seed: u64,
+    discard_ply_limit: bool,
+) -> CLMBatch {
+    let max_ply = seq_len - 1;
+
+    let game_batch = if discard_ply_limit {
+        generate_completed_games(batch_size, max_ply, seed)
+    } else {
+        generate_random_games(batch_size, max_ply, seed)
+    };
+
+    let mut input_ids = vec![0i16; batch_size * seq_len];
+    let mut targets = vec![0i16; batch_size * seq_len];
+    let mut loss_mask = vec![false; batch_size * seq_len];
+
+    for b in 0..batch_size {
+        let gl = game_batch.game_lengths[b] as usize;
+        let term = match game_batch.termination_codes[b] {
+            0 => Termination::Checkmate,
+            1 => Termination::Stalemate,
+            2 => Termination::SeventyFiveMoveRule,
+            3 => Termination::FivefoldRepetition,
+            4 => Termination::InsufficientMaterial,
+            _ => Termination::PlyLimit,
+        };
+        let outcome = vocab::termination_to_outcome(term, game_batch.game_lengths[b] as u16);
+
+        let row = b * seq_len;
+
+        // Position 0: outcome token
+        input_ids[row] = outcome as i16;
+
+        // Positions 1..=gl: move tokens
+        for t in 0..gl {
+            input_ids[row + 1 + t] = game_batch.move_ids[b * max_ply + t];
+        }
+        // Remaining positions are already 0 (PAD)
+
+        // Targets: input_ids shifted left by 1
+        for t in 0..(seq_len - 1) {
+            targets[row + t] = input_ids[row + t + 1];
+        }
+        // targets[row + seq_len - 1] is already 0
+
+        // Loss mask: positions 0..=gl are true
+        for t in 0..=gl {
+            loss_mask[row + t] = true;
+        }
+    }
+
+    CLMBatch {
+        input_ids,
+        targets,
+        loss_mask,
+        move_ids: game_batch.move_ids,
+        game_lengths: game_batch.game_lengths,
+        termination_codes: game_batch.termination_codes,
+        batch_size,
+        seq_len,
+        max_ply,
+    }
 }
 
 #[cfg(test)]
@@ -321,15 +395,23 @@ mod tests {
     }
 
     #[test]
-    fn test_eog_token_placement() {
+    fn test_pad_after_game_end() {
         let batch = generate_training_batch(2, 256, 42);
         for b in 0..2 {
             let len = batch.game_lengths[b] as usize;
             if len < 256 {
                 assert_eq!(
                     batch.move_ids[b * 256 + len],
-                    vocab::EOG_TOKEN as i16,
-                    "EOG token should be at position game_length"
+                    vocab::PAD_TOKEN as i16,
+                    "Position game_length should be PAD (0)"
+                );
+            }
+            // All positions after game_length should also be PAD
+            for t in len..256 {
+                assert_eq!(
+                    batch.move_ids[b * 256 + t],
+                    0,
+                    "Position {} (after game_length={}) should be PAD", t, len
                 );
             }
         }
@@ -342,5 +424,91 @@ mod tests {
         assert_eq!(b1.move_ids, b2.move_ids);
         assert_eq!(b1.game_lengths, b2.game_lengths);
         assert_eq!(b1.legal_move_grid, b2.legal_move_grid);
+    }
+
+    #[test]
+    fn test_clm_batch_format() {
+        let seq_len = 256;
+        let batch = generate_clm_batch(8, seq_len, 42, false);
+        assert_eq!(batch.input_ids.len(), 8 * seq_len);
+        assert_eq!(batch.targets.len(), 8 * seq_len);
+        assert_eq!(batch.loss_mask.len(), 8 * seq_len);
+        assert_eq!(batch.move_ids.len(), 8 * (seq_len - 1));
+        assert_eq!(batch.game_lengths.len(), 8);
+
+        for b in 0..8 {
+            let gl = batch.game_lengths[b] as usize;
+            let row = b * seq_len;
+
+            // Position 0: outcome token (4273-4277)
+            let outcome = batch.input_ids[row];
+            assert!(outcome >= vocab::OUTCOME_BASE as i16 && outcome <= vocab::PLY_LIMIT as i16,
+                "Position 0 should be outcome token, got {}", outcome);
+
+            // Positions 1..=gl: move tokens (1-4272)
+            for t in 1..=gl {
+                let tok = batch.input_ids[row + t];
+                assert!(tok >= 1 && tok <= 4272,
+                    "Position {} should be move token, got {}", t, tok);
+            }
+
+            // Positions gl+1..seq_len: PAD (0)
+            for t in (gl + 1)..seq_len {
+                assert_eq!(batch.input_ids[row + t], 0,
+                    "Position {} should be PAD, got {}", t, batch.input_ids[row + t]);
+            }
+
+            // Targets: shifted left by 1
+            for t in 0..(seq_len - 1) {
+                assert_eq!(batch.targets[row + t], batch.input_ids[row + t + 1],
+                    "targets[{}] should equal input_ids[{}]", t, t + 1);
+            }
+            assert_eq!(batch.targets[row + seq_len - 1], 0, "Last target should be PAD");
+
+            // Target at position gl is PAD (end of game)
+            assert_eq!(batch.targets[row + gl], 0, "Target at game_length should be PAD");
+
+            // Loss mask: true for 0..=gl, false after
+            for t in 0..=gl {
+                assert!(batch.loss_mask[row + t],
+                    "loss_mask[{}] should be true (gl={})", t, gl);
+            }
+            for t in (gl + 1)..seq_len {
+                assert!(!batch.loss_mask[row + t],
+                    "loss_mask[{}] should be false (gl={})", t, gl);
+            }
+        }
+    }
+
+    #[test]
+    fn test_clm_batch_deterministic() {
+        let b1 = generate_clm_batch(4, 256, 99, false);
+        let b2 = generate_clm_batch(4, 256, 99, false);
+        assert_eq!(b1.input_ids, b2.input_ids);
+        assert_eq!(b1.targets, b2.targets);
+        assert_eq!(b1.loss_mask, b2.loss_mask);
+        assert_eq!(b1.game_lengths, b2.game_lengths);
+    }
+
+    #[test]
+    fn test_clm_batch_outcome_correctness() {
+        let batch = generate_clm_batch(32, 256, 42, false);
+        for b in 0..32 {
+            let gl = batch.game_lengths[b] as usize;
+            let tc = batch.termination_codes[b];
+            let expected = vocab::termination_to_outcome(
+                match tc {
+                    0 => Termination::Checkmate,
+                    1 => Termination::Stalemate,
+                    2 => Termination::SeventyFiveMoveRule,
+                    3 => Termination::FivefoldRepetition,
+                    4 => Termination::InsufficientMaterial,
+                    _ => Termination::PlyLimit,
+                },
+                gl as u16,
+            );
+            assert_eq!(batch.input_ids[b * 256] as u16, expected,
+                "Game {} outcome mismatch: tc={}, gl={}", b, tc, gl);
+        }
     }
 }

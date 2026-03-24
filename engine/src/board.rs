@@ -74,7 +74,7 @@ pub fn move_to_token(m: &Move) -> u16 {
 /// Convert our token index to a shakmaty Move, given the current position.
 /// Finds the legal move matching the token's (src, dst, promo) decomposition.
 pub fn token_to_move(pos: &Chess, token: u16) -> Option<Move> {
-    // Validate the token is decomposable (not PAD/EOG)
+    // Validate the token is decomposable (not PAD/outcome)
     vocab::decompose_token(token)?;
     let legal = pos.legal_moves();
 

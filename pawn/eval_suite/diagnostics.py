@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import chess_engine as engine
 
 from pawn.config import PAD_TOKEN
-from pawn.data import _to_clm_batch, _map_termination_to_outcome
+from pawn.data import pack_clm_sequences, _map_termination_to_outcome
 
 
 # ---------------------------------------------------------------------------

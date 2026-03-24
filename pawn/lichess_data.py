@@ -219,32 +219,15 @@ def prepare_lichess_dataset(
 
     seq_len = max_ply + 1  # outcome token + max_ply move slots
 
-    # Build CLM sequences: [outcome, move_0, ..., move_{N-1}, PAD, ...]
-    input_ids = torch.zeros(N, seq_len, dtype=torch.long)
-    input_ids[:, 0] = outcome_tokens
-
-    gl_t = torch.from_numpy(game_lengths).long()
-    mid_t = torch.from_numpy(move_ids).long()
-
-    ply_range = torch.arange(max_ply).unsqueeze(0)
-    move_mask = ply_range < gl_t.unsqueeze(1)
-    input_ids[:, 1:] = mid_t * move_mask
-
-    # Targets: shifted left by 1
-    targets = torch.zeros(N, seq_len, dtype=torch.long)
-    targets[:, :-1] = input_ids[:, 1:]
-
-    # Loss mask: positions 0..game_length-1 (each has a valid move target)
-    # Position gl would target PAD, which we don't want to train on.
-    seq_positions = torch.arange(seq_len).unsqueeze(0)
-    loss_mask = seq_positions < gl_t.unsqueeze(1)
+    from pawn.data import pack_clm_sequences
+    batch = pack_clm_sequences(move_ids, game_lengths, outcome_tokens, seq_len)
 
     return {
         "move_ids": move_ids,
         "game_lengths": game_lengths,
-        "input_ids": input_ids,
-        "targets": targets,
-        "loss_mask": loss_mask,
+        "input_ids": batch["input_ids"],
+        "targets": batch["targets"],
+        "loss_mask": batch["loss_mask"],
         "outcome_tokens": outcome_tokens,
         "n_games": N,
     }

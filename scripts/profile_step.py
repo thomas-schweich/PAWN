@@ -18,17 +18,18 @@ import torch
 # ── PAWN imports ─────────────────────────────────────────────────────────────
 from pawn.config import CLMConfig
 from pawn.model import PAWNCLM
-from pawn.data import _to_clm_batch
 import chess_engine as engine
 
 
 def generate_clm_batch(batch_size: int, device: str):
     """Generate a CLM batch and move to device."""
-    move_ids, game_lengths, term_codes = engine.generate_random_games(
-        batch_size, 255, seed=42
-    )
-    batch = _to_clm_batch(move_ids, game_lengths, term_codes, 256)
-    return {k: v.to(device) for k, v in batch.items()}
+    input_ids, targets, loss_mask, _mid, _gl, _tc = \
+        engine.generate_clm_batch(batch_size, 256, seed=42)
+    return {
+        "input_ids": torch.from_numpy(input_ids).long().to(device),
+        "targets": torch.from_numpy(targets).long().to(device),
+        "loss_mask": torch.from_numpy(loss_mask).to(device),
+    }
 
 
 

@@ -1,10 +1,10 @@
 //! Move vocabulary: the single source of truth for token ↔ UCI string mapping.
 //!
-//! Token layout (4,274 total):
+//! Token layout (4,278 total):
 //!   0        = padding
 //!   1..=4096 = base grid (64×64 src×dst pairs)
 //!   4097..=4272 = promotions (44 eligible pairs × 4 piece types)
-//!   4273     = end-of-game
+//!   4273..=4277 = outcome tokens (game result)
 //!
 //! Square indexing: file-major within rank.
 //!   a1=0, b1=1, ..., h1=7, a2=8, ..., h8=63
@@ -12,15 +12,24 @@
 
 use std::collections::HashMap;
 
-pub const VOCAB_SIZE: usize = 4274;
+use crate::types::Termination;
+
+pub const VOCAB_SIZE: usize = 4278;
 pub const PAD_TOKEN: u16 = 0;
-pub const EOG_TOKEN: u16 = 4273;
 pub const BASE_GRID_START: u16 = 1;
 pub const BASE_GRID_END: u16 = 4096; // inclusive
 pub const PROMO_START: u16 = 4097;
 pub const PROMO_END: u16 = 4272; // inclusive
 pub const NUM_PROMO_PAIRS: usize = 44;
 pub const NUM_PROMO_TYPES: usize = 4;
+
+// Outcome tokens — must match pawn/config.py
+pub const OUTCOME_BASE: u16 = 4273;
+pub const WHITE_CHECKMATES: u16 = 4273;
+pub const BLACK_CHECKMATES: u16 = 4274;
+pub const STALEMATE: u16 = 4275;
+pub const DRAW_BY_RULE: u16 = 4276;
+pub const PLY_LIMIT: u16 = 4277;
 
 /// Square names in our index order.
 pub const SQUARE_NAMES: [&str; 64] = [
@@ -131,11 +140,29 @@ pub fn promo_token(src: u8, dst: u8, promo_type: u8) -> Option<u16> {
     Some(PROMO_START + (pair_idx as u16) * 4 + (promo_type as u16))
 }
 
+/// Map a game termination reason to the corresponding outcome token.
+///
+/// For checkmate, the winner is determined by game length parity:
+/// - Odd game_length (white made the last move) → WHITE_CHECKMATES
+/// - Even game_length (black made the last move) → BLACK_CHECKMATES
+pub fn termination_to_outcome(term: Termination, game_length: u16) -> u16 {
+    match term {
+        Termination::Checkmate => {
+            if game_length % 2 == 1 { WHITE_CHECKMATES } else { BLACK_CHECKMATES }
+        }
+        Termination::Stalemate => STALEMATE,
+        Termination::SeventyFiveMoveRule
+        | Termination::FivefoldRepetition
+        | Termination::InsufficientMaterial => DRAW_BY_RULE,
+        Termination::PlyLimit => PLY_LIMIT,
+    }
+}
+
 /// Decompose a token into (src_square, dst_square, promo_type).
 /// promo_type: 0=none, 1=q, 2=r, 3=b, 4=n (matches embedding index).
-/// Returns None for PAD and EOG tokens.
+/// Returns None for PAD and outcome tokens.
 pub fn decompose_token(token: u16) -> Option<(u8, u8, u8)> {
-    if token == PAD_TOKEN || token == EOG_TOKEN {
+    if token == PAD_TOKEN || token >= OUTCOME_BASE {
         return None;
     }
     if token >= BASE_GRID_START && token <= BASE_GRID_END {
@@ -285,8 +312,32 @@ mod tests {
     }
 
     #[test]
-    fn test_pad_eog_decompose() {
+    fn test_pad_outcome_decompose() {
         assert!(decompose_token(PAD_TOKEN).is_none());
-        assert!(decompose_token(EOG_TOKEN).is_none());
+        // All 5 outcome tokens should return None
+        for token in OUTCOME_BASE..=PLY_LIMIT {
+            assert!(decompose_token(token).is_none(),
+                "outcome token {} should not decompose", token);
+        }
+    }
+
+    #[test]
+    fn test_termination_to_outcome() {
+        use crate::types::Termination;
+
+        // Checkmate with odd game_length = white wins
+        assert_eq!(termination_to_outcome(Termination::Checkmate, 11), WHITE_CHECKMATES);
+        assert_eq!(termination_to_outcome(Termination::Checkmate, 1), WHITE_CHECKMATES);
+
+        // Checkmate with even game_length = black wins
+        assert_eq!(termination_to_outcome(Termination::Checkmate, 12), BLACK_CHECKMATES);
+        assert_eq!(termination_to_outcome(Termination::Checkmate, 2), BLACK_CHECKMATES);
+
+        // Other terminations
+        assert_eq!(termination_to_outcome(Termination::Stalemate, 50), STALEMATE);
+        assert_eq!(termination_to_outcome(Termination::SeventyFiveMoveRule, 100), DRAW_BY_RULE);
+        assert_eq!(termination_to_outcome(Termination::FivefoldRepetition, 80), DRAW_BY_RULE);
+        assert_eq!(termination_to_outcome(Termination::InsufficientMaterial, 60), DRAW_BY_RULE);
+        assert_eq!(termination_to_outcome(Termination::PlyLimit, 255), PLY_LIMIT);
     }
 }

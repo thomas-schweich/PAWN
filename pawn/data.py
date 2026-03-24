@@ -23,7 +23,6 @@ from pawn.config import (
 _positions_cache: dict[tuple[str, int], torch.Tensor] = {}
 
 
-
 def _map_termination_to_outcome(
     term_codes: np.ndarray, game_lengths: np.ndarray
 ) -> torch.Tensor:
@@ -51,46 +50,45 @@ def _map_termination_to_outcome(
     return outcomes
 
 
-def _to_clm_batch(
+def pack_clm_sequences(
     move_ids: np.ndarray,
     game_lengths: np.ndarray,
-    term_codes: np.ndarray,
+    outcome_tokens: torch.Tensor,
     seq_len: int,
 ) -> dict[str, torch.Tensor]:
-    """Convert Rust engine output to CLM training tensors.
+    """Pack move arrays into CLM training tensors.
 
     Constructs input_ids = [outcome, move_1, ..., move_N, PAD, ...]
     and targets shifted left by 1.
 
     Args:
-        move_ids: (B, engine_max_ply) from generate_random_games
-        game_lengths: (B,) actual game lengths (≤ engine_max_ply)
-        term_codes: (B,) termination codes
+        move_ids: (B, max_ply) raw move token IDs
+        game_lengths: (B,) actual game lengths
+        outcome_tokens: (B,) pre-computed outcome token IDs (4273-4277)
         seq_len: total CLM sequence length (256)
     """
     B = len(game_lengths)
     n_move_slots = seq_len - 1  # 255 slots for moves (position 0 = outcome)
-    engine_max_ply = move_ids.shape[1]
+    max_ply = move_ids.shape[1]
 
     game_lengths_t = torch.from_numpy(game_lengths).long()
-    move_ids_t = torch.from_numpy(move_ids).long()  # (B, engine_max_ply)
-    outcome_tokens = _map_termination_to_outcome(term_codes, game_lengths)
+    move_ids_t = torch.from_numpy(move_ids).long()  # (B, max_ply)
 
     # Build input_ids: [outcome, move_0, ..., move_{N-1}, PAD, ...]
     input_ids = torch.zeros(B, seq_len, dtype=torch.long)
     input_ids[:, 0] = outcome_tokens
 
     # Mask out any non-move tokens from engine output
-    cache_key = ("engine", engine_max_ply)
+    cache_key = ("engine", max_ply)
     engine_positions = _positions_cache.get(cache_key)
     if engine_positions is None:
-        engine_positions = torch.arange(engine_max_ply).unsqueeze(0)
+        engine_positions = torch.arange(max_ply).unsqueeze(0)
         _positions_cache[cache_key] = engine_positions
     move_mask = engine_positions < game_lengths_t.unsqueeze(1)
     clean_moves = move_ids_t * move_mask
 
     # Place moves at positions 1..n_move_slots
-    n_to_copy = min(engine_max_ply, n_move_slots)
+    n_to_copy = min(max_ply, n_move_slots)
     input_ids[:, 1 : n_to_copy + 1] = clean_moves[:, :n_to_copy]
 
     # Cap game_lengths to n_move_slots (handles edge case where engine
@@ -114,6 +112,21 @@ def _to_clm_batch(
         "targets": targets,
         "loss_mask": loss_mask,
     }
+
+
+def _to_clm_batch(
+    move_ids: np.ndarray,
+    game_lengths: np.ndarray,
+    term_codes: np.ndarray,
+    seq_len: int,
+) -> dict[str, torch.Tensor]:
+    """Convert Rust engine output to CLM training tensors.
+
+    Convenience wrapper: computes outcome tokens from termination codes,
+    then delegates to pack_clm_sequences.
+    """
+    outcome_tokens = _map_termination_to_outcome(term_codes, game_lengths)
+    return pack_clm_sequences(move_ids, game_lengths, outcome_tokens, seq_len)
 
 
 class CLMDataset(torch.utils.data.IterableDataset):
@@ -156,16 +169,18 @@ class CLMDataset(torch.utils.data.IterableDataset):
             t.start()
 
         step = self._start_step
-        # Engine generates games of up to max_ply-1 moves, leaving 1 slot
-        # for the outcome token in the seq_len=max_ply CLM sequence.
-        engine_max_ply = self.max_ply - 1
         while True:
             seed = self.base_seed + step * num_workers + worker_id
-            move_ids, game_lengths, term_codes = engine.generate_random_games(
-                self.batch_size, engine_max_ply, seed,
-                discard_ply_limit=self.discard_ply_limit,
-            )
-            yield _to_clm_batch(move_ids, game_lengths, term_codes, self.max_ply)
+            input_ids, targets, loss_mask, _move_ids, _gl, _tc = \
+                engine.generate_clm_batch(
+                    self.batch_size, self.max_ply, seed,
+                    discard_ply_limit=self.discard_ply_limit,
+                )
+            yield {
+                "input_ids": torch.from_numpy(input_ids).long(),
+                "targets": torch.from_numpy(targets).long(),
+                "loss_mask": torch.from_numpy(loss_mask),
+            }
             step += 1
 
 
@@ -178,17 +193,21 @@ def create_validation_set(
     Also computes legal move masks for legal move rate evaluation.
 
     Args:
-        max_ply: total CLM sequence length (256). Engine gets max_ply-1.
+        max_ply: total CLM sequence length (256).
     """
-    engine_max_ply = max_ply - 1
-    move_ids, game_lengths, term_codes = engine.generate_random_games(
-        n_games, engine_max_ply, seed, discard_ply_limit=discard_ply_limit,
-    )
-    batch = _to_clm_batch(move_ids, game_lengths, term_codes, max_ply)
+    input_ids, targets, loss_mask, move_ids, game_lengths, _tc = \
+        engine.generate_clm_batch(
+            n_games, max_ply, seed, discard_ply_limit=discard_ply_limit,
+        )
+    batch = {
+        "input_ids": torch.from_numpy(input_ids).long(),
+        "targets": torch.from_numpy(targets).long(),
+        "loss_mask": torch.from_numpy(loss_mask),
+    }
 
     # Compute legal move masks for evaluating legal move rate
     legal_grid, _legal_promo = engine.compute_legal_move_masks(move_ids, game_lengths)
-    batch["legal_grid"] = torch.from_numpy(legal_grid).long()  # (B, engine_max_ply, 64)
+    batch["legal_grid"] = torch.from_numpy(legal_grid).long()
     batch["game_lengths"] = torch.from_numpy(game_lengths).long()
 
     return batch

@@ -169,6 +169,46 @@ fn generate_random_games<'py>(
     Ok((move_ids, game_lengths, termination_codes))
 }
 
+/// Generate a CLM training batch with model-ready tensors.
+///
+/// Returns (input_ids, targets, loss_mask, move_ids, game_lengths, term_codes).
+/// input_ids = [outcome, ply_1, ..., ply_N, PAD, ...] (seq_len per row).
+/// move_ids are the raw moves (seq_len-1 per row) for replay operations.
+#[pyfunction]
+#[pyo3(signature = (batch_size, seq_len=256, seed=42, discard_ply_limit=false))]
+fn generate_clm_batch<'py>(
+    py: Python<'py>,
+    batch_size: usize,
+    seq_len: usize,
+    seed: u64,
+    discard_ply_limit: bool,
+) -> PyResult<(
+    Bound<'py, PyArray2<i16>>,   // input_ids (B, seq_len)
+    Bound<'py, PyArray2<i16>>,   // targets (B, seq_len)
+    Bound<'py, PyArray2<bool>>,  // loss_mask (B, seq_len)
+    Bound<'py, PyArray2<i16>>,   // move_ids (B, seq_len-1)
+    Bound<'py, PyArray1<i16>>,   // game_lengths (B,)
+    Bound<'py, PyArray1<u8>>,    // termination_codes (B,)
+)> {
+    let result = py.allow_threads(|| {
+        batch::generate_clm_batch(batch_size, seq_len, seed, discard_ply_limit)
+    });
+
+    let max_ply = seq_len - 1;
+    let input_ids = numpy::PyArray::from_vec(py, result.input_ids)
+        .reshape([batch_size, seq_len])?;
+    let targets = numpy::PyArray::from_vec(py, result.targets)
+        .reshape([batch_size, seq_len])?;
+    let loss_mask = numpy::PyArray::from_vec(py, result.loss_mask)
+        .reshape([batch_size, seq_len])?;
+    let move_ids = numpy::PyArray::from_vec(py, result.move_ids)
+        .reshape([batch_size, max_ply])?;
+    let game_lengths = numpy::PyArray::from_vec(py, result.game_lengths);
+    let termination_codes = numpy::PyArray::from_vec(py, result.termination_codes);
+
+    Ok((input_ids, targets, loss_mask, move_ids, game_lengths, termination_codes))
+}
+
 /// Compute legal move masks by replaying games. Spec §7.4.
 #[pyfunction]
 fn compute_legal_move_masks<'py>(
@@ -868,6 +908,7 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(export_move_vocabulary, m)?)?;
     m.add_function(wrap_pyfunction!(generate_training_batch, m)?)?;
     m.add_function(wrap_pyfunction!(generate_random_games, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_clm_batch, m)?)?;
     m.add_function(wrap_pyfunction!(generate_checkmate_games, m)?)?;
     m.add_function(wrap_pyfunction!(generate_checkmate_training_batch, m)?)?;
     m.add_function(wrap_pyfunction!(compute_legal_move_masks, m)?)?;

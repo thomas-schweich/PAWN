@@ -70,11 +70,11 @@ PAWN is a standard decoder-only transformer trained with next-token prediction o
 [outcome] [ply_1] [ply_2] ... [ply_N] [PAD] ... [PAD]
 ```
 
-The outcome token is one of `WHITE_CHECKMATE`, `BLACK_CHECKMATE`, `STALEMATE`, `DRAW_BY_RULE`, or `PLY_LIMIT`.
+The outcome token is one of `WHITE_CHECKMATES`, `BLACK_CHECKMATES`, `STALEMATE`, `DRAW_BY_RULE`, or `PLY_LIMIT`.
 
 Ply tokens use a factored embedding: each move is decomposed into source square + destination square + promotion piece, with embeddings summed. This gives the model some degree of explicit spatial structure while keeping the vocabulary compact.
 
-The summed embeddings effectively represent UCI strings like `e2e4` (peice moves from `e2` to `e4`) or `f7f8q` (promotion to queen on `f8`). In factored form, the vector `e2e4` is given by `(e2xx + xxe4)`. Likewise, `f7f8q` is given by `(f7xx + xxf8 + q)`.
+The summed embeddings effectively represent UCI strings like `e2e4` (peice moves from `e2` to `e4`) or `f7f8q` (promotion to queen on `f8`). In factored form, the vector `e2e4` is given by `(e2xx + xxe4 + no_promotion)`. Likewise, `f7f8q` is given by `(f7xx + xxf8 + xxxxq)`.
 
 The context window of all variants is 256 tokens wide. Training examples all include the outcome token followed by up to 255 ply or padding tokens.
 
@@ -82,7 +82,7 @@ During training, simulated games are retroactively prepended with their actual o
 
 The models predictions are not masked to legal moves during training; it has to determine what moves are currently legal based on the seqeunce of moves so far.
 
-No attempt is made to provide the model with information about other peices. In other words, it only thinks in moves. There is no equivalent of 7-dimensional manifold board representation used by e.g. Alpha Zero and Lc0. Any and all state representation is learned by the model internally.
+No attempt is made to provide the model with information about other peices. In other words, it only thinks in moves. There is no equivalent of 7-dimensional manifold board representation used by e.g. Alpha Zero and Lc0. Any and all state representation and geometry is learned by the model internally.
 
 ## Adapter Methods
 <sub>Main article: [docs/ADAPTERS.md](docs/ADAPTERS.md)</sub>
