@@ -16,4 +16,12 @@ print('Model downloaded to checkpoints/model/')
 "
 fi
 
-exec "$@"
+# Run the command: Docker CMD args, or PAWN_CMD env var
+if [ $# -gt 0 ]; then
+    exec "$@"
+elif [ -n "$PAWN_CMD" ]; then
+    exec bash -c "$PAWN_CMD"
+else
+    echo "ERROR: No command provided. Set PAWN_CMD env var or pass Docker CMD args."
+    exit 1
+fi
