@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Train small, base, and large PAWN models simultaneously on shared data.
+
+All three models see the exact same batches in the same order, eliminating
+data generation overhead and ensuring comparable training conditions.
+
+Usage:
+    uv run python scripts/train_all.py --local-checkpoints
+    uv run python scripts/train_all.py --hf-repo thomas-schweich/pawn-{variant}
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import signal
+import sys
+import time
+
+import torch
+import torch.multiprocessing as mp
+from torch.utils.data import DataLoader
+
+from pawn.config import CLMConfig, TrainingConfig
+from pawn.model import PAWNCLM, clm_loss
+from pawn.data import CLMDataset, create_validation_set
+from pawn.gpu import configure_gpu, apply_gpu_config
+from pawn.checkpoint import save_pretrain_checkpoint, push_checkpoint_to_hf
+
+
+# ---------------------------------------------------------------------------
+# Per-model state
+# ---------------------------------------------------------------------------
+
+class ModelSlot:
+    """Holds everything needed to train and checkpoint one model variant."""
+
+    def __init__(
+        self,
+        name: str,
+        model_cfg: CLMConfig,
+        train_cfg: TrainingConfig,
+        device: str,
+        hf_repo: str | None,
+    ):
+        self.name = name
+        self.model_cfg = model_cfg
+        self.train_cfg = train_cfg
+        self.device = device
+        self.hf_repo = hf_repo
+
+        self.model = PAWNCLM(model_cfg).to(device)
+        param_count = sum(p.numel() for p in self.model.parameters())
+        print(f"  {name}: {param_count:,} params ({model_cfg.d_model}d/{model_cfg.n_layers}L)")
+
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=train_cfg.lr,
+            weight_decay=train_cfg.weight_decay,
+        )
+
+        from pawn.trainer import CosineWithWarmup
+        self.scheduler = CosineWithWarmup(
+            self.optimizer,
+            warmup_steps=train_cfg.warmup_steps,
+            total_steps=train_cfg.total_steps,
+        )
+
+        self.scaler = torch.amp.GradScaler(device, enabled=train_cfg.use_amp)
+
+        # Run directory
+        self.run_dir = _make_run_dir(train_cfg.log_dir, name)
+        self.checkpoint_dir = os.path.join(self.run_dir, "checkpoints")
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        self.jsonl_path = os.path.join(self.run_dir, "metrics.jsonl")
+        self._jsonl_file: open | None = None
+
+        self.hf_branch = f"run/{os.path.basename(self.run_dir)}" if hf_repo else None
+        self.global_step = 0
+
+        # Write config
+        import subprocess
+        try:
+            git_hash = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+            ).strip()
+        except Exception:
+            git_hash = os.environ.get("PAWN_GIT_HASH")
+        try:
+            git_tag = subprocess.check_output(
+                ["git", "tag", "--points-at", "HEAD"], stderr=subprocess.DEVNULL, text=True
+            ).strip() or None
+        except Exception:
+            git_tag = os.environ.get("PAWN_GIT_TAG")
+
+        config_data = {
+            "model": model_cfg.__dict__,
+            "training": train_cfg.__dict__,
+            "param_count": param_count,
+            "formulation": "clm",
+            "multi_model": True,
+            "variant": name,
+            "git_hash": git_hash,
+            "git_tag": git_tag,
+        }
+        with open(os.path.join(self.run_dir, "config.json"), "w") as f:
+            json.dump(config_data, f, indent=2, default=str)
+        self._log_jsonl({"type": "config", **config_data})
+
+    def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
+        self.model.train()
+        input_ids = batch["input_ids"].to(self.device)
+        targets = batch["targets"].to(self.device)
+        loss_mask = batch["loss_mask"].to(self.device)
+
+        with torch.amp.autocast(self.device, enabled=self.train_cfg.use_amp):
+            loss, metrics = self.model.forward_train(input_ids, loss_mask, targets)
+
+        self.scaler.scale(loss).backward()
+        return metrics
+
+    def optimizer_step(self) -> float:
+        self.scaler.unscale_(self.optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), self.train_cfg.max_grad_norm
+        ).item()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.scheduler.step()
+        return grad_norm
+
+    def save_checkpoint(self):
+        path = os.path.join(self.checkpoint_dir, f"step_{self.global_step:08d}")
+        save_pretrain_checkpoint(
+            path, self.model, self.optimizer, self.scheduler, self.scaler,
+            self.global_step, self.model_cfg.__dict__, self.train_cfg.__dict__,
+        )
+        print(f"  [{self.name}] Checkpoint saved: {path}")
+
+        if self.hf_repo and self.hf_branch:
+            try:
+                push_checkpoint_to_hf(
+                    path, self.hf_repo, self.hf_branch,
+                    metrics_path=self.jsonl_path, step=self.global_step,
+                )
+                print(f"  [{self.name}] Pushed to HF: {self.hf_repo}@{self.hf_branch}")
+            except Exception as e:
+                print(f"  [{self.name}] WARNING: HF push failed: {e}")
+
+    @torch.no_grad()
+    def evaluate(self, val_data: dict[str, torch.Tensor]) -> dict[str, float]:
+        self.model.eval()
+        n = val_data["input_ids"].shape[0]
+        batch_size = self.train_cfg.batch_size
+        total_metrics: dict[str, float] = {}
+        n_batches = 0
+
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            input_ids = val_data["input_ids"][start:end].to(self.device)
+            targets = val_data["targets"][start:end].to(self.device)
+            loss_mask = val_data["loss_mask"][start:end].to(self.device)
+
+            with torch.amp.autocast(self.device, enabled=self.train_cfg.use_amp):
+                logits, _ = self.model(input_ids, loss_mask)
+                _, metrics = clm_loss(logits, targets, loss_mask)
+
+            for k, v in metrics.items():
+                total_metrics[k] = total_metrics.get(k, 0.0) + v
+            n_batches += 1
+
+        return {f"val/{k}": v / n_batches for k, v in total_metrics.items()}
+
+    def _log_jsonl(self, record: dict):
+        if self._jsonl_file is None:
+            self._jsonl_file = open(self.jsonl_path, "a")
+        self._jsonl_file.write(json.dumps(record, default=str) + "\n")
+        self._jsonl_file.flush()
+
+    def close(self):
+        if self._jsonl_file:
+            self._jsonl_file.close()
+            self._jsonl_file = None
+
+
+def _make_run_dir(log_dir: str, variant: str) -> str:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(log_dir, f"run_{timestamp}_{variant}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Train small/base/large PAWN models simultaneously")
+    p.add_argument("--device", type=str, default=None, help="Device (cuda/cpu)")
+    p.add_argument("--total-steps", type=int, default=100_000, help="Total training steps")
+    p.add_argument("--batch-size", type=int, default=256, help="Batch size (shared across models)")
+    p.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
+    p.add_argument("--log-dir", type=str, default="logs", help="Log directory")
+    p.add_argument("--log-interval", type=int, default=10)
+    p.add_argument("--eval-interval", type=int, default=500)
+    p.add_argument("--checkpoint-interval", type=int, default=5000)
+    p.add_argument("--discard-ply-limit", action="store_true")
+    p.add_argument("--wandb", action="store_true")
+
+    ckpt_group = p.add_mutually_exclusive_group(required=True)
+    ckpt_group.add_argument("--hf-repo", type=str, default=None,
+                            help="HF repo prefix (appends -{variant}). E.g. thomas-schweich/pawn")
+    ckpt_group.add_argument("--local-checkpoints", action="store_true")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if device == "cuda":
+        gpu_cfg = configure_gpu()
+        import pawn.model as model_module
+        if gpu_cfg.get("sdpa_backend"):
+            model_module.SDPA_BACKEND = gpu_cfg["sdpa_backend"]
+
+    # Build per-variant configs (shared training hyperparams, different model sizes)
+    variants = {
+        "small": CLMConfig.small(),
+        "base": CLMConfig.base(),
+        "large": CLMConfig.large(),
+    }
+
+    print("=== Multi-Model Training ===")
+    print(f"Device: {device}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Total steps: {args.total_steps}")
+    print()
+
+    slots: list[ModelSlot] = []
+    for name, model_cfg in variants.items():
+        train_cfg = TrainingConfig()
+        train_cfg.total_steps = args.total_steps
+        train_cfg.batch_size = args.batch_size
+        train_cfg.num_workers = args.num_workers
+        train_cfg.device = device
+        train_cfg.log_dir = args.log_dir
+        train_cfg.log_interval = args.log_interval
+        train_cfg.eval_interval = args.eval_interval
+        train_cfg.checkpoint_interval = args.checkpoint_interval
+        train_cfg.discard_ply_limit = args.discard_ply_limit
+        train_cfg.use_wandb = args.wandb
+
+        hf_repo = f"{args.hf_repo}-{name}" if args.hf_repo else None
+        slots.append(ModelSlot(name, model_cfg, train_cfg, device, hf_repo))
+
+    # Shared dataset and validation set
+    max_ply = 256
+    dataset = CLMDataset(
+        args.batch_size, max_ply, base_seed=42,
+        discard_ply_limit=args.discard_ply_limit,
+    )
+
+    print("\nGenerating shared validation set...")
+    val_data = create_validation_set(512, max_ply, seed=(2**63) - 1,
+                                     discard_ply_limit=args.discard_ply_limit)
+
+    # Compile models
+    if device != "cpu":
+        for slot in slots:
+            try:
+                slot.model = torch.compile(slot.model, mode="default")
+                print(f"  [{slot.name}] torch.compile enabled")
+            except Exception:
+                print(f"  [{slot.name}] torch.compile not available")
+
+    loader = DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=args.num_workers,
+        pin_memory=(device != "cpu"),
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=1 if args.num_workers > 0 else None,
+    )
+
+    # Signal handling
+    _shutdown_requested = False
+    _shutdown_signal = None
+
+    def _graceful_exit(signum, frame):
+        nonlocal _shutdown_requested, _shutdown_signal
+        _shutdown_requested = True
+        _shutdown_signal = signum
+
+    signal.signal(signal.SIGTERM, _graceful_exit)
+    signal.signal(signal.SIGINT, _graceful_exit)
+
+    # Training loop
+    global_step = 0
+    step_start = time.time()
+
+    print(f"\nStarting training from step 0", flush=True)
+    for slot in slots:
+        print(f"  [{slot.name}] JSONL: {slot.jsonl_path}", flush=True)
+    print()
+
+    for batch in loader:
+        # Forward + backward for each model on the same batch
+        all_metrics: dict[str, dict[str, float]] = {}
+        for slot in slots:
+            metrics = slot.train_step(batch)
+            all_metrics[slot.name] = metrics
+
+        # Optimizer step for each model
+        all_grad_norms: dict[str, float] = {}
+        for slot in slots:
+            gn = slot.optimizer_step()
+            all_grad_norms[slot.name] = gn
+
+        global_step += 1
+        for slot in slots:
+            slot.global_step = global_step
+
+        step_time = time.time() - step_start
+        games_per_sec = args.batch_size / step_time
+
+        # Logging
+        if global_step % args.log_interval == 0:
+            print(f"step {global_step:>7d} | {games_per_sec:.0f} g/s | {step_time:.2f}s", flush=True)
+            for slot in slots:
+                m = all_metrics[slot.name]
+                gn = all_grad_norms[slot.name]
+                lr = slot.scheduler.get_lr()
+                print(f"  {slot.name:>5s}: loss {m['loss']:.4f} | acc {m['accuracy']:.3f} | "
+                      f"lr {lr:.2e} | gn {gn:.2f}", flush=True)
+
+                record = {
+                    "type": "train",
+                    "step": global_step,
+                    "timestamp": time.time(),
+                    "lr": lr,
+                    "grad_norm": gn,
+                    "step_time": step_time,
+                    "games_per_sec": games_per_sec,
+                    **{f"train/{k}": v for k, v in m.items()},
+                }
+                slot._log_jsonl(record)
+
+        # Eval
+        if global_step % args.eval_interval == 0:
+            for slot in slots:
+                val_metrics = slot.evaluate(val_data)
+                print(f"  {slot.name:>5s} val: loss {val_metrics['val/loss']:.4f} | "
+                      f"acc {val_metrics['val/accuracy']:.3f}", flush=True)
+                slot._log_jsonl({
+                    "type": "val",
+                    "step": global_step,
+                    "timestamp": time.time(),
+                    **val_metrics,
+                })
+
+        # Checkpoint
+        if global_step % args.checkpoint_interval == 0:
+            for slot in slots:
+                slot.save_checkpoint()
+
+        # Done?
+        if global_step >= args.total_steps:
+            print(f"\nTraining complete at step {global_step}")
+            for slot in slots:
+                slot.save_checkpoint()
+            break
+
+        # Graceful shutdown
+        if _shutdown_requested:
+            print(f"\nShutdown requested (signal {_shutdown_signal}), "
+                  f"saving checkpoints at step {global_step}...")
+            for slot in slots:
+                slot.save_checkpoint()
+            break
+
+        step_start = time.time()
+
+    # Cleanup
+    for slot in slots:
+        slot.close()
+
+    print("\nAll done.")
+
+
+if __name__ == "__main__":
+    try:
+        mp.set_start_method("forkserver", force=True)
+    except ValueError:
+        mp.set_start_method("spawn", force=True)
+    main()
