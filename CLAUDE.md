@@ -117,8 +117,73 @@ Auto-detects run type from config fields (`run_type`, `formulation`, `pgn_file`)
 
 ## Checkpoints
 
-Stored in `checkpoints/` (gitignored). Pre-trained weights downloadable from HuggingFace Hub / GitHub Releases.
+Pre-trained weights are HuggingFace git submodules under `checkpoints/`:
+- `checkpoints/pawn-small` — 9.5M params, `CLMConfig.small()`
+- `checkpoints/pawn-base` — 35.8M params, `CLMConfig.base()`
+- `checkpoints/pawn-large` — 68.4M params, `CLMConfig.large()`
+
+Pull with: `git submodule update --init --remote checkpoints/pawn-base`
+
+### Checkpoint Format (safetensors)
+
+Checkpoints are directories, not single files:
+```
+step_00065000/
+├── model.safetensors        # model weights
+├── optimizer.safetensors    # flattened optimizer state
+├── training_state.json      # step, scheduler, scaler, RNG (base64)
+├── config.json              # model + training config
+└── .complete                # SHA-256 hashes of all files (integrity sentinel)
+```
+
+Central module: `pawn/checkpoint.py`. All save/load goes through this module.
+Legacy `.pt` files are still loadable (backward compatible).
+
+### Checkpoint Storage Modes
+
+All training scripts require one of:
+- `--hf-repo REPO_ID` — push checkpoints to a HuggingFace branch as they're written (durable)
+- `--local-checkpoints` — save locally only (for development without an HF account)
+
+HF mode creates a `run/{run_id}` branch. Squash-merge into main when satisfied.
+
+### Data Integrity
+
+**Every checkpoint write is atomic**: files are written to a `.tmp` directory, then renamed.
+The `.complete` sentinel contains SHA-256 hashes of every file in the checkpoint.
+**Hashes are always verified on load — no exceptions.**
+
+- `IncompleteCheckpointError` — raised when `.complete` sentinel is missing
+- `CheckpointIntegrityError` — raised when any hash mismatches
+
+**Never use `kill -9` on training processes.** SIGTERM is handled gracefully: a flag is set,
+the training loop checks it between steps, saves a checkpoint, pushes to HF, and exits cleanly.
+
+**Never rsync checkpoint files from running pods.** Checkpoints are pushed to HuggingFace
+from the trainer. Pull via `deploy/sync.sh` (submodule update).
 
 ## Logs
 
 Training metrics in `logs/` (gitignored). Each run gets a timestamped directory with `metrics.jsonl`.
+
+## Runpod Pod Management
+
+### Setup
+
+- Docker image: multi-target build in `Dockerfile`
+  - `interactive` (default) — SSH + Jupyter, stays alive
+  - `runner` — executes command then exits (pod auto-stops)
+- Build: `docker build --target runner --build-arg GIT_HASH=$(git rev-parse HEAD) ...`
+
+### Required Configuration
+
+- **Always attach a network volume.** Checkpoints write to disk during atomic rename and HF push. Ephemeral container disk is lost on pod termination.
+- **Set `HF_TOKEN` as a pod environment variable** for automatic HuggingFace authentication.
+- Set `PAWN_MODEL=thomas-schweich/pawn-base` env var in the runner to auto-pull a checkpoint on startup.
+
+### Lifecycle
+
+- Create: `runpodctl pod create --name pawn-exp --gpu-id "NVIDIA RTX A5000" --image thomasschweich/pawn:<tag> --volume-in-gb 75 --ports "8888/http,22/tcp"`
+- Stop: `runpodctl pod stop <ID>` — sends SIGTERM → trainer saves and pushes before exiting
+- **Never `runpodctl pod delete` while training is running** — data loss risk
+- Monitor: pull HF submodule (`deploy/sync.sh`) and read `metrics.jsonl`

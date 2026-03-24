@@ -17,6 +17,7 @@ import argparse
 import gc
 import json
 import math
+import signal
 import time
 from pathlib import Path
 
@@ -79,6 +80,12 @@ def parse_args():
                     help="Disable torch.compile")
     p.add_argument("--sdpa-math", action="store_true",
                     help="Use MATH SDPA backend (workaround for ROCm flash attn + compile)")
+
+    ckpt_group = p.add_mutually_exclusive_group(required=True)
+    ckpt_group.add_argument("--hf-repo", type=str, default=None,
+                            help="Push checkpoints to this HuggingFace repo (requires HF_TOKEN)")
+    ckpt_group.add_argument("--local-checkpoints", action="store_true",
+                            help="Save checkpoints locally only")
 
     return p.parse_args()
 
@@ -180,6 +187,10 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
+
+    hf_branch = None
+    if args.hf_repo:
+        hf_branch = f"run/{out_dir.name}"
 
     device = args.device
     print(f"Device: {device}")
@@ -285,6 +296,13 @@ def main():
     global_step = 0
     val_metrics = baseline  # for first log if val_every > 1
 
+    _shutdown_requested = False
+    def _graceful_exit(signum, frame):
+        nonlocal _shutdown_requested
+        _shutdown_requested = True
+    signal.signal(signal.SIGTERM, _graceful_exit)
+    signal.signal(signal.SIGINT, _graceful_exit)
+
     print(f"\nTraining for up to {args.epochs} epochs ({total_steps} steps)")
     print(f"  Warmup: {warmup_steps} steps, LR: {args.lr}")
     if args.val_every > 1:
@@ -381,11 +399,22 @@ def main():
                     step=global_step,
                     val_metrics=val_metrics,
                 )
+                if args.hf_repo and hf_branch:
+                    from pawn.checkpoint import push_checkpoint_to_hf
+                    try:
+                        push_checkpoint_to_hf(ckpt_dir / "best", args.hf_repo, hf_branch, step=global_step)
+                        print(f"Pushed to HF: {args.hf_repo}@{hf_branch}")
+                    except Exception as e:
+                        print(f"WARNING: HF push failed: {e}")
             else:
                 patience_counter += 1
                 if patience_counter >= args.patience:
                     print(f"\n  Early stopping at epoch {epoch} (patience={args.patience})")
                     break
+
+        if _shutdown_requested:
+            print("Shutdown requested, saving checkpoint...")
+            break
 
     # Save final checkpoint
     from pawn.checkpoint import save_adapter_checkpoint
@@ -397,6 +426,13 @@ def main():
         step=global_step,
         val_metrics=val_metrics,
     )
+    if args.hf_repo and hf_branch:
+        from pawn.checkpoint import push_checkpoint_to_hf
+        try:
+            push_checkpoint_to_hf(ckpt_dir / "final", args.hf_repo, hf_branch, step=global_step)
+            print(f"Pushed to HF: {args.hf_repo}@{hf_branch}")
+        except Exception as e:
+            print(f"WARNING: HF push failed: {e}")
 
     print(f"\nDone. Best val_loss={best_val_loss:.4f}")
     print(f"Checkpoints saved to {out_dir}")

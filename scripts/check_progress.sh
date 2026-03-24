@@ -1,33 +1,34 @@
 #!/usr/bin/env bash
-# Check training progress, sync from pods, and auto-stop finished pods.
-# Usage: check_progress.sh [--sync] [--auto-stop] [LOG_DIR]
+# Check training progress from HuggingFace submodules and local logs.
+# Usage: check_progress.sh [--sync] [LOG_DIR]
 set -euo pipefail
 
 SYNC=false
-AUTO_STOP=false
 LOG_DIR=""
 
 for arg in "$@"; do
     case "$arg" in
         --sync) SYNC=true ;;
-        --auto-stop) AUTO_STOP=true ;;
         *) LOG_DIR="$arg" ;;
     esac
 done
 LOG_DIR="${LOG_DIR:-logs}"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-POD_DIR="$HOME/.config/pawn/pods"
 
-# Sync from all pods
-if $SYNC && [ -d "$POD_DIR" ]; then
+# Sync submodules from HuggingFace
+if $SYNC; then
     bash "$REPO/deploy/sync.sh" 2>/dev/null || true
 fi
 
-# Show progress for top 5 most recent runs
-find "$LOG_DIR" -name metrics.jsonl -printf '%T@ %p\n' 2>/dev/null \
-    | sort -rn | head -n 5 | while read -r _ path; do
+# Show progress from all metrics.jsonl files (local logs + submodules)
+N=5
+{
+    find "$LOG_DIR" -name metrics.jsonl -printf '%T@ %p\n' 2>/dev/null
+    find "$REPO/checkpoints" -name metrics.jsonl -printf '%T@ %p\n' 2>/dev/null
+} | sort -rn | head -n "$N" | while read -r _ path; do
     run_name="$(basename "$(dirname "$path")")"
+
     python3 -c "
 import json, sys
 records = [json.loads(l) for l in open('$path')]
@@ -51,29 +52,8 @@ print(f'{\"$run_name\":<28}  {variant}  discard_ply={str(discard):<5}  step {ste
 done
 
 # Check local training process
-if pgrep -f 'train.py.*discard-ply-limit' > /dev/null 2>&1; then
-    echo "Local discard-ply-limit run: RUNNING"
+if pgrep -f 'train.py' > /dev/null 2>&1; then
+    echo "Local training: RUNNING"
 else
-    echo "WARNING: Local discard-ply-limit run: NOT RUNNING"
-fi
-
-# Auto-stop finished pods
-if $AUTO_STOP && [ -d "$POD_DIR" ]; then
-    for env_file in "$POD_DIR"/*.env; do
-        [ -f "$env_file" ] || continue
-        pod_name="$(basename "${env_file%.env}")"
-        unset POD_ID POD_HOST POD_PORT POD_GPU 2>/dev/null || true
-        source "$env_file"
-
-        # Check if process is alive on pod
-        alive=$(ssh -o ConnectTimeout=5 -p "$POD_PORT" "root@$POD_HOST" \
-            "pgrep -f 'train.py' > /dev/null 2>&1 && echo yes || echo no" 2>/dev/null || echo "unreachable")
-
-        if [ "$alive" = "no" ]; then
-            echo ">>> $pod_name: training finished. Final sync + stopping..."
-            bash "$REPO/deploy/sync.sh" "$pod_name" 2>/dev/null || true
-            runpodctl pod stop "$POD_ID" 2>/dev/null
-            echo ">>> $pod_name ($POD_ID) STOPPED"
-        fi
-    done
+    echo "Local training: NOT RUNNING"
 fi

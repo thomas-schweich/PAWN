@@ -1,65 +1,36 @@
 #!/usr/bin/env bash
-# Sync logs and checkpoints from Runpod pod(s) to local machine.
-# Usage: bash deploy/sync.sh [pod-name]
+# Pull latest checkpoints and metrics from HuggingFace submodules.
+# Usage: bash deploy/sync.sh [submodule-name]
 #
-# With no args, syncs from all pods in ~/.config/pawn/pods/
-# With a pod name, syncs from that specific pod only.
+# With no args, pulls all checkpoint submodules.
+# With a name, pulls only that submodule.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-POD_DIR="$HOME/.config/pawn/pods"
 
-sync_pod() {
-    local name="$1" host="$2" port="$3" remote_root="${4:-/opt/pawn}"
-    local ssh_opts="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p $port"
-
-    echo "=== Syncing from $name ($host:$port) ==="
-
-    echo "--- Logs ---"
-    rsync -avz --progress --no-owner --no-group \
-        -e "ssh $ssh_opts" \
-        "root@$host:$remote_root/logs/" "$REPO/logs/" || {
-        echo "  Failed to sync logs from $name"
-        return 1
-    }
-
-    echo "--- Checkpoints (best.pt only) ---"
-    rsync -avz --progress --no-owner --no-group \
-        --include='*/' --include='best.pt' --include='*.pt' --exclude='*' \
-        -e "ssh $ssh_opts" \
-        "root@$host:$remote_root/logs/" "$REPO/logs/" || {
-        echo "  Failed to sync checkpoints from $name"
-        return 1
-    }
-
-    echo "=== $name sync complete ==="
+pull_submodule() {
+    local sub="$1"
+    local name="$(basename "$sub")"
+    echo "=== Pulling $name ==="
+    git -C "$sub" fetch origin 2>/dev/null || { echo "  Failed to fetch $name"; return 1; }
+    git -C "$sub" pull origin main 2>/dev/null || { echo "  Failed to pull $name (main)"; return 1; }
+    echo "=== $name up to date ==="
     echo ""
 }
 
-if [ ! -d "$POD_DIR" ] || [ -z "$(ls "$POD_DIR"/*.env 2>/dev/null)" ]; then
-    echo "No pods configured. Add .env files to $POD_DIR/"
-    exit 1
-fi
-
 if [ $# -ge 1 ]; then
-    # Sync specific pod
-    POD_FILE="$POD_DIR/$1.env"
-    if [ ! -f "$POD_FILE" ]; then
-        echo "Pod '$1' not found. Available pods:"
-        ls "$POD_DIR"/*.env 2>/dev/null | xargs -I{} basename {} .env | sed 's/^/  /'
+    sub="$REPO/checkpoints/$1"
+    if [ ! -d "$sub/.git" ]; then
+        echo "Submodule '$1' not found. Available:"
+        for s in "$REPO"/checkpoints/pawn-*/; do
+            [ -d "$s/.git" ] && echo "  $(basename "$s")"
+        done
         exit 1
     fi
-    source "$POD_FILE"
-    sync_pod "$1" "$POD_HOST" "$POD_PORT" "${POD_REMOTE_ROOT:-/opt/pawn}"
+    pull_submodule "$sub"
 else
-    # Sync all pods
-    for pod_file in "$POD_DIR"/*.env; do
-        pod_name="$(basename "${pod_file%.env}")"
-        unset POD_HOST POD_PORT POD_REMOTE_ROOT
-        source "$pod_file"
-        sync_pod "$pod_name" "$POD_HOST" "$POD_PORT" "${POD_REMOTE_ROOT:-/opt/pawn}" || true
+    for sub in "$REPO"/checkpoints/pawn-*/; do
+        [ -d "$sub/.git" ] || continue
+        pull_submodule "$sub" || true
     done
 fi
-
-echo "Local logs:"
-du -sh "$REPO/logs/"

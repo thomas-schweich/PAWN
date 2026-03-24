@@ -197,16 +197,26 @@ def _make_run_dir(base_log_dir: str) -> str:
 
 
 class CLMTrainer:
-    def __init__(self, train_cfg: TrainingConfig, model_cfg: CLMConfig):
+    def __init__(
+        self,
+        train_cfg: TrainingConfig,
+        model_cfg: CLMConfig,
+        hf_repo: str | None = None,
+    ):
         self.cfg = train_cfg
         self.model_cfg = model_cfg
         self.device = train_cfg.device
         self.global_step = 0
+        self.hf_repo = hf_repo
+        self.hf_branch: str | None = None
 
         self.run_dir = _make_run_dir(train_cfg.log_dir)
         self.cfg.checkpoint_dir = os.path.join(self.run_dir, "checkpoints")
         self._jsonl_path = os.path.join(self.run_dir, "metrics.jsonl")
         self._jsonl_file = None
+
+        if self.hf_repo:
+            self.hf_branch = f"run/{os.path.basename(self.run_dir)}"
 
         self._model = PAWNCLM(model_cfg).to(self.device)
         self.model = self._model
@@ -574,6 +584,18 @@ class CLMTrainer:
             self.cfg.__dict__,
         )
         print(f"Checkpoint saved: {path}")
+
+        if self.hf_repo and self.hf_branch:
+            from pawn.checkpoint import push_checkpoint_to_hf
+            try:
+                push_checkpoint_to_hf(
+                    path, self.hf_repo, self.hf_branch,
+                    metrics_path=self._jsonl_path,
+                    step=self.global_step,
+                )
+                print(f"Pushed to HF: {self.hf_repo}@{self.hf_branch}")
+            except Exception as e:
+                print(f"WARNING: HF push failed: {e}")
 
     def load_checkpoint(self, path: str):
         from pawn.checkpoint import load_pretrain_checkpoint

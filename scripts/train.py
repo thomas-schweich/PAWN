@@ -30,6 +30,12 @@ def parse_args():
     parser.add_argument("--log-dir", type=str, default=None, help="Override log directory")
     parser.add_argument("--discard-ply-limit", action="store_true",
                         help="Only train on games that ended naturally (no ply limit truncation)")
+
+    ckpt_group = parser.add_mutually_exclusive_group(required=True)
+    ckpt_group.add_argument("--hf-repo", type=str, default=None,
+                            help="Push checkpoints to this HuggingFace repo (requires HF_TOKEN)")
+    ckpt_group.add_argument("--local-checkpoints", action="store_true",
+                            help="Save checkpoints locally only (no HuggingFace push)")
     return parser.parse_args()
 
 
@@ -73,7 +79,7 @@ def main():
     print(f"Model config: {model_cfg}")
     print(f"Training config: {train_cfg}")
 
-    trainer = CLMTrainer(train_cfg, model_cfg)
+    trainer = CLMTrainer(train_cfg, model_cfg, hf_repo=args.hf_repo)
 
     if args.resume:
         trainer.load_checkpoint(args.resume)

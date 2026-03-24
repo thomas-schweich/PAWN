@@ -17,6 +17,10 @@
 # Run (interactive):
 #   docker run --gpus all pawn:<tag>
 #
+# IMPORTANT: Always attach a Runpod network volume. Checkpoints use
+# atomic directory writes (tmp + rename) that require persistent disk.
+# Set HF_TOKEN as a pod env var for HuggingFace checkpoint push.
+#
 # Run (auto-stop):
 #   docker run --gpus all -e PAWN_MODEL=thomas-schweich/pawn-base \
 #     pawn:<tag>-runner python scripts/train.py --variant base

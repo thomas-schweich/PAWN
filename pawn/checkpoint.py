@@ -572,3 +572,76 @@ def load_backbone_weights(
         return weights, config
 
     raise ValueError(f"Unrecognized checkpoint format: {path}")
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace push
+# ---------------------------------------------------------------------------
+
+def push_checkpoint_to_hf(
+    checkpoint_path: str | Path,
+    repo_id: str,
+    branch: str,
+    metrics_path: str | Path | None = None,
+    step: int = 0,
+) -> None:
+    """Push a complete checkpoint directory to a HuggingFace repo branch.
+
+    Uploads checkpoint files to checkpoints/step_NNNN/ on the branch.
+    Optionally uploads metrics.jsonl (truncated to current step) to the root.
+
+    Requires HF_TOKEN environment variable or prior `huggingface_hub.login()`.
+    """
+    from huggingface_hub import HfApi
+
+    checkpoint_path = Path(checkpoint_path)
+    api = HfApi()
+
+    # Ensure branch exists
+    try:
+        api.create_branch(repo_id, repo_type="model", branch=branch, exist_ok=True)
+    except Exception:
+        pass  # Branch may already exist
+
+    # Upload checkpoint directory
+    api.upload_folder(
+        folder_path=str(checkpoint_path),
+        path_in_repo=f"checkpoints/{checkpoint_path.name}",
+        repo_id=repo_id,
+        repo_type="model",
+        revision=branch,
+        commit_message=f"Checkpoint step {step}",
+    )
+
+    # Upload truncated metrics.jsonl to repo root
+    if metrics_path is not None:
+        metrics_path = Path(metrics_path)
+        if metrics_path.exists():
+            import tempfile
+            # Truncate metrics to current step
+            truncated_lines = []
+            with open(metrics_path) as f:
+                for line in f:
+                    truncated_lines.append(line)
+                    try:
+                        record = json.loads(line)
+                        if record.get("type") in ("train", "val") and record.get("step", 0) >= step:
+                            break
+                    except json.JSONDecodeError:
+                        continue
+
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tmp:
+                tmp.writelines(truncated_lines)
+                tmp_path = tmp.name
+
+            try:
+                api.upload_file(
+                    path_or_fileobj=tmp_path,
+                    path_in_repo="metrics.jsonl",
+                    repo_id=repo_id,
+                    repo_type="model",
+                    revision=branch,
+                    commit_message=f"Metrics through step {step}",
+                )
+            finally:
+                os.unlink(tmp_path)
