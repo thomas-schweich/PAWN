@@ -6,13 +6,13 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           lfs: true
-      - uses: JacobLinCool/hugging-face-sync@v1
-        with:
-          user: thomas-schweich
-          repo: PAWN
-          token: ${{ secrets.HF_TOKEN }}
+      - name: Push to HuggingFace
+        run: |
+          git push --force https://thomas-schweich:$HF_TOKEN@huggingface.co/thomas-schweich/PAWN main
