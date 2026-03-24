@@ -94,6 +94,7 @@ class ModelSlot:
         self.global_step = 0
         self.best_val_step = 0
         self.best_val_loss = float("inf")
+        self.patience_counter = 0
 
         # Background HF push (one thread per slot, so pushes don't block training)
         from concurrent.futures import ThreadPoolExecutor
@@ -282,6 +283,8 @@ def parse_args():
     p.add_argument("--eval-interval", type=int, default=500)
     p.add_argument("--checkpoint-interval", type=int, default=5000)
     p.add_argument("--discard-ply-limit", action="store_true")
+    p.add_argument("--patience", type=int, default=10,
+                    help="Stop if no val loss improvement for N eval intervals (0=disabled)")
     p.add_argument("--wandb", action="store_true")
 
     ckpt_group = p.add_mutually_exclusive_group(required=True)
@@ -558,11 +561,22 @@ def main():
                     "timestamp": time.time(),
                     **val_metrics,
                 })
-                # Track best for eval and /dev/shm cleanup
+                # Track best for eval, /dev/shm cleanup, and patience
                 vl = val_metrics["val/loss"]
                 if vl < slot.best_val_loss:
                     slot.best_val_loss = vl
                     slot.best_val_step = global_step
+                    slot.patience_counter = 0
+                else:
+                    slot.patience_counter += 1
+
+            # Early stop when ALL slots have exhausted patience
+            if args.patience > 0 and all(s.patience_counter >= args.patience for s in slots):
+                print(f"\nEarly stopping at step {global_step} — no improvement "
+                      f"for {args.patience} evals on any variant")
+                for slot in slots:
+                    slot.save_checkpoint()
+                break
 
         # Checkpoint
         if global_step % args.checkpoint_interval == 0:
