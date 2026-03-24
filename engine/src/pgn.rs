@@ -62,9 +62,6 @@ pub fn batch_san_to_tokens(
         for (t, &tok) in tokens.iter().enumerate() {
             flat[gi * max_ply + t] = tok as i16;
         }
-        if n_valid < max_ply {
-            flat[gi * max_ply + n_valid] = crate::vocab::EOG_TOKEN as i16;
-        }
         lengths.push(n_valid as i16);
     }
 
@@ -194,9 +191,6 @@ pub fn pgn_file_to_tokens(
     for (gi, (tokens, n_valid)) in filtered.iter().enumerate() {
         for (t, &tok) in tokens.iter().enumerate() {
             flat[gi * max_ply + t] = tok as i16;
-        }
-        if *n_valid < max_ply {
-            flat[gi * max_ply + n_valid] = crate::vocab::EOG_TOKEN as i16;
         }
         lengths.push(*n_valid as i16);
     }

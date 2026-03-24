@@ -17,6 +17,7 @@ import argparse
 import gc
 import json
 import math
+import signal
 import time
 from pathlib import Path
 
@@ -83,15 +84,22 @@ def parse_args():
     p.add_argument("--sdpa-math", action="store_true",
                     help="Use MATH SDPA backend (workaround for ROCm flash attn + compile)")
 
+    ckpt_group = p.add_mutually_exclusive_group(required=True)
+    ckpt_group.add_argument("--hf-repo", type=str, default=None,
+                            help="Push checkpoints to this HuggingFace repo (requires HF_TOKEN)")
+    ckpt_group.add_argument("--local-checkpoints", action="store_true",
+                            help="Save checkpoints locally only")
+
     return p.parse_args()
 
 
 def load_backbone(checkpoint_path: str, device: str) -> PAWNCLM:
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg = CLMConfig(**ckpt["model_config"]) if "model_config" in ckpt else CLMConfig()
+    from pawn.checkpoint import load_backbone_weights
+    state_dict, model_config = load_backbone_weights(checkpoint_path, device)
+    cfg = CLMConfig(**model_config) if model_config else CLMConfig()
     model = PAWNCLM(cfg).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    del ckpt
+    model.load_state_dict(state_dict)
+    del state_dict
     gc.collect()
     model.eval()
     return model
@@ -181,6 +189,10 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
+
+    hf_branch = None
+    if args.hf_repo:
+        hf_branch = f"run/{out_dir.name}"
 
     device = args.device
     print(f"Device: {device}")
@@ -299,6 +311,13 @@ def main():
     global_step = 0
     val_metrics = baseline
 
+    _shutdown_requested = False
+    def _graceful_exit(signum, frame):
+        nonlocal _shutdown_requested
+        _shutdown_requested = True
+    signal.signal(signal.SIGTERM, _graceful_exit)
+    signal.signal(signal.SIGINT, _graceful_exit)
+
     print(f"\nTraining for up to {args.epochs} epochs ({total_steps} steps)")
     print(f"  Warmup: {warmup_steps} steps, LR: {args.lr}")
 
@@ -379,28 +398,48 @@ def main():
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 patience_counter = 0
-                torch.save({
-                    "sparse_state_dict": model.sparse_state_dict(),
-                    "epoch": epoch,
-                    "step": global_step,
-                    "val_loss": val_metrics["loss"],
-                    "val_top1": val_metrics["top1_accuracy"],
-                    "config": vars(args),
-                }, ckpt_dir / "best.pt")
+                from pawn.checkpoint import save_adapter_checkpoint
+                save_adapter_checkpoint(
+                    ckpt_dir / "best",
+                    model.sparse_state_dict(),
+                    config=vars(args),
+                    epoch=epoch,
+                    step=global_step,
+                    val_metrics=val_metrics,
+                )
+                if args.hf_repo and hf_branch:
+                    from pawn.checkpoint import push_checkpoint_to_hf
+                    try:
+                        push_checkpoint_to_hf(ckpt_dir / "best", args.hf_repo, hf_branch, step=global_step)
+                        print(f"Pushed to HF: {args.hf_repo}@{hf_branch}")
+                    except Exception as e:
+                        print(f"WARNING: HF push failed: {e}")
             else:
                 patience_counter += 1
                 if patience_counter >= args.patience:
                     print(f"\n  Early stopping at epoch {epoch} (patience={args.patience})")
                     break
 
-    torch.save({
-        "sparse_state_dict": model.sparse_state_dict(),
-        "epoch": epoch,
-        "step": global_step,
-        "val_loss": val_metrics["loss"],
-        "val_top1": val_metrics["top1_accuracy"],
-        "config": vars(args),
-    }, ckpt_dir / "final.pt")
+        if _shutdown_requested:
+            print("Shutdown requested, saving checkpoint...")
+            break
+
+    from pawn.checkpoint import save_adapter_checkpoint
+    save_adapter_checkpoint(
+        ckpt_dir / "final",
+        model.sparse_state_dict(),
+        config=vars(args),
+        epoch=epoch,
+        step=global_step,
+        val_metrics=val_metrics,
+    )
+    if args.hf_repo and hf_branch:
+        from pawn.checkpoint import push_checkpoint_to_hf
+        try:
+            push_checkpoint_to_hf(ckpt_dir / "final", args.hf_repo, hf_branch, step=global_step)
+            print(f"Pushed to HF: {args.hf_repo}@{hf_branch}")
+        except Exception as e:
+            print(f"WARNING: HF push failed: {e}")
 
     print(f"\nDone. Best val_loss={best_val_loss:.4f}")
     print(f"Checkpoints saved to {out_dir}")

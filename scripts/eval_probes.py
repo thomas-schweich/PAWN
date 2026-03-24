@@ -11,20 +11,17 @@ import torch
 from pawn.config import CLMConfig
 from pawn.model import PAWNCLM
 from pawn.eval_suite.probes import extract_probe_data, train_all_probes
-from pawn.gpu import configure_gpu
 
 
 def load_model_from_checkpoint(checkpoint_path: str, device: str) -> PAWNCLM:
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    config_dict = ckpt.get("model_config")
-    if config_dict:
-        cfg = CLMConfig(**config_dict)
+    from pawn.checkpoint import load_backbone_weights
+    state_dict, model_config = load_backbone_weights(checkpoint_path, device)
+    if model_config:
+        cfg = CLMConfig(**model_config)
     else:
-        state = ckpt["model_state_dict"]
-        d_model = state["embed.src_embed.weight"].shape[1]
-        n_layers = max(int(k.split(".")[1]) for k in state if k.startswith("layers.")) + 1
-        n_heads = state["layers.0.attn.wq.weight"].shape[0] // (d_model // (d_model // (state["layers.0.attn.wq.weight"].shape[0] // d_model * d_model // state["layers.0.attn.wq.weight"].shape[0]) if True else 1))
-        # Infer config from known variants
+        # Fallback: infer from state dict shapes
+        d_model = state_dict["embed.src_embed.weight"].shape[1]
+        n_layers = max(int(k.split(".")[1]) for k in state_dict if k.startswith("layers.")) + 1
         if d_model == 256 and n_layers == 8:
             cfg = CLMConfig.small()
         elif d_model == 512 and n_layers == 8:
@@ -33,9 +30,8 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str) -> PAWNCLM:
             cfg = CLMConfig.large()
         else:
             cfg = CLMConfig(d_model=d_model, n_layers=n_layers)
-
     model = PAWNCLM(cfg).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(state_dict)
     model.eval()
     return model
 
@@ -52,6 +48,7 @@ def main():
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     if device == "cuda":
+        from pawn.gpu import configure_gpu
         gpu_cfg = configure_gpu()
         import pawn.model as model_module
         model_module.SDPA_BACKEND = gpu_cfg.get("sdpa_backend")

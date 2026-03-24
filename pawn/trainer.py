@@ -207,16 +207,26 @@ def _make_run_dir(base_log_dir: str) -> str:
 
 
 class CLMTrainer:
-    def __init__(self, train_cfg: TrainingConfig, model_cfg: CLMConfig):
+    def __init__(
+        self,
+        train_cfg: TrainingConfig,
+        model_cfg: CLMConfig,
+        hf_repo: str | None = None,
+    ):
         self.cfg = train_cfg
         self.model_cfg = model_cfg
         self.device = train_cfg.device
         self.global_step = 0
+        self.hf_repo = hf_repo
+        self.hf_branch: str | None = None
 
         self.run_dir = _make_run_dir(train_cfg.log_dir)
         self.cfg.checkpoint_dir = os.path.join(self.run_dir, "checkpoints")
         self._jsonl_path = os.path.join(self.run_dir, "metrics.jsonl")
         self._jsonl_file = None
+
+        if self.hf_repo:
+            self.hf_branch = f"run/{os.path.basename(self.run_dir)}"
 
         self._model = PAWNCLM(model_cfg).to(self.device)
         self.model = self._model
@@ -449,12 +459,13 @@ class CLMTrainer:
             prefetch_factor=1 if num_workers > 0 else None,
         )
 
+        _shutdown_requested = False
+        _shutdown_signal = None
+
         def _graceful_exit(signum, frame):
-            print(f"\nReceived signal {signum}, saving checkpoint and exiting...")
-            self.save_checkpoint()
-            if self._jsonl_file:
-                self._jsonl_file.close()
-            sys.exit(128 + signum)
+            nonlocal _shutdown_requested, _shutdown_signal
+            _shutdown_requested = True
+            _shutdown_signal = signum
 
         old_term = signal.signal(signal.SIGTERM, _graceful_exit)
         old_int = signal.signal(signal.SIGINT, _graceful_exit)
@@ -547,6 +558,12 @@ class CLMTrainer:
                     self.save_checkpoint()
                     break
 
+                if _shutdown_requested:
+                    print(f"\nShutdown requested (signal {_shutdown_signal}), "
+                          f"saving checkpoint at step {self.global_step}...")
+                    self.save_checkpoint()
+                    break
+
                 step_start = time.time()
 
         signal.signal(signal.SIGTERM, old_term)
@@ -557,49 +574,47 @@ class CLMTrainer:
             self._jsonl_file = None
 
     def save_checkpoint(self, path: str | None = None):
+        from pawn.checkpoint import save_pretrain_checkpoint
+
         if path is None:
             path = os.path.join(
-                self.cfg.checkpoint_dir, f"step_{self.global_step:08d}.pt"
+                self.cfg.checkpoint_dir, f"step_{self.global_step:08d}"
             )
-
-        dirname = os.path.dirname(path)
-        if dirname:
-            os.makedirs(dirname, exist_ok=True)
 
         model: PAWNCLM = self._eager_model()
 
-        torch.save(
-            {
-                "global_step": self.global_step,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": self.scheduler.state_dict(),
-                "scaler_state_dict": self.scaler.state_dict(),
-                "model_config": self.model_cfg.__dict__,
-                "training_config": self.cfg.__dict__,
-                "torch_rng_state": torch.get_rng_state(),
-                "cuda_rng_state": (
-                    torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-                ),
-            },
+        save_pretrain_checkpoint(
             path,
+            model,
+            self.optimizer,
+            self.scheduler,
+            self.scaler,
+            self.global_step,
+            self.model_cfg.__dict__,
+            self.cfg.__dict__,
         )
         print(f"Checkpoint saved: {path}")
 
+        if self.hf_repo and self.hf_branch:
+            from pawn.checkpoint import push_checkpoint_to_hf
+            try:
+                push_checkpoint_to_hf(
+                    path, self.hf_repo, self.hf_branch,
+                    metrics_path=self._jsonl_path,
+                    step=self.global_step,
+                )
+                print(f"Pushed to HF: {self.hf_repo}@{self.hf_branch}")
+            except Exception as e:
+                print(f"WARNING: HF push failed: {e}")
+
     def load_checkpoint(self, path: str):
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.global_step = ckpt["global_step"]
+        from pawn.checkpoint import load_pretrain_checkpoint
 
         model: PAWNCLM = self._eager_model()
 
-        model.load_state_dict(ckpt["model_state_dict"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        self.scaler.load_state_dict(ckpt["scaler_state_dict"])
-
-        if ckpt.get("torch_rng_state") is not None:
-            torch.set_rng_state(ckpt["torch_rng_state"].cpu().byte())
-        if ckpt.get("cuda_rng_state") is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state(ckpt["cuda_rng_state"].cpu().byte())
-
+        meta = load_pretrain_checkpoint(
+            path, model, self.optimizer, self.scheduler, self.scaler,
+            device=self.device,
+        )
+        self.global_step = meta["global_step"]
         print(f"Resumed from step {self.global_step}")

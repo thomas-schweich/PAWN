@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import signal
 import time
 from pathlib import Path
 
@@ -228,6 +229,12 @@ def parse_args():
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--num-workers", type=int, default=3)
 
+    ckpt_group = p.add_mutually_exclusive_group(required=True)
+    ckpt_group.add_argument("--hf-repo", type=str, default=None,
+                            help="Push checkpoints to this HuggingFace repo (requires HF_TOKEN)")
+    ckpt_group.add_argument("--local-checkpoints", action="store_true",
+                            help="Save checkpoints locally only")
+
     return p.parse_args()
 
 
@@ -254,6 +261,10 @@ def main():
 
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
+
+    hf_branch = None
+    if args.hf_repo:
+        hf_branch = f"run/{out_dir.name}"
 
     # Build model
     model = TinyChessLM(
@@ -358,6 +369,13 @@ def main():
     global_step = 0
     val_metrics = baseline
 
+    _shutdown_requested = False
+    def _graceful_exit(signum, frame):
+        nonlocal _shutdown_requested
+        _shutdown_requested = True
+    signal.signal(signal.SIGTERM, _graceful_exit)
+    signal.signal(signal.SIGINT, _graceful_exit)
+
     print(f"\nTraining for up to {args.epochs} epochs ({total_steps} steps)")
     print(f"  Warmup: {warmup_steps} steps, LR: {args.lr}")
 
@@ -428,23 +446,38 @@ def main():
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 patience_counter = 0
-                torch.save({
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "scaler_state_dict": scaler.state_dict() if scaler else None,
-                    "epoch": epoch, "step": global_step,
-                    "val_loss": val_metrics["loss"],
-                    "val_top1": val_metrics["top1_accuracy"],
-                    "best_val_loss": best_val_loss,
-                    "patience_counter": patience_counter,
-                    "config": vars(args),
-                }, ckpt_dir / "best.pt")
+                from pawn.checkpoint import save_pretrain_checkpoint
+                save_pretrain_checkpoint(
+                    ckpt_dir / "best",
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    global_step=global_step,
+                    model_config={
+                        "d_model": args.d_model,
+                        "n_layers": args.n_layers,
+                        "n_heads": args.n_heads,
+                        "d_ff": args.d_ff,
+                    },
+                    training_config=vars(args),
+                )
+                if args.hf_repo and hf_branch:
+                    from pawn.checkpoint import push_checkpoint_to_hf
+                    try:
+                        push_checkpoint_to_hf(ckpt_dir / "best", args.hf_repo, hf_branch, step=global_step)
+                        print(f"Pushed to HF: {args.hf_repo}@{hf_branch}")
+                    except Exception as e:
+                        print(f"WARNING: HF push failed: {e}")
             else:
                 patience_counter += 1
                 if patience_counter >= args.patience:
                     print(f"\n  Early stopping at epoch {epoch} (patience={args.patience})")
                     break
+
+        if _shutdown_requested:
+            print("Shutdown requested, saving checkpoint...")
+            break
 
     logger.close()
     print(f"\nDone. Best val_loss={best_val_loss:.4f}")

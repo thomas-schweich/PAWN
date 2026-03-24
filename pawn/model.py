@@ -37,7 +37,7 @@ def _build_decomposition_table() -> torch.Tensor:
 
     for token_idx, uci_str in vocab["token_to_move"].items():
         if token_idx >= OUTCOME_TOKEN_BASE:
-            continue  # Skip EOG (and beyond)
+            continue  # Outcome tokens use standalone embeddings
         src_name = uci_str[:2]
         dst_name = uci_str[2:4]
         promo_suffix = uci_str[4:] if len(uci_str) > 4 else ""

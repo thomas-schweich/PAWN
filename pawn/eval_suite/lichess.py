@@ -9,8 +9,8 @@ import torch.nn as nn
 
 import chess_engine as engine
 
-from pawn.config import PAD_TOKEN, WHITE_CHECKMATES
-from pawn.data import _to_clm_batch, _map_termination_to_outcome
+from pawn.config import PAD_TOKEN, WHITE_CHECKMATES, PLY_LIMIT
+from pawn.data import pack_clm_sequences, _map_termination_to_outcome
 
 
 # ---------------------------------------------------------------------------
@@ -139,12 +139,11 @@ def evaluate_on_lichess(
         game_lengths = band_data["game_lengths"]
         n = len(move_ids)
 
-        # We don't have true termination codes for Lichess games parsed via PGN
-        # (the Rust parser returns move sequences, not outcomes).
-        # Use a dummy termination code and outcome token.
-        # For loss/accuracy evaluation, the outcome token choice doesn't matter
+        # We don't have true termination codes for Lichess games parsed via PGN.
+        # Use PLY_LIMIT as a dummy outcome token for all games — for
+        # loss/accuracy evaluation the outcome token choice doesn't matter
         # much since we evaluate on move prediction, not outcome prediction.
-        term_codes = np.full(n, 5, dtype=np.uint8)  # PLY_LIMIT as default
+        dummy_outcomes = torch.full((n,), PLY_LIMIT, dtype=torch.long)
 
         engine_max_ply = max_seq_len - 1
         # Pad/truncate move_ids to engine_max_ply
@@ -154,7 +153,7 @@ def evaluate_on_lichess(
             padded[i, :gl] = move_ids[i, :gl]
         game_lengths_capped = np.minimum(game_lengths, engine_max_ply).astype(np.int16)
 
-        batch = _to_clm_batch(padded, game_lengths_capped, term_codes, max_seq_len)
+        batch = pack_clm_sequences(padded, game_lengths_capped, dummy_outcomes, max_seq_len)
         input_ids = batch["input_ids"]
         targets = batch["targets"]
         loss_mask = batch["loss_mask"]

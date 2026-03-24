@@ -1,5 +1,4 @@
-# Checkpoints and logs
-checkpoints/
+# Local checkpoints and logs
 logs/
 
 # Training data
@@ -7,6 +6,7 @@ data/
 
 # Deployment artifacts
 deploy/pawn-deploy/
+export/
 
 # Python
 __pycache__/
@@ -36,8 +36,15 @@ Thumbs.db
 # uv (track root lockfile only)
 engine/uv.lock
 
+# Local working files
+local/
+
 # Misc
 runpodctl.tar.gz
 .claude/
+<<<<<<< HEAD
+.playwright-mcp
+=======
 .playwright-mcp/
 local/
+>>>>>>> c965110657b87bef82768cf9960b3f5486c54867

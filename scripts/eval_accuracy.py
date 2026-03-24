@@ -65,37 +65,47 @@ def parse_args():
     return p.parse_args()
 
 
-def _detect_adapter_type(ckpt: dict) -> str:
-    """Auto-detect adapter type from checkpoint keys."""
-    if "adapter_state_dict" in ckpt:
-        return "hybrid"
-    if "lora_state_dict" in ckpt:
-        return "lora"
-    if "film_state_dict" in ckpt:
-        return "film"
-    if "sparse_state_dict" in ckpt:
-        return "sparse"
-    if "bottleneck_state_dict" in ckpt:
+def _detect_adapter_type(config: dict) -> str:
+    """Auto-detect adapter type from config dict.
+
+    The config dict comes from load_adapter_checkpoint()["config"], which
+    contains training args for both legacy .pt files and new-format directories.
+    """
+    if "checkpoint_type" in config:
+        return config["checkpoint_type"]
+    if "bottleneck_dim" in config:
         return "bottleneck"
-    raise ValueError("Cannot detect adapter type from checkpoint keys: "
-                     + ", ".join(ckpt.keys()))
+    if "lora_rank" in config and config.get("use_film") is not None:
+        return "hybrid"
+    if "lora_rank" in config:
+        return "lora"
+    if "density" in config:
+        return "sparse"
+    if "no_output_film" in config:
+        return "film"
+
+    raise ValueError("Cannot detect adapter type from config keys: "
+                     + ", ".join(config.keys()))
 
 
 def load_model(checkpoint_path: str, adapter_path: str, device: str):
     """Load backbone + adapter, auto-detecting adapter type."""
+    from pawn.checkpoint import load_backbone_weights, load_adapter_checkpoint
+
     # Backbone
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg = CLMConfig(**ckpt["model_config"]) if "model_config" in ckpt else CLMConfig()
+    state_dict, model_config = load_backbone_weights(checkpoint_path, device)
+    cfg = CLMConfig(**model_config) if model_config else CLMConfig()
     backbone = PAWNCLM(cfg).to(device)
-    backbone.load_state_dict(ckpt["model_state_dict"])
-    del ckpt
+    backbone.load_state_dict(state_dict)
+    del state_dict
     gc.collect()
     backbone.eval()
 
     # Adapter
-    adapter_ckpt = torch.load(adapter_path, map_location=device, weights_only=False)
-    adapter_type = _detect_adapter_type(adapter_ckpt)
-    adapter_config = adapter_ckpt.get("config", {})
+    adapter_data = load_adapter_checkpoint(adapter_path, device)
+    adapter_weights = adapter_data["adapter_state_dict"]
+    adapter_config = adapter_data.get("config", {})
+    adapter_type = _detect_adapter_type(adapter_config)
 
     if adapter_type == "lora":
         from pawn.adapters.lora import LoRACLM
@@ -108,15 +118,15 @@ def load_model(checkpoint_path: str, adapter_path: str, device: str):
             layers=tuple(int(x) for x in adapter_config["lora_layers"].split(","))
                    if adapter_config.get("lora_layers") else None,
         ).to(device)
-        model.load_lora_state_dict(adapter_ckpt["lora_state_dict"])
+        model.load_lora_state_dict(adapter_weights)
 
     elif adapter_type == "film":
         from pawn.adapters.film import FiLMCLM
         has_output = not adapter_config.get("no_output_film", False)
-        if any(k.startswith("output_film.") for k in adapter_ckpt["film_state_dict"]):
+        if any(k.startswith("output_film.") for k in adapter_weights):
             has_output = True
         model = FiLMCLM(backbone, use_output_film=has_output).to(device)
-        model.load_film_state_dict(adapter_ckpt["film_state_dict"])
+        model.load_film_state_dict(adapter_weights)
 
     elif adapter_type == "hybrid":
         from pawn.adapters.hybrid import HybridCLM
@@ -133,7 +143,7 @@ def load_model(checkpoint_path: str, adapter_path: str, device: str):
             use_output_film=adapter_config.get("output_film", False),
             film_layers=tuple(int(x) for x in film_layers.split(",")) if film_layers else None,
         ).to(device)
-        model.load_adapter_state_dict(adapter_ckpt["adapter_state_dict"])
+        model.load_adapter_state_dict(adapter_weights)
 
     elif adapter_type == "sparse":
         from pawn.adapters.sparse import SparseCLM
@@ -148,7 +158,7 @@ def load_model(checkpoint_path: str, adapter_path: str, device: str):
             layers=tuple(int(x) for x in sparse_layers.split(",")) if sparse_layers else None,
             seed=adapter_config.get("sparse_seed", 42),
         ).to(device)
-        model.load_sparse_state_dict(adapter_ckpt["sparse_state_dict"])
+        model.load_sparse_state_dict(adapter_weights)
 
     elif adapter_type == "bottleneck":
         from pawn.adapters.bottleneck import BottleneckCLM
@@ -160,7 +170,7 @@ def load_model(checkpoint_path: str, adapter_path: str, device: str):
             adapt_ffn=adapter_config.get("adapt_ffn", True),
             layers=tuple(int(x) for x in adapter_layers_str.split(",")) if adapter_layers_str else None,
         ).to(device)
-        model.load_adapter_state_dict(adapter_ckpt["bottleneck_state_dict"])
+        model.load_adapter_state_dict(adapter_weights)
 
     model.eval()
     return model, adapter_type

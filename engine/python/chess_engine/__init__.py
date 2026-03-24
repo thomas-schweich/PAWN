@@ -8,6 +8,7 @@ from chess_engine._engine import (
     # Core game generation
     generate_training_batch,
     generate_random_games,
+    generate_clm_batch,
     generate_checkmate_games,
     generate_checkmate_training_batch,
     # Diagnostic sets
@@ -37,6 +38,7 @@ from chess_engine._engine import (
 __all__ = [
     "generate_training_batch",
     "generate_random_games",
+    "generate_clm_batch",
     "generate_checkmate_games",
     "generate_checkmate_training_batch",
     "generate_diagnostic_sets",

@@ -62,15 +62,15 @@ def run_in_worker(fn: Callable[..., Any], *args: Any, timeout: float | None = No
 
 def _load_model(checkpoint_path: str, device: str) -> PAWNCLM:
     """Load and freeze a PAWNCLM checkpoint. Runs inside worker processes."""
-    import torch
+    from pawn.checkpoint import load_backbone_weights
     from pawn.config import CLMConfig
     from pawn.model import PAWNCLM
 
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg = CLMConfig(**ckpt["model_config"]) if "model_config" in ckpt else CLMConfig()
+    state_dict, model_config = load_backbone_weights(checkpoint_path, device)
+    cfg = CLMConfig(**model_config) if model_config else CLMConfig()
     model = PAWNCLM(cfg).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    del ckpt
+    model.load_state_dict(state_dict)
+    del state_dict
     gc.collect()
     model.eval()
     for p in model.parameters():

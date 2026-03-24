@@ -15,7 +15,6 @@ import chess_engine as engine
 
 from pawn.config import CLMConfig
 from pawn.model import PAWNCLM
-from pawn.data import _to_clm_batch
 
 
 # ---------------------------------------------------------------------------
@@ -77,21 +76,16 @@ def extract_probe_data(
 
     Returns dict with all arrays needed for all probes.
     """
-    engine_max_ply = max_ply - 1
-
-    move_ids_np, game_lengths_np, term_codes_np = engine.generate_random_games(
-        n_games, engine_max_ply, seed
-    )
+    input_ids, targets, loss_mask, move_ids_np, game_lengths_np, _tc = \
+        engine.generate_clm_batch(n_games, max_ply, seed)
 
     boards_np, side_np, castling_np, ep_np, check_np, halfmove_np = (
         engine.extract_board_states(move_ids_np, game_lengths_np)
     )
 
-    batch = _to_clm_batch(move_ids_np, game_lengths_np, term_codes_np, max_ply)
-
     result = {
-        "input_ids": batch["input_ids"],
-        "loss_mask": batch["loss_mask"],
+        "input_ids": torch.from_numpy(input_ids).long(),
+        "loss_mask": torch.from_numpy(loss_mask),
         "boards": torch.from_numpy(boards_np.copy()).long(),
         "side_to_move": torch.from_numpy(side_np.copy()).float(),
         "castling_rights": torch.from_numpy(castling_np.copy()),

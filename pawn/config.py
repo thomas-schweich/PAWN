@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 
-# Outcome token IDs (spec section 3.2)
+# Outcome token IDs — must match engine/src/vocab.rs
 PAD_TOKEN = 0
 OUTCOME_TOKEN_BASE = 4273
 WHITE_CHECKMATES = 4273

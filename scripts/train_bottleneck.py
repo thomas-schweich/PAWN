@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import gc
 import math
+import signal
 import time
 from pathlib import Path
 
@@ -90,15 +91,22 @@ def parse_args():
     p.add_argument("--resume", type=str, default=None,
                     help="Path to checkpoint to resume from (best.pt or final.pt)")
 
+    ckpt_group = p.add_mutually_exclusive_group(required=True)
+    ckpt_group.add_argument("--hf-repo", type=str, default=None,
+                            help="Push checkpoints to this HuggingFace repo (requires HF_TOKEN)")
+    ckpt_group.add_argument("--local-checkpoints", action="store_true",
+                            help="Save checkpoints locally only")
+
     return p.parse_args()
 
 
 def load_backbone(checkpoint_path: str, device: str) -> PAWNCLM:
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg = CLMConfig(**ckpt["model_config"]) if "model_config" in ckpt else CLMConfig()
+    from pawn.checkpoint import load_backbone_weights
+    state_dict, model_config = load_backbone_weights(checkpoint_path, device)
+    cfg = CLMConfig(**model_config) if model_config else CLMConfig()
     model = PAWNCLM(cfg).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    del ckpt
+    model.load_state_dict(state_dict)
+    del state_dict
     gc.collect()
     model.eval()
     return model
@@ -196,6 +204,10 @@ def main():
 
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
+
+    hf_branch = None
+    if args.hf_repo:
+        hf_branch = f"run/{out_dir.name}"
 
     print(f"Device: {device}")
     print(f"Output: {out_dir}")
@@ -312,17 +324,18 @@ def main():
 
     if args.resume:
         print(f"\nResuming from: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_adapter_state_dict(ckpt["bottleneck_state_dict"])
-        if "optimizer_state_dict" in ckpt:
+        from pawn.checkpoint import load_adapter_checkpoint
+        ckpt = load_adapter_checkpoint(args.resume, device=device)
+        model.load_adapter_state_dict(ckpt["adapter_state_dict"])
+        if ckpt.get("optimizer_state_dict"):
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt:
+        if ckpt.get("scheduler_state_dict"):
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         if scaler and ckpt.get("scaler_state_dict"):
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt["step"]
-        best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
+        best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_metrics", {}).get("loss", float("inf")))
         patience_counter = ckpt.get("patience_counter", 0)
         print(f"  Resumed at epoch {start_epoch}, step {global_step}, "
               f"best_val_loss={best_val_loss:.4f}")
@@ -357,6 +370,13 @@ def main():
 
     val_metrics = evaluate(model, val_loader, mask_builder, device, use_amp=use_amp,
                            precomputed_indices=val_legal_indices) if args.resume else baseline
+
+    _shutdown_requested = False
+    def _graceful_exit(signum, frame):
+        nonlocal _shutdown_requested
+        _shutdown_requested = True
+    signal.signal(signal.SIGTERM, _graceful_exit)
+    signal.signal(signal.SIGINT, _graceful_exit)
 
     print(f"\nTraining for up to {args.epochs} epochs ({total_steps} steps)")
     print(f"  Warmup: {warmup_steps} steps, LR: {args.lr}")
@@ -434,38 +454,56 @@ def main():
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 patience_counter = 0
-                torch.save({
-                    "bottleneck_state_dict": model.adapter_state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "scaler_state_dict": scaler.state_dict() if scaler else None,
-                    "epoch": epoch,
-                    "step": global_step,
-                    "val_loss": val_metrics["loss"],
-                    "val_top1": val_metrics["top1_accuracy"],
-                    "best_val_loss": best_val_loss,
-                    "patience_counter": patience_counter,
-                    "config": vars(args),
-                }, ckpt_dir / "best.pt")
+                from pawn.checkpoint import save_adapter_checkpoint
+                save_adapter_checkpoint(
+                    ckpt_dir / "best",
+                    model.adapter_state_dict(),
+                    config=vars(args),
+                    epoch=epoch,
+                    step=global_step,
+                    val_metrics=val_metrics,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    extra={"best_val_loss": best_val_loss, "patience_counter": patience_counter},
+                )
+                if args.hf_repo and hf_branch:
+                    from pawn.checkpoint import push_checkpoint_to_hf
+                    try:
+                        push_checkpoint_to_hf(ckpt_dir / "best", args.hf_repo, hf_branch, step=global_step)
+                        print(f"Pushed to HF: {args.hf_repo}@{hf_branch}")
+                    except Exception as e:
+                        print(f"WARNING: HF push failed: {e}")
             else:
                 patience_counter += 1
                 if patience_counter >= args.patience:
                     print(f"\n  Early stopping at epoch {epoch} (patience={args.patience})")
                     break
 
-    torch.save({
-        "bottleneck_state_dict": model.adapter_state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "scaler_state_dict": scaler.state_dict() if scaler else None,
-        "epoch": epoch,
-        "step": global_step,
-        "val_loss": val_metrics["loss"],
-        "val_top1": val_metrics["top1_accuracy"],
-        "best_val_loss": best_val_loss,
-        "patience_counter": patience_counter,
-        "config": vars(args),
-    }, ckpt_dir / "final.pt")
+        if _shutdown_requested:
+            print("Shutdown requested, saving checkpoint...")
+            break
+
+    from pawn.checkpoint import save_adapter_checkpoint
+    save_adapter_checkpoint(
+        ckpt_dir / "final",
+        model.adapter_state_dict(),
+        config=vars(args),
+        epoch=epoch,
+        step=global_step,
+        val_metrics=val_metrics,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        extra={"best_val_loss": best_val_loss, "patience_counter": patience_counter},
+    )
+    if args.hf_repo and hf_branch:
+        from pawn.checkpoint import push_checkpoint_to_hf
+        try:
+            push_checkpoint_to_hf(ckpt_dir / "final", args.hf_repo, hf_branch, step=global_step)
+            print(f"Pushed to HF: {args.hf_repo}@{hf_branch}")
+        except Exception as e:
+            print(f"WARNING: HF push failed: {e}")
 
     logger.close()
     print(f"\nDone. Best val_loss={best_val_loss:.4f}")
