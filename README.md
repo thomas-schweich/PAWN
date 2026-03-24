@@ -32,7 +32,9 @@ Notably, the vocabulary includes impossible moves like `a1a1` and `b1a5`. PAWN n
 
 Conceptually, each token is best thought of as a move in UCI notation--they are effectively coordinates. They do not include any information on the type of peice, side to play, or any direct geometric or board state information other than the factored nature of the embeddings (see the architecture section below for details). 
 
-For example, `e2e4` is the token that represents the king's pawn opening, but only when it's the first ply in the sequence (moving a rook between from e2 to e4 in the late game would use the same token). The model learns to track which type of peice is on each square any given moment entirely of its own accord. For that matter, it isn't even told what piece types exist and what movement patterns they follow, or indeed even the concept of a peice. All of that 'understanding' comes purely from observation.
+For example, `e2e4` is the token that represents the king's pawn opening, but only when it's the first ply in the sequence (moving a rook between from e2 to e4 in the late game would use the same token). The model learns to track which type of peice is on each square any given moment entirely of its own accord. 
+
+For that matter, it isn't told what piece types exist, what movement patterns they follow, or indeed the concept of a peice. All of that 'understanding' comes purely from observation and can be isolated via [linear probes](https://arxiv.org/abs/1610.01644) (Alain & Bengio, 2016).
 
 ## Quickstart
 
