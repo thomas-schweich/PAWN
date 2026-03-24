@@ -4,11 +4,11 @@ PAWN is designed as a testbed for parameter-efficient fine-tuning. The frozen 30
 
 All adapter implementations live in `pawn/adapters/`. Each wraps a frozen `PAWNCLM` backbone and exposes a uniform interface: `forward_hidden()`, `project_head()`, `forward()`, and `forward_generate()` (with KV-cache).
 
-## Bottleneck (Houlsby-style)
+## Bottleneck ([Houlsby et al., 2019](https://arxiv.org/abs/1902.00751))
 
 **Module:** `pawn.adapters.bottleneck.BottleneckCLM`
 
-Inserts small residual MLP bottlenecks after the attention sublayer and/or FFN sublayer within each transformer block:
+Inserts small residual MLP bottlenecks after the attention sublayer and/or FFN sublayer within each transformer block, following "Parameter-Efficient Transfer Learning for NLP" (ICML 2019):
 
 ```
 x = x + up(gelu(down(x)))
@@ -26,11 +26,11 @@ The up-projection is zero-initialized, so the model starts identical to the froz
 
 Best performer at low parameter budgets. The GELU nonlinearity and full-rank projections provide the most expressive per-parameter adaptation.
 
-## LoRA (Low-Rank Adaptation)
+## LoRA ([Hu et al., 2021](https://arxiv.org/abs/2106.09685))
 
 **Module:** `pawn.adapters.lora.LoRACLM`
 
-Injects rank-r adapters into attention projections (and optionally FFN) in every transformer layer (Hu et al., 2021):
+Injects rank-r adapters into attention projections (and optionally FFN) in every transformer layer, following "LoRA: Low-Rank Adaptation of Large Language Models" (ICLR 2022):
 
 ```
 output = frozen_linear(x) + (x @ A^T) @ B^T * (alpha / rank)
@@ -47,11 +47,11 @@ B is zero-initialized for identity start. A is Kaiming-initialized. LoRA modifie
 
 **Param count:** `n_layers * n_targets * 2 * d_model * rank` (e.g. 131K at rank=4, qkvo, all 8 layers).
 
-## FiLM (Feature-wise Linear Modulation)
+## FiLM ([Perez et al., 2017](https://arxiv.org/abs/1709.07871))
 
 **Module:** `pawn.adapters.film.FiLMCLM`
 
-Applies learned per-channel affine transforms after each transformer block and optionally on the output logits:
+Applies learned per-channel affine transforms after each transformer block and optionally on the output logits, following "FiLM: Visual Reasoning with a General Conditioning Layer" (AAAI 2018):
 
 ```
 h_adapted = gamma * h + beta       (hidden layers, dim = d_model)
@@ -69,7 +69,7 @@ Identity-initialized: gamma=1, beta=0.
 
 **Module:** `pawn.adapters.sparse.SparseCLM`
 
-Perturbs a random subset of frozen weight elements. A fixed binary mask selects which weight positions get a trainable additive delta (zero-initialized):
+Perturbs a random subset of frozen weight elements (related to sparse fine-tuning ideas from the [lottery ticket hypothesis](https://arxiv.org/abs/1803.03635); Frankle & Carbin, 2018). A fixed binary mask selects which weight positions get a trainable additive delta (zero-initialized):
 
 ```
 W_effective = W_frozen + delta * mask
@@ -88,7 +88,7 @@ The mask is generated once at initialization from a fixed seed and never changes
 
 Excels at high parameter budgets where many small perturbations to existing weights can outperform structured adapters.
 
-## Hybrid (LoRA + FiLM)
+## Hybrid ([LoRA](https://arxiv.org/abs/2106.09685) + [FiLM](https://arxiv.org/abs/1709.07871))
 
 **Module:** `pawn.adapters.hybrid.HybridCLM`
 

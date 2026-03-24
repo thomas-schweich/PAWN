@@ -1,5 +1,8 @@
 """LoRA (Low-Rank Adaptation) for PAWN.
 
+Implements `Hu et al., 2021 <https://arxiv.org/abs/2106.09685>`_
+("LoRA: Low-Rank Adaptation of Large Language Models", ICLR 2022).
+
 Injects rank-r adapters into Q, K, V, O attention projections (and optionally
 FFN projections) in all transformer layers:
 

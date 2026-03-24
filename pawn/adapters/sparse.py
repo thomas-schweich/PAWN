@@ -2,7 +2,9 @@
 
 Perturbs a random subset of frozen weight elements. Each selected weight
 gets an additive trainable delta (zero-initialized, so the model starts
-identical to the frozen backbone).
+identical to the frozen backbone).  Related to sparse fine-tuning ideas
+from the lottery ticket literature (`Frankle & Carbin, 2018
+<https://arxiv.org/abs/1803.03635>`_, ICLR 2019).
 
     output = linear(x)  where  W = W_frozen + delta * mask
 
