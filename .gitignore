@@ -7,6 +7,7 @@ data/
 
 # Deployment artifacts
 deploy/pawn-deploy/
+export/
 
 # Python
 __pycache__/
@@ -42,3 +43,4 @@ local/
 # Misc
 runpodctl.tar.gz
 .claude/
+.playwright-mcp
