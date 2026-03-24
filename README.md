@@ -24,23 +24,23 @@ To aid in exploring how model size affects different finetuning methods, I train
 All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), factored move embeddings, and a 4278-token vocabulary covering:
 
 - all possible (src, dst) pairs for an 8x8 grid (the chess board),
-- promotion moves (one per promotion piece type per square on 1st or 8th rank), 
-- a token for each game outcome (`WHITE_CHECKMATE`, `BLACK_CHECKMATE`, `STALEMATE`, `DRAW_BY_RULE`, `PLY_LIMIT`),
+- promotion moves: 4 piece types (queen, bishop, rook, knight) × 44 eligible (source square, destination square) pairs for pawns reaching the 1st & 8th ranks,
+- a token for each game outcome (`WHITE_CHECKMATES`, `BLACK_CHECKMATES`, `STALEMATE`, `DRAW_BY_RULE`, `PLY_LIMIT`),
 - and a padding token.
 
 Notably, the vocabulary includes impossible moves like `a1a1` and `b1a5`. PAWN naturally learns to avoid these since they don't appear in its training examples.
 
-Conceptually, each token is best thought of as a move in UCI notation--they are effectively coordinates. They do not include any information on the type of peice, side to play, or any direct geometric or board state information other than the factored nature of the embeddings (see the architecture section below for details). 
+Conceptually, each token is best thought of as a move in UCI notation--they are effectively coordinates. They do not include any information on the type of piece, side to play, or any direct geometric or board state information other than the factored nature of the embeddings (see the architecture section below for details). 
 
-For example, `e2e4` is the token that represents the king's pawn opening, but only when it's the first ply in the sequence (moving a rook between from e2 to e4 in the late game would use the same token). The model learns to track which type of peice is on each square any given moment entirely of its own accord. 
+For example, `e2e4` is the token that represents the king's pawn opening, but only when it's the first ply in the sequence (moving a rook from e2 to e4 in the late game would use the same token). The model learns to track which type of piece is on each square at any given moment entirely of its own accord.
 
-For that matter, it isn't told what piece types exist, what movement patterns they follow, or indeed the concept of a peice. All of that 'understanding' comes purely from observation and can be isolated via [linear probes](https://arxiv.org/abs/1610.01644) (Alain & Bengio, 2016).
+For that matter, it isn't told what piece types exist, what movement patterns they follow, or indeed the concept of a piece. All of that 'understanding' comes purely from observation and can be isolated via [linear probes](https://arxiv.org/abs/1610.01644) (Alain & Bengio, 2016).
 
 ## Quickstart
 
 ```bash
 # Clone and build
-git clone https://github.com/<user>/pawn.git && cd pawn
+git clone https://github.com/thomas-schweich/PAWN.git && cd PAWN
 
 # Build the Rust chess engine
 cd engine && uv run --with maturin maturin develop --release && cd ..
@@ -82,15 +82,15 @@ The outcome token is one of `WHITE_CHECKMATES`, `BLACK_CHECKMATES`, `STALEMATE`,
 
 Ply tokens use a factored embedding: each move is decomposed into source square + destination square + promotion piece, with embeddings summed. This gives the model some degree of explicit spatial structure while keeping the vocabulary compact.
 
-The summed embeddings effectively represent UCI strings like `e2e4` (peice moves from `e2` to `e4`) or `f7f8q` (promotion to queen on `f8`). In factored form, the vector `e2e4` is given by `(e2xx + xxe4 + no_promotion)`. Likewise, `f7f8q` is given by `(f7xx + xxf8 + xxxxq)`.
+The summed embeddings effectively represent UCI strings like `e2e4` (a piece moves from `e2` to `e4`) or `f7f8q` (promotion to queen on `f8`). In factored form, the vector `e2e4` is given by `(e2xx + xxe4 + no_promotion)`. Likewise, `f7f8q` is given by `(f7xx + xxf8 + xxxxq)`.
 
 The context window of all variants is 256 tokens wide. Training examples all include the outcome token followed by up to 255 ply or padding tokens.
 
 During training, simulated games are retroactively prepended with their actual outcome. During inference, the outcome token has a measurable impact on subsequent completions.
 
-The models predictions are not masked to legal moves during training; it has to determine what moves are currently legal based on the seqeunce of moves so far.
+The model's predictions are not masked to legal moves during training; it has to determine what moves are currently legal based on the sequence of moves so far.
 
-No attempt is made to provide the model with information about other peices. In other words, it only thinks in moves. There is no equivalent of 7-dimensional manifold board representation used by e.g. [AlphaZero](https://arxiv.org/abs/1712.01815) (Silver et al., 2017) and [Lc0](https://github.com/LeelaChessZero/lc0). Any and all state representation and geometry is learned by the model internally.
+No attempt is made to provide the model with information about other pieces. In other words, it only thinks in moves. There is no equivalent of the multi-plane 8×8×N board representation used by e.g. [AlphaZero](https://arxiv.org/abs/1712.01815) (Silver et al., 2018) and [Lc0](https://github.com/LeelaChessZero/lc0). Any and all state representation and geometry is learned by the model internally.
 
 ## Adapter Methods
 <sub>More info: [docs/ADAPTERS.md](docs/ADAPTERS.md)</sub>
@@ -131,7 +131,7 @@ pawn/
 
 ## Chess Engine
 
-PAWN includes a bundled Rust chess engine (`engine/`) that handles all game simulation, move generation, legal move computation, and PGN parsing. The engine extensively uses [`shakmaty`](https://github.com/niklasf/shakmaty) under the hood, with [PyO3](https://github.com/PyO3/pyo3) bindings to Python. No Python chess libraries are used. The engine generates training data on-the-fly via `chess_engine.generate_random_games()`, which is capable of producing well over 100 million random games per hour on a on my CPU (AMD Ryzen 7800X3D).
+PAWN includes a bundled Rust chess engine (`engine/`) that handles all game simulation, move generation, legal move computation, and PGN parsing. The engine extensively uses [`shakmaty`](https://github.com/niklasf/shakmaty) under the hood, with [PyO3](https://github.com/PyO3/pyo3) bindings to Python. No Python chess libraries are used. The engine generates training data on-the-fly via `chess_engine.generate_random_games()`, which is capable of producing well over 100 million random games per hour on my CPU (AMD Ryzen 7800X3D).
 
 
 ## More info
@@ -156,8 +156,9 @@ PAWN builds on ideas and tools from the following projects and publications:
 | Bottleneck adapters | [Houlsby et al., "Parameter-Efficient Transfer Learning for NLP", ICML 2019](https://arxiv.org/abs/1902.00751) |
 | LoRA | [Hu et al., "LoRA: Low-Rank Adaptation of Large Language Models", ICLR 2022](https://arxiv.org/abs/2106.09685) |
 | FiLM | [Perez et al., "FiLM: Visual Reasoning with a General Conditioning Layer", AAAI 2018](https://arxiv.org/abs/1709.07871) |
-| MAIA evaluation | [McIlroy-Young et al., "Aligning Superhuman AI with Human Behavior: Chess as a Model System", KDD 2020](https://arxiv.org/abs/2006.01855) |
-| AlphaZero | [Silver et al., "A General Reinforcement Learning Algorithm that Masters Chess, Shogi, and Go", Science 2018](https://arxiv.org/abs/1712.01815) |
+| Linear probes | [Alain & Bengio, "Understanding Intermediate Layers Using Linear Classifier Probes", ICLR Workshop 2017](https://arxiv.org/abs/1610.01644) |
+| MAIA | [McIlroy-Young et al., "Aligning Superhuman AI with Human Behavior: Chess as a Model System", KDD 2020](https://arxiv.org/abs/2006.01855) |
+| AlphaZero | [Silver et al., "A General Reinforcement Learning Algorithm that Masters Chess, Shogi, and Go through Self-Play", Science 2018](https://arxiv.org/abs/1712.01815) |
 | Leela Chess Zero | [github.com/LeelaChessZero/lc0](https://github.com/LeelaChessZero/lc0) |
 | shakmaty | [github.com/niklasf/shakmaty](https://github.com/niklasf/shakmaty) |
 | PyO3 | [github.com/PyO3/pyo3](https://github.com/PyO3/pyo3) |
