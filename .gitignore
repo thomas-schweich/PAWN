@@ -1,5 +1,4 @@
-# Checkpoints and logs
-checkpoints/
+# Local checkpoints and logs
 logs/
 
 # Training data
