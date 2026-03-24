@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import os
+import random
 import shutil
 import signal
 import sys
@@ -47,8 +48,10 @@ class ModelSlot:
         device: str,
         hf_repo: str | None,
         shm_checkpoints: bool = False,
+        slug: str = "",
     ):
         self.name = name
+        self.slug = slug
         self.model_cfg = model_cfg
         self.train_cfg = train_cfg
         self.device = device
@@ -75,7 +78,7 @@ class ModelSlot:
         self.scaler = torch.amp.GradScaler(device, enabled=train_cfg.use_amp)
 
         # Run directory (logs always on persistent disk)
-        self.run_dir = _make_run_dir(train_cfg.log_dir, name)
+        self.run_dir = _make_run_dir(train_cfg.log_dir, name, slug)
 
         # Checkpoint directory: /dev/shm if requested, else under run_dir
         if shm_checkpoints:
@@ -119,6 +122,7 @@ class ModelSlot:
             "formulation": "clm",
             "multi_model": True,
             "variant": name,
+            "slug": slug,
             "git_hash": git_hash,
             "git_tag": git_tag,
         }
@@ -126,7 +130,8 @@ class ModelSlot:
             json.dump(config_data, f, indent=2, default=str)
         self._log_jsonl({"type": "config", **config_data})
 
-    def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
+    def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Forward + backward. Returns raw GPU tensor metrics (no .item() sync)."""
         self.model.train()
         input_ids = batch["input_ids"].to(self.device)
         targets = batch["targets"].to(self.device)
@@ -237,9 +242,27 @@ class ModelSlot:
             self._jsonl_file = None
 
 
-def _make_run_dir(log_dir: str, variant: str) -> str:
+_ADJECTIVES = [
+    "amber", "bold", "calm", "deft", "eager", "fair", "grim", "hale",
+    "keen", "lush", "mild", "neat", "pale", "quick", "rare", "sly",
+    "taut", "vast", "warm", "zesty", "brisk", "crisp", "dense", "fleet",
+    "grand", "hardy", "jolly", "lucid", "noble", "prime", "stark", "vivid",
+]
+_ANIMALS = [
+    "puma", "lynx", "hawk", "wolf", "bear", "deer", "fox", "owl",
+    "pike", "wren", "crane", "otter", "raven", "cobra", "heron", "bison",
+    "finch", "marten", "osprey", "falcon", "badger", "salmon", "condor",
+    "coyote", "ferret", "jackal", "marmot", "parrot", "turtle", "walrus",
+]
+
+
+def _random_slug() -> str:
+    return f"{random.choice(_ADJECTIVES)}-{random.choice(_ANIMALS)}"
+
+
+def _make_run_dir(log_dir: str, variant: str, slug: str) -> str:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(log_dir, f"run_{timestamp}_{variant}")
+    run_dir = os.path.join(log_dir, f"run_{timestamp}_{variant}_{slug}")
     os.makedirs(run_dir, exist_ok=True)
     return run_dir
 
@@ -252,7 +275,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train small/base/large PAWN models simultaneously")
     p.add_argument("--device", type=str, default=None, help="Device (cuda/cpu)")
     p.add_argument("--total-steps", type=int, default=100_000, help="Total training steps")
-    p.add_argument("--batch-size", type=int, default=256, help="Batch size (shared across models)")
+    p.add_argument("--batch-size", type=int, default=512, help="Batch size (shared across models)")
     p.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     p.add_argument("--log-dir", type=str, default="logs", help="Log directory")
     p.add_argument("--log-interval", type=int, default=10)
@@ -393,7 +416,9 @@ def main():
         "large": CLMConfig.large(),
     }
 
-    print("=== Multi-Model Training ===")
+    slug = _random_slug()
+
+    print(f"=== Multi-Model Training [{slug}] ===")
     print(f"Device: {device}")
     print(f"Batch size: {args.batch_size}")
     print(f"Total steps: {args.total_steps}")
@@ -401,9 +426,16 @@ def main():
         print("Checkpoints: /dev/shm (volatile, HF push is durable store)")
     print()
 
+    # Linear LR scaling: lr = base_lr * (batch_size / base_batch_size)
+    base_batch_size = 256
+    base_lr = TrainingConfig.lr
+    scaled_lr = base_lr * (args.batch_size / base_batch_size)
+    print(f"LR: {scaled_lr:.2e} (scaled from {base_lr:.2e} for batch {args.batch_size})")
+
     slots: list[ModelSlot] = []
     for name, model_cfg in variants.items():
         train_cfg = TrainingConfig()
+        train_cfg.lr = scaled_lr
         train_cfg.total_steps = args.total_steps
         train_cfg.batch_size = args.batch_size
         train_cfg.num_workers = args.num_workers
@@ -417,7 +449,7 @@ def main():
 
         hf_repo = f"{args.hf_repo}-{name}" if args.hf_repo else None
         slots.append(ModelSlot(name, model_cfg, train_cfg, device, hf_repo,
-                               shm_checkpoints=args.shm_checkpoints))
+                               shm_checkpoints=args.shm_checkpoints, slug=slug))
 
     # Shared dataset and validation set
     max_ply = 256
@@ -470,8 +502,8 @@ def main():
     print()
 
     for batch in loader:
-        # Forward + backward for each model on the same batch
-        all_metrics: dict[str, dict[str, float]] = {}
+        # Forward + backward for each model on the same batch (no .item() sync)
+        all_metrics: dict[str, dict[str, torch.Tensor]] = {}
         for slot in slots:
             metrics = slot.train_step(batch)
             all_metrics[slot.name] = metrics
@@ -489,14 +521,16 @@ def main():
         step_time = time.time() - step_start
         games_per_sec = args.batch_size / step_time
 
-        # Logging
+        # Logging — .item() sync only at log intervals
         if global_step % args.log_interval == 0:
             print(f"step {global_step:>7d} | {games_per_sec:.0f} g/s | {step_time:.2f}s", flush=True)
             for slot in slots:
                 m = all_metrics[slot.name]
+                loss_val = m['loss'].item()
+                acc_val = m['accuracy'].item()
                 gn = all_grad_norms[slot.name]
                 lr = slot.scheduler.get_lr()
-                print(f"  {slot.name:>5s}: loss {m['loss']:.4f} | acc {m['accuracy']:.3f} | "
+                print(f"  {slot.name:>5s}: loss {loss_val:.4f} | acc {acc_val:.3f} | "
                       f"lr {lr:.2e} | gn {gn:.2f}", flush=True)
 
                 record = {
@@ -507,7 +541,8 @@ def main():
                     "grad_norm": gn,
                     "step_time": step_time,
                     "games_per_sec": games_per_sec,
-                    **{f"train/{k}": v for k, v in m.items()},
+                    "train/loss": loss_val,
+                    "train/accuracy": acc_val,
                 }
                 slot._log_jsonl(record)
 

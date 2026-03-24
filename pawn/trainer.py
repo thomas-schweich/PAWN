@@ -492,13 +492,16 @@ class CLMTrainer:
                 games_per_sec = games_per_step / step_time
 
                 if self.global_step % self.cfg.log_interval == 0:
+                    # .item() sync only at log intervals
+                    loss_val = metrics['loss'].item()
+                    acc_val = metrics['accuracy'].item()
                     lr = self.scheduler.get_lr()
                     mem = _get_memory_stats(self.device)
 
                     msg = (
                         f"step {self.global_step:>7d} | "
-                        f"loss {metrics['loss']:.4f} | "
-                        f"acc {metrics['accuracy']:.3f} | "
+                        f"loss {loss_val:.4f} | "
+                        f"acc {acc_val:.3f} | "
                         f"lr {lr:.2e} | "
                         f"gn {grad_norm:.2f} | "
                         f"{games_per_sec:.0f} g/s | "
@@ -514,17 +517,21 @@ class CLMTrainer:
                         "grad_norm": grad_norm,
                         "step_time": step_time,
                         "games_per_sec": games_per_sec,
-                        **{f"train/{k}": v for k, v in metrics.items()},
+                        "train/loss": loss_val,
+                        "train/accuracy": acc_val,
                         **{f"mem/{k}": v for k, v in mem.items()},
                     }
                     self._log_jsonl(record)
 
                     if self.wandb_run:
-                        log_data = {f"train/{k}": v for k, v in metrics.items()}
-                        log_data["train/lr"] = lr
-                        log_data["train/grad_norm"] = grad_norm
-                        log_data["train/step_time"] = step_time
-                        log_data["train/games_per_sec"] = games_per_sec
+                        log_data = {
+                            "train/loss": loss_val,
+                            "train/accuracy": acc_val,
+                            "train/lr": lr,
+                            "train/grad_norm": grad_norm,
+                            "train/step_time": step_time,
+                            "train/games_per_sec": games_per_sec,
+                        }
                         self.wandb_run.log(log_data, step=self.global_step)
 
                 if self.global_step % self.cfg.eval_interval == 0:

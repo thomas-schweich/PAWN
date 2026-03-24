@@ -14,7 +14,7 @@ from pathlib import Path
 import solara
 
 from . import charts
-from .metrics import detect_run_type, get_run_hostname, load_metrics, load_runs
+from .metrics import detect_run_type, get_run_hostname, get_run_meta, load_metrics, load_runs
 
 # ---------------------------------------------------------------------------
 # Global reactive state
@@ -61,8 +61,15 @@ def RunSelector(auto_refresh: bool = False, on_auto_refresh=None, interval: floa
         labeled = []
         label_to_name = {}
         for name in raw:
-            host = get_run_hostname(log_dir.value, name)
-            label = f"{name} @ {host}" if host else name
+            meta = get_run_meta(log_dir.value, name)
+            parts = []
+            if meta.get("slug"):
+                parts.append(meta["slug"])
+            if meta.get("variant"):
+                parts.append(meta["variant"])
+            if meta.get("hostname"):
+                parts.append(f"@ {meta['hostname']}")
+            label = f"{name} ({' / '.join(parts)})" if parts else name
             labeled.append(label)
             label_to_name[label] = name
         return labeled, label_to_name

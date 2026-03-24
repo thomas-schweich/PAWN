@@ -26,20 +26,29 @@ def load_runs(log_dir: Path, max_age_hours: float = 1.0) -> list[str]:
     return [r.name for r in runs]
 
 
-def get_run_hostname(log_dir: Path, run_name: str) -> str:
-    """Extract hostname from the config record of a run."""
+def get_run_meta(log_dir: Path, run_name: str) -> dict[str, str]:
+    """Extract metadata (hostname, slug, variant) from the config record of a run."""
     path = log_dir / run_name / "metrics.jsonl"
     if not path.exists():
-        return ""
+        return {}
     try:
         with open(path) as f:
             first_line = f.readline().strip()
             if first_line:
                 rec = json.loads(first_line)
-                return rec.get("hostname", "")
+                return {
+                    "hostname": rec.get("hostname", ""),
+                    "slug": rec.get("slug", ""),
+                    "variant": rec.get("variant", ""),
+                }
     except (json.JSONDecodeError, OSError):
         pass
-    return ""
+    return {}
+
+
+def get_run_hostname(log_dir: Path, run_name: str) -> str:
+    """Extract hostname from the config record of a run."""
+    return get_run_meta(log_dir, run_name).get("hostname", "")
 
 
 def load_metrics(log_dir: Path, run_name: str) -> dict[str, list]:

@@ -384,10 +384,13 @@ class PAWNCLM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         targets: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Training-optimized forward: computes lm_head only at non-padding
         positions to avoid materializing the full (B, T, vocab_size) logits
         tensor. Returns loss and metrics directly.
+
+        Metrics are returned as raw GPU tensors to avoid CUDA synchronization.
+        Call .item() on them only when you need to log (e.g. every N steps).
 
         Args:
             input_ids: (B, T) token indices
@@ -395,8 +398,8 @@ class PAWNCLM(nn.Module):
             targets: (B, T) target token indices (padding positions ignored)
 
         Returns:
-            loss: scalar
-            metrics: dict with loss and accuracy
+            loss: scalar tensor (for backward)
+            metrics: dict with loss and accuracy as GPU tensors (no .item())
         """
         x = self.embed(input_ids)
 
@@ -422,9 +425,9 @@ class PAWNCLM(nn.Module):
 
         with torch.no_grad():
             preds = valid_logits.argmax(dim=-1)
-            accuracy = (preds == valid_targets).float().mean().item()
+            accuracy = (preds == valid_targets).float().mean()
 
-        return loss, {"loss": loss.item(), "accuracy": accuracy}
+        return loss, {"loss": loss.detach(), "accuracy": accuracy}
 
     def forward_generate(
         self,
