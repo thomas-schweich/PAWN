@@ -39,3 +39,5 @@ engine/uv.lock
 # Misc
 runpodctl.tar.gz
 .claude/
+.playwright-mcp/
+local/

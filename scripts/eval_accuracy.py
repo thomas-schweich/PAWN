@@ -2,8 +2,10 @@
 """Evaluate adapter move-prediction accuracy (MAIA-compatible).
 
 Supports LoRA, FiLM, and hybrid adapters. By default skips the first
-10 ply to match MAIA's evaluation methodology (opening moves are too
-book-ish to be informative).
+10 ply to match the evaluation methodology from `MAIA
+<https://arxiv.org/abs/2006.01855>`_ (McIlroy-Young et al., "Aligning
+Superhuman AI with Human Behavior: Chess as a Model System", KDD 2020).
+Opening moves are too book-ish to be informative.
 
 Reports overall accuracy, per-phase accuracy (opening / middle / late),
 and optionally per-ply accuracy.

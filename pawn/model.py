@@ -1,7 +1,14 @@
 """PAWN: Causal Language Model for chess move prediction.
 
-Standard next-token prediction over the move vocabulary with a single
-softmax output head.
+Decoder-only transformer (`Vaswani et al., 2017
+<https://arxiv.org/abs/1706.03762>`_) with next-token prediction over
+the move vocabulary.  Key architectural choices drawn from subsequent
+work:
+
+* **RMSNorm** -- `Zhang & Sennrich, 2019 <https://arxiv.org/abs/1910.07467>`_
+* **SwiGLU** FFN -- `Shazeer, 2020 <https://arxiv.org/abs/2002.05202>`_
+* **Rotary Position Embeddings (RoPE)** -- `Su et al., 2021
+  <https://arxiv.org/abs/2104.09864>`_
 """
 
 import math
@@ -50,6 +57,9 @@ def _build_decomposition_table() -> torch.Tensor:
 
 
 class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (`Zhang & Sennrich, 2019
+    <https://arxiv.org/abs/1910.07467>`_)."""
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
@@ -63,7 +73,8 @@ class RMSNorm(nn.Module):
 def _apply_rope(
     x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
 ) -> torch.Tensor:
-    """Apply rotary position embeddings.
+    """Apply Rotary Position Embeddings (`Su et al., 2021
+    <https://arxiv.org/abs/2104.09864>`_).
 
     x: (B, n_heads, T, head_dim)
     rope_cos, rope_sin: (1, 1, T, head_dim // 2)
@@ -168,6 +179,9 @@ class Attention(nn.Module):
 
 
 class SwiGLUFFN(nn.Module):
+    """SwiGLU feed-forward network (`Shazeer, 2020
+    <https://arxiv.org/abs/2002.05202>`_)."""
+
     def __init__(self, cfg: CLMConfig):
         super().__init__()
         self.w_gate = nn.Linear(cfg.d_model, cfg.d_ff, bias=False)

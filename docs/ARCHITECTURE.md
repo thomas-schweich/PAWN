@@ -62,9 +62,9 @@ PAD and outcome tokens are not decomposed. PAD uses a standalone learned paramet
 
 ## Transformer Architecture
 
-PAWN uses a decoder-only transformer with the following design choices:
+PAWN uses a decoder-only transformer ([Vaswani et al., 2017](https://arxiv.org/abs/1706.03762)) with the following design choices:
 
-**Normalization.** Pre-norm with RMSNorm. Each transformer block applies RMSNorm before the attention sublayer and before the feed-forward sublayer:
+**Normalization.** Pre-norm with [RMSNorm](https://arxiv.org/abs/1910.07467) (Zhang & Sennrich, 2019). Each transformer block applies RMSNorm before the attention sublayer and before the feed-forward sublayer:
 
 ```
 x = x + Attention(RMSNorm(x))
@@ -75,9 +75,9 @@ A final RMSNorm is applied after the last transformer block, before the output p
 
 **Attention.** Standard multi-head self-attention with no bias terms in any of the projection matrices (Q, K, V, output). Attention uses PyTorch's `scaled_dot_product_attention` with a causal mask combined with a padding mask. The padding mask ensures that PAD tokens are not attended to.
 
-**Positional encoding.** Rotary Position Embeddings (RoPE) with base frequency 10000. RoPE is applied to the query and key vectors after projection, before the attention computation. Frequency tensors are precomputed for the full sequence length and stored as non-persistent buffers.
+**Positional encoding.** [Rotary Position Embeddings (RoPE)](https://arxiv.org/abs/2104.09864) (Su et al., 2021) with base frequency 10000. RoPE is applied to the query and key vectors after projection, before the attention computation. Frequency tensors are precomputed for the full sequence length and stored as non-persistent buffers.
 
-**Feed-forward network.** SwiGLU (gated linear unit with SiLU activation), implemented as:
+**Feed-forward network.** [SwiGLU](https://arxiv.org/abs/2002.05202) (Shazeer, 2020), a gated linear unit with SiLU activation, implemented as:
 
 ```
 FFN(x) = W_down(SiLU(W_gate(x)) * W_up(x))

@@ -1,8 +1,11 @@
 """LoRA + FiLM hybrid adapter for PAWN.
 
 Combines both adaptation methods on a frozen backbone:
-- LoRA modifies attention (and optionally FFN) projections within layers
-- FiLM applies per-channel affine transforms between layers
+
+- `LoRA <https://arxiv.org/abs/2106.09685>`_ (Hu et al., 2021) modifies
+  attention (and optionally FFN) projections within layers
+- `FiLM <https://arxiv.org/abs/1709.07871>`_ (Perez et al., 2017) applies
+  per-channel affine transforms between layers
 
 Both are identity-initialized so the model starts identical to the frozen
 backbone. The two methods are complementary: LoRA changes how attention

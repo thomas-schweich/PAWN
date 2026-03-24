@@ -1,4 +1,10 @@
-"""PAWN training loop with checkpointing and monitoring."""
+"""PAWN training loop with checkpointing and monitoring.
+
+Uses `AdamW <https://arxiv.org/abs/1711.05101>`_ (Loshchilov & Hutter,
+2017) with cosine LR decay (`Loshchilov & Hutter, 2016
+<https://arxiv.org/abs/1608.03983>`_) and mixed-precision training
+(`Micikevicius et al., 2017 <https://arxiv.org/abs/1710.03740>`_).
+"""
 
 import json
 import math
@@ -21,7 +27,11 @@ from pawn.data_utils import unpack_grid
 
 
 class CosineWithWarmup:
-    """Cosine LR schedule with linear warmup."""
+    """Cosine LR schedule with linear warmup.
+
+    Based on SGDR (`Loshchilov & Hutter, 2016
+    <https://arxiv.org/abs/1608.03983>`_).
+    """
 
     def __init__(
         self,

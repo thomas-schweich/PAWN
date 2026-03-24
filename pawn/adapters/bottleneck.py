@@ -1,7 +1,9 @@
 """Bottleneck adapters for PAWN.
 
 Inserts small residual MLP bottlenecks after the attention sublayer and/or
-the FFN sublayer within each transformer block (Houlsby et al. 2019):
+the FFN sublayer within each transformer block, following `Houlsby et al.,
+2019 <https://arxiv.org/abs/1902.00751>`_
+("Parameter-Efficient Transfer Learning for NLP", ICML 2019):
 
     x = x + up(gelu(down(x)))
 

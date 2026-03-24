@@ -45,9 +45,9 @@ uv run python scripts/train.py --variant base
 
 - **Total steps**: 100,000
 - **Batch size**: 256
-- **Optimizer**: AdamW (lr=3e-4, weight_decay=0.01)
-- **LR schedule**: cosine decay with 1,000-step warmup
-- **Mixed precision**: fp16 AMP (auto-detected)
+- **Optimizer**: [AdamW](https://arxiv.org/abs/1711.05101) (Loshchilov & Hutter, 2017) (lr=3e-4, weight_decay=0.01)
+- **LR schedule**: [cosine decay](https://arxiv.org/abs/1608.03983) (Loshchilov & Hutter, 2016) with 1,000-step warmup
+- **Mixed precision**: fp16 [AMP](https://arxiv.org/abs/1710.03740) (Micikevicius et al., 2017) (auto-detected)
 - **Checkpoints**: saved every 5,000 steps to `checkpoints/`
 - **Eval**: every 500 steps on 512 held-out random games
 
@@ -76,7 +76,7 @@ Adapter training freezes the pretrained PAWN backbone and trains lightweight ada
 1. A pretrained PAWN checkpoint (from pretraining above)
 2. A Lichess PGN file filtered to an Elo band
 
-Download standard rated game archives from [database.lichess.org](https://database.lichess.org/), filtered to your target Elo band. The scripts expect a single `.pgn` file.
+Download standard rated game archives from the [Lichess open database](https://database.lichess.org/) ([Lichess](https://lichess.org/)), filtered to your target Elo band. The scripts expect a single `.pgn` file.
 
 ### Available adapters
 

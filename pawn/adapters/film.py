@@ -1,5 +1,9 @@
 """FiLM conditioning for PAWN.
 
+Implements Feature-wise Linear Modulation following `Perez et al., 2017
+<https://arxiv.org/abs/1709.07871>`_
+("FiLM: Visual Reasoning with a General Conditioning Layer", AAAI 2018).
+
 Applies learned per-channel affine transforms after each transformer block
 and on the output logits:
 
