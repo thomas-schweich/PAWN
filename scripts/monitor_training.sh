@@ -1,18 +1,57 @@
 #!/usr/bin/env bash
 # Monitor multi-model training: check pod log + HuggingFace checkpoints.
-# Usage: bash scripts/monitor_training.sh <host> <port>
+# Usage: bash scripts/monitor_training.sh [<pod-id>]
+#
+# If pod-id is given, resolves SSH host/port via runpodctl.
+# Otherwise checks HuggingFace only (no SSH).
 set -euo pipefail
 
-HOST="${1:-50.145.48.110}"
-PORT="${2:-13321}"
-SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p $PORT root@$HOST"
+POD_ID="${1:-}"
+SSH=""
 
-echo "=== Training Log ==="
-$SSH "tail -15 /workspace/logs/train_all.log" 2>/dev/null || echo "  (SSH failed)"
+if [ -n "$POD_ID" ]; then
+    # Resolve SSH connection from runpodctl
+    ssh_info=$(runpodctl pod get "$POD_ID" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+ssh = d.get('ssh', {})
+host = ssh.get('host', '')
+port = ssh.get('port', '')
+status = ssh.get('status', '')
+error = ssh.get('error', '')
+if host and port:
+    print(f'{host} {port}')
+elif error:
+    print(f'ERROR {error}')
+else:
+    print(f'ERROR status={status}')
+" 2>/dev/null || echo "ERROR runpodctl-failed")
 
-echo ""
-echo "=== Process Status ==="
-$SSH "pgrep -f train_all > /dev/null && echo RUNNING || echo STOPPED" 2>/dev/null || echo "  (SSH failed)"
+    if [[ "$ssh_info" == ERROR* ]]; then
+        echo "=== Pod Status ==="
+        echo "  Pod $POD_ID: ${ssh_info#ERROR }"
+        echo ""
+    else
+        HOST=$(echo "$ssh_info" | cut -d' ' -f1)
+        PORT=$(echo "$ssh_info" | cut -d' ' -f2)
+        SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p $PORT root@$HOST"
+    fi
+fi
+
+if [ -n "$SSH" ]; then
+    echo "=== Training Log ==="
+    $SSH "tail -15 /opt/pawn/logs/*/metrics.jsonl 2>/dev/null | tail -15" 2>/dev/null || echo "  (SSH failed)"
+
+    echo ""
+    echo "=== Process Status ==="
+    $SSH "pgrep -f train_all > /dev/null && echo RUNNING || echo STOPPED" 2>/dev/null || echo "  (SSH failed)"
+
+    echo ""
+    echo "=== Metrics Sync ==="
+    rsync -az --include='*/' --include='metrics.jsonl' --include='config.json' --exclude='*' \
+        -e "ssh -o StrictHostKeyChecking=accept-new -p $PORT" \
+        "root@$HOST:/opt/pawn/logs/" logs/ 2>/dev/null && echo "  Synced" || echo "  (Sync failed)"
+fi
 
 echo ""
 echo "=== HuggingFace Checkpoints ==="
@@ -32,9 +71,3 @@ for variant in ['small', 'base', 'large']:
     except Exception as e:
         print(f'  {repo}: {e}')
 " 2>/dev/null || echo "  (HF check failed)"
-
-echo ""
-echo "=== Metrics Sync ==="
-rsync -az --include='*/' --include='metrics.jsonl' --include='config.json' --exclude='*' \
-    -e "ssh -o StrictHostKeyChecking=accept-new -p $PORT" \
-    "root@$HOST:/workspace/logs/" logs/ 2>/dev/null && echo "  Synced" || echo "  (Sync failed)"
