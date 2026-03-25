@@ -4,7 +4,7 @@ PAWN is trained on uniformly random chess games. Since each move is drawn
 uniformly from the legal move set, top-1 accuracy has a hard theoretical
 ceiling — no model, however large, can exceed it.
 
-## Two ceilings
+## Three ceilings
 
 ### Unconditional ceiling: E[1/N_legal] = 6.43%
 
@@ -16,7 +16,22 @@ A model that exceeds this ceiling has learned something beyond just "which
 moves are legal" — it has learned to estimate the number of legal moves at
 each position and bias predictions toward positions with fewer options.
 
-### Outcome-conditioned ceiling: 7.92%
+### Naive conditional ceiling: 6.44%
+
+A zero-cost analytical estimate of outcome conditioning. At each position,
+legal moves that lead to an immediate terminal state with a *different*
+outcome than the actual game are excluded, and accuracy = 1/(N_legal - N_wrong).
+
+This barely exceeds the unconditional ceiling (1.00x boost) because
+immediate terminal states are rare — most moves at most positions lead to
+non-terminal continuations, so the filter has almost nothing to exclude.
+
+### MCTS conditional ceiling: 7.92%
+
+The full Monte Carlo estimate. At each sampled position, every legal move is
+tried and 32 random continuations are played out to estimate
+P(outcome | move, history). The Bayes-optimal predictor picks the move most
+consistent with the known outcome.
 
 PAWN's input sequence begins with an outcome token (`WHITE_CHECKMATES`,
 `STALEMATE`, `PLY_LIMIT`, etc.). This leaks information about the game's
@@ -29,54 +44,56 @@ trajectory, making some moves more predictable:
 - **Stalemate games**: The final position has no legal moves but isn't check
   — very constraining on late moves.
 
-The conditioned ceiling is estimated via Monte Carlo rollouts: at each
-sampled position, every legal move is tried and 32 random continuations are
-played out to estimate P(outcome | move, history). The Bayes-optimal
-predictor picks the move most consistent with the known outcome.
-
 ## Adjusted accuracy
 
 | Metric | Value |
 |--------|-------|
 | Unconditional ceiling (E[1/N_legal]) | 6.43% |
-| Outcome-conditioned ceiling (MC, 32 rollouts) | 7.92% |
-| Conditioning boost | 1.23x |
+| Naive conditional ceiling (1-ply filter) | 6.44% |
+| MCTS conditional ceiling (32 rollouts) | 7.92% |
+| Conditioning boost (naive) | 1.00x |
+| Conditioning boost (MCTS) | 1.23x |
 
 For a model with top-1 accuracy A:
 
 - **Adjusted (unconditional)** = A / 6.43% — measures how much the model
   has learned about chess legality. Values > 100% mean it has learned
   structure beyond just legal moves.
-- **Adjusted (conditioned)** = A / 7.92% — measures how close the model is
-  to the Bayes-optimal predictor with perfect outcome knowledge. This is
-  the tighter bound.
+- **Adjusted (naive conditional)** = A / 6.44% — essentially the same as
+  unconditional; confirms that 1-ply lookahead explains almost none of the
+  outcome conditioning benefit.
+- **Adjusted (MCTS conditional)** = A / 7.92% — measures how close the
+  model is to the Bayes-optimal predictor with perfect outcome knowledge.
+  This is the tighter bound.
 
 ### Current model results (step ~69K)
 
-| Variant | Top-1 | vs Uncond | vs Conditioned |
-|---------|-------|-----------|----------------|
-| large (68M) | 6.9% | 107% | 87% |
-| base (36M) | 6.9% | 107% | 87% |
-| small (10M) | 6.5% | 101% | 82% |
+| Variant | Top-1 | vs Uncond | vs Naive Cond | vs MCTS Cond |
+|---------|-------|-----------|---------------|--------------|
+| large (68M) | 6.9% | 107% | 107% | 87% |
+| base (36M) | 6.9% | 107% | 107% | 87% |
+| small (10M) | 6.5% | 101% | 101% | 82% |
 
-All models exceed the unconditional ceiling, confirming they learn chess
-structure beyond move legality. The large and base models reach 87% of the
-outcome-conditioned ceiling.
+All models exceed the unconditional and naive conditional ceilings,
+confirming they learn chess structure beyond move legality. The large and
+base models reach 87% of the MCTS conditional ceiling.
 
 ## Per-outcome breakdown
 
-| Outcome | Uncond | Conditioned | Boost | Positions |
-|---------|--------|-------------|-------|-----------|
-| White checkmated | 5.26% | 13.79% | 2.62x | 328 |
-| Black checkmated | 5.02% | 13.64% | 2.72x | 388 |
-| Stalemate | 7.22% | 18.67% | 2.59x | 125 |
-| Insufficient material | 7.17% | 18.61% | 2.60x | 256 |
-| Ply limit | 6.51% | 6.97% | 1.07x | 8,618 |
+| Outcome | Uncond | Naive Cond | MCTS Cond | Positions |
+|---------|--------|------------|-----------|-----------|
+| White checkmated | 5.26% | 5.26% | 13.79% | 328 |
+| Black checkmated | 5.02% | 5.02% | 13.64% | 388 |
+| Stalemate | 7.22% | 7.22% | 18.67% | 125 |
+| Insufficient material | 7.17% | 7.17% | 18.61% | 256 |
+| Ply limit | 6.51% | 6.51% | 6.97% | 8,618 |
 
-Decisive outcomes (checkmate, stalemate, insufficient material) show 2.6x
-conditioning boost. Ply limit games — the vast majority — show only 1.07x
-because knowing the game goes the distance provides minimal per-move
-information.
+The naive conditional ceiling equals the unconditional ceiling across all
+outcome types — the 1-ply filter never fires in practice. The MCTS ceiling
+shows the real conditioning benefit: decisive outcomes (checkmate, stalemate,
+insufficient material) get a 2.6x boost, while ply limit games — the vast
+majority — show only 1.07x because knowing the game goes the distance
+provides minimal per-move information.
 
 ## Reproducing
 
