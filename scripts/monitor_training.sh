@@ -39,12 +39,18 @@ else:
 fi
 
 if [ -n "$SSH" ]; then
-    echo "=== Training Log ==="
-    $SSH "tail -15 /opt/pawn/logs/*/metrics.jsonl 2>/dev/null | tail -15" 2>/dev/null || echo "  (SSH failed)"
-
-    echo ""
     echo "=== Process Status ==="
     $SSH "pgrep -f train_all > /dev/null && echo RUNNING || echo STOPPED" 2>/dev/null || echo "  (SSH failed)"
+
+    echo ""
+    echo "=== Latest Metrics ==="
+    $SSH 'for f in /opt/pawn/logs/run_*/metrics.jsonl; do
+        [ -f "$f" ] || continue
+        name=$(basename $(dirname "$f"))
+        last=$(tail -1 "$f" 2>/dev/null)
+        step=$(echo "$last" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(f\"step={d.get(\"step\",\"?\"):>6}  loss={d.get(\"train/loss\",d.get(\"val/loss\",\"?\")):>8.4f}  acc={d.get(\"train/accuracy\",d.get(\"val/accuracy\",\"?\")):>6.3f}\")" 2>/dev/null)
+        echo "  $name: $step"
+    done' 2>/dev/null || echo "  (SSH failed)"
 
     echo ""
     echo "=== Metrics Sync ==="
