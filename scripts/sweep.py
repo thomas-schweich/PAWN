@@ -128,20 +128,32 @@ def main():
     print(f"SWEEP COMPLETE: {len(study.trials)} trials")
     print(f"{'='*60}")
 
-    print(f"\nBest trial: #{study.best_trial.number}")
-    print(f"  Val loss: {study.best_trial.value:.4f}")
-    print(f"  Params:")
-    for k, v in study.best_trial.params.items():
-        print(f"    {k}: {v}")
+    completed = [t for t in study.trials if t.value is not None]
+    pruned = [t for t in study.trials if t.state.name == "PRUNED"]
+    failed = [t for t in study.trials if t.state.name == "FAIL"]
 
-    print(f"\nTop 5 trials:")
-    sorted_trials = sorted(
-        [t for t in study.trials if t.value is not None],
-        key=lambda t: t.value or float("inf"),
-    )
-    for t in sorted_trials[:5]:
-        params_str = ", ".join(f"{k}={v}" for k, v in t.params.items())
-        print(f"  #{t.number}: val_loss={t.value:.4f}  {params_str}")
+    print(f"  Completed: {len(completed)}  Pruned: {len(pruned)}  Failed: {len(failed)}")
+
+    if completed:
+        sorted_trials = sorted(completed, key=lambda t: t.value or float("inf"))
+        best = sorted_trials[0]
+        print(f"\nBest trial: #{best.number}")
+        print(f"  Val loss: {best.value:.4f}")
+        print(f"  Params:")
+        for k, v in best.params.items():
+            print(f"    {k}: {v}")
+
+        print(f"\nTop 5 trials:")
+        for t in sorted_trials[:5]:
+            params_str = ", ".join(f"{k}={v}" for k, v in t.params.items())
+            print(f"  #{t.number}: val_loss={t.value:.4f}  {params_str}")
+    else:
+        print("\nNo completed trials. All were pruned or failed.")
+        if failed:
+            t = failed[0]
+            print(f"  Example failure (trial #{t.number}):")
+            for k, v in t.params.items():
+                print(f"    {k}: {v}")
 
     print(f"\nResults: {db_path}")
     print(f"Dashboard: uv run optuna-dashboard {db_path}")

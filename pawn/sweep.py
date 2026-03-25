@@ -269,9 +269,9 @@ class AdapterObjective:
             cmd.extend(["--local-checkpoints"])
         else:
             cmd.extend(["--output-dir", str(trial_dir)])
-
-        if "epochs" not in params and "total_steps" not in params:
-            cmd.extend(["--epochs", str(self.epochs)])
+            # Only pass --epochs for adapter scripts (train.py uses --total-steps)
+            if "epochs" not in params:
+                cmd.extend(["--epochs", str(self.epochs)])
 
         # Suggested hyperparameters
         cmd.extend(_params_to_cli_args(params))
