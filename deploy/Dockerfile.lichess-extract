@@ -1,0 +1,25 @@
+# Lightweight container for downloading and filtering Lichess PGN data.
+# No GPU, no torch, no engine — just curl, zstd, python3, pyarrow, huggingface-hub.
+#
+# Build:
+#   docker build -f deploy/Dockerfile.lichess-extract -t thomasschweich/pawn-lichess-extract:latest .
+#
+# Run (ephemeral, writes to /dev/shm, uploads to HF):
+#   docker run -e HF_TOKEN=... -e HF_REPO=thomas-schweich/lichess-1800-1900 \
+#     -e MONTHS="2025-01,2025-02" -e MIN_ELO=1800 -e MAX_ELO=1900 \
+#     thomasschweich/pawn-lichess-extract:latest
+
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir pyarrow huggingface-hub
+
+WORKDIR /opt/pawn
+COPY scripts/extract_lichess.sh scripts/
+COPY deploy/entrypoint-extract.sh /entrypoint-extract.sh
+RUN chmod +x /entrypoint-extract.sh scripts/extract_lichess.sh
+
+ENTRYPOINT ["/entrypoint-extract.sh"]

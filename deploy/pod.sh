@@ -2,7 +2,7 @@
 # Manage Runpod GPU pods for PAWN experiments.
 #
 # Usage:
-#   pod.sh create <name> [--gpu <type>] [--disk <gb>] [--volume <gb>] [--image <name>]
+#   pod.sh create <name> [--gpu <type>] [--count <n>] [--disk <gb>] [--volume <gb>] [--community]
 #   pod.sh start <name>
 #   pod.sh stop <name>
 #   pod.sh delete <name>
@@ -17,14 +17,17 @@
 # Pod configs are cached in ~/.config/pawn/pods/<name>.env
 # Requires: runpodctl (wget -qO- cli.runpod.net | sudo bash)
 #
-# GPU type shortcuts:
-#   a5000  -> "NVIDIA RTX A5000"
-#   a40    -> "NVIDIA A40"
-#   a6000  -> "NVIDIA RTX A6000"
-#   4090   -> "NVIDIA GeForce RTX 4090"
-#   5090   -> "NVIDIA GeForce RTX 5090"
-#   l40s   -> "NVIDIA L40S"
-#   h100   -> "NVIDIA H100 80GB HBM3"
+# GPU type shortcuts (mapped to runpodctl --gpu-id values):
+#   a5000      -> "NVIDIA RTX A5000"
+#   a40        -> "NVIDIA A40"
+#   a6000      -> "NVIDIA RTX 6000 Ada Generation"
+#   4090       -> "NVIDIA GeForce RTX 4090"
+#   5090       -> "NVIDIA GeForce RTX 5090"
+#   l40s       -> "NVIDIA L40S"
+#   a100-pcie  -> "NVIDIA A100 80GB PCIe"
+#   a100-sxm   -> "NVIDIA A100-SXM4-80GB"
+#   h100       -> "NVIDIA H100 80GB HBM3"
+#   h200       -> "NVIDIA H200"
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,20 +38,24 @@ mkdir -p "$POD_DIR"
 DEFAULT_GPU="NVIDIA RTX A5000"
 DEFAULT_CONTAINER_DISK=20
 DEFAULT_VOLUME_DISK=75
-DEFAULT_IMAGE="runpod/pytorch:2.8.0-py3.12-cuda12.8.1-cudnn9.8.0-runtime"
+DEFAULT_IMAGE="runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404"
 
 # --- Helpers ---
 
 gpu_shortcut() {
     case "${1,,}" in
-        a5000)  echo "NVIDIA RTX A5000" ;;
-        a40)    echo "NVIDIA A40" ;;
-        a6000)  echo "NVIDIA RTX A6000" ;;
-        4090)   echo "NVIDIA GeForce RTX 4090" ;;
-        5090)   echo "NVIDIA GeForce RTX 5090" ;;
-        l40s)   echo "NVIDIA L40S" ;;
-        h100)   echo "NVIDIA H100 80GB HBM3" ;;
-        *)      echo "$1" ;;
+        a5000)     echo "NVIDIA RTX A5000" ;;
+        a40)       echo "NVIDIA A40" ;;
+        a6000)     echo "NVIDIA RTX 6000 Ada Generation" ;;
+        4090)      echo "NVIDIA GeForce RTX 4090" ;;
+        5090)      echo "NVIDIA GeForce RTX 5090" ;;
+        l40s)      echo "NVIDIA L40S" ;;
+        a100-pcie) echo "NVIDIA A100 80GB PCIe" ;;
+        a100-sxm)  echo "NVIDIA A100-SXM4-80GB" ;;
+        a100)      echo "NVIDIA A100 80GB PCIe" ;;
+        h100)      echo "NVIDIA H100 80GB HBM3" ;;
+        h200)      echo "NVIDIA H200" ;;
+        *)         echo "$1" ;;
     esac
 }
 
@@ -121,28 +128,33 @@ ssh_opts() {
 # --- Commands ---
 
 cmd_create() {
-    local name="" gpu="$DEFAULT_GPU" container_disk="$DEFAULT_CONTAINER_DISK"
+    local name="" gpu="$DEFAULT_GPU" gpu_count=1
+    local container_disk="$DEFAULT_CONTAINER_DISK"
     local volume_disk="$DEFAULT_VOLUME_DISK" image="$DEFAULT_IMAGE"
+    local cloud_type="SECURE"
 
     name="${1:-}"
     shift || true
     while [ $# -gt 0 ]; do
         case "$1" in
-            --gpu)    gpu="$(gpu_shortcut "$2")"; shift 2 ;;
-            --disk)   container_disk="$2"; shift 2 ;;
-            --volume) volume_disk="$2"; shift 2 ;;
-            --image)  image="$2"; shift 2 ;;
-            *)        echo "Unknown option: $1"; exit 1 ;;
+            --gpu)       gpu="$(gpu_shortcut "$2")"; shift 2 ;;
+            --count)     gpu_count="$2"; shift 2 ;;
+            --disk)      container_disk="$2"; shift 2 ;;
+            --volume)    volume_disk="$2"; shift 2 ;;
+            --image)     image="$2"; shift 2 ;;
+            --community) cloud_type="COMMUNITY"; shift ;;
+            *)           echo "Unknown option: $1"; exit 1 ;;
         esac
     done
 
     if [ -z "$name" ]; then
-        echo "Usage: $0 create <name> [--gpu <type>] [--disk <gb>] [--volume <gb>]"
+        echo "Usage: $0 create <name> [--gpu <type>] [--count <n>] [--disk <gb>] [--volume <gb>] [--community]"
         exit 1
     fi
 
     echo "Creating pod '$name'..."
-    echo "  GPU: $gpu"
+    echo "  GPU: ${gpu_count}x $gpu"
+    echo "  Cloud: $cloud_type"
     echo "  Container disk: ${container_disk}GB"
     echo "  Volume disk: ${volume_disk}GB"
     echo "  Image: $image"
@@ -151,11 +163,12 @@ cmd_create() {
     local output
     output=$(runpodctl pod create \
         --name "pawn-$name" \
-        --gpuType "$gpu" \
-        --gpuCount 1 \
-        --imageName "$image" \
-        --containerDiskSize "$container_disk" \
-        --volumeSize "$volume_disk" \
+        --gpu-id "$gpu" \
+        --gpu-count "$gpu_count" \
+        --image "$image" \
+        --container-disk-in-gb "$container_disk" \
+        --volume-in-gb "$volume_disk" \
+        --cloud-type "$cloud_type" \
         2>&1)
 
     echo "$output"
@@ -311,8 +324,8 @@ case "${1:-}" in
         echo "Usage: $0 <command> [args...]"
         echo ""
         echo "Commands:"
-        echo "  create <name> [--gpu <type>] [--disk <gb>] [--volume <gb>]"
-        echo "                           Create a new pod"
+        echo "  create <name> [--gpu <type>] [--count <n>] [--disk <gb>] [--volume <gb>] [--community]"
+        echo "                           Create a new pod (default: 1 GPU, secure cloud)"
         echo "  start  <name>            Resume a stopped pod"
         echo "  stop   <name>            Pause a pod (preserves volume, stops billing)"
         echo "  delete <name>            Destroy a pod and its data"
@@ -325,10 +338,11 @@ case "${1:-}" in
         echo "  launch <name> <cmd>      Run a training command via nohup"
         echo "  sync   [name]            Sync logs/checkpoints from pod(s)"
         echo ""
-        echo "GPU shortcuts: a5000, a40, a6000, 4090, 5090, l40s, h100"
+        echo "GPU shortcuts: a5000, a40, a6000, 4090, 5090, l40s, a100, a100-pcie, a100-sxm, h100, h200"
         echo ""
         echo "Examples:"
         echo "  $0 create exp1 --gpu a5000"
+        echo "  $0 create sweep1 --gpu a100-pcie --count 2 --community"
         echo "  $0 deploy exp1"
         echo "  $0 launch exp1 scripts/train.py --variant base"
         echo "  $0 stop exp1"
