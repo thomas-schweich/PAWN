@@ -6,6 +6,12 @@ set -e
 cd /opt/pawn
 export PYTHONPATH=/opt/pawn
 
+# Persist HF_TOKEN to huggingface-hub's token cache so it survives env changes
+if [ -n "$HF_TOKEN" ]; then
+    mkdir -p /root/.cache/huggingface
+    echo -n "$HF_TOKEN" > /root/.cache/huggingface/token
+fi
+
 # Let Runpod's own start script handle SSH, Jupyter, key injection, etc.
 if [ -f /start.sh ]; then
     /start.sh &
