@@ -35,6 +35,7 @@ import optuna
 from pawn.sweep import (
     ADAPTER_SCRIPTS,
     AdapterObjective,
+    InProcessRoSAObjective,
     create_study,
 )
 
@@ -69,6 +70,9 @@ def main():
                     choices=["hyperband", "median", "none"])
     p.add_argument("--study-name", type=str, default=None,
                     help="Study name (default: adapter type)")
+    p.add_argument("--in-process", action="store_true",
+                    help="Run trials in-process (RoSA only). Shares backbone and data "
+                         "across trials, enables epoch-level pruning. Faster than subprocess.")
     p.add_argument("--extra-args", nargs=argparse.REMAINDER, default=[],
                     help="Extra args passed to training script (after --)")
 
@@ -100,21 +104,32 @@ def main():
         pruner=args.pruner,
     )
 
-    # For architecture/pretrain sweeps, pass --total-steps via extra args
-    extra = list(args.extra_args)
-    if args.adapter in ("pretrain", "architecture"):
-        extra.extend(["--total-steps", str(args.total_steps)])
+    if args.in_process:
+        if args.adapter != "rosa":
+            p.error("--in-process is currently only supported for --adapter rosa")
+        objective = InProcessRoSAObjective(
+            checkpoint=args.checkpoint,
+            pgn=args.pgn or "",
+            device=args.device,
+            output_base=args.output_dir,
+            epochs=args.epochs,
+        )
+    else:
+        # For architecture/pretrain sweeps, pass --total-steps via extra args
+        extra = list(args.extra_args)
+        if args.adapter in ("pretrain", "architecture"):
+            extra.extend(["--total-steps", str(args.total_steps)])
 
-    objective = AdapterObjective(
-        adapter_type=args.adapter,
-        checkpoint=args.checkpoint,
-        pgn=args.pgn or "",
-        device=args.device,
-        output_base=args.output_dir,
-        epochs=args.epochs,
-        n_gpus=args.n_gpus,
-        extra_args=extra,
-    )
+        objective = AdapterObjective(
+            adapter_type=args.adapter,
+            checkpoint=args.checkpoint,
+            pgn=args.pgn or "",
+            device=args.device,
+            output_base=args.output_dir,
+            epochs=args.epochs,
+            n_gpus=args.n_gpus,
+            extra_args=extra,
+        )
 
     study.optimize(
         objective,
