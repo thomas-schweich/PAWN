@@ -15,6 +15,7 @@ pawn/
 │   ├── trainer.py   # Pretraining loop
 │   ├── gpu.py       # GPU auto-detection (compile/AMP/SDPA backend)
 │   ├── logging.py   # MetricsLogger (JSONL output)
+│   ├── checkpoint.py # Atomic save/load, .complete sentinel, HF push
 │   ├── adapters/    # Bottleneck, LoRA, FiLM, sparse, hybrid
 │   ├── eval_suite/  # Probes, generation tests, diagnostics, lichess eval
 │   └── dashboard/   # Solara training dashboard (metrics, charts, runner)
@@ -32,16 +33,18 @@ This is a uv workspace. The root project is the `pawn` Python package; `engine/`
 # Build the Rust chess engine (required before anything else)
 cd engine && uv run --with maturin maturin develop --release && cd ..
 
-# Install Python deps (dev tools like pytest are in base dependencies):
+# Install Python deps (dev tools like pytest, seaborn, solara are in base dependencies):
 uv sync --extra rocm      # AMD (ROCm 7.1)
 uv sync --extra cu128     # NVIDIA (CUDA 12.8)
 
 # Run tests
 uv run pytest tests/
 
-# Pretrain from scratch
+# Pretrain from scratch (local dev)
 uv run python scripts/train.py --variant base --local-checkpoints
 ```
+
+The only extras are GPU backends (`rocm` or `cu128`). Everything else (pytest, solara, optuna, seaborn, etc.) is in base dependencies.
 
 ## Engine (`engine/`)
 
@@ -49,13 +52,13 @@ uv run python scripts/train.py --variant base --local-checkpoints
 
 - Uses rayon for parallel game generation (~43K games/sec, 150M+/hr)
 - PyO3 bindings expose `chess_engine` module to Python
-- Key functions: `generate_random_games()`, `parse_pgn_file()`, `compute_legal_token_masks_sparse()`, `extract_board_states()`, `export_move_vocabulary()`
+- Key functions: `generate_random_games()`, `parse_pgn_file()`, `compute_legal_token_masks_sparse()`, `extract_board_states()`, `export_move_vocabulary()`, `compute_accuracy_ceiling()`
 
-## Model (`pawn/`)
+## Model
 
 ### Architecture
-- Decoder-only transformer, next-token prediction over 4278 tokens
-- Token vocabulary: 1 PAD + 4096 grid (64x64 src/dst) + 176 promotions + 5 outcomes
+- Decoder-only transformer, next-token prediction over 4,278 tokens
+- Token vocabulary: 1 PAD + 4,096 grid (64x64 src/dst) + 176 promotions + 5 outcomes
 - Factored embeddings: `src_embed[s] + dst_embed[d] + promo_embed[p]`
 - Sequence format: `[outcome] [ply_1] ... [ply_N] [PAD] ... [PAD]` (256 tokens)
 
@@ -65,60 +68,105 @@ uv run python scripts/train.py --variant base --local-checkpoints
 - `CLMConfig.large()`: d=640, 10 layers, 8 heads, ~68.4M params
 - `CLMConfig.toy()`: d=64, 2 layers, for tests only
 
-### Key Patterns
+## Training
 
-- **Sparse logit projection**: `forward_hidden()` returns `(B,T,d_model)`, then only loss-masked positions project through `lm_head` -- avoids full `(B,T,V)` materialization
-- **Legal mask via Rust**: `LegalMaskBuilder` replays games in Rust, returns sparse indices scattered into a pre-allocated GPU buffer
-- **DataLoader workers**: Must use `multiprocessing_context='spawn'` -- the engine uses rayon, and fork after rayon init causes deadlocks
-- **GPU auto-detection**: `pawn.gpu.configure_gpu()` selects compile/AMP/SDPA settings. ROCm uses MATH SDPA backend (flash attention backward has stride issues with torch.compile)
-- **SDPA backend global**: `pawn.model.SDPA_BACKEND` is set by `apply_gpu_config()` and used in `Attention.forward()` via `sdpa_kernel()` context
+All training scripts require one of `--hf-repo REPO_ID` or `--local-checkpoints` (mutually exclusive). Use `--local-checkpoints` for local dev; use `--hf-repo` for any run where you need durable checkpoints.
 
-## Adapters (`pawn/adapters/`)
-
-All adapters freeze the backbone and initialize to identity (zero-init or gamma=1, beta=0):
-- `bottleneck.py` -- Houlsby-style down/up MLP, best parameter efficiency below ~1M params
-- `lora.py` -- Low-rank attention projection adapters
-- `film.py` -- Feature-wise Linear Modulation (lightest, ~17K params)
-- `sparse.py` -- Random binary mask on frozen weights
-- `hybrid.py` -- LoRA + FiLM combined
-
-## Scripts (`scripts/`)
-
-- `train.py` -- Pretrain from scratch (`--variant small|base|large|toy`)
-- `train_all.py` -- Train small/base/large simultaneously on shared data batches. Supports `--run-evals` for automatic post-training probes, diagnostics, and Lichess eval, and `--publish-results` to push eval results to HF.
-- `train_bottleneck.py`, `train_film.py`, `train_lora.py`, `train_sparse.py`, `train_hybrid.py` -- Adapter behavioral cloning on Lichess PGN
-- `train_tiny.py` -- Standalone tiny transformer baseline (no frozen backbone)
-- `eval_accuracy.py` -- MAIA-compatible evaluation (per-phase, per-ply accuracy)
-- `eval_probes.py` -- Run linear probes on all checkpoints
-- `export_hf_repo.py` -- Convert training run to HuggingFace repo format (safetensors + metrics)
-
-All training scripts require `--hf-repo REPO` or `--local-checkpoints`.
-
-## Deploy (`deploy/`)
-
-Docker-based deployment to Runpod GPU VMs:
-- `Dockerfile` -- Multi-target build: `interactive` (SSH+Jupyter, default) and `runner` (auto-stop)
-- `entrypoint-run.sh` -- Runner entrypoint, pulls from HF via `PAWN_MODEL` env var
-- `sync.sh` -- Pull latest checkpoints/metrics from HuggingFace submodules
-- `pod.sh` -- Pod lifecycle (create/start/stop/delete/ssh)
-
-Code lives at `/opt/pawn` on pods (outside the `/workspace` volume mount).
-
-## Dashboard (`pawn/dashboard/`)
-
-Solara-based training dashboard. Reads `metrics.jsonl` files, no dependency on training packages.
+### Pretraining
 
 ```bash
-uv sync --extra dashboard
-python -m pawn.dashboard --log-dir logs
+# Single model
+uv run python scripts/train.py --variant base --local-checkpoints
+
+# All three variants simultaneously (shared data batches, sequential GPU)
+uv run python scripts/train_all.py --local-checkpoints
+
+# Resume from checkpoint
+uv run python scripts/train.py --variant base --resume checkpoints/step_00050000 --local-checkpoints
 ```
 
-- `metrics.py` -- Load runs, parse JSONL, detect run type from config record
-- `charts.py` -- Plotly chart builders (loss, accuracy, LR, GPU, adapter-specific diagnostics)
-- `sol.py` -- Solara components: RunSelector, ConfigSummary, MetricsCharts, Runner, Dashboard
-- `__main__.py` -- CLI entry point, sets `PAWN_LOG_DIR` env var, launches `solara run`
+**`scripts/train.py`** key args:
+- `--variant {small|base|large|toy}` — model size (default: base)
+- `--resume PATH` — resume from checkpoint directory
+- `--total-steps N` — training steps (default: 100,000)
+- `--batch-size N` — batch size (default: 256)
+- `--discard-ply-limit` — only train on naturally-ended games (no ply-limit truncation)
+- Architecture overrides: `--d-model`, `--n-layers`, `--n-heads`, `--d-ff`, `--lr`, `--weight-decay`, `--warmup-steps`
 
-Auto-detects run type from config fields (`run_type`, `formulation`, `pgn_file`). Dashboard requires restart for code changes (no hot reload).
+**`scripts/train_all.py`** additional args:
+- `--shm-checkpoints` — write checkpoints to `/dev/shm` (requires `--hf-repo`, volatile)
+- `--run-evals` — auto-run probes + diagnostics after training completes
+- `--publish-results` — push eval results to HF
+- `--patience N` — per-model early stopping patience (eval intervals without improvement)
+
+### Adapter Training
+
+All adapter scripts require `--checkpoint PATH` (pretrained weights) and `--pgn PATH` (Lichess PGN file). They freeze the backbone and train only adapter parameters.
+
+```bash
+# Example: train a LoRA adapter on Lichess 1800-1900 games
+uv run python scripts/train_lora.py \
+    --checkpoint checkpoints/pawn-base \
+    --pgn data/lichess_1800_1900.pgn \
+    --lora-rank 4 --lr 3e-4 --local-checkpoints
+```
+
+| Script | Adapter | Key args | Typical params |
+|--------|---------|----------|----------------|
+| `train_bottleneck.py` | Houlsby MLP | `--bottleneck-dim 8` | ~131K |
+| `train_lora.py` | Low-rank attention | `--lora-rank 4 --lora-targets qkvo` | ~65K |
+| `train_film.py` | Channel-wise affine | `--no-output-film` | ~17K |
+| `train_sparse.py` | Binary mask | `--density 0.01 --sparse-targets qkvo` | ~503K-2.7M |
+| `train_hybrid.py` | LoRA + FiLM | `--lora-rank 4 --film-lr 1e-3` | ~65K |
+| `train_tiny.py` | None (from scratch) | `--d-model 84 --n-layers 2` | ~524K |
+
+Common adapter args: `--epochs 50`, `--batch-size 64`, `--lr 3e-4`, `--patience 10`, `--val-every 1`, `--max-games 12000`, `--min-ply 10`
+
+### Common CLI Patterns
+
+- `--sdpa-math` — force MATH SDPA backend (required for ROCm + torch.compile)
+- `--no-compile` — disable torch.compile
+- `--no-amp` — disable mixed precision
+- `--num-workers N` — DataLoader workers (default: 8 for adapters, 4 for pretraining)
+- `--device {cuda|cpu}` — device selection
+- `--wandb` — enable Weights & Biases logging
+
+## Evaluation & Metrics
+
+### Linear Probes
+
+```bash
+uv run python scripts/eval_probes.py --log-dir logs --device cuda
+```
+
+Trains linear probes on frozen hidden states to measure internal representations (piece type, check status, castling rights, material count, game phase, etc.). Args: `--n-games 4096`, `--n-val-games 1024`, `--n-epochs 20`, `--run RUN_NAME` (specific run).
+
+### Move Prediction Accuracy
+
+```bash
+uv run python scripts/eval_accuracy.py \
+    --checkpoint checkpoints/pawn-base \
+    --pgn data/lichess_1800_1900.pgn \
+    --adapter-checkpoint logs/run_*/checkpoints/best
+```
+
+MAIA-compatible evaluation with per-phase and per-ply accuracy. Args: `--min-eval-ply 10`, `--max-games 50000`, `--per-ply`.
+
+### Theoretical Accuracy Ceilings
+
+```bash
+uv run python scripts/compute_theoretical_ceiling.py
+```
+
+Computes upper bounds on top-1 accuracy for random games: unconditional (E[1/N_legal] = 6.43%), naive-conditioned (1-ply filter = 6.44%), MCTS-conditioned (32 rollouts = 7.92%). CPU-intensive.
+
+### Export to HuggingFace
+
+```bash
+uv run python scripts/export_hf_repo.py --run-dir logs/run_YYYYMMDD_HHMMSS
+```
+
+Converts a training run to HuggingFace repo format (safetensors + metrics). Finds best checkpoint by val loss.
 
 ## Checkpoints
 
@@ -169,28 +217,152 @@ the training loop checks it between steps, saves a checkpoint, pushes to HF, and
 **Never rsync checkpoint files from running pods.** Checkpoints are pushed to HuggingFace
 from the trainer. Pull via `deploy/sync.sh` (submodule update).
 
-## Logs
+## RunPod Operations
 
-Training metrics in `logs/` (gitignored). Each run gets a timestamped directory with `metrics.jsonl`.
+### Docker Build & Push
 
-## Runpod Pod Management
+```bash
+# Build runner target (auto-stop after training completes)
+docker build --platform linux/amd64 \
+    --build-arg GIT_HASH=$(git rev-parse HEAD) \
+    --build-arg GIT_TAG=$(git tag --points-at HEAD) \
+    --target runner \
+    -t thomasschweich/pawn:latest-runner .
 
-### Setup
+# Build interactive target (SSH + Jupyter, stays alive)
+docker build --platform linux/amd64 \
+    --build-arg GIT_HASH=$(git rev-parse HEAD) \
+    --target interactive \
+    -t thomasschweich/pawn:latest .
 
-- Docker image: multi-target build in `Dockerfile`
-  - `interactive` (default) — SSH + Jupyter, stays alive
-  - `runner` — executes command then exits (pod auto-stops)
-- Build: `docker build --target runner --build-arg GIT_HASH=$(git rev-parse HEAD) ...`
+docker push thomasschweich/pawn:latest-runner
+```
 
-### Required Configuration
+Code lives at `/opt/pawn` on pods (outside the `/workspace` volume mount).
+
+### Pod Lifecycle
+
+Use `deploy/pod.sh` for all pod management. Requires `runpodctl` (`wget -qO- cli.runpod.net | sudo bash`).
+
+```bash
+# Create a pod
+bash deploy/pod.sh create myexp --gpu h100
+
+# SSH into it
+bash deploy/pod.sh ssh myexp
+
+# Launch training
+bash deploy/pod.sh launch myexp scripts/train_all.py --hf-repo thomas-schweich/pawn-{variant}
+
+# Stop (preserves volume, stops billing)
+bash deploy/pod.sh stop myexp
+
+# Delete (destroys everything)
+bash deploy/pod.sh delete myexp
+```
+
+GPU shortcuts: `a5000`, `a40`, `a6000`, `4090`, `5090`, `l40s`, `h100`. Pod configs are cached in `~/.config/pawn/pods/<name>.env`.
+
+### GPU Selection
+
+Benchmarks from pretraining 3 models concurrently (`train_all.py`, batch=256):
+
+| GPU | VRAM | $/hr | Step time | 100K cost | Notes |
+|-----|------|------|-----------|-----------|-------|
+| B200 | 192GB | $4.99 | 0.28s | ~$39 | Fastest |
+| H200 SXM | 80GB | $3.59 | 0.34s | ~$34 | Best wall-clock/cost balance |
+| RTX PRO 6000 | 48GB | $1.89 | 0.62s | ~$33 | Cheapest viable |
+| A100 PCIe | 80GB | $1.39 | 0.79s | ~$30 | Cheapest overall |
+| L40S | 48GB | $0.86 | 1.37s | ~$33 | Slow but cheap |
+| RTX 5090/4090/3090 | 24-32GB | — | OOM | — | Insufficient VRAM for 3 models |
+
+Total cost is remarkably consistent ($30-39) across viable GPUs. The choice is wall-clock time vs cost, not cost vs cost. Single-model training fits on 24GB GPUs.
+
+### Required Pod Configuration
 
 - **Always attach a network volume.** Checkpoints write to disk during atomic rename and HF push. Ephemeral container disk is lost on pod termination.
-- **Set `HF_TOKEN` as a pod environment variable** for automatic HuggingFace authentication.
-- Set `PAWN_MODEL=thomas-schweich/pawn-base` env var in the runner to auto-pull a checkpoint on startup.
+- **Set `HF_TOKEN` as a pod environment variable** for automatic HuggingFace authentication. The entrypoint persists it to `~/.cache/huggingface/token`.
+- `PAWN_MODEL=thomas-schweich/pawn-base` — auto-pull a checkpoint on startup (runner target).
+- `PAWN_CMD` — training command to execute (alternative to Docker CMD args).
 
-### Lifecycle
+### Pod Safety
 
-- Create: `runpodctl pod create --name pawn-exp --gpu-id "NVIDIA RTX A5000" --image thomasschweich/pawn:<tag> --volume-in-gb 75 --ports "8888/http,22/tcp"`
-- Stop: `runpodctl pod stop <ID>` — sends SIGTERM → trainer saves and pushes before exiting
-- **Never `runpodctl pod delete` while training is running** — data loss risk
-- Monitor: pull HF submodule (`deploy/sync.sh`) and read `metrics.jsonl`
+- Stop pods with `runpodctl pod stop` or `bash deploy/pod.sh stop` — sends SIGTERM, trainer saves and pushes before exiting.
+- **Never `runpodctl pod delete` while training is running** — data loss risk.
+- **Never `kill -9` training processes** — use SIGTERM (plain `kill`), which triggers graceful shutdown.
+- **Never rsync checkpoint files from running pods** — pull via HF submodule instead.
+
+## Monitoring Training Progress
+
+### Key Principle: Write Scripts to Disk for Pre-Approval
+
+When setting up recurring monitoring, **always write the monitoring script to a file first** so the user can review and pre-approve it. This avoids repeated permission prompts when `/loop` fires.
+
+**Pattern:**
+1. Write a bash script to disk (e.g., `scripts/check_my_run.sh`)
+2. User reviews and approves the script
+3. Schedule with `/loop 15m bash scripts/check_my_run.sh`
+
+**Example monitoring script:**
+
+```bash
+#!/usr/bin/env bash
+# scripts/check_my_run.sh — monitor a specific training run
+set -euo pipefail
+bash /home/tas/pawn/scripts/monitor_training.sh <POD_ID>
+```
+
+Or for local-only monitoring:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+bash /home/tas/pawn/scripts/check_progress.sh --sync
+```
+
+### Available Monitoring Tools
+
+| Tool | What it does |
+|------|-------------|
+| `scripts/monitor_training.sh [POD_ID]` | SSH to pod, sync metrics via rsync, show per-variant step/loss/acc/ETA, check HF checkpoint branches |
+| `scripts/check_progress.sh [--sync]` | Show progress from local `logs/` and HF submodules. `--sync` pulls submodules first. |
+| `deploy/sync.sh [name]` | Pull latest checkpoints/metrics from HuggingFace submodules |
+| `python -m pawn.dashboard --log-dir logs` | Solara web dashboard with interactive charts |
+
+### Dashboard
+
+```bash
+python -m pawn.dashboard --log-dir logs
+```
+
+Reads `metrics.jsonl` files, no dependency on training packages. Auto-detects run type from config fields. Shows loss curves, accuracy, LR schedules, GPU utilization, patience clocks, and adapter-specific diagnostics. Requires restart for code changes (no hot reload).
+
+## Logs
+
+Training metrics in `logs/` (gitignored). Each run gets a timestamped directory with `metrics.jsonl` and a random slug (e.g., `run_20260325_140000_zesty-osprey/`).
+
+`MetricsLogger` (`pawn/logging.py`) writes one JSON object per line. Every record includes timestamp, step, elapsed time, and memory stats. Config records include hostname, git hash, git tag, and run slug.
+
+## Hyperparameter Sweeps
+
+Optuna integration via `pawn/sweep.py` and `scripts/sweep.py`:
+
+```bash
+uv run python scripts/sweep.py \
+    --adapter lora --n-trials 30 --n-jobs 2 --n-gpus 2 \
+    --total-steps 20000 --pruner hyperband \
+    --checkpoint checkpoints/pawn-base --pgn data/lichess_1800_1900.pgn \
+    --local-checkpoints
+```
+
+Supports all adapter types + architecture search. GPU affinity assigns `CUDA_VISIBLE_DEVICES = trial.number % n_gpus`. SQLite-backed study persistence. Pruner options: `hyperband`, `median`, `none`.
+
+## Key Patterns & Gotchas
+
+- **DataLoader workers must use `multiprocessing_context='spawn'`** — the Rust engine uses rayon, and fork after rayon init causes deadlocks.
+- **`SDPA_BACKEND` must be set before `torch.compile()`** — compiled code captures the backend at trace time. `apply_gpu_config()` handles this.
+- **ROCm flash attention bug**: with `torch.compile`, flash attention backward has stride issues. Use `--sdpa-math` to force the MATH SDPA backend.
+- **Sparse logit projection**: `forward_hidden()` returns `(B,T,d_model)`, then only loss-masked positions project through `lm_head` — avoids full `(B,T,V)` materialization.
+- **Legal mask via Rust**: `LegalMaskBuilder` replays games in Rust, returns sparse indices (~2 MB) scattered into a pre-allocated GPU buffer (vs ~70 MB dense).
+- **GPU auto-detection**: `pawn.gpu.configure_gpu()` selects compile/AMP/SDPA settings. `apply_gpu_config()` applies them. NVIDIA uses flash attention + compile; AMD uses MATH SDPA + compile.
+- **Factored embeddings**: each move token decomposes into `src_embed[s] + dst_embed[d] + promo_embed[p]`, reducing embedding parameters by ~32x.
