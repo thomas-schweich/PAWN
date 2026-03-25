@@ -14,6 +14,13 @@ from pawn.adapters.rosa import (
 from pawn.adapters.sparse import SparseCLM, SparseLinear
 
 
+class SimpleMaskBuilder:
+    """Dummy mask builder that allows all moves."""
+    def __call__(self, batch):
+        B, T = batch["input_ids"].shape[:2]
+        return torch.ones(B, T, 4278, dtype=torch.bool)
+
+
 @pytest.fixture
 def toy_backbone():
     return PAWNCLM(CLMConfig.toy())
@@ -351,13 +358,6 @@ class TestGenerateGradientMasks:
                 "loss_mask": msk,
             })
 
-        class SimpleMaskBuilder:
-            """Dummy mask builder that allows all moves."""
-            def __call__(self, batch):
-                B = batch["input_ids"].shape[0]
-                T = batch["input_ids"].shape[1]
-                return torch.ones(B, T, 4278, dtype=torch.bool)
-
         masks = generate_gradient_masks(
             model, batches, SimpleMaskBuilder(),
             density=density, alpha=2,
@@ -399,11 +399,6 @@ class TestGenerateGradientMasks:
                 "loss_mask": torch.ones(4, 16, dtype=torch.bool),
             })
 
-        class SimpleMaskBuilder:
-            def __call__(self, batch):
-                B, T = batch["input_ids"].shape[:2]
-                return torch.ones(B, T, 4278, dtype=torch.bool)
-
         masks = generate_gradient_masks(
             model, batches, SimpleMaskBuilder(),
             density=0.05, alpha=2,
@@ -423,11 +418,6 @@ class TestGenerateGradientMasks:
             "targets": torch.randint(1, 4273, (2, 8)),
             "loss_mask": torch.ones(2, 8, dtype=torch.bool),
         }]
-
-        class SimpleMaskBuilder:
-            def __call__(self, batch):
-                B, T = batch["input_ids"].shape[:2]
-                return torch.ones(B, T, 4278, dtype=torch.bool)
 
         generate_gradient_masks(
             model, batches, SimpleMaskBuilder(),

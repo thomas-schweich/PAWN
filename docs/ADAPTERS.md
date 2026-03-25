@@ -238,12 +238,14 @@ uv run python scripts/train_hybrid.py \
 # RoSA (standard: joint LoRA + gradient-informed sparse)
 uv run python scripts/train_rosa.py \
     --checkpoint checkpoints/pawn.pt --pgn data/lichess_1800.pgn \
-    --mode rosa --density 0.01 --lora-rank 4 --warmup-steps 128 --lr 3e-4
+    --mode rosa --density 0.01 --lora-rank 4 --warmup-steps 128 --lr 3e-4 \
+    --local-checkpoints
 
 # RoSA (retrospective sparse + bottleneck)
 uv run python scripts/train_rosa.py \
     --checkpoint checkpoints/pawn.pt --pgn data/lichess_1800.pgn \
-    --mode retro-bottleneck --density 0.01 --bottleneck-dim 8 --lr 3e-4
+    --mode retro-bottleneck --density 0.01 --bottleneck-dim 8 --lr 3e-4 \
+    --local-checkpoints
 ```
 
 All scripts share common flags: `--epochs`, `--batch-size`, `--patience` (early stopping), `--no-compile` (required on ROCm), `--device`, `--num-workers`, `--resume` (checkpoint path for resuming).

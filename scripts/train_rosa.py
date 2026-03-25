@@ -587,11 +587,13 @@ def main():
     if args.output_dir:
         out_dir = Path(args.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        import psutil as _psutil
         logger = MetricsLogger.__new__(MetricsLogger)
+        logger.slug = ""
         logger.run_dir = out_dir
         logger.metrics_path = out_dir / "metrics.jsonl"
         logger._file = open(logger.metrics_path, "a")
-        logger._proc = __import__('psutil').Process()
+        logger._proc = _psutil.Process()
         logger._device = device
         logger._start_time = time.time()
     else:

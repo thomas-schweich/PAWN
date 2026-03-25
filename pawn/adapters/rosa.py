@@ -320,15 +320,22 @@ class RoSACLM(nn.Module):
         return state
 
     def load_adapter_state_dict(self, state: dict[str, torch.Tensor]):
-        """Load adapter weights and masks."""
+        """Load adapter weights and masks.
+
+        Masks with no active entries are stored but don't enable the sparse
+        branch (preserves LoRA-only state from warmup checkpoints).
+        """
         params = dict(self.named_parameters())
         for k, v in state.items():
             if k.startswith("mask/"):
-                # Restore mask
                 mask_key = k[5:]  # strip "mask/"
                 for key, module in self._rosa_modules():
                     if key == mask_key:
-                        module.set_mask(v)
+                        if v.any():
+                            module.set_mask(v)
+                        else:
+                            # Store the empty mask but don't enable sparse
+                            module.mask.copy_(v)
                         break
             elif k in params:
                 params[k].data.copy_(v)
@@ -511,16 +518,40 @@ class RetroBottleneckCLM(nn.Module):
         return params
 
     def adapter_state_dict(self) -> dict[str, torch.Tensor]:
-        return {
+        state = {
             name: param.data.clone()
             for name, param in self.named_parameters()
             if param.requires_grad
         }
+        # Also save sparse masks for reproducibility
+        for layer_idx in range(len(self.backbone.layers)):
+            block = self.backbone.get_block(layer_idx)
+            for proj_name in ("wq", "wk", "wv", "wo"):
+                module = getattr(block.attn, proj_name, None)
+                if isinstance(module, SparseLinear):
+                    state[f"mask/layer{layer_idx}.{proj_name}"] = module.mask.clone()
+            for proj_name in _FFN_TARGETS:
+                module = getattr(block.ffn, proj_name, None)
+                if isinstance(module, SparseLinear):
+                    state[f"mask/layer{layer_idx}.{proj_name}"] = module.mask.clone()
+        return state
 
     def load_adapter_state_dict(self, state: dict[str, torch.Tensor]):
         params = dict(self.named_parameters())
         for k, v in state.items():
-            if k in params:
+            if k.startswith("mask/"):
+                # Restore sparse mask: "mask/layer{i}.{proj}" -> layer i, proj
+                mask_key = k[5:]  # strip "mask/"
+                parts = mask_key.split(".")
+                layer_idx = int(parts[0].replace("layer", ""))
+                proj_name = parts[1]
+                block = self.backbone.get_block(layer_idx)
+                for container in (block.attn, block.ffn):
+                    module = getattr(container, proj_name, None)
+                    if isinstance(module, SparseLinear):
+                        module.mask.copy_(v)
+                        break
+            elif k in params:
                 params[k].data.copy_(v)
 
     def adapter_weight_report(self) -> dict[str, float]:
@@ -600,9 +631,9 @@ def generate_gradient_masks(
         if n_batches >= max_batches:
             break
 
-        ids = batch["input_ids"].to(device)
-        tgt = batch["targets"].to(device)
-        msk = batch["loss_mask"].to(device)
+        ids = batch["input_ids"].to(device, non_blocking=True)
+        tgt = batch["targets"].to(device, non_blocking=True)
+        msk = batch["loss_mask"].to(device, non_blocking=True)
 
         # Build legal mask
         if "legal_indices" in batch:
