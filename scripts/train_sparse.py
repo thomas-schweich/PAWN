@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import json
 import math
 import signal
 import time
@@ -29,6 +28,7 @@ from torch.utils.data import DataLoader
 from pawn.config import CLMConfig, PAD_TOKEN
 from pawn.model import PAWNCLM
 from pawn.adapters.sparse import SparseCLM
+from pawn.logging import MetricsLogger
 from pawn.gpu import configure_gpu, apply_gpu_config
 
 from pawn.lichess_data import (
@@ -180,13 +180,25 @@ def main():
     args = parse_args()
 
     # Resolve output directory
+    device = args.device
+    log_dir = Path(args.log_dir) if args.log_dir else Path(__file__).resolve().parent.parent.parent / "logs"
+
     if args.output_dir:
         out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        import psutil as _psutil
+        logger = MetricsLogger.__new__(MetricsLogger)
+        logger.slug = ""
+        logger.run_dir = out_dir
+        logger.metrics_path = out_dir / "metrics.jsonl"
+        logger._file = open(logger.metrics_path, "a")
+        logger._proc = _psutil.Process()
+        logger._device = device
+        logger._start_time = time.time()
     else:
-        log_dir = Path(args.log_dir) if args.log_dir else Path(__file__).resolve().parent.parent.parent / "logs"
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_dir = log_dir / f"sparse_{timestamp}"
-    out_dir.mkdir(parents=True, exist_ok=True)
+        logger = MetricsLogger(str(log_dir), run_prefix="sparse", device=device)
+        out_dir = logger.run_dir
+
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
 
@@ -194,7 +206,6 @@ def main():
     if args.hf_repo:
         hf_branch = f"run/{out_dir.name}"
 
-    device = args.device
     print(f"Device: {device}")
     print(f"Output: {out_dir}")
 
@@ -202,27 +213,23 @@ def main():
     attn_targets = _ATTN_PRESETS[args.sparse_targets]
 
     # Write config record
-    metrics_path = out_dir / "metrics.jsonl"
-    config_record = {
-        "type": "config",
-        "run_type": "sparse",
-        "checkpoint": str(args.checkpoint),
-        "pgn": str(args.pgn),
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "lr": args.lr,
-        "weight_decay": args.weight_decay,
-        "patience": args.patience,
-        "warmup_frac": args.warmup_frac,
-        "max_grad_norm": args.max_grad_norm,
-        "density": args.density,
-        "sparse_targets": args.sparse_targets,
-        "sparse_layers": args.sparse_layers,
-        "sparse_ffn": args.sparse_ffn,
-        "sparse_seed": args.sparse_seed,
-    }
-    with open(metrics_path, "w") as f:
-        f.write(json.dumps(config_record) + "\n")
+    logger.log_config(
+        run_type="sparse",
+        checkpoint=str(args.checkpoint),
+        pgn=str(args.pgn),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
+        warmup_frac=args.warmup_frac,
+        max_grad_norm=args.max_grad_norm,
+        density=args.density,
+        sparse_targets=args.sparse_targets,
+        sparse_layers=args.sparse_layers,
+        sparse_ffn=args.sparse_ffn,
+        sparse_seed=args.sparse_seed,
+    )
 
     # Load backbone
     print(f"Loading backbone: {args.checkpoint}")
@@ -297,14 +304,11 @@ def main():
     print(f"  loss={baseline['loss']:.4f}, top1={baseline['top1_accuracy']:.4%}, "
           f"top5={baseline['top5_accuracy']:.4%}")
 
-    with open(metrics_path, "a") as f:
-        f.write(json.dumps({
-            "type": "train",
-            "epoch": -1, "step": 0,
-            "train_loss": baseline["loss"], "train_top1": baseline["top1_accuracy"],
-            "val_loss": baseline["loss"], "val_top1": baseline["top1_accuracy"],
-            "val_top5": baseline["top5_accuracy"],
-        }) + "\n")
+    logger.log_train(step=0, epoch=-1,
+        train_loss=baseline["loss"], train_top1=baseline["top1_accuracy"],
+        val_loss=baseline["loss"], val_top1=baseline["top1_accuracy"],
+        val_top5=baseline["top5_accuracy"],
+    )
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -372,21 +376,16 @@ def main():
 
         weight_report = model.sparse_weight_report()
 
-        record = {
-            "type": "train",
-            "epoch": epoch,
-            "step": global_step,
-            "lr": optimizer.param_groups[0]["lr"],
-            "train_loss": train_loss,
-            "train_top1": train_top1,
-            "val_loss": val_metrics["loss"],
-            "val_top1": val_metrics["top1_accuracy"],
-            "val_top5": val_metrics["top5_accuracy"],
-            "epoch_time_s": dt,
-            **{k: v for k, v in weight_report.items()},
-        }
-        with open(metrics_path, "a") as f:
-            f.write(json.dumps(record) + "\n")
+        logger.log_train(step=global_step, epoch=epoch,
+            lr=optimizer.param_groups[0]["lr"],
+            train_loss=train_loss,
+            train_top1=train_top1,
+            val_loss=val_metrics["loss"],
+            val_top1=val_metrics["top1_accuracy"],
+            val_top5=val_metrics["top5_accuracy"],
+            epoch_time_s=dt,
+            **weight_report,
+        )
 
         print(f"  Epoch {epoch:3d} | "
               f"train_loss={train_loss:.4f} train_top1={train_top1:.4%} | "
@@ -441,6 +440,7 @@ def main():
         except Exception as e:
             print(f"WARNING: HF push failed: {e}")
 
+    logger.close()
     print(f"\nDone. Best val_loss={best_val_loss:.4f}")
     print(f"Checkpoints saved to {out_dir}")
 

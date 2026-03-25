@@ -13,9 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
-import random
 import shutil
 import signal
 import sys
@@ -31,6 +29,7 @@ from pawn.model import PAWNCLM, clm_loss
 from pawn.data import CLMDataset, create_validation_set
 from pawn.gpu import configure_gpu
 from pawn.checkpoint import save_pretrain_checkpoint, push_checkpoint_to_hf
+from pawn.logging import MetricsLogger, random_slug
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +76,13 @@ class ModelSlot:
 
         self.scaler = torch.amp.GradScaler(device, enabled=train_cfg.use_amp)
 
-        # Run directory (logs always on persistent disk)
-        self.run_dir = _make_run_dir(train_cfg.log_dir, name, slug)
+        # Logger (creates run directory)
+        self.logger = MetricsLogger(
+            train_cfg.log_dir, run_prefix="run", device=device,
+            slug=slug, suffix=name,
+        )
+        self.run_dir = str(self.logger.run_dir)
+        self.jsonl_path = str(self.logger.metrics_path)
 
         # Checkpoint directory: /dev/shm if requested, else under run_dir
         if shm_checkpoints:
@@ -86,9 +90,6 @@ class ModelSlot:
         else:
             self.checkpoint_dir = os.path.join(self.run_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-
-        self.jsonl_path = os.path.join(self.run_dir, "metrics.jsonl")
-        self._jsonl_file: open | None = None
 
         self.hf_branch = f"run/{os.path.basename(self.run_dir)}" if hf_repo else None
         self.global_step = 0
@@ -102,35 +103,22 @@ class ModelSlot:
         self._hf_push_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"hf-{name}")
         self._hf_push_future = None
 
-        # Write config
-        import subprocess
-        try:
-            git_hash = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
-            ).strip()
-        except Exception:
-            git_hash = os.environ.get("PAWN_GIT_HASH")
-        try:
-            git_tag = subprocess.check_output(
-                ["git", "tag", "--points-at", "HEAD"], stderr=subprocess.DEVNULL, text=True
-            ).strip() or None
-        except Exception:
-            git_tag = os.environ.get("PAWN_GIT_TAG")
-
-        config_data = {
-            "model": model_cfg.__dict__,
-            "training": train_cfg.__dict__,
-            "param_count": param_count,
-            "formulation": "clm",
-            "multi_model": True,
-            "variant": name,
-            "slug": slug,
-            "git_hash": git_hash,
-            "git_tag": git_tag,
-        }
-        with open(os.path.join(self.run_dir, "config.json"), "w") as f:
-            json.dump(config_data, f, indent=2, default=str)
-        self._log_jsonl({"type": "config", **config_data})
+        self.logger.log_config(
+            model=model_cfg.__dict__,
+            training=train_cfg.__dict__,
+            param_count=param_count,
+            formulation="clm",
+            multi_model=True,
+            variant=name,
+        )
+        self.logger.write_config_json(
+            model=model_cfg.__dict__,
+            training=train_cfg.__dict__,
+            param_count=param_count,
+            formulation="clm",
+            multi_model=True,
+            variant=name,
+        )
 
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Forward + backward. Returns raw GPU tensor metrics (no .item() sync)."""
@@ -255,43 +243,12 @@ class ModelSlot:
 
         return {f"val/{k}": v / n_batches for k, v in total_metrics.items()}
 
-    def _log_jsonl(self, record: dict):
-        if self._jsonl_file is None:
-            self._jsonl_file = open(self.jsonl_path, "a")
-        self._jsonl_file.write(json.dumps(record, default=str) + "\n")
-        self._jsonl_file.flush()
-
     def close(self):
         self.wait_for_push()
         self._hf_push_pool.shutdown(wait=True)
-        if self._jsonl_file:
-            self._jsonl_file.close()
-            self._jsonl_file = None
+        self.logger.close()
 
 
-_ADJECTIVES = [
-    "amber", "bold", "calm", "deft", "eager", "fair", "grim", "hale",
-    "keen", "lush", "mild", "neat", "pale", "quick", "rare", "sly",
-    "taut", "vast", "warm", "zesty", "brisk", "crisp", "dense", "fleet",
-    "grand", "hardy", "jolly", "lucid", "noble", "prime", "stark", "vivid",
-]
-_ANIMALS = [
-    "puma", "lynx", "hawk", "wolf", "bear", "deer", "fox", "owl",
-    "pike", "wren", "crane", "otter", "raven", "cobra", "heron", "bison",
-    "finch", "marten", "osprey", "falcon", "badger", "salmon", "condor",
-    "coyote", "ferret", "jackal", "marmot", "parrot", "turtle", "walrus",
-]
-
-
-def _random_slug() -> str:
-    return f"{random.choice(_ADJECTIVES)}-{random.choice(_ANIMALS)}"
-
-
-def _make_run_dir(log_dir: str, variant: str, slug: str) -> str:
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(log_dir, f"run_{timestamp}_{variant}_{slug}")
-    os.makedirs(run_dir, exist_ok=True)
-    return run_dir
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +402,7 @@ def main():
         "large": CLMConfig.large(),
     }
 
-    slug = _random_slug()
+    slug = random_slug()
 
     print(f"=== Multi-Model Training [{slug}] ===")
     print(f"Device: {device}")
@@ -565,18 +522,12 @@ def main():
                 print(f"  {slot.name:>5s}: loss {loss_val:.4f} | acc {acc_val:.3f} | "
                       f"lr {lr:.2e} | gn {gn:.2f}", flush=True)
 
-                record = {
-                    "type": "train",
-                    "step": global_step,
-                    "timestamp": time.time(),
-                    "lr": lr,
-                    "grad_norm": gn,
-                    "step_time": step_time,
-                    "games_per_sec": games_per_sec,
-                    "train/loss": loss_val,
-                    "train/accuracy": acc_val,
-                }
-                slot._log_jsonl(record)
+                slot.logger.log_train(
+                    step=global_step,
+                    lr=lr, grad_norm=gn,
+                    step_time=step_time, games_per_sec=games_per_sec,
+                    **{"train/loss": loss_val, "train/accuracy": acc_val},
+                )
 
         # Eval
         if global_step % args.eval_interval == 0:
@@ -593,15 +544,13 @@ def main():
                 else:
                     slot.patience_counter += 1
 
-                slot._log_jsonl({
-                    "type": "val",
-                    "step": global_step,
-                    "timestamp": time.time(),
-                    "patience": slot.patience_counter,
-                    "best_val_loss": slot.best_val_loss,
-                    "best_val_step": slot.best_val_step,
+                slot.logger.log_val(
+                    step=global_step,
+                    patience=slot.patience_counter,
+                    best_val_loss=slot.best_val_loss,
+                    best_val_step=slot.best_val_step,
                     **val_metrics,
-                })
+                )
 
                 # Per-model early stopping
                 if args.patience > 0 and slot.patience_counter >= args.patience:

@@ -217,24 +217,24 @@ def main():
     ffn_layers = tuple(int(x) for x in args.ffn_layers.split(",")) if args.ffn_layers else None
 
     # Write config record
-    logger.log_config({
-        "run_type": "bottleneck",
-        "checkpoint": str(args.checkpoint),
-        "pgn": str(args.pgn),
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "lr": args.lr,
-        "weight_decay": args.weight_decay,
-        "patience": args.patience,
-        "warmup_frac": args.warmup_frac,
-        "max_grad_norm": args.max_grad_norm,
-        "bottleneck_dim": args.bottleneck_dim,
-        "adapt_attn": not args.no_adapt_attn,
-        "adapt_ffn": not args.no_adapt_ffn,
-        "adapter_layers": args.adapter_layers,
-        "attn_layers": args.attn_layers,
-        "ffn_layers": args.ffn_layers,
-    })
+    logger.log_config(
+        run_type="bottleneck",
+        checkpoint=str(args.checkpoint),
+        pgn=str(args.pgn),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
+        warmup_frac=args.warmup_frac,
+        max_grad_norm=args.max_grad_norm,
+        bottleneck_dim=args.bottleneck_dim,
+        adapt_attn=not args.no_adapt_attn,
+        adapt_ffn=not args.no_adapt_ffn,
+        adapter_layers=args.adapter_layers,
+        attn_layers=args.attn_layers,
+        ffn_layers=args.ffn_layers,
+    )
 
     # Load backbone
     print(f"Loading backbone: {args.checkpoint}")
@@ -362,11 +362,11 @@ def main():
         print(f"  loss={baseline['loss']:.4f}, top1={baseline['top1_accuracy']:.4%}, "
               f"top5={baseline['top5_accuracy']:.4%}")
 
-        logger.log({
-            "train_loss": baseline["loss"], "train_top1": baseline["top1_accuracy"],
-            "val_loss": baseline["loss"], "val_top1": baseline["top1_accuracy"],
-            "val_top5": baseline["top5_accuracy"],
-        }, step=0, epoch=-1)
+        logger.log_train(step=0, epoch=-1,
+            train_loss=baseline["loss"], train_top1=baseline["top1_accuracy"],
+            val_loss=baseline["loss"], val_top1=baseline["top1_accuracy"],
+            val_top5=baseline["top5_accuracy"],
+        )
 
     val_metrics = evaluate(model, val_loader, mask_builder, device, use_amp=use_amp,
                            precomputed_indices=val_legal_indices) if args.resume else baseline
@@ -433,16 +433,16 @@ def main():
 
         weight_report = model.adapter_weight_report()
 
-        logger.log({
-            "lr": optimizer.param_groups[0]["lr"],
-            "train_loss": train_loss,
-            "train_top1": train_top1,
-            "val_loss": val_metrics["loss"],
-            "val_top1": val_metrics["top1_accuracy"],
-            "val_top5": val_metrics["top5_accuracy"],
-            "epoch_time_s": dt,
+        logger.log_train(step=global_step, epoch=epoch,
+            lr=optimizer.param_groups[0]["lr"],
+            train_loss=train_loss,
+            train_top1=train_top1,
+            val_loss=val_metrics["loss"],
+            val_top1=val_metrics["top1_accuracy"],
+            val_top5=val_metrics["top5_accuracy"],
+            epoch_time_s=dt,
             **weight_report,
-        }, step=global_step, epoch=epoch)
+        )
 
         print(f"  Epoch {epoch:3d} | "
               f"train_loss={train_loss:.4f} train_top1={train_top1:.4%} | "

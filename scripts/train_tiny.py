@@ -284,19 +284,19 @@ def main():
     print(f"Parameters: {n_params:,} total, {n_unique:,} unique (weight-tied)")
 
     # Config record
-    logger.log_config({
-        "run_type": "tiny",
-        "pgn": str(args.pgn),
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "lr": args.lr,
-        "weight_decay": args.weight_decay,
-        "d_model": args.d_model,
-        "n_layers": args.n_layers,
-        "n_heads": args.n_heads,
-        "d_ff": args.d_ff,
-        "n_params_unique": n_unique,
-    })
+    logger.log_config(
+        run_type="tiny",
+        pgn=str(args.pgn),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+        n_heads=args.n_heads,
+        d_ff=args.d_ff,
+        n_params_unique=n_unique,
+    )
 
     # Data
     print(f"\nPreparing data: {args.pgn}")
@@ -358,11 +358,11 @@ def main():
     print(f"  loss={baseline['loss']:.4f}, top1={baseline['top1_accuracy']:.4%}, "
           f"top5={baseline['top5_accuracy']:.4%}")
 
-    logger.log({
-        "train_loss": baseline["loss"], "train_top1": baseline["top1_accuracy"],
-        "val_loss": baseline["loss"], "val_top1": baseline["top1_accuracy"],
-        "val_top5": baseline["top5_accuracy"],
-    }, step=0, epoch=-1)
+    logger.log_train(step=0, epoch=-1,
+        train_loss=baseline["loss"], train_top1=baseline["top1_accuracy"],
+        val_loss=baseline["loss"], val_top1=baseline["top1_accuracy"],
+        val_top5=baseline["top5_accuracy"],
+    )
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -428,14 +428,14 @@ def main():
             val_metrics = evaluate(model, val_loader, mask_builder, device,
                                    use_amp=use_amp, precomputed_indices=val_legal_indices)
 
-        logger.log({
-            "lr": optimizer.param_groups[0]["lr"],
-            "train_loss": train_loss, "train_top1": train_top1,
-            "val_loss": val_metrics["loss"],
-            "val_top1": val_metrics["top1_accuracy"],
-            "val_top5": val_metrics["top5_accuracy"],
-            "epoch_time_s": dt,
-        }, step=global_step, epoch=epoch)
+        logger.log_train(step=global_step, epoch=epoch,
+            lr=optimizer.param_groups[0]["lr"],
+            train_loss=train_loss, train_top1=train_top1,
+            val_loss=val_metrics["loss"],
+            val_top1=val_metrics["top1_accuracy"],
+            val_top5=val_metrics["top5_accuracy"],
+            epoch_time_s=dt,
+        )
 
         print(f"  Epoch {epoch:3d} | "
               f"train_loss={train_loss:.4f} train_top1={train_top1:.4%} | "

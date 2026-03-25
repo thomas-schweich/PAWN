@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from pawn.config import CLMConfig, TrainingConfig
 from pawn.model import PAWNCLM, clm_loss
 from pawn.data import CLMDataset, create_validation_set
+from pawn.logging import MetricsLogger
 
 from pawn.data_utils import unpack_grid
 
@@ -168,28 +169,6 @@ def _compute_legal_move_rate(
         return legal_count / valid_count
 
 
-def _get_memory_stats(device: str, reset_peak: bool = True) -> dict[str, float]:
-    proc = psutil.Process()
-    mem = proc.memory_info()
-    sys_mem = psutil.virtual_memory()
-    per_cpu = psutil.cpu_percent(interval=None, percpu=True)
-    cpu_pct = sum(per_cpu) if per_cpu else 0.0
-    stats = {
-        "system_rss_gb": mem.rss / (1024**3),
-        "system_used_gb": sys_mem.used / (1024**3),
-        "system_total_gb": sys_mem.total / (1024**3),
-        "cpu_percent": cpu_pct,
-    }
-
-    if device != "cpu" and torch.cuda.is_available():
-        stats["gpu_peak_gb"] = torch.cuda.max_memory_allocated() / (1024**3)
-        stats["gpu_reserved_gb"] = torch.cuda.memory_reserved() / (1024**3)
-        stats["gpu_current_gb"] = torch.cuda.memory_allocated() / (1024**3)
-        if reset_peak:
-            torch.cuda.reset_peak_memory_stats()
-
-    return stats
-
 
 def _get_grad_norm(model: nn.Module) -> float:
     total = 0.0
@@ -197,13 +176,6 @@ def _get_grad_norm(model: nn.Module) -> float:
         if p.grad is not None:
             total += p.grad.data.float().norm().item() ** 2
     return total**0.5
-
-
-def _make_run_dir(base_log_dir: str) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(base_log_dir, f"run_{ts}")
-    os.makedirs(run_dir, exist_ok=True)
-    return run_dir
 
 
 class CLMTrainer:
@@ -220,10 +192,12 @@ class CLMTrainer:
         self.hf_repo = hf_repo
         self.hf_branch: str | None = None
 
-        self.run_dir = _make_run_dir(train_cfg.log_dir)
+        self.logger = MetricsLogger(
+            train_cfg.log_dir, run_prefix="run", device=self.device,
+        )
+        self.run_dir = str(self.logger.run_dir)
         self.cfg.checkpoint_dir = os.path.join(self.run_dir, "checkpoints")
-        self._jsonl_path = os.path.join(self.run_dir, "metrics.jsonl")
-        self._jsonl_file = None
+        self._jsonl_path = str(self.logger.metrics_path)
 
         if self.hf_repo:
             self.hf_branch = f"run/{os.path.basename(self.run_dir)}"
@@ -285,36 +259,20 @@ class CLMTrainer:
         else:
             print("Skipping torch.compile on CPU")
 
-        import subprocess
-        try:
-            git_hash = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
-            ).strip()
-        except Exception:
-            git_hash = os.environ.get("PAWN_GIT_HASH")
-        try:
-            git_tag = subprocess.check_output(
-                ["git", "tag", "--points-at", "HEAD"], stderr=subprocess.DEVNULL, text=True
-            ).strip() or None
-        except Exception:
-            git_tag = os.environ.get("PAWN_GIT_TAG")
-
-        config_data = {
-            "model": model_cfg.__dict__,
-            "training": train_cfg.__dict__,
-            "param_count": param_count,
-            "compiled": self._compiled,
-            "formulation": "clm",
-            "git_hash": git_hash,
-            "git_tag": git_tag,
-        }
-
-        config_path = os.path.join(self.run_dir, "config.json")
-        with open(config_path, "w") as f:
-            json.dump(config_data, f, indent=2, default=str)
-
-        # Write config record to JSONL so the dashboard can detect run type
-        self._log_jsonl({"type": "config", **config_data})
+        self.logger.log_config(
+            model=model_cfg.__dict__,
+            training=train_cfg.__dict__,
+            param_count=param_count,
+            compiled=self._compiled,
+            formulation="clm",
+        )
+        self.logger.write_config_json(
+            model=model_cfg.__dict__,
+            training=train_cfg.__dict__,
+            param_count=param_count,
+            compiled=self._compiled,
+            formulation="clm",
+        )
 
     def seed_logs(self, run_dirs: list[str], max_step: int):
         """Splice prior run logs into this run's JSONL."""
@@ -362,10 +320,8 @@ class CLMTrainer:
               f"(steps {first_step}-{last_step})")
 
     def _log_jsonl(self, record: dict):
-        if self._jsonl_file is None:
-            self._jsonl_file = open(self._jsonl_path, "a")
-        self._jsonl_file.write(json.dumps(record, default=str) + "\n")
-        self._jsonl_file.flush()
+        """Low-level JSONL write for seed_logs compatibility."""
+        self.logger._write(record)
 
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         self.model.train()
@@ -496,43 +452,31 @@ class CLMTrainer:
                     loss_val = metrics['loss'].item()
                     acc_val = metrics['accuracy'].item()
                     lr = self.scheduler.get_lr()
-                    mem = _get_memory_stats(self.device)
 
-                    msg = (
+                    print(
                         f"step {self.global_step:>7d} | "
                         f"loss {loss_val:.4f} | "
                         f"acc {acc_val:.3f} | "
                         f"lr {lr:.2e} | "
                         f"gn {grad_norm:.2f} | "
                         f"{games_per_sec:.0f} g/s | "
-                        f"{step_time:.2f}s"
+                        f"{step_time:.2f}s",
+                        flush=True,
                     )
-                    print(msg, flush=True)
 
-                    record = {
-                        "type": "train",
-                        "step": self.global_step,
-                        "timestamp": time.time(),
-                        "lr": lr,
-                        "grad_norm": grad_norm,
-                        "step_time": step_time,
-                        "games_per_sec": games_per_sec,
-                        "train/loss": loss_val,
-                        "train/accuracy": acc_val,
-                        **{f"mem/{k}": v for k, v in mem.items()},
-                    }
-                    self._log_jsonl(record)
+                    self.logger.log_train(
+                        step=self.global_step,
+                        lr=lr, grad_norm=grad_norm,
+                        step_time=step_time, games_per_sec=games_per_sec,
+                        **{"train/loss": loss_val, "train/accuracy": acc_val},
+                    )
 
                     if self.wandb_run:
-                        log_data = {
-                            "train/loss": loss_val,
-                            "train/accuracy": acc_val,
-                            "train/lr": lr,
-                            "train/grad_norm": grad_norm,
-                            "train/step_time": step_time,
-                            "train/games_per_sec": games_per_sec,
-                        }
-                        self.wandb_run.log(log_data, step=self.global_step)
+                        self.wandb_run.log({
+                            "train/loss": loss_val, "train/accuracy": acc_val,
+                            "train/lr": lr, "train/grad_norm": grad_norm,
+                            "train/step_time": step_time, "train/games_per_sec": games_per_sec,
+                        }, step=self.global_step)
 
                 if self.global_step % self.cfg.eval_interval == 0:
                     val_metrics = self.evaluate()
@@ -546,13 +490,7 @@ class CLMTrainer:
                         val_msg += f" | legal {val_metrics['val/legal_move_rate']:.3f}"
                     print(val_msg, flush=True)
 
-                    record = {
-                        "type": "val",
-                        "step": self.global_step,
-                        "timestamp": time.time(),
-                        **val_metrics,
-                    }
-                    self._log_jsonl(record)
+                    self.logger.log_val(step=self.global_step, **val_metrics)
 
                     if self.wandb_run:
                         self.wandb_run.log(val_metrics, step=self.global_step)
@@ -576,9 +514,7 @@ class CLMTrainer:
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGINT, old_int)
 
-        if self._jsonl_file:
-            self._jsonl_file.close()
-            self._jsonl_file = None
+        self.logger.close()
 
     def save_checkpoint(self, path: str | None = None):
         from pawn.checkpoint import save_pretrain_checkpoint

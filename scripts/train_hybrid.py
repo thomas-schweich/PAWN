@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import json
 import math
 import signal
 import time
@@ -30,6 +29,7 @@ from torch.utils.data import DataLoader
 from pawn.config import CLMConfig, PAD_TOKEN
 from pawn.model import PAWNCLM
 from pawn.adapters.hybrid import HybridCLM
+from pawn.logging import MetricsLogger
 from pawn.gpu import configure_gpu, apply_gpu_config
 
 from pawn.lichess_data import (
@@ -180,13 +180,25 @@ def main():
     args = parse_args()
 
     # Resolve output directory
+    device = args.device
+    log_dir = Path(args.log_dir) if args.log_dir else Path(__file__).resolve().parent.parent.parent / "logs"
+
     if args.output_dir:
         out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        import psutil as _psutil
+        logger = MetricsLogger.__new__(MetricsLogger)
+        logger.slug = ""
+        logger.run_dir = out_dir
+        logger.metrics_path = out_dir / "metrics.jsonl"
+        logger._file = open(logger.metrics_path, "a")
+        logger._proc = _psutil.Process()
+        logger._device = device
+        logger._start_time = time.time()
     else:
-        log_dir = Path(args.log_dir) if args.log_dir else Path(__file__).resolve().parent.parent.parent / "logs"
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_dir = log_dir / f"hybrid_{timestamp}"
-    out_dir.mkdir(parents=True, exist_ok=True)
+        logger = MetricsLogger(str(log_dir), run_prefix="hybrid", device=device)
+        out_dir = logger.run_dir
+
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
 
@@ -194,7 +206,6 @@ def main():
     if args.hf_repo:
         hf_branch = f"run/{out_dir.name}"
 
-    device = args.device
     print(f"Device: {device}")
     print(f"Output: {out_dir}")
 
@@ -203,31 +214,27 @@ def main():
     film_layers = tuple(int(x) for x in args.film_layers.split(",")) if args.film_layers else None
 
     # Write config record
-    metrics_path = out_dir / "metrics.jsonl"
-    config_record = {
-        "type": "config",
-        "run_type": "hybrid",
-        "checkpoint": str(args.checkpoint),
-        "pgn": str(args.pgn),
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "lora_rank": args.lora_rank,
-        "lora_alpha": args.lora_alpha if args.lora_alpha is not None else args.lora_rank,
-        "lora_targets": args.lora_targets,
-        "lora_layers": args.lora_layers,
-        "lora_ffn": args.lora_ffn,
-        "lora_lr": args.lora_lr,
-        "use_film": not args.no_film,
-        "output_film": args.output_film,
-        "film_layers": args.film_layers,
-        "film_lr": args.film_lr,
-        "weight_decay": args.weight_decay,
-        "patience": args.patience,
-        "warmup_frac": args.warmup_frac,
-        "max_grad_norm": args.max_grad_norm,
-    }
-    with open(metrics_path, "w") as f:
-        f.write(json.dumps(config_record) + "\n")
+    logger.log_config(
+        run_type="hybrid",
+        checkpoint=str(args.checkpoint),
+        pgn=str(args.pgn),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha if args.lora_alpha is not None else args.lora_rank,
+        lora_targets=args.lora_targets,
+        lora_layers=args.lora_layers,
+        lora_ffn=args.lora_ffn,
+        lora_lr=args.lora_lr,
+        use_film=not args.no_film,
+        output_film=args.output_film,
+        film_layers=args.film_layers,
+        film_lr=args.film_lr,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
+        warmup_frac=args.warmup_frac,
+        max_grad_norm=args.max_grad_norm,
+    )
 
     # Load backbone
     print(f"Loading backbone: {args.checkpoint}")
@@ -312,14 +319,11 @@ def main():
     print(f"  loss={baseline['loss']:.4f}, top1={baseline['top1_accuracy']:.4%}, "
           f"top5={baseline['top5_accuracy']:.4%}")
 
-    with open(metrics_path, "a") as f:
-        f.write(json.dumps({
-            "type": "train",
-            "epoch": -1, "step": 0,
-            "train_loss": baseline["loss"], "train_top1": baseline["top1_accuracy"],
-            "val_loss": baseline["loss"], "val_top1": baseline["top1_accuracy"],
-            "val_top5": baseline["top5_accuracy"],
-        }) + "\n")
+    logger.log_train(step=0, epoch=-1,
+        train_loss=baseline["loss"], train_top1=baseline["top1_accuracy"],
+        val_loss=baseline["loss"], val_top1=baseline["top1_accuracy"],
+        val_top5=baseline["top5_accuracy"],
+    )
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -386,22 +390,17 @@ def main():
 
         weight_report = model.weight_report()
 
-        record = {
-            "type": "train",
-            "epoch": epoch,
-            "step": global_step,
-            "lr_lora": optimizer.param_groups[0]["lr"] if lora_params else None,
-            "lr_film": optimizer.param_groups[-1]["lr"] if film_params else None,
-            "train_loss": train_loss,
-            "train_top1": train_top1,
-            "val_loss": val_metrics["loss"],
-            "val_top1": val_metrics["top1_accuracy"],
-            "val_top5": val_metrics["top5_accuracy"],
-            "epoch_time_s": dt,
-            **{k: v for k, v in weight_report.items()},
-        }
-        with open(metrics_path, "a") as f:
-            f.write(json.dumps(record) + "\n")
+        logger.log_train(step=global_step, epoch=epoch,
+            lr_lora=optimizer.param_groups[0]["lr"] if lora_params else None,
+            lr_film=optimizer.param_groups[-1]["lr"] if film_params else None,
+            train_loss=train_loss,
+            train_top1=train_top1,
+            val_loss=val_metrics["loss"],
+            val_top1=val_metrics["top1_accuracy"],
+            val_top5=val_metrics["top5_accuracy"],
+            epoch_time_s=dt,
+            **weight_report,
+        )
 
         print(f"  Epoch {epoch:3d} | "
               f"train_loss={train_loss:.4f} train_top1={train_top1:.4%} | "
@@ -456,6 +455,7 @@ def main():
         except Exception as e:
             print(f"WARNING: HF push failed: {e}")
 
+    logger.close()
     print(f"\nDone. Best val_loss={best_val_loss:.4f}")
     print(f"Checkpoints saved to {out_dir}")
 
