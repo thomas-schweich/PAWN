@@ -87,6 +87,160 @@ pub fn generate_one_game(seed: u64, max_ply: usize) -> (Vec<u16>, u16, Terminati
     }
 }
 
+/// Outcome distribution from Monte Carlo rollouts.
+#[derive(Debug, Clone, Default)]
+pub struct OutcomeDistribution {
+    pub counts: [u32; 6], // indexed by Termination as usize
+    pub total: u32,
+}
+
+/// Result for a single position in the ceiling computation.
+#[derive(Debug, Clone)]
+pub struct PositionCeiling {
+    /// Number of legal moves at this position
+    pub n_legal: u32,
+    /// Unconditional ceiling: 1/n_legal
+    pub unconditional: f64,
+    /// Conditional ceiling: max_m P(m | outcome, history) where the max is over
+    /// legal moves and P is estimated from rollouts
+    pub conditional: f64,
+    /// The actual outcome of the game this position came from
+    pub actual_outcome: u8,
+    /// Ply index within the game
+    pub ply: u16,
+    /// Game length
+    pub game_length: u16,
+}
+
+/// For a given position (as move token prefix), play out N random continuations
+/// from each legal move and return the outcome distribution per move.
+///
+/// Returns Vec<(token, OutcomeDistribution)> for each legal move.
+pub fn rollout_legal_moves(
+    prefix_tokens: &[u16],
+    n_rollouts: usize,
+    max_ply: usize,
+    base_seed: u64,
+) -> Vec<(u16, OutcomeDistribution)> {
+    let state = match GameState::from_move_tokens(prefix_tokens) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let legal_tokens = state.legal_move_tokens();
+    if legal_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let seeds = derive_game_seeds(base_seed, legal_tokens.len() * n_rollouts);
+
+    legal_tokens
+        .iter()
+        .enumerate()
+        .map(|(move_idx, &token)| {
+            let mut dist = OutcomeDistribution::default();
+            for r in 0..n_rollouts {
+                let seed = seeds[move_idx * n_rollouts + r];
+                let mut rng = ChaCha8Rng::seed_from_u64(seed);
+                let mut s = state.clone();
+                s.make_move(token).unwrap();
+                let term = s.play_random_to_end(&mut rng, max_ply);
+                dist.counts[term as usize] += 1;
+                dist.total += 1;
+            }
+            (token, dist)
+        })
+        .collect()
+}
+
+/// Compute the theoretical accuracy ceiling for a batch of random games.
+///
+/// For each position in each game:
+/// - Computes 1/N_legal (unconditional ceiling)
+/// - Uses Monte Carlo rollouts to estimate the conditional ceiling
+///   (how well you can predict the move given the outcome)
+///
+/// Returns per-position results. The overall ceiling is the mean.
+pub fn compute_accuracy_ceiling(
+    n_games: usize,
+    max_ply: usize,
+    n_rollouts_per_move: usize,
+    sample_rate: f64,  // fraction of positions to sample (1.0 = all, 0.01 = 1%)
+    base_seed: u64,
+) -> Vec<PositionCeiling> {
+    let game_seeds = derive_game_seeds(base_seed, n_games);
+
+    // Generate all games first
+    let games: Vec<(Vec<u16>, u16, Termination)> = game_seeds
+        .par_iter()
+        .map(|&seed| generate_one_game(seed, max_ply))
+        .collect();
+
+    // For each sampled position, compute the ceiling
+    let mut rng_sample = ChaCha8Rng::seed_from_u64(base_seed.wrapping_add(999));
+    let mut work_items: Vec<(usize, usize, u8, u16)> = Vec::new(); // (game_idx, ply, outcome, game_length)
+
+    for (game_idx, (move_ids, game_length, termination)) in games.iter().enumerate() {
+        let gl = *game_length as usize;
+        let outcome = *termination as u8;
+        for ply in 0..gl {
+            if sample_rate >= 1.0 || rng_sample.gen::<f64>() < sample_rate {
+                work_items.push((game_idx, ply, outcome, *game_length));
+            }
+        }
+    }
+
+    // Process positions in parallel
+    let rollout_seed_base = base_seed.wrapping_add(1_000_000);
+
+    work_items
+        .par_iter()
+        .enumerate()
+        .map(|(work_idx, &(game_idx, ply, actual_outcome, game_length))| {
+            let prefix = &games[game_idx].0[..ply];
+            let actual_move = games[game_idx].0[ply];
+
+            let rollout_seed = rollout_seed_base.wrapping_add(work_idx as u64 * 1000);
+            let move_dists = rollout_legal_moves(prefix, n_rollouts_per_move, max_ply, rollout_seed);
+
+            let n_legal = move_dists.len() as u32;
+            let unconditional = if n_legal > 0 { 1.0 / n_legal as f64 } else { 0.0 };
+
+            // Conditional ceiling: P(actual_outcome | move) for each move,
+            // then the best predictor picks the move with highest P(outcome|move).
+            // Accuracy = max_m P(m | outcome) = max_m [P(outcome|m) / sum_m' P(outcome|m')]
+            let outcome_idx = actual_outcome as usize;
+            let probs: Vec<f64> = move_dists
+                .iter()
+                .map(|(_, dist)| {
+                    if dist.total > 0 {
+                        dist.counts[outcome_idx] as f64 / dist.total as f64
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+
+            let sum_probs: f64 = probs.iter().sum();
+            let conditional = if sum_probs > 0.0 {
+                let max_prob = probs.iter().cloned().fold(0.0f64, f64::max);
+                max_prob / sum_probs
+            } else {
+                unconditional
+            };
+
+            PositionCeiling {
+                n_legal,
+                unconditional,
+                conditional,
+                actual_outcome,
+                ply: ply as u16,
+                game_length,
+            }
+        })
+        .collect()
+}
+
 /// Training example for checkmate prediction.
 pub struct CheckmateExample {
     pub move_ids: Vec<u16>,          // full game including mating move

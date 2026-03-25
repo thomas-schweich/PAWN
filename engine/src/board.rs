@@ -470,6 +470,29 @@ impl GameState {
         self.make_move(token).ok();
         Some(token)
     }
+
+    /// Create a GameState by replaying a sequence of move tokens from the starting position.
+    /// Returns an error if any token is invalid or illegal.
+    pub fn from_move_tokens(tokens: &[u16]) -> Result<Self, String> {
+        let mut state = Self::new();
+        for (i, &token) in tokens.iter().enumerate() {
+            state.make_move(token).map_err(|e| format!("ply {}: {}", i, e))?;
+        }
+        Ok(state)
+    }
+
+    /// Play out a random game from the current position to completion.
+    /// Returns the termination type.
+    pub fn play_random_to_end(&mut self, rng: &mut impl Rng, max_ply: usize) -> Termination {
+        loop {
+            if let Some(term) = self.check_termination(max_ply) {
+                return term;
+            }
+            if self.make_random_move(rng).is_none() {
+                return Termination::Stalemate;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

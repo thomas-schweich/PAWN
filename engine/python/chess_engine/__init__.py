@@ -31,6 +31,8 @@ from chess_engine._engine import (
     # Interactive game state (for RL)
     PyGameState,
     PyBatchRLEnv,
+    # Accuracy ceiling
+    compute_accuracy_ceiling_py as compute_accuracy_ceiling,
     # Utilities
     hello,
 )
@@ -55,5 +57,6 @@ __all__ = [
     "export_move_vocabulary",
     "PyGameState",
     "PyBatchRLEnv",
+    "compute_accuracy_ceiling",
     "hello",
 ]

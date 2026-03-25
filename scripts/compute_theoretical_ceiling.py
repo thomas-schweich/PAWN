@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Compute theoretical maximum top-1 accuracy for random chess play.
 
-Two ceilings:
+Two ceilings computed via Monte Carlo rollouts in the Rust engine:
+
 1. Unconditional: E[1/N_legal] — best accuracy without knowing the outcome.
 2. Outcome-conditioned: E[max_m P(m|outcome, history)] — best accuracy when
-   the outcome token is known. Estimated via Monte Carlo rollouts.
+   the outcome token is known. Estimated by playing out random continuations
+   from each legal move and measuring which outcomes result.
 
 The "adjusted accuracy" normalizes model accuracy against these ceilings:
     adjusted = model_accuracy / ceiling
 
 Usage:
-    uv run python scripts/compute_theoretical_ceiling.py --n-games 10000
-    uv run python scripts/compute_theoretical_ceiling.py --n-games 50000 --rollouts 64
+    uv run python scripts/compute_theoretical_ceiling.py
+    uv run python scripts/compute_theoretical_ceiling.py --n-games 5000 --rollouts 64
+    uv run python scripts/compute_theoretical_ceiling.py --model-accuracy 0.070
 """
 
 from __future__ import annotations
@@ -19,7 +22,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -27,208 +29,16 @@ import numpy as np
 import chess_engine as engine
 
 
-def compute_unconditional_ceiling(
-    n_games: int, max_ply: int = 255, seed: int = 77777,
-) -> dict:
-    """Compute E[1/N_legal] from a corpus of random games.
-
-    This is the theoretical maximum top-1 accuracy for a predictor that
-    knows the rules of chess but NOT the outcome token.
-    """
-    # Generate random games and get legal move masks
-    move_ids, game_lengths, term_codes = engine.generate_random_games(
-        n_games, max_ply, seed,
-    )
-
-    # Compute legal move masks: grid is (n_games, max_ply, 64) packed bits
-    grid, promo = engine.compute_legal_move_masks(move_ids, game_lengths)
-
-    # Count legal moves at each position
-    inv_n_sum = 0.0
-    total_positions = 0
-    inv_n_by_ply = defaultdict(list)
-
-    for i in range(n_games):
-        gl = int(game_lengths[i])
-        for ply in range(gl):
-            # Count legal grid moves: unpack 64 uint64 values, popcount each
-            n_legal = 0
-            for sq in range(64):
-                n_legal += bin(int(grid[i, ply, sq])).count('1')
-            # Add promotion moves
-            if promo is not None and promo.shape[1] > ply:
-                n_legal += int(np.sum(promo[i, ply] > 0))
-
-            if n_legal > 0:
-                inv_n_sum += 1.0 / n_legal
-                inv_n_by_ply[ply].append(1.0 / n_legal)
-                total_positions += 1
-
-    overall = inv_n_sum / total_positions if total_positions else 0
-
-    # Per-ply breakdown (sampled)
-    ply_ceilings = {}
-    for ply in sorted(inv_n_by_ply.keys())[:256]:
-        vals = inv_n_by_ply[ply]
-        ply_ceilings[ply] = sum(vals) / len(vals)
-
-    return {
-        "unconditional_ceiling": overall,
-        "total_positions": total_positions,
-        "n_games": n_games,
-        "per_ply_ceiling": ply_ceilings,
-    }
-
-
-def compute_conditional_ceiling_mc(
-    n_games: int = 5000,
-    n_sample_positions: int = 2000,
-    n_rollouts: int = 32,
-    max_ply: int = 255,
-    seed: int = 88888,
-) -> dict:
-    """Estimate outcome-conditioned ceiling via Monte Carlo rollouts.
-
-    For a sample of positions, enumerate legal moves and estimate
-    P(outcome | move, history) by playing out random continuations.
-    The Bayes-optimal predictor picks argmax, giving accuracy =
-    max_m P(outcome | move, history) / sum_m P(outcome | move, history).
-
-    This requires playing games from arbitrary positions, which we approximate
-    by generating many games and looking at positions where the same board
-    state appears with different continuations.
-
-    More practical approach: for each sampled position in a game:
-    - We know the actual outcome O and the actual move m*
-    - We know N_legal moves
-    - We estimate: does knowing O help predict m*?
-    - Specifically: we compute the fraction of random continuations from m*
-      that produce outcome O, vs the average fraction across all legal moves.
-
-    Since we can't easily play from arbitrary positions in the engine,
-    we use an analytical approximation based on game structure:
-    - Near game end (last few plies of checkmate): huge conditioning benefit
-    - Mid-game: minimal conditioning benefit (~= 1/N)
-    - PLY_LIMIT games: game length is known, slight benefit
-    """
-    # Generate games
-    move_ids, game_lengths, term_codes = engine.generate_random_games(
-        n_games, max_ply, seed,
-    )
-    grid, promo = engine.compute_legal_move_masks(move_ids, game_lengths)
-
-    # Analytical estimation of conditioning benefit
-    #
-    # For each position, the conditioning benefit depends on:
-    # 1. How many plies remain (closer to end = more benefit)
-    # 2. The outcome type (checkmate is more constraining than ply_limit)
-    #
-    # At the LAST ply of a checkmate game:
-    #   Only checkmate-delivering moves are consistent with the outcome.
-    #   Ceiling = 1/n_checkmate_moves (often 1-3 out of ~30 legal moves)
-    #
-    # At earlier plies: the benefit decays roughly exponentially.
-    # P(outcome | move, history) ≈ 1/N_legal * (1 + benefit(plies_remaining))
-    # where benefit → large near the end, → 0 far from the end.
-
-    # Empirical approach: measure how concentrated the move distribution is
-    # by looking at the last K plies of decisive games.
-    conditioning_by_plies_from_end = defaultdict(list)
-
-    for i in range(min(n_games, 10000)):
-        gl = int(game_lengths[i])
-        tc = int(term_codes[i])  # 0=checkmate, 1=stalemate, etc.
-
-        for ply in range(gl):
-            plies_from_end = gl - ply
-
-            # Count legal moves
-            n_legal = 0
-            for sq in range(64):
-                n_legal += bin(int(grid[i, ply, sq])).count('1')
-            if promo is not None and promo.shape[1] > ply:
-                n_legal += int(np.sum(promo[i, ply] > 0))
-
-            if n_legal <= 0:
-                continue
-
-            # For the last move of a checkmate: only 1 move delivers mate
-            # (approximately — sometimes 2-3 moves all give checkmate)
-            if tc == 0 and plies_from_end == 1:
-                # Last move is checkmate. Estimate ~1-2 mating moves.
-                # Ceiling ≈ 1/min(n_legal, 2)
-                effective_n = min(n_legal, 2)
-            elif tc == 0 and plies_from_end <= 3:
-                # Near-checkmate: some conditioning benefit
-                # Rough: conditioning cuts effective choices by factor of
-                # plies_from_end
-                effective_n = max(1, n_legal / plies_from_end)
-            elif tc == 1 and plies_from_end == 1:
-                # Last move before stalemate
-                effective_n = min(n_legal, 3)
-            else:
-                # General position: conditioning benefit is small
-                # The outcome provides ~log2(5) ≈ 2.3 bits over the whole
-                # game, distributed across ~gl plies. Per-ply benefit is tiny.
-                effective_n = n_legal
-
-            conditioning_by_plies_from_end[plies_from_end].append(
-                1.0 / effective_n
-            )
-
-    # Compute overall conditioned ceiling
-    all_conditioned = []
-    all_unconditioned = []
-    for i in range(min(n_games, 10000)):
-        gl = int(game_lengths[i])
-        tc = int(term_codes[i])
-        for ply in range(gl):
-            n_legal = 0
-            for sq in range(64):
-                n_legal += bin(int(grid[i, ply, sq])).count('1')
-            if promo is not None and promo.shape[1] > ply:
-                n_legal += int(np.sum(promo[i, ply] > 0))
-            if n_legal <= 0:
-                continue
-
-            plies_from_end = gl - ply
-            all_unconditioned.append(1.0 / n_legal)
-
-            if tc == 0 and plies_from_end == 1:
-                all_conditioned.append(1.0 / min(n_legal, 2))
-            elif tc == 0 and plies_from_end <= 3:
-                all_conditioned.append(1.0 / max(1, n_legal / plies_from_end))
-            elif tc == 1 and plies_from_end == 1:
-                all_conditioned.append(1.0 / min(n_legal, 3))
-            else:
-                all_conditioned.append(1.0 / n_legal)
-
-    uncond = np.mean(all_unconditioned)
-    cond = np.mean(all_conditioned)
-
-    # Per-distance-from-end breakdown
-    by_distance = {}
-    for dist in sorted(conditioning_by_plies_from_end.keys()):
-        if dist <= 20:
-            vals = conditioning_by_plies_from_end[dist]
-            by_distance[dist] = float(np.mean(vals))
-
-    return {
-        "conditional_ceiling_estimate": float(cond),
-        "unconditional_ceiling": float(uncond),
-        "conditioning_boost": float(cond / uncond) if uncond > 0 else 0,
-        "n_positions": len(all_conditioned),
-        "ceiling_by_plies_from_end": by_distance,
-        "note": "Conditional ceiling is an analytical estimate, not exact Monte Carlo. "
-                "The main benefit comes from the last 1-3 plies of decisive games.",
-    }
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Compute theoretical accuracy ceilings for random chess"
     )
-    parser.add_argument("--n-games", type=int, default=10000)
+    parser.add_argument("--n-games", type=int, default=2000,
+                        help="Number of random games to generate")
+    parser.add_argument("--rollouts", type=int, default=32,
+                        help="Monte Carlo rollouts per legal move")
+    parser.add_argument("--sample-rate", type=float, default=0.02,
+                        help="Fraction of positions to sample (1.0=all, 0.02=2%%)")
     parser.add_argument("--seed", type=int, default=77777)
     parser.add_argument("--output", type=str, default="data/theoretical_ceiling.json")
     parser.add_argument("--model-accuracy", type=float, default=None,
@@ -238,62 +48,110 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Computing theoretical accuracy ceilings ({args.n_games:,} games)...")
+    print(f"Computing theoretical accuracy ceilings")
+    print(f"  Games: {args.n_games:,}")
+    print(f"  Rollouts/move: {args.rollouts}")
+    print(f"  Sample rate: {args.sample_rate:.0%}")
+    print(f"  Seed: {args.seed}")
     print()
 
     t0 = time.time()
-
-    # Unconditional ceiling
-    print("1. Unconditional ceiling (E[1/N_legal])...")
-    uncond = compute_unconditional_ceiling(args.n_games, seed=args.seed)
-    print(f"   = {uncond['unconditional_ceiling']:.4f} "
-          f"({uncond['unconditional_ceiling']*100:.2f}%)")
-    print(f"   ({uncond['total_positions']:,} positions from {args.n_games:,} games)")
-
-    # Conditional ceiling
-    print()
-    print("2. Outcome-conditioned ceiling (analytical estimate)...")
-    cond = compute_conditional_ceiling_mc(
-        n_games=args.n_games, seed=args.seed + 1,
+    result = engine.compute_accuracy_ceiling(
+        n_games=args.n_games,
+        max_ply=255,
+        n_rollouts=args.rollouts,
+        sample_rate=args.sample_rate,
+        seed=args.seed,
     )
-    print(f"   = {cond['conditional_ceiling_estimate']:.4f} "
-          f"({cond['conditional_ceiling_estimate']*100:.2f}%)")
-    print(f"   Conditioning boost: {cond['conditioning_boost']:.2f}x")
-
-    print()
-    print(f"   Ceiling by plies from game end:")
-    for dist, ceil in sorted(cond["ceiling_by_plies_from_end"].items()):
-        bar = "#" * int(ceil * 200)
-        print(f"     {dist:>3} plies from end: {ceil:.4f} ({ceil*100:.1f}%) {bar}")
-
-    # Summary
     elapsed = time.time() - t0
-    results = {
-        "unconditional_ceiling": uncond["unconditional_ceiling"],
-        "conditional_ceiling": cond["conditional_ceiling_estimate"],
-        "conditioning_boost": cond["conditioning_boost"],
-        "n_games": args.n_games,
-        "total_positions": uncond["total_positions"],
-        "per_ply_ceiling": uncond["per_ply_ceiling"],
-        "ceiling_by_plies_from_end": cond["ceiling_by_plies_from_end"],
-        "elapsed_seconds": elapsed,
-    }
 
+    uncond = result["unconditional_ceiling"]
+    cond = result["conditional_ceiling"]
+    boost = cond / uncond if uncond > 0 else 0
+
+    print(f"Positions sampled: {result['n_positions']:,}")
+    print(f"Unconditional ceiling: {uncond:.4f} ({uncond*100:.2f}%)")
+    print(f"Conditional ceiling:   {cond:.4f} ({cond*100:.2f}%)")
+    print(f"Conditioning boost:    {boost:.2f}x")
+    print(f"Time: {elapsed:.0f}s")
+    print()
+
+    # Per-outcome breakdown
+    outcomes = result["outcome"]
+    conditionals = result["conditional"]
+    unconditionals = result["unconditional"]
+    outcome_names = [
+        "Checkmate", "Stalemate", "75-move", "5-fold rep",
+        "Insuff mat", "Ply limit",
+    ]
+
+    print("Per-outcome breakdown:")
+    outcome_data = {}
+    for oi in range(6):
+        mask = outcomes == oi
+        n = int(mask.sum())
+        if n > 0:
+            uc = float(unconditionals[mask].mean())
+            cc = float(conditionals[mask].mean())
+            ob = cc / uc if uc > 0 else 0
+            print(f"  {outcome_names[oi]:>12}: uncond={uc:.4f}  cond={cc:.4f}  "
+                  f"boost={ob:.2f}x  (n={n})")
+            outcome_data[outcome_names[oi]] = {
+                "unconditional": uc, "conditional": cc,
+                "boost": ob, "n_positions": n,
+            }
+    print()
+
+    # Per-ply-from-end breakdown
+    plies = result["ply"]
+    game_lengths = result["game_length"]
+    plies_from_end = game_lengths - plies
+
+    print("Ceiling by distance from game end:")
+    distance_data = {}
+    for dist in range(1, 21):
+        mask = plies_from_end == dist
+        n = int(mask.sum())
+        if n > 10:
+            uc = float(unconditionals[mask].mean())
+            cc = float(conditionals[mask].mean())
+            bar = "#" * int(cc * 200)
+            print(f"  {dist:>3} plies from end: uncond={uc:.4f}  cond={cc:.4f}  {bar}")
+            distance_data[dist] = {"unconditional": uc, "conditional": cc, "n": n}
+    print()
+
+    # Model adjusted accuracy
     if args.model_accuracy is not None:
         ma = args.model_accuracy
-        results["model_accuracy"] = ma
-        results["adjusted_vs_unconditional"] = ma / uncond["unconditional_ceiling"]
-        results["adjusted_vs_conditional"] = ma / cond["conditional_ceiling_estimate"]
-        print()
+        adj_uncond = ma / uncond if uncond > 0 else 0
+        adj_cond = ma / cond if cond > 0 else 0
         print(f"Model accuracy: {ma:.4f} ({ma*100:.2f}%)")
-        print(f"  vs unconditional ceiling: {results['adjusted_vs_unconditional']:.2f}x "
-              f"({results['adjusted_vs_unconditional']*100:.1f}% of theoretical max)")
-        print(f"  vs conditional ceiling:   {results['adjusted_vs_conditional']:.2f}x "
-              f"({results['adjusted_vs_conditional']*100:.1f}% of theoretical max)")
+        print(f"  vs unconditional ceiling: {adj_uncond:.1%} of theoretical max")
+        print(f"  vs conditional ceiling:   {adj_cond:.1%} of theoretical max")
+        print()
+
+    # Save results
+    data = {
+        "unconditional_ceiling": float(uncond),
+        "conditional_ceiling": float(cond),
+        "conditioning_boost": float(boost),
+        "n_positions": int(result["n_positions"]),
+        "n_games": args.n_games,
+        "n_rollouts": args.rollouts,
+        "sample_rate": args.sample_rate,
+        "seed": args.seed,
+        "elapsed_seconds": elapsed,
+        "per_outcome": outcome_data,
+        "per_distance_from_end": {str(k): v for k, v in distance_data.items()},
+    }
+    if args.model_accuracy is not None:
+        data["model_accuracy"] = args.model_accuracy
+        data["adjusted_vs_unconditional"] = adj_uncond
+        data["adjusted_vs_conditional"] = adj_cond
 
     with open(output_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\nSaved to {output_path} ({elapsed:.1f}s)")
+        json.dump(data, f, indent=2)
+    print(f"Saved to {output_path}")
 
 
 if __name__ == "__main__":

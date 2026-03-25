@@ -902,6 +902,70 @@ impl PyBatchRLEnv {
     }
 }
 
+/// Compute theoretical accuracy ceiling via Monte Carlo rollouts.
+///
+/// For a sample of positions from random games, estimates:
+/// - Unconditional ceiling: E[1/N_legal]
+/// - Conditional ceiling: E[max_m P(m|outcome, history)] via rollouts
+///
+/// Returns dict with overall ceilings and per-position data.
+#[pyfunction]
+#[pyo3(signature = (n_games=1000, max_ply=255, n_rollouts=32, sample_rate=0.01, seed=77777))]
+fn compute_accuracy_ceiling_py(
+    py: Python<'_>,
+    n_games: usize,
+    max_ply: usize,
+    n_rollouts: usize,
+    sample_rate: f64,
+    seed: u64,
+) -> PyResult<PyObject> {
+    let results = py.allow_threads(|| {
+        random::compute_accuracy_ceiling(n_games, max_ply, n_rollouts, sample_rate, seed)
+    });
+
+    let n = results.len();
+    let mut uncond_sum = 0.0f64;
+    let mut cond_sum = 0.0f64;
+
+    // Build per-position arrays
+    let mut plies = Vec::with_capacity(n);
+    let mut game_lengths = Vec::with_capacity(n);
+    let mut n_legals = Vec::with_capacity(n);
+    let mut unconditionals = Vec::with_capacity(n);
+    let mut conditionals = Vec::with_capacity(n);
+    let mut outcomes = Vec::with_capacity(n);
+
+    for r in &results {
+        uncond_sum += r.unconditional;
+        cond_sum += r.conditional;
+        plies.push(r.ply);
+        game_lengths.push(r.game_length);
+        n_legals.push(r.n_legal);
+        unconditionals.push(r.unconditional as f32);
+        conditionals.push(r.conditional as f32);
+        outcomes.push(r.actual_outcome);
+    }
+
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("n_positions", n)?;
+    dict.set_item("n_games", n_games)?;
+    dict.set_item("n_rollouts", n_rollouts)?;
+    dict.set_item("sample_rate", sample_rate)?;
+    dict.set_item("unconditional_ceiling", if n > 0 { uncond_sum / n as f64 } else { 0.0 })?;
+    dict.set_item("conditional_ceiling", if n > 0 { cond_sum / n as f64 } else { 0.0 })?;
+
+    // Return numpy arrays for per-position data
+    let np = py.import("numpy")?;
+    dict.set_item("ply", np.call_method1("array", (plies,))?)?;
+    dict.set_item("game_length", np.call_method1("array", (game_lengths,))?)?;
+    dict.set_item("n_legal", np.call_method1("array", (n_legals,))?)?;
+    dict.set_item("unconditional", np.call_method1("array", (unconditionals,))?)?;
+    dict.set_item("conditional", np.call_method1("array", (conditionals,))?)?;
+    dict.set_item("outcome", np.call_method1("array", (outcomes,))?)?;
+
+    Ok(dict.into())
+}
+
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hello, m)?)?;
@@ -924,5 +988,6 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBatchRLEnv>()?;
     m.add_function(wrap_pyfunction!(parse_pgn_file, m)?)?;
     m.add_function(wrap_pyfunction!(pgn_to_tokens, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_accuracy_ceiling_py, m)?)?;
     Ok(())
 }
