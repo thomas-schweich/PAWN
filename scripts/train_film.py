@@ -124,7 +124,7 @@ def sparse_forward(model, ids, msk, legal_mask, use_amp, device):
     Returns: valid_logits (N_valid, V), valid_targets implicit via caller.
     """
     with torch.amp.autocast('cuda', dtype=torch.float16, enabled=use_amp):
-        hidden = model.forward_hidden(ids)          # (B, T, d_model)
+        hidden = model.forward_hidden(ids, msk)      # (B, T, d_model)
         valid_hidden = hidden[msk]                   # (N_valid, d_model)
         valid_logits = model.project_head(valid_hidden)  # (N_valid, V)
 

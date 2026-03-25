@@ -127,7 +127,7 @@ def cosine_warmup_schedule(optimizer, warmup_steps: int, total_steps: int):
 
 def sparse_forward(model, ids, msk, legal_mask, use_amp, device):
     with torch.amp.autocast('cuda', dtype=torch.float16, enabled=use_amp):
-        hidden = model.forward_hidden(ids)
+        hidden = model.forward_hidden(ids, msk)
         valid_hidden = hidden[msk]
         valid_logits = model.project_head(valid_hidden)
 

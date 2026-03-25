@@ -144,12 +144,49 @@ def suggest_architecture(trial: "optuna.Trial") -> dict:
     }
 
 
+def _suggest_rosa_common(trial: "optuna.Trial") -> dict:
+    """Shared search space for all RoSA modes."""
+    params = suggest_common(trial)
+    params["density"] = trial.suggest_float("density", 0.001, 0.1, log=True)
+    params["lora_rank"] = trial.suggest_categorical("lora_rank", [2, 4, 8, 16])
+    params["lora_targets"] = trial.suggest_categorical("lora_targets", ["qkvo", "qv", "qkv"])
+    params["warmup_steps"] = trial.suggest_int("warmup_steps", 32, 256, step=32)
+    params["mask_samples"] = trial.suggest_categorical("mask_samples", [16, 32, 64])
+    params["grad_alpha"] = trial.suggest_categorical("grad_alpha", [1, 2])
+    return params
+
+
+def suggest_rosa(trial: "optuna.Trial") -> dict:
+    """Standard RoSA: joint LoRA + gradient-informed sparse."""
+    params = _suggest_rosa_common(trial)
+    params["mode"] = "rosa"
+    return params
+
+
+def suggest_retro_sparse(trial: "optuna.Trial") -> dict:
+    """Retrospective sparse-only with gradient-informed masks."""
+    params = _suggest_rosa_common(trial)
+    params["mode"] = "retro-sparse"
+    return params
+
+
+def suggest_retro_bottleneck(trial: "optuna.Trial") -> dict:
+    """Retrospective sparse + bottleneck adapters."""
+    params = _suggest_rosa_common(trial)
+    params["mode"] = "retro-bottleneck"
+    params["bottleneck_dim"] = trial.suggest_categorical("bottleneck_dim", [4, 8, 16])
+    return params
+
+
 SUGGEST_FNS = {
     "lora": suggest_lora,
     "bottleneck": suggest_bottleneck,
     "film": suggest_film,
     "sparse": suggest_sparse,
     "hybrid": suggest_hybrid,
+    "rosa": suggest_rosa,
+    "retro-sparse": suggest_retro_sparse,
+    "retro-bottleneck": suggest_retro_bottleneck,
     "tiny": suggest_tiny,
     "architecture": suggest_architecture,
     "pretrain": suggest_pretrain,
@@ -161,6 +198,9 @@ ADAPTER_SCRIPTS = {
     "film": "scripts/train_film.py",
     "sparse": "scripts/train_sparse.py",
     "hybrid": "scripts/train_hybrid.py",
+    "rosa": "scripts/train_rosa.py",
+    "retro-sparse": "scripts/train_rosa.py",
+    "retro-bottleneck": "scripts/train_rosa.py",
     "tiny": "scripts/train_tiny.py",
     "pretrain": "scripts/train.py",
     "architecture": "scripts/train.py",
@@ -308,11 +348,18 @@ class AdapterObjective:
         return best_loss
 
 
-class InProcessAdapterObjective:
-    """Optuna objective that runs training in-process for tighter pruning integration.
+class InProcessRoSAObjective:
+    """Optuna objective that runs RoSA training in-process.
 
-    Imports the training function directly and hooks into the validation loop
-    for epoch-level Optuna pruning.
+    Loads backbone weights and parses PGN data once at construction time.
+    Each trial gets a fresh model wrapping the shared backbone state, with
+    epoch-level Optuna pruning via ``trial.report()`` / ``trial.should_prune()``.
+
+    Usage::
+
+        objective = InProcessRoSAObjective("rosa", checkpoint, pgn, device="cuda")
+        study = create_study("rosa")
+        study.optimize(objective, n_trials=50)
     """
 
     def __init__(
@@ -323,47 +370,348 @@ class InProcessAdapterObjective:
         device: str = "cuda",
         output_base: str = "sweeps",
         epochs: int = 50,
+        max_games: int = 12_000,
+        val_games: int = 2_000,
+        min_ply: int = 10,
+        val_batch_size: int = 64,
+        no_amp: bool = False,
+        no_compile: bool = False,
+        sdpa_math: bool = False,
+        max_grad_norm: float = 1.0,
     ):
+        if adapter_type not in ("rosa", "retro-sparse", "retro-bottleneck"):
+            raise ValueError(f"InProcessRoSAObjective does not support adapter_type={adapter_type!r}")
         self.adapter_type = adapter_type
         self.checkpoint = checkpoint
-        self.pgn = pgn
         self.device = device
         self.output_base = Path(output_base) / adapter_type
         self.output_base.mkdir(parents=True, exist_ok=True)
         self.epochs = epochs
+        self.max_grad_norm = max_grad_norm
+        self.val_batch_size = val_batch_size
+
+        # Lazy imports -- only pay the cost when actually used
+        import torch
+        from pawn.config import CLMConfig
+        from pawn.model import PAWNCLM
+        from pawn.checkpoint import load_backbone_weights
+        from pawn.gpu import configure_gpu
+        from pawn.lichess_data import (
+            prepare_lichess_dataset,
+            LegalMaskBuilder,
+            LichessDataset,
+            compute_legal_indices,
+        )
+        import numpy as np
+        from torch.utils.data import DataLoader
+
+        # --- Load backbone weights once (kept on CPU) ---
+        state_dict, model_config = load_backbone_weights(checkpoint, "cpu")
+        self._cfg = CLMConfig(**model_config) if model_config else CLMConfig()
+        self._backbone_state = state_dict
+
+        # --- Parse PGN once ---
+        data = prepare_lichess_dataset(
+            pgn, max_ply=255, max_games=max_games, min_ply=min_ply,
+        )
+        n_total = data["n_games"]
+        n_val = min(val_games, n_total // 5)
+        self._n_train = n_total - n_val
+        self._train_ds = LichessDataset(data, start=0, end=self._n_train).share_memory()
+        self._val_ds = LichessDataset(data, start=self._n_train, end=n_total)
+
+        # --- GPU config ---
+        self._gpu_cfg = configure_gpu(
+            device, no_compile=no_compile, no_amp=no_amp, sdpa_math=sdpa_math,
+        )
+        self._gpu_cfg_no_compile = configure_gpu(
+            device, no_compile=True, no_amp=no_amp, sdpa_math=sdpa_math,
+        )
+        self._use_amp = self._gpu_cfg["use_amp"]
+
+        # --- Precompute val legal indices (fixed batch size) ---
+        vocab_size = self._cfg.vocab_size
+        self._mask_builder = LegalMaskBuilder(
+            val_batch_size, max_ply=255, vocab_size=vocab_size, device=device,
+        )
+        val_loader = DataLoader(
+            self._val_ds, batch_size=val_batch_size, shuffle=False,
+            num_workers=0, pin_memory=True,
+        )
+        self._val_legal_indices = []
+        for batch in val_loader:
+            move_ids = batch["move_ids"]
+            if isinstance(move_ids, torch.Tensor):
+                move_ids = move_ids.numpy()
+            game_lengths = np.asarray(batch["game_length"], dtype=np.int16)
+            indices = compute_legal_indices(
+                move_ids, game_lengths, self._mask_builder.T, vocab_size,
+            )
+            self._val_legal_indices.append(torch.from_numpy(indices).pin_memory())
+
+        print(f"InProcessRoSAObjective ready: {self._n_train} train / "
+              f"{n_val} val games, {len(self._val_legal_indices)} val batches")
+
+    def _make_backbone(self):
+        """Create a fresh backbone from the cached state dict."""
+        import torch
+        from pawn.model import PAWNCLM
+        model = PAWNCLM(self._cfg).to(self.device)
+        model.load_state_dict(self._backbone_state)
+        model.eval()
+        return model
 
     def __call__(self, trial: "optuna.Trial") -> float:
+        import gc
+        import math
+        import torch
+        import torch.nn.functional as F
+        from torch.utils.data import DataLoader
+        from pawn.adapters.rosa import RoSACLM, RetroBottleneckCLM, generate_gradient_masks
+        from pawn.adapters.sparse import SparseCLM, SparseLinear
+        from pawn.adapters.lora import ATTN_PRESETS, _FFN_TARGETS
+        from pawn.gpu import apply_gpu_config
+        from pawn.lichess_data import LegalMaskCollate
+
+        assert _optuna is not None
+
         suggest_fn = SUGGEST_FNS[self.adapter_type]
         params = suggest_fn(trial)
+        mode = params["mode"]
+        density = params["density"]
+        lr = params["lr"]
+        lora_rank = params["lora_rank"]
+        lora_targets = params["lora_targets"]
+        batch_size = params["batch_size"]
+        warmup_steps = params["warmup_steps"]
+        mask_samples = params["mask_samples"]
+        grad_alpha = params["grad_alpha"]
+        weight_decay = params["weight_decay"]
+        warmup_frac = params["warmup_frac"]
+        patience = params["patience"]
+        bottleneck_dim = params.get("bottleneck_dim", 8)
 
-        trial_dir = self.output_base / f"trial_{trial.number:04d}"
-        trial_dir.mkdir(parents=True, exist_ok=True)
+        vocab_size = self._cfg.vocab_size
+        use_amp = self._use_amp
+        device = self.device
 
-        # Build args namespace (same as argparse would produce)
-        args = argparse.Namespace(
-            checkpoint=self.checkpoint,
-            pgn=self.pgn,
-            device=self.device,
-            output_dir=str(trial_dir),
-            log_dir=str(self.output_base),
-            epochs=self.epochs,
-            val_every=1,
-            no_amp=False,
-            max_games=12000,
-            val_games=2000,
-            min_ply=10,
-            max_grad_norm=params.get("max_grad_norm", 1.0),
-            **params,
+        # --- Data loaders (batch_size varies per trial) ---
+        collate = LegalMaskCollate(seq_len=256, vocab_size=vocab_size)
+        train_loader = DataLoader(
+            self._train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=0, pin_memory=True, collate_fn=collate,
+        )
+        val_loader = DataLoader(
+            self._val_ds, batch_size=self.val_batch_size, shuffle=False,
+            num_workers=0, pin_memory=True,
         )
 
-        # Import the training function
-        # The actual in-process integration requires modifying each training
-        # script to accept an optuna.Trial and call trial.report()/should_prune().
-        # For now, fall back to subprocess.
-        raise NotImplementedError(
-            "In-process objectives require training scripts to accept a Trial parameter. "
-            "Use AdapterObjective (subprocess) or add trial hooks to the training script."
+        # Ensure mask builder capacity matches train batch size
+        mask_builder = self._mask_builder
+        if batch_size > mask_builder._mask_gpu.shape[0]:
+            from pawn.lichess_data import LegalMaskBuilder
+            mask_builder = LegalMaskBuilder(
+                batch_size, max_ply=255, vocab_size=vocab_size, device=device,
+            )
+
+        # ---------------------------------------------------------------
+        # Phase 1: LoRA warm-up
+        # ---------------------------------------------------------------
+        backbone = self._make_backbone()
+        warmup_model = RoSACLM(
+            backbone, rank=lora_rank, alpha=None,
+            attn_targets=lora_targets, adapt_ffn=False,
+            lora_enabled=True, sparse_enabled=False,
+        ).to(device)
+
+        lora_params = warmup_model.lora_parameters()
+        optimizer = torch.optim.AdamW(lora_params, lr=lr, weight_decay=weight_decay)
+
+        warmup_model.train()
+        step = 0
+        while step < warmup_steps:
+            for batch in train_loader:
+                if step >= warmup_steps:
+                    break
+                ids = batch["input_ids"].to(device, non_blocking=True)
+                tgt = batch["targets"].to(device, non_blocking=True)
+                msk = batch["loss_mask"].to(device, non_blocking=True)
+                legal_mask = mask_builder.scatter(batch["legal_indices"], ids.shape[0])
+
+                with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+                    hidden = warmup_model.forward_hidden(ids, msk)
+                    valid_logits = warmup_model.project_head(hidden[msk])
+                valid_logits = valid_logits.float()
+                valid_logits.masked_fill_(~legal_mask[msk], float("-inf"))
+                valid_targets = tgt[msk]
+                if valid_targets.shape[0] == 0:
+                    continue
+
+                loss = F.cross_entropy(valid_logits, valid_targets)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(lora_params, self.max_grad_norm)
+                optimizer.step()
+                step += 1
+
+        del optimizer
+
+        # ---------------------------------------------------------------
+        # Phase 2: Mask generation
+        # ---------------------------------------------------------------
+        masks = generate_gradient_masks(
+            warmup_model, train_loader, mask_builder,
+            density=density, alpha=grad_alpha,
+            device=device, use_amp=use_amp, max_batches=mask_samples,
         )
+
+        # ---------------------------------------------------------------
+        # Phase 3: Set up model per mode
+        # ---------------------------------------------------------------
+        attn_target_tuple = ATTN_PRESETS[lora_targets]
+
+        if mode == "rosa":
+            warmup_model.set_masks(masks)
+            warmup_model.reinit_lora()
+            model = warmup_model
+            adapter_params = model.adapter_parameters()
+        else:
+            # Retrospective modes: discard warm-up, reload backbone
+            del warmup_model
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            backbone = self._make_backbone()
+            sparse_model = SparseCLM(
+                backbone, density=density, attn_targets=attn_target_tuple,
+            )
+            # Overwrite random masks with gradient-derived masks
+            for layer_idx in range(len(backbone.layers)):
+                block = backbone.get_block(layer_idx)
+                for proj_name in attn_target_tuple:
+                    module = getattr(block.attn, proj_name, None)
+                    if isinstance(module, SparseLinear):
+                        key = f"layer{layer_idx}.{proj_name}"
+                        if key in masks:
+                            module.mask.copy_(masks[key])
+
+            if mode == "retro-sparse":
+                model = sparse_model
+                adapter_params = model.sparse_parameters()
+            else:  # retro-bottleneck
+                model = RetroBottleneckCLM(
+                    sparse_model.backbone, bottleneck_dim=bottleneck_dim,
+                ).to(device)
+                adapter_params = model.adapter_parameters()
+
+        # Compile for Phase 3
+        from pawn import model as model_module
+        model.forward_hidden = apply_gpu_config(
+            self._gpu_cfg, model_module, model.forward_hidden,
+        )
+
+        # ---------------------------------------------------------------
+        # Phase 3: Training with epoch-level pruning
+        # ---------------------------------------------------------------
+        optimizer = torch.optim.AdamW(adapter_params, lr=lr, weight_decay=weight_decay)
+        total_steps = self.epochs * len(train_loader)
+        sched_warmup = int(warmup_frac * total_steps)
+
+        def lr_lambda(s):
+            if s < sched_warmup:
+                return s / max(sched_warmup, 1)
+            progress = (s - sched_warmup) / max(total_steps - sched_warmup, 1)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        scaler = torch.amp.GradScaler() if use_amp else None
+
+        best_val_loss = float("inf")
+        patience_counter = 0
+
+        for epoch in range(self.epochs):
+            model.train()
+            for batch in train_loader:
+                ids = batch["input_ids"].to(device, non_blocking=True)
+                tgt = batch["targets"].to(device, non_blocking=True)
+                msk = batch["loss_mask"].to(device, non_blocking=True)
+                legal_mask = mask_builder.scatter(batch["legal_indices"], ids.shape[0])
+
+                with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+                    hidden = model.forward_hidden(ids, msk)
+                    valid_logits = model.project_head(hidden[msk])
+                valid_logits = valid_logits.float()
+                valid_logits.masked_fill_(~legal_mask[msk], float("-inf"))
+                valid_targets = tgt[msk]
+                if valid_targets.shape[0] == 0:
+                    continue
+
+                loss = F.cross_entropy(valid_logits, valid_targets)
+                optimizer.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(adapter_params, self.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(adapter_params, self.max_grad_norm)
+                    optimizer.step()
+                scheduler.step()
+
+            # --- Validation ---
+            model.eval()
+            total_loss = 0.0
+            total_pos = 0
+            with torch.no_grad():
+                for i, batch in enumerate(val_loader):
+                    ids = batch["input_ids"].to(device, non_blocking=True)
+                    tgt = batch["targets"].to(device, non_blocking=True)
+                    msk = batch["loss_mask"].to(device, non_blocking=True)
+                    lm = self._mask_builder.scatter(
+                        self._val_legal_indices[i], ids.shape[0],
+                    )
+                    with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+                        hidden = model.forward_hidden(ids, msk)
+                        vl = model.project_head(hidden[msk])
+                    vl = vl.float()
+                    vl.masked_fill_(~lm[msk], float("-inf"))
+                    vt = tgt[msk]
+                    n = vt.shape[0]
+                    if n == 0:
+                        continue
+                    total_loss += F.cross_entropy(vl, vt).item() * n
+                    total_pos += n
+
+            val_loss = total_loss / max(total_pos, 1)
+
+            # Report to Optuna for pruning
+            trial.report(val_loss, epoch)
+            if trial.should_prune():
+                self._cleanup(model, optimizer, scaler)
+                raise _optuna.TrialPruned()
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
+
+        self._cleanup(model, optimizer, scaler)
+        return best_val_loss
+
+    @staticmethod
+    def _cleanup(model, optimizer, scaler):
+        """Free GPU memory between trials."""
+        import gc
+        import torch
+        del model, optimizer, scaler
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------

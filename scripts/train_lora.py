@@ -134,7 +134,7 @@ def sparse_forward(model, ids, msk, legal_mask, use_amp, device):
     positions, then applies legal mask at those positions only.
     """
     with torch.amp.autocast('cuda', dtype=torch.float16, enabled=use_amp):
-        hidden = model.forward_hidden(ids)          # (B, T, d_model)
+        hidden = model.forward_hidden(ids, msk)      # (B, T, d_model)
         valid_hidden = hidden[msk]                   # (N_valid, d_model)
         valid_logits = model.project_head(valid_hidden)  # (N_valid, V)
 

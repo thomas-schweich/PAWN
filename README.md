@@ -124,11 +124,12 @@ These properties make PAWN useful as a frozen backbone for downstream tasks. See
 
 ## Adapter Methods
 
-PAWN ships with five adapter implementations for fine-tuning the frozen backbone on human game data:
+PAWN ships with six adapter implementations for fine-tuning the frozen backbone on human game data:
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | Bottleneck | ~131K | Houlsby-style residual MLP adapters |
+| RoSA | configurable | Gradient-informed sparse + LoRA ([Nikdan et al., 2024](https://arxiv.org/abs/2401.04679)) |
 | Sparse | 503K--2.7M | Random binary mask on frozen weights |
 | LoRA | ~65K | Low-rank attention projection adapters |
 | Hybrid | ~65K | LoRA + FiLM combined |

@@ -65,6 +65,41 @@ Identity-initialized: gamma=1, beta=0.
 
 **Param count:** `n_layers * 2 * d_model + 2 * vocab_size` = ~17K. The lightest adapter by far -- only diagonal (per-channel) modulation with no cross-channel mixing.
 
+## RoSA ([Nikdan et al., 2024](https://arxiv.org/abs/2401.04679))
+
+**Module:** `pawn.adapters.rosa.RoSACLM`
+
+Implements Robust Sparse Adaptation from "RoSA: Accurate Parameter-Efficient Fine-Tuning via Robust Adaptation". Combines a low-rank adapter (LoRA) with a gradient-informed sparse adapter on each frozen projection matrix:
+
+```
+output = frozen(x) + (x @ A^T) @ B^T * scaling + F.linear(x, delta * mask)
+```
+
+Unlike the random masks used by the Sparse adapter, RoSA selects its sparse mask positions based on gradient information from a LoRA warm-up phase. Training proceeds in three phases:
+
+1. **LoRA warm-up** -- train LoRA-only for `warmup_steps` steps to build gradient signal
+2. **Mask generation** -- accumulate squared gradient magnitudes over a small data subset, select top-k positions per weight matrix at the target density (Algorithm 1 from the paper)
+3. **Joint training** -- train both LoRA and sparse adapters simultaneously
+
+The training script (`scripts/train_rosa.py`) also supports two **retrospective ablation** modes via `--mode`:
+
+- **`retro-sparse`** -- use LoRA purely as a probe for mask selection, then discard it and train sparse-only on a fresh backbone with the found masks
+- **`retro-bottleneck`** -- same as retro-sparse, but adds bottleneck adapters (`RetroBottleneckCLM`) after each sublayer for nonlinearity that sparse-only cannot express
+
+In retrospective modes, warm-up LoRA weights are saved as a checkpoint for analysis before the backbone is reloaded.
+
+**Key parameters:**
+- `rank` -- LoRA rank during warm-up and joint training (default: 4)
+- `density` -- target sparse mask density (default: 0.01)
+- `attn_targets` -- which attention projections: `"qkvo"`, `"qv"`, or `"qkv"` (default: `"qkvo"`)
+- `adapt_ffn` -- also adapt FFN projections
+- `warmup_steps` -- LoRA-only steps before mask generation (default: 128)
+- `mask_samples` -- batches for gradient accumulation (default: 32)
+- `grad_alpha` -- gradient exponent: 1=mean magnitude, 2=Fisher diagonal (default: 2)
+- `bottleneck_dim` -- bottleneck dimension for retro-bottleneck mode (default: 8)
+
+**Param count:** Depends on mode and configuration. In `rosa` mode: `n_lora_params + density * total_weight_elements`. In `retro-sparse`: `density * total_weight_elements`. In `retro-bottleneck`: sparse params + `2 * n_positions * n_layers * 2 * d_model * bottleneck_dim`.
+
 ## Sparse
 
 **Module:** `pawn.adapters.sparse.SparseCLM`
@@ -199,6 +234,18 @@ uv run python scripts/train_sparse.py \
 uv run python scripts/train_hybrid.py \
     --checkpoint checkpoints/pawn.pt --pgn data/lichess_1800.pgn \
     --lora-rank 4 --lora-lr 3e-4 --film-lr 1e-3
+
+# RoSA (standard: joint LoRA + gradient-informed sparse)
+uv run python scripts/train_rosa.py \
+    --checkpoint checkpoints/pawn.pt --pgn data/lichess_1800.pgn \
+    --mode rosa --density 0.01 --lora-rank 4 --warmup-steps 128 --lr 3e-4 \
+    --local-checkpoints
+
+# RoSA (retrospective sparse + bottleneck)
+uv run python scripts/train_rosa.py \
+    --checkpoint checkpoints/pawn.pt --pgn data/lichess_1800.pgn \
+    --mode retro-bottleneck --density 0.01 --bottleneck-dim 8 --lr 3e-4 \
+    --local-checkpoints
 ```
 
 All scripts share common flags: `--epochs`, `--batch-size`, `--patience` (early stopping), `--no-compile` (required on ROCm), `--device`, `--num-workers`, `--resume` (checkpoint path for resuming).
