@@ -436,3 +436,6 @@ class TestGenerateGradientMasks:
 
         for _, module in model._rosa_modules():
             assert torch.allclose(module.delta, torch.zeros_like(module.delta))
+            # sparse_enabled and requires_grad should be restored to original state
+            assert not module.sparse_enabled
+            assert not module.delta.requires_grad

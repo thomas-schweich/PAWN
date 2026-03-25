@@ -145,7 +145,15 @@ def suggest_architecture(trial: "optuna.Trial") -> dict:
 
 
 def suggest_rosa(trial: "optuna.Trial") -> dict:
-    """RoSA (Robust Sparse Adaptation) hyperparameters."""
+    """RoSA (Robust Sparse Adaptation) hyperparameters.
+
+    Note: ``mode`` is sampled across all three variants in a single study.
+    ``bottleneck_dim`` is only suggested when mode is ``retro-bottleneck``
+    (conditional parameter). Optuna handles this correctly, but standard
+    samplers (TPE) treat absent params as NaN. If you need clean per-mode
+    analysis, run separate studies per mode or filter trials by mode when
+    interpreting results.
+    """
     params = suggest_common(trial)
     params["mode"] = trial.suggest_categorical("mode", ["rosa", "retro-sparse", "retro-bottleneck"])
     params["density"] = trial.suggest_float("density", 0.001, 0.1, log=True)

@@ -372,6 +372,10 @@ class RetroBottleneckCLM(nn.Module):
         n_layers = len(backbone.layers)
         adapted = set(layers if layers is not None else range(n_layers))
 
+        # Freeze backbone (may already be frozen by SparseCLM, but be explicit)
+        for p in backbone.parameters():
+            p.requires_grad = False
+
         # Bottleneck adapters (same pattern as BottleneckCLM)
         self.attn_adapters = nn.ModuleList()
         self.ffn_adapters = nn.ModuleList()
