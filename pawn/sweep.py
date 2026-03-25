@@ -144,12 +144,28 @@ def suggest_architecture(trial: "optuna.Trial") -> dict:
     }
 
 
+def suggest_rosa(trial: "optuna.Trial") -> dict:
+    """RoSA (Robust Sparse Adaptation) hyperparameters."""
+    params = suggest_common(trial)
+    params["mode"] = trial.suggest_categorical("mode", ["rosa", "retro-sparse", "retro-bottleneck"])
+    params["density"] = trial.suggest_float("density", 0.001, 0.1, log=True)
+    params["lora_rank"] = trial.suggest_categorical("lora_rank", [2, 4, 8, 16])
+    params["lora_targets"] = trial.suggest_categorical("lora_targets", ["qkvo", "qv", "qkv"])
+    params["warmup_steps"] = trial.suggest_int("warmup_steps", 32, 256, step=32)
+    params["mask_samples"] = trial.suggest_categorical("mask_samples", [16, 32, 64])
+    params["grad_alpha"] = trial.suggest_categorical("grad_alpha", [1, 2])
+    if params["mode"] == "retro-bottleneck":
+        params["bottleneck_dim"] = trial.suggest_categorical("bottleneck_dim", [4, 8, 16])
+    return params
+
+
 SUGGEST_FNS = {
     "lora": suggest_lora,
     "bottleneck": suggest_bottleneck,
     "film": suggest_film,
     "sparse": suggest_sparse,
     "hybrid": suggest_hybrid,
+    "rosa": suggest_rosa,
     "tiny": suggest_tiny,
     "architecture": suggest_architecture,
     "pretrain": suggest_pretrain,
@@ -161,6 +177,7 @@ ADAPTER_SCRIPTS = {
     "film": "scripts/train_film.py",
     "sparse": "scripts/train_sparse.py",
     "hybrid": "scripts/train_hybrid.py",
+    "rosa": "scripts/train_rosa.py",
     "tiny": "scripts/train_tiny.py",
     "pretrain": "scripts/train.py",
     "architecture": "scripts/train.py",

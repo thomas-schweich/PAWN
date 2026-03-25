@@ -5,3 +5,4 @@ from pawn.adapters.film import FiLMLayer, FiLMCLM
 from pawn.adapters.lora import LoRALinear, LoRACLM
 from pawn.adapters.sparse import SparseLinear, SparseCLM
 from pawn.adapters.hybrid import HybridCLM
+from pawn.adapters.rosa import RoSALinear, RoSACLM, RetroBottleneckCLM
