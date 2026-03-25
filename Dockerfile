@@ -60,7 +60,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/opt/pawn
 
 # Direct deps only (torch + numpy already in base image)
-RUN pip install --no-cache-dir psutil safetensors tqdm wandb huggingface-hub
+RUN pip install --no-cache-dir psutil safetensors tqdm wandb huggingface-hub optuna optuna-dashboard
 
 COPY --from=builder /workspace/pawn/engine/target/wheels/*.whl /tmp/
 RUN pip install --no-cache-dir /tmp/*.whl && rm -rf /tmp/*.whl
