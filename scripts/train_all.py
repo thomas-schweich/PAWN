@@ -584,12 +584,6 @@ def main():
                 val_metrics = slot.evaluate(val_data)
                 print(f"  {slot.name:>5s} val: loss {val_metrics['val/loss']:.4f} | "
                       f"acc {val_metrics['val/accuracy']:.3f}", flush=True)
-                slot._log_jsonl({
-                    "type": "val",
-                    "step": global_step,
-                    "timestamp": time.time(),
-                    **val_metrics,
-                })
                 # Track best for eval, /dev/shm cleanup, and patience
                 vl = val_metrics["val/loss"]
                 if vl < slot.best_val_loss:
@@ -598,6 +592,16 @@ def main():
                     slot.patience_counter = 0
                 else:
                     slot.patience_counter += 1
+
+                slot._log_jsonl({
+                    "type": "val",
+                    "step": global_step,
+                    "timestamp": time.time(),
+                    "patience": slot.patience_counter,
+                    "best_val_loss": slot.best_val_loss,
+                    "best_val_step": slot.best_val_step,
+                    **val_metrics,
+                })
 
                 # Per-model early stopping
                 if args.patience > 0 and slot.patience_counter >= args.patience:
