@@ -109,12 +109,16 @@ class LegalMaskBuilder:
         Uses a pre-allocated index buffer to avoid per-batch GPU allocation.
         Falls back to a fresh allocation if the buffer is too small.
         """
+        if B > self._mask_gpu.shape[0]:
+            raise ValueError(
+                f"B={B} exceeds pre-allocated batch_size={self._mask_gpu.shape[0]}"
+            )
         mask_view = self._mask_gpu[:B]
         mask_view.zero_()
         n = legal_indices.shape[0]
         if n > 0:
             if n <= self._idx_buf.shape[0]:
-                self._idx_buf[:n].copy_(legal_indices, non_blocking=True)
+                self._idx_buf[:n].copy_(legal_indices)
                 mask_view.view(-1).index_fill_(0, self._idx_buf[:n], True)
             else:
                 idx_gpu = legal_indices.to(self.device)
@@ -284,9 +288,9 @@ class LichessDataset(torch.utils.data.Dataset):
 
     def share_memory(self):
         """Move tensors to shared memory so spawn workers avoid copies."""
-        self.input_ids = self.input_ids.clone().share_memory_()
-        self.targets = self.targets.clone().share_memory_()
-        self.loss_mask = self.loss_mask.clone().share_memory_()
+        self.input_ids = self.input_ids.share_memory_()
+        self.targets = self.targets.share_memory_()
+        self.loss_mask = self.loss_mask.share_memory_()
         self.move_ids = torch.from_numpy(np.array(self.move_ids)).share_memory_()
         self.game_lengths = torch.from_numpy(np.array(self.game_lengths)).share_memory_()
         return self

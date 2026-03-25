@@ -56,6 +56,9 @@ cd engine && uv run --with maturin maturin develop --release && cd ..
 # Install Python dependencies
 uv sync --extra cu128   # NVIDIA (or --extra rocm for AMD)
 
+# Dev tools (pytest, seaborn, solara, etc.) are included in base dependencies
+# — no extra flags needed beyond the GPU backend above
+
 # Pull a pretrained checkpoint
 git submodule update --init checkpoints/pawn-base
 ```

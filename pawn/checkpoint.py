@@ -232,7 +232,10 @@ def _unflatten_optimizer_state(
         parts = flat_key.split(".", 2)
         if len(parts) != 3 or parts[0] != "state":
             continue
-        param_id = int(parts[1])
+        try:
+            param_id = int(parts[1])
+        except ValueError:
+            continue
         key = parts[2]
         if param_id not in state:
             state[param_id] = {}
@@ -245,7 +248,10 @@ def _unflatten_optimizer_state(
         parts = flat_key.split(".", 2)
         if len(parts) != 3:
             continue
-        param_id = int(parts[1])
+        try:
+            param_id = int(parts[1])
+        except ValueError:
+            continue
         key = parts[2]
         if param_id not in state:
             state[param_id] = {}

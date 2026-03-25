@@ -357,6 +357,10 @@ class PAWNCLM(nn.Module):
         x = self.embed(input_ids)
 
         T = input_ids.shape[1]
+        if T > self.rope_cos.shape[2]:
+            raise ValueError(
+                f"Sequence length {T} exceeds max {self.rope_cos.shape[2]}"
+            )
         causal = self.causal_mask[:T, :T]
         padding = attention_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
         mask = causal.unsqueeze(0) & padding  # (B, 1, T, T)
@@ -382,7 +386,7 @@ class PAWNCLM(nn.Module):
     def forward_train(
         self,
         input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
         targets: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Training-optimized forward: computes lm_head only at non-padding
@@ -394,7 +398,9 @@ class PAWNCLM(nn.Module):
 
         Args:
             input_ids: (B, T) token indices
-            attention_mask: (B, T) bool — True for real tokens
+            loss_mask: (B, T) bool — True for positions included in loss
+                       (outcome + moves, not padding). Also used as the
+                       attention padding mask for SDPA.
             targets: (B, T) target token indices (padding positions ignored)
 
         Returns:
@@ -404,8 +410,12 @@ class PAWNCLM(nn.Module):
         x = self.embed(input_ids)
 
         T = input_ids.shape[1]
+        if T > self.rope_cos.shape[2]:
+            raise ValueError(
+                f"Sequence length {T} exceeds max {self.rope_cos.shape[2]}"
+            )
         causal = self.causal_mask[:T, :T]
-        padding = attention_mask.unsqueeze(1).unsqueeze(2)
+        padding = loss_mask.unsqueeze(1).unsqueeze(2)
         mask = causal.unsqueeze(0) & padding
 
         rope_cos = self.rope_cos[:, :, :T, :]
@@ -417,9 +427,9 @@ class PAWNCLM(nn.Module):
         x = self.final_norm(x)
 
         # Project only valid positions through lm_head to save ~25% memory
-        valid_x = x[attention_mask]                  # (N_valid, d_model)
+        valid_x = x[loss_mask]                       # (N_valid, d_model)
         valid_logits = self.lm_head(valid_x)         # (N_valid, vocab_size)
-        valid_targets = targets[attention_mask]       # (N_valid,)
+        valid_targets = targets[loss_mask]            # (N_valid,)
 
         loss = F.cross_entropy(valid_logits, valid_targets)
 
@@ -452,13 +462,19 @@ class PAWNCLM(nn.Module):
         x = self.embed(input_ids)
 
         T_new = input_ids.shape[1]
+        T_total = T_new
         if kv_cache is not None:
             T_cached = kv_cache[0][0].shape[2]
-            rope_cos = self.rope_cos[:, :, T_cached:T_cached + T_new, :]
-            rope_sin = self.rope_sin[:, :, T_cached:T_cached + T_new, :]
+            T_total = T_cached + T_new
+            rope_cos = self.rope_cos[:, :, T_cached:T_total, :]
+            rope_sin = self.rope_sin[:, :, T_cached:T_total, :]
         else:
             rope_cos = self.rope_cos[:, :, :T_new, :]
             rope_sin = self.rope_sin[:, :, :T_new, :]
+        if T_total > self.rope_cos.shape[2]:
+            raise ValueError(
+                f"Sequence length {T_total} exceeds max {self.rope_cos.shape[2]}"
+            )
 
         new_kv_cache = []
         for i in range(len(self.layers)):

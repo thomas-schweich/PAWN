@@ -129,8 +129,11 @@ def _generate_batch(
     if prefix_moves is not None and prefix_lengths is not None:
         # Pad prefix to (n_games, max_move_positions) uint16 for Rust
         padded = np.zeros((n_games, max_move_positions), dtype=np.uint16)
+        clamped_pls = np.minimum(
+            np.asarray(prefix_lengths, dtype=np.int32), max_move_positions
+        )
         for i in range(n_games):
-            pl = min(int(prefix_lengths[i]), max_move_positions)
+            pl = clamped_pls[i]
             padded[i, :pl] = prefix_moves[i, :pl]
         lengths_u32 = np.array(prefix_lengths, dtype=np.uint32)
 
@@ -138,7 +141,7 @@ def _generate_batch(
 
         # Copy prefix moves into sequences and track terminations
         for i in range(n_games):
-            pl = min(int(prefix_lengths[i]), max_move_positions)
+            pl = clamped_pls[i]
             sequences[i, 1:pl + 1] = prefix_moves[i, :pl]
             if prefix_tc[i] >= 0:
                 terminated[i] = True
@@ -167,6 +170,11 @@ def _generate_batch(
     pad_row = torch.zeros(1, cfg_vocab_size, dtype=torch.bool, device=device)
     pad_row[0, PAD_TOKEN] = True
 
+    # Pre-allocate GPU buffers for legal masking to avoid per-step allocation
+    if mask_illegal:
+        _mask_buf = torch.empty(n_games, cfg_vocab_size, dtype=torch.bool, device=device)
+        _term_buf = torch.empty(n_games, 1, dtype=torch.bool, device=device)
+
     # --- Autoregressive decode loop ---
     for pos in range(prefix_end + 1, max_seq_len):
         active_mask = ~terminated
@@ -179,10 +187,10 @@ def _generate_batch(
         # Full-batch legal masking — avoids expensive boolean advanced indexing
         if mask_illegal:
             raw_mask = env.get_legal_token_masks_batch(all_indices)
-            full_mask = torch.from_numpy(np.asarray(raw_mask)).to(device)
-            # Terminated games: allow only PAD so softmax/argmax stays valid
-            term_gpu = torch.from_numpy(terminated).to(device).unsqueeze(-1)
-            full_mask = torch.where(term_gpu, pad_row.expand(n_games, -1), full_mask)
+            # Reuse pre-allocated GPU buffers instead of allocating each step
+            _mask_buf.copy_(torch.from_numpy(np.asarray(raw_mask)))
+            _term_buf[:, 0] = torch.from_numpy(terminated)
+            full_mask = torch.where(_term_buf, pad_row.expand(n_games, -1), _mask_buf)
             next_logits.masked_fill_(~full_mask, float("-inf"))
 
         # Gumbel-max sampling (replaces softmax + multinomial)

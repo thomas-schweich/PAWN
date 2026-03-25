@@ -34,6 +34,7 @@ from pawn.gpu import configure_gpu, apply_gpu_config
 from pawn.lichess_data import (
     prepare_lichess_dataset,
     LegalMaskBuilder,
+    LegalMaskCollate,
     LichessDataset,
 )
 
@@ -92,6 +93,8 @@ def parse_args():
                     help="Disable torch.compile")
     p.add_argument("--sdpa-math", action="store_true",
                     help="Use MATH SDPA backend (workaround for ROCm flash attn + compile)")
+    p.add_argument("--num-workers", type=int, default=8,
+                    help="DataLoader workers for legal mask prefetch (default: 8)")
 
     ckpt_group = p.add_mutually_exclusive_group(required=True)
     ckpt_group.add_argument("--hf-repo", type=str, default=None,
@@ -282,9 +285,14 @@ def main():
     train_ds = LichessDataset(data, start=0, end=n_train)
     val_ds = LichessDataset(data, start=n_train, end=n_total_games)
 
+    max_ply = 255
+    collate = LegalMaskCollate(seq_len=max_ply + 1, vocab_size=vocab_size)
+    n_workers = args.num_workers
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=0, pin_memory=True,
+        num_workers=n_workers, pin_memory=True,
+        persistent_workers=n_workers > 0, collate_fn=collate,
+        multiprocessing_context='spawn' if n_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
@@ -348,7 +356,7 @@ def main():
             ids = batch["input_ids"].to(device)
             tgt = batch["targets"].to(device)
             msk = batch["loss_mask"].to(device)
-            legal_mask = mask_builder(batch)
+            legal_mask = mask_builder.scatter(batch["legal_indices"], ids.shape[0])
 
             valid_logits = sparse_forward(model, ids, msk, legal_mask, use_amp, device)
             valid_targets = tgt[msk]
