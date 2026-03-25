@@ -43,21 +43,56 @@ if [ -n "$SSH" ]; then
     $SSH "pgrep -f train_all > /dev/null && echo RUNNING || echo STOPPED" 2>/dev/null || echo "  (SSH failed)"
 
     echo ""
-    echo "=== Latest Metrics ==="
-    $SSH 'for f in /opt/pawn/logs/run_*/metrics.jsonl; do
-        [ -f "$f" ] || continue
-        name=$(basename $(dirname "$f"))
-        last=$(tail -1 "$f" 2>/dev/null)
-        step=$(echo "$last" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(f\"step={d.get(\"step\",\"?\"):>6}  loss={d.get(\"train/loss\",d.get(\"val/loss\",\"?\")):>8.4f}  acc={d.get(\"train/accuracy\",d.get(\"val/accuracy\",\"?\")):>6.3f}\")" 2>/dev/null)
-        echo "  $name: $step"
-    done' 2>/dev/null || echo "  (SSH failed)"
-
-    echo ""
     echo "=== Metrics Sync ==="
     rsync -az --include='*/' --include='metrics.jsonl' --include='config.json' --exclude='*' \
         -e "ssh -o StrictHostKeyChecking=accept-new -p $PORT" \
         "root@$HOST:/opt/pawn/logs/" logs/ 2>/dev/null && echo "  Synced" || echo "  (Sync failed)"
 fi
+
+# Show metrics from local synced files (works with or without SSH)
+echo ""
+echo "=== Training Progress ==="
+python3 -c "
+import json, statistics, glob, os
+
+for f in sorted(glob.glob('logs/run_*/metrics.jsonl')):
+    run = os.path.basename(os.path.dirname(f))
+    recs = []
+    with open(f) as fh:
+        for line in fh:
+            try: recs.append(json.loads(line.strip()))
+            except: pass
+
+    train = [r for r in recs if r.get('type') == 'train' and r.get('step', 0) > 10]
+    val = [r for r in recs if r.get('type') == 'val']
+    if not train:
+        continue
+
+    last = train[-1]
+    times = [r['step_time'] for r in train if 'step_time' in r]
+    gps = [r['games_per_sec'] for r in train if 'games_per_sec' in r]
+    med_t = statistics.median(times) if times else 0
+    med_gps = statistics.median(gps) if gps else 0
+
+    step = last.get('step', 0)
+    loss = last.get('train/loss', 0)
+    acc = last.get('train/accuracy', 0)
+
+    # Val metrics
+    val_str = ''
+    if val:
+        lv = val[-1]
+        val_str = f\"  val_loss={lv.get('val/loss',0):.4f}\"
+
+    # ETA
+    cfg = next((r for r in recs if r.get('type') == 'config'), {})
+    total = cfg.get('training', {}).get('total_steps', 100000)
+    remaining_h = (total - step) * med_t / 3600 if med_t else 0
+
+    print(f'  {run}')
+    print(f'    step {step:>6}/{total}  loss={loss:.4f}  acc={acc:.3f}{val_str}')
+    print(f'    {med_t:.3f}s/step  {med_gps:.0f} g/s  ETA {remaining_h:.1f}h')
+" 2>/dev/null || echo "  (no local metrics)"
 
 echo ""
 echo "=== HuggingFace Checkpoints ==="
