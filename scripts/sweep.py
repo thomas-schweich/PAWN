@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 import optuna
 
@@ -77,7 +78,9 @@ def main():
         p.error("--pgn is required for adapter sweeps")
 
     study_name = args.study_name or args.adapter
-    db_path = f"sqlite:///{args.output_dir}/{args.adapter}/study.db"
+    db_dir = Path(args.output_dir) / args.adapter
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = f"sqlite:///{db_dir}/study.db"
 
     print(f"=== PAWN Hyperparameter Sweep ===")
     print(f"Adapter: {args.adapter}")
