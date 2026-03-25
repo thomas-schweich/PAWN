@@ -72,7 +72,9 @@ def extract_diagnostic_positions(
     positions = {}
 
     # Terminal categories (checkmate, stalemate) come from termination codes,
-    # not per-ply stats. The "position" is the final one (ply = game_length - 1).
+    # not per-ply stats. The position is post-terminal (ply = game_length),
+    # where there are no legal moves. The relevant metric is pad_prob (does
+    # the model know the game is over?), not legal_rate.
     _TERMINAL_CATEGORIES = {"checkmate": 0, "stalemate": 1}
 
     for cat_name, bit_value in DIAGNOSTIC_CATEGORIES.items():
@@ -238,14 +240,19 @@ def evaluate_diagnostic_positions(
                 n_legal = sum(1 for s in sampled if int(s) in legal_tokens)
                 all_legal_rates.append(n_legal / n_samples)
 
+        is_terminal = cat_name in ("checkmate", "stalemate")
         results[cat_name] = {
             "n_positions": len(pos_list),
+            "terminal": is_terminal,
             "mean_legal_rate": float(np.mean(all_legal_rates)),
             "std_legal_rate": float(np.std(all_legal_rates)),
             "mean_pad_prob": float(np.mean(all_pad_rates)),
             "mean_entropy": float(np.mean(all_entropies)),
             "std_entropy": float(np.std(all_entropies)),
         }
-        print(f" legal_rate={results[cat_name]['mean_legal_rate']:.3f}")
+        if is_terminal:
+            print(f" pad_prob={results[cat_name]['mean_pad_prob']:.3f}")
+        else:
+            print(f" legal_rate={results[cat_name]['mean_legal_rate']:.3f}")
 
     return results
