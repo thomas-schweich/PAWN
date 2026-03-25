@@ -15,7 +15,7 @@ if [ -n "$POD_ID" ]; then
 import json, sys
 d = json.load(sys.stdin)
 ssh = d.get('ssh', {})
-host = ssh.get('host', '')
+host = ssh.get('ip', '') or ssh.get('host', '')
 port = ssh.get('port', '')
 status = ssh.get('status', '')
 error = ssh.get('error', '')
