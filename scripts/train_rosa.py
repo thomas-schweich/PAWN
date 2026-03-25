@@ -364,6 +364,7 @@ def train_loop(model, adapter_params, train_loader, val_loader, mask_builder,
     print(f"\n=== Phase 3: Main training ({args.epochs} epochs, {total_steps} steps) ===")
     print(f"  LR warmup: {warmup_steps} steps, LR: {args.lr}")
 
+    epoch = -1
     for epoch in range(args.epochs):
         model.train()
         epoch_loss = 0.0
@@ -566,11 +567,11 @@ def setup_retro_bottleneck(masks, args, device):
     ).to(device)
 
     params = model.adapter_parameters()
-    n_sparse = len(model.sparse_parameters())
+    n_sparse = sum(p.numel() for p in model.sparse_parameters())
     n_bottleneck = sum(p.numel() for p in model.bottleneck_parameters())
     n_total = sum(p.numel() for p in params)
     print(f"Retro-bottleneck: {n_total:,} trainable params")
-    print(f"  Sparse deltas: {n_sparse}, Bottleneck params: {n_bottleneck:,}")
+    print(f"  Sparse: {n_sparse:,}, Bottleneck: {n_bottleneck:,}")
     return model, params
 
 
