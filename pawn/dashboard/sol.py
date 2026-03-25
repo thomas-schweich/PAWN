@@ -327,6 +327,16 @@ def MetricsCharts():
         with solara.Columns([1, 1]):
             ChartWithInfo(charts.gpu_chart(train, x_key), desc("gpu"))
             ChartWithInfo(charts.time_chart(train, x_key, run_type), desc("time"))
+        if val:
+            patience = config.get("training", {}).get("patience", 10)
+            if isinstance(patience, str):
+                patience = int(patience)
+            with solara.Columns([1]):
+                ChartWithInfo(
+                    charts.patience_chart(val, x_key, patience_limit=patience),
+                    "Consecutive evals without val loss improvement. "
+                    "Training stops when this reaches the patience limit."
+                )
 
 
 @solara.component

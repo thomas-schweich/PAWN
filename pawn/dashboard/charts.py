@@ -298,3 +298,57 @@ def val_accuracy_chart(records: list[dict], x_key: str, run_type: str):
             ("val_top5", "Val Top-5", COLORS["green"]),
         ]
     return make_chart(records, x_key, specs, title="Validation Accuracy", y_title="Rate")
+
+
+def patience_chart(val_records: list[dict], x_key: str = "step",
+                   patience_limit: int = 10) -> "go.Figure":
+    """Infer patience counter from val loss records and plot it.
+
+    Patience resets to 0 when val loss improves, increments by 1 otherwise.
+    Shows a horizontal line at the patience limit.
+    """
+    import plotly.graph_objects as go
+
+    if not val_records:
+        fig = go.Figure()
+        fig.update_layout(**LAYOUT, title="Patience (early stopping)")
+        return fig
+
+    best_loss = float("inf")
+    steps = []
+    counters = []
+
+    counter = 0
+    for r in val_records:
+        vl = r.get("val/loss")
+        s = r.get(x_key)
+        if vl is None or s is None:
+            continue
+        if vl < best_loss:
+            best_loss = vl
+            counter = 0
+        else:
+            counter += 1
+        steps.append(s)
+        counters.append(counter)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=steps, y=counters, mode="lines+markers",
+        name="Patience counter",
+        line=dict(color=COLORS["orange"], width=2),
+        marker=dict(size=4),
+    ))
+    fig.add_hline(
+        y=patience_limit, line_dash="dash", line_color=COLORS["red"],
+        annotation_text=f"limit ({patience_limit})",
+        annotation_position="top left",
+    )
+    fig.update_layout(
+        **LAYOUT,
+        title="Patience (early stopping)",
+        xaxis_title=x_key.capitalize(),
+        yaxis_title="Evals without improvement",
+        yaxis=dict(range=[0, patience_limit + 2]),
+    )
+    return fig
