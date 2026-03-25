@@ -22,6 +22,9 @@ dependencies = [
     "plotly>=5.18.0",
     "pandas>=2.0.0",
     "anywidget>=0.9.21",
+    # Sweeps
+    "optuna>=4.0.0",
+    "optuna-dashboard>=0.17.0",
     # Dev
     "pytest~=9.0.0",
     "ipykernel>=7.2.0",
