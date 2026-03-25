@@ -1,0 +1,86 @@
+# Chess Data Generation Container
+#
+# Lc0 v0.33-dev (CUDA) + generation scripts.
+# Optionally includes Stockfish 18 (--build-arg INCLUDE_STOCKFISH=1).
+# Produces UCI move sequences for PAWN training.
+#
+# Build (Lc0 only — default):
+#   docker build --platform linux/amd64 \
+#     -f Dockerfile.datagen -t pawn-datagen .
+#
+# Build (with Stockfish):
+#   docker build --platform linux/amd64 \
+#     --build-arg INCLUDE_STOCKFISH=1 \
+#     -f Dockerfile.datagen -t pawn-datagen .
+#
+# Run (Lc0 — requires NVIDIA GPU):
+#   docker run --rm --gpus all -v $(pwd)/data:/out pawn-datagen \
+#     scripts/generate_lc0_data.py --output /out/lc0
+#
+# Pinned versions for reproducibility:
+#   Lc0 afaa5ab         https://github.com/LeelaChessZero/lc0 (v0.28.1-429-gafaa5ab)
+#   Stockfish 18        https://github.com/official-stockfish/Stockfish/releases/tag/sf_18
+#   Networks:
+#     t1-256x10-distilled-swa-2432500        sha256:bc27a6ca...
+#     t3-512x15x16h-distill-swa-2767500      sha256:78541c4a...
+#     BT4-1024x15x32h-swa-6147500-pt-332     sha256:e6ada9d6...
+
+# ── Build Lc0 from source ─────────────────────────────────────────────
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS lc0-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git g++ python3-pip ninja-build pkg-config libopenblas-dev \
+    && pip3 install --break-system-packages meson \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG LC0_COMMIT=afaa5ab
+RUN git clone --recurse-submodules https://github.com/LeelaChessZero/lc0.git /lc0 \
+    && cd /lc0 && git checkout ${LC0_COMMIT} \
+    && PATH=/usr/local/cuda/bin:$PATH ./build.sh
+
+# ── Runtime ────────────────────────────────────────────────────────────
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip curl libopenblas0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Stockfish 18 (opt-in: --build-arg INCLUDE_STOCKFISH=1)
+ARG INCLUDE_STOCKFISH=0
+RUN if [ "$INCLUDE_STOCKFISH" = "1" ]; then \
+        curl -L -o /tmp/sf.tar \
+            https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64-avx2.tar \
+        && tar xf /tmp/sf.tar -C /tmp \
+        && cp /tmp/stockfish/stockfish-ubuntu-x86-64-avx2 /usr/local/bin/stockfish \
+        && chmod +x /usr/local/bin/stockfish \
+        && rm -rf /tmp/sf.tar /tmp/stockfish \
+        && echo "quit" | stockfish | head -1; \
+    fi
+
+# Lc0 binary
+COPY --from=lc0-builder /lc0/build/release/lc0 /usr/local/bin/lc0
+
+# Lc0 networks (pinned by SHA256)
+RUN mkdir -p /opt/lc0_nets \
+    && curl -L -o /opt/lc0_nets/t1-256x10.pb.gz \
+        https://storage.lczero.org/files/networks-contrib/t1-256x10-distilled-swa-2432500.pb.gz \
+    && curl -L -o /opt/lc0_nets/t3-512x15.pb.gz \
+        https://storage.lczero.org/files/networks-contrib/t3-512x15x16h-distill-swa-2767500.pb.gz \
+    && curl -L -o /opt/lc0_nets/bt4-1024x15.pb.gz \
+        https://storage.lczero.org/files/networks-contrib/BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz \
+    && echo "bc27a6cae8ad36f2b9a80a6ad9dabb0d6fda25b1e7f481a79bc359e14f563406  /opt/lc0_nets/t1-256x10.pb.gz" | sha256sum -c \
+    && echo "78541c4abc0bc81e8145e1f9a4c35a934ebbefff70f11f33215751d55a886352  /opt/lc0_nets/t3-512x15.pb.gz" | sha256sum -c \
+    && echo "e6ada9d6c4a769bfab3aa0848d82caeb809aa45f83e6c605fc58a31d21bdd618  /opt/lc0_nets/bt4-1024x15.pb.gz" | sha256sum -c
+
+# Generation scripts
+WORKDIR /opt/datagen
+COPY scripts/generate_stockfish_data.py scripts/
+COPY scripts/benchmark_stockfish_nodes.py scripts/
+COPY scripts/generate_lc0_data.py scripts/
+
+RUN lc0 --help 2>&1 | head -1
+
+ENTRYPOINT ["python3"]

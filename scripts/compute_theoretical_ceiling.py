@@ -66,45 +66,48 @@ def main():
     elapsed = time.time() - t0
 
     uncond = result["unconditional_ceiling"]
+    naive_cond = result["naive_conditional_ceiling"]
     cond = result["conditional_ceiling"]
+    boost_naive = naive_cond / uncond if uncond > 0 else 0
     boost = cond / uncond if uncond > 0 else 0
 
     print(f"Positions sampled: {result['n_positions']:,}")
-    print(f"Unconditional ceiling: {uncond:.4f} ({uncond*100:.2f}%)")
-    print(f"Conditional ceiling:   {cond:.4f} ({cond*100:.2f}%)")
-    print(f"Conditioning boost:    {boost:.2f}x")
+    print(f"Unconditional ceiling:       {uncond:.4f} ({uncond*100:.2f}%)")
+    print(f"Naive conditional ceiling:   {naive_cond:.4f} ({naive_cond*100:.2f}%)  {boost_naive:.2f}x")
+    print(f"MCTS conditional ceiling:    {cond:.4f} ({cond*100:.2f}%)  {boost:.2f}x")
     print(f"Time: {elapsed:.0f}s")
     print()
 
     # Per-outcome breakdown
-    outcomes = result["outcome"]
-    conditionals = result["conditional"]
-    unconditionals = result["unconditional"]
+    outcomes = np.asarray(result["outcome"])
+    conditionals = np.asarray(result["conditional"])
+    naive_conditionals = np.asarray(result["naive_conditional"])
+    unconditionals = np.asarray(result["unconditional"])
     outcome_names = [
-        "Checkmate", "Stalemate", "75-move", "5-fold rep",
-        "Insuff mat", "Ply limit",
+        "W checkmated", "B checkmated", "Stalemate", "75-move",
+        "5-fold rep", "Insuff mat", "Ply limit",
     ]
 
     print("Per-outcome breakdown:")
     outcome_data = {}
-    for oi in range(6):
+    for oi in range(7):
         mask = outcomes == oi
         n = int(mask.sum())
         if n > 0:
             uc = float(unconditionals[mask].mean())
+            nc = float(naive_conditionals[mask].mean())
             cc = float(conditionals[mask].mean())
-            ob = cc / uc if uc > 0 else 0
-            print(f"  {outcome_names[oi]:>12}: uncond={uc:.4f}  cond={cc:.4f}  "
-                  f"boost={ob:.2f}x  (n={n})")
+            print(f"  {outcome_names[oi]:>12}: uncond={uc:.4f}  naive={nc:.4f}  "
+                  f"mcts={cc:.4f}  (n={n})")
             outcome_data[outcome_names[oi]] = {
-                "unconditional": uc, "conditional": cc,
-                "boost": ob, "n_positions": n,
+                "unconditional": uc, "naive_conditional": nc,
+                "conditional": cc, "n_positions": n,
             }
     print()
 
     # Per-ply-from-end breakdown
-    plies = result["ply"]
-    game_lengths = result["game_length"]
+    plies = np.asarray(result["ply"])
+    game_lengths = np.asarray(result["game_length"])
     plies_from_end = game_lengths - plies
 
     print("Ceiling by distance from game end:")
@@ -114,27 +117,32 @@ def main():
         n = int(mask.sum())
         if n > 10:
             uc = float(unconditionals[mask].mean())
+            nc = float(naive_conditionals[mask].mean())
             cc = float(conditionals[mask].mean())
             bar = "#" * int(cc * 200)
-            print(f"  {dist:>3} plies from end: uncond={uc:.4f}  cond={cc:.4f}  {bar}")
-            distance_data[dist] = {"unconditional": uc, "conditional": cc, "n": n}
+            print(f"  {dist:>3} plies from end: uncond={uc:.4f}  naive={nc:.4f}  mcts={cc:.4f}  {bar}")
+            distance_data[dist] = {"unconditional": uc, "naive_conditional": nc, "conditional": cc, "n": n}
     print()
 
     # Model adjusted accuracy
     if args.model_accuracy is not None:
         ma = args.model_accuracy
         adj_uncond = ma / uncond if uncond > 0 else 0
+        adj_naive = ma / naive_cond if naive_cond > 0 else 0
         adj_cond = ma / cond if cond > 0 else 0
         print(f"Model accuracy: {ma:.4f} ({ma*100:.2f}%)")
-        print(f"  vs unconditional ceiling: {adj_uncond:.1%} of theoretical max")
-        print(f"  vs conditional ceiling:   {adj_cond:.1%} of theoretical max")
+        print(f"  vs unconditional ceiling:     {adj_uncond:.1%} of theoretical max")
+        print(f"  vs naive conditional ceiling: {adj_naive:.1%} of theoretical max")
+        print(f"  vs MCTS conditional ceiling:  {adj_cond:.1%} of theoretical max")
         print()
 
     # Save results
     data = {
         "unconditional_ceiling": float(uncond),
+        "naive_conditional_ceiling": float(naive_cond),
         "conditional_ceiling": float(cond),
-        "conditioning_boost": float(boost),
+        "naive_conditioning_boost": float(boost_naive),
+        "mcts_conditioning_boost": float(boost),
         "n_positions": int(result["n_positions"]),
         "n_games": args.n_games,
         "n_rollouts": args.rollouts,
@@ -147,6 +155,7 @@ def main():
     if args.model_accuracy is not None:
         data["model_accuracy"] = args.model_accuracy
         data["adjusted_vs_unconditional"] = adj_uncond
+        data["adjusted_vs_naive_conditional"] = adj_naive
         data["adjusted_vs_conditional"] = adj_cond
 
     with open(output_path, "w") as f:
