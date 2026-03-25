@@ -33,6 +33,7 @@ from pawn.config import CLMConfig, PAD_TOKEN
 from pawn.model import PAWNCLM
 from pawn.adapters.rosa import RoSACLM, RetroBottleneckCLM, generate_gradient_masks
 from pawn.adapters.sparse import SparseCLM, SparseLinear
+from pawn.adapters.lora import ATTN_PRESETS, _FFN_TARGETS
 from pawn.logging import MetricsLogger
 from pawn.gpu import configure_gpu, apply_gpu_config
 
@@ -316,6 +317,7 @@ def train_loop(model, adapter_params, train_loader, val_loader, mask_builder,
                weight_report_fn):
     """Standard epoch-based training loop for Phase 3."""
     from pawn import model as model_module
+    from pawn.checkpoint import save_adapter_checkpoint, push_checkpoint_to_hf
 
     # Compile forward_hidden for Phase 3
     model.forward_hidden = apply_gpu_config(gpu_cfg, model_module, model.forward_hidden)
@@ -438,7 +440,6 @@ def train_loop(model, adapter_params, train_loader, val_loader, mask_builder,
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 patience_counter = 0
-                from pawn.checkpoint import save_adapter_checkpoint
                 save_adapter_checkpoint(
                     ckpt_dir / "best",
                     model.adapter_state_dict(),
@@ -452,7 +453,6 @@ def train_loop(model, adapter_params, train_loader, val_loader, mask_builder,
                     extra={"best_val_loss": best_val_loss, "patience_counter": patience_counter},
                 )
                 if args.hf_repo and hf_branch:
-                    from pawn.checkpoint import push_checkpoint_to_hf
                     try:
                         push_checkpoint_to_hf(ckpt_dir / "best", args.hf_repo, hf_branch,
                                               step=global_step)
@@ -470,7 +470,6 @@ def train_loop(model, adapter_params, train_loader, val_loader, mask_builder,
             break
 
     # Save final checkpoint
-    from pawn.checkpoint import save_adapter_checkpoint
     save_adapter_checkpoint(
         ckpt_dir / "final",
         model.adapter_state_dict(),
@@ -484,7 +483,6 @@ def train_loop(model, adapter_params, train_loader, val_loader, mask_builder,
         extra={"best_val_loss": best_val_loss, "patience_counter": patience_counter},
     )
     if args.hf_repo and hf_branch:
-        from pawn.checkpoint import push_checkpoint_to_hf
         try:
             push_checkpoint_to_hf(ckpt_dir / "final", args.hf_repo, hf_branch,
                                   step=global_step)
@@ -513,39 +511,41 @@ def setup_rosa(model, masks, args):
     return model, params
 
 
-def setup_retro_sparse(masks, args, device):
-    """Retrospective sparse-only: reload backbone, apply gradient masks."""
-    print("\nReloading fresh backbone for retrospective sparse training...")
+def _make_sparse_with_masks(masks, args, device):
+    """Reload backbone, create SparseCLM, overwrite random masks with gradient-derived ones."""
     backbone = load_backbone(args.checkpoint, device)
+    attn_targets = ATTN_PRESETS[args.lora_targets]
 
-    # Build SparseCLM with dummy density (masks will be overwritten)
     sparse_model = SparseCLM(
         backbone, density=args.density,
-        attn_targets={"qkvo": ("wq", "wk", "wv", "wo"),
-                       "qv": ("wq", "wv"),
-                       "qkv": ("wq", "wk", "wv")}[args.lora_targets],
+        attn_targets=attn_targets,
         adapt_ffn=args.lora_ffn,
     )
 
     # Overwrite random masks with gradient-derived masks
     for layer_idx in range(len(backbone.layers)):
         block = backbone.get_block(layer_idx)
-        targets = {"qkvo": ("wq", "wk", "wv", "wo"),
-                   "qv": ("wq", "wv"),
-                   "qkv": ("wq", "wk", "wv")}[args.lora_targets]
-        for proj_name in targets:
+        for proj_name in attn_targets:
             module = getattr(block.attn, proj_name, None)
             if isinstance(module, SparseLinear):
                 key = f"layer{layer_idx}.{proj_name}"
                 if key in masks:
                     module.mask.copy_(masks[key])
         if args.lora_ffn:
-            for proj_name in ("w_gate", "w_up", "w_down"):
+            for proj_name in _FFN_TARGETS:
                 module = getattr(block.ffn, proj_name, None)
                 if isinstance(module, SparseLinear):
                     key = f"layer{layer_idx}.{proj_name}"
                     if key in masks:
                         module.mask.copy_(masks[key])
+
+    return sparse_model
+
+
+def setup_retro_sparse(masks, args, device):
+    """Retrospective sparse-only: reload backbone, apply gradient masks."""
+    print("\nReloading fresh backbone for retrospective sparse training...")
+    sparse_model = _make_sparse_with_masks(masks, args, device)
 
     params = sparse_model.sparse_parameters()
     n_active = sparse_model.n_active_params()
@@ -557,36 +557,7 @@ def setup_retro_sparse(masks, args, device):
 def setup_retro_bottleneck(masks, args, device):
     """Retrospective sparse + bottleneck: reload, apply masks, add bottlenecks."""
     print("\nReloading fresh backbone for retrospective sparse+bottleneck training...")
-    backbone = load_backbone(args.checkpoint, device)
-
-    # Inject sparse adapters (same as retro-sparse)
-    sparse_model = SparseCLM(
-        backbone, density=args.density,
-        attn_targets={"qkvo": ("wq", "wk", "wv", "wo"),
-                       "qv": ("wq", "wv"),
-                       "qkv": ("wq", "wk", "wv")}[args.lora_targets],
-        adapt_ffn=args.lora_ffn,
-    )
-
-    # Overwrite random masks with gradient-derived masks
-    for layer_idx in range(len(backbone.layers)):
-        block = backbone.get_block(layer_idx)
-        targets = {"qkvo": ("wq", "wk", "wv", "wo"),
-                   "qv": ("wq", "wv"),
-                   "qkv": ("wq", "wk", "wv")}[args.lora_targets]
-        for proj_name in targets:
-            module = getattr(block.attn, proj_name, None)
-            if isinstance(module, SparseLinear):
-                key = f"layer{layer_idx}.{proj_name}"
-                if key in masks:
-                    module.mask.copy_(masks[key])
-        if args.lora_ffn:
-            for proj_name in ("w_gate", "w_up", "w_down"):
-                module = getattr(block.ffn, proj_name, None)
-                if isinstance(module, SparseLinear):
-                    key = f"layer{layer_idx}.{proj_name}"
-                    if key in masks:
-                        module.mask.copy_(masks[key])
+    sparse_model = _make_sparse_with_masks(masks, args, device)
 
     # Wrap with bottleneck adapters
     model = RetroBottleneckCLM(
@@ -736,7 +707,7 @@ def main():
 
     # Save warm-up LoRA weights for posterity
     print("\nSaving warm-up LoRA weights...")
-    from pawn.checkpoint import save_adapter_checkpoint
+    from pawn.checkpoint import save_adapter_checkpoint  # used here and below
     save_adapter_checkpoint(
         ckpt_dir / "warmup",
         warmup_model.adapter_state_dict(),

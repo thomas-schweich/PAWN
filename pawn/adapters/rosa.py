@@ -587,6 +587,9 @@ def generate_gradient_masks(
         # Initialize accumulator
         accumulators[key] = torch.zeros_like(module.delta)
 
+    # Clear any stale gradients before accumulation
+    model.zero_grad(set_to_none=True)
+
     # Accumulate gradients
     n_batches = 0
     for batch in dataloader:
