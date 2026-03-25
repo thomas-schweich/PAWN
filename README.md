@@ -13,6 +13,15 @@ tags:
   - rust
 language:
   - en
+pipeline_tag: other
+citation: |
+  @software{schweich2025pawn,
+    author = {Schweich, Thomas},
+    title = {{PAWN}: Playstyle-Agnostic World-model Network for Chess},
+    year = {2025},
+    url = {https://github.com/thomas-schweich/PAWN},
+    license = {Apache-2.0}
+  }
 ---
 
 # PAWN: Playstyle-Agnostic World-model Network for Chess
