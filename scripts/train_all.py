@@ -95,6 +95,7 @@ class ModelSlot:
         self.best_val_step = 0
         self.best_val_loss = float("inf")
         self.patience_counter = 0
+        self.stopped = False
 
         # Background HF push (one thread per slot, so pushes don't block training)
         from concurrent.futures import ThreadPoolExecutor
@@ -529,16 +530,18 @@ def main():
         print(f"  [{slot.name}] JSONL: {slot.jsonl_path}", flush=True)
     print()
 
+    active_slots = list(slots)  # slots still training
+
     for batch in loader:
-        # Forward + backward for each model on the same batch (no .item() sync)
+        # Forward + backward for active models only (no .item() sync)
         all_metrics: dict[str, dict[str, torch.Tensor]] = {}
-        for slot in slots:
+        for slot in active_slots:
             metrics = slot.train_step(batch)
             all_metrics[slot.name] = metrics
 
-        # Optimizer step for each model
+        # Optimizer step for active models
         all_grad_norms: dict[str, float] = {}
-        for slot in slots:
+        for slot in active_slots:
             gn = slot.optimizer_step()
             all_grad_norms[slot.name] = gn
 
@@ -551,8 +554,9 @@ def main():
 
         # Logging — .item() sync only at log intervals
         if global_step % args.log_interval == 0:
-            print(f"step {global_step:>7d} | {games_per_sec:.0f} g/s | {step_time:.2f}s", flush=True)
-            for slot in slots:
+            active_names = ", ".join(s.name for s in active_slots)
+            print(f"step {global_step:>7d} | {games_per_sec:.0f} g/s | {step_time:.2f}s | active: {active_names}", flush=True)
+            for slot in active_slots:
                 m = all_metrics[slot.name]
                 loss_val = m['loss'].item()
                 acc_val = m['accuracy'].item()
@@ -576,7 +580,7 @@ def main():
 
         # Eval
         if global_step % args.eval_interval == 0:
-            for slot in slots:
+            for slot in active_slots:
                 val_metrics = slot.evaluate(val_data)
                 print(f"  {slot.name:>5s} val: loss {val_metrics['val/loss']:.4f} | "
                       f"acc {val_metrics['val/accuracy']:.3f}", flush=True)
@@ -595,27 +599,32 @@ def main():
                 else:
                     slot.patience_counter += 1
 
+                # Per-model early stopping
+                if args.patience > 0 and slot.patience_counter >= args.patience:
+                    print(f"  [{slot.name}] Early stopping — no improvement "
+                          f"for {args.patience} evals (best step {slot.best_val_step})")
+                    slot.stopped = True
+                    slot.save_checkpoint()
+
+            active_slots = [s for s in active_slots if not s.stopped]
+
             # Push metrics to HF after eval (lightweight, background)
             for slot in slots:
                 slot.push_metrics_to_hf()
 
-            # Early stop when ALL slots have exhausted patience
-            if args.patience > 0 and all(s.patience_counter >= args.patience for s in slots):
-                print(f"\nEarly stopping at step {global_step} — no improvement "
-                      f"for {args.patience} evals on any variant")
-                for slot in slots:
-                    slot.save_checkpoint()
+            if not active_slots:
+                print(f"\nAll models stopped at step {global_step}")
                 break
 
         # Checkpoint
         if global_step % args.checkpoint_interval == 0:
-            for slot in slots:
+            for slot in active_slots:
                 slot.save_checkpoint()
 
         # Done?
         if global_step >= args.total_steps:
             print(f"\nTraining complete at step {global_step}")
-            for slot in slots:
+            for slot in active_slots:
                 slot.save_checkpoint()
             break
 
@@ -623,7 +632,7 @@ def main():
         if _shutdown_requested:
             print(f"\nShutdown requested (signal {_shutdown_signal}), "
                   f"saving checkpoints at step {global_step}...")
-            for slot in slots:
+            for slot in active_slots:
                 slot.save_checkpoint()
             break
 
