@@ -144,26 +144,37 @@ def suggest_architecture(trial: "optuna.Trial") -> dict:
     }
 
 
-def suggest_rosa(trial: "optuna.Trial") -> dict:
-    """RoSA (Robust Sparse Adaptation) hyperparameters.
-
-    Note: ``mode`` is sampled across all three variants in a single study.
-    ``bottleneck_dim`` is only suggested when mode is ``retro-bottleneck``
-    (conditional parameter). Optuna handles this correctly, but standard
-    samplers (TPE) treat absent params as NaN. If you need clean per-mode
-    analysis, run separate studies per mode or filter trials by mode when
-    interpreting results.
-    """
+def _suggest_rosa_common(trial: "optuna.Trial") -> dict:
+    """Shared search space for all RoSA modes."""
     params = suggest_common(trial)
-    params["mode"] = trial.suggest_categorical("mode", ["rosa", "retro-sparse", "retro-bottleneck"])
     params["density"] = trial.suggest_float("density", 0.001, 0.1, log=True)
     params["lora_rank"] = trial.suggest_categorical("lora_rank", [2, 4, 8, 16])
     params["lora_targets"] = trial.suggest_categorical("lora_targets", ["qkvo", "qv", "qkv"])
     params["warmup_steps"] = trial.suggest_int("warmup_steps", 32, 256, step=32)
     params["mask_samples"] = trial.suggest_categorical("mask_samples", [16, 32, 64])
     params["grad_alpha"] = trial.suggest_categorical("grad_alpha", [1, 2])
-    if params["mode"] == "retro-bottleneck":
-        params["bottleneck_dim"] = trial.suggest_categorical("bottleneck_dim", [4, 8, 16])
+    return params
+
+
+def suggest_rosa(trial: "optuna.Trial") -> dict:
+    """Standard RoSA: joint LoRA + gradient-informed sparse."""
+    params = _suggest_rosa_common(trial)
+    params["mode"] = "rosa"
+    return params
+
+
+def suggest_retro_sparse(trial: "optuna.Trial") -> dict:
+    """Retrospective sparse-only with gradient-informed masks."""
+    params = _suggest_rosa_common(trial)
+    params["mode"] = "retro-sparse"
+    return params
+
+
+def suggest_retro_bottleneck(trial: "optuna.Trial") -> dict:
+    """Retrospective sparse + bottleneck adapters."""
+    params = _suggest_rosa_common(trial)
+    params["mode"] = "retro-bottleneck"
+    params["bottleneck_dim"] = trial.suggest_categorical("bottleneck_dim", [4, 8, 16])
     return params
 
 
@@ -174,6 +185,8 @@ SUGGEST_FNS = {
     "sparse": suggest_sparse,
     "hybrid": suggest_hybrid,
     "rosa": suggest_rosa,
+    "retro-sparse": suggest_retro_sparse,
+    "retro-bottleneck": suggest_retro_bottleneck,
     "tiny": suggest_tiny,
     "architecture": suggest_architecture,
     "pretrain": suggest_pretrain,
@@ -186,6 +199,8 @@ ADAPTER_SCRIPTS = {
     "sparse": "scripts/train_sparse.py",
     "hybrid": "scripts/train_hybrid.py",
     "rosa": "scripts/train_rosa.py",
+    "retro-sparse": "scripts/train_rosa.py",
+    "retro-bottleneck": "scripts/train_rosa.py",
     "tiny": "scripts/train_tiny.py",
     "pretrain": "scripts/train.py",
     "architecture": "scripts/train.py",
@@ -342,13 +357,14 @@ class InProcessRoSAObjective:
 
     Usage::
 
-        objective = InProcessRoSAObjective(checkpoint, pgn, device="cuda")
+        objective = InProcessRoSAObjective("rosa", checkpoint, pgn, device="cuda")
         study = create_study("rosa")
         study.optimize(objective, n_trials=50)
     """
 
     def __init__(
         self,
+        adapter_type: str,
         checkpoint: str,
         pgn: str,
         device: str = "cuda",
@@ -363,9 +379,12 @@ class InProcessRoSAObjective:
         sdpa_math: bool = False,
         max_grad_norm: float = 1.0,
     ):
+        if adapter_type not in ("rosa", "retro-sparse", "retro-bottleneck"):
+            raise ValueError(f"InProcessRoSAObjective does not support adapter_type={adapter_type!r}")
+        self.adapter_type = adapter_type
         self.checkpoint = checkpoint
         self.device = device
-        self.output_base = Path(output_base) / "rosa"
+        self.output_base = Path(output_base) / adapter_type
         self.output_base.mkdir(parents=True, exist_ok=True)
         self.epochs = epochs
         self.max_grad_norm = max_grad_norm
@@ -456,7 +475,8 @@ class InProcessRoSAObjective:
 
         assert _optuna is not None
 
-        params = suggest_rosa(trial)
+        suggest_fn = SUGGEST_FNS[self.adapter_type]
+        params = suggest_fn(trial)
         mode = params["mode"]
         density = params["density"]
         lr = params["lr"]

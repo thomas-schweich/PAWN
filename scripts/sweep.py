@@ -105,9 +105,11 @@ def main():
     )
 
     if args.in_process:
-        if args.adapter != "rosa":
-            p.error("--in-process is currently only supported for --adapter rosa")
+        if args.adapter not in ("rosa", "retro-sparse", "retro-bottleneck"):
+            p.error("--in-process is currently only supported for "
+                    "--adapter rosa|retro-sparse|retro-bottleneck")
         objective = InProcessRoSAObjective(
+            adapter_type=args.adapter,
             checkpoint=args.checkpoint,
             pgn=args.pgn or "",
             device=args.device,
