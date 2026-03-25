@@ -301,7 +301,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train small/base/large PAWN models simultaneously")
     p.add_argument("--device", type=str, default=None, help="Device (cuda/cpu)")
     p.add_argument("--total-steps", type=int, default=100_000, help="Total training steps")
-    p.add_argument("--batch-size", type=int, default=512, help="Batch size (shared across models)")
+    p.add_argument("--batch-size", type=int, default=256, help="Batch size (shared across models)")
     p.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     p.add_argument("--log-dir", type=str, default="logs", help="Log directory")
     p.add_argument("--log-interval", type=int, default=10)
