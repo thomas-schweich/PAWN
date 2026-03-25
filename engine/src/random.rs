@@ -87,10 +87,49 @@ pub fn generate_one_game(seed: u64, max_ply: usize) -> (Vec<u16>, u16, Terminati
     }
 }
 
+/// Resolved game outcome with side-aware checkmate.
+///
+/// Unlike `Termination`, this distinguishes which side was checkmated.
+/// Used for accurate conditional ceiling estimation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Outcome {
+    WhiteCheckmated = 0,  // Black wins (1-0 for black)
+    BlackCheckmated = 1,  // White wins (0-1 for white... well, 1-0)
+    Stalemate = 2,
+    SeventyFiveMoveRule = 3,
+    FivefoldRepetition = 4,
+    InsufficientMaterial = 5,
+    PlyLimit = 6,
+}
+
+pub const NUM_OUTCOMES: usize = 7;
+
+impl Outcome {
+    /// Resolve a Termination + the game state at termination into an Outcome.
+    pub fn from_termination(term: Termination, white_to_move_at_end: bool) -> Self {
+        match term {
+            Termination::Checkmate => {
+                // Side to move is checkmated
+                if white_to_move_at_end {
+                    Outcome::WhiteCheckmated
+                } else {
+                    Outcome::BlackCheckmated
+                }
+            }
+            Termination::Stalemate => Outcome::Stalemate,
+            Termination::SeventyFiveMoveRule => Outcome::SeventyFiveMoveRule,
+            Termination::FivefoldRepetition => Outcome::FivefoldRepetition,
+            Termination::InsufficientMaterial => Outcome::InsufficientMaterial,
+            Termination::PlyLimit => Outcome::PlyLimit,
+        }
+    }
+}
+
 /// Outcome distribution from Monte Carlo rollouts.
 #[derive(Debug, Clone, Default)]
 pub struct OutcomeDistribution {
-    pub counts: [u32; 6], // indexed by Termination as usize
+    pub counts: [u32; NUM_OUTCOMES],
     pub total: u32,
 }
 
@@ -104,6 +143,11 @@ pub struct PositionCeiling {
     /// Conditional ceiling: max_m P(m | outcome, history) where the max is over
     /// legal moves and P is estimated from rollouts
     pub conditional: f64,
+    /// Naive conditional ceiling: 1/(N_legal - N_wrong_immediate) where
+    /// N_wrong_immediate is the count of legal moves that lead to an immediate
+    /// terminal state with a different outcome than the actual game outcome.
+    /// This is a 0-depth version of the conditional ceiling — no rollouts needed.
+    pub naive_conditional: f64,
     /// The actual outcome of the game this position came from
     pub actual_outcome: u8,
     /// Ply index within the game
@@ -145,7 +189,8 @@ pub fn rollout_legal_moves(
                 let mut s = state.clone();
                 s.make_move(token).unwrap();
                 let term = s.play_random_to_end(&mut rng, max_ply);
-                dist.counts[term as usize] += 1;
+                let outcome = Outcome::from_termination(term, s.is_white_to_move());
+                dist.counts[outcome as usize] += 1;
                 dist.total += 1;
             }
             (token, dist)
@@ -156,9 +201,11 @@ pub fn rollout_legal_moves(
 /// Compute the theoretical accuracy ceiling for a batch of random games.
 ///
 /// For each position in each game:
-/// - Computes 1/N_legal (unconditional ceiling)
-/// - Uses Monte Carlo rollouts to estimate the conditional ceiling
-///   (how well you can predict the move given the outcome)
+/// - Unconditional: 1/N_legal
+/// - Naive conditional (0-depth): prune legal moves that immediately terminate
+///   with the wrong outcome, then 1/N_remaining
+/// - MCTS conditional: Monte Carlo rollouts estimate P(outcome | move),
+///   best predictor picks argmax
 ///
 /// Returns per-position results. The overall ceiling is the mean.
 pub fn compute_accuracy_ceiling(
@@ -176,16 +223,28 @@ pub fn compute_accuracy_ceiling(
         .map(|&seed| generate_one_game(seed, max_ply))
         .collect();
 
+    // Resolve each game's Termination to a side-aware Outcome
+    let game_outcomes: Vec<Outcome> = games
+        .iter()
+        .map(|(_, game_length, term)| {
+            // At termination, the side to move is the one at ply = game_length.
+            // Even ply = white to move, odd = black to move.
+            let white_to_move_at_end = *game_length % 2 == 0;
+            Outcome::from_termination(*term, white_to_move_at_end)
+        })
+        .collect();
+
     // For each sampled position, compute the ceiling
     let mut rng_sample = ChaCha8Rng::seed_from_u64(base_seed.wrapping_add(999));
-    let mut work_items: Vec<(usize, usize, u8, u16)> = Vec::new(); // (game_idx, ply, outcome, game_length)
+    // (game_idx, ply, outcome_idx, game_length)
+    let mut work_items: Vec<(usize, usize, u8, u16)> = Vec::new();
 
-    for (game_idx, (move_ids, game_length, termination)) in games.iter().enumerate() {
-        let gl = *game_length as usize;
-        let outcome = *termination as u8;
+    for (game_idx, outcome) in game_outcomes.iter().enumerate() {
+        let gl = games[game_idx].1 as usize;
+        let oi = *outcome as u8;
         for ply in 0..gl {
             if sample_rate >= 1.0 || rng_sample.gen::<f64>() < sample_rate {
-                work_items.push((game_idx, ply, outcome, *game_length));
+                work_items.push((game_idx, ply, oi, games[game_idx].1));
             }
         }
     }
@@ -198,17 +257,38 @@ pub fn compute_accuracy_ceiling(
         .enumerate()
         .map(|(work_idx, &(game_idx, ply, actual_outcome, game_length))| {
             let prefix = &games[game_idx].0[..ply];
-            let actual_move = games[game_idx].0[ply];
 
+            // Reconstruct position for naive ceiling
+            let state = GameState::from_move_tokens(prefix).expect("valid prefix");
+            let legal_tokens = state.legal_move_tokens();
+            let n_legal = legal_tokens.len() as u32;
+            let unconditional = if n_legal > 0 { 1.0 / n_legal as f64 } else { 0.0 };
+
+            // --- Naive conditional (0-depth) ---
+            // Try each legal move; if it immediately terminates with a different
+            // Outcome than the game's actual outcome, it can be pruned.
+            let mut n_wrong_immediate = 0u32;
+            for &token in &legal_tokens {
+                let mut s = state.clone();
+                s.make_move(token).unwrap();
+                if let Some(term) = s.check_termination(max_ply) {
+                    let move_outcome = Outcome::from_termination(term, s.is_white_to_move());
+                    if move_outcome as u8 != actual_outcome {
+                        n_wrong_immediate += 1;
+                    }
+                }
+            }
+            let n_remaining = n_legal - n_wrong_immediate;
+            let naive_conditional = if n_remaining > 0 {
+                1.0 / n_remaining as f64
+            } else {
+                unconditional // fallback: all moves lead to wrong immediate outcome
+            };
+
+            // --- MCTS conditional (rollout-based) ---
             let rollout_seed = rollout_seed_base.wrapping_add(work_idx as u64 * 1000);
             let move_dists = rollout_legal_moves(prefix, n_rollouts_per_move, max_ply, rollout_seed);
 
-            let n_legal = move_dists.len() as u32;
-            let unconditional = if n_legal > 0 { 1.0 / n_legal as f64 } else { 0.0 };
-
-            // Conditional ceiling: P(actual_outcome | move) for each move,
-            // then the best predictor picks the move with highest P(outcome|move).
-            // Accuracy = max_m P(m | outcome) = max_m [P(outcome|m) / sum_m' P(outcome|m')]
             let outcome_idx = actual_outcome as usize;
             let probs: Vec<f64> = move_dists
                 .iter()
@@ -233,6 +313,7 @@ pub fn compute_accuracy_ceiling(
                 n_legal,
                 unconditional,
                 conditional,
+                naive_conditional,
                 actual_outcome,
                 ply: ply as u16,
                 game_length,
