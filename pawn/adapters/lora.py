@@ -113,21 +113,28 @@ class LoRACLM(nn.Module):
     def cfg(self) -> CLMConfig:
         return self.backbone.cfg
 
-    def forward_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward_hidden(self, input_ids: torch.Tensor,
+                       attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Run backbone layers (with LoRA), return normed hidden states.
 
-        Returns (B, T, d_model) -- before lm_head projection. Uses
-        is_causal=True in SDPA (Flash Attention).
+        Returns (B, T, d_model) -- before lm_head projection.
         """
         bb = self.backbone
         x = bb.embed(input_ids)
 
         T = input_ids.shape[1]
+        if attention_mask is not None:
+            causal = bb.causal_mask[:T, :T]
+            padding = attention_mask.unsqueeze(1).unsqueeze(2)
+            mask = causal.unsqueeze(0) & padding
+        else:
+            mask = None
+
         rope_cos = bb.rope_cos[:, :, :T, :]
         rope_sin = bb.rope_sin[:, :, :T, :]
 
         for layer in bb.layers:
-            x = layer(x, rope_cos, rope_sin, None)
+            x = layer(x, rope_cos, rope_sin, mask)
 
         return bb.final_norm(x)
 

@@ -103,17 +103,25 @@ class HybridCLM(nn.Module):
     def cfg(self) -> CLMConfig:
         return self.backbone.cfg
 
-    def forward_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward_hidden(self, input_ids: torch.Tensor,
+                       attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Run backbone layers (LoRA inside + FiLM after), return normed hidden."""
         bb = self.backbone
         x = bb.embed(input_ids)
 
         T = input_ids.shape[1]
+        if attention_mask is not None:
+            causal = bb.causal_mask[:T, :T]
+            padding = attention_mask.unsqueeze(1).unsqueeze(2)
+            mask = causal.unsqueeze(0) & padding
+        else:
+            mask = None
+
         rope_cos = bb.rope_cos[:, :, :T, :]
         rope_sin = bb.rope_sin[:, :, :T, :]
 
         for i, layer in enumerate(bb.layers):
-            x = layer(x, rope_cos, rope_sin, None)  # LoRA happens inside
+            x = layer(x, rope_cos, rope_sin, mask)
             if self.hidden_films is not None:
                 x = self.hidden_films[i](x)
 

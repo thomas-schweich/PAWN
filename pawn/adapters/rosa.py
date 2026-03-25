@@ -189,17 +189,25 @@ class RoSACLM(nn.Module):
 
     # --- Forward methods ---
 
-    def forward_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward_hidden(self, input_ids: torch.Tensor,
+                       attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Run backbone layers (with RoSA), return normed hidden states."""
         bb = self.backbone
         x = bb.embed(input_ids)
 
         T = input_ids.shape[1]
+        if attention_mask is not None:
+            causal = bb.causal_mask[:T, :T]
+            padding = attention_mask.unsqueeze(1).unsqueeze(2)
+            mask = causal.unsqueeze(0) & padding
+        else:
+            mask = None
+
         rope_cos = bb.rope_cos[:, :, :T, :]
         rope_sin = bb.rope_sin[:, :, :T, :]
 
         for layer in bb.layers:
-            x = layer(x, rope_cos, rope_sin, None)
+            x = layer(x, rope_cos, rope_sin, mask)
 
         return bb.final_norm(x)
 
@@ -400,20 +408,26 @@ class RetroBottleneckCLM(nn.Module):
     def cfg(self) -> CLMConfig:
         return self.backbone.cfg
 
-    def forward_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward_hidden(self, input_ids: torch.Tensor,
+                       attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         bb = self.backbone
         x = bb.embed(input_ids)
 
         T = input_ids.shape[1]
+        if attention_mask is not None:
+            causal = bb.causal_mask[:T, :T]
+            padding = attention_mask.unsqueeze(1).unsqueeze(2)
+            mask = causal.unsqueeze(0) & padding
+        else:
+            mask = None
+
         rope_cos = bb.rope_cos[:, :, :T, :]
         rope_sin = bb.rope_sin[:, :, :T, :]
 
         for i in range(len(bb.layers)):
             block = bb.get_block(i)
-            # Attention sublayer (SparseLinear already injected by SparseCLM)
-            x = x + block.attn(block.attn_norm(x), rope_cos, rope_sin, None)
+            x = x + block.attn(block.attn_norm(x), rope_cos, rope_sin, mask)
             x = self.attn_adapters[i](x)
-            # FFN sublayer
             x = x + block.ffn(block.ffn_norm(x))
             x = self.ffn_adapters[i](x)
 
@@ -642,7 +656,7 @@ def generate_gradient_masks(
             legal_mask = mask_builder(batch)
 
         with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-            hidden = model.forward_hidden(ids)
+            hidden = model.forward_hidden(ids, msk)
             valid_hidden = hidden[msk]
             valid_logits = model.project_head(valid_hidden)
 

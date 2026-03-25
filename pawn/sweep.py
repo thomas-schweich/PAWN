@@ -519,7 +519,7 @@ class InProcessRoSAObjective:
                 legal_mask = mask_builder.scatter(batch["legal_indices"], ids.shape[0])
 
                 with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-                    hidden = warmup_model.forward_hidden(ids)
+                    hidden = warmup_model.forward_hidden(ids, msk)
                     valid_logits = warmup_model.project_head(hidden[msk])
                 valid_logits = valid_logits.float()
                 valid_logits.masked_fill_(~legal_mask[msk], float("-inf"))
@@ -618,7 +618,7 @@ class InProcessRoSAObjective:
                 legal_mask = mask_builder.scatter(batch["legal_indices"], ids.shape[0])
 
                 with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-                    hidden = model.forward_hidden(ids)
+                    hidden = model.forward_hidden(ids, msk)
                     valid_logits = model.project_head(hidden[msk])
                 valid_logits = valid_logits.float()
                 valid_logits.masked_fill_(~legal_mask[msk], float("-inf"))
@@ -653,7 +653,7 @@ class InProcessRoSAObjective:
                         self._val_legal_indices[i], ids.shape[0],
                     )
                     with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-                        hidden = model.forward_hidden(ids)
+                        hidden = model.forward_hidden(ids, msk)
                         vl = model.project_head(hidden[msk])
                     vl = vl.float()
                     vl.masked_fill_(~lm[msk], float("-inf"))
