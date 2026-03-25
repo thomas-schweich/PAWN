@@ -1,6 +1,6 @@
 # Adapter Methods
 
-PAWN is designed as a testbed for parameter-efficient fine-tuning. The frozen 30M-parameter backbone provides learned chess representations from pretraining on random games; adapters specialize those representations for downstream tasks like predicting human moves at a given Elo level.
+PAWN is designed as a testbed for parameter-efficient fine-tuning. The frozen ~36M-parameter backbone provides learned chess representations from pretraining on random games; adapters specialize those representations for downstream tasks like predicting human moves at a given Elo level.
 
 All adapter implementations live in `pawn/adapters/`. Each wraps a frozen `PAWNCLM` backbone and exposes a uniform interface: `forward_hidden()`, `project_head()`, `forward()`, and `forward_generate()` (with KV-cache).
 
@@ -22,7 +22,7 @@ The up-projection is zero-initialized, so the model starts identical to the froz
 - `layers` -- which transformer layers to adapt (default: all)
 - `attn_layers` / `ffn_layers` -- per-sublayer layer selection overrides
 
-**Param count:** `2 * n_positions * n_layers * 2 * d_model * bottleneck_dim` (e.g. 131K at dim=8, both positions, all 8 layers).
+**Param count:** `n_positions * n_layers * 2 * d_model * bottleneck_dim` where n_positions is 2 (attn + ffn) by default (e.g. `2 * 8 * 2 * 512 * 8 = 131K` at dim=8, both positions, all 8 layers).
 
 Best performer at low parameter budgets. The GELU nonlinearity and full-rank projections provide the most expressive per-parameter adaptation.
 
@@ -131,7 +131,7 @@ Each adapter exposes three helpers:
 
 ## Results Summary
 
-All results on the PAWN-Base backbone (~36M params, 8 layers, d_model=512), trained via behavioral cloning on Lichess games with legal-move-masked cross-entropy loss.
+All results on the PAWN-Base backbone (~35.8M params, 8 layers, d_model=512), trained via behavioral cloning on Lichess games with legal-move-masked cross-entropy loss.
 
 ### Method comparison (~65K params, 1000-1100 Elo, 100K games)
 

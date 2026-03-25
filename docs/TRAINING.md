@@ -36,7 +36,7 @@ uv run python scripts/train.py --variant base
 
 | Variant | Params | d_model | Layers | Heads | d_ff |
 |---------|--------|---------|--------|-------|------|
-| `small` | ~10M   | 256     | 8      | 4     | 1024 |
+| `small` | ~9.5M  | 256     | 8      | 4     | 1024 |
 | `base`  | ~36M   | 512     | 8      | 8     | 2048 |
 | `large` | ~68M   | 640     | 10     | 8     | 2560 |
 | `toy`   | tiny   | 64      | 2      | 4     | 256  |
@@ -55,7 +55,7 @@ uv run python scripts/train.py --variant base
 
 ```bash
 # Resume from a checkpoint
-uv run python scripts/train.py --variant base --resume checkpoints/step_50000.pt
+uv run python scripts/train.py --variant base --resume checkpoints/step_00050000
 
 # Custom batch size and step count
 uv run python scripts/train.py --variant base --batch-size 128 --total-steps 200000

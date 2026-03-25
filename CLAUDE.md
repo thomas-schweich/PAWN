@@ -32,10 +32,9 @@ This is a uv workspace. The root project is the `pawn` Python package; `engine/`
 # Build the Rust chess engine (required before anything else)
 cd engine && uv run --with maturin maturin develop --release && cd ..
 
-# Install Python deps:
+# Install Python deps (dev tools like pytest are in base dependencies):
 uv sync --extra rocm      # AMD (ROCm 7.1)
 uv sync --extra cu128     # NVIDIA (CUDA 12.8)
-uv sync --extra dev       # + pytest, ipykernel
 
 # Run tests
 uv run pytest tests/

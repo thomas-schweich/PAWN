@@ -96,6 +96,8 @@ def apply_gpu_config(config: dict, model_module, forward_fn):
     Returns:
         The (possibly compiled) forward function.
     """
+    # IMPORTANT: Set SDPA_BACKEND before torch.compile — compiled code
+    # captures the backend at trace time.
     if config["sdpa_backend"] is not None:
         model_module.SDPA_BACKEND = config["sdpa_backend"]
 

@@ -86,9 +86,8 @@ def _compute_legal_move_rate(
 ) -> float:
     """Compute fraction of argmax predictions that are legal moves.
 
-    Only evaluated at positions where the target is an actual move
-    (positions 0 through game_lengths-1, i.e., not the final position
-    where the target is PAD).
+    Evaluated at positions 0 through game_lengths (inclusive), matching the
+    loss_mask semantics (which includes the end-of-game PAD prediction).
 
     Args:
         logits: (B, T, vocab_size)
@@ -100,9 +99,9 @@ def _compute_legal_move_rate(
     max_ply = legal_grid.shape[1]
 
     with torch.no_grad():
-        # Positions where target is an actual move: 0..game_lengths-1 in CLM indexing
-        # CLM position p maps to engine ply p (prediction at position p = move at ply p)
-        move_mask = torch.arange(T, device=logits.device).unsqueeze(0) < game_lengths.unsqueeze(1)
+        # Positions where target is an actual move or end-of-game PAD:
+        # 0..game_lengths in CLM indexing (matches loss_mask <= semantics)
+        move_mask = torch.arange(T, device=logits.device).unsqueeze(0) <= game_lengths.unsqueeze(1)
         move_mask = move_mask & loss_mask
 
         if not move_mask.any():
@@ -123,7 +122,8 @@ def _compute_legal_move_rate(
         # We need to handle the case where T might differ from max_ply
         n_plies = min(T, max_ply)
         valid_count = 0
-        legal_count = 0
+        # Accumulate legal counts on GPU, sync once at the end
+        legal_acc = torch.tensor(0, dtype=torch.long, device=logits.device)
 
         # Build a flat legal move check
         # For base grid tokens 1-4096: token_id - 1 is the grid index
@@ -159,23 +159,23 @@ def _compute_legal_move_rate(
             is_legal = is_base & (base_legal > 0.5)
 
             valid_count += len(batch_preds)
-            legal_count += is_legal.sum().item()
+            legal_acc += is_legal.sum()
             # Count promos separately (assume legal if predicted in promo range
             # and the position has promotions available)
-            legal_count += is_promo.sum().item()  # Approximate
+            legal_acc += is_promo.sum()  # Approximate
 
         if valid_count == 0:
             return 0.0
-        return legal_count / valid_count
+        return legal_acc.item() / valid_count
 
 
 
 def _get_grad_norm(model: nn.Module) -> float:
-    total = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            total += p.grad.data.float().norm().item() ** 2
-    return total**0.5
+    grads = [p.grad.data for p in model.parameters() if p.grad is not None]
+    if not grads:
+        return 0.0
+    total = torch.stack([g.float().norm() for g in grads]).square().sum()
+    return total.sqrt().item()
 
 
 class CLMTrainer:
@@ -286,7 +286,7 @@ class CLMTrainer:
                 continue
             with open(p, "rb") as f:
                 data = f.read()
-            text = data.rstrip(b"\x00").decode()
+            text = data.rstrip(b"\x00").decode(errors="replace")
             for line in text.splitlines():
                 line = line.strip()
                 if not line:

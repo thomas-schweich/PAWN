@@ -48,8 +48,8 @@ cd engine && uv run --with maturin maturin develop --release && cd ..
 # Install core dependencies
 uv sync --extra cu128   # NVIDIA GPU (or --extra rocm for AMD)
 
-# Install dependencies for running tests, performing analysis on the results, and running the training monitoring dashboard (optional but recommended) 
-uv sync --extra dev --extra eval --extra dashboard
+# Dev tools (pytest, seaborn, solara, etc.) are included in base dependencies
+# — no extra flags needed beyond the GPU backend above
 
 # Train an adapter on a pre-trained checkpoint
 git submodule update --init checkpoints/pawn-base
