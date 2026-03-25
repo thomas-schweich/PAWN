@@ -31,6 +31,15 @@ def parse_args():
     parser.add_argument("--discard-ply-limit", action="store_true",
                         help="Only train on games that ended naturally (no ply limit truncation)")
 
+    # Architecture overrides (for sweeps — override the named variant)
+    parser.add_argument("--d-model", type=int, default=None, help="Override d_model")
+    parser.add_argument("--n-layers", type=int, default=None, help="Override n_layers")
+    parser.add_argument("--n-heads", type=int, default=None, help="Override n_heads")
+    parser.add_argument("--d-ff", type=int, default=None, help="Override d_ff")
+    parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
+    parser.add_argument("--weight-decay", type=float, default=None, help="Override weight decay")
+    parser.add_argument("--warmup-steps", type=int, default=None, help="Override warmup steps")
+
     ckpt_group = parser.add_mutually_exclusive_group(required=True)
     ckpt_group.add_argument("--hf-repo", type=str, default=None,
                             help="Push checkpoints to this HuggingFace repo (requires HF_TOKEN)")
@@ -75,6 +84,22 @@ def main():
         train_cfg.log_dir = args.log_dir
     if args.discard_ply_limit:
         train_cfg.discard_ply_limit = True
+
+    # Architecture overrides
+    if args.d_model is not None:
+        model_cfg.d_model = args.d_model
+    if args.n_layers is not None:
+        model_cfg.n_layers = args.n_layers
+    if args.n_heads is not None:
+        model_cfg.n_heads = args.n_heads
+    if args.d_ff is not None:
+        model_cfg.d_ff = args.d_ff
+    if args.lr is not None:
+        train_cfg.lr = args.lr
+    if args.weight_decay is not None:
+        train_cfg.weight_decay = args.weight_decay
+    if args.warmup_steps is not None:
+        train_cfg.warmup_steps = args.warmup_steps
 
     print(f"Model config: {model_cfg}")
     print(f"Training config: {train_cfg}")

@@ -56,9 +56,13 @@ def main():
     p.add_argument("--n-trials", type=int, default=30,
                     help="Number of trials to run")
     p.add_argument("--n-jobs", type=int, default=1,
-                    help="Parallel trials (careful with GPU memory)")
+                    help="Parallel trials (match --n-gpus for multi-GPU)")
+    p.add_argument("--n-gpus", type=int, default=1,
+                    help="Number of GPUs. Trials are pinned to GPUs round-robin.")
     p.add_argument("--epochs", type=int, default=30,
-                    help="Max epochs per trial")
+                    help="Max epochs per trial (adapter sweeps)")
+    p.add_argument("--total-steps", type=int, default=20000,
+                    help="Total steps per trial (architecture/pretrain sweeps)")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--pruner", type=str, default="hyperband",
                     choices=["hyperband", "median", "none"])
@@ -69,7 +73,7 @@ def main():
 
     args = p.parse_args()
 
-    if args.adapter != "pretrain" and not args.pgn:
+    if args.adapter not in ("pretrain", "architecture") and not args.pgn:
         p.error("--pgn is required for adapter sweeps")
 
     study_name = args.study_name or args.adapter
@@ -77,8 +81,11 @@ def main():
 
     print(f"=== PAWN Hyperparameter Sweep ===")
     print(f"Adapter: {args.adapter}")
-    print(f"Trials: {args.n_trials} (parallel: {args.n_jobs})")
-    print(f"Epochs/trial: {args.epochs}")
+    print(f"Trials: {args.n_trials} (parallel: {args.n_jobs}, GPUs: {args.n_gpus})")
+    if args.adapter in ("pretrain", "architecture"):
+        print(f"Steps/trial: {args.total_steps}")
+    else:
+        print(f"Epochs/trial: {args.epochs}")
     print(f"Pruner: {args.pruner}")
     print(f"Storage: {db_path}")
     print(f"Dashboard: uv run optuna-dashboard {db_path}")
@@ -90,6 +97,11 @@ def main():
         pruner=args.pruner,
     )
 
+    # For architecture/pretrain sweeps, pass --total-steps via extra args
+    extra = list(args.extra_args)
+    if args.adapter in ("pretrain", "architecture"):
+        extra.extend(["--total-steps", str(args.total_steps)])
+
     objective = AdapterObjective(
         adapter_type=args.adapter,
         checkpoint=args.checkpoint,
@@ -97,7 +109,8 @@ def main():
         device=args.device,
         output_base=args.output_dir,
         epochs=args.epochs,
-        extra_args=args.extra_args,
+        n_gpus=args.n_gpus,
+        extra_args=extra,
     )
 
     study.optimize(

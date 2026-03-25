@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -110,13 +111,36 @@ def suggest_tiny(trial: "optuna.Trial") -> dict:
 
 
 def suggest_pretrain(trial: "optuna.Trial") -> dict:
-    """Pretraining hyperparameters."""
+    """Pretraining hyperparameters (fixed architecture, tune training)."""
     return {
         "lr": trial.suggest_float("lr", 1e-5, 1e-3, log=True),
         "batch_size": trial.suggest_categorical("batch_size", [128, 256, 512]),
         "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
         "warmup_steps": trial.suggest_int("warmup_steps", 500, 5000, step=500),
         "total_steps": trial.suggest_categorical("total_steps", [50000, 100000]),
+    }
+
+
+def suggest_architecture(trial: "optuna.Trial") -> dict:
+    """Architecture search space for pretraining.
+
+    Explores model size, depth/width tradeoff, and training hyperparameters.
+    Target budget: 150M-500M parameters on 80GB GPUs.
+    """
+    d_model = trial.suggest_categorical("d_model", [512, 640, 768, 896, 1024, 1280])
+    n_layers = trial.suggest_int("n_layers", 8, 24, step=2)
+    n_heads = trial.suggest_categorical("n_heads", [8, 16])
+    d_ff_mult = trial.suggest_categorical("d_ff_mult", [3, 4, 5])
+
+    return {
+        "d_model": d_model,
+        "n_layers": n_layers,
+        "n_heads": n_heads,
+        "d_ff": d_model * d_ff_mult,
+        "lr": trial.suggest_float("lr", 1e-5, 1e-3, log=True),
+        "batch_size": trial.suggest_categorical("batch_size", [128, 256]),
+        "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
+        "warmup_steps": trial.suggest_int("warmup_steps", 500, 3000, step=500),
     }
 
 
@@ -127,6 +151,7 @@ SUGGEST_FNS = {
     "sparse": suggest_sparse,
     "hybrid": suggest_hybrid,
     "tiny": suggest_tiny,
+    "architecture": suggest_architecture,
     "pretrain": suggest_pretrain,
 }
 
@@ -138,6 +163,7 @@ ADAPTER_SCRIPTS = {
     "hybrid": "scripts/train_hybrid.py",
     "tiny": "scripts/train_tiny.py",
     "pretrain": "scripts/train.py",
+    "architecture": "scripts/train.py",
 }
 
 
@@ -208,6 +234,7 @@ class AdapterObjective:
         device: str = "cuda",
         output_base: str = "sweeps",
         epochs: int = 50,
+        n_gpus: int = 1,
         extra_args: list[str] | None = None,
     ):
         self.adapter_type = adapter_type
@@ -217,6 +244,7 @@ class AdapterObjective:
         self.output_base = Path(output_base) / adapter_type
         self.output_base.mkdir(parents=True, exist_ok=True)
         self.epochs = epochs
+        self.n_gpus = n_gpus
         self.extra_args = extra_args or []
         self.script = ADAPTER_SCRIPTS[adapter_type]
 
@@ -229,13 +257,20 @@ class AdapterObjective:
         # Build command
         cmd = [sys.executable, self.script]
 
-        # Fixed args
-        if self.adapter_type != "pretrain":
+        # Fixed args — architecture and pretrain sweeps use train.py directly
+        if self.adapter_type not in ("pretrain", "architecture"):
             cmd.extend(["--checkpoint", self.checkpoint])
             cmd.extend(["--pgn", self.pgn])
         cmd.extend(["--device", self.device])
-        cmd.extend(["--output-dir", str(trial_dir)])
-        if "epochs" not in params:
+
+        # output-dir for adapters, log-dir for pretraining
+        if self.adapter_type in ("pretrain", "architecture"):
+            cmd.extend(["--log-dir", str(trial_dir)])
+            cmd.extend(["--local-checkpoints"])
+        else:
+            cmd.extend(["--output-dir", str(trial_dir)])
+
+        if "epochs" not in params and "total_steps" not in params:
             cmd.extend(["--epochs", str(self.epochs)])
 
         # Suggested hyperparameters
@@ -244,11 +279,18 @@ class AdapterObjective:
         # Extra user-provided args
         cmd.extend(self.extra_args)
 
+        # GPU affinity: pin trial to GPU (trial.number % n_gpus)
+        env = os.environ.copy()
+        if self.n_gpus > 1:
+            gpu_id = trial.number % self.n_gpus
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
         # Run training
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
+            env=env,
         )
 
         if result.returncode != 0:
