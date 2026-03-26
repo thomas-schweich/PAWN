@@ -208,8 +208,10 @@ def batch_to_dataframe(parsed: dict) -> pl.DataFrame:
 
     # Hash usernames: vectorized xxHash64 via Polars.
     # NOTE: hash() output is deterministic within a Polars version but the
-    # algorithm is not guaranteed stable across major versions. Pin Polars
-    # version (via uv.lock) and tag the repo to ensure reproducibility.
+    # algorithm is not guaranteed stable across major versions. Originally
+    # recorded with Polars 1.39.3. Pin Polars version (via uv.lock) and
+    # tag the repo to ensure reproducibility. See test_enriched_pgn.py
+    # TestPlayerHashRegression for the snapshot test.
     df = df.with_columns(
         pl.col("white_player").hash().alias("white_player"),
         pl.col("black_player").hash().alias("black_player"),

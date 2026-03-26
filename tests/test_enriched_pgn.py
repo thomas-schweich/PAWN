@@ -291,10 +291,10 @@ class TestPlayerHashing:
 class TestPlayerHashRegression:
     """Snapshot test: catch if a Polars update changes the hash algorithm.
 
-    These exact values were recorded with Polars 1.x using the default
-    hash() seed. If this test fails after a Polars upgrade, the dataset
-    must be regenerated to stay consistent (or the old Polars version
-    must be pinned).
+    These exact values were recorded with Polars 1.39.3 using the default
+    hash() seed (xxHash64). If this test fails after a Polars upgrade, the
+    dataset must be regenerated to stay consistent (or the old Polars
+    version must be pinned).
     """
 
     EXPECTED_HASHES = {
