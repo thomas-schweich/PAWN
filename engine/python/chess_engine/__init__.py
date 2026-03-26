@@ -26,6 +26,7 @@ from chess_engine._engine import (
     # PGN parsing
     parse_pgn_file,
     pgn_to_tokens,
+    parse_pgn_enriched,
     # UCI parsing
     parse_uci_file,
     uci_to_tokens,
@@ -60,6 +61,7 @@ __all__ = [
     "validate_games",
     "parse_pgn_file",
     "pgn_to_tokens",
+    "parse_pgn_enriched",
     "parse_uci_file",
     "uci_to_tokens",
     "pgn_to_uci",
