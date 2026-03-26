@@ -134,6 +134,13 @@ pub fn compute_legal_token_masks_sparse(
                 state.make_move(move_tok).expect("Move should be legal during replay");
             }
 
+            // At position `length`, the target is PAD (end of game).
+            // Include PAD token in the legal mask so loss is finite.
+            if length < seq_len {
+                let pad_base = game_base + (length * vocab_size) as i64;
+                indices.push(pad_base); // PAD_TOKEN = 0
+            }
+
             indices
         })
         .collect();
