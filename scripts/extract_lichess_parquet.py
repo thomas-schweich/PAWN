@@ -268,13 +268,95 @@ def upload_to_hf(output_dir: Path, hf_repo: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def parse_date(s: str) -> datetime:
+    """Parse YYYY-MM-DD date string."""
+    return datetime.strptime(s, "%Y-%m-%d")
+
+
+class SplitBuffer:
+    """Accumulates DataFrames for a single split and flushes to Parquet shards."""
+
+    def __init__(self, split: str, shard_size: int, output_dir: Path):
+        self.split = split
+        self.shard_size = shard_size
+        self.output_dir = output_dir / "data"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.frames: list[pl.DataFrame] = []
+        self.buffered = 0
+        self.total_games = 0
+        self.shard_paths: list[Path] = []
+        self.shard_idx = 0
+
+    def add(self, df: pl.DataFrame) -> None:
+        if df.is_empty():
+            return
+        self.frames.append(df)
+        self.buffered += len(df)
+        self.total_games += len(df)
+        self._flush_full()
+
+    def _flush_full(self) -> None:
+        while self.buffered >= self.shard_size:
+            combined = pl.concat(self.frames)
+            shard_df = combined.head(self.shard_size)
+            leftover = combined.slice(self.shard_size)
+            self._write_shard(shard_df)
+            self.frames = [leftover] if len(leftover) > 0 else []
+            self.buffered = len(leftover) if len(leftover) > 0 else 0
+
+    def flush_remaining(self) -> None:
+        if self.frames:
+            combined = pl.concat(self.frames)
+            if len(combined) > 0:
+                self._write_shard(combined)
+            self.frames.clear()
+            self.buffered = 0
+
+    def _write_shard(self, df: pl.DataFrame) -> None:
+        # Write with placeholder name; rename after all shards are counted
+        path = self.output_dir / f"{self.split}-temp-{self.shard_idx:05d}.parquet"
+        df.write_parquet(path, compression="zstd", compression_level=3)
+        size_mb = path.stat().st_size / 1024 / 1024
+        log(f"  [{self.split}] shard {self.shard_idx}: {len(df):,} games, {size_mb:.1f} MB")
+        self.shard_paths.append(path)
+        self.shard_idx += 1
+
+    def rename_shards(self) -> list[Path]:
+        """Rename temp shards to HF-compatible names with correct total count."""
+        n = len(self.shard_paths)
+        final = []
+        for i, path in enumerate(self.shard_paths):
+            new_name = f"{self.split}-{i:05d}-of-{n:05d}.parquet"
+            new_path = path.parent / new_name
+            path.rename(new_path)
+            final.append(new_path)
+            log(f"  {path.name} -> {new_name}")
+        self.shard_paths = final
+        return final
+
+
+def classify_game_date(
+    dt: datetime | None,
+    val_range: tuple[datetime, datetime] | None,
+    test_range: tuple[datetime, datetime] | None,
+) -> str:
+    """Classify a game into train/validation/test based on its date."""
+    if dt is None:
+        return "train"
+    if val_range and val_range[0] <= dt <= val_range[1]:
+        return "validation"
+    if test_range and test_range[0] <= dt <= test_range[1]:
+        return "test"
+    return "train"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract Lichess PGN dumps to PAWN-compatible Parquet"
     )
     parser.add_argument(
         "--months", nargs="+", required=True,
-        help="Month(s) to download, e.g. 2024-12 2025-01 2025-02 2025-03"
+        help="Month(s) to download, e.g. 2023-12 2025-01 2025-02 2025-03"
     )
     parser.add_argument(
         "--output", type=Path, default=Path("/workspace/lichess-parquet"),
@@ -293,10 +375,12 @@ def main():
         help="Target games per output shard"
     )
     parser.add_argument(
-        "--holdout-months", nargs="*", default=None,
-        help="Month(s) to use for val/test splits (e.g. 2024-12). "
-             "First half of holdout shards become validation, second half test. "
-             "All other months become train."
+        "--val-range", nargs=2, metavar=("START", "END"), default=None,
+        help="Date range for validation split (YYYY-MM-DD YYYY-MM-DD inclusive)"
+    )
+    parser.add_argument(
+        "--test-range", nargs=2, metavar=("START", "END"), default=None,
+        help="Date range for test split (YYYY-MM-DD YYYY-MM-DD inclusive)"
     )
     parser.add_argument(
         "--max-games", type=int, default=None,
@@ -304,39 +388,43 @@ def main():
     )
     args = parser.parse_args()
 
-    holdout = set(args.holdout_months) if args.holdout_months else set()
+    val_range = None
+    test_range = None
+    if args.val_range:
+        val_range = (parse_date(args.val_range[0]), parse_date(args.val_range[1]))
+    if args.test_range:
+        test_range = (parse_date(args.test_range[0]), parse_date(args.test_range[1]))
 
-    log(f"=== Lichess Parquet Extraction ===")
+    log("=== Lichess Parquet Extraction ===")
     log(f"Months: {args.months}")
     log(f"Output: {args.output}")
     log(f"Batch size: {args.batch_size:,}")
     log(f"Shard size: {args.shard_size:,}")
-    if holdout:
-        log(f"Holdout months (val/test): {sorted(holdout)}")
-    else:
-        log(f"No holdout months — all shards will be train")
+    if val_range:
+        log(f"Val range: {args.val_range[0]} to {args.val_range[1]}")
+    if test_range:
+        log(f"Test range: {args.test_range[0]} to {args.test_range[1]}")
+    if not val_range and not test_range:
+        log("No val/test ranges — all games will be train")
     if args.max_games:
         log(f"Max games: {args.max_games:,}")
     log("")
 
     args.output.mkdir(parents=True, exist_ok=True)
-    (args.output / "data").mkdir(parents=True, exist_ok=True)
 
-    # Phase 1: Download, parse, and write temporary shards.
-    # We accumulate games into a buffer and flush when it reaches shard_size.
-    # Track (path, month) for each shard so we can assign splits later.
-    temp_shards: list[tuple[Path, str]] = []  # (path, source_month)
-    buffer_frames: list[pl.DataFrame] = []
-    buffer_games = 0
+    # Per-split buffers that flush to shards independently
+    buffers = {
+        "train": SplitBuffer("train", args.shard_size, args.output),
+        "validation": SplitBuffer("validation", args.shard_size, args.output),
+        "test": SplitBuffer("test", args.shard_size, args.output),
+    }
+
     total_games = 0
-    shard_idx = 0
-    current_month = ""
     stop = False
 
     for month in args.months:
         if stop:
             break
-        current_month = month
         log(f"\n=== Processing {month} ===")
 
         for parsed in download_month(month, args.output, args.batch_size):
@@ -345,7 +433,6 @@ def main():
                 continue
 
             # Apply max_games limit
-            remaining = None
             if args.max_games:
                 remaining = args.max_games - total_games
                 if remaining <= 0:
@@ -354,95 +441,61 @@ def main():
                 if len(df) > remaining:
                     df = df.head(remaining)
 
-            buffer_frames.append(df)
-            buffer_games += len(df)
             total_games += len(df)
 
-            # Flush shard when buffer is full
-            while buffer_games >= args.shard_size:
-                combined = pl.concat(buffer_frames)
-                shard_df = combined.head(args.shard_size)
-                leftover = combined.slice(args.shard_size)
+            # Route games to splits based on date
+            if val_range or test_range:
+                # Add a temporary split column based on date
+                # Use the datetime column to classify each row
+                val_start = val_range[0] if val_range else datetime.max
+                val_end = val_range[1] if val_range else datetime.min
+                test_start = test_range[0] if test_range else datetime.max
+                test_end = test_range[1] if test_range else datetime.min
 
-                path = args.output / "data" / f"shard-{shard_idx:05d}.parquet"
-                shard_df.write_parquet(path, compression="zstd", compression_level=3)
-                size_mb = path.stat().st_size / 1024 / 1024
-                log(f"  Shard {shard_idx}: {len(shard_df):,} games, {size_mb:.1f} MB | Total: {total_games:,}")
-                temp_shards.append((path, current_month))
-                shard_idx += 1
+                df = df.with_columns(
+                    pl.when(
+                        pl.col("date").is_between(val_start, val_end)
+                    ).then(pl.lit("validation"))
+                    .when(
+                        pl.col("date").is_between(test_start, test_end)
+                    ).then(pl.lit("test"))
+                    .otherwise(pl.lit("train"))
+                    .alias("_split")
+                )
 
-                buffer_frames = [leftover] if len(leftover) > 0 else []
-                buffer_games = len(leftover) if len(leftover) > 0 else 0
+                for split_name in ("train", "validation", "test"):
+                    split_df = df.filter(pl.col("_split") == split_name).drop("_split")
+                    if not split_df.is_empty():
+                        buffers[split_name].add(split_df)
+            else:
+                buffers["train"].add(df)
 
-            if remaining is not None and remaining <= len(df):
+            if args.max_games and total_games >= args.max_games:
                 stop = True
                 break
 
-    # Flush remaining buffer
-    if buffer_frames:
-        combined = pl.concat(buffer_frames)
-        if len(combined) > 0:
-            path = args.output / "data" / f"shard-{shard_idx:05d}.parquet"
-            combined.write_parquet(path, compression="zstd", compression_level=3)
-            size_mb = path.stat().st_size / 1024 / 1024
-            log(f"  Shard {shard_idx}: {len(combined):,} games, {size_mb:.1f} MB (final) | Total: {total_games:,}")
-            temp_shards.append((path, current_month))
-            shard_idx += 1
+    # Flush remaining data in each buffer
+    for buf in buffers.values():
+        buf.flush_remaining()
 
-    n_shards = len(temp_shards)
-    log(f"\n=== Assigning splits ({n_shards} shards) ===")
-
-    # Phase 2: Assign splits based on holdout months.
-    # Holdout month shards are split evenly into validation and test.
-    # All other shards become train.
-    train_shards = [(p, m) for p, m in temp_shards if m not in holdout]
-    holdout_shards = [(p, m) for p, m in temp_shards if m in holdout]
-
-    n_holdout = len(holdout_shards)
-    n_val = n_holdout // 2
-    n_test = n_holdout - n_val
-    n_train = len(train_shards)
-
-    log(f"  Train: {n_train} shards, Val: {n_val} shards, Test: {n_test} shards")
-    if holdout:
-        log(f"  Holdout months {sorted(holdout)}: {n_holdout} shards -> {n_val} val + {n_test} test")
-
+    log(f"\n=== Renaming shards ===")
     final_paths = []
+    for buf in buffers.values():
+        if buf.shard_paths:
+            final_paths.extend(buf.rename_shards())
 
-    # Rename train shards
-    for i, (path, _month) in enumerate(train_shards):
-        new_name = f"train-{i:05d}-of-{n_train:05d}.parquet"
-        new_path = path.parent / new_name
-        path.rename(new_path)
-        final_paths.append(new_path)
-        log(f"  {path.name} -> {new_name}")
-
-    # Rename holdout shards: first half -> validation, second half -> test
-    for i, (path, _month) in enumerate(holdout_shards):
-        if i < n_val:
-            split = "validation"
-            split_idx = i
-            split_total = n_val
-        else:
-            split = "test"
-            split_idx = i - n_val
-            split_total = n_test
-
-        new_name = f"{split}-{split_idx:05d}-of-{split_total:05d}.parquet"
-        new_path = path.parent / new_name
-        path.rename(new_path)
-        final_paths.append(new_path)
-        log(f"  {path.name} -> {new_name}")
-
-    # Phase 3: Summary
+    # Summary
     log(f"\n=== Summary ===")
     log(f"Total games: {total_games:,}")
-    log(f"Shards: {n_shards} ({n_train} train, {n_val} val, {n_test} test)")
+    for name, buf in buffers.items():
+        if buf.total_games > 0:
+            log(f"  {name}: {buf.total_games:,} games, {len(buf.shard_paths)} shards")
 
-    total_size = sum(p.stat().st_size for p in final_paths)
-    log(f"Total size: {total_size / 1024 / 1024 / 1024:.2f} GB")
+    if final_paths:
+        total_size = sum(p.stat().st_size for p in final_paths)
+        log(f"Total size: {total_size / 1024 / 1024 / 1024:.2f} GB")
 
-    # Phase 4: Upload to HuggingFace
+    # Upload to HuggingFace
     if args.hf_repo:
         upload_to_hf(args.output, args.hf_repo)
 
