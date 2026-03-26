@@ -41,7 +41,7 @@ COPY scripts/ scripts/
 RUN cd engine && uv run --no-project --with maturin maturin build --release
 
 # ── Runtime base (shared by all targets) ─────────────────────────────
-FROM runpod/base:1.0.3-cuda1281-ubuntu2404 AS runtime-base
+FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS runtime-base
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
@@ -57,12 +57,13 @@ COPY pawn/ pawn/
 COPY scripts/ scripts/
 COPY tests/ tests/
 
-# Install engine wheel first (uv sync needs it or --no-install-workspace)
+# Install engine wheel first
 COPY --from=builder /build/engine/target/wheels/*.whl /tmp/
 
-# Create venv and install all Python deps from lockfile (CUDA backend)
-# --no-install-workspace skips the chess-engine workspace member (installed from wheel)
-RUN uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
+# Create venv with system packages (picks up pre-installed torch + CUDA)
+# and install remaining deps from lockfile
+RUN uv venv --system-site-packages && \
+    uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl
 
 # Bake git version info
