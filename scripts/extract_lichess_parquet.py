@@ -274,7 +274,7 @@ def main():
     )
     parser.add_argument(
         "--months", nargs="+", required=True,
-        help="Month(s) to download, e.g. 2025-01 2025-02 2025-03"
+        help="Month(s) to download, e.g. 2024-12 2025-01 2025-02 2025-03"
     )
     parser.add_argument(
         "--output", type=Path, default=Path("/workspace/lichess-parquet"),
@@ -282,7 +282,7 @@ def main():
     )
     parser.add_argument(
         "--hf-repo", type=str, default=None,
-        help="HuggingFace dataset repo to push to (e.g. thomas-schweich/lichess-pawn)"
+        help="HuggingFace dataset repo to push to (e.g. thomas-schweich/pawn-lichess-full)"
     )
     parser.add_argument(
         "--batch-size", type=int, default=500_000,
@@ -293,12 +293,10 @@ def main():
         help="Target games per output shard"
     )
     parser.add_argument(
-        "--val-weeks", type=int, default=1,
-        help="Number of final shards for validation split"
-    )
-    parser.add_argument(
-        "--test-weeks", type=int, default=1,
-        help="Number of final shards for test split (after val)"
+        "--holdout-months", nargs="*", default=None,
+        help="Month(s) to use for val/test splits (e.g. 2024-12). "
+             "First half of holdout shards become validation, second half test. "
+             "All other months become train."
     )
     parser.add_argument(
         "--max-games", type=int, default=None,
@@ -306,12 +304,17 @@ def main():
     )
     args = parser.parse_args()
 
+    holdout = set(args.holdout_months) if args.holdout_months else set()
+
     log(f"=== Lichess Parquet Extraction ===")
     log(f"Months: {args.months}")
     log(f"Output: {args.output}")
     log(f"Batch size: {args.batch_size:,}")
     log(f"Shard size: {args.shard_size:,}")
-    log(f"Val shards: {args.val_weeks}, Test shards: {args.test_weeks}")
+    if holdout:
+        log(f"Holdout months (val/test): {sorted(holdout)}")
+    else:
+        log(f"No holdout months — all shards will be train")
     if args.max_games:
         log(f"Max games: {args.max_games:,}")
     log("")
@@ -319,18 +322,21 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "data").mkdir(parents=True, exist_ok=True)
 
-    # Phase 1: Download, parse, and write temporary shards
+    # Phase 1: Download, parse, and write temporary shards.
     # We accumulate games into a buffer and flush when it reaches shard_size.
-    temp_shards: list[Path] = []
+    # Track (path, month) for each shard so we can assign splits later.
+    temp_shards: list[tuple[Path, str]] = []  # (path, source_month)
     buffer_frames: list[pl.DataFrame] = []
     buffer_games = 0
     total_games = 0
     shard_idx = 0
+    current_month = ""
     stop = False
 
     for month in args.months:
         if stop:
             break
+        current_month = month
         log(f"\n=== Processing {month} ===")
 
         for parsed in download_month(month, args.output, args.batch_size):
@@ -358,12 +364,11 @@ def main():
                 shard_df = combined.head(args.shard_size)
                 leftover = combined.slice(args.shard_size)
 
-                # Write with placeholder name (we'll rename for splits later)
                 path = args.output / "data" / f"shard-{shard_idx:05d}.parquet"
                 shard_df.write_parquet(path, compression="zstd", compression_level=3)
                 size_mb = path.stat().st_size / 1024 / 1024
                 log(f"  Shard {shard_idx}: {len(shard_df):,} games, {size_mb:.1f} MB | Total: {total_games:,}")
-                temp_shards.append(path)
+                temp_shards.append((path, current_month))
                 shard_idx += 1
 
                 buffer_frames = [leftover] if len(leftover) > 0 else []
@@ -381,32 +386,46 @@ def main():
             combined.write_parquet(path, compression="zstd", compression_level=3)
             size_mb = path.stat().st_size / 1024 / 1024
             log(f"  Shard {shard_idx}: {len(combined):,} games, {size_mb:.1f} MB (final) | Total: {total_games:,}")
-            temp_shards.append(path)
+            temp_shards.append((path, current_month))
             shard_idx += 1
 
     n_shards = len(temp_shards)
     log(f"\n=== Assigning splits ({n_shards} shards) ===")
 
-    # Phase 2: Rename shards into train/val/test splits
-    n_test = min(args.test_weeks, n_shards)
-    n_val = min(args.val_weeks, n_shards - n_test)
-    n_train = n_shards - n_val - n_test
+    # Phase 2: Assign splits based on holdout months.
+    # Holdout month shards are split evenly into validation and test.
+    # All other shards become train.
+    train_shards = [(p, m) for p, m in temp_shards if m not in holdout]
+    holdout_shards = [(p, m) for p, m in temp_shards if m in holdout]
+
+    n_holdout = len(holdout_shards)
+    n_val = n_holdout // 2
+    n_test = n_holdout - n_val
+    n_train = len(train_shards)
 
     log(f"  Train: {n_train} shards, Val: {n_val} shards, Test: {n_test} shards")
+    if holdout:
+        log(f"  Holdout months {sorted(holdout)}: {n_holdout} shards -> {n_val} val + {n_test} test")
 
     final_paths = []
-    for i, path in enumerate(temp_shards):
-        if i < n_train:
-            split = "train"
-            split_idx = i
-            split_total = n_train
-        elif i < n_train + n_val:
+
+    # Rename train shards
+    for i, (path, _month) in enumerate(train_shards):
+        new_name = f"train-{i:05d}-of-{n_train:05d}.parquet"
+        new_path = path.parent / new_name
+        path.rename(new_path)
+        final_paths.append(new_path)
+        log(f"  {path.name} -> {new_name}")
+
+    # Rename holdout shards: first half -> validation, second half -> test
+    for i, (path, _month) in enumerate(holdout_shards):
+        if i < n_val:
             split = "validation"
-            split_idx = i - n_train
+            split_idx = i
             split_total = n_val
         else:
             split = "test"
-            split_idx = i - n_train - n_val
+            split_idx = i - n_val
             split_total = n_test
 
         new_name = f"{split}-{split_idx:05d}-of-{split_total:05d}.parquet"
