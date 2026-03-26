@@ -247,7 +247,7 @@ def MetricsCharts():
     train = data.get("train", [])
     val = data.get("val", [])
     batch = data.get("batch", [])
-    x_key = "epoch" if run_type in ("bc", "film", "lora", "hybrid", "sparse", "bottleneck") else "step"
+    x_key = "epoch" if run_type in ("bc", "film", "lora", "hybrid", "sparse", "bottleneck", "rosa") else "step"
 
     descs = _CHART_DESCRIPTIONS.get(run_type, {})
 
@@ -267,6 +267,19 @@ def MetricsCharts():
         with solara.Columns([1, 1]):
             ChartWithInfo(charts.lr_chart(train, batch, x_key), desc("lr"))
             ChartWithInfo(charts.time_chart(train, x_key, run_type), desc("time"))
+    elif run_type == "rosa":
+        with solara.Columns([1, 1]):
+            ChartWithInfo(charts.loss_chart(train, x_key, run_type), desc("loss"))
+            ChartWithInfo(charts.accuracy_chart(train, x_key, run_type), desc("accuracy"))
+        with solara.Columns([1, 1]):
+            ChartWithInfo(charts.sparse_delta_chart(train, x_key), desc("sparse_delta"))
+            ChartWithInfo(charts.bottleneck_up_chart(train, x_key), desc("adapter_up"))
+        with solara.Columns([1, 1]):
+            ChartWithInfo(charts.lr_chart(train, batch, x_key), desc("lr"))
+            ChartWithInfo(charts.time_chart(train, x_key, run_type), desc("time"))
+        with solara.Columns([1, 1]):
+            ChartWithInfo(charts.gpu_chart(train, x_key), desc("gpu"))
+            ChartWithInfo(charts.patience_chart(val, x_key), desc("patience"))
     elif run_type == "sparse":
         with solara.Columns([1, 1]):
             ChartWithInfo(charts.loss_chart(train, x_key, run_type), desc("loss"))

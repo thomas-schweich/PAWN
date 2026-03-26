@@ -72,7 +72,7 @@ def load_metrics(log_dir: Path, run_name: str) -> dict[str, list]:
 def detect_run_type(config: dict) -> str:
     """Detect run type from config record."""
     rt = config.get("run_type")
-    if rt in ("film", "lora", "hybrid", "sparse", "bottleneck", "tiny"):
+    if rt in ("film", "lora", "hybrid", "sparse", "bottleneck", "tiny", "rosa"):
         return rt
     if config.get("formulation") == "clm":
         return "pawn"

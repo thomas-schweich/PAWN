@@ -80,7 +80,7 @@ def make_chart(
     return fig
 
 
-_ADAPTER_TYPES = {"film", "lora", "hybrid", "sparse", "bottleneck", "tiny"}
+_ADAPTER_TYPES = {"film", "lora", "hybrid", "sparse", "bottleneck", "tiny", "rosa"}
 
 
 def loss_chart(records: list[dict], x_key: str, run_type: str):

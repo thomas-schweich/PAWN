@@ -266,53 +266,50 @@ def prepare_lichess_parquet(
 
     Returns the same dict format as prepare_lichess_dataset().
     """
-    import pyarrow.parquet as pq
+
+    import polars as pl
 
     if hf_repo is not None:
         from huggingface_hub import hf_hub_download, HfApi
-        import pyarrow as pa
         api = HfApi()
         files = api.list_repo_files(hf_repo, repo_type="dataset")
         parquet_files = [f for f in files if f.endswith(".parquet")]
-        tables = []
-        remaining = max_games
-        for pf in parquet_files:
-            if remaining <= 0:
-                break
-            local = hf_hub_download(hf_repo, pf, repo_type="dataset")
-            t = pq.read_table(local, columns=["pgn", "result"])
-            if len(t) > remaining:
-                t = t.slice(0, remaining)
-            tables.append(t)
-            remaining -= len(t)
-        table = pa.concat_tables(tables)
+        local_files = [hf_hub_download(hf_repo, pf, repo_type="dataset")
+                       for pf in parquet_files]
+        lf = pl.scan_parquet(local_files)
     elif parquet_path is not None:
-        table = pq.read_table(parquet_path, columns=["pgn", "result"])
+        lf = pl.scan_parquet(str(parquet_path))
     else:
         raise ValueError("Either parquet_path or hf_repo must be provided")
 
-    n_available = len(table)
-    n_to_use = min(max_games, n_available)
-    table = table.slice(0, n_to_use)
-    print(f"Loaded {n_to_use} games from Parquet ({n_available} available)")
+    # Lazy: select only needed columns, limit rows, then collect
+    df = (
+        lf.select(["pgn", "result"])
+        .head(max_games)
+        .collect()
+    )
+    n_to_use = len(df)
+    print(f"Loaded {n_to_use} games from Parquet")
 
-    # Extract SAN move lists from the pgn column
-    pgn_strings = table.column("pgn").to_pylist()
-    results = table.column("result").to_pylist()
+    pgn_strings = df["pgn"].to_list()
+    results = df["result"].to_list()
 
-    # Split PGN text into move lists, stripping move numbers and results
+    # Split PGN text into move lists, stripping comments, move numbers, results
     import re
     games: list[list[str]] = []
     for pgn_text in pgn_strings:
-        # Remove move numbers (1. 2. etc) and result markers
-        tokens = pgn_text.split()
+        # Strip { ... } comments (clock annotations, etc.)
+        cleaned = re.sub(r'\{[^}]*\}', '', pgn_text)
+        tokens = cleaned.split()
         moves = []
         for tok in tokens:
             if tok in ("1-0", "0-1", "1/2-1/2", "*"):
                 break
-            # Skip move numbers
+            # Skip move numbers (1. 2. 12... etc.)
             stripped = tok.rstrip(".")
             if stripped and stripped.replace(".", "").isdigit():
+                continue
+            if not tok:
                 continue
             moves.append(tok)
         games.append(moves)
