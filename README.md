@@ -15,10 +15,10 @@ language:
   - en
 pipeline_tag: other
 citation: |
-  @software{schweich2025pawn,
+  @software{schweich2026pawn,
     author = {Schweich, Thomas},
     title = {{PAWN}: Playstyle-Agnostic World-model Network for Chess},
-    year = {2025},
+    year = 2026,
     url = {https://github.com/thomas-schweich/PAWN},
     license = {Apache-2.0}
   }
@@ -138,10 +138,10 @@ PAWN ships with six adapter implementations for fine-tuning the frozen backbone 
 ## Citation
 
 ```bibtex
-@software{schweich2025pawn,
+@software{schweich2026pawn,
   author = {Schweich, Thomas},
   title = {{PAWN}: Playstyle-Agnostic World-model Network for Chess},
-  year = {2025},
+  year = 2026,
   url = {https://github.com/thomas-schweich/PAWN},
   license = {Apache-2.0}
 }
