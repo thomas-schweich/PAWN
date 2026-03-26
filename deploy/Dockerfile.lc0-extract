@@ -1,0 +1,82 @@
+# Lc0 self-play data generation container (Rust engine for game generation).
+# GPU required (CUDA backend for Lc0 inference).
+#
+# Build:
+#   docker build --platform linux/amd64 -f deploy/Dockerfile.lc0-extract \
+#     -t thomasschweich/pawn-lc0-extract:latest .
+#
+# Run:
+#   docker run --gpus all \
+#     -e HF_TOKEN=... -e HF_REPO=thomas-schweich/lc0-nodes1 \
+#     -e GAMES=1000000 -e WORKERS=1 \
+#     thomasschweich/pawn-lc0-extract:latest
+
+# ── Lc0 build ────────────────────────────────────────────────────────
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS lc0-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git meson ninja-build g++ libcudnn9-dev-cuda-12 pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch v0.32.1 \
+        https://github.com/LeelaChessZero/lc0.git /tmp/lc0 && \
+    cd /tmp/lc0 && \
+    git submodule update --init --recursive && \
+    meson setup build/release --buildtype=release \
+        -Dplain_cuda=true -Donednn=false -Dopenblas=false \
+        -Dgtest=false -Dispc=false -Donnx=false \
+        -Dnative_arch=false -Dpopcnt=true -Df16c=true && \
+    ninja -C build/release
+
+# ── Rust engine build ────────────────────────────────────────────────
+FROM python:3.12-slim AS engine-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.cargo/bin:/root/.local/bin:${PATH}"
+
+WORKDIR /tmp/pawn
+COPY engine/ engine/
+COPY pyproject.toml uv.lock ./
+COPY pawn/ pawn/
+COPY scripts/ scripts/
+
+RUN cd engine && uv run --no-project --with maturin maturin build --release
+
+# ── Runtime ──────────────────────────────────────────────────────────
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip curl zstd zlib1g-dev libcudnn9-cuda-12 libcublas-12-8 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --break-system-packages pyarrow huggingface-hub
+
+# Install chess engine wheel
+COPY --from=engine-builder /tmp/pawn/engine/target/wheels/*.whl /tmp/
+RUN pip install --no-cache-dir --break-system-packages /tmp/*.whl && rm -rf /tmp/*.whl
+
+# Lc0 binary
+COPY --from=lc0-builder /tmp/lc0/build/release/lc0 /usr/local/bin/lc0
+
+# Lc0 weights
+RUN mkdir -p /usr/local/share/lc0 && \
+    curl -sL https://storage.lczero.org/files/networks-contrib/t1-256x10-distilled-swa-2432500.pb.gz \
+        -o /usr/local/share/lc0/weights.pb.gz && \
+    gunzip /usr/local/share/lc0/weights.pb.gz
+
+# Wrapper so the engine can be invoked as a single path
+RUN printf '#!/bin/bash\nexec /usr/local/bin/lc0 --weights=/usr/local/share/lc0/weights.pb "$@"\n' \
+    > /usr/local/bin/lc0-wrap && chmod +x /usr/local/bin/lc0-wrap
+
+WORKDIR /opt/pawn
+COPY deploy/entrypoint-lc0.sh /entrypoint-lc0.sh
+RUN chmod +x /entrypoint-lc0.sh
+
+ENTRYPOINT ["/entrypoint-lc0.sh"]

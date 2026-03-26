@@ -134,7 +134,7 @@ draws = results.count('1/2-1/2')
 
 # Write README
 readme = f'''---
-license: cc-by-nc-sa-4.0
+license: cc0-1.0
 task_categories:
   - other
 tags:
@@ -191,8 +191,8 @@ print(game[\"headers\"])    # full PGN headers (for parser compatibility)
 
 ## License
 
-Released under [CC-BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/),
-consistent with the [Lichess database license](https://database.lichess.org/).
+[CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/), consistent with the
+[Lichess database license](https://database.lichess.org/).
 
 ## Attribution
 

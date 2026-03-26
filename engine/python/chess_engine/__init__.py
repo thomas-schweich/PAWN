@@ -26,6 +26,12 @@ from chess_engine._engine import (
     # PGN parsing
     parse_pgn_file,
     pgn_to_tokens,
+    # UCI parsing
+    parse_uci_file,
+    uci_to_tokens,
+    pgn_to_uci,
+    # Engine self-play generation
+    generate_engine_games_py as generate_engine_games,
     # Vocabulary
     export_move_vocabulary,
     # Interactive game state (for RL)
@@ -54,6 +60,10 @@ __all__ = [
     "validate_games",
     "parse_pgn_file",
     "pgn_to_tokens",
+    "parse_uci_file",
+    "uci_to_tokens",
+    "pgn_to_uci",
+    "generate_engine_games",
     "export_move_vocabulary",
     "PyGameState",
     "PyBatchRLEnv",

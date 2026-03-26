@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
-"""Generate Stockfish self-play data as UCI move sequences.
+"""Generate Stockfish self-play data as zstd-compressed Parquet.
 
 Runs a pool of single-threaded Stockfish engines in parallel, one per core.
-Output format: one game per line, space-separated UCI moves followed by the result.
+Each worker writes an incremental Parquet shard to the output directory.
+After all workers finish, shards are merged into a single file.
 
-    e2e4 e7e5 g1f3 b8c6 ... 1-0
+Output schema matches the Lichess dataset format:
+    uci (string)        — space-separated UCI moves
+    result (string)     — 1-0, 0-1, 1/2-1/2, or *
+    n_ply (int16)       — number of half-moves
+    nodes (int32)       — Stockfish node budget per move
+    worker_id (int16)   — worker index (for reproducibility)
+    seed (int32)        — worker RNG seed
 
 Each tier uses MultiPV + softmax temperature sampling to produce diverse games
 from deterministic Stockfish search. Seeds are hardcoded per tier so runs are
 reproducible. Worker seeds are derived as tier_seed + worker_id.
 
 Tiers (by node count):
-    nodes_0001:   128K games,    1 node   (near-random)
-    nodes_0032:   128K games,   32 nodes
-    nodes_0128:   128K games,  128 nodes
-    nodes_0256:   128K games,  256 nodes
-    nodes_1024:   128K games, 1024 nodes  (strongest)
+    nodes_0001:   1 node   (near-random)
+    nodes_0032:  32 nodes
+    nodes_0128: 128 nodes
+    nodes_0256: 256 nodes
+    nodes_1024: 1024 nodes (strongest)
 
 Usage:
-    python scripts/generate_stockfish_data.py --stockfish ~/bin/stockfish --output data/stockfish/
-    python scripts/generate_stockfish_data.py --stockfish ~/bin/stockfish --output data/stockfish/ --tier nodes_0128
-    python scripts/generate_stockfish_data.py --stockfish ~/bin/stockfish --output data/stockfish/ --workers 8
+    python scripts/generate_stockfish_data.py --stockfish ~/bin/stockfish --output /dev/shm/stockfish
+    python scripts/generate_stockfish_data.py --stockfish ~/bin/stockfish --output /dev/shm/stockfish --tier nodes_0001 --games 1000000
 """
 
 from __future__ import annotations
@@ -36,6 +42,9 @@ from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 # Hardcoded, non-conflicting seeds per tier.  Worker i gets seed = tier_seed + i.
 TIERS = [
     {"name": "nodes_0001", "nodes": 1,    "games": 128_000, "seed": 10_000},
@@ -47,7 +56,18 @@ TIERS = [
 
 MULTI_PV = 5        # candidates per move during opening
 TEMPERATURE = 1.0   # softmax temperature (higher = more random)
-SAMPLE_PLIES = 15   # use MultiPV+temperature for the first 15 plies, then top-1
+SAMPLE_PLIES = 999  # use MultiPV+temperature for all plies by default
+
+FLUSH_EVERY = 5_000  # games per Parquet row group
+
+SCHEMA = pa.schema([
+    ('uci', pa.string()),
+    ('result', pa.string()),
+    ('n_ply', pa.int16()),
+    ('nodes', pa.int32()),
+    ('worker_id', pa.int16()),
+    ('seed', pa.int32()),
+])
 
 
 class StockfishEngine:
@@ -130,7 +150,6 @@ class StockfishEngine:
                     if m and m != "(none)":
                         return [(m, 0.0)]
                     # No legal moves — distinguish checkmate from stalemate
-                    # by checking the score in the info lines.
                     self.last_terminal = "stalemate"  # default
                     for info_line in lines:
                         if not info_line.startswith("info") or "score" not in info_line:
@@ -254,21 +273,48 @@ def worker_generate(
     temperature: float,
     multi_pv: int,
     sample_plies: int,
-) -> tuple[list[str], int, float]:
-    """Worker: play num_games, return (lines, total_ply, elapsed)."""
+    shard_path: str,
+) -> tuple[int, int, float]:
+    """Worker: play num_games, write Parquet shard incrementally.
+
+    Returns (n_written, total_ply, elapsed).
+    """
     rng = random.Random(seed)
     engine = StockfishEngine(stockfish_path, hash_mb=hash_mb, multi_pv=multi_pv)
-    lines: list[str] = []
+    writer = pq.ParquetWriter(shard_path, SCHEMA, compression='zstd')
+
+    batch: dict[str, list] = {name: [] for name in SCHEMA.names}
     total_ply = 0
+    n_written = 0
     t0 = time.perf_counter()
 
     for i in range(num_games):
         moves, result = play_game(engine, nodes, rng, temperature, multi_pv, sample_plies)
-        total_ply += len(moves)
-        line = " ".join(moves) + " " + result
-        lines.append(line)
+        n_ply = len(moves)
+        total_ply += n_ply
 
-        if (i + 1) % 500 == 0:
+        batch['uci'].append(" ".join(moves))
+        batch['result'].append(result)
+        batch['n_ply'].append(n_ply)
+        batch['nodes'].append(nodes)
+        batch['worker_id'].append(worker_id)
+        batch['seed'].append(seed)
+        n_written += 1
+
+        # Flush batch to Parquet periodically
+        if n_written % FLUSH_EVERY == 0:
+            table = pa.table(batch, schema=SCHEMA)
+            writer.write_table(table)
+            batch = {name: [] for name in SCHEMA.names}
+
+            elapsed = time.perf_counter() - t0
+            rate = n_written / elapsed
+            print(
+                f"  [worker {worker_id:>2}] {n_written:>6,}/{num_games:,}  "
+                f"{rate:.1f} games/s  (flushed)",
+                flush=True,
+            )
+        elif (i + 1) % 500 == 0:
             elapsed = time.perf_counter() - t0
             rate = (i + 1) / elapsed
             print(
@@ -277,9 +323,15 @@ def worker_generate(
                 flush=True,
             )
 
+    # Flush remaining
+    if batch['uci']:
+        table = pa.table(batch, schema=SCHEMA)
+        writer.write_table(table)
+
+    writer.close()
     elapsed = time.perf_counter() - t0
     engine.close()
-    return lines, total_ply, elapsed
+    return n_written, total_ply, elapsed
 
 
 def generate_tier(
@@ -296,7 +348,10 @@ def generate_tier(
     total_games = tier["games"]
     tier_seed = tier["seed"]
     name = tier["name"]
-    out_path = output_dir / f"{name}.txt"
+
+    # Shard directory for worker output
+    shard_dir = output_dir / f".shards_{name}"
+    shard_dir.mkdir(parents=True, exist_ok=True)
 
     # Distribute games across workers
     base = total_games // num_workers
@@ -308,7 +363,7 @@ def generate_tier(
     print(f"Workers: {num_workers}, games/worker: ~{base}")
     print(f"MultiPV: {multi_pv} for first {sample_plies} plies, then top-1; temperature: {temperature}")
     print(f"Seed base: {tier_seed} (workers {tier_seed}..{tier_seed + num_workers - 1})")
-    print(f"Output: {out_path}")
+    print(f"Output: {output_dir / f'{name}.parquet'}")
     print(f"{'=' * 60}")
 
     ctx = get_context("spawn")
@@ -327,35 +382,43 @@ def generate_tier(
                 temperature,
                 multi_pv,
                 sample_plies,
+                str(shard_dir / f"shard_{i:03d}.parquet"),
             )
             for i in range(num_workers)
         ]
         results = [f.result() for f in futures]
     wall_elapsed = time.perf_counter() - wall_t0
 
-    # Collect and write
-    total_ply = 0
-    total_written = 0
-    with open(out_path, "w") as f:
-        for lines, ply, _ in results:
-            for line in lines:
-                f.write(line + "\n")
-            total_ply += ply
-            total_written += len(lines)
-
+    total_written = sum(r[0] for r in results)
+    total_ply = sum(r[1] for r in results)
     avg_ply = total_ply / total_written if total_written else 0
     rate = total_written / wall_elapsed
 
-    print(f"\n  Done: {total_written:,} games in {wall_elapsed / 60:.1f}m")
+    print(f"\n  Generation done: {total_written:,} games in {wall_elapsed / 60:.1f}m")
     print(f"  Rate: {rate:.1f} games/s  Avg ply: {avg_ply:.0f}")
-    print(f"  File: {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
+
+    # Merge shards into single file
+    print("  Merging shards...")
+    out_path = output_dir / f"{name}.parquet"
+    shard_files = sorted(shard_dir.glob("shard_*.parquet"))
+    tables = [pq.read_table(f) for f in shard_files]
+    merged = pa.concat_tables(tables)
+    pq.write_table(merged, out_path, compression='zstd')
+
+    # Clean up shards
+    for f in shard_files:
+        f.unlink()
+    shard_dir.rmdir()
+
+    size_mb = out_path.stat().st_size / 1e6
+    print(f"  Merged: {out_path} ({size_mb:.1f} MB, {len(merged):,} rows)")
 
     return out_path
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate Stockfish self-play UCI data (parallel)"
+        description="Generate Stockfish self-play data as Parquet (parallel)"
     )
     parser.add_argument(
         "--stockfish",

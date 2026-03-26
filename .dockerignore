@@ -11,6 +11,8 @@ checkpoints/
 logs/
 deploy/
 !deploy/entrypoint-run.sh
+!deploy/entrypoint-extract.sh
+!deploy/entrypoint-lc0.sh
 *.so
 CLAUDE.md
 docs/

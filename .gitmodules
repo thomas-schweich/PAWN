@@ -10,3 +10,6 @@
 [submodule "checkpoints/pawn-base-discard-ply"]
 	path = checkpoints/pawn-base-discard-ply
 	url = https://huggingface.co/thomas-schweich/pawn-base-discard-ply
+[submodule "data/stockfish-nodes1"]
+	path = data/stockfish-nodes1
+	url = https://huggingface.co/datasets/thomas-schweich/stockfish-nodes1

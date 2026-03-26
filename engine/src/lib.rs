@@ -3,6 +3,8 @@ pub mod vocab;
 pub mod board;
 pub mod random;
 pub mod pgn;
+pub mod uci;
+pub mod engine_gen;
 pub mod rl_batch;
 pub mod batch;
 pub mod labels;
@@ -715,6 +717,173 @@ fn pgn_to_tokens<'py>(
 }
 
 // ---------------------------------------------------------------------------
+// UCI parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a file of UCI game lines into token sequences.
+/// File format: one game per line, space-separated UCI moves, optional result
+/// marker (1-0, 0-1, 1/2-1/2, *).
+///
+/// Returns (move_ids: (N, max_ply) i16, lengths: (N,) i16, n_parsed: int).
+#[pyfunction]
+#[pyo3(signature = (path, max_ply=256, max_games=1_000_000, min_ply=10))]
+fn parse_uci_file<'py>(
+    py: Python<'py>,
+    path: &str,
+    max_ply: usize,
+    max_games: usize,
+    min_ply: usize,
+) -> PyResult<(
+    Bound<'py, numpy::PyArray2<i16>>,
+    Bound<'py, numpy::PyArray1<i16>>,
+    usize,
+)> {
+    let (flat, lengths, n_parsed) = py.allow_threads(|| {
+        uci::uci_file_to_tokens(path, max_ply, max_games, min_ply)
+    });
+
+    let n = lengths.len();
+    let move_ids = numpy::PyArray::from_vec(py, flat)
+        .reshape([n, max_ply])?;
+    let lengths_arr = numpy::PyArray::from_vec(py, lengths);
+
+    Ok((move_ids, lengths_arr, n_parsed))
+}
+
+/// Convert a batch of UCI game strings to token sequences.
+/// Each game is a list of UCI move strings (e.g., ["e2e4", "e7e5"]).
+///
+/// Returns (move_ids: (N, max_ply) i16, lengths: (N,) i16).
+#[pyfunction]
+#[pyo3(signature = (games, max_ply=256))]
+fn uci_to_tokens<'py>(
+    py: Python<'py>,
+    games: Vec<Vec<String>>,
+    max_ply: usize,
+) -> PyResult<(
+    Bound<'py, numpy::PyArray2<i16>>,
+    Bound<'py, numpy::PyArray1<i16>>,
+)> {
+    let n = games.len();
+    let (flat, lengths) = py.allow_threads(|| {
+        let mut flat = vec![0i16; n * max_ply];
+        let mut lengths = Vec::with_capacity(n);
+        // Convert in parallel
+        let results: Vec<(Vec<u16>, usize)> = games
+            .iter()
+            .map(|g| {
+                let refs: Vec<&str> = g.iter().map(|s| s.as_str()).collect();
+                uci::uci_moves_to_tokens(&refs, max_ply)
+            })
+            .collect();
+        for (gi, (tokens, n_valid)) in results.iter().enumerate() {
+            for (t, &tok) in tokens.iter().enumerate() {
+                flat[gi * max_ply + t] = tok as i16;
+            }
+            lengths.push(*n_valid as i16);
+        }
+        (flat, lengths)
+    });
+
+    let move_ids = numpy::PyArray::from_vec(py, flat)
+        .reshape([n, max_ply])?;
+    let lengths_arr = numpy::PyArray::from_vec(py, lengths);
+
+    Ok((move_ids, lengths_arr))
+}
+
+/// Convert a batch of PGN games (SAN moves) to UCI move strings.
+/// Each game is a list of SAN strings (e.g., ["e4", "e5", "Nf3"]).
+///
+/// Returns a list of lists of UCI strings.
+#[pyfunction]
+fn pgn_to_uci(py: Python<'_>, games: Vec<Vec<String>>) -> PyResult<Vec<Vec<String>>> {
+    let results = py.allow_threads(|| {
+        let refs: Vec<Vec<&str>> = games
+            .iter()
+            .map(|g| g.iter().map(|s| s.as_str()).collect())
+            .collect();
+        uci::batch_san_to_uci(&refs)
+    });
+
+    Ok(results.into_iter().map(|(uci, _)| uci).collect())
+}
+
+// ---------------------------------------------------------------------------
+// UCI engine self-play generation
+// ---------------------------------------------------------------------------
+
+/// Generate self-play games using an external UCI engine (Stockfish, Lc0, etc).
+///
+/// Each worker spawns its own engine subprocess. Returns a dict with columns:
+///   uci: list[str]        — space-separated UCI moves per game
+///   result: list[str]     — "1-0", "0-1", "1/2-1/2"
+///   n_ply: list[int]      — half-move count per game
+///   worker_id: list[int]  — worker index
+///   seed: list[int]       — worker RNG seed
+#[pyfunction]
+#[pyo3(signature = (
+    engine_path,
+    nodes = 1,
+    total_games = 100_000,
+    n_workers = 8,
+    base_seed = 10_000,
+    temperature = 1.0,
+    multi_pv = 5,
+    sample_plies = 999,
+    hash_mb = 16,
+    max_ply = 500,
+))]
+fn generate_engine_games_py(
+    py: Python<'_>,
+    engine_path: &str,
+    nodes: u32,
+    total_games: u32,
+    n_workers: u32,
+    base_seed: u64,
+    temperature: f64,
+    multi_pv: u32,
+    sample_plies: u32,
+    hash_mb: u32,
+    max_ply: u32,
+) -> PyResult<PyObject> {
+    let results = py.allow_threads(|| {
+        engine_gen::generate_engine_games(
+            engine_path, nodes, total_games, n_workers, base_seed,
+            temperature, multi_pv, sample_plies, hash_mb, max_ply,
+        )
+    });
+
+    let dict = PyDict::new(py);
+
+    let uci: Vec<String> = results.iter().map(|r| r.uci.clone()).collect();
+    let result: Vec<String> = results.iter().map(|r| r.result.clone()).collect();
+    let n_ply: Vec<u16> = results.iter().map(|r| r.n_ply).collect();
+
+    // Reconstruct worker_id and seed from the generation order
+    let base = total_games / n_workers;
+    let remainder = total_games % n_workers;
+    let mut worker_ids: Vec<u16> = Vec::with_capacity(results.len());
+    let mut seeds: Vec<u64> = Vec::with_capacity(results.len());
+    for i in 0..n_workers {
+        let games = base + if i < remainder { 1 } else { 0 };
+        for _ in 0..games {
+            worker_ids.push(i as u16);
+            seeds.push(base_seed + i as u64);
+        }
+    }
+
+    dict.set_item("uci", uci)?;
+    dict.set_item("result", result)?;
+    dict.set_item("n_ply", n_ply)?;
+    dict.set_item("worker_id", worker_ids)?;
+    dict.set_item("seed", seeds)?;
+    dict.set_item("nodes", vec![nodes as i32; results.len()])?;
+
+    Ok(dict.into())
+}
+
+// ---------------------------------------------------------------------------
 // Batch RL environment (all game state in Rust)
 // ---------------------------------------------------------------------------
 
@@ -1000,6 +1169,10 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBatchRLEnv>()?;
     m.add_function(wrap_pyfunction!(parse_pgn_file, m)?)?;
     m.add_function(wrap_pyfunction!(pgn_to_tokens, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_uci_file, m)?)?;
+    m.add_function(wrap_pyfunction!(uci_to_tokens, m)?)?;
+    m.add_function(wrap_pyfunction!(pgn_to_uci, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_engine_games_py, m)?)?;
     m.add_function(wrap_pyfunction!(compute_accuracy_ceiling_py, m)?)?;
     Ok(())
 }

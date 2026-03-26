@@ -183,7 +183,10 @@ def prepare_lichess_dataset(
     max_games: int = 50_000,
     min_ply: int = 10,
 ) -> dict:
-    """Parse a PGN file and produce training-ready tensors.
+    """Parse a PGN or Parquet file and produce training-ready tensors.
+
+    If pgn_path ends with .parquet, delegates to prepare_lichess_parquet().
+    If pgn_path looks like a HuggingFace repo (contains '/'), loads from HF.
 
     Returns dict with:
         move_ids:       (N, max_ply) int16 — tokenized moves
@@ -193,6 +196,18 @@ def prepare_lichess_dataset(
         loss_mask:      (N, seq_len) bool
         n_games:        int
     """
+    pgn_path_str = str(pgn_path)
+    if pgn_path_str.endswith(".parquet"):
+        return prepare_lichess_parquet(
+            parquet_path=pgn_path_str, max_ply=max_ply,
+            max_games=max_games, min_ply=min_ply,
+        )
+    # Check if it looks like a HF repo ID (e.g. "user/dataset")
+    if "/" in pgn_path_str and not Path(pgn_path_str).exists():
+        return prepare_lichess_parquet(
+            hf_repo=pgn_path_str, max_ply=max_ply,
+            max_games=max_games, min_ply=min_ply,
+        )
     pgn_path = Path(pgn_path)
 
     # Parse with min_ply=1 so every parseable game appears in the output,
@@ -223,6 +238,102 @@ def prepare_lichess_dataset(
 
     seq_len = max_ply + 1  # outcome token + max_ply move slots
 
+    from pawn.data import pack_clm_sequences
+    batch = pack_clm_sequences(move_ids, game_lengths, outcome_tokens, seq_len)
+
+    return {
+        "move_ids": move_ids,
+        "game_lengths": game_lengths,
+        "input_ids": batch["input_ids"],
+        "targets": batch["targets"],
+        "loss_mask": batch["loss_mask"],
+        "outcome_tokens": outcome_tokens,
+        "n_games": N,
+    }
+
+
+def prepare_lichess_parquet(
+    parquet_path: str | Path = None,
+    hf_repo: str = None,
+    max_ply: int = 255,
+    max_games: int = 50_000,
+    min_ply: int = 10,
+) -> dict:
+    """Load a Lichess Parquet dataset and produce training-ready tensors.
+
+    Reads from a local Parquet file or a HuggingFace dataset repo.
+    Expects columns: pgn (SAN move text), result (1-0/0-1/1/2-1/2).
+
+    Returns the same dict format as prepare_lichess_dataset().
+    """
+    import pyarrow.parquet as pq
+
+    if hf_repo is not None:
+        from huggingface_hub import hf_hub_download, HfApi
+        import pyarrow as pa
+        api = HfApi()
+        files = api.list_repo_files(hf_repo, repo_type="dataset")
+        parquet_files = [f for f in files if f.endswith(".parquet")]
+        tables = []
+        remaining = max_games
+        for pf in parquet_files:
+            if remaining <= 0:
+                break
+            local = hf_hub_download(hf_repo, pf, repo_type="dataset")
+            t = pq.read_table(local, columns=["pgn", "result"])
+            if len(t) > remaining:
+                t = t.slice(0, remaining)
+            tables.append(t)
+            remaining -= len(t)
+        table = pa.concat_tables(tables)
+    elif parquet_path is not None:
+        table = pq.read_table(parquet_path, columns=["pgn", "result"])
+    else:
+        raise ValueError("Either parquet_path or hf_repo must be provided")
+
+    n_available = len(table)
+    n_to_use = min(max_games, n_available)
+    table = table.slice(0, n_to_use)
+    print(f"Loaded {n_to_use} games from Parquet ({n_available} available)")
+
+    # Extract SAN move lists from the pgn column
+    pgn_strings = table.column("pgn").to_pylist()
+    results = table.column("result").to_pylist()
+
+    # Split PGN text into move lists, stripping move numbers and results
+    import re
+    games: list[list[str]] = []
+    for pgn_text in pgn_strings:
+        # Remove move numbers (1. 2. etc) and result markers
+        tokens = pgn_text.split()
+        moves = []
+        for tok in tokens:
+            if tok in ("1-0", "0-1", "1/2-1/2", "*"):
+                break
+            # Skip move numbers
+            stripped = tok.rstrip(".")
+            if stripped and stripped.replace(".", "").isdigit():
+                continue
+            moves.append(tok)
+        games.append(moves)
+
+    # Tokenize via Rust engine (batch)
+    print(f"  Tokenizing {len(games)} games...")
+    move_ids, game_lengths = engine.pgn_to_tokens(games, max_ply=max_ply)
+    N = move_ids.shape[0]
+
+    # Apply min_ply filter
+    if min_ply > 1:
+        keep = game_lengths >= min_ply
+        move_ids = move_ids[keep]
+        game_lengths = game_lengths[keep]
+        results = [r for r, k in zip(results, keep) if k]
+        N = len(results)
+        print(f"  After min_ply={min_ply} filter: {N} games")
+
+    outcome_tokens = _result_to_outcome(results)
+
+    seq_len = max_ply + 1
     from pawn.data import pack_clm_sequences
     batch = pack_clm_sequences(move_ids, game_lengths, outcome_tokens, seq_len)
 
