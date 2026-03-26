@@ -84,7 +84,6 @@ for ADAPTER in rosa retro-sparse retro-bottleneck; do
         --checkpoint checkpoints/model \
         --pgn "$PARQUET_PATH" \
         --output-dir /workspace/sweeps \
-        --local-checkpoints \
         || echo "WARNING: $ADAPTER sweep failed with exit code $?"
 
     echo "=== $ADAPTER sweep complete ($(date)) ==="
