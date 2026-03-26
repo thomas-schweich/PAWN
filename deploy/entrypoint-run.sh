@@ -5,6 +5,7 @@ set -e
 
 cd /opt/pawn
 export PYTHONPATH=/opt/pawn
+export PATH="/opt/pawn/.venv/bin:$PATH"
 
 # Persist HF_TOKEN to huggingface-hub's token cache so it survives env changes
 if [ -n "$HF_TOKEN" ]; then

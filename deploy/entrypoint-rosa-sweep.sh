@@ -14,6 +14,7 @@
 #   EPOCHS       — Epochs per trial (default: 50)
 #   MAX_GAMES    — Max training games (default: 12000)
 set -euo pipefail
+export PATH="/opt/pawn/.venv/bin:$PATH"
 
 N_TRIALS="${N_TRIALS:-30}"
 N_GPUS="${N_GPUS:-2}"
