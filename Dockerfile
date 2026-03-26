@@ -26,7 +26,7 @@
 #     pawn:<tag>-runner python scripts/train.py --variant base
 
 # ── Builder ──────────────────────────────────────────────────────────
-FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404 AS builder
+FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS builder
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
@@ -54,7 +54,7 @@ RUN cd engine && \
     cd ..
 
 # ── Runtime base (shared by all targets) ─────────────────────────────
-FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404 AS runtime-base
+FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS runtime-base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/opt/pawn
@@ -88,6 +88,13 @@ FROM runtime-base AS runner
 COPY deploy/entrypoint-run.sh /entrypoint-run.sh
 RUN chmod +x /entrypoint-run.sh
 ENTRYPOINT ["/entrypoint-run.sh"]
+
+# ── RoSA sweep — runs all three ablation sweeps then exits ───────────
+FROM runtime-base AS rosa-sweep
+RUN pip install --no-cache-dir pyarrow
+COPY deploy/entrypoint-rosa-sweep.sh /entrypoint-rosa-sweep.sh
+RUN chmod +x /entrypoint-rosa-sweep.sh
+ENTRYPOINT ["/entrypoint-rosa-sweep.sh"]
 
 # ── Interactive (default) — SSH + Jupyter, stays alive ───────────────
 FROM runtime-base AS interactive

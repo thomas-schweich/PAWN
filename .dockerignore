@@ -13,6 +13,7 @@ deploy/
 !deploy/entrypoint-run.sh
 !deploy/entrypoint-extract.sh
 !deploy/entrypoint-lc0.sh
+!deploy/entrypoint-rosa-sweep.sh
 *.so
 CLAUDE.md
 docs/
