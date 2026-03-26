@@ -268,11 +268,6 @@ def upload_to_hf(output_dir: Path, hf_repo: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def parse_date(s: str) -> datetime:
-    """Parse YYYY-MM-DD date string."""
-    return datetime.strptime(s, "%Y-%m-%d")
-
-
 class SplitBuffer:
     """Accumulates DataFrames for a single split and flushes to Parquet shards."""
 
@@ -335,28 +330,13 @@ class SplitBuffer:
         return final
 
 
-def classify_game_date(
-    dt: datetime | None,
-    val_range: tuple[datetime, datetime] | None,
-    test_range: tuple[datetime, datetime] | None,
-) -> str:
-    """Classify a game into train/validation/test based on its date."""
-    if dt is None:
-        return "train"
-    if val_range and val_range[0] <= dt <= val_range[1]:
-        return "validation"
-    if test_range and test_range[0] <= dt <= test_range[1]:
-        return "test"
-    return "train"
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Extract Lichess PGN dumps to PAWN-compatible Parquet"
     )
     parser.add_argument(
         "--months", nargs="+", required=True,
-        help="Month(s) to download, e.g. 2023-12 2025-01 2025-02 2025-03"
+        help="Training month(s) to download, e.g. 2025-01 2025-02 2025-03"
     )
     parser.add_argument(
         "--output", type=Path, default=Path("/workspace/lichess-parquet"),
@@ -375,102 +355,125 @@ def main():
         help="Target games per output shard"
     )
     parser.add_argument(
-        "--val-range", nargs=2, metavar=("START", "END"), default=None,
-        help="Date range for validation split (YYYY-MM-DD YYYY-MM-DD inclusive)"
+        "--holdout-month", type=str, default=None,
+        help="Month to use for val/test (e.g. 2023-12). First half of month "
+             "-> val, second half -> test. Randomly samples --holdout-games "
+             "from each half."
     )
     parser.add_argument(
-        "--test-range", nargs=2, metavar=("START", "END"), default=None,
-        help="Date range for test split (YYYY-MM-DD YYYY-MM-DD inclusive)"
+        "--holdout-games", type=int, default=50_000,
+        help="Number of games to sample for each of val and test (default: 50000)"
     )
     parser.add_argument(
         "--max-games", type=int, default=None,
-        help="Stop after this many games total (for testing)"
+        help="Stop after this many training games (for testing)"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for holdout sampling (default: 42)"
     )
     args = parser.parse_args()
 
-    val_range = None
-    test_range = None
-    if args.val_range:
-        val_range = (parse_date(args.val_range[0]), parse_date(args.val_range[1]))
-    if args.test_range:
-        test_range = (parse_date(args.test_range[0]), parse_date(args.test_range[1]))
-
     log("=== Lichess Parquet Extraction ===")
-    log(f"Months: {args.months}")
+    log(f"Training months: {args.months}")
     log(f"Output: {args.output}")
     log(f"Batch size: {args.batch_size:,}")
     log(f"Shard size: {args.shard_size:,}")
-    if val_range:
-        log(f"Val range: {args.val_range[0]} to {args.val_range[1]}")
-    if test_range:
-        log(f"Test range: {args.test_range[0]} to {args.test_range[1]}")
-    if not val_range and not test_range:
-        log("No val/test ranges — all games will be train")
+    if args.holdout_month:
+        log(f"Holdout month: {args.holdout_month}")
+        log(f"Holdout games per split: {args.holdout_games:,}")
+        log(f"Holdout seed: {args.seed}")
     if args.max_games:
-        log(f"Max games: {args.max_games:,}")
+        log(f"Max training games: {args.max_games:,}")
     log("")
 
     args.output.mkdir(parents=True, exist_ok=True)
 
-    # Per-split buffers that flush to shards independently
+    # ── Phase 1: Process holdout month (val/test) ──────────────────────
     buffers = {
         "train": SplitBuffer("train", args.shard_size, args.output),
         "validation": SplitBuffer("validation", args.shard_size, args.output),
         "test": SplitBuffer("test", args.shard_size, args.output),
     }
 
-    total_games = 0
+    if args.holdout_month:
+        log(f"\n=== Processing holdout month {args.holdout_month} ===")
+        target_per_half = args.holdout_games
+
+        year, mon = args.holdout_month.split("-")
+        midpoint = datetime(int(year), int(mon), 15)
+
+        # Accumulate games from each half of the month, stopping early
+        # once we have enough candidates in both halves. We oversample by
+        # 2x to give random sampling room, then stop downloading.
+        oversample = target_per_half * 2
+        first_half_frames: list[pl.DataFrame] = []
+        second_half_frames: list[pl.DataFrame] = []
+        n_first = 0
+        n_second = 0
+
+        for parsed in download_month(args.holdout_month, args.output, args.batch_size):
+            df = batch_to_dataframe(parsed)
+            if df.is_empty():
+                continue
+
+            fh = df.filter(pl.col("date") < midpoint)
+            sh = df.filter(pl.col("date") >= midpoint)
+
+            if not fh.is_empty() and n_first < oversample:
+                first_half_frames.append(fh)
+                n_first += len(fh)
+            if not sh.is_empty() and n_second < oversample:
+                second_half_frames.append(sh)
+                n_second += len(sh)
+
+            if n_first >= oversample and n_second >= oversample:
+                log(f"  Collected enough holdout candidates, stopping early")
+                break
+
+        # Sample from collected candidates
+        if first_half_frames:
+            first_half = pl.concat(first_half_frames)
+            n_val = min(target_per_half, len(first_half))
+            val_df = first_half.sample(n=n_val, seed=args.seed)
+            buffers["validation"].add(val_df)
+            log(f"  Val: sampled {n_val:,} from {len(first_half):,} first-half games")
+            del first_half, first_half_frames
+
+        if second_half_frames:
+            second_half = pl.concat(second_half_frames)
+            n_test = min(target_per_half, len(second_half))
+            test_df = second_half.sample(n=n_test, seed=args.seed)
+            buffers["test"].add(test_df)
+            log(f"  Test: sampled {n_test:,} from {len(second_half):,} second-half games")
+            del second_half, second_half_frames
+
+    # ── Phase 2: Process training months ───────────────────────────────
+    total_train = 0
     stop = False
 
     for month in args.months:
         if stop:
             break
-        log(f"\n=== Processing {month} ===")
+        log(f"\n=== Processing {month} (train) ===")
 
         for parsed in download_month(month, args.output, args.batch_size):
             df = batch_to_dataframe(parsed)
             if df.is_empty():
                 continue
 
-            # Apply max_games limit
             if args.max_games:
-                remaining = args.max_games - total_games
+                remaining = args.max_games - total_train
                 if remaining <= 0:
                     stop = True
                     break
                 if len(df) > remaining:
                     df = df.head(remaining)
 
-            total_games += len(df)
+            total_train += len(df)
+            buffers["train"].add(df)
 
-            # Route games to splits based on date
-            if val_range or test_range:
-                # Add a temporary split column based on date
-                # Use the datetime column to classify each row
-                val_start = val_range[0] if val_range else datetime.max
-                val_end = val_range[1] if val_range else datetime.min
-                test_start = test_range[0] if test_range else datetime.max
-                test_end = test_range[1] if test_range else datetime.min
-
-                df = df.with_columns(
-                    pl.when(
-                        pl.col("date").is_between(val_start, val_end)
-                    ).then(pl.lit("validation"))
-                    .when(
-                        pl.col("date").is_between(test_start, test_end)
-                    ).then(pl.lit("test"))
-                    .otherwise(pl.lit("train"))
-                    .alias("_split")
-                )
-
-                for split_name in ("train", "validation", "test"):
-                    split_df = df.filter(pl.col("_split") == split_name).drop("_split")
-                    if not split_df.is_empty():
-                        buffers[split_name].add(split_df)
-            else:
-                buffers["train"].add(df)
-
-            if args.max_games and total_games >= args.max_games:
+            if args.max_games and total_train >= args.max_games:
                 stop = True
                 break
 
@@ -486,6 +489,7 @@ def main():
 
     # Summary
     log(f"\n=== Summary ===")
+    total_games = sum(buf.total_games for buf in buffers.values())
     log(f"Total games: {total_games:,}")
     for name, buf in buffers.items():
         if buf.total_games > 0:
