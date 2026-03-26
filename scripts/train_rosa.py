@@ -219,7 +219,7 @@ def evaluate(model, dataloader, mask_builder, device, use_amp: bool = False,
 # Phase 1: LoRA warm-up
 # ---------------------------------------------------------------------------
 
-def run_warmup(model, train_loader, mask_builder, args, device, use_amp):
+def run_warmup(model, train_loader, mask_builder, logger, args, device, use_amp):
     """Train LoRA-only for warmup_steps steps. Returns step count."""
     lr = args.warmup_lr if args.warmup_lr is not None else args.lr
     lora_params = model.lora_parameters()
@@ -229,9 +229,11 @@ def run_warmup(model, train_loader, mask_builder, args, device, use_amp):
     model.train()
     step = 0
     total_loss = 0.0
+    n_positions = 0
     t0 = time.time()
 
-    print(f"\n=== Phase 1: LoRA warm-up ({args.warmup_steps} steps, lr={lr}) ===")
+    print(f"\n=== Phase 1: LoRA warm-up ({args.warmup_steps} steps, lr={lr}) ===",
+          flush=True)
 
     while step < args.warmup_steps:
         for batch in train_loader:
@@ -265,15 +267,26 @@ def run_warmup(model, train_loader, mask_builder, args, device, use_amp):
                 torch.nn.utils.clip_grad_norm_(lora_params, args.max_grad_norm)
                 optimizer.step()
 
-            total_loss += loss.item()
+            n_pos = valid_targets.shape[0]
+            total_loss += loss.item() * n_pos
+            n_positions += n_pos
             step += 1
 
             if step % 32 == 0 or step == args.warmup_steps:
-                avg = total_loss / step
-                print(f"  Warmup step {step}/{args.warmup_steps} | loss={avg:.4f}")
+                avg = total_loss / max(n_positions, 1)
+                with torch.no_grad():
+                    preds = valid_logits.argmax(dim=-1)
+                    acc = (preds == valid_targets).float().mean().item()
+                print(f"  Warmup step {step}/{args.warmup_steps} | "
+                      f"loss={avg:.4f} acc={acc:.3f}", flush=True)
+                logger.log_train(
+                    step=step, phase="warmup",
+                    warmup_loss=avg, warmup_acc=acc, lr=lr,
+                )
 
     dt = time.time() - t0
-    print(f"  Warm-up complete in {dt:.1f}s (avg loss={total_loss / max(step, 1):.4f})")
+    avg_loss = total_loss / max(n_positions, 1)
+    print(f"  Warm-up complete in {dt:.1f}s (avg loss={avg_loss:.4f})", flush=True)
     return step
 
 
@@ -281,10 +294,11 @@ def run_warmup(model, train_loader, mask_builder, args, device, use_amp):
 # Phase 2: Mask generation
 # ---------------------------------------------------------------------------
 
-def run_mask_generation(model, train_loader, mask_builder, args, device, use_amp):
+def run_mask_generation(model, train_loader, mask_builder, logger, args, device, use_amp):
     """Generate gradient-based sparse masks. Returns mask dict."""
     print(f"\n=== Phase 2: Mask generation (density={args.density}, "
-          f"alpha={args.grad_alpha}, samples={args.mask_samples}) ===")
+          f"alpha={args.grad_alpha}, samples={args.mask_samples}) ===",
+          flush=True)
 
     masks = generate_gradient_masks(
         model, train_loader, mask_builder,
@@ -295,15 +309,28 @@ def run_mask_generation(model, train_loader, mask_builder, args, device, use_amp
     # Log mask statistics
     total_active = 0
     total_elements = 0
+    mask_stats = {}
     for key, mask in masks.items():
         n_active = mask.sum().item()
         n_total = mask.numel()
         total_active += n_active
         total_elements += n_total
-        print(f"  {key}: {n_active:,} / {n_total:,} ({100*n_active/n_total:.2f}%)")
+        actual_density = n_active / n_total
+        print(f"  {key}: {n_active:,} / {n_total:,} ({100*actual_density:.2f}%)",
+              flush=True)
+        mask_stats[f"mask/{key}_active"] = n_active
+        mask_stats[f"mask/{key}_density"] = actual_density
 
     print(f"  Total: {total_active:,} / {total_elements:,} "
-          f"({100*total_active/total_elements:.2f}%)")
+          f"({100*total_active/total_elements:.2f}%)", flush=True)
+
+    logger.log_train(
+        step=0, phase="mask_generation",
+        mask_total_active=total_active,
+        mask_total_elements=total_elements,
+        mask_density=total_active / max(total_elements, 1),
+        **mask_stats,
+    )
 
     return masks
 
@@ -545,20 +572,20 @@ def _make_sparse_with_masks(masks, args, device):
 
 def setup_retro_sparse(masks, args, device):
     """Retrospective sparse-only: reload backbone, apply gradient masks."""
-    print("\nReloading fresh backbone for retrospective sparse training...")
-    sparse_model = _make_sparse_with_masks(masks, args, device)
+    print("\nReloading fresh backbone for retrospective sparse training...", flush=True)
+    sparse_model = _make_sparse_with_masks(masks, args, device).to(device)
 
     params = sparse_model.sparse_parameters()
     n_active = sparse_model.n_active_params()
     n_total = sum(p.numel() for p in params)
-    print(f"Retro-sparse: {n_active:,} active / {n_total:,} total sparse params")
+    print(f"Retro-sparse: {n_active:,} active / {n_total:,} total sparse params", flush=True)
     return sparse_model, params
 
 
 def setup_retro_bottleneck(masks, args, device):
     """Retrospective sparse + bottleneck: reload, apply masks, add bottlenecks."""
-    print("\nReloading fresh backbone for retrospective sparse+bottleneck training...")
-    sparse_model = _make_sparse_with_masks(masks, args, device)
+    print("\nReloading fresh backbone for retrospective sparse+bottleneck training...", flush=True)
+    sparse_model = _make_sparse_with_masks(masks, args, device).to(device)
 
     # Wrap with bottleneck adapters
     model = RetroBottleneckCLM(
@@ -699,13 +726,13 @@ def main():
         lora_enabled=True, sparse_enabled=False,
     ).to(device)
 
-    run_warmup(warmup_model, train_loader, mask_builder, args, device, use_amp)
+    run_warmup(warmup_model, train_loader, mask_builder, logger, args, device, use_amp)
 
     # -----------------------------------------------------------------------
     # Phase 2: Mask generation
     # -----------------------------------------------------------------------
     masks = run_mask_generation(
-        warmup_model, train_loader, mask_builder, args, device, use_amp,
+        warmup_model, train_loader, mask_builder, logger, args, device, use_amp,
     )
 
     # Save warm-up LoRA weights for posterity
