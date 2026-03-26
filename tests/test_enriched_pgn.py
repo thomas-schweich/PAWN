@@ -288,6 +288,61 @@ class TestPlayerHashing:
         )
 
 
+class TestPlayerHashRegression:
+    """Snapshot test: catch if a Polars update changes the hash algorithm.
+
+    These exact values were recorded with Polars 1.x using the default
+    hash() seed. If this test fails after a Polars upgrade, the dataset
+    must be regenerated to stay consistent (or the old Polars version
+    must be pinned).
+    """
+
+    EXPECTED_HASHES = {
+        "alice": 573680751236103438,
+        "bob": 11376496890720967193,
+        "xavier": 2453512920044318708,
+    }
+
+    def test_hash_values_match_snapshot(self):
+        """Verify that pl.Series.hash() produces the exact same uint64
+        values that were recorded when the dataset was built."""
+        for name, expected in self.EXPECTED_HASHES.items():
+            actual = pl.Series([name]).hash()[0]
+            assert actual == expected, (
+                f"Hash regression for '{name}': expected {expected}, got {actual}. "
+                f"Polars hash algorithm may have changed — dataset must be regenerated."
+            )
+
+    def test_snapshot_matches_pipeline(self):
+        """The snapshot values must agree with what batch_to_dataframe produces."""
+        combined = "\n".join(PGNS.values())
+        r = chess_engine.parse_pgn_enriched(combined)
+        df = batch_to_dataframe(r)
+
+        for name, expected in self.EXPECTED_HASHES.items():
+            # Find rows where this player appears as white
+            white_rows = [
+                i for i, w in enumerate(r["white"]) if w == name
+            ]
+            for i in white_rows:
+                actual = df["white_player"][i]
+                assert actual == expected, (
+                    f"Pipeline hash for '{name}' (white, row {i}): "
+                    f"expected {expected}, got {actual}"
+                )
+
+            # Find rows where this player appears as black
+            black_rows = [
+                i for i, b in enumerate(r["black"]) if b == name
+            ]
+            for i in black_rows:
+                actual = df["black_player"][i]
+                assert actual == expected, (
+                    f"Pipeline hash for '{name}' (black, row {i}): "
+                    f"expected {expected}, got {actual}"
+                )
+
+
 class TestBatchToDataframe:
     """Test the full batch_to_dataframe pipeline."""
 
