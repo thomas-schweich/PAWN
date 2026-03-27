@@ -26,17 +26,25 @@ The vocabulary contains 4278 tokens:
 | 0 | 1 | PAD token |
 | 1--4096 | 4096 | Grid moves (64 source squares x 64 destination squares) |
 | 4097--4272 | 176 | Promotion moves (44 promotion src/dst pairs x 4 piece types) |
-| 4273--4277 | 5 | Outcome tokens |
+| 4273--4283 | 11 | Outcome tokens |
 
-The five outcome tokens are:
+The outcome tokens are:
 
-| Token ID | Meaning |
-|----------|---------|
-| 4273 | White delivers checkmate |
-| 4274 | Black delivers checkmate |
-| 4275 | Stalemate |
-| 4276 | Draw by rule (75-move rule, fivefold repetition, insufficient material) |
-| 4277 | Ply limit reached |
+| Token ID | Meaning | Source |
+|----------|---------|--------|
+| 4273 | White delivers checkmate | Pretraining + Lichess |
+| 4274 | Black delivers checkmate | Pretraining + Lichess |
+| 4275 | Stalemate | Pretraining + Lichess |
+| 4276 | Draw by rule (75-move, fivefold rep, insufficient material) | Pretraining + Lichess |
+| 4277 | Ply limit reached (255 plies) | Pretraining + Lichess (truncated) |
+| 4278 | White wins by resignation | Lichess only |
+| 4279 | Black wins by resignation | Lichess only |
+| 4280 | Draw by agreement | Lichess only |
+| 4281 | White wins on time | Lichess only |
+| 4282 | Black wins on time | Lichess only |
+| 4283 | Draw on time (insufficient material) | Lichess only |
+
+Tokens 4273-4277 are used during pretraining on random games. Tokens 4278-4283 appear only in Lichess finetuning data. The pretrained model has no trained embeddings for tokens 4278-4283; these are initialized during adapter training.
 
 Move tokenization is handled entirely by the Rust chess engine, which maps UCI move strings (e.g., `e2e4`, `a7a8q`) to token indices.
 
@@ -56,9 +64,9 @@ The embedding tables are:
 - `dst_embed`: 64 entries (one per square), each of dimension d_model
 - `promo_embed`: 5 entries (none, queen, rook, bishop, knight), each of dimension d_model
 
-This reduces the embedding parameter count from 4278 x d_model to 133 x d_model -- a roughly 32x reduction. It also provides structural inductive bias: moves that share a source or destination square share embedding components.
+This reduces the embedding parameter count from 4284 x d_model to 133 x d_model -- a roughly 32x reduction. It also provides structural inductive bias: moves that share a source or destination square share embedding components.
 
-PAD and outcome tokens are not decomposed. PAD uses a standalone learned parameter vector. The 5 outcome tokens use a separate small embedding table.
+PAD and outcome tokens are not decomposed. PAD uses a standalone learned parameter vector. The 11 outcome tokens use a separate small embedding table.
 
 ## Transformer Architecture
 

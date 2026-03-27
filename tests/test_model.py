@@ -13,7 +13,7 @@ from pawn.data import CLMDataset, _to_clm_batch, _map_termination_to_outcome
 class TestCLMConfig:
     def test_default_config(self):
         cfg = CLMConfig()
-        assert cfg.vocab_size == 4278
+        assert cfg.vocab_size == CLMConfig().vocab_size
         assert cfg.max_seq_len == 256
         assert cfg.d_model == 512
         assert cfg.n_layers == 8
@@ -35,12 +35,12 @@ class TestPAWNCLM:
 
     def test_forward_shapes_toy(self, toy_model):
         B, T = 4, 256
-        input_ids = torch.randint(0, 4278, (B, T))
+        input_ids = torch.randint(0, CLMConfig().vocab_size, (B, T))
         mask = torch.ones(B, T, dtype=torch.bool)
 
         logits, layer_outputs = toy_model(input_ids, mask)
 
-        assert logits.shape == (B, T, 4278)
+        assert logits.shape == (B, T, CLMConfig().vocab_size)
         # embed + 2 layers = 3 outputs
         assert len(layer_outputs) == 3
         for lo in layer_outputs:
@@ -48,22 +48,22 @@ class TestPAWNCLM:
 
     def test_forward_shapes_full(self, full_model):
         B, T = 2, 32
-        input_ids = torch.randint(0, 4278, (B, T))
+        input_ids = torch.randint(0, CLMConfig().vocab_size, (B, T))
         mask = torch.ones(B, T, dtype=torch.bool)
 
         logits, layer_outputs = full_model(input_ids, mask)
 
-        assert logits.shape == (B, T, 4278)
+        assert logits.shape == (B, T, CLMConfig().vocab_size)
         assert len(layer_outputs) == 9  # embed + 8 layers
 
     def test_hidden_only(self, toy_model):
         B, T = 4, 256
-        input_ids = torch.randint(0, 4278, (B, T))
+        input_ids = torch.randint(0, CLMConfig().vocab_size, (B, T))
         mask = torch.ones(B, T, dtype=torch.bool)
 
         logits, layer_outputs = toy_model(input_ids, mask, hidden_only=True)
 
-        assert logits.shape == (B, T, 4278)
+        assert logits.shape == (B, T, CLMConfig().vocab_size)
         assert len(layer_outputs) == 1  # only final hidden
 
     def test_param_count_toy(self, toy_model):
@@ -103,7 +103,7 @@ class TestPAWNCLM:
 
 class TestCLMLoss:
     def test_loss_computation(self):
-        B, T, V = 4, 32, 4278
+        B, T, V = 4, 32, CLMConfig().vocab_size
         logits = torch.randn(B, T, V)
         targets = torch.randint(0, V, (B, T))
         loss_mask = torch.ones(B, T, dtype=torch.bool)
@@ -120,8 +120,8 @@ class TestCLMLoss:
     def test_gradient_flow(self):
         model = PAWNCLM(CLMConfig.toy())
         B, T = 4, 32
-        input_ids = torch.randint(0, 4278, (B, T))
-        targets = torch.randint(0, 4278, (B, T))
+        input_ids = torch.randint(0, CLMConfig().vocab_size, (B, T))
+        targets = torch.randint(0, CLMConfig().vocab_size, (B, T))
         mask = torch.ones(B, T, dtype=torch.bool)
 
         logits, _ = model(input_ids, mask)

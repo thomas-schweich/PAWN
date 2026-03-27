@@ -8,9 +8,14 @@ from pathlib import Path
 
 import chess_engine
 
-# Import extraction helper
+# Import extraction helpers
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from extract_lichess_parquet import batch_to_dataframe
+
+# batch_to_dataframe expects parse_pgn_lichess output; use this for tests
+def parse_and_build_df(pgn: str):
+    """Parse PGN with Lichess parser and build DataFrame."""
+    return batch_to_dataframe(chess_engine.parse_pgn_lichess(pgn))
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +242,7 @@ class TestPlayerHashing:
         """Parse all 6 PGNs separately and collect per-player hash values."""
         hashes = {}  # name -> list of observed uint64 hashes
         for name, pgn in PGNS.items():
-            r = chess_engine.parse_pgn_enriched(pgn)
+            r = chess_engine.parse_pgn_lichess(pgn)
             df = batch_to_dataframe(r)
             w_name = r["white"][0]
             b_name = r["black"][0]
@@ -268,7 +273,7 @@ class TestPlayerHashing:
 
     def test_hash_dtype_is_uint64(self, player_hashes):
         # Parse one game and check the Polars column dtype
-        r = chess_engine.parse_pgn_enriched(PGNS["alice_v_bob"])
+        r = chess_engine.parse_pgn_lichess(PGNS["alice_v_bob"])
         df = batch_to_dataframe(r)
         assert df["white_player"].dtype == pl.UInt64
         assert df["black_player"].dtype == pl.UInt64
@@ -276,9 +281,9 @@ class TestPlayerHashing:
     def test_hash_appears_in_both_columns(self, player_hashes):
         """alice appears as both white and black — hash must match in both columns."""
         # alice is white in alice_v_bob and black in bob_v_alice
-        r1 = chess_engine.parse_pgn_enriched(PGNS["alice_v_bob"])
+        r1 = chess_engine.parse_pgn_lichess(PGNS["alice_v_bob"])
         df1 = batch_to_dataframe(r1)
-        r2 = chess_engine.parse_pgn_enriched(PGNS["bob_v_alice"])
+        r2 = chess_engine.parse_pgn_lichess(PGNS["bob_v_alice"])
         df2 = batch_to_dataframe(r2)
 
         alice_as_white = df1["white_player"][0]
@@ -316,7 +321,7 @@ class TestPlayerHashRegression:
     def test_snapshot_matches_pipeline(self):
         """The snapshot values must agree with what batch_to_dataframe produces."""
         combined = "\n".join(PGNS.values())
-        r = chess_engine.parse_pgn_enriched(combined)
+        r = chess_engine.parse_pgn_lichess(combined)
         df = batch_to_dataframe(r)
 
         for name, expected in self.EXPECTED_HASHES.items():
@@ -347,11 +352,10 @@ class TestBatchToDataframe:
     """Test the full batch_to_dataframe pipeline."""
 
     def test_schema(self):
-        r = chess_engine.parse_pgn_enriched(PGNS["alice_v_bob"])
+        r = chess_engine.parse_pgn_lichess(PGNS["alice_v_bob"])
         df = batch_to_dataframe(r)
         assert df["tokens"].dtype == pl.List(pl.Int16)
         assert df["clock"].dtype == pl.List(pl.UInt16)
-        assert df["eval"].dtype == pl.List(pl.Int16)
         assert df["game_length"].dtype == pl.UInt16
         assert df["white_elo"].dtype == pl.UInt16
         assert df["black_elo"].dtype == pl.UInt16
@@ -361,17 +365,16 @@ class TestBatchToDataframe:
         assert df["black_player"].dtype == pl.UInt64
 
     def test_list_columns_trimmed_to_game_length(self):
-        """List columns should contain exactly game_length elements (no padding)."""
-        r = chess_engine.parse_pgn_enriched(PGNS["bob_v_xavier"])
+        """Token list = game_length + 1 (outcome), clock list = game_length."""
+        r = chess_engine.parse_pgn_lichess(PGNS["bob_v_xavier"])
         df = batch_to_dataframe(r)
         gl = df["game_length"][0]
-        assert len(df["tokens"][0]) == gl
+        assert len(df["tokens"][0]) == gl + 1  # outcome + moves
         assert len(df["clock"][0]) == gl
-        assert len(df["eval"][0]) == gl
 
     def test_parquet_roundtrip(self, tmp_path):
         """Write to Parquet and read back — all values must survive."""
-        r = chess_engine.parse_pgn_enriched(PGNS["xavier_v_bob"])
+        r = chess_engine.parse_pgn_lichess(PGNS["xavier_v_bob"])
         df = batch_to_dataframe(r)
         path = tmp_path / "test.parquet"
         df.write_parquet(path, compression="zstd")
@@ -379,13 +382,12 @@ class TestBatchToDataframe:
         assert df.shape == df2.shape
         assert df["tokens"].to_list() == df2["tokens"].to_list()
         assert df["clock"].to_list() == df2["clock"].to_list()
-        assert df["eval"].to_list() == df2["eval"].to_list()
         assert df["white_player"].to_list() == df2["white_player"].to_list()
 
     def test_multi_game_batch(self):
         """Parse all 6 games in a single PGN string."""
         combined = "\n".join(PGNS.values())
-        r = chess_engine.parse_pgn_enriched(combined)
+        r = chess_engine.parse_pgn_lichess(combined)
         df = batch_to_dataframe(r)
         assert len(df) == 6
         # Each game should have a different game length

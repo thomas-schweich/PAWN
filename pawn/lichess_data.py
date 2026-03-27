@@ -330,10 +330,18 @@ def _prepare_from_tokens(
     max_games: int,
     min_ply: int,
 ) -> dict:
-    """Load pre-tokenized PAWN format: tokens list[int16] + result str."""
+    """Load pre-tokenized PAWN format: tokens list[int16] + result str.
+
+    Supports two token formats:
+    - **v2 (outcome-prepended)**: tokens[0] is an outcome token (>= OUTCOME_TOKEN_BASE),
+      followed by move tokens. Used by pawn-lichess-full v2+.
+    - **v1 (moves only)**: tokens are pure move IDs. Outcome is derived from the
+      ``result`` column. Used by stockfish-nodes1 and pawn-lichess-full v1.
+
+    Format is auto-detected from the first token of the first game.
+    """
     import polars as pl
 
-    # Lazy select + filter + limit
     needed_cols = ["tokens", "result"]
     if "game_length" in lf.collect_schema():
         needed_cols.append("game_length")
@@ -341,8 +349,99 @@ def _prepare_from_tokens(
     df = lf.select(needed_cols).head(max_games).collect()
     print(f"Loaded {len(df):,} games from pre-tokenized Parquet")
 
-    # Extract token lists → padded numpy array
     token_lists = df["tokens"].to_list()
+    N = len(token_lists)
+    if N == 0:
+        return {"move_ids": np.zeros((0, max_ply), dtype=np.int16),
+                "game_lengths": np.zeros(0, dtype=np.int16),
+                "input_ids": torch.zeros(0, max_ply + 1, dtype=torch.long),
+                "targets": torch.zeros(0, max_ply + 1, dtype=torch.long),
+                "loss_mask": torch.zeros(0, max_ply + 1, dtype=torch.bool),
+                "outcome_tokens": torch.zeros(0, dtype=torch.long),
+                "n_games": 0}
+
+    # Auto-detect format: v2 has outcome token (>= 4273) at position 0
+    first_token = token_lists[0][0] if token_lists[0] else 0
+    has_outcome_token = first_token >= OUTCOME_TOKEN_BASE
+    seq_len = max_ply + 1
+
+    if has_outcome_token:
+        print(f"  Detected v2 format (outcome token prepended)")
+        return _prepare_v2_tokens(token_lists, df["result"].to_list(),
+                                  max_ply, min_ply, seq_len)
+    else:
+        print(f"  Detected v1 format (moves only, deriving outcomes from result)")
+        return _prepare_v1_tokens(token_lists, df["result"].to_list(),
+                                  max_ply, min_ply, seq_len)
+
+
+def _prepare_v2_tokens(
+    token_lists: list[list[int]],
+    results: list[str],
+    max_ply: int,
+    min_ply: int,
+    seq_len: int,
+) -> dict:
+    """Prepare training data from v2 tokens (outcome already prepended).
+
+    Uses the token sequence verbatim as input_ids — no disassembly.
+    """
+    N = len(token_lists)
+
+    # Build input_ids directly: pad each token list to seq_len
+    input_ids = torch.zeros(N, seq_len, dtype=torch.long)
+    game_lengths = np.zeros(N, dtype=np.int16)
+    move_ids = np.zeros((N, max_ply), dtype=np.int16)
+
+    for i, toks in enumerate(token_lists):
+        # toks = [outcome, move_1, ..., move_K]
+        n_moves = min(len(toks) - 1, max_ply)
+        game_lengths[i] = n_moves
+        length = min(len(toks), seq_len)
+        input_ids[i, :length] = torch.tensor(toks[:length], dtype=torch.long)
+        # move_ids for legal mask computation (moves only, no outcome)
+        move_ids[i, :n_moves] = toks[1 : n_moves + 1]
+
+    # Apply min_ply filter
+    if min_ply > 1:
+        keep = game_lengths >= min_ply
+        input_ids = input_ids[keep]
+        move_ids = move_ids[keep]
+        game_lengths = game_lengths[keep]
+        results = [r for r, k in zip(results, keep) if k]
+        N = len(results)
+        print(f"  After min_ply={min_ply} filter: {N:,} games")
+
+    outcome_tokens = input_ids[:, 0]
+    capped_lengths = torch.from_numpy(game_lengths).long().clamp(max=max_ply)
+
+    # Targets: input shifted left by 1
+    targets = torch.zeros(N, seq_len, dtype=torch.long)
+    targets[:, :-1] = input_ids[:, 1:]
+
+    # Loss mask: True for positions 0 through game_length
+    positions = torch.arange(seq_len).unsqueeze(0)
+    loss_mask = positions <= capped_lengths.unsqueeze(1)
+
+    return {
+        "move_ids": move_ids,
+        "game_lengths": game_lengths,
+        "input_ids": input_ids,
+        "targets": targets,
+        "loss_mask": loss_mask,
+        "outcome_tokens": outcome_tokens,
+        "n_games": N,
+    }
+
+
+def _prepare_v1_tokens(
+    token_lists: list[list[int]],
+    results: list[str],
+    max_ply: int,
+    min_ply: int,
+    seq_len: int,
+) -> dict:
+    """Prepare training data from v1 tokens (moves only, no outcome)."""
     N = len(token_lists)
 
     move_ids = np.zeros((N, max_ply), dtype=np.int16)
@@ -353,8 +452,6 @@ def _prepare_from_tokens(
         game_lengths[i] = length
         move_ids[i, :length] = toks[:length]
 
-    # Apply min_ply filter
-    results = df["result"].to_list()
     if min_ply > 1:
         keep = game_lengths >= min_ply
         move_ids = move_ids[keep]
@@ -365,7 +462,6 @@ def _prepare_from_tokens(
 
     outcome_tokens = _result_to_outcome(results)
 
-    seq_len = max_ply + 1
     from pawn.data import pack_clm_sequences
     batch = pack_clm_sequences(move_ids, game_lengths, outcome_tokens, seq_len)
 
