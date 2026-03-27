@@ -87,15 +87,34 @@ next_token = logits[0, -1].argmax()
 
 ### Train an adapter
 
-```bash
-uv sync --extra dev
-git submodule update --init checkpoints/pawn-base
+Weights and data load directly from HuggingFace — no submodules or local files needed:
 
+```bash
 uv run python scripts/train_bottleneck.py \
-    --checkpoint checkpoints/pawn-base \
-    --pgn data/lichess_1800_1900.pgn \
+    --checkpoint thomas-schweich/pawn-base \
+    --pgn thomas-schweich/pawn-lichess-full \
     --bottleneck-dim 32 --lr 1e-4 --local-checkpoints
 ```
+
+Or use the Stockfish self-play dataset:
+
+```bash
+uv run python scripts/train_lora.py \
+    --checkpoint thomas-schweich/pawn-base \
+    --pgn thomas-schweich/stockfish-nodes1 \
+    --lora-rank 4 --lr 3e-4 --local-checkpoints
+```
+
+## Datasets
+
+| Dataset | Games | Description | Link |
+|---------|-------|-------------|------|
+| Lichess Full | ~289M train + 50K val + 50K test | Rated games from Q1 2025 (all Elos), holdout from Jan 2026 | [pawn-lichess-full](https://huggingface.co/datasets/thomas-schweich/pawn-lichess-full) |
+| Stockfish nodes=1 | 900K train + 50K val + 50K test | NNUE self-play, 1 node/move | [stockfish-nodes1](https://huggingface.co/datasets/thomas-schweich/stockfish-nodes1) |
+
+All datasets use the PAWN token format: pre-tokenized `list[int16]` move sequences, ready for training without any parsing. The Lichess dataset also includes clock annotations, Stockfish eval annotations (~8% of games), player hashes, Elo ratings, and game metadata.
+
+Datasets load directly from HuggingFace via Polars lazy scan — predicate pushdown on columns like `white_elo` and `date` lets you efficiently filter to specific Elo bands or time periods without downloading the full dataset.
 
 ## Architecture
 

@@ -66,17 +66,17 @@ For a model with top-1 accuracy A:
   model is to the Bayes-optimal predictor with perfect outcome knowledge.
   This is the tighter bound.
 
-### Current model results (step ~69K)
+### Final model results (100K steps)
 
 | Variant | Top-1 | vs Uncond | vs Naive Cond | vs MCTS Cond |
 |---------|-------|-----------|---------------|--------------|
-| large (68M) | 6.9% | 107% | 107% | 87% |
-| base (36M) | 6.9% | 107% | 107% | 87% |
-| small (10M) | 6.5% | 101% | 101% | 82% |
+| large (68M) | 6.94% | 108% | 108% | 88% |
+| base (36M) | 6.86% | 107% | 107% | 87% |
+| small (10M) | 6.73% | 105% | 105% | 85% |
 
 All models exceed the unconditional and naive conditional ceilings,
 confirming they learn chess structure beyond move legality. The large and
-base models reach 87% of the MCTS conditional ceiling.
+base models reach 87-88% of the MCTS conditional ceiling.
 
 ## Per-outcome breakdown
 
