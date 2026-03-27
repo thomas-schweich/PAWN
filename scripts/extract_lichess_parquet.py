@@ -26,7 +26,6 @@ import multiprocessing as mp
 import os
 import sys
 import time
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -39,10 +38,8 @@ import polars as pl
 # Constants
 # ---------------------------------------------------------------------------
 
-LICHESS_URL_TEMPLATE = (
-    "https://database.lichess.org/standard/"
-    "lichess_db_standard_rated_{year_month}.pgn.zst"
-)
+HF_RAW_BUCKET = "thomas-schweich/raw-lichess"
+HF_RAW_FILENAME_TEMPLATE = "lichess_{year_month}.pgn.zst"
 MAX_PLY = 255
 SHARD_TARGET_GAMES = 1_000_000
 
@@ -97,38 +94,29 @@ def stream_pgn_games(fileobj, batch_size: int):
 
 
 def download_zst(year_month: str, output_dir: Path, prefix: str = "") -> Path:
-    """Download a Lichess zstd PGN dump to disk. Atomic write."""
-    url = LICHESS_URL_TEMPLATE.format(year_month=year_month)
-    zst_path = output_dir / f"lichess_{year_month}.pgn.zst"
+    """Download a Lichess zstd PGN dump from HuggingFace bucket."""
+    from huggingface_hub import download_bucket_files
+
+    hf_filename = HF_RAW_FILENAME_TEMPLATE.format(year_month=year_month)
+    zst_path = output_dir / hf_filename
     if zst_path.exists():
         log(f"Using cached {zst_path} ({zst_path.stat().st_size / 1e9:.1f} GB)", prefix)
         return zst_path
 
-    log(f"Downloading {url}", prefix)
-    req = urllib.request.Request(url)
-    req.add_header("User-Agent", "pawn-lichess-extract/2.0")
-    response = urllib.request.urlopen(req)
+    log(f"Downloading {HF_RAW_BUCKET}/{hf_filename} -> {zst_path}", prefix)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    tmp_path = zst_path.with_suffix(".zst.tmp")
     t0 = time.monotonic()
-    downloaded = 0
-    try:
-        with open(tmp_path, "wb") as f:
-            while True:
-                chunk = response.read(8 * 1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-        tmp_path.rename(zst_path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-
-    response.close()
+    download_bucket_files(
+        HF_RAW_BUCKET,
+        files=[(hf_filename, str(zst_path))],
+        raise_on_missing_files=True,
+    )
     dt = time.monotonic() - t0
-    rate = (downloaded / 1e6) / dt if dt > 0 else 0
-    log(f"Downloaded {downloaded / 1e9:.2f} GB in {dt:.0f}s ({rate:.0f} MB/s)", prefix)
+
+    size_gb = zst_path.stat().st_size / 1e9
+    rate = (size_gb * 1000) / dt if dt > 0 else 0
+    log(f"Downloaded {size_gb:.2f} GB in {dt:.0f}s ({rate:.0f} MB/s)", prefix)
     return zst_path
 
 
@@ -157,10 +145,10 @@ def batch_to_dataframe(parsed: dict) -> pl.DataFrame:
         for i in range(n)
     ]
 
-    # Clock lists: parallel to moves only (game_length elements)
+    # Clock lists: aligned with tokens (0 for outcome slot, then per-ply clocks)
     clocks: np.ndarray = parsed["clocks"]  # (N, max_ply) u16
     clock_rows = [
-        clocks[i, : game_lengths[i]].tolist()
+        [0] + clocks[i, : game_lengths[i]].tolist()
         for i in range(n)
     ]
 
