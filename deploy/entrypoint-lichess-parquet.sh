@@ -37,25 +37,26 @@ fi
 # Install zstandard if not available (needed for streaming decompression)
 python3 -c "import zstandard" 2>/dev/null || pip install --no-cache-dir zstandard
 
-# Build the command
-CMD="python3 /opt/pawn/scripts/extract_lichess_parquet.py"
-CMD="$CMD --months $MONTHS"
-CMD="$CMD --output ${OUTPUT_DIR:-/workspace/lichess-parquet}"
-CMD="$CMD --batch-size ${BATCH_SIZE:-500000}"
-CMD="$CMD --shard-size ${SHARD_SIZE:-1000000}"
-CMD="$CMD --seed ${SEED:-42}"
+# Build the command as an array to avoid shell injection
+CMD=(python3 /opt/pawn/scripts/extract_lichess_parquet.py
+    --months $MONTHS
+    --output "${OUTPUT_DIR:-/workspace/lichess-parquet}"
+    --batch-size "${BATCH_SIZE:-500000}"
+    --shard-size "${SHARD_SIZE:-1000000}"
+    --seed "${SEED:-42}"
+)
 
 if [ -n "${HOLDOUT_MONTH:-}" ]; then
-    CMD="$CMD --holdout-month $HOLDOUT_MONTH"
-    CMD="$CMD --holdout-games ${HOLDOUT_GAMES:-50000}"
+    CMD+=(--holdout-month "$HOLDOUT_MONTH")
+    CMD+=(--holdout-games "${HOLDOUT_GAMES:-50000}")
 fi
 if [ -n "${HF_REPO:-}" ]; then
-    CMD="$CMD --hf-repo $HF_REPO"
+    CMD+=(--hf-repo "$HF_REPO")
 fi
 if [ -n "${MAX_GAMES:-}" ]; then
-    CMD="$CMD --max-games $MAX_GAMES"
+    CMD+=(--max-games "$MAX_GAMES")
 fi
 
-echo "Running: $CMD"
+echo "Running: ${CMD[*]}"
 echo ""
-exec $CMD
+exec "${CMD[@]}"

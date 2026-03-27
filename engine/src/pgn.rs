@@ -201,15 +201,18 @@ fn parse_raw_games(
     let mut movetext_lines: Vec<&str> = Vec::new();
     let mut in_movetext = false;
     let mut date_excluded = false;   // UTCDate outside date_range
+    let mut has_utc_date = false;    // saw a UTCDate header for this game
     let mut date_matched_idx = 0usize; // count of date-matching games seen
 
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
             if in_movetext {
-                // End of movetext — game boundary
-                let dominated = date_excluded;
-                if !dominated && !movetext_lines.is_empty() {
+                // End of movetext — game boundary.
+                // Exclude if date is out of range OR if date_range is active
+                // but no UTCDate header was found (consistent with count_games_in_date_range).
+                let excluded = date_excluded || (date_range.is_some() && !has_utc_date);
+                if !excluded && !movetext_lines.is_empty() {
                     // Game passed date filter. Check sample if present.
                     let keep = match sample {
                         Some((indices, offset)) => indices.contains(&(offset + date_matched_idx)),
@@ -231,6 +234,7 @@ fn parse_raw_games(
                 headers.clear();
                 in_movetext = false;
                 date_excluded = false;
+                has_utc_date = false;
             }
             // Blank line between headers and movetext: don't reset state
             continue;
@@ -240,6 +244,7 @@ fn parse_raw_games(
         if line.starts_with('[') && line.ends_with(']') {
             if let Some((key, value)) = parse_header_line(line) {
                 if key == "UTCDate" {
+                    has_utc_date = true;
                     if let Some((start, end)) = date_range {
                         if value.as_str() < start || value.as_str() > end {
                             date_excluded = true;
@@ -261,7 +266,8 @@ fn parse_raw_games(
     }
 
     // Handle last game
-    if in_movetext && !date_excluded && !movetext_lines.is_empty() && games.len() < max_games {
+    let last_excluded = date_excluded || (date_range.is_some() && !has_utc_date);
+    if in_movetext && !last_excluded && !movetext_lines.is_empty() && games.len() < max_games {
         let keep = match sample {
             Some((indices, offset)) => indices.contains(&(offset + date_matched_idx)),
             None => true,
@@ -308,68 +314,12 @@ fn extract_moves_and_annotations(text: &str) -> (Vec<String>, Vec<u16>, Vec<i16>
     let mut clocks = Vec::new();
     let mut evals = Vec::new();
 
-    // Current annotation values (set when we encounter a comment, consumed on next move)
-    let mut pending_clock: u16 = CLOCK_NONE;
-    let mut pending_eval: i16 = EVAL_NONE;
-
-    let mut i = 0;
     let bytes = text.as_bytes();
     let len = bytes.len();
 
-    while i < len {
-        // Skip whitespace
-        if bytes[i].is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-
-        // Comment: { ... }
-        if bytes[i] == b'{' {
-            i += 1;
-            let start = i;
-            while i < len && bytes[i] != b'}' {
-                i += 1;
-            }
-            let comment = &text[start..i];
-            parse_comment(comment, &mut pending_clock, &mut pending_eval);
-            if i < len { i += 1; } // skip '}'
-            continue;
-        }
-
-        // Collect a whitespace-delimited token
-        let start = i;
-        while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b'{' {
-            i += 1;
-        }
-        let token = &text[start..i];
-
-        // Skip NAGs
-        if token.starts_with('$') {
-            continue;
-        }
-
-        // Result markers — stop
-        if token == "1-0" || token == "0-1" || token == "1/2-1/2" || token == "*" {
-            break;
-        }
-
-        // Skip move numbers
-        let stripped = token.trim_end_matches('.');
-        if !stripped.is_empty() && stripped.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-
-        // Skip non-move tokens in the first pass; real parsing is below.
-        break;
-    }
-
     // Lichess format: move { comment } move { comment } ...
     // The comment annotates the move immediately before it.
-    moves.clear();
-    clocks.clear();
-    evals.clear();
-
-    i = 0;
+    let mut i = 0;
     while i < len {
         if bytes[i].is_ascii_whitespace() {
             i += 1;
@@ -456,7 +406,8 @@ fn parse_clock(s: &str) -> Option<u16> {
     let m: u32 = parts[1].parse().ok()?;
     let s: u32 = parts[2].parse().ok()?;
     let total = h * 3600 + m * 60 + s;
-    Some(total.min(u16::MAX as u32) as u16)
+    // Cap at 0x7FFF (32767) to avoid collision with CLOCK_NONE (0x8000)
+    Some(total.min(0x7FFF) as u16)
 }
 
 /// Parse eval string into centipawns (i16).
@@ -937,12 +888,21 @@ mod tests {
         assert_eq!(sampled[0].headers.get("UTCDate").unwrap(), "2023.12.05");
         assert_eq!(sampled[1].headers.get("UTCDate").unwrap(), "2023.12.20");
 
-        // Sample with offset (simulating a second chunk where previous chunk had 1 match)
-        let indices: HashSet<usize> = HashSet::from([1]);
+        // Sample with offset: simulating a second chunk where previous chunk had 1 match.
+        // Global index 2 = offset 1 + local index 1 => selects Game 2 (local idx 1).
+        let indices: HashSet<usize> = HashSet::from([2]);
         let sampled = parse_pgn_enriched_sampled(
-            pgn, 256, 2, "2023.12.01", "2023.12.31", &indices, 0,
+            pgn, 256, 2, "2023.12.01", "2023.12.31", &indices, 1,
         );
         assert_eq!(sampled.len(), 1);
         assert_eq!(sampled[0].headers.get("UTCDate").unwrap(), "2023.12.10");
+
+        // Offset that skips all local games: offset=3 means local indices are 3,4,5
+        // but we only ask for global index 0, which isn't in this chunk.
+        let indices: HashSet<usize> = HashSet::from([0]);
+        let sampled = parse_pgn_enriched_sampled(
+            pgn, 256, 2, "2023.12.01", "2023.12.31", &indices, 3,
+        );
+        assert_eq!(sampled.len(), 0);
     }
 }

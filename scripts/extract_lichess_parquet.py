@@ -5,14 +5,15 @@ Downloads a zstd-compressed PGN from database.lichess.org, parses games via
 the Rust chess engine (tokens, clocks, evals, headers), builds a Polars
 DataFrame, and writes sharded Parquet to disk with train/val/test splits.
 
-The output schema stores pre-tokenized move sequences as list[uint16],
-clock annotations as list[uint16] (seconds remaining), eval annotations
-as list[int16] (centipawns, mate=+-32000, missing=-32768), and metadata
-columns. Player usernames are SHA-256 hashed to uint64.
+The output schema stores pre-tokenized move sequences as list[int16],
+clock annotations as list[uint16] (seconds remaining, 0x8000=missing),
+eval annotations as list[int16] (centipawns, mate=±(32767-N),
+0x8000=missing), and metadata columns. Player usernames are hashed to
+uint64 via Polars xxHash64 (deterministic within a Polars version).
 
-Shards are written in chronological order (no shuffle) so that the last
-shards can be held out as val/test by time. The script auto-assigns splits
-based on --val-weeks and --test-weeks.
+Training months are written as chronologically-ordered shards. Holdout
+val/test data is uniformly sampled from a separate month via two-pass
+Rust-side date filtering.
 
 Designed to run on a CPU pod with the pawn Docker image.
 
@@ -74,8 +75,6 @@ def stream_pgn_games(fileobj, batch_size: int):
 
     buf = []
     game_count = 0
-    # Track blank-line state for game boundary detection
-    last_was_blank = False
     in_movetext = False
 
     for line in text_reader:
@@ -86,14 +85,12 @@ def stream_pgn_games(fileobj, batch_size: int):
                 # End of movetext — game boundary
                 game_count += 1
                 in_movetext = False
-                last_was_blank = True
                 buf.append(line)
                 if game_count >= batch_size:
                     yield "".join(buf), game_count
                     buf.clear()
                     game_count = 0
                 continue
-            last_was_blank = True
             buf.append(line)
             continue
 
@@ -102,7 +99,6 @@ def stream_pgn_games(fileobj, batch_size: int):
         else:
             in_movetext = True
 
-        last_was_blank = False
         buf.append(line)
 
     # Final batch
@@ -123,19 +119,26 @@ def download_zst(year_month: str, output_dir: Path) -> Path:
     req.add_header("User-Agent", "pawn-lichess-extract/1.0")
     response = urllib.request.urlopen(req)
 
+    # Write to a temp file and rename on completion to avoid partial downloads
+    tmp_path = zst_path.with_suffix(".zst.tmp")
     t0 = time.monotonic()
     downloaded = 0
-    with open(zst_path, "wb") as f:
-        while True:
-            chunk = response.read(8 * 1024 * 1024)  # 8 MB
-            if not chunk:
-                break
-            f.write(chunk)
-            downloaded += len(chunk)
-            elapsed = time.monotonic() - t0
-            rate_mb = (downloaded / 1e6) / elapsed if elapsed > 0 else 0
-            print(f"\r  Downloaded {downloaded / 1e9:.2f} GB ({rate_mb:.0f} MB/s)", end="", flush=True)
-    print(flush=True)
+    try:
+        with open(tmp_path, "wb") as f:
+            while True:
+                chunk = response.read(8 * 1024 * 1024)  # 8 MB
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                elapsed = time.monotonic() - t0
+                rate_mb = (downloaded / 1e6) / elapsed if elapsed > 0 else 0
+                print(f"\r  Downloaded {downloaded / 1e9:.2f} GB ({rate_mb:.0f} MB/s)", end="", flush=True)
+        print(flush=True)
+        tmp_path.rename(zst_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     response.close()
     log(f"  Saved {zst_path} ({downloaded / 1e9:.2f} GB in {time.monotonic() - t0:.0f}s)")
@@ -262,13 +265,12 @@ def sample_holdout(
 # ---------------------------------------------------------------------------
 
 def numpy_rows_to_list_series(
-    arr: np.ndarray, lengths: np.ndarray, name: str, dtype: pl.DataType
+    arr: np.ndarray, lengths: np.ndarray, name: str, inner_dtype: pl.DataType
 ) -> pl.Series:
     """Convert a 0-padded (N, max_ply) numpy array to a Polars List series,
     trimming each row to its actual game length."""
-    inner = dtype.inner  # type: ignore[attr-defined]
     rows = [arr[i, :lengths[i]].tolist() for i in range(len(arr))]
-    return pl.Series(name, rows, dtype=pl.List(inner))
+    return pl.Series(name, rows, dtype=pl.List(inner_dtype))
 
 
 def batch_to_dataframe(parsed: dict) -> pl.DataFrame:
@@ -300,9 +302,9 @@ def batch_to_dataframe(parsed: dict) -> pl.DataFrame:
             datetimes.append(None)
 
     df = pl.DataFrame({
-        "tokens": numpy_rows_to_list_series(tokens, lengths, "tokens", pl.List(pl.Int16)),
-        "clock": numpy_rows_to_list_series(parsed["clocks"], lengths, "clock", pl.List(pl.UInt16)),
-        "eval": numpy_rows_to_list_series(parsed["evals"], lengths, "eval", pl.List(pl.Int16)),
+        "tokens": numpy_rows_to_list_series(tokens, lengths, "tokens", pl.Int16),
+        "clock": numpy_rows_to_list_series(parsed["clocks"], lengths, "clock", pl.UInt16),
+        "eval": numpy_rows_to_list_series(parsed["evals"], lengths, "eval", pl.Int16),
         "game_length": pl.Series("game_length", parsed["game_lengths"], dtype=pl.UInt16),
         "result": pl.Series("result", parsed["result"], dtype=pl.Utf8),
         "white_player": pl.Series("white_player", parsed["white"], dtype=pl.Utf8),
