@@ -1,25 +1,64 @@
-# Lightweight container for downloading and filtering Lichess PGN data.
-# No GPU, no torch, no engine — just curl, zstd, python3, pyarrow, huggingface-hub.
+# Slim CPU image for Lichess PGN -> Parquet extraction.
+# No PyTorch, no CUDA — just the Rust engine, Polars, and zstandard.
+# ~2 GB vs ~55 GB for the GPU image.
 #
 # Build:
-#   docker build -f deploy/Dockerfile.lichess-extract -t thomasschweich/pawn-lichess-extract:latest .
+#   docker build --platform linux/amd64 \
+#     -f deploy/Dockerfile.lichess-extract \
+#     -t thomasschweich/pawn-lichess-extract:latest .
 #
-# Run (ephemeral, writes to /dev/shm, uploads to HF):
-#   docker run -e HF_TOKEN=... -e HF_REPO=thomas-schweich/lichess-1800-1900 \
-#     -e MONTHS="2025-01,2025-02" -e MIN_ELO=1800 -e MAX_ELO=1900 \
+# Run:
+#   docker run \
+#     -e MONTHS="2025-01 2025-02 2025-03" \
+#     -e HOLDOUT_MONTH="2026-01" \
+#     -e HOLDOUT_GAMES=50000 \
+#     -e HF_TOKEN=... \
+#     -e HF_REPO=thomas-schweich/pawn-lichess-full \
+#     -v /workspace:/workspace \
 #     thomasschweich/pawn-lichess-extract:latest
 
+# ── Build Rust engine wheel ────────────────────────────────────────────
+FROM python:3.12-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /build
+COPY engine/ engine/
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+COPY pyproject.toml uv.lock ./
+COPY pawn/ pawn/
+COPY scripts/ scripts/
+
+RUN cd engine && uv run --no-project --with maturin maturin build --release
+
+# ── Slim runtime ───────────────────────────────────────────────────────
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl zstd \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir pyarrow huggingface-hub
+# Install just what we need: engine wheel + extraction deps
+COPY --from=builder /build/engine/target/wheels/*.whl /tmp/
+RUN pip install --no-cache-dir \
+        /tmp/*.whl \
+        polars \
+        zstandard \
+        numpy \
+        huggingface-hub \
+    && rm -rf /tmp/*.whl
 
 WORKDIR /opt/pawn
-COPY scripts/extract_lichess.sh scripts/
-COPY deploy/entrypoint-extract.sh /entrypoint-extract.sh
-RUN chmod +x /entrypoint-extract.sh scripts/extract_lichess.sh
+COPY scripts/extract_lichess_parquet.py scripts/
+COPY deploy/entrypoint-lichess-parquet.sh /entrypoint-lichess-parquet.sh
+RUN chmod +x /entrypoint-lichess-parquet.sh
 
-ENTRYPOINT ["/entrypoint-extract.sh"]
+ENTRYPOINT ["/entrypoint-lichess-parquet.sh"]
