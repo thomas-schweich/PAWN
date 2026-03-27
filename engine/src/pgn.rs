@@ -7,7 +7,7 @@
 //! Also provides enriched parsing that extracts clock annotations,
 //! eval annotations, and PGN headers for dataset construction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use rayon::prelude::*;
 use shakmaty::{Chess, Position};
@@ -26,7 +26,7 @@ pub struct EnrichedGame {
     /// Seconds remaining on clock after each ply (0 = no annotation).
     pub clocks: Vec<u16>,
     /// Centipawns from white's perspective after each ply.
-    /// Mate scores: ±32000. No annotation: i16::MIN (-32768).
+    /// Mate scores: ±(32767-N). No annotation: 0x8000 (-32768 as i16).
     pub evals: Vec<i16>,
     /// Number of valid plies.
     pub game_length: usize,
@@ -45,8 +45,7 @@ pub fn parse_pgn_enriched(
     max_games: usize,
     min_ply: usize,
 ) -> Vec<EnrichedGame> {
-    // Phase 1: single-threaded line scan to extract raw game data
-    let raw_games = parse_raw_games(content, max_games);
+    let raw_games = parse_raw_games(content, max_games, None, None);
 
     // Phase 2: parallel tokenization + annotation extraction
     raw_games
@@ -64,7 +63,108 @@ pub fn parse_pgn_enriched(
                 return None;
             }
 
-            // Trim annotations to match token count (moves may have failed to parse)
+            // Trim annotations to match token count (moves may have failed to parse).
+            let clocks = clocks_raw.into_iter().take(n_valid).collect();
+            let evals = evals_raw.into_iter().take(n_valid).collect();
+
+            Some(EnrichedGame {
+                tokens,
+                clocks,
+                evals,
+                game_length: n_valid,
+                headers: raw.headers,
+            })
+        })
+        .collect()
+}
+
+/// Count games in a PGN string whose UTCDate falls within [start, end].
+///
+/// Header-only scan — no movetext parsing, no tokenization.
+/// Returns (count_in_range, offset) where offset is the running game index
+/// that should be passed to the next chunk for correct global indexing.
+pub fn count_games_in_date_range(
+    content: &str,
+    date_start: &str,
+    date_end: &str,
+) -> usize {
+    let mut count = 0;
+    let mut current_date: Option<String> = None;
+    let mut in_movetext = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            if in_movetext {
+                // End of game — check if the date was in range
+                if let Some(ref d) = current_date {
+                    if d.as_str() >= date_start && d.as_str() <= date_end {
+                        count += 1;
+                    }
+                }
+                current_date = None;
+                in_movetext = false;
+            }
+            continue;
+        }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            if let Some((key, value)) = parse_header_line(line) {
+                if key == "UTCDate" {
+                    current_date = Some(value);
+                }
+            }
+            in_movetext = false;
+        } else {
+            in_movetext = true;
+        }
+    }
+
+    // Handle last game
+    if in_movetext {
+        if let Some(ref d) = current_date {
+            if d.as_str() >= date_start && d.as_str() <= date_end {
+                count += 1;
+            }
+        }
+    }
+
+    count
+}
+
+/// Parse a PGN string, but only tokenize games at specific indices within a
+/// date range. Used for uniform random sampling: Python counts games in the
+/// date range (via `count_games_in_date_range`), generates a random index
+/// set, then calls this to parse only those games.
+///
+/// `indices` are 0-based within the date-range-matching games of this chunk.
+/// `game_offset` is the number of date-matching games seen in previous chunks,
+/// so global index = game_offset + local_index.
+pub fn parse_pgn_enriched_sampled(
+    content: &str,
+    max_ply: usize,
+    min_ply: usize,
+    date_start: &str,
+    date_end: &str,
+    indices: &HashSet<usize>,
+    game_offset: usize,
+) -> Vec<EnrichedGame> {
+    let raw_games = parse_raw_games(content, usize::MAX, Some((date_start, date_end)), Some((indices, game_offset)));
+
+    raw_games
+        .into_par_iter()
+        .filter_map(|raw| {
+            let (san_moves, clocks_raw, evals_raw) = extract_moves_and_annotations(&raw.movetext);
+            if san_moves.len() < min_ply {
+                return None;
+            }
+
+            let refs: Vec<&str> = san_moves.iter().map(|s| s.as_str()).collect();
+            let (tokens, n_valid) = san_moves_to_tokens(&refs, max_ply);
+            if n_valid < min_ply {
+                return None;
+            }
+
             let clocks = clocks_raw.into_iter().take(n_valid).collect();
             let evals = evals_raw.into_iter().take(n_valid).collect();
 
@@ -86,48 +186,92 @@ struct RawGame {
 }
 
 /// Single-threaded PGN line scanner. Extracts headers and raw movetext.
-fn parse_raw_games(content: &str, max_games: usize) -> Vec<RawGame> {
+///
+/// If `date_range` is Some((start, end)), only games whose UTCDate falls
+/// within [start, end] are included. If `sample` is Some((indices, offset)),
+/// only games whose (offset + local_index) is in the index set are kept.
+fn parse_raw_games(
+    content: &str,
+    max_games: usize,
+    date_range: Option<(&str, &str)>,
+    sample: Option<(&HashSet<usize>, usize)>,
+) -> Vec<RawGame> {
     let mut games = Vec::new();
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut movetext_lines: Vec<&str> = Vec::new();
     let mut in_movetext = false;
+    let mut date_excluded = false;   // UTCDate outside date_range
+    let mut date_matched_idx = 0usize; // count of date-matching games seen
 
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
-            if in_movetext && !movetext_lines.is_empty() {
-                games.push(RawGame {
-                    headers: std::mem::take(&mut headers),
-                    movetext: movetext_lines.join(" "),
-                });
-                movetext_lines.clear();
-                in_movetext = false;
-                if games.len() >= max_games {
-                    break;
+            if in_movetext {
+                // End of movetext — game boundary
+                let dominated = date_excluded;
+                if !dominated && !movetext_lines.is_empty() {
+                    // Game passed date filter. Check sample if present.
+                    let keep = match sample {
+                        Some((indices, offset)) => indices.contains(&(offset + date_matched_idx)),
+                        None => true,
+                    };
+                    date_matched_idx += 1;
+
+                    if keep {
+                        games.push(RawGame {
+                            headers: std::mem::take(&mut headers),
+                            movetext: movetext_lines.join(" "),
+                        });
+                        if games.len() >= max_games {
+                            break;
+                        }
+                    }
                 }
+                movetext_lines.clear();
+                headers.clear();
+                in_movetext = false;
+                date_excluded = false;
             }
+            // Blank line between headers and movetext: don't reset state
             continue;
         }
 
         // Header line: [Key "Value"]
         if line.starts_with('[') && line.ends_with(']') {
             if let Some((key, value)) = parse_header_line(line) {
-                headers.insert(key, value);
+                if key == "UTCDate" {
+                    if let Some((start, end)) = date_range {
+                        if value.as_str() < start || value.as_str() > end {
+                            date_excluded = true;
+                        }
+                    }
+                }
+                if !date_excluded {
+                    headers.insert(key, value);
+                }
             }
             in_movetext = false;
             continue;
         }
 
-        in_movetext = true;
-        movetext_lines.push(line);
+        if !date_excluded {
+            in_movetext = true;
+            movetext_lines.push(line);
+        }
     }
 
     // Handle last game
-    if !movetext_lines.is_empty() && games.len() < max_games {
-        games.push(RawGame {
-            headers: std::mem::take(&mut headers),
-            movetext: movetext_lines.join(" "),
-        });
+    if in_movetext && !date_excluded && !movetext_lines.is_empty() && games.len() < max_games {
+        let keep = match sample {
+            Some((indices, offset)) => indices.contains(&(offset + date_matched_idx)),
+            None => true,
+        };
+        if keep {
+            games.push(RawGame {
+                headers: std::mem::take(&mut headers),
+                movetext: movetext_lines.join(" "),
+            });
+        }
     }
 
     games
@@ -149,19 +293,24 @@ fn parse_header_line(line: &str) -> Option<(String, String)> {
     Some((key, value))
 }
 
+/// Sentinel for "no clock annotation" (0x8000 as u16 = 32768).
+const CLOCK_NONE: u16 = 0x8000;
+/// Sentinel for "no eval annotation" (0x8000 as i16 = -32768).
+const EVAL_NONE: i16 = -0x8000; // i16::MIN
+
 /// Extract SAN moves, clock annotations, and eval annotations from movetext.
 ///
 /// Returns (san_moves, clocks, evals) where clocks[i] is the clock after
-/// move i (0 if no annotation) and evals[i] is centipawns after move i
-/// (i16::MIN if no annotation).
+/// move i (CLOCK_NONE if no annotation) and evals[i] is centipawns after
+/// move i (EVAL_NONE if no annotation).
 fn extract_moves_and_annotations(text: &str) -> (Vec<String>, Vec<u16>, Vec<i16>) {
     let mut moves = Vec::new();
     let mut clocks = Vec::new();
     let mut evals = Vec::new();
 
     // Current annotation values (set when we encounter a comment, consumed on next move)
-    let mut pending_clock: u16 = 0;
-    let mut pending_eval: i16 = i16::MIN;
+    let mut pending_clock: u16 = CLOCK_NONE;
+    let mut pending_eval: i16 = EVAL_NONE;
 
     let mut i = 0;
     let bytes = text.as_bytes();
@@ -210,27 +359,12 @@ fn extract_moves_and_annotations(text: &str) -> (Vec<String>, Vec<u16>, Vec<i16>
             continue;
         }
 
-        // It's a SAN move — record it with the pending annotations
-        // In Lichess PGN, annotations follow the move they belong to:
-        //   1. e4 { [%clk 0:10:00] [%eval 0.23] } 1... e5 { [%clk 0:09:58] }
-        // So we push the annotation from the PREVIOUS comment, which applies
-        // to the move that preceded this one. But actually, the comment comes
-        // AFTER the move it annotates. So we need to push the current move,
-        // then when we see the next comment, associate it with the last pushed move.
-        //
-        // Revised approach: push move with defaults, then when comment is seen,
-        // update the last move's annotations.
-        moves.push(token.to_string());
-        clocks.push(0);
-        evals.push(i16::MIN);
+        // Skip non-move tokens in the first pass; real parsing is below.
+        break;
     }
 
-    // Now do a second pass to associate comments with the preceding move.
-    // Actually, let me redo this more cleanly.
-    // The Lichess format is: move { comment } move { comment } ...
-    // where the comment annotates the move immediately before it.
-    // Let me rewrite with that logic.
-
+    // Lichess format: move { comment } move { comment } ...
+    // The comment annotates the move immediately before it.
     moves.clear();
     clocks.clear();
     evals.clear();
@@ -254,11 +388,11 @@ fn extract_moves_and_annotations(text: &str) -> (Vec<String>, Vec<u16>, Vec<i16>
 
             // Apply to last move
             if let Some(last_clk) = clocks.last_mut() {
-                let mut clk = 0u16;
-                let mut ev = i16::MIN;
+                let mut clk = CLOCK_NONE;
+                let mut ev = EVAL_NONE;
                 parse_comment(comment, &mut clk, &mut ev);
-                if clk != 0 { *last_clk = clk; }
-                if ev != i16::MIN {
+                if clk != CLOCK_NONE { *last_clk = clk; }
+                if ev != EVAL_NONE {
                     if let Some(last_ev) = evals.last_mut() {
                         *last_ev = ev;
                     }
@@ -280,8 +414,8 @@ fn extract_moves_and_annotations(text: &str) -> (Vec<String>, Vec<u16>, Vec<i16>
         if !stripped.is_empty() && stripped.bytes().all(|b| b.is_ascii_digit()) { continue; }
 
         moves.push(token.to_string());
-        clocks.push(0);
-        evals.push(i16::MIN);
+        clocks.push(CLOCK_NONE);
+        evals.push(EVAL_NONE);
     }
 
     (moves, clocks, evals)
@@ -326,17 +460,21 @@ fn parse_clock(s: &str) -> Option<u16> {
 }
 
 /// Parse eval string into centipawns (i16).
-/// "1.23" → 123, "-0.50" → -50, "#3" → 32000, "#-3" → -32000.
+/// "1.23" → 123, "-0.50" → -50.
+/// Mate scores: "#N" → 32767-N, "#-N" → -(32767-N).
+/// Bit 14 is always set for mates, making them detectable via bitmask.
+/// Centipawn values are clamped to ±16383 to avoid overlap with the mate range.
 fn parse_eval(s: &str) -> Option<i16> {
     if s.starts_with('#') {
-        // Mate score
         let rest = &s[1..];
         let n: i32 = rest.parse().ok()?;
-        Some(if n > 0 { 32000 } else { -32000 })
+        let abs_n = n.unsigned_abs().max(1) as i16;
+        let mate_val = 32767 - abs_n;
+        Some(if n > 0 { mate_val } else { -mate_val })
     } else {
         let f: f64 = s.parse().ok()?;
         let cp = (f * 100.0).round() as i32;
-        Some(cp.clamp(-32000, 32000) as i16)
+        Some(cp.clamp(-16383, 16383) as i16)
     }
 }
 
@@ -623,10 +761,18 @@ mod tests {
         assert_eq!(parse_eval("0.23"), Some(23));
         assert_eq!(parse_eval("-1.50"), Some(-150));
         assert_eq!(parse_eval("0.00"), Some(0));
-        assert_eq!(parse_eval("#3"), Some(32000));
-        assert_eq!(parse_eval("#-3"), Some(-32000));
-        assert_eq!(parse_eval("#1"), Some(32000));
-        assert_eq!(parse_eval("#-1"), Some(-32000));
+        // Mate scores: 32767 - N
+        assert_eq!(parse_eval("#1"), Some(32766));
+        assert_eq!(parse_eval("#-1"), Some(-32766));
+        assert_eq!(parse_eval("#3"), Some(32764));
+        assert_eq!(parse_eval("#-3"), Some(-32764));
+        assert_eq!(parse_eval("#10"), Some(32757));
+        // Bit 14 (0x4000 = 16384) is set for all mate values
+        assert!(parse_eval("#1").unwrap() & 0x4000 != 0);
+        assert!(parse_eval("#100").unwrap() & 0x4000 != 0);
+        // Centipawns clamped to ±16383 to avoid mate range
+        assert_eq!(parse_eval("200.00"), Some(16383));
+        assert_eq!(parse_eval("-200.00"), Some(-16383));
     }
 
     #[test]
@@ -651,7 +797,7 @@ mod tests {
         let (moves, clocks, evals) = extract_moves_and_annotations(text);
         assert_eq!(moves, vec!["e4", "e5", "Nf3"]);
         assert_eq!(clocks, vec![600, 598, 595]);
-        assert_eq!(evals, vec![23, 31, i16::MIN]);
+        assert_eq!(evals, vec![23, 31, EVAL_NONE]);
     }
 
     #[test]
@@ -659,8 +805,8 @@ mod tests {
         let text = "1. e4 e5 2. Nf3 Nc6 1-0";
         let (moves, clocks, evals) = extract_moves_and_annotations(text);
         assert_eq!(moves, vec!["e4", "e5", "Nf3", "Nc6"]);
-        assert_eq!(clocks, vec![0, 0, 0, 0]);
-        assert_eq!(evals, vec![i16::MIN; 4]);
+        assert_eq!(clocks, vec![CLOCK_NONE, CLOCK_NONE, CLOCK_NONE, CLOCK_NONE]);
+        assert_eq!(evals, vec![EVAL_NONE; 4]);
     }
 
     #[test]
@@ -668,7 +814,7 @@ mod tests {
         let text = r#"1. e4 { [%eval 0.23] } 1... e5 { [%eval #-3] } 1-0"#;
         let (moves, _clocks, evals) = extract_moves_and_annotations(text);
         assert_eq!(moves, vec!["e4", "e5"]);
-        assert_eq!(evals, vec![23, -32000]);
+        assert_eq!(evals, vec![23, -32764]);
     }
 
     #[test]
@@ -723,5 +869,80 @@ mod tests {
 
         assert_eq!(enriched[0].tokens, legacy_tokens);
         assert_eq!(enriched[0].game_length, legacy_n);
+    }
+
+    #[test]
+    fn test_count_games_in_date_range() {
+        let pgn = r#"[Event "Game 1"]
+[UTCDate "2023.12.05"]
+
+1. e4 e5 1-0
+
+[Event "Game 2"]
+[UTCDate "2023.12.20"]
+
+1. d4 d5 0-1
+
+[Event "Game 3"]
+[UTCDate "2025.01.15"]
+
+1. e4 c5 1-0
+"#;
+        assert_eq!(count_games_in_date_range(pgn, "2023.12.01", "2023.12.31"), 2);
+        assert_eq!(count_games_in_date_range(pgn, "2023.12.01", "2023.12.14"), 1);
+        assert_eq!(count_games_in_date_range(pgn, "2023.12.15", "2023.12.31"), 1);
+        assert_eq!(count_games_in_date_range(pgn, "2025.01.01", "2025.01.31"), 1);
+        assert_eq!(count_games_in_date_range(pgn, "2024.01.01", "2024.12.31"), 0);
+    }
+
+    #[test]
+    fn test_sampled_parsing() {
+        let pgn = r#"[Event "Game 1"]
+[UTCDate "2023.12.05"]
+
+1. e4 e5 1-0
+
+[Event "Game 2"]
+[UTCDate "2023.12.10"]
+
+1. d4 d5 0-1
+
+[Event "Game 3"]
+[UTCDate "2023.12.20"]
+
+1. e4 c5 1-0
+
+[Event "Game 4"]
+[UTCDate "2025.01.15"]
+
+1. Nf3 d5 1-0
+"#;
+        // 3 games match Dec 2023 (indices 0, 1, 2 within the date range)
+        assert_eq!(count_games_in_date_range(pgn, "2023.12.01", "2023.12.31"), 3);
+
+        // Sample only index 1 (Game 2)
+        let indices: HashSet<usize> = HashSet::from([1]);
+        let sampled = parse_pgn_enriched_sampled(
+            pgn, 256, 2, "2023.12.01", "2023.12.31", &indices, 0,
+        );
+        assert_eq!(sampled.len(), 1);
+        assert_eq!(sampled[0].headers.get("UTCDate").unwrap(), "2023.12.10");
+
+        // Sample indices 0 and 2 (Game 1 and Game 3)
+        let indices: HashSet<usize> = HashSet::from([0, 2]);
+        let sampled = parse_pgn_enriched_sampled(
+            pgn, 256, 2, "2023.12.01", "2023.12.31", &indices, 0,
+        );
+        assert_eq!(sampled.len(), 2);
+        assert_eq!(sampled[0].headers.get("UTCDate").unwrap(), "2023.12.05");
+        assert_eq!(sampled[1].headers.get("UTCDate").unwrap(), "2023.12.20");
+
+        // Sample with offset (simulating a second chunk where previous chunk had 1 match)
+        let indices: HashSet<usize> = HashSet::from([1]);
+        let sampled = parse_pgn_enriched_sampled(
+            pgn, 256, 2, "2023.12.01", "2023.12.31", &indices, 0,
+        );
+        assert_eq!(sampled.len(), 1);
+        assert_eq!(sampled[0].headers.get("UTCDate").unwrap(), "2023.12.10");
     }
 }

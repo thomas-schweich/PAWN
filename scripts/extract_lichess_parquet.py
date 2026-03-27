@@ -110,19 +110,51 @@ def stream_pgn_games(fileobj, batch_size: int):
         yield "".join(buf), game_count
 
 
-def download_month(year_month: str, output_dir: Path, batch_size: int):
-    """Download and parse a single month's PGN dump, yielding parsed batches."""
+def download_zst(year_month: str, output_dir: Path) -> Path:
+    """Download a Lichess zstd PGN dump to disk. Returns path to .zst file."""
     url = LICHESS_URL_TEMPLATE.format(year_month=year_month)
-    log(f"Downloading {url}")
+    zst_path = output_dir / f"lichess_{year_month}.pgn.zst"
+    if zst_path.exists():
+        log(f"  Using cached {zst_path} ({zst_path.stat().st_size / 1e9:.1f} GB)")
+        return zst_path
 
+    log(f"  Downloading {url}")
     req = urllib.request.Request(url)
     req.add_header("User-Agent", "pawn-lichess-extract/1.0")
-
     response = urllib.request.urlopen(req)
+
+    t0 = time.monotonic()
+    downloaded = 0
+    with open(zst_path, "wb") as f:
+        while True:
+            chunk = response.read(8 * 1024 * 1024)  # 8 MB
+            if not chunk:
+                break
+            f.write(chunk)
+            downloaded += len(chunk)
+            elapsed = time.monotonic() - t0
+            rate_mb = (downloaded / 1e6) / elapsed if elapsed > 0 else 0
+            print(f"\r  Downloaded {downloaded / 1e9:.2f} GB ({rate_mb:.0f} MB/s)", end="", flush=True)
+    print(flush=True)
+
+    response.close()
+    log(f"  Saved {zst_path} ({downloaded / 1e9:.2f} GB in {time.monotonic() - t0:.0f}s)")
+    return zst_path
+
+
+def stream_pgn_from_zst(zst_path: Path, batch_size: int):
+    """Yield PGN text batches from a local .zst file."""
+    with open(zst_path, "rb") as f:
+        yield from stream_pgn_games(f, batch_size)
+
+
+def download_month(year_month: str, output_dir: Path, batch_size: int):
+    """Download and parse a single month's PGN dump, yielding parsed batches."""
+    zst_path = download_zst(year_month, output_dir)
     total_games = 0
     batch_num = 0
 
-    for pgn_text, n_games_in_chunk in stream_pgn_games(response, batch_size):
+    for pgn_text, n_games_in_chunk in stream_pgn_from_zst(zst_path, batch_size):
         if not pgn_text.strip():
             continue
 
@@ -140,8 +172,89 @@ def download_month(year_month: str, output_dir: Path, batch_size: int):
 
         yield parsed
 
-    response.close()
     log(f"  [{year_month}] Done — {total_games:,} games total")
+
+
+def sample_holdout(
+    zst_path: Path,
+    date_start: str,
+    date_end: str,
+    n_games: int,
+    batch_size: int,
+    seed: int,
+) -> pl.DataFrame:
+    """Uniformly sample n_games from a date range within a .zst PGN dump.
+
+    Two-pass approach:
+    1. Count games in the date range (header-only scan, no tokenization)
+    2. Generate random indices, parse only those games
+    """
+    # Pass 1: count
+    log(f"  Pass 1: counting games in [{date_start}, {date_end}]")
+    total_in_range = 0
+    t0 = time.monotonic()
+    for pgn_text, _ in stream_pgn_from_zst(zst_path, batch_size):
+        if not pgn_text.strip():
+            continue
+        total_in_range += chess_engine.count_pgn_games_in_date_range(
+            pgn_text, date_start, date_end
+        )
+    dt = time.monotonic() - t0
+    log(f"  Found {total_in_range:,} games in range ({dt:.1f}s)")
+
+    if total_in_range == 0:
+        return pl.DataFrame()
+
+    # Generate random sample indices
+    actual_n = min(n_games, total_in_range)
+    rng = np.random.default_rng(seed)
+    indices = set(rng.choice(total_in_range, size=actual_n, replace=False).tolist())
+    log(f"  Sampling {actual_n:,} of {total_in_range:,} games (seed={seed})")
+
+    # Pass 2: parse only sampled games
+    log(f"  Pass 2: parsing sampled games")
+    frames = []
+    game_offset = 0
+    t0 = time.monotonic()
+    for pgn_text, _ in stream_pgn_from_zst(zst_path, batch_size):
+        if not pgn_text.strip():
+            continue
+
+        # Count how many date-matching games are in this chunk
+        chunk_count = chess_engine.count_pgn_games_in_date_range(
+            pgn_text, date_start, date_end
+        )
+
+        # Check if any of our target indices fall in this chunk's range
+        chunk_indices = [
+            i for i in range(game_offset, game_offset + chunk_count)
+            if i in indices
+        ]
+
+        if chunk_indices:
+            parsed = chess_engine.parse_pgn_sampled(
+                pgn_text,
+                chunk_indices,
+                date_start,
+                date_end,
+                game_offset=game_offset,
+                max_ply=MAX_PLY,
+                min_ply=1,
+            )
+            n = parsed["tokens"].shape[0]
+            if n > 0:
+                frames.append(batch_to_dataframe(parsed))
+
+        game_offset += chunk_count
+
+    dt = time.monotonic() - t0
+    if not frames:
+        log(f"  No games parsed")
+        return pl.DataFrame()
+
+    result = pl.concat(frames)
+    log(f"  Parsed {len(result):,} games ({dt:.1f}s)")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -398,55 +511,33 @@ def main():
 
     if args.holdout_month:
         log(f"\n=== Processing holdout month {args.holdout_month} ===")
-        target_per_half = args.holdout_games
 
+        # Download the zstd file (reused for both count and parse passes)
+        zst_path = download_zst(args.holdout_month, args.output)
+
+        # Date ranges: first half of month -> val, second half -> test
+        # UTCDate format is "YYYY.MM.DD"
         year, mon = args.holdout_month.split("-")
-        midpoint = datetime(int(year), int(mon), 15)
+        val_start = f"{year}.{mon}.01"
+        val_end = f"{year}.{mon}.14"
+        test_start = f"{year}.{mon}.15"
+        test_end = f"{year}.{mon}.31"
 
-        # Accumulate games from each half of the month, stopping early
-        # once we have enough candidates in both halves. We oversample by
-        # 2x to give random sampling room, then stop downloading.
-        oversample = target_per_half * 2
-        first_half_frames: list[pl.DataFrame] = []
-        second_half_frames: list[pl.DataFrame] = []
-        n_first = 0
-        n_second = 0
-
-        for parsed in download_month(args.holdout_month, args.output, args.batch_size):
-            df = batch_to_dataframe(parsed)
-            if df.is_empty():
-                continue
-
-            fh = df.filter(pl.col("date") < midpoint)
-            sh = df.filter(pl.col("date") >= midpoint)
-
-            if not fh.is_empty() and n_first < oversample:
-                first_half_frames.append(fh)
-                n_first += len(fh)
-            if not sh.is_empty() and n_second < oversample:
-                second_half_frames.append(sh)
-                n_second += len(sh)
-
-            if n_first >= oversample and n_second >= oversample:
-                log(f"  Collected enough holdout candidates, stopping early")
-                break
-
-        # Sample from collected candidates
-        if first_half_frames:
-            first_half = pl.concat(first_half_frames)
-            n_val = min(target_per_half, len(first_half))
-            val_df = first_half.sample(n=n_val, seed=args.seed)
+        log(f"  Val date range: [{val_start}, {val_end}]")
+        val_df = sample_holdout(
+            zst_path, val_start, val_end,
+            args.holdout_games, args.batch_size, args.seed,
+        )
+        if not val_df.is_empty():
             buffers["validation"].add(val_df)
-            log(f"  Val: sampled {n_val:,} from {len(first_half):,} first-half games")
-            del first_half, first_half_frames
 
-        if second_half_frames:
-            second_half = pl.concat(second_half_frames)
-            n_test = min(target_per_half, len(second_half))
-            test_df = second_half.sample(n=n_test, seed=args.seed)
+        log(f"  Test date range: [{test_start}, {test_end}]")
+        test_df = sample_holdout(
+            zst_path, test_start, test_end,
+            args.holdout_games, args.batch_size, args.seed + 1,
+        )
+        if not test_df.is_empty():
             buffers["test"].add(test_df)
-            log(f"  Test: sampled {n_test:,} from {len(second_half):,} second-half games")
-            del second_half, second_half_frames
 
     # ── Phase 2: Process training months ───────────────────────────────
     total_train = 0
