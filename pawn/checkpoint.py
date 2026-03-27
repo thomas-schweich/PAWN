@@ -539,12 +539,20 @@ def load_backbone_weights(
     """Load model weights and config for inference with integrity verification.
 
     Works with:
+    - HuggingFace repo IDs (e.g. "thomas-schweich/pawn-small") — downloads
+      model.safetensors + config.json via huggingface_hub
     - Legacy .pt files (extracts model_state_dict + model_config)
     - New checkpoint directories (reads model.safetensors + config.json, verifies .complete)
     - Bare model.safetensors files (no .complete check — used for HF downloads)
 
     Returns (state_dict, model_config_dict_or_None).
     """
+    path_str = str(path)
+
+    # HuggingFace repo ID: contains "/" and doesn't exist as a local path
+    if "/" in path_str and not Path(path_str).exists():
+        return _load_from_hf_repo(path_str, device)
+
     path = Path(path)
 
     if is_legacy_checkpoint(path):
@@ -578,6 +586,28 @@ def load_backbone_weights(
         return weights, config
 
     raise ValueError(f"Unrecognized checkpoint format: {path}")
+
+
+def _load_from_hf_repo(
+    repo_id: str,
+    device: str = "cpu",
+) -> tuple[dict[str, torch.Tensor], dict | None]:
+    """Download and load model weights from a HuggingFace model repo."""
+    from huggingface_hub import hf_hub_download
+
+    print(f"Downloading weights from HuggingFace: {repo_id}")
+    sf_path = hf_hub_download(repo_id, "model.safetensors")
+    weights = load_file(sf_path, device=device)
+
+    config = None
+    try:
+        config_path = hf_hub_download(repo_id, "config.json")
+        with open(config_path) as f:
+            config = json.load(f).get("model_config")
+    except Exception:
+        pass
+
+    return weights, config
 
 
 # ---------------------------------------------------------------------------

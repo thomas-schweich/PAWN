@@ -252,60 +252,160 @@ def prepare_lichess_dataset(
     }
 
 
+def _scan_parquet(
+    parquet_path: str | Path = None,
+    hf_repo: str = None,
+    split: str = "train",
+) -> "pl.LazyFrame":
+    """Create a Polars LazyFrame from a local Parquet file or HF dataset repo."""
+    import polars as pl
+
+    if hf_repo is not None:
+        # Use hf:// protocol for direct lazy scanning from HuggingFace
+        hf_url = f"hf://datasets/{hf_repo}/data/{split}-*.parquet"
+        try:
+            return pl.scan_parquet(hf_url)
+        except Exception:
+            # Fallback: download files and scan locally
+            from huggingface_hub import hf_hub_download, HfApi
+            api = HfApi()
+            files = api.list_repo_files(hf_repo, repo_type="dataset")
+            parquet_files = [
+                f for f in files
+                if f.endswith(".parquet") and f"/{split}-" in f"/{f}"
+            ]
+            if not parquet_files:
+                # No split-specific files — try all parquet files
+                parquet_files = [f for f in files if f.endswith(".parquet")]
+            local_files = [
+                hf_hub_download(hf_repo, pf, repo_type="dataset")
+                for pf in parquet_files
+            ]
+            return pl.scan_parquet(local_files)
+    elif parquet_path is not None:
+        return pl.scan_parquet(str(parquet_path))
+    else:
+        raise ValueError("Either parquet_path or hf_repo must be provided")
+
+
 def prepare_lichess_parquet(
     parquet_path: str | Path = None,
     hf_repo: str = None,
     max_ply: int = 255,
     max_games: int = 50_000,
     min_ply: int = 10,
+    split: str = "train",
 ) -> dict:
-    """Load a Lichess Parquet dataset and produce training-ready tensors.
+    """Load a Parquet dataset and produce training-ready tensors.
+
+    Supports two Parquet formats:
+    1. **PAWN token format** (has ``tokens`` column): pre-tokenized list[int16].
+       No parsing needed — just pad and pack. Used by pawn-lichess-full and
+       stockfish-nodes1 datasets.
+    2. **Legacy PGN format** (has ``pgn`` column): SAN move text that needs
+       tokenization via the Rust engine.
 
     Reads from a local Parquet file or a HuggingFace dataset repo.
-    Expects columns: pgn (SAN move text), result (1-0/0-1/1/2-1/2).
-
     Returns the same dict format as prepare_lichess_dataset().
     """
-
     import polars as pl
 
-    if hf_repo is not None:
-        from huggingface_hub import hf_hub_download, HfApi
-        api = HfApi()
-        files = api.list_repo_files(hf_repo, repo_type="dataset")
-        parquet_files = [f for f in files if f.endswith(".parquet")]
-        local_files = [hf_hub_download(hf_repo, pf, repo_type="dataset")
-                       for pf in parquet_files]
-        lf = pl.scan_parquet(local_files)
-    elif parquet_path is not None:
-        lf = pl.scan_parquet(str(parquet_path))
-    else:
-        raise ValueError("Either parquet_path or hf_repo must be provided")
+    lf = _scan_parquet(parquet_path, hf_repo, split)
+    schema = lf.collect_schema()
 
-    # Lazy: select only needed columns, limit rows, then collect
-    df = (
-        lf.select(["pgn", "result"])
-        .head(max_games)
-        .collect()
-    )
+    if "tokens" in schema:
+        return _prepare_from_tokens(lf, max_ply, max_games, min_ply)
+    elif "pgn" in schema:
+        return _prepare_from_pgn(lf, max_ply, max_games, min_ply)
+    else:
+        raise ValueError(
+            f"Parquet schema must have 'tokens' or 'pgn' column, "
+            f"got: {list(schema.names())}"
+        )
+
+
+def _prepare_from_tokens(
+    lf: "pl.LazyFrame",
+    max_ply: int,
+    max_games: int,
+    min_ply: int,
+) -> dict:
+    """Load pre-tokenized PAWN format: tokens list[int16] + result str."""
+    import polars as pl
+
+    # Lazy select + filter + limit
+    needed_cols = ["tokens", "result"]
+    if "game_length" in lf.collect_schema():
+        needed_cols.append("game_length")
+
+    df = lf.select(needed_cols).head(max_games).collect()
+    print(f"Loaded {len(df):,} games from pre-tokenized Parquet")
+
+    # Extract token lists → padded numpy array
+    token_lists = df["tokens"].to_list()
+    N = len(token_lists)
+
+    move_ids = np.zeros((N, max_ply), dtype=np.int16)
+    game_lengths = np.zeros(N, dtype=np.int16)
+
+    for i, toks in enumerate(token_lists):
+        length = min(len(toks), max_ply)
+        game_lengths[i] = length
+        move_ids[i, :length] = toks[:length]
+
+    # Apply min_ply filter
+    results = df["result"].to_list()
+    if min_ply > 1:
+        keep = game_lengths >= min_ply
+        move_ids = move_ids[keep]
+        game_lengths = game_lengths[keep]
+        results = [r for r, k in zip(results, keep) if k]
+        N = len(results)
+        print(f"  After min_ply={min_ply} filter: {N:,} games")
+
+    outcome_tokens = _result_to_outcome(results)
+
+    seq_len = max_ply + 1
+    from pawn.data import pack_clm_sequences
+    batch = pack_clm_sequences(move_ids, game_lengths, outcome_tokens, seq_len)
+
+    return {
+        "move_ids": move_ids,
+        "game_lengths": game_lengths,
+        "input_ids": batch["input_ids"],
+        "targets": batch["targets"],
+        "loss_mask": batch["loss_mask"],
+        "outcome_tokens": outcome_tokens,
+        "n_games": N,
+    }
+
+
+def _prepare_from_pgn(
+    lf: "pl.LazyFrame",
+    max_ply: int,
+    max_games: int,
+    min_ply: int,
+) -> dict:
+    """Load legacy PGN format: pgn str + result str, tokenize via Rust."""
+    import polars as pl
+    import re
+
+    df = lf.select(["pgn", "result"]).head(max_games).collect()
     n_to_use = len(df)
-    print(f"Loaded {n_to_use} games from Parquet")
+    print(f"Loaded {n_to_use:,} games from PGN Parquet")
 
     pgn_strings = df["pgn"].to_list()
     results = df["result"].to_list()
 
     # Split PGN text into move lists, stripping comments, move numbers, results
-    import re
     games: list[list[str]] = []
     for pgn_text in pgn_strings:
-        # Strip { ... } comments (clock annotations, etc.)
         cleaned = re.sub(r'\{[^}]*\}', '', pgn_text)
         tokens = cleaned.split()
         moves = []
         for tok in tokens:
             if tok in ("1-0", "0-1", "1/2-1/2", "*"):
                 break
-            # Skip move numbers (1. 2. 12... etc.)
             stripped = tok.rstrip(".")
             if stripped and stripped.replace(".", "").isdigit():
                 continue
@@ -314,19 +414,17 @@ def prepare_lichess_parquet(
             moves.append(tok)
         games.append(moves)
 
-    # Tokenize via Rust engine (batch)
-    print(f"  Tokenizing {len(games)} games...")
+    print(f"  Tokenizing {len(games):,} games...")
     move_ids, game_lengths = engine.pgn_to_tokens(games, max_ply=max_ply)
     N = move_ids.shape[0]
 
-    # Apply min_ply filter
     if min_ply > 1:
         keep = game_lengths >= min_ply
         move_ids = move_ids[keep]
         game_lengths = game_lengths[keep]
         results = [r for r, k in zip(results, keep) if k]
         N = len(results)
-        print(f"  After min_ply={min_ply} filter: {N} games")
+        print(f"  After min_ply={min_ply} filter: {N:,} games")
 
     outcome_tokens = _result_to_outcome(results)
 
