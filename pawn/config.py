@@ -6,21 +6,34 @@ from dataclasses import dataclass
 # Outcome token IDs — must match engine/src/vocab.rs
 PAD_TOKEN = 0
 OUTCOME_TOKEN_BASE = 4273
+
+# Pretraining outcomes (random games — natural terminations)
 WHITE_CHECKMATES = 4273
 BLACK_CHECKMATES = 4274
 STALEMATE = 4275
-DRAW_BY_RULE = 4276
-PLY_LIMIT = 4277
+DRAW_BY_RULE = 4276       # 75-move, fivefold repetition, insufficient material
+PLY_LIMIT = 4277          # Hit 255 plies (also used for truncated Lichess games)
+
+# Lichess-specific outcomes (finetuning data)
+WHITE_RESIGNS = 4278      # Normal termination, white wins, no checkmate
+BLACK_RESIGNS = 4279      # Normal termination, black wins, no checkmate
+DRAW_BY_AGREEMENT = 4280  # Normal termination, draw, not stalemate
+WHITE_WINS_ON_TIME = 4281 # Time forfeit, white wins
+BLACK_WINS_ON_TIME = 4282 # Time forfeit, black wins
+DRAW_BY_TIME = 4283       # Time forfeit, draw (insufficient mating material)
+
+N_PRETRAINING_OUTCOMES = 5  # Original vocab: tokens 4273-4277
+N_TOTAL_OUTCOMES = 11       # Full vocab: tokens 4273-4283
 
 
 @dataclass
 class CLMConfig:
     """Model architecture hyperparameters."""
 
-    # Vocabulary: 1 pad + 4096 grid + 176 promo + 5 outcome tokens
-    vocab_size: int = 4278
+    # Vocabulary: 1 pad + 4096 grid + 176 promo + 11 outcome tokens
+    vocab_size: int = 4284
     max_seq_len: int = 256  # 1 outcome + up to 255 move/padding tokens
-    n_outcomes: int = 5
+    n_outcomes: int = N_TOTAL_OUTCOMES
 
     # Transformer
     d_model: int = 512
