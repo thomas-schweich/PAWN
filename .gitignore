@@ -42,9 +42,6 @@ local/
 # Misc
 runpodctl.tar.gz
 .claude/
-<<<<<<< HEAD
-.playwright-mcp
-=======
 .playwright-mcp/
-local/
->>>>>>> c965110657b87bef82768cf9960b3f5486c54867
+.env
+study.sqlite
