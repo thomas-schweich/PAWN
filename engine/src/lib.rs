@@ -810,6 +810,267 @@ fn pgn_to_uci(py: Python<'_>, games: Vec<Vec<String>>) -> PyResult<Vec<Vec<Strin
 }
 
 // ---------------------------------------------------------------------------
+// Enriched PGN parsing (for dataset construction)
+// ---------------------------------------------------------------------------
+
+/// Parse PGN text with full annotation extraction for dataset building.
+///
+/// Extracts move tokens, clock annotations, eval annotations, and all PGN
+/// headers in a single pass. Designed for streaming: Python passes chunks of
+/// PGN text (containing complete games), Rust returns structured columns.
+///
+/// Returns a dict with:
+///   tokens: ndarray[i16, (N, max_ply)]   — PAWN token IDs, 0-padded
+///   clocks: ndarray[u16, (N, max_ply)]   — seconds remaining, 0-padded
+///   evals: ndarray[i16, (N, max_ply)]    — centipawns, 0-padded (i16::MIN = no annotation)
+///   game_lengths: ndarray[u16, (N,)]     — number of plies per game
+///   white_elo: ndarray[u16, (N,)]        — white Elo (0 if missing)
+///   black_elo: ndarray[u16, (N,)]        — black Elo (0 if missing)
+///   white_rating_diff: ndarray[i16, (N,)] — white rating change (0 if missing)
+///   black_rating_diff: ndarray[i16, (N,)] — black rating change (0 if missing)
+///   result: list[str]                     — "1-0", "0-1", "1/2-1/2", or ""
+///   white: list[str]                      — white player name
+///   black: list[str]                      — black player name
+///   eco: list[str]                        — ECO code
+///   opening: list[str]                    — opening name
+///   time_control: list[str]               — time control string
+///   termination: list[str]                — termination reason
+///   date_time: list[str]                  — "YYYY.MM.DD HH:MM:SS" UTC
+///   site: list[str]                       — game URL
+#[pyfunction]
+#[pyo3(signature = (content, max_ply=255, max_games=1_000_000, min_ply=1))]
+fn parse_pgn_enriched<'py>(
+    py: Python<'py>,
+    content: &str,
+    max_ply: usize,
+    max_games: usize,
+    min_ply: usize,
+) -> PyResult<PyObject> {
+    let games = py.allow_threads(|| {
+        pgn::parse_pgn_enriched(content, max_ply, max_games, min_ply)
+    });
+
+    let n = games.len();
+    let dict = PyDict::new(py);
+
+    // Flat 0-padded arrays for tokens, clocks, evals (N * max_ply)
+    let mut flat_tokens = vec![0i16; n * max_ply];
+    let mut flat_clocks = vec![0u16; n * max_ply];
+    let mut flat_evals = vec![0i16; n * max_ply];
+
+    // Scalar arrays
+    let mut lengths_out = Vec::with_capacity(n);
+    let mut white_elo_out = Vec::with_capacity(n);
+    let mut black_elo_out = Vec::with_capacity(n);
+    let mut white_rd_out = Vec::with_capacity(n);
+    let mut black_rd_out = Vec::with_capacity(n);
+
+    // String lists
+    let mut result_out = Vec::with_capacity(n);
+    let mut white_out = Vec::with_capacity(n);
+    let mut black_out = Vec::with_capacity(n);
+    let mut eco_out = Vec::with_capacity(n);
+    let mut opening_out = Vec::with_capacity(n);
+    let mut tc_out = Vec::with_capacity(n);
+    let mut term_out = Vec::with_capacity(n);
+    let mut datetime_out = Vec::with_capacity(n);
+    let mut site_out = Vec::with_capacity(n);
+
+    for (gi, g) in games.iter().enumerate() {
+        let offset = gi * max_ply;
+        let len = g.game_length.min(max_ply);
+        for t in 0..len {
+            flat_tokens[offset + t] = g.tokens[t] as i16;
+            flat_clocks[offset + t] = g.clocks[t];
+            flat_evals[offset + t] = g.evals[t];
+        }
+
+        lengths_out.push(g.game_length as u16);
+
+        let h = &g.headers;
+        white_elo_out.push(h.get("WhiteElo").and_then(|s| s.parse::<u16>().ok()).unwrap_or(0));
+        black_elo_out.push(h.get("BlackElo").and_then(|s| s.parse::<u16>().ok()).unwrap_or(0));
+        white_rd_out.push(h.get("WhiteRatingDiff").and_then(|s| s.parse::<i16>().ok()).unwrap_or(0));
+        black_rd_out.push(h.get("BlackRatingDiff").and_then(|s| s.parse::<i16>().ok()).unwrap_or(0));
+
+        result_out.push(h.get("Result").cloned().unwrap_or_default());
+        white_out.push(h.get("White").cloned().unwrap_or_default());
+        black_out.push(h.get("Black").cloned().unwrap_or_default());
+        eco_out.push(h.get("ECO").cloned().unwrap_or_default());
+        opening_out.push(h.get("Opening").cloned().unwrap_or_default());
+        tc_out.push(h.get("TimeControl").cloned().unwrap_or_default());
+        term_out.push(h.get("Termination").cloned().unwrap_or_default());
+        site_out.push(h.get("Site").cloned().unwrap_or_default());
+
+        let date = h.get("UTCDate").cloned().unwrap_or_default();
+        let time = h.get("UTCTime").cloned().unwrap_or_default();
+        if !date.is_empty() && !time.is_empty() {
+            datetime_out.push(format!("{} {}", date, time));
+        } else {
+            datetime_out.push(date);
+        }
+    }
+
+    // 2D numpy arrays: (N, max_ply)
+    let tokens_arr = numpy::PyArray::from_vec(py, flat_tokens).reshape([n, max_ply])?;
+    let clocks_arr = numpy::PyArray::from_vec(py, flat_clocks).reshape([n, max_ply])?;
+    let evals_arr = numpy::PyArray::from_vec(py, flat_evals).reshape([n, max_ply])?;
+
+    // 1D numpy arrays
+    let lengths_arr = numpy::PyArray::from_vec(py, lengths_out);
+    let white_elo_arr = numpy::PyArray::from_vec(py, white_elo_out);
+    let black_elo_arr = numpy::PyArray::from_vec(py, black_elo_out);
+    let white_rd_arr = numpy::PyArray::from_vec(py, white_rd_out);
+    let black_rd_arr = numpy::PyArray::from_vec(py, black_rd_out);
+
+    dict.set_item("tokens", tokens_arr)?;
+    dict.set_item("clocks", clocks_arr)?;
+    dict.set_item("evals", evals_arr)?;
+    dict.set_item("game_lengths", lengths_arr)?;
+    dict.set_item("white_elo", white_elo_arr)?;
+    dict.set_item("black_elo", black_elo_arr)?;
+    dict.set_item("white_rating_diff", white_rd_arr)?;
+    dict.set_item("black_rating_diff", black_rd_arr)?;
+    dict.set_item("result", result_out)?;
+    dict.set_item("white", white_out)?;
+    dict.set_item("black", black_out)?;
+    dict.set_item("eco", eco_out)?;
+    dict.set_item("opening", opening_out)?;
+    dict.set_item("time_control", tc_out)?;
+    dict.set_item("termination", term_out)?;
+    dict.set_item("date_time", datetime_out)?;
+    dict.set_item("site", site_out)?;
+
+    Ok(dict.into())
+}
+
+/// Count games in a PGN string whose UTCDate falls within [date_start, date_end].
+/// Header-only scan — no tokenization. Very fast.
+#[pyfunction]
+fn count_pgn_games_in_date_range(
+    py: Python<'_>,
+    content: &str,
+    date_start: &str,
+    date_end: &str,
+) -> PyResult<usize> {
+    let count = py.allow_threads(|| {
+        pgn::count_games_in_date_range(content, date_start, date_end)
+    });
+    Ok(count)
+}
+
+/// Parse only specific games (by index within a date range) from a PGN string.
+///
+/// Used for uniform random sampling: call count_pgn_games_in_date_range first
+/// to get the total, generate random indices in Python, then call this to
+/// parse only those games. `game_offset` is the cumulative count of
+/// date-matching games from previous chunks.
+///
+/// Returns the same dict format as parse_pgn_enriched.
+#[pyfunction]
+#[pyo3(signature = (content, indices, date_start, date_end, game_offset=0, max_ply=255, min_ply=1))]
+fn parse_pgn_sampled<'py>(
+    py: Python<'py>,
+    content: &str,
+    indices: Vec<usize>,
+    date_start: &str,
+    date_end: &str,
+    game_offset: usize,
+    max_ply: usize,
+    min_ply: usize,
+) -> PyResult<PyObject> {
+    let index_set: std::collections::HashSet<usize> = indices.into_iter().collect();
+
+    let games = py.allow_threads(|| {
+        pgn::parse_pgn_enriched_sampled(
+            content, max_ply, min_ply, date_start, date_end, &index_set, game_offset,
+        )
+    });
+
+    // Reuse the same dict-building logic as parse_pgn_enriched
+    let n = games.len();
+    let dict = PyDict::new(py);
+
+    let mut flat_tokens = vec![0i16; n * max_ply];
+    let mut flat_clocks = vec![0u16; n * max_ply];
+    let mut flat_evals = vec![0i16; n * max_ply];
+    let mut lengths_out = Vec::with_capacity(n);
+    let mut white_elo_out = Vec::with_capacity(n);
+    let mut black_elo_out = Vec::with_capacity(n);
+    let mut white_rd_out = Vec::with_capacity(n);
+    let mut black_rd_out = Vec::with_capacity(n);
+    let mut result_out = Vec::with_capacity(n);
+    let mut white_out = Vec::with_capacity(n);
+    let mut black_out = Vec::with_capacity(n);
+    let mut eco_out = Vec::with_capacity(n);
+    let mut opening_out = Vec::with_capacity(n);
+    let mut tc_out = Vec::with_capacity(n);
+    let mut term_out = Vec::with_capacity(n);
+    let mut datetime_out = Vec::with_capacity(n);
+    let mut site_out = Vec::with_capacity(n);
+
+    for (gi, g) in games.iter().enumerate() {
+        let offset = gi * max_ply;
+        let len = g.game_length.min(max_ply);
+        for t in 0..len {
+            flat_tokens[offset + t] = g.tokens[t] as i16;
+            flat_clocks[offset + t] = g.clocks[t];
+            flat_evals[offset + t] = g.evals[t];
+        }
+        lengths_out.push(g.game_length as u16);
+        let h = &g.headers;
+        white_elo_out.push(h.get("WhiteElo").and_then(|s| s.parse::<u16>().ok()).unwrap_or(0));
+        black_elo_out.push(h.get("BlackElo").and_then(|s| s.parse::<u16>().ok()).unwrap_or(0));
+        white_rd_out.push(h.get("WhiteRatingDiff").and_then(|s| s.parse::<i16>().ok()).unwrap_or(0));
+        black_rd_out.push(h.get("BlackRatingDiff").and_then(|s| s.parse::<i16>().ok()).unwrap_or(0));
+        result_out.push(h.get("Result").cloned().unwrap_or_default());
+        white_out.push(h.get("White").cloned().unwrap_or_default());
+        black_out.push(h.get("Black").cloned().unwrap_or_default());
+        eco_out.push(h.get("ECO").cloned().unwrap_or_default());
+        opening_out.push(h.get("Opening").cloned().unwrap_or_default());
+        tc_out.push(h.get("TimeControl").cloned().unwrap_or_default());
+        term_out.push(h.get("Termination").cloned().unwrap_or_default());
+        site_out.push(h.get("Site").cloned().unwrap_or_default());
+        let date = h.get("UTCDate").cloned().unwrap_or_default();
+        let time = h.get("UTCTime").cloned().unwrap_or_default();
+        if !date.is_empty() && !time.is_empty() {
+            datetime_out.push(format!("{} {}", date, time));
+        } else {
+            datetime_out.push(date);
+        }
+    }
+
+    let tokens_arr = numpy::PyArray::from_vec(py, flat_tokens).reshape([n, max_ply])?;
+    let clocks_arr = numpy::PyArray::from_vec(py, flat_clocks).reshape([n, max_ply])?;
+    let evals_arr = numpy::PyArray::from_vec(py, flat_evals).reshape([n, max_ply])?;
+    let lengths_arr = numpy::PyArray::from_vec(py, lengths_out);
+    let white_elo_arr = numpy::PyArray::from_vec(py, white_elo_out);
+    let black_elo_arr = numpy::PyArray::from_vec(py, black_elo_out);
+    let white_rd_arr = numpy::PyArray::from_vec(py, white_rd_out);
+    let black_rd_arr = numpy::PyArray::from_vec(py, black_rd_out);
+
+    dict.set_item("tokens", tokens_arr)?;
+    dict.set_item("clocks", clocks_arr)?;
+    dict.set_item("evals", evals_arr)?;
+    dict.set_item("game_lengths", lengths_arr)?;
+    dict.set_item("white_elo", white_elo_arr)?;
+    dict.set_item("black_elo", black_elo_arr)?;
+    dict.set_item("white_rating_diff", white_rd_arr)?;
+    dict.set_item("black_rating_diff", black_rd_arr)?;
+    dict.set_item("result", result_out)?;
+    dict.set_item("white", white_out)?;
+    dict.set_item("black", black_out)?;
+    dict.set_item("eco", eco_out)?;
+    dict.set_item("opening", opening_out)?;
+    dict.set_item("time_control", tc_out)?;
+    dict.set_item("termination", term_out)?;
+    dict.set_item("date_time", datetime_out)?;
+    dict.set_item("site", site_out)?;
+
+    Ok(dict.into())
+}
+
+// ---------------------------------------------------------------------------
 // UCI engine self-play generation
 // ---------------------------------------------------------------------------
 
@@ -1172,6 +1433,9 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_uci_file, m)?)?;
     m.add_function(wrap_pyfunction!(uci_to_tokens, m)?)?;
     m.add_function(wrap_pyfunction!(pgn_to_uci, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_pgn_enriched, m)?)?;
+    m.add_function(wrap_pyfunction!(count_pgn_games_in_date_range, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_pgn_sampled, m)?)?;
     m.add_function(wrap_pyfunction!(generate_engine_games_py, m)?)?;
     m.add_function(wrap_pyfunction!(compute_accuracy_ceiling_py, m)?)?;
     Ok(())

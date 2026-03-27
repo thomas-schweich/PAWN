@@ -92,6 +92,13 @@ COPY deploy/entrypoint-rosa-sweep.sh /entrypoint-rosa-sweep.sh
 RUN chmod +x /entrypoint-rosa-sweep.sh
 ENTRYPOINT ["/entrypoint-rosa-sweep.sh"]
 
+# ── Lichess extract — downloads PGN, writes Parquet, pushes to HF ───
+FROM runtime-base AS lichess-extract
+RUN pip install --no-cache-dir zstandard
+COPY deploy/entrypoint-lichess-parquet.sh /entrypoint-lichess-parquet.sh
+RUN chmod +x /entrypoint-lichess-parquet.sh
+ENTRYPOINT ["/entrypoint-lichess-parquet.sh"]
+
 # ── Interactive (default) — SSH + Jupyter, stays alive ───────────────
 FROM runtime-base AS interactive
 # Inherits /start.sh entrypoint from Runpod base image

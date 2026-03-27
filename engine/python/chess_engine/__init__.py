@@ -26,6 +26,9 @@ from chess_engine._engine import (
     # PGN parsing
     parse_pgn_file,
     pgn_to_tokens,
+    parse_pgn_enriched,
+    count_pgn_games_in_date_range,
+    parse_pgn_sampled,
     # UCI parsing
     parse_uci_file,
     uci_to_tokens,
@@ -60,6 +63,9 @@ __all__ = [
     "validate_games",
     "parse_pgn_file",
     "pgn_to_tokens",
+    "parse_pgn_enriched",
+    "count_pgn_games_in_date_range",
+    "parse_pgn_sampled",
     "parse_uci_file",
     "uci_to_tokens",
     "pgn_to_uci",

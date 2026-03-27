@@ -14,6 +14,8 @@ deploy/
 !deploy/entrypoint-extract.sh
 !deploy/entrypoint-lc0.sh
 !deploy/entrypoint-rosa-sweep.sh
+!deploy/entrypoint-lc0-selfplay.sh
+!deploy/entrypoint-lichess-parquet.sh
 *.so
 CLAUDE.md
 docs/
