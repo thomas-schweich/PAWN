@@ -1,6 +1,6 @@
 # Slim CPU image for Lichess PGN -> Parquet extraction.
 # No PyTorch, no CUDA — just the Rust engine, Polars, and zstandard.
-# ~2 GB vs ~55 GB for the GPU image.
+# Includes openssh-server for RunPod SSH access.
 #
 # Build:
 #   docker build --platform linux/amd64 \
@@ -43,8 +43,11 @@ RUN cd engine && uv run --no-project --with maturin maturin build --release
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+        ca-certificates openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/run/sshd \
+    && echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config \
+    && echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config
 
 # Install just what we need: engine wheel + extraction deps
 COPY --from=builder /build/engine/target/wheels/*.whl /tmp/

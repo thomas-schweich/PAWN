@@ -1,7 +1,7 @@
 #!/bin/bash
 # Lichess PGN -> PAWN Parquet extraction entrypoint.
-# Downloads monthly database dumps, parses via Rust engine, writes sharded
-# Parquet with train/val/test splits, and optionally pushes to HuggingFace.
+# Downloads monthly database dumps in parallel, parses via Rust engine,
+# writes sharded Parquet with train/val/test splits, pushes to HuggingFace.
 #
 # Required env vars:
 #   MONTHS          — space-separated training months (e.g., "2025-01 2025-02 2025-03")
@@ -9,14 +9,27 @@
 # Optional env vars:
 #   HF_TOKEN        — HuggingFace token (for pushing dataset)
 #   HF_REPO         — HuggingFace dataset repo (e.g., "thomas-schweich/pawn-lichess-full")
-#   HOLDOUT_MONTH   — month for val/test (e.g., "2023-12")
+#   HOLDOUT_MONTH   — month for val/test (e.g., "2026-01")
 #   HOLDOUT_GAMES   — games per split from holdout month (default: 50000)
 #   BATCH_SIZE      — games per parsing batch (default: 500000)
 #   SHARD_SIZE      — games per output shard (default: 1000000)
-#   MAX_GAMES       — stop after this many training games (for testing)
+#   MAX_GAMES       — stop after this many training games per month (for testing)
 #   OUTPUT_DIR      — output directory (default: /workspace/lichess-parquet)
 #   SEED            — random seed for holdout sampling (default: 42)
 set -euo pipefail
+
+# ── Start SSH server for RunPod access ─────────────────────────────────
+if [ -d /var/run/sshd ]; then
+    # Inject RunPod SSH public key if provided
+    if [ -n "${PUBLIC_KEY:-}" ]; then
+        mkdir -p /root/.ssh
+        echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
+        chmod 700 /root/.ssh
+        chmod 600 /root/.ssh/authorized_keys
+    fi
+    /usr/sbin/sshd
+    echo "SSH server started"
+fi
 
 echo "=== Lichess Parquet Extraction ==="
 echo "  Training months: ${MONTHS:?MONTHS env var is required}"
@@ -34,10 +47,7 @@ if [ -n "${HF_TOKEN:-}" ]; then
     echo "HF token persisted"
 fi
 
-# Install zstandard if not available (needed for streaming decompression)
-python3 -c "import zstandard" 2>/dev/null || pip install --no-cache-dir zstandard
-
-# Build the command as an array to avoid shell injection
+# Build the command as an array
 CMD=(python3 /opt/pawn/scripts/extract_lichess_parquet.py
     --months $MONTHS
     --output "${OUTPUT_DIR:-/workspace/lichess-parquet}"
@@ -59,4 +69,9 @@ fi
 
 echo "Running: ${CMD[*]}"
 echo ""
-exec "${CMD[@]}"
+"${CMD[@]}"
+
+# Keep container alive for SSH inspection after completion
+echo ""
+echo "=== Extraction complete. Container staying alive for inspection ==="
+sleep infinity
