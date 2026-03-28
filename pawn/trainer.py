@@ -334,7 +334,7 @@ class CLMTrainer:
         """Low-level JSONL write for seed_logs compatibility."""
         self.logger._write(record)
 
-    def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
+    def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         self.model.train()
 
         input_ids = batch["input_ids"].to(self.device)
