@@ -73,10 +73,22 @@ def count_params_from_weights(repo: str) -> int:
             total += f.get_tensor(key).numel()
     return total
 
-# Accuracy ceiling constants
-UNCOND_CEILING = 6.43
-NAIVE_CEILING = 6.44
-MCTS_CEILING = 7.92
+CEILING_PATH = Path("data/theoretical_ceiling.json")
+
+
+def load_ceilings() -> tuple[float, float, float]:
+    """Load accuracy ceilings from the canonical JSON artifact."""
+    if CEILING_PATH.exists():
+        with open(CEILING_PATH) as f:
+            data = json.load(f)
+        return (
+            data["unconditional_ceiling"] * 100,
+            data["naive_conditional_ceiling"] * 100,
+            data["conditional_ceiling"] * 100,
+        )
+    # Fallback if file not present
+    print("  Warning: data/theoretical_ceiling.json not found, using hardcoded ceilings")
+    return 6.43, 6.44, 7.92
 
 PROBE_DESCRIPTIONS = {
     "piece_type": "Per-square piece type (13 classes x 64 squares)",
@@ -211,9 +223,13 @@ def build_context(variant_key: str, variant: dict) -> dict:
         ctx.update(fallback.get(variant_key, {}))
 
     # Accuracy ratios
-    ctx["uncond_ratio"] = round(ctx["top1"] / UNCOND_CEILING * 100)
-    ctx["naive_ratio"] = round(ctx["top1"] / NAIVE_CEILING * 100)
-    ctx["mcts_ratio"] = round(ctx["top1"] / MCTS_CEILING * 100)
+    uncond, naive, mcts = load_ceilings()
+    ctx["uncond_ceiling"] = uncond
+    ctx["naive_ceiling"] = naive
+    ctx["mcts_ceiling"] = mcts
+    ctx["uncond_ratio"] = round(ctx["top1"] / uncond * 100)
+    ctx["naive_ratio"] = round(ctx["top1"] / naive * 100)
+    ctx["mcts_ratio"] = round(ctx["top1"] / mcts * 100)
 
     # Fetch eval results for probes and diagnostics
     eval_results = fetch_eval_results(repo)

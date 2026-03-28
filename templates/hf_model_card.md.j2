@@ -92,9 +92,9 @@ PAWN is trained on uniformly random chess games, so top-1 accuracy has a hard th
 
 | Ceiling | Ratio |
 |---------|-------|
-| Unconditioned (E\[1/N_legal\] = 6.43%) | {{ uncond_ratio }}% |
-| Naive-conditioned (1-ply filter = 6.44%) | {{ naive_ratio }}% |
-| Bayes-optimal conditioned (MCTS, 32 rollouts = 7.92%) | {{ mcts_ratio }}% |
+| Unconditioned (E\[1/N_legal\] = {{ "%.2f"|format(uncond_ceiling) }}%) | {{ uncond_ratio }}% |
+| Naive-conditioned (1-ply filter = {{ "%.2f"|format(naive_ceiling) }}%) | {{ naive_ratio }}% |
+| Bayes-optimal conditioned (MCTS, 32 rollouts = {{ "%.2f"|format(mcts_ceiling) }}%) | {{ mcts_ratio }}% |
 {% if probes %}
 
 ## Probe Results
