@@ -26,6 +26,7 @@ dependencies = [
     "optuna>=4.0.0",
     "optuna-dashboard>=0.17.0",
     # Dev
+    "pyright>=1.1.0",
     "pytest~=9.0.0",
     "ipykernel>=7.2.0",
 ]
@@ -80,6 +81,7 @@ reportMissingTypeStubs = false
 reportPrivateImportUsage = false
 reportMissingImports = "warning"
 include = ["pawn"]
+exclude = ["pawn/dashboard"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
