@@ -8,14 +8,14 @@ Usage:
     # LoRA sweep on Lichess data
     uv run python scripts/sweep.py \\
         --adapter lora \\
-        --checkpoint checkpoints/pawn-base/model.safetensors \\
+        --checkpoint thomas-schweich/pawn-base \\
         --pgn data/lichess_1200_1400.pgn \\
         --n-trials 30
 
     # Bottleneck sweep with custom output
     uv run python scripts/sweep.py \\
         --adapter bottleneck \\
-        --checkpoint checkpoints/pawn-base/model.safetensors \\
+        --checkpoint thomas-schweich/pawn-base \\
         --pgn data/lichess_1200_1400.pgn \\
         --n-trials 50 \\
         --output-dir sweeps/bottleneck_1200

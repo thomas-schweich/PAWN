@@ -13,7 +13,7 @@ Usage:
 
     # Split a single file
     python scripts/split_dataset.py \
-        --input data/stockfish-nodes1/data/nodes_0001.parquet \
+        --input /path/to/nodes_0001.parquet \
         --hf-repo thomas-schweich/stockfish-nodes1 \
         --seed 42
 """

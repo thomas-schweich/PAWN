@@ -94,8 +94,8 @@ There is also `scripts/train_tiny.py` for a standalone small transformer baselin
 
 ```bash
 uv run python scripts/train_bottleneck.py \
-    --checkpoint checkpoints/pawn-base.pt \
-    --pgn data/lichess_1800_1900.pgn \
+    --checkpoint thomas-schweich/pawn-base \
+    --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
     --bottleneck-dim 32 \
     --lr 1e-4
 ```
@@ -114,8 +114,8 @@ uv run python scripts/train_bottleneck.py \
 
 ```bash
 uv run python scripts/train_bottleneck.py \
-    --checkpoint checkpoints/pawn-base.pt \
-    --pgn data/lichess_1800_1900.pgn \
+    --checkpoint thomas-schweich/pawn-base \
+    --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
     --resume logs/bottleneck_20260315_120000/checkpoints/best.pt
 ```
 
@@ -126,8 +126,8 @@ Adapters can target specific layers or sublayer positions:
 ```bash
 # Only FFN adapters on layers 4-7
 uv run python scripts/train_bottleneck.py \
-    --checkpoint checkpoints/pawn-base.pt \
-    --pgn data/lichess_1800_1900.pgn \
+    --checkpoint thomas-schweich/pawn-base \
+    --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
     --no-adapt-attn --adapter-layers 4,5,6,7
 ```
 
@@ -155,7 +155,7 @@ If you prefer to deploy manually:
 
 ```bash
 # 1. Build deploy package locally
-bash deploy/build.sh --checkpoint checkpoints/pawn-base.pt --data-dir data/
+bash deploy/build.sh --checkpoint thomas-schweich/pawn-base --data-dir data/
 
 # 2. Transfer to pod
 rsync -avz --progress deploy/pawn-deploy/ root@<pod-ip>:/workspace/pawn/
