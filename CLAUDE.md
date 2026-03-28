@@ -221,26 +221,18 @@ from the trainer. Load via HF repo ID (e.g. `--checkpoint thomas-schweich/pawn-b
 
 ## RunPod Operations
 
-### Docker Build & Push
+### Docker Image
 
+A single Docker image (`thomasschweich/pawn:latest`) is **automatically built and pushed to Docker Hub by CI** on every merge to main. No manual builds needed.
+
+The image is based on `runpod/pytorch` (CUDA + SSH + Jupyter) with all Python deps pre-installed. Code lives at `/opt/pawn` on pods. SSH in and run experiments directly.
+
+To build locally (rarely needed):
 ```bash
-# Build runner target (auto-stop after training completes)
 docker build --platform linux/amd64 \
     --build-arg GIT_HASH=$(git rev-parse HEAD) \
-    --build-arg GIT_TAG=$(git tag --points-at HEAD) \
-    --target runner \
-    -t thomasschweich/pawn:latest-runner .
-
-# Build interactive target (SSH + Jupyter, stays alive)
-docker build --platform linux/amd64 \
-    --build-arg GIT_HASH=$(git rev-parse HEAD) \
-    --target interactive \
     -t thomasschweich/pawn:latest .
-
-docker push thomasschweich/pawn:latest-runner
 ```
-
-Code lives at `/opt/pawn` on pods (outside the `/workspace` volume mount).
 
 ### Pod Lifecycle
 
