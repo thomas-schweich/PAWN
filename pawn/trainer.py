@@ -474,11 +474,12 @@ class CLMTrainer:
                         flush=True,
                     )
 
-                    self.logger.log_train(  # type: ignore[arg-type]
+                    train_metrics = {"train/loss": loss_val, "train/accuracy": acc_val}
+                    self.logger.log_train(
                         step=self.global_step,
                         lr=lr, grad_norm=grad_norm,
                         step_time=step_time, games_per_sec=games_per_sec,
-                        **{"train/loss": loss_val, "train/accuracy": acc_val},
+                        **train_metrics,  # type: ignore[arg-type]
                     )
 
                     if self.wandb_run:
