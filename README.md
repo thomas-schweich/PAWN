@@ -1,29 +1,3 @@
----
-library_name: pawn
-license: apache-2.0
-tags:
-  - chess
-  - transformer
-  - world-model
-  - causal-lm
-  - next-token-prediction
-  - representation-learning
-  - parameter-efficient-finetuning
-  - pytorch
-  - rust
-language:
-  - en
-pipeline_tag: other
-citation: |
-  @software{schweich2026pawn,
-    author = {Schweich, Thomas},
-    title = {{PAWN}: Playstyle-Agnostic World-model Network for Chess},
-    year = 2026,
-    url = {https://github.com/thomas-schweich/PAWN},
-    license = {Apache-2.0}
-  }
----
-
 # PAWN: Playstyle-Agnostic World-model Network for Chess
 
 A small causal transformer trained on random chess games that learns legal moves, board state representations, and game dynamics purely from random legal move sequences absent any form of strategic play.
