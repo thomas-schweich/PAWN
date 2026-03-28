@@ -37,6 +37,9 @@ from pawn.data import create_validation_set
 from pawn.trainer import compute_legal_move_rate
 
 
+# Local metrics paths point to the zesty-osprey run (the 100K-step production
+# training run). These are hardcoded because this script was written to recover
+# that specific run's metrics. Update the paths if reusing for a different run.
 VARIANTS = {
     "small": {
         "repo": "thomas-schweich/pawn-small",
@@ -228,7 +231,9 @@ def backfill_variant(
     model = PAWNCLM(cfg).to(device).eval()
 
     print(f"  Generating validation set ({val_games} games)...")
-    val_data = create_validation_set(val_games, train_cfg.max_ply, seed=(2**63) - 1)
+    val_data = create_validation_set(
+        val_games, train_cfg.max_ply, seed=(2**63) - 1, discard_ply_limit=False,
+    )
 
     # --- Evaluate each available checkpoint ---
     step_to_metrics: dict[int, dict[str, float]] = {}
@@ -298,7 +303,7 @@ def _push_metrics(repo: str, records: list[dict], source_path: Path):
 
     api = HfApi()
 
-    # Write to temp file
+    # Write to temp file and upload
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
         for record in records:
             f.write(json.dumps(record) + "\n")
@@ -307,19 +312,20 @@ def _push_metrics(repo: str, records: list[dict], source_path: Path):
     val_count = sum(1 for r in records if r.get("type") == "val")
     has_top5 = sum(1 for r in records if r.get("type") == "val" and "val/top5_accuracy" in r)
 
-    api.upload_file(
-        path_or_fileobj=tmp_path,
-        path_in_repo="metrics.jsonl",
-        repo_id=repo,
-        repo_type="model",
-        commit_message=(
-            f"Restore complete metrics ({len(records)} records, "
-            f"{val_count} val, {has_top5} with extended fields)"
-        ),
-    )
-    print(f"  Pushed {len(records)} records to {repo}")
-
-    Path(tmp_path).unlink()
+    try:
+        api.upload_file(
+            path_or_fileobj=tmp_path,
+            path_in_repo="metrics.jsonl",
+            repo_id=repo,
+            repo_type="model",
+            commit_message=(
+                f"Restore complete metrics ({len(records)} records, "
+                f"{val_count} val, {has_top5} with extended fields)"
+            ),
+        )
+        print(f"  Pushed {len(records)} records to {repo}")
+    finally:
+        Path(tmp_path).unlink()
 
 
 def main():
