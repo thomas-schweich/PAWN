@@ -1,10 +1,6 @@
 ---
 library_name: pawn
 license: apache-2.0
-base_model:
-  - thomas-schweich/pawn-small
-  - thomas-schweich/pawn-base
-  - thomas-schweich/pawn-large
 tags:
   - chess
   - transformer

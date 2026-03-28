@@ -1,10 +1,6 @@
 ---
 library_name: pawn
 license: apache-2.0
-base_model:
-  - thomas-schweich/pawn-small
-  - thomas-schweich/pawn-base
-  - thomas-schweich/pawn-large
 tags:
   - chess
   - transformer
@@ -47,7 +43,7 @@ model-index:
 
           - name: Legal Move Rate
             type: accuracy
-            value: 0.9919
+            value: 0.9918
 
           - name: Top-1 Accuracy
             type: accuracy
@@ -85,7 +81,7 @@ This is the **small** variant (~9.5M parameters). PAWN is designed as a frozen b
 
 | Metric | Value |
 |--------|-------|
-| Legal move rate | 99.19% |
+| Legal move rate | 99.18% |
 | Top-1 accuracy | 6.75% |
 | Top-5 accuracy | 27.40% |
 | Val loss | 3.159 |
