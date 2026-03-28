@@ -1,23 +1,13 @@
-# PAWN Container for Runpod
+# PAWN — single image for all RunPod workloads
 #
-# Uses runpod/base (CUDA + SSH + Jupyter, no PyTorch) with uv for
-# reproducible Python dependency management from the lockfile.
+# Built automatically by CI on merge to main and pushed to Docker Hub.
+# Uses the RunPod base image (CUDA + SSH + Jupyter) with uv for
+# reproducible Python dependency management.
 #
-# Build targets:
-#   interactive (default) — SSH + Jupyter, stays alive
-#   runner               — runs a command then exits (pod auto-stops)
-#   rosa-sweep           — runs RoSA ablation sweeps then exits
+# Usage: create a RunPod template pointing at thomasschweich/pawn:latest,
+# SSH in, and run experiments. Code lives at /opt/pawn.
 #
-# Build:
-#   docker build --platform linux/amd64 \
-#     --build-arg GIT_HASH=$(git rev-parse HEAD) \
-#     --build-arg GIT_TAG=$(git tag --points-at HEAD) \
-#     [--target runner] \
-#     -t pawn:<tag> .
-#
-# IMPORTANT: Always attach a Runpod network volume. Checkpoints use
-# atomic directory writes (tmp + rename) that require persistent disk.
-# Set HF_TOKEN as a pod env var for HuggingFace checkpoint push.
+# IMPORTANT: Always attach a network volume. Set HF_TOKEN as a pod env var.
 
 # ── Builder: compile Rust engine wheel ───────────────────────────────
 FROM python:3.12-slim AS builder
@@ -40,8 +30,8 @@ COPY scripts/ scripts/
 
 RUN cd engine && uv run --no-project --with maturin maturin build --release
 
-# ── Runtime base (shared by all targets) ─────────────────────────────
-FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS runtime-base
+# ── Runtime ──────────────────────────────────────────────────────────
+FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
@@ -56,12 +46,13 @@ COPY pyproject.toml uv.lock ./
 COPY pawn/ pawn/
 COPY scripts/ scripts/
 COPY tests/ tests/
+COPY deploy/ deploy/
+COPY docs/ docs/
+COPY cards/ cards/
+COPY data/ data/
 
-# Install engine wheel first
+# Install engine wheel, then sync Python deps from lockfile
 COPY --from=builder /build/engine/target/wheels/*.whl /tmp/
-
-# Create venv with system packages (picks up pre-installed torch + CUDA)
-# and install remaining deps from lockfile
 RUN uv venv --system-site-packages && \
     uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl
@@ -80,25 +71,4 @@ RUN echo "export PYTHONPATH=/opt/pawn" >> /etc/environment && \
     echo 'export PATH="/opt/pawn/.venv/bin:$PATH"' >> /etc/environment && \
     cat /etc/environment >> /root/.bashrc
 
-# ── Runner — executes command then exits (pod auto-stops) ────────────
-FROM runtime-base AS runner
-COPY deploy/entrypoint-run.sh /entrypoint-run.sh
-RUN chmod +x /entrypoint-run.sh
-ENTRYPOINT ["/entrypoint-run.sh"]
-
-# ── RoSA sweep — runs all three ablation sweeps then exits ───────────
-FROM runtime-base AS rosa-sweep
-COPY deploy/entrypoint-rosa-sweep.sh /entrypoint-rosa-sweep.sh
-RUN chmod +x /entrypoint-rosa-sweep.sh
-ENTRYPOINT ["/entrypoint-rosa-sweep.sh"]
-
-# ── Lichess extract — downloads PGN, writes Parquet, pushes to HF ───
-FROM runtime-base AS lichess-extract
-RUN pip install --no-cache-dir zstandard
-COPY deploy/entrypoint-lichess-parquet.sh /entrypoint-lichess-parquet.sh
-RUN chmod +x /entrypoint-lichess-parquet.sh
-ENTRYPOINT ["/entrypoint-lichess-parquet.sh"]
-
-# ── Interactive (default) — SSH + Jupyter, stays alive ───────────────
-FROM runtime-base AS interactive
-# Inherits /start.sh entrypoint from Runpod base image
+# Inherits /start.sh entrypoint from RunPod base image (SSH + Jupyter)
