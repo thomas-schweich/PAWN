@@ -365,12 +365,12 @@ class TestBatchToDataframe:
         assert df["black_player"].dtype == pl.UInt64
 
     def test_list_columns_trimmed_to_game_length(self):
-        """Token list = game_length + 1 (outcome), clock list = game_length."""
+        """Token and clock lists are aligned: both game_length + 1 (outcome slot + moves)."""
         r = chess_engine.parse_pgn_lichess(PGNS["bob_v_xavier"])
         df = batch_to_dataframe(r)
         gl = df["game_length"][0]
         assert len(df["tokens"][0]) == gl + 1  # outcome + moves
-        assert len(df["clock"][0]) == gl
+        assert len(df["clock"][0]) == gl + 1   # aligned with tokens (0 for outcome slot)
 
     def test_parquet_roundtrip(self, tmp_path):
         """Write to Parquet and read back — all values must survive."""
