@@ -47,19 +47,19 @@ model-index:
 
           - name: Legal Move Rate
             type: accuracy
-            value: 0.9997
+            value: 0.9987
 
           - name: Top-1 Accuracy
             type: accuracy
-            value: 0.0700
+            value: 0.0702
 
           - name: Top-5 Accuracy
             type: accuracy
-            value: 0.2801
+            value: 0.2780
 
           - name: Val Loss
             type: loss
-            value: 3.0948
+            value: 3.0951
           - name: Games Seen
             type: other
             value: 25600000
@@ -85,9 +85,9 @@ This is the **base (default)** variant (~35.8M parameters). PAWN is designed as 
 
 | Metric | Value |
 |--------|-------|
-| Legal move rate | 99.97% |
-| Top-1 accuracy | 7.00% |
-| Top-5 accuracy | 28.01% |
+| Legal move rate | 99.87% |
+| Top-1 accuracy | 7.02% |
+| Top-5 accuracy | 27.80% |
 | Val loss | 3.095 |
 
 ### Accuracy Ratios
@@ -98,7 +98,7 @@ PAWN is trained on uniformly random chess games, so top-1 accuracy has a hard th
 |---------|-------|
 | Unconditioned (E\[1/N_legal\] = 6.43%) | 109% |
 | Naive-conditioned (1-ply filter = 6.44%) | 109% |
-| Bayes-optimal conditioned (MCTS, 32 rollouts = 7.92%) | 88% |
+| Bayes-optimal conditioned (MCTS, 32 rollouts = 7.92%) | 89% |
 
 
 ## Probe Results

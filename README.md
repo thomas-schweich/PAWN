@@ -16,9 +16,9 @@ Three sizes, trained for 100K steps on random games (~25.6M games each):
 
 | Variant | d_model | Layers | Heads | Params | Top-1 | Legal Rate | Download |
 |---------|---------|--------|-------|--------|-------|------------|----------|
-| **PAWN-Small** | 256 | 8 | 4 | ~9.5M | 6.73% | 99.29% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-small) |
-| **PAWN (Base)** | 512 | 8 | 8 | ~35.8M | 6.86% | 99.97% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
-| **PAWN-Large** | 640 | 10 | 8 | ~68.4M | 6.94% | 99.98% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
+| **PAWN-Small** | 256 | 8 | 4 | ~9.5M | 6.75% | 99.19% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-small) |
+| **PAWN (Base)** | 512 | 8 | 8 | ~35.8M | 7.02% | 99.87% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
+| **PAWN-Large** | 640 | 10 | 8 | ~68.4M | 6.95% | 99.89% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
 
 All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), factored move embeddings, and a 4278-token vocabulary covering:
 
@@ -120,7 +120,7 @@ Despite training exclusively on random games, PAWN develops rich internal repres
 | Is check | 94.2% |
 | Material count (MAE) | 6.1 |
 
-The model also achieves >99.9% legal move rate on the base and large variants, correctly identifying legal moves from move history alone.
+The model also achieves >99.8% legal move rate on the base and large variants, correctly identifying legal moves from move history alone.
 
 The [theoretical accuracy ceiling](docs/ACCURACY_CEILING.md) for random game prediction is 6.43% (unconditional) to 7.92% (MCTS-conditioned on outcome). All three models exceed the unconditional ceiling, confirming they learn structure beyond move legality.
 

@@ -47,7 +47,7 @@ model-index:
 
           - name: Legal Move Rate
             type: accuracy
-            value: 0.9929
+            value: 0.9919
 
           - name: Top-1 Accuracy
             type: accuracy
@@ -55,7 +55,7 @@ model-index:
 
           - name: Top-5 Accuracy
             type: accuracy
-            value: 0.2744
+            value: 0.2740
 
           - name: Val Loss
             type: loss
@@ -85,9 +85,9 @@ This is the **small** variant (~9.5M parameters). PAWN is designed as a frozen b
 
 | Metric | Value |
 |--------|-------|
-| Legal move rate | 99.29% |
+| Legal move rate | 99.19% |
 | Top-1 accuracy | 6.75% |
-| Top-5 accuracy | 27.44% |
+| Top-5 accuracy | 27.40% |
 | Val loss | 3.159 |
 
 ### Accuracy Ratios
