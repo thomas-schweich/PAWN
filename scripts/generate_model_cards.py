@@ -78,17 +78,17 @@ CEILING_PATH = Path("data/theoretical_ceiling.json")
 
 def load_ceilings() -> tuple[float, float, float]:
     """Load accuracy ceilings from the canonical JSON artifact."""
-    if CEILING_PATH.exists():
-        with open(CEILING_PATH) as f:
-            data = json.load(f)
-        return (
-            data["unconditional_ceiling"] * 100,
-            data["naive_conditional_ceiling"] * 100,
-            data["conditional_ceiling"] * 100,
+    if not CEILING_PATH.exists():
+        raise FileNotFoundError(
+            f"{CEILING_PATH} not found. Run scripts/compute_theoretical_ceiling.py first."
         )
-    # Fallback if file not present
-    print("  Warning: data/theoretical_ceiling.json not found, using hardcoded ceilings")
-    return 6.43, 6.44, 7.92
+    with open(CEILING_PATH) as f:
+        data = json.load(f)
+    return (
+        data["unconditional_ceiling"] * 100,
+        data["naive_conditional_ceiling"] * 100,
+        data["conditional_ceiling"] * 100,
+    )
 
 PROBE_DESCRIPTIONS = {
     "piece_type": "Per-square piece type (13 classes x 64 squares)",
