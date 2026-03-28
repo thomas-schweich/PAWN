@@ -36,9 +36,7 @@ cd engine && uv run --with maturin maturin develop --release && cd ..
 echo "Installing Python deps..."
 uv sync --extra cu128
 
-# Pull checkpoint
-echo "Pulling pawn-base checkpoint..."
-git submodule update --init checkpoints/pawn-base
+# Checkpoint is loaded directly from HF at runtime (thomas-schweich/pawn-base)
 
 # Download one Lichess Parquet file for training
 echo "Downloading Lichess training data..."
@@ -69,7 +67,7 @@ echo ""
 echo "  # RoSA (joint LoRA + gradient sparse)"
 echo "  nohup uv run python scripts/sweep.py \\"
 echo "    --adapter rosa --in-process --n-trials 30 --n-gpus 2 --n-jobs 2 \\"
-echo "    --checkpoint checkpoints/pawn-base \\"
+echo "    --checkpoint thomas-schweich/pawn-base \\"
 echo "    --pgn /workspace/data/data/train-00000-of-00001.parquet \\"
 echo "    --output-dir /workspace/sweeps --local-checkpoints \\"
 echo "    > /workspace/sweeps/rosa.log 2>&1 &"

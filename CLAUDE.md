@@ -106,8 +106,8 @@ All adapter scripts require `--checkpoint PATH` (pretrained weights) and `--pgn 
 ```bash
 # Example: train a LoRA adapter on Lichess 1800-1900 games
 uv run python scripts/train_lora.py \
-    --checkpoint checkpoints/pawn-base \
-    --pgn data/lichess_1800_1900.pgn \
+    --checkpoint thomas-schweich/pawn-base \
+    --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
     --lora-rank 4 --lr 3e-4 --local-checkpoints
 ```
 
@@ -145,8 +145,8 @@ Trains linear probes on frozen hidden states to measure internal representations
 
 ```bash
 uv run python scripts/eval_accuracy.py \
-    --checkpoint checkpoints/pawn-base \
-    --pgn data/lichess_1800_1900.pgn \
+    --checkpoint thomas-schweich/pawn-base \
+    --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
     --adapter-checkpoint logs/run_*/checkpoints/best
 ```
 
@@ -170,12 +170,12 @@ Converts a training run to HuggingFace repo format (safetensors + metrics). Find
 
 ## Checkpoints
 
-Pre-trained weights are HuggingFace git submodules under `checkpoints/`:
-- `checkpoints/pawn-small` — 9.5M params, `CLMConfig.small()`
-- `checkpoints/pawn-base` — 35.8M params, `CLMConfig.base()`
-- `checkpoints/pawn-large` — 68.4M params, `CLMConfig.large()`
+Pre-trained weights are hosted on HuggingFace and loaded directly by repo ID:
+- `thomas-schweich/pawn-small` — 9.5M params, `CLMConfig.small()`
+- `thomas-schweich/pawn-base` — 35.8M params, `CLMConfig.base()`
+- `thomas-schweich/pawn-large` — 68.4M params, `CLMConfig.large()`
 
-Pull with: `git submodule update --init --remote checkpoints/pawn-base`
+All scripts accept HF repo IDs for `--checkpoint` (e.g. `--checkpoint thomas-schweich/pawn-base`). Weights are downloaded and cached automatically via `huggingface_hub`.
 
 ### Checkpoint Format (safetensors)
 
@@ -351,7 +351,7 @@ Optuna integration via `pawn/sweep.py` and `scripts/sweep.py`:
 uv run python scripts/sweep.py \
     --adapter lora --n-trials 30 --n-jobs 2 --n-gpus 2 \
     --total-steps 20000 --pruner hyperband \
-    --checkpoint checkpoints/pawn-base --pgn data/lichess_1800_1900.pgn \
+    --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
     --local-checkpoints
 ```
 

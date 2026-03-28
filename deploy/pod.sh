@@ -283,8 +283,8 @@ cmd_launch() {
         echo ""
         echo "Examples:"
         echo "  $0 launch exp1 scripts/train.py --variant base"
-        echo "  $0 launch exp1 scripts/train_bottleneck.py --checkpoint checkpoints/pawn-base.pt \\"
-        echo "      --pgn data/lichess_1800_1900.pgn --bottleneck-dim 32"
+        echo "  $0 launch exp1 scripts/train_bottleneck.py --checkpoint thomas-schweich/pawn-base \\"
+        echo "      --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 --bottleneck-dim 32"
         exit 1
     fi
 
