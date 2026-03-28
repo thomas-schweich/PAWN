@@ -2,7 +2,6 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 from matplotlib.axes import Axes
 import seaborn as sns
 
@@ -11,6 +10,15 @@ sns.set_theme(style="darkgrid", context="notebook", palette="muted")
 FIGSIZE = (10, 5)
 FIGSIZE_WIDE = (14, 5)
 FIGSIZE_TALL = (10, 8)
+
+
+def _get_figure(fig: plt.Figure | None, ax: Axes) -> plt.Figure:
+    """Return the figure, preferring an explicitly-created one over ax.figure."""
+    if fig is not None:
+        return fig
+    assert isinstance(ax.figure, plt.Figure)
+    return ax.figure
+
 
 # Grid-PAWN baselines (Run 2, layer 7)
 GRID_PAWN_BASELINES = {
@@ -43,7 +51,7 @@ def plot_game_length_distribution(stats: dict, ax: Axes | None = None) -> plt.Fi
     ax.set_ylabel("Count")
     ax.set_title("Game Length Distribution")
     ax.legend()
-    return fig or ax.figure
+    return _get_figure(fig, ax)
 
 
 def plot_legal_move_distribution(bounds: dict, ax: Axes | None = None) -> plt.Figure:
@@ -64,7 +72,7 @@ def plot_legal_move_distribution(bounds: dict, ax: Axes | None = None) -> plt.Fi
     ax.set_title("Legal Move Count Distribution")
     ax.set_xlim(0, 80)
     ax.legend()
-    return fig or ax.figure
+    return _get_figure(fig, ax)
 
 
 def plot_outcome_rates(stats: dict, ax: Axes | None = None) -> plt.Figure:
@@ -83,7 +91,7 @@ def plot_outcome_rates(stats: dict, ax: Axes | None = None) -> plt.Figure:
     ax.set_xlabel("Rate (%)")
     ax.set_title("Outcome Base Rates (1M Random Games)")
     ax.invert_yaxis()
-    return fig or ax.figure
+    return _get_figure(fig, ax)
 
 
 def plot_k_by_phase(bounds: dict, ax: Axes | None = None) -> plt.Figure:
@@ -106,7 +114,7 @@ def plot_k_by_phase(bounds: dict, ax: Axes | None = None) -> plt.Figure:
     ax.set_xticklabels(labels)
     ax.set_ylabel("E[1/K] (%)")
     ax.set_title("Theoretical Top-1 Accuracy Ceiling by Game Phase")
-    return fig or ax.figure
+    return _get_figure(fig, ax)
 
 
 def plot_prefix_histogram(sanity: dict, ax: Axes | None = None) -> plt.Figure:
@@ -123,7 +131,7 @@ def plot_prefix_histogram(sanity: dict, ax: Axes | None = None) -> plt.Figure:
     ax.set_ylabel("Count (adjacent pairs)")
     ax.set_title(f"Adjacent-Pair Common Prefix Lengths (max={sanity['max_prefix_moves']})")
     ax.set_yscale("log")
-    return fig or ax.figure
+    return _get_figure(fig, ax)
 
 
 # ---------------------------------------------------------------------------

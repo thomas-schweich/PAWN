@@ -44,7 +44,9 @@ uv run pytest tests/
 uv run python scripts/train.py --variant base --local-checkpoints
 ```
 
-The only extras are GPU backends (`rocm` or `cu128`). Everything else (pytest, solara, optuna, seaborn, etc.) is in base dependencies.
+PyTorch is a **base dependency** — `uv sync` always installs it (CPU build from PyPI by default). The extras (`rocm`, `cu128`) only control which GPU-accelerated build is pulled from the PyTorch index. You cannot accidentally end up without torch.
+
+**GPU requirement**: `configure_gpu()` (called by every training and eval script) raises `RuntimeError` if no CUDA/ROCm GPU is detected. This prevents accidentally running GPU workloads on CPU, which is almost always a mistake. The environment variable `PAWN_ALLOW_CPU=1` overrides this check as a last resort for the rare case where CPU execution is genuinely intended (e.g. a lightweight backfill script). Unit tests do not call `configure_gpu()` and run fine on CPU without the override.
 
 ## Engine (`engine/`)
 
