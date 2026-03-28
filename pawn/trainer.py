@@ -78,6 +78,35 @@ class CosineWithWarmup:
         self._apply_lr(self._step)
 
 
+def _build_promo_grid_index() -> list[int]:
+    """Build a mapping from promotion token to grid index (src*64 + dst).
+
+    Promotion tokens 4097..4272 encode 44 (src, dst) pairs x 4 piece types.
+    Token layout: PROMO_START + pair_idx * 4 + promo_type.
+    """
+    import chess_engine
+    vocab = chess_engine.export_move_vocabulary()
+    promo_pairs = vocab["promo_pairs"]  # list of (src, dst) tuples, len=44
+    # For each of the 176 promo tokens, compute src*64+dst
+    grid_indices = []
+    for src, dst in promo_pairs:
+        grid_idx = src * 64 + dst
+        grid_indices.extend([grid_idx] * 4)  # 4 piece types per pair
+    return grid_indices
+
+
+# Lazily initialized on first use
+_PROMO_GRID_INDEX: list[int] | None = None
+
+
+def _get_promo_grid_index(device: str | torch.device) -> torch.Tensor:
+    """Get the promo-token-to-grid-index mapping as a tensor on the given device."""
+    global _PROMO_GRID_INDEX
+    if _PROMO_GRID_INDEX is None:
+        _PROMO_GRID_INDEX = _build_promo_grid_index()
+    return torch.tensor(_PROMO_GRID_INDEX, dtype=torch.long, device=device)
+
+
 def compute_legal_move_rate(
     logits: torch.Tensor,
     legal_grid: torch.Tensor,
@@ -113,23 +142,12 @@ def compute_legal_move_rate(
         legal_dense = unpack_grid(legal_grid)  # (B, max_ply, 64, 64)
         legal_flat = legal_dense.reshape(B, max_ply, 4096)  # (B, max_ply, 4096)
 
-        # For each valid position, check if the predicted token is legal
-        # CLM position p -> ply p in the engine (0-indexed)
-        # But legal_grid is (B, max_ply), and CLM positions are (B, T=256)
-        # CLM position 0 predicts move at ply 0, which uses legal_grid[:, 0]
-        # So CLM position p uses legal_grid[:, p]
-
-        # We need to handle the case where T might differ from max_ply
         n_plies = min(T, max_ply)
         valid_count = 0
-        # Accumulate legal counts on GPU, sync once at the end
         legal_acc = torch.tensor(0, dtype=torch.long, device=logits.device)
 
-        # Build a flat legal move check
-        # For base grid tokens 1-4096: token_id - 1 is the grid index
-        # For promotion tokens 4097-4272: the base grid move is also legal
-        # For simplicity, check if pred is in 1-4272 (any valid move token)
-        # and whether the corresponding grid position is set
+        # Promo token -> grid index lookup (lazily built, cached)
+        promo_grid_idx = _get_promo_grid_index(logits.device)  # (176,)
 
         for p in range(n_plies):
             pos_mask = move_mask[:, p]  # (B,)
@@ -138,31 +156,24 @@ def compute_legal_move_rate(
 
             batch_preds = preds[pos_mask, p]  # (N,)
             batch_legal = legal_flat[pos_mask, p]  # (N, 4096)
+            n = len(batch_preds)
+            arange_n = torch.arange(n, device=logits.device)
 
-            # Check base grid tokens (1-4096)
+            # Base grid tokens (1-4096): grid index = token - 1
             is_base = (batch_preds >= 1) & (batch_preds <= 4096)
             base_idx = (batch_preds - 1).clamp(0, 4095)
-            base_legal = batch_legal[torch.arange(len(batch_preds), device=logits.device), base_idx]
+            base_legal = batch_legal[arange_n, base_idx] > 0.5
+            legal_base = is_base & base_legal
 
-            # Check promotion tokens (4097-4272): the underlying src-dst move
-            # must be legal (promotion legality is implied by grid legality)
-            # Token 4097+ maps to promotion pairs; for now just check grid
+            # Promotion tokens (4097-4272): look up the (src, dst) grid index
             is_promo = (batch_preds >= 4097) & (batch_preds <= 4272)
+            promo_offset = (batch_preds - 4097).clamp(0, 175)
+            promo_grid = promo_grid_idx[promo_offset]  # (N,) grid index per pred
+            promo_legal = batch_legal[arange_n, promo_grid] > 0.5
+            legal_promo = is_promo & promo_legal
 
-            # For promos, we need to map to the grid index
-            # Promo tokens map to specific (src, dst) pairs
-            # The grid already marks these as legal if any promotion is legal
-            # So we need the token-to-grid mapping
-            # For simplicity, count promos as legal if the src-dst pair is set
-            # This is close enough for monitoring purposes
-
-            is_legal = is_base & (base_legal > 0.5)
-
-            valid_count += len(batch_preds)
-            legal_acc += is_legal.sum()
-            # Count promos separately (assume legal if predicted in promo range
-            # and the position has promotions available)
-            legal_acc += is_promo.sum()  # Approximate
+            valid_count += n
+            legal_acc += legal_base.sum() + legal_promo.sum()
 
         if valid_count == 0:
             return 0.0
@@ -385,9 +396,6 @@ class CLMTrainer:
             top5_acc = (top5 == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
             metrics["top5_accuracy"] = top5_acc
 
-            # Perplexity
-            metrics["perplexity"] = math.exp(min(metrics["loss"], 20.0))
-
             # Legal move rate (if legal grid available)
             if has_legal:
                 legal_grid = self.val_data["legal_grid"][start:end].to(self.device)
@@ -401,7 +409,9 @@ class CLMTrainer:
 
         if self.device != "cpu" and torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return {f"val/{k}": v / n_batches for k, v in total_metrics.items()}
+        avg = {f"val/{k}": v / n_batches for k, v in total_metrics.items()}
+        avg["val/perplexity"] = math.exp(min(avg["val/loss"], 20.0))
+        return avg
 
     def train(self):
         self.dataset.set_start_step(self.global_step)

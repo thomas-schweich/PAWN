@@ -121,9 +121,6 @@ def evaluate_checkpoint(
             (top5 == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
         )
 
-        # Perplexity
-        metrics["perplexity"] = math.exp(min(metrics["loss"], 20.0))
-
         # Legal move rate
         if has_legal:
             legal_grid = val_data["legal_grid"][start:end].to(device)
@@ -136,7 +133,9 @@ def evaluate_checkpoint(
             total_metrics[k] = total_metrics.get(k, 0.0) + v
         n_batches += 1
 
-    return {k: v / n_batches for k, v in total_metrics.items()}
+    avg = {k: v / n_batches for k, v in total_metrics.items()}
+    avg["perplexity"] = math.exp(min(avg["loss"], 20.0))
+    return avg
 
 
 def step_from_dir(step_dir: str) -> int:

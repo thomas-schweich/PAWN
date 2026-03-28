@@ -249,9 +249,6 @@ class ModelSlot:
                 (top5 == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
             )
 
-            # Perplexity
-            metrics["perplexity"] = math.exp(min(metrics["loss"], 20.0))
-
             # Legal move rate
             if has_legal:
                 legal_grid = val_data["legal_grid"][start:end].to(self.device)
@@ -264,7 +261,9 @@ class ModelSlot:
                 total_metrics[k] = total_metrics.get(k, 0.0) + v
             n_batches += 1
 
-        return {f"val/{k}": v / n_batches for k, v in total_metrics.items()}
+        avg = {f"val/{k}": v / n_batches for k, v in total_metrics.items()}
+        avg["val/perplexity"] = math.exp(min(avg["val/loss"], 20.0))
+        return avg
 
     def close(self):
         self.wait_for_push()
