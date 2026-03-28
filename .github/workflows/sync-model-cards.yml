@@ -1,0 +1,45 @@
+name: Sync Model Cards to HuggingFace
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cards/model/*.md'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Upload model cards to HuggingFace
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          pip install --quiet huggingface-hub
+          python3 -c "
+          from huggingface_hub import HfApi
+          from pathlib import Path
+
+          api = HfApi()
+          cards_dir = Path('cards/model')
+
+          variant_repos = {
+              'pawn-small.md': 'thomas-schweich/pawn-small',
+              'pawn-base.md': 'thomas-schweich/pawn-base',
+              'pawn-large.md': 'thomas-schweich/pawn-large',
+          }
+
+          for filename, repo in variant_repos.items():
+              card_path = cards_dir / filename
+              if card_path.exists():
+                  api.upload_file(
+                      path_or_fileobj=str(card_path),
+                      path_in_repo='README.md',
+                      repo_id=repo,
+                      repo_type='model',
+                  )
+                  print(f'Uploaded {filename} -> {repo}')
+              else:
+                  print(f'Skipped {filename} (not found)')
+          "

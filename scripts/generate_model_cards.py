@@ -4,6 +4,11 @@
 Fetches eval_results.json and metrics.jsonl from each HuggingFace model repo,
 renders the Jinja2 template, and optionally uploads the result.
 
+This script intentionally fails loudly if any metrics are missing to ensure bad numbers don't
+wind up getting posted due to e.g. a connection error. Do not add fallback values or default to
+zero. Just use direct subscripting, division, etc. so that an exception is thrown if anything is
+suspect. Better not to update the model card in such cases.
+
 Usage:
     # Preview locally
     python scripts/generate_model_cards.py
@@ -203,9 +208,18 @@ def build_context(variant_key: str, variant: dict) -> dict:
     if not best:
         raise RuntimeError(f"Could not fetch metrics.jsonl from {repo}")
     ctx["top1"] = best["val/accuracy"] * 100
-    ctx["top5"] = best["val/top5_accuracy"] * 100
     ctx["val_loss"] = best["val/loss"]
-    ctx["legal_rate"] = best["val/legal_move_rate"] * 100
+    # These fields were added in later training runs — warn if missing
+    if "val/top5_accuracy" not in best:
+        print(f"  WARNING: val/top5_accuracy missing from {repo} metrics")
+    if "val/legal_move_rate" not in best:
+        print(f"  WARNING: val/legal_move_rate missing from {repo} metrics")
+    ctx["top5"] = best.get("val/top5_accuracy", None)
+    if ctx["top5"] is not None:
+        ctx["top5"] *= 100
+    ctx["legal_rate"] = best.get("val/legal_move_rate", None)
+    if ctx["legal_rate"] is not None:
+        ctx["legal_rate"] *= 100
 
     # Accuracy ratios
     uncond, naive, mcts = load_ceilings()
@@ -243,8 +257,8 @@ def build_context(variant_key: str, variant: dict) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Generate HuggingFace model cards")
     parser.add_argument("--push", action="store_true", help="Upload cards to HuggingFace")
-    parser.add_argument("--template", type=Path, default=Path("templates/hf_model_card.md.j2"))
-    parser.add_argument("--output-dir", type=Path, default=Path("templates/generated"))
+    parser.add_argument("--template", type=Path, default=Path("cards/hf_model_card.md.j2"))
+    parser.add_argument("--output-dir", type=Path, default=Path("cards/model"))
     parser.add_argument("--variants", nargs="*", default=list(VARIANTS.keys()))
     args = parser.parse_args()
 
@@ -266,7 +280,7 @@ def main():
         ctx = build_context(variant_key, VARIANTS[variant_key])
         card = template.render(**ctx)
 
-        output_path = args.output_dir / f"pawn-{variant_key}-README.md"
+        output_path = args.output_dir / f"pawn-{variant_key}.md"
         output_path.write_text(card)
         print(f"  Written to {output_path}")
 

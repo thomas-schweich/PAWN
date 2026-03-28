@@ -14,21 +14,21 @@ tags:
   - representation-learning
   - pytorch
   - rust
-model_name: PAWN-{{ variant_name }}
+model_name: PAWN-Base
 pipeline_tag: other
 citation: |
-  {% raw %}@software{schweich2026pawn,
+  @software{schweich2026pawn,
     author = {Schweich, Thomas},
     title = {{PAWN}: Playstyle-Agnostic World-model Network for Chess},
     year = {2026},
     url = {https://github.com/thomas-schweich/PAWN},
     license = {Apache-2.0}
-  }{% endraw %}
-model_params: {{ params_num }}
-d_model: {{ d_model }}
-n_layers: {{ n_layers }}
-n_heads: {{ n_heads }}
-d_ff: {{ d_ff }}
+  }
+model_params: 35824640
+d_model: 512
+n_layers: 8
+n_heads: 8
+d_ff: 2048
 context_length: 256
 vocab_size: 4284
 datasets:
@@ -38,34 +38,38 @@ language:
 metrics:
   - accuracy
 model-index:
-  - name: PAWN-{{ variant_name }}
+  - name: PAWN-Base
     results:
       - task:
           type: next-token-prediction
           name: Chess Move Prediction (Random Games)
         metrics:
+
           - name: Legal Move Rate
             type: accuracy
-            value: {{ "%.4f"|format(legal_rate / 100) }}
+            value: 0.9997
+
           - name: Top-1 Accuracy
             type: accuracy
-            value: {{ "%.4f"|format(top1 / 100) }}
+            value: 0.0700
+
           - name: Top-5 Accuracy
             type: accuracy
-            value: {{ "%.4f"|format(top5 / 100) }}
+            value: 0.2801
+
           - name: Val Loss
             type: loss
-            value: {{ "%.4f"|format(val_loss) }}
+            value: 3.0948
           - name: Games Seen
             type: other
             value: 25600000
 ---
 
-# PAWN-{{ variant_name }}
+# PAWN-Base
 
 **PAWN** (Playstyle-Agnostic World-model Network for Chess) is a causal transformer trained on random chess games. It learns legal moves, board state representations, and game dynamics purely from uniformly random legal move sequences -- no strategic play, no hand-crafted features, no external game databases.
 
-This is the **{{ variant_label }}** variant ({{ params }} parameters). PAWN is designed as a frozen backbone for parameter-efficient finetuning into player models with arbitrary playstyles.
+This is the **base (default)** variant (~35.8M parameters). PAWN is designed as a frozen backbone for parameter-efficient finetuning into player models with arbitrary playstyles.
 
 **[GitHub Repository](https://github.com/thomas-schweich/PAWN)** -- full source code, training scripts, adapter implementations, and documentation.
 
@@ -81,10 +85,10 @@ This is the **{{ variant_label }}** variant ({{ params }} parameters). PAWN is d
 
 | Metric | Value |
 |--------|-------|
-| Legal move rate | {{ "%.2f"|format(legal_rate) }}% |
-| Top-1 accuracy | {{ "%.2f"|format(top1) }}% |
-| Top-5 accuracy | {{ "%.2f"|format(top5) }}% |
-| Val loss | {{ "%.3f"|format(val_loss) }} |
+| Legal move rate | 99.97% |
+| Top-1 accuracy | 7.00% |
+| Top-5 accuracy | 28.01% |
+| Val loss | 3.095 |
 
 ### Accuracy Ratios
 
@@ -92,10 +96,10 @@ PAWN is trained on uniformly random chess games, so top-1 accuracy has a hard th
 
 | Ceiling | Ratio |
 |---------|-------|
-| Unconditioned (E\[1/N_legal\] = {{ "%.2f"|format(uncond_ceiling) }}%) | {{ uncond_ratio }}% |
-| Naive-conditioned (1-ply filter = {{ "%.2f"|format(naive_ceiling) }}%) | {{ naive_ratio }}% |
-| Bayes-optimal conditioned (MCTS, 32 rollouts = {{ "%.2f"|format(mcts_ceiling) }}%) | {{ mcts_ratio }}% |
-{% if probes %}
+| Unconditioned (E\[1/N_legal\] = 6.43%) | 109% |
+| Naive-conditioned (1-ply filter = 6.44%) | 109% |
+| Bayes-optimal conditioned (MCTS, 32 rollouts = 7.92%) | 88% |
+
 
 ## Probe Results
 
@@ -103,11 +107,18 @@ Linear probes trained on frozen hidden states measure how well the model's inter
 
 | Probe | Accuracy | Description |
 |-------|----------|-------------|
-{% for probe in probes -%}
-| {{ probe.name }} | {{ probe.result }} | {{ probe.description }} |
-{% endfor %}
-{% endif %}
-{% if diagnostics %}
+| Piece type | 89.7% | Per-square piece type (13 classes x 64 squares) |
+| Side to move | 100.0% | Whose turn it is |
+| Is check | 94.2% | Whether the side to move is in check |
+| Castling rights | 96.6% | KQkq castling availability |
+| En passant square | 99.7% | En passant target square (64 + none) |
+| Material count | 86.1% (MAE 6.1) | Piece counts per type per color |
+| Legal move count | 37.9% (MAE 6.8) | Number of legal moves available |
+| Halfmove clock | 11.8% (MAE 4.1) | Plies since last capture or pawn move |
+| Game phase | 90.7% | Opening / middlegame / endgame |
+
+
+
 
 ## Diagnostic Results
 
@@ -115,22 +126,30 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 
 | Category | Positions | Legal Rate |
 |----------|-----------|------------|
-{% for diag in diagnostics -%}
-| {{ diag.name }} | {{ diag.n }} | {{ diag.value }} |
-{% endfor %}
-{% endif %}
+| In check | 1000 | 97.7% |
+| Double check | 71 | 91.2% |
+| Pin restricts movement | 1000 | 97.2% |
+| En passant available | 940 | 99.2% |
+| Castling legal (kingside) | 1000 | 99.7% |
+| Castling legal (queenside) | 1000 | 99.6% |
+| Castling blocked by check | 892 | 99.4% |
+| Promotion available | 1000 | 99.4% |
+| Checkmate (terminal) | 276 | 91.2% |
+| Stalemate (terminal) | 41 | 84.2% |
+
+
 
 ## Architecture
 
 | Parameter | Value |
 |-----------|-------|
 | Architecture | Decoder-only transformer |
-| d_model | {{ d_model }} |
-| Layers | {{ n_layers }} |
-| Attention heads | {{ n_heads }} |
-| Head dimension | {{ head_dim }} |
-| d_ff | {{ d_ff }} |
-| Parameters | {{ params }} |
+| d_model | 512 |
+| Layers | 8 |
+| Attention heads | 8 |
+| Head dimension | 64 |
+| d_ff | 2048 |
+| Parameters | ~35.8M |
 | Vocabulary | 4,284 tokens |
 | Context length | 256 tokens |
 | Normalization | Pre-norm RMSNorm |
@@ -163,7 +182,7 @@ from safetensors.torch import load_file
 from pawn.config import CLMConfig
 from pawn.model import PAWNCLM
 
-cfg = CLMConfig.{{ variant_factory }}()
+cfg = CLMConfig.base()
 model = PAWNCLM(cfg).cuda().eval()
 weights = load_file("model.safetensors", device="cuda")
 model.load_state_dict(weights)
@@ -176,8 +195,8 @@ from pawn.checkpoint import load_backbone_weights
 from pawn.config import CLMConfig
 from pawn.model import PAWNCLM
 
-weights, config = load_backbone_weights("thomas-schweich/pawn-{{ variant_key }}")
-cfg = CLMConfig.{{ variant_factory }}()
+weights, config = load_backbone_weights("thomas-schweich/pawn-base")
+cfg = CLMConfig.base()
 model = PAWNCLM(cfg).eval()
 model.load_state_dict(weights)
 ```
@@ -186,7 +205,7 @@ model.load_state_dict(weights)
 
 ```bash
 uv run python scripts/train_bottleneck.py \
-    --checkpoint thomas-schweich/pawn-{{ variant_key }} \
+    --checkpoint thomas-schweich/pawn-base \
     --pgn thomas-schweich/pawn-lichess-full \
     --bottleneck-dim 32 --lr 1e-4 --local-checkpoints
 ```
@@ -219,7 +238,7 @@ PAWN builds on ideas and tools from the following projects and publications:
 
 ## Citation
 
-{% raw %}
+
 ```bibtex
 @software{schweich2026pawn,
   author = {Schweich, Thomas},
@@ -229,7 +248,7 @@ PAWN builds on ideas and tools from the following projects and publications:
   license = {Apache-2.0}
 }
 ```
-{% endraw %}
+
 
 ## License
 
