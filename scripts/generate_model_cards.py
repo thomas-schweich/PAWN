@@ -128,37 +128,31 @@ DIAGNOSTIC_NAMES = {
 }
 
 
-def fetch_eval_results(repo: str) -> dict | None:
+def fetch_eval_results(repo: str) -> dict:
     """Download eval_results.json from a HuggingFace model repo."""
     from huggingface_hub import hf_hub_download
-    try:
-        path = hf_hub_download(repo, "eval_results.json")
-        with open(path) as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"  Warning: could not fetch eval_results.json from {repo}: {e}")
-        return None
+    path = hf_hub_download(repo, "eval_results.json")
+    with open(path) as f:
+        return json.load(f)
 
 
-def fetch_best_metrics(repo: str) -> dict | None:
+def fetch_best_metrics(repo: str) -> dict:
     """Download metrics.jsonl and extract best val metrics."""
     from huggingface_hub import hf_hub_download
-    try:
-        path = hf_hub_download(repo, "metrics.jsonl")
-        best_loss = float("inf")
-        best = None
-        with open(path) as f:
-            for line in f:
-                r = json.loads(line)
-                if r.get("type") == "val":
-                    loss = r.get("val/loss", float("inf"))
-                    if loss < best_loss:
-                        best_loss = loss
-                        best = r
-        return best
-    except Exception as e:
-        print(f"  Warning: could not fetch metrics.jsonl from {repo}: {e}")
-        return None
+    path = hf_hub_download(repo, "metrics.jsonl")
+    best_loss = float("inf")
+    best = None
+    with open(path) as f:
+        for line in f:
+            r = json.loads(line)
+            if r.get("type") == "val":
+                loss = r.get("val/loss", float("inf"))
+                if loss < best_loss:
+                    best_loss = loss
+                    best = r
+    if best is None:
+        raise ValueError(f"No val records found in metrics.jsonl from {repo}")
+    return best
 
 
 def format_probe(eval_results: dict, probe_name: str) -> str:
@@ -208,19 +202,12 @@ def build_context(variant_key: str, variant: dict) -> dict:
 
     # Fetch training metrics
     best = fetch_best_metrics(repo)
-    if best:
-        ctx["top1"] = best.get("val/accuracy", 0) * 100
-        ctx["top5"] = best.get("val/top5_accuracy", 0) * 100
-        ctx["val_loss"] = best.get("val/loss", 0)
-        ctx["legal_rate"] = best.get("val/legal_move_rate", 0) * 100
-    else:
-        # Fallback hardcoded values from postmortem
-        fallback = {
-            "small": {"top1": 6.73, "top5": 27.44, "val_loss": 3.160, "legal_rate": 99.29},
-            "base": {"top1": 6.86, "top5": 27.76, "val_loss": 3.096, "legal_rate": 99.97},
-            "large": {"top1": 6.94, "top5": 27.78, "val_loss": 3.092, "legal_rate": 99.98},
-        }
-        ctx.update(fallback.get(variant_key, {}))
+    if not best:
+        raise RuntimeError(f"Could not fetch metrics.jsonl from {repo}")
+    ctx["top1"] = best.get("val/accuracy", 0) * 100
+    ctx["top5"] = best.get("val/top5_accuracy", 0) * 100
+    ctx["val_loss"] = best.get("val/loss", 0)
+    ctx["legal_rate"] = best.get("val/legal_move_rate", 0) * 100
 
     # Accuracy ratios
     uncond, naive, mcts = load_ceilings()
@@ -233,26 +220,24 @@ def build_context(variant_key: str, variant: dict) -> dict:
 
     # Fetch eval results for probes and diagnostics
     eval_results = fetch_eval_results(repo)
+    if not eval_results:
+        raise RuntimeError(f"Could not fetch eval_results.json from {repo}")
 
-    if eval_results:
-        ctx["probes"] = [
-            {
-                "name": PROBE_NAMES[k],
-                "result": format_probe(eval_results, k),
-                "description": PROBE_DESCRIPTIONS[k],
-            }
-            for k in PROBE_DESCRIPTIONS
-            if k in eval_results.get("probes", {})
-        ]
+    ctx["probes"] = [
+        {
+            "name": PROBE_NAMES[k],
+            "result": format_probe(eval_results, k),
+            "description": PROBE_DESCRIPTIONS[k],
+        }
+        for k in PROBE_DESCRIPTIONS
+        if k in eval_results.get("probes", {})
+    ]
 
-        ctx["diagnostics"] = []
-        for k, name in DIAGNOSTIC_NAMES.items():
-            if k in eval_results.get("diagnostics", {}):
-                n, val = format_diagnostic(eval_results, k)
-                ctx["diagnostics"].append({"name": name, "n": n, "value": val})
-    else:
-        ctx["probes"] = []
-        ctx["diagnostics"] = []
+    ctx["diagnostics"] = []
+    for k, name in DIAGNOSTIC_NAMES.items():
+        if k in eval_results.get("diagnostics", {}):
+            n, val = format_diagnostic(eval_results, k)
+            ctx["diagnostics"].append({"name": name, "n": n, "value": val})
 
     return ctx
 
