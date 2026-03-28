@@ -474,7 +474,7 @@ class CLMTrainer:
                         flush=True,
                     )
 
-                    self.logger.log_train(
+                    self.logger.log_train(  # type: ignore[arg-type]
                         step=self.global_step,
                         lr=lr, grad_norm=grad_norm,
                         step_time=step_time, games_per_sec=games_per_sec,
