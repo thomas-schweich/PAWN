@@ -157,27 +157,25 @@ def fetch_best_metrics(repo: str) -> dict:
 
 def format_probe(eval_results: dict, probe_name: str) -> str:
     """Format a probe result."""
-    probes = eval_results.get("probes", {})
-    probe = probes.get(probe_name, {})
-    for layer_key in sorted(probe.keys(), reverse=True):
-        data = probe[layer_key]
-        acc = data.get("best_accuracy", data.get("accuracy", 0))
-        mae = data.get("mae")
-        if mae is not None:
-            return f"{acc:.1%} (MAE {mae:.1f})"
-        return f"{acc:.1%}"
-    return "N/A"
+    probe = eval_results["probes"][probe_name]
+    # Use the highest layer
+    layer_key = sorted(probe.keys(), reverse=True)[0]
+    data = probe[layer_key]
+    acc = data.get("best_accuracy", data["accuracy"])
+    mae = data.get("mae")
+    if mae is not None:
+        return f"{acc:.1%} (MAE {mae:.1f})"
+    return f"{acc:.1%}"
 
 
 def format_diagnostic(eval_results: dict, diag_name: str) -> tuple[str, str]:
     """Format a diagnostic result as (n_positions, value)."""
-    diags = eval_results.get("diagnostics", {})
-    diag = diags.get(diag_name, {})
-    n = diag.get("n_positions", 0)
+    diag = eval_results["diagnostics"][diag_name]
+    n = diag["n_positions"]
     if diag_name in ("checkmate", "stalemate"):
-        val = diag.get("mean_pad_prob", 0)
+        val = diag["mean_pad_prob"]
     else:
-        val = diag.get("mean_legal_rate", 0)
+        val = diag["mean_legal_rate"]
     return str(n), f"{val:.1%}"
 
 
@@ -191,11 +189,11 @@ def build_context(variant_key: str, variant: dict) -> dict:
 
     # Fetch model architecture from config.json
     config = fetch_config(repo)
-    mc = config.get("model_config", {})
-    ctx["d_model"] = mc.get("d_model", 0)
-    ctx["n_layers"] = mc.get("n_layers", 0)
-    ctx["n_heads"] = mc.get("n_heads", 0)
-    ctx["d_ff"] = mc.get("d_ff", 0)
+    mc = config["model_config"]
+    ctx["d_model"] = mc["d_model"]
+    ctx["n_layers"] = mc["n_layers"]
+    ctx["n_heads"] = mc["n_heads"]
+    ctx["d_ff"] = mc["d_ff"]
     ctx["head_dim"] = ctx["d_model"] // ctx["n_heads"] if ctx["n_heads"] else 0
     ctx["params_num"] = count_params_from_weights(repo)
     ctx["params"] = params_str(ctx["params_num"])
@@ -204,10 +202,10 @@ def build_context(variant_key: str, variant: dict) -> dict:
     best = fetch_best_metrics(repo)
     if not best:
         raise RuntimeError(f"Could not fetch metrics.jsonl from {repo}")
-    ctx["top1"] = best.get("val/accuracy", 0) * 100
-    ctx["top5"] = best.get("val/top5_accuracy", 0) * 100
-    ctx["val_loss"] = best.get("val/loss", 0)
-    ctx["legal_rate"] = best.get("val/legal_move_rate", 0) * 100
+    ctx["top1"] = best["val/accuracy"] * 100
+    ctx["top5"] = best["val/top5_accuracy"] * 100
+    ctx["val_loss"] = best["val/loss"]
+    ctx["legal_rate"] = best["val/legal_move_rate"] * 100
 
     # Accuracy ratios
     uncond, naive, mcts = load_ceilings()
