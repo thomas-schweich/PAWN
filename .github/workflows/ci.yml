@@ -10,37 +10,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build
-        uses: actions/cache@v4
-        with:
-          path: |
-            engine/target
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: rust-${{ hashFiles('engine/Cargo.lock') }}
-          restore-keys: rust-
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
-
-      - name: Build Rust engine
-        run: cd engine && uv run --with maturin maturin develop --release
-
-      - name: Install Python deps
-        run: uv sync
-
-      - name: Run tests
-        run: uv run pytest tests/ -x -q
-
-  lint:
+  ci:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,3 +39,6 @@ jobs:
 
       - name: Pyright
         run: uv run pyright pawn/
+
+      - name: Tests
+        run: uv run pytest tests/ -x -q
