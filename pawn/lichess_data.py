@@ -402,9 +402,9 @@ def _prepare_v2_tokens(
     # Apply min_ply filter
     if min_ply > 1:
         keep: np.ndarray = game_lengths >= min_ply
-        input_ids = input_ids[keep]  # type: ignore[index]
-        move_ids = move_ids[keep]  # type: ignore[index]
-        game_lengths = game_lengths[keep]  # type: ignore[index]
+        input_ids = input_ids[keep]
+        move_ids = move_ids[keep]
+        game_lengths = game_lengths[keep]
         results = [r for r, k in zip(results, keep) if k]
         N = len(results)
         print(f"  After min_ply={min_ply} filter: {N:,} games")

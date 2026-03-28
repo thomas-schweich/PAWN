@@ -459,8 +459,8 @@ class CLMTrainer:
 
                 if self.global_step % self.cfg.log_interval == 0:
                     # .item() sync only at log intervals (metrics are tensors here)
-                    loss_val = metrics['loss'].item()  # type: ignore[union-attr]
-                    acc_val = metrics['accuracy'].item()  # type: ignore[union-attr]
+                    loss_val = metrics['loss'].item()
+                    acc_val = metrics['accuracy'].item()
                     lr = self.scheduler.get_lr()
 
                     print(
@@ -474,12 +474,11 @@ class CLMTrainer:
                         flush=True,
                     )
 
-                    train_metrics = {"train/loss": loss_val, "train/accuracy": acc_val}
                     self.logger.log_train(
                         step=self.global_step,
                         lr=lr, grad_norm=grad_norm,
                         step_time=step_time, games_per_sec=games_per_sec,
-                        **train_metrics,  # type: ignore[arg-type]
+                        **{"train/loss": loss_val, "train/accuracy": acc_val},  # type: ignore[arg-type]
                     )
 
                     if self.wandb_run:
