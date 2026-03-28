@@ -28,44 +28,65 @@ VARIANTS = {
         "variant_name": "Small",
         "variant_label": "small",
         "variant_factory": "small",
-        "variant_key": "small",
-        "params": "~9.5M",
-        "params_num": 9524224,
-        "d_model": 256,
-        "n_layers": 8,
-        "n_heads": 4,
-        "d_ff": 1024,
-        "head_dim": 64,
     },
     "base": {
         "repo": "thomas-schweich/pawn-base",
         "variant_name": "Base",
         "variant_label": "base (default)",
         "variant_factory": "base",
-        "variant_key": "base",
-        "params": "~35.8M",
-        "params_num": 35824640,
-        "d_model": 512,
-        "n_layers": 8,
-        "n_heads": 8,
-        "d_ff": 2048,
-        "head_dim": 64,
     },
     "large": {
         "repo": "thomas-schweich/pawn-large",
         "variant_name": "Large",
         "variant_label": "large",
         "variant_factory": "large",
-        "variant_key": "large",
-        "params": "~68.4M",
-        "params_num": 68370432,
-        "d_model": 640,
-        "n_layers": 10,
-        "n_heads": 8,
-        "d_ff": 2560,
-        "head_dim": 80,
     },
 }
+
+
+def fetch_config(repo: str) -> dict:
+    """Download config.json from a HuggingFace model repo."""
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download(repo, "config.json")
+    with open(path) as f:
+        return json.load(f)
+
+
+def params_str(n: int) -> str:
+    """Format parameter count as human-readable string."""
+    if n >= 1_000_000:
+        return f"~{n / 1_000_000:.1f}M"
+    elif n >= 1_000:
+        return f"~{n / 1_000:.0f}K"
+    return str(n)
+
+
+def count_params(model_config: dict) -> int:
+    """Estimate parameter count from model config.
+
+    This is an approximation — the exact count depends on the factored
+    embedding implementation, but it's close enough for display.
+    """
+    d = model_config["d_model"]
+    n_layers = model_config["n_layers"]
+    n_heads = model_config["n_heads"]
+    d_ff = model_config["d_ff"]
+    vocab_size = model_config["vocab_size"]
+    head_dim = d // n_heads
+
+    # Factored embeddings: src(64) + dst(64) + promo(5) + pad(1) + outcomes
+    embed = (64 + 64 + 5) * d + d + model_config.get("n_outcomes", 5) * d
+
+    # Per layer: attn (Q,K,V,O) + ffn (gate, up, down) + 2x RMSNorm
+    attn = 4 * d * d  # Q, K, V, O
+    ffn = 3 * d * d_ff  # gate, up (SwiGLU), down
+    norm = 2 * d  # 2 RMSNorm per layer
+    per_layer = attn + ffn + norm
+
+    # Final norm + lm_head
+    final = d + vocab_size * d
+
+    return embed + n_layers * per_layer + final
 
 # Accuracy ceiling constants
 UNCOND_CEILING = 6.43
@@ -172,9 +193,21 @@ def format_diagnostic(eval_results: dict, diag_name: str) -> tuple[str, str]:
 def build_context(variant_key: str, variant: dict) -> dict:
     """Build the full Jinja template context for a variant."""
     repo = variant["repo"]
-    print(f"  Fetching metrics from {repo}...")
+    print(f"  Fetching config and metrics from {repo}...")
 
     ctx = dict(variant)
+    ctx["variant_key"] = variant_key
+
+    # Fetch model architecture from config.json
+    config = fetch_config(repo)
+    mc = config.get("model_config", {})
+    ctx["d_model"] = mc.get("d_model", 0)
+    ctx["n_layers"] = mc.get("n_layers", 0)
+    ctx["n_heads"] = mc.get("n_heads", 0)
+    ctx["d_ff"] = mc.get("d_ff", 0)
+    ctx["head_dim"] = ctx["d_model"] // ctx["n_heads"] if ctx["n_heads"] else 0
+    ctx["params_num"] = count_params(mc)
+    ctx["params"] = params_str(ctx["params_num"])
 
     # Fetch training metrics
     best = fetch_best_metrics(repo)
