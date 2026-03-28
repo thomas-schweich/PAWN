@@ -136,11 +136,16 @@ fn compute_ply_bits(
     }
 
     if legal.is_empty() {
-        if in_check {
-            bits |= CHECKMATE;
+        // Terminal state: the only relevant diagnostic is "does the model
+        // know the game is over?" Checkmate is not check — it's checkmate.
+        // Return only the terminal bit (plus any draw termination bits passed
+        // in by the caller) so terminal positions don't pollute non-terminal
+        // category quotas and counts.
+        return if in_check {
+            CHECKMATE | termination_bits
         } else {
-            bits |= STALEMATE;
-        }
+            STALEMATE | termination_bits
+        };
     }
 
     // --- Pins (bit 4) ---

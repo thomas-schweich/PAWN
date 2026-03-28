@@ -2,7 +2,6 @@
 """Run top-layer probes and diagnostics on all three trained models. Fast version."""
 
 import json
-import tempfile
 import torch
 
 from pawn.config import CLMConfig
@@ -10,8 +9,10 @@ from pawn.model import PAWNCLM
 from pawn.checkpoint import load_backbone_weights
 from pawn.gpu import configure_gpu
 from pawn.eval_suite.probes import extract_probe_data, train_all_probes
-from pawn.eval_suite.corpus import generate_corpus, load_corpus
-from pawn.eval_suite.diagnostics import extract_diagnostic_positions, evaluate_diagnostic_positions
+from pawn.eval_suite.diagnostics import (
+    generate_diagnostic_corpus,
+    extract_diagnostic_positions, evaluate_diagnostic_positions,
+)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cuda":
@@ -31,11 +32,10 @@ train_data = extract_probe_data(2048, 256, seed=12345)
 val_data = extract_probe_data(512, 256, seed=54321)
 print("Done.", flush=True)
 
+# Generate diagnostic corpus (quota-controlled for rare edge cases)
 print("Generating diagnostic corpus...", flush=True)
-tmpdir = tempfile.mkdtemp()
-corpus_path = generate_corpus(tmpdir, n_games=2048, max_ply=255, seed=99999, batch_size=2048)
-corpus = load_corpus(corpus_path)
-positions = extract_diagnostic_positions(corpus, min_per_category=200, max_per_category=1000)
+corpus = generate_diagnostic_corpus(n_per_category=10_000)
+positions = extract_diagnostic_positions(corpus, max_per_category=10_000)
 print("Done.", flush=True)
 
 for name, info in variants.items():
