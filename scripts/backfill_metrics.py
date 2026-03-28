@@ -80,6 +80,16 @@ def load_checkpoint_from_hf(repo: str, step_dir: str, device: str) -> dict[str, 
     return load_file(path, device=device)
 
 
+def load_checkpoint_config(repo: str, step_dir: str) -> CLMConfig:
+    """Load CLMConfig from a checkpoint's config.json on HF."""
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download(repo, f"checkpoints/{step_dir}/config.json")
+    with open(path) as f:
+        data = json.load(f)
+    mc = data["model_config"]
+    return CLMConfig(**mc)
+
+
 def load_root_weights_from_hf(repo: str, device: str) -> dict[str, torch.Tensor]:
     """Download and load root-level model weights from HF."""
     from huggingface_hub import hf_hub_download
@@ -224,11 +234,8 @@ def backfill_variant(
             _push_metrics(repo, all_records, local_metrics_path)
         return
 
-    # --- Create model and val data ---
-    cfg = getattr(CLMConfig, variant["config_factory"])()
+    # --- Generate val data ---
     train_cfg = TrainingConfig()
-    model = PAWNCLM(cfg).to(device).eval()
-
     print(f"  Generating validation set ({val_games} games)...")
     val_data = create_validation_set(
         val_games, train_cfg.max_ply, seed=(2**63) - 1, discard_ply_limit=False,
@@ -236,15 +243,26 @@ def backfill_variant(
 
     # --- Evaluate each available checkpoint ---
     step_to_metrics: dict[int, dict[str, float]] = {}
+    model: PAWNCLM | None = None
+    prev_cfg: CLMConfig | None = None
 
     for step in sorted(available_steps):
         source = step_to_source[step]
+
+        # Load config from the checkpoint being evaluated
         if source == "__root__":
+            cfg = getattr(CLMConfig, variant["config_factory"])()
             print(f"  Evaluating root weights (step {step})...", end=" ", flush=True)
             weights = load_root_weights_from_hf(repo, device)
         else:
+            cfg = load_checkpoint_config(repo, source)
             print(f"  Evaluating {source}...", end=" ", flush=True)
             weights = load_checkpoint_from_hf(repo, source, device)
+
+        # Rebuild model if config changed (or first iteration)
+        if model is None or cfg != prev_cfg:
+            model = PAWNCLM(cfg).to(device).eval()
+            prev_cfg = cfg
 
         metrics = evaluate_checkpoint(model, weights, val_data, device)
         step_to_metrics[step] = metrics
