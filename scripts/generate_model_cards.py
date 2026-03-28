@@ -61,32 +61,17 @@ def params_str(n: int) -> str:
     return str(n)
 
 
-def count_params(model_config: dict) -> int:
-    """Estimate parameter count from model config.
+def count_params_from_weights(repo: str) -> int:
+    """Count exact parameters from the safetensors weights on HuggingFace."""
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
 
-    This is an approximation — the exact count depends on the factored
-    embedding implementation, but it's close enough for display.
-    """
-    d = model_config["d_model"]
-    n_layers = model_config["n_layers"]
-    n_heads = model_config["n_heads"]
-    d_ff = model_config["d_ff"]
-    vocab_size = model_config["vocab_size"]
-    head_dim = d // n_heads
-
-    # Factored embeddings: src(64) + dst(64) + promo(5) + pad(1) + outcomes
-    embed = (64 + 64 + 5) * d + d + model_config.get("n_outcomes", 5) * d
-
-    # Per layer: attn (Q,K,V,O) + ffn (gate, up, down) + 2x RMSNorm
-    attn = 4 * d * d  # Q, K, V, O
-    ffn = 3 * d * d_ff  # gate, up (SwiGLU), down
-    norm = 2 * d  # 2 RMSNorm per layer
-    per_layer = attn + ffn + norm
-
-    # Final norm + lm_head
-    final = d + vocab_size * d
-
-    return embed + n_layers * per_layer + final
+    path = hf_hub_download(repo, "model.safetensors")
+    total = 0
+    with safe_open(path, framework="pt") as f:
+        for key in f.keys():
+            total += f.get_tensor(key).numel()
+    return total
 
 # Accuracy ceiling constants
 UNCOND_CEILING = 6.43
@@ -206,7 +191,7 @@ def build_context(variant_key: str, variant: dict) -> dict:
     ctx["n_heads"] = mc.get("n_heads", 0)
     ctx["d_ff"] = mc.get("d_ff", 0)
     ctx["head_dim"] = ctx["d_model"] // ctx["n_heads"] if ctx["n_heads"] else 0
-    ctx["params_num"] = count_params(mc)
+    ctx["params_num"] = count_params_from_weights(repo)
     ctx["params"] = params_str(ctx["params_num"])
 
     # Fetch training metrics
