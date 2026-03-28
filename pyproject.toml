@@ -80,7 +80,7 @@ pythonVersion = "3.10"
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false
 reportPrivateImportUsage = false
-reportMissingImports = "warning"
+reportMissingImports = "error"
 include = ["pawn"]
 exclude = ["pawn/dashboard"]
 
