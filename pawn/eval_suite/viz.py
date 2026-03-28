@@ -43,7 +43,7 @@ def plot_game_length_distribution(stats: dict, ax: Axes | None = None) -> plt.Fi
     ax.set_ylabel("Count")
     ax.set_title("Game Length Distribution")
     ax.legend()
-    return fig or ax.figure
+    return fig or ax.figure  # type: ignore[return-value]
 
 
 def plot_legal_move_distribution(bounds: dict, ax: Axes | None = None) -> plt.Figure:
@@ -64,7 +64,7 @@ def plot_legal_move_distribution(bounds: dict, ax: Axes | None = None) -> plt.Fi
     ax.set_title("Legal Move Count Distribution")
     ax.set_xlim(0, 80)
     ax.legend()
-    return fig or ax.figure
+    return fig or ax.figure  # type: ignore[return-value]
 
 
 def plot_outcome_rates(stats: dict, ax: Axes | None = None) -> plt.Figure:
@@ -83,7 +83,7 @@ def plot_outcome_rates(stats: dict, ax: Axes | None = None) -> plt.Figure:
     ax.set_xlabel("Rate (%)")
     ax.set_title("Outcome Base Rates (1M Random Games)")
     ax.invert_yaxis()
-    return fig or ax.figure
+    return fig or ax.figure  # type: ignore[return-value]
 
 
 def plot_k_by_phase(bounds: dict, ax: Axes | None = None) -> plt.Figure:
@@ -106,7 +106,7 @@ def plot_k_by_phase(bounds: dict, ax: Axes | None = None) -> plt.Figure:
     ax.set_xticklabels(labels)
     ax.set_ylabel("E[1/K] (%)")
     ax.set_title("Theoretical Top-1 Accuracy Ceiling by Game Phase")
-    return fig or ax.figure
+    return fig or ax.figure  # type: ignore[return-value]
 
 
 def plot_prefix_histogram(sanity: dict, ax: Axes | None = None) -> plt.Figure:
@@ -123,7 +123,7 @@ def plot_prefix_histogram(sanity: dict, ax: Axes | None = None) -> plt.Figure:
     ax.set_ylabel("Count (adjacent pairs)")
     ax.set_title(f"Adjacent-Pair Common Prefix Lengths (max={sanity['max_prefix_moves']})")
     ax.set_yscale("log")
-    return fig or ax.figure
+    return fig or ax.figure  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------

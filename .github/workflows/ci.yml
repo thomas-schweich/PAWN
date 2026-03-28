@@ -6,6 +6,9 @@ on:
   push:
     branches: [main]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -69,5 +72,4 @@ jobs:
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Pyright
-        continue-on-error: true
         run: uv run pyright pawn/

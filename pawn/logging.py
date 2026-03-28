@@ -106,9 +106,9 @@ def _sanitize(obj: object) -> object:
 def _json_default(obj: object) -> object:
     """JSON serializer for types not natively supported."""
     if torch is not None and isinstance(obj, torch.Tensor):
-        return obj.item() if obj.numel() == 1 else obj.tolist()
+        return obj.item() if obj.numel() == 1 else obj.tolist()  # type: ignore[union-attr]
     if hasattr(obj, "item"):  # numpy scalar
-        return obj.item()
+        return obj.item()  # type: ignore[union-attr]
     if isinstance(obj, Path):
         return str(obj)
     return str(obj)
