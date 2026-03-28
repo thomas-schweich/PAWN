@@ -317,7 +317,7 @@ case "${1:-}" in
     setup)   shift; cmd_setup "$@" ;;
     deploy)  shift; cmd_deploy "$@" ;;
     launch)  shift; cmd_launch "$@" ;;
-    sync)    shift; bash "$REPO/deploy/sync.sh" "$@" ;;
+    sync)    echo "sync command removed — checkpoints load directly from HuggingFace"; exit 1 ;;
     *)
         echo "PAWN Pod Manager"
         echo ""
@@ -336,7 +336,7 @@ case "${1:-}" in
         echo "  setup  <name>            Run setup.sh on the pod"
         echo "  deploy <name>            Build + transfer + setup (full deploy)"
         echo "  launch <name> <cmd>      Run a training command via nohup"
-        echo "  sync   [name]            Sync logs/checkpoints from pod(s)"
+        echo "  sync                     (removed — checkpoints load from HuggingFace)"
         echo ""
         echo "GPU shortcuts: a5000, a40, a6000, 4090, 5090, l40s, a100, a100-pcie, a100-sxm, h100, h200"
         echo ""

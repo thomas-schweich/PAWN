@@ -212,38 +212,38 @@ All commands assume you are in the `pawn/` directory. `--checkpoint` points to a
 ```bash
 # Bottleneck (recommended default)
 uv run python scripts/train_bottleneck.py \
-    --checkpoint checkpoints/pawn.pt --pgn data/lichess_1800.pgn \
+    --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
     --bottleneck-dim 32 --max-games 100000 --lr 3e-4
 
 # LoRA
 uv run python scripts/train_lora.py \
-    --checkpoint checkpoints/pawn.pt --pgn data/lichess_1800.pgn \
+    --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
     --lora-rank 8 --lora-targets qkvo --lr 3e-4
 
 # FiLM
 uv run python scripts/train_film.py \
-    --checkpoint checkpoints/pawn.pt --pgn data/lichess_1800.pgn \
+    --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
     --lr 1e-3
 
 # Sparse
 uv run python scripts/train_sparse.py \
-    --checkpoint checkpoints/pawn.pt --pgn data/lichess_1800.pgn \
+    --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
     --density 0.015 --sparse-ffn --lr 3e-4
 
 # Hybrid (LoRA + FiLM)
 uv run python scripts/train_hybrid.py \
-    --checkpoint checkpoints/pawn.pt --pgn data/lichess_1800.pgn \
+    --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
     --lora-rank 4 --lora-lr 3e-4 --film-lr 1e-3
 
 # RoSA (standard: joint LoRA + gradient-informed sparse)
 uv run python scripts/train_rosa.py \
-    --checkpoint checkpoints/pawn.pt --pgn data/lichess_1800.pgn \
+    --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
     --mode rosa --density 0.01 --lora-rank 4 --warmup-steps 128 --lr 3e-4 \
     --local-checkpoints
 
 # RoSA (retrospective sparse + bottleneck)
 uv run python scripts/train_rosa.py \
-    --checkpoint checkpoints/pawn.pt --pgn data/lichess_1800.pgn \
+    --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
     --mode retro-bottleneck --density 0.01 --bottleneck-dim 8 --lr 3e-4 \
     --local-checkpoints
 ```

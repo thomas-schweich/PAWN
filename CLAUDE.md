@@ -215,7 +215,7 @@ The `.complete` sentinel contains SHA-256 hashes of every file in the checkpoint
 the training loop checks it between steps, saves a checkpoint, pushes to HF, and exits cleanly.
 
 **Never rsync checkpoint files from running pods.** Checkpoints are pushed to HuggingFace
-from the trainer. Pull via `deploy/sync.sh` (submodule update).
+from the trainer. Load via HF repo ID (e.g. `--checkpoint thomas-schweich/pawn-base`).
 
 ## RunPod Operations
 
@@ -290,7 +290,7 @@ Total cost is remarkably consistent ($30-39) across viable GPUs. The choice is w
 - Stop pods with `runpodctl pod stop` or `bash deploy/pod.sh stop` — sends SIGTERM, trainer saves and pushes before exiting.
 - **Never `runpodctl pod delete` while training is running** — data loss risk.
 - **Never `kill -9` training processes** — use SIGTERM (plain `kill`), which triggers graceful shutdown.
-- **Never rsync checkpoint files from running pods** — pull via HF submodule instead.
+- **Never rsync checkpoint files from running pods** — load via HF repo ID instead.
 
 ## Monitoring Training Progress
 
@@ -325,8 +325,7 @@ bash /home/tas/pawn/scripts/check_progress.sh --sync
 | Tool | What it does |
 |------|-------------|
 | `scripts/monitor_training.sh [POD_ID]` | SSH to pod, sync metrics via rsync, show per-variant step/loss/acc/ETA, check HF checkpoint branches |
-| `scripts/check_progress.sh [--sync]` | Show progress from local `logs/` and HF submodules. `--sync` pulls submodules first. |
-| `deploy/sync.sh [name]` | Pull latest checkpoints/metrics from HuggingFace submodules |
+| `scripts/check_progress.sh [LOG_DIR]` | Show progress from local `logs/` directory |
 | `python -m pawn.dashboard --log-dir logs` | Solara web dashboard with interactive charts |
 
 ### Dashboard
