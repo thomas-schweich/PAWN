@@ -40,9 +40,7 @@ cd engine && uv run --with maturin maturin develop --release && cd ..
 echo "Installing Python dependencies..."
 uv sync --extra cu128
 
-# Pull pawn-base checkpoint
-echo "Pulling pawn-base checkpoint..."
-git submodule update --init checkpoints/pawn-base
+# Checkpoint is loaded directly from HF at runtime (thomas-schweich/pawn-base)
 
 # Create sweep output dir on volume
 mkdir -p /workspace/sweeps
@@ -58,5 +56,5 @@ echo "Run sweeps with:"
 echo "  cd /workspace/pawn"
 echo "  CUDA_VISIBLE_DEVICES=0,1 uv run python scripts/sweep.py \\"
 echo "    --adapter rosa --in-process --n-trials 30 --n-gpus 2 --n-jobs 2 \\"
-echo "    --checkpoint checkpoints/pawn-base --pgn <PGN_PATH> \\"
+echo "    --checkpoint thomas-schweich/pawn-base --pgn <PGN_PATH> \\"
 echo "    --output-dir /workspace/sweeps --local-checkpoints"

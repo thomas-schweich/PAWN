@@ -1,32 +1,13 @@
 #!/usr/bin/env bash
-# Check training progress from HuggingFace submodules and local logs.
-# Usage: check_progress.sh [--sync] [LOG_DIR]
+# Check training progress from local logs.
+# Usage: check_progress.sh [LOG_DIR]
 set -euo pipefail
 
-SYNC=false
-LOG_DIR=""
+LOG_DIR="${1:-logs}"
 
-for arg in "$@"; do
-    case "$arg" in
-        --sync) SYNC=true ;;
-        *) LOG_DIR="$arg" ;;
-    esac
-done
-LOG_DIR="${LOG_DIR:-logs}"
-
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
-
-# Sync submodules from HuggingFace
-if $SYNC; then
-    bash "$REPO/deploy/sync.sh" 2>/dev/null || true
-fi
-
-# Show progress from all metrics.jsonl files (local logs + submodules)
 N=5
-{
-    find "$LOG_DIR" -name metrics.jsonl -printf '%T@ %p\n' 2>/dev/null
-    find "$REPO/checkpoints" -name metrics.jsonl -printf '%T@ %p\n' 2>/dev/null
-} | sort -rn | head -n "$N" | while read -r _ path; do
+find "$LOG_DIR" -name metrics.jsonl -printf '%T@ %p\n' 2>/dev/null \
+| sort -rn | head -n "$N" | while read -r _ path; do
     run_name="$(basename "$(dirname "$path")")"
 
     python3 -c "

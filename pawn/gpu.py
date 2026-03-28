@@ -4,7 +4,12 @@ Auto-detects NVIDIA vs AMD GPUs and configures torch.compile and SDPA
 backend for best performance. ROCm's flash attention backward has stride
 mismatches with torch.compile, so we fall back to the MATH SDPA backend
 on AMD GPUs (still ~30% faster than no compile at all).
+
+Raises RuntimeError if no GPU is detected at runtime, unless the
+environment variable PAWN_ALLOW_CPU=1 is set.
 """
+
+import os
 
 
 def is_rocm() -> bool:
@@ -35,12 +40,12 @@ def configure_gpu(
 
         NVIDIA: compile + AMP + flash attention (default SDPA)
         AMD:    compile + AMP + MATH SDPA (avoids flash attn backward bug)
-        CPU:    no compile, no AMP
+        CPU:    no compile, no AMP (requires PAWN_ALLOW_CPU=1)
     """
     import torch
     from torch.nn.attention import SDPBackend
 
-    is_cuda = device.startswith("cuda") and torch.cuda.is_available()
+    is_cuda = torch.cuda.is_available()
     rocm = is_cuda and is_rocm()
 
     # Defaults: compile and AMP on for CUDA
@@ -60,8 +65,13 @@ def configure_gpu(
         gpu_name = torch.cuda.get_device_name(0)
         platform = "ROCm" if rocm else "CUDA"
         print(f"GPU: {gpu_name} ({platform})")
+    elif os.environ.get("PAWN_ALLOW_CPU") == "1":
+        print("GPU: none (CPU mode — PAWN_ALLOW_CPU=1)")
     else:
-        print("GPU: none (CPU mode)")
+        raise RuntimeError(
+            "No GPU available. Training and evaluation require a CUDA or ROCm GPU.\n"
+            "Set PAWN_ALLOW_CPU=1 to override."
+        )
 
     if use_compile:
         print(f"  torch.compile: enabled (inductor)")

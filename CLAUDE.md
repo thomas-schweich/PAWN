@@ -44,7 +44,9 @@ uv run pytest tests/
 uv run python scripts/train.py --variant base --local-checkpoints
 ```
 
-The only extras are GPU backends (`rocm` or `cu128`). Everything else (pytest, solara, optuna, seaborn, etc.) is in base dependencies.
+PyTorch is a **base dependency** — `uv sync` always installs it (CPU build from PyPI by default). The extras (`rocm`, `cu128`) only control which GPU-accelerated build is pulled from the PyTorch index. You cannot accidentally end up without torch.
+
+**GPU requirement**: `configure_gpu()` (called by every training and eval script) raises `RuntimeError` if no CUDA/ROCm GPU is detected. This prevents accidentally running GPU workloads on CPU, which is almost always a mistake. The environment variable `PAWN_ALLOW_CPU=1` overrides this check as a last resort for the rare case where CPU execution is genuinely intended (e.g. a lightweight backfill script). Unit tests do not call `configure_gpu()` and run fine on CPU without the override.
 
 ## Engine (`engine/`)
 
@@ -106,8 +108,8 @@ All adapter scripts require `--checkpoint PATH` (pretrained weights) and `--pgn 
 ```bash
 # Example: train a LoRA adapter on Lichess 1800-1900 games
 uv run python scripts/train_lora.py \
-    --checkpoint checkpoints/pawn-base \
-    --pgn data/lichess_1800_1900.pgn \
+    --checkpoint thomas-schweich/pawn-base \
+    --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
     --lora-rank 4 --lr 3e-4 --local-checkpoints
 ```
 
@@ -145,8 +147,8 @@ Trains linear probes on frozen hidden states to measure internal representations
 
 ```bash
 uv run python scripts/eval_accuracy.py \
-    --checkpoint checkpoints/pawn-base \
-    --pgn data/lichess_1800_1900.pgn \
+    --checkpoint thomas-schweich/pawn-base \
+    --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
     --adapter-checkpoint logs/run_*/checkpoints/best
 ```
 
@@ -170,12 +172,12 @@ Converts a training run to HuggingFace repo format (safetensors + metrics). Find
 
 ## Checkpoints
 
-Pre-trained weights are HuggingFace git submodules under `checkpoints/`:
-- `checkpoints/pawn-small` — 9.5M params, `CLMConfig.small()`
-- `checkpoints/pawn-base` — 35.8M params, `CLMConfig.base()`
-- `checkpoints/pawn-large` — 68.4M params, `CLMConfig.large()`
+Pre-trained weights are hosted on HuggingFace and loaded directly by repo ID:
+- `thomas-schweich/pawn-small` — 9.5M params, `CLMConfig.small()`
+- `thomas-schweich/pawn-base` — 35.8M params, `CLMConfig.base()`
+- `thomas-schweich/pawn-large` — 68.4M params, `CLMConfig.large()`
 
-Pull with: `git submodule update --init --remote checkpoints/pawn-base`
+All scripts accept HF repo IDs for `--checkpoint` (e.g. `--checkpoint thomas-schweich/pawn-base`). Weights are downloaded and cached automatically via `huggingface_hub`.
 
 ### Checkpoint Format (safetensors)
 
@@ -215,7 +217,7 @@ The `.complete` sentinel contains SHA-256 hashes of every file in the checkpoint
 the training loop checks it between steps, saves a checkpoint, pushes to HF, and exits cleanly.
 
 **Never rsync checkpoint files from running pods.** Checkpoints are pushed to HuggingFace
-from the trainer. Pull via `deploy/sync.sh` (submodule update).
+from the trainer. Load via HF repo ID (e.g. `--checkpoint thomas-schweich/pawn-base`).
 
 ## RunPod Operations
 
@@ -290,7 +292,7 @@ Total cost is remarkably consistent ($30-39) across viable GPUs. The choice is w
 - Stop pods with `runpodctl pod stop` or `bash deploy/pod.sh stop` — sends SIGTERM, trainer saves and pushes before exiting.
 - **Never `runpodctl pod delete` while training is running** — data loss risk.
 - **Never `kill -9` training processes** — use SIGTERM (plain `kill`), which triggers graceful shutdown.
-- **Never rsync checkpoint files from running pods** — pull via HF submodule instead.
+- **Never rsync checkpoint files from running pods** — load via HF repo ID instead.
 
 ## Monitoring Training Progress
 
@@ -325,8 +327,7 @@ bash /home/tas/pawn/scripts/check_progress.sh --sync
 | Tool | What it does |
 |------|-------------|
 | `scripts/monitor_training.sh [POD_ID]` | SSH to pod, sync metrics via rsync, show per-variant step/loss/acc/ETA, check HF checkpoint branches |
-| `scripts/check_progress.sh [--sync]` | Show progress from local `logs/` and HF submodules. `--sync` pulls submodules first. |
-| `deploy/sync.sh [name]` | Pull latest checkpoints/metrics from HuggingFace submodules |
+| `scripts/check_progress.sh [LOG_DIR]` | Show progress from local `logs/` directory |
 | `python -m pawn.dashboard --log-dir logs` | Solara web dashboard with interactive charts |
 
 ### Dashboard
@@ -351,7 +352,7 @@ Optuna integration via `pawn/sweep.py` and `scripts/sweep.py`:
 uv run python scripts/sweep.py \
     --adapter lora --n-trials 30 --n-jobs 2 --n-gpus 2 \
     --total-steps 20000 --pruner hyperband \
-    --checkpoint checkpoints/pawn-base --pgn data/lichess_1800_1900.pgn \
+    --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
     --local-checkpoints
 ```
 

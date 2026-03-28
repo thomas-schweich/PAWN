@@ -334,7 +334,7 @@ class CLMTrainer:
         """Low-level JSONL write for seed_logs compatibility."""
         self.logger._write(record)
 
-    def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
+    def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         self.model.train()
 
         input_ids = batch["input_ids"].to(self.device)
@@ -458,7 +458,7 @@ class CLMTrainer:
                 games_per_sec = games_per_step / step_time
 
                 if self.global_step % self.cfg.log_interval == 0:
-                    # .item() sync only at log intervals
+                    # .item() sync only at log intervals (metrics are tensors here)
                     loss_val = metrics['loss'].item()
                     acc_val = metrics['accuracy'].item()
                     lr = self.scheduler.get_lr()
@@ -478,7 +478,7 @@ class CLMTrainer:
                         step=self.global_step,
                         lr=lr, grad_norm=grad_norm,
                         step_time=step_time, games_per_sec=games_per_sec,
-                        **{"train/loss": loss_val, "train/accuracy": acc_val},
+                        **{"train/loss": loss_val, "train/accuracy": acc_val},  # type: ignore[arg-type]
                     )
 
                     if self.wandb_run:
@@ -500,7 +500,7 @@ class CLMTrainer:
                         val_msg += f" | legal {val_metrics['val/legal_move_rate']:.3f}"
                     print(val_msg, flush=True)
 
-                    self.logger.log_val(step=self.global_step, **val_metrics)
+                    self.logger.log_val(step=self.global_step, **val_metrics)  # type: ignore[arg-type]
 
                     if self.wandb_run:
                         self.wandb_run.log(val_metrics, step=self.global_step)

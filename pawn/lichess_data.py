@@ -10,12 +10,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 import torch
 import torch.utils.data
 
 import chess_engine as engine
 
 from pawn.config import (
+    OUTCOME_TOKEN_BASE,
     WHITE_CHECKMATES,
     BLACK_CHECKMATES,
     DRAW_BY_RULE,
@@ -253,13 +255,11 @@ def prepare_lichess_dataset(
 
 
 def _scan_parquet(
-    parquet_path: str | Path = None,
-    hf_repo: str = None,
+    parquet_path: str | Path | None = None,
+    hf_repo: str | None = None,
     split: str = "train",
 ) -> "pl.LazyFrame":
     """Create a Polars LazyFrame from a local Parquet file or HF dataset repo."""
-    import polars as pl
-
     if hf_repo is not None:
         # Use hf:// protocol for direct lazy scanning from HuggingFace
         hf_url = f"hf://datasets/{hf_repo}/data/{split}-*.parquet"
@@ -289,8 +289,8 @@ def _scan_parquet(
 
 
 def prepare_lichess_parquet(
-    parquet_path: str | Path = None,
-    hf_repo: str = None,
+    parquet_path: str | Path | None = None,
+    hf_repo: str | None = None,
     max_ply: int = 255,
     max_games: int = 50_000,
     min_ply: int = 10,
@@ -308,8 +308,6 @@ def prepare_lichess_parquet(
     Reads from a local Parquet file or a HuggingFace dataset repo.
     Returns the same dict format as prepare_lichess_dataset().
     """
-    import polars as pl
-
     lf = _scan_parquet(parquet_path, hf_repo, split)
     schema = lf.collect_schema()
 
@@ -340,7 +338,6 @@ def _prepare_from_tokens(
 
     Format is auto-detected from the first token of the first game.
     """
-    import polars as pl
 
     needed_cols = ["tokens", "result"]
     if "game_length" in lf.collect_schema():
@@ -404,7 +401,7 @@ def _prepare_v2_tokens(
 
     # Apply min_ply filter
     if min_ply > 1:
-        keep = game_lengths >= min_ply
+        keep: np.ndarray = game_lengths >= min_ply
         input_ids = input_ids[keep]
         move_ids = move_ids[keep]
         game_lengths = game_lengths[keep]
