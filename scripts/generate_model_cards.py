@@ -142,11 +142,20 @@ def fetch_eval_results(repo: str) -> dict:
 
 
 def fetch_best_metrics(repo: str) -> dict:
-    """Download metrics.jsonl and extract best val metrics."""
+    """Download metrics.jsonl and extract best val metrics.
+
+    Returns the best val record by loss. If that record is missing extended
+    fields (top5_accuracy, legal_move_rate), merges them from the best val
+    record that does have them. This handles the case where val was logged
+    every 500 steps but checkpoints (with backfilled extended metrics) only
+    exist every 5K steps.
+    """
     from huggingface_hub import hf_hub_download
     path = hf_hub_download(repo, "metrics.jsonl")
     best_loss = float("inf")
     best = None
+    best_extended_loss = float("inf")
+    best_extended = None
     with open(path) as f:
         for line in f:
             r = json.loads(line)
@@ -155,8 +164,16 @@ def fetch_best_metrics(repo: str) -> dict:
                 if loss < best_loss:
                     best_loss = loss
                     best = r
+                if "val/top5_accuracy" in r and loss < best_extended_loss:
+                    best_extended_loss = loss
+                    best_extended = r
     if best is None:
         raise ValueError(f"No val records found in metrics.jsonl from {repo}")
+    # Merge extended fields from the best record that has them
+    if best_extended is not None:
+        for key in ("val/top5_accuracy", "val/perplexity", "val/legal_move_rate"):
+            if key not in best and key in best_extended:
+                best[key] = best_extended[key]
     return best
 
 
