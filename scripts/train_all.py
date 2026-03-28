@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import signal
@@ -221,11 +222,14 @@ class ModelSlot:
 
     @torch.no_grad()
     def evaluate(self, val_data: dict[str, torch.Tensor]) -> dict[str, float]:
+        from pawn.trainer import compute_legal_move_rate
+
         self.model.eval()
         n = val_data["input_ids"].shape[0]
         batch_size = self.train_cfg.batch_size
         total_metrics: dict[str, float] = {}
         n_batches = 0
+        has_legal = "legal_grid" in val_data
 
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
@@ -236,6 +240,25 @@ class ModelSlot:
             with torch.amp.autocast(self.device, enabled=self.train_cfg.use_amp):
                 logits, _ = self.model(input_ids, loss_mask)
                 _, metrics = clm_loss(logits, targets, loss_mask)
+
+            # Top-5 accuracy
+            valid_logits = logits[loss_mask]
+            valid_targets = targets[loss_mask]
+            top5 = valid_logits.topk(5, dim=-1).indices
+            metrics["top5_accuracy"] = (
+                (top5 == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
+            )
+
+            # Perplexity
+            metrics["perplexity"] = math.exp(min(metrics["loss"], 20.0))
+
+            # Legal move rate
+            if has_legal:
+                legal_grid = val_data["legal_grid"][start:end].to(self.device)
+                game_lengths = val_data["game_lengths"][start:end].to(self.device)
+                metrics["legal_move_rate"] = compute_legal_move_rate(
+                    logits, legal_grid, loss_mask, game_lengths,
+                )
 
             for k, v in metrics.items():
                 total_metrics[k] = total_metrics.get(k, 0.0) + v

@@ -78,7 +78,7 @@ class CosineWithWarmup:
         self._apply_lr(self._step)
 
 
-def _compute_legal_move_rate(
+def compute_legal_move_rate(
     logits: torch.Tensor,
     legal_grid: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -392,7 +392,7 @@ class CLMTrainer:
             if has_legal:
                 legal_grid = self.val_data["legal_grid"][start:end].to(self.device)
                 game_lengths = self.val_data["game_lengths"][start:end].to(self.device)
-                legal_rate = _compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
+                legal_rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
                 metrics["legal_move_rate"] = legal_rate
 
             for k, v in metrics.items():
