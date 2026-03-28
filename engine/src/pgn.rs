@@ -14,6 +14,7 @@ use shakmaty::{Chess, Position};
 use shakmaty::san::San;
 
 use crate::board::move_to_token;
+use crate::vocab;
 
 // ---------------------------------------------------------------------------
 // Enriched PGN parsing — extracts moves, clocks, evals, and headers
@@ -72,6 +73,88 @@ pub fn parse_pgn_enriched(
                 clocks,
                 evals,
                 game_length: n_valid,
+                headers: raw.headers,
+            })
+        })
+        .collect()
+}
+
+/// A Lichess game parsed with outcome token prepended and no eval column.
+pub struct LichessGame {
+    /// PAWN token sequence: [outcome_token, ply_1, ..., ply_N].
+    pub tokens: Vec<u16>,
+    /// Seconds remaining on clock after each ply (parallel to moves, not outcome).
+    pub clocks: Vec<u16>,
+    /// Number of move plies (excluding outcome token).
+    pub game_length: usize,
+    /// Original game length before truncation (for detecting >max_ply games).
+    pub original_length: usize,
+    /// The outcome token ID.
+    pub outcome_token: u16,
+    /// PGN header fields.
+    pub headers: HashMap<String, String>,
+}
+
+/// Parse Lichess PGN into games with outcome tokens prepended.
+///
+/// For each game:
+/// 1. Replays ALL moves (even beyond max_ply) to determine checkmate/stalemate
+/// 2. Classifies outcome using Termination header + board state
+/// 3. Prepends the outcome token to the (truncated) move sequence
+/// 4. Filters out Abandoned, Rules infraction, Unterminated games
+/// 5. Drops eval annotations (not included in output)
+pub fn parse_pgn_lichess(
+    content: &str,
+    max_ply: usize,
+    max_games: usize,
+    min_ply: usize,
+) -> Vec<LichessGame> {
+    let raw_games = parse_raw_games(content, max_games, None, None);
+
+    raw_games
+        .into_par_iter()
+        .filter_map(|raw| {
+            let (san_moves, clocks_raw, _evals_raw) = extract_moves_and_annotations(&raw.movetext);
+            if san_moves.len() < min_ply {
+                return None;
+            }
+
+            // Tokenize with full replay for terminal state detection
+            let refs: Vec<&str> = san_moves.iter().map(|s| s.as_str()).collect();
+            let result = san_moves_to_tokens_full(&refs, max_ply);
+
+            if result.n_tokenized < min_ply {
+                return None;
+            }
+
+            let truncated = result.n_total_moves > max_ply;
+
+            // Classify outcome
+            let termination = raw.headers.get("Termination").map(|s| s.as_str()).unwrap_or("");
+            let pgn_result = raw.headers.get("Result").map(|s| s.as_str()).unwrap_or("");
+
+            let outcome = vocab::lichess_outcome_token(
+                termination,
+                pgn_result,
+                result.is_checkmate,
+                result.is_stalemate,
+                truncated,
+            )?; // None = filtered out (Abandoned, Rules infraction, etc.)
+
+            // Build token sequence: [outcome, ply_1, ..., ply_N]
+            let mut tokens = Vec::with_capacity(result.n_tokenized + 1);
+            tokens.push(outcome);
+            tokens.extend_from_slice(&result.tokens);
+
+            // Trim clocks to match tokenized moves
+            let clocks = clocks_raw.into_iter().take(result.n_tokenized).collect();
+
+            Some(LichessGame {
+                tokens,
+                clocks,
+                game_length: result.n_tokenized,
+                original_length: result.n_total_moves,
+                outcome_token: outcome,
                 headers: raw.headers,
             })
         })
@@ -438,14 +521,37 @@ pub fn san_moves_to_tokens(
     san_moves: &[&str],
     max_ply: usize,
 ) -> (Vec<u16>, usize) {
+    let (tokens, _n_total, _, _) = san_moves_to_tokens_with_state(san_moves, max_ply);
+    let n = tokens.len();
+    (tokens, n)
+}
+
+/// Result of tokenizing a game with terminal state info.
+pub struct TokenizeResult {
+    pub tokens: Vec<u16>,
+    /// Number of moves successfully tokenized (may be < total moves if truncated).
+    pub n_tokenized: usize,
+    /// Total number of parseable moves in the game (before truncation).
+    pub n_total_moves: usize,
+    /// Whether the final position (after all moves, not just tokenized ones) is checkmate.
+    pub is_checkmate: bool,
+    /// Whether the final position is stalemate.
+    pub is_stalemate: bool,
+}
+
+/// Convert SAN moves to tokens, also returning terminal state info.
+///
+/// Plays through ALL moves (not just up to max_ply) to determine the
+/// final board state, but only records tokens up to max_ply.
+fn san_moves_to_tokens_with_state(
+    san_moves: &[&str],
+    max_ply: usize,
+) -> (Vec<u16>, usize, bool, bool) {
     let mut pos = Chess::default();
     let mut tokens = Vec::with_capacity(san_moves.len().min(max_ply));
+    let mut n_valid = 0;
 
     for (i, san_str) in san_moves.iter().enumerate() {
-        if i >= max_ply {
-            break;
-        }
-
         let san = match San::from_ascii(san_str.as_bytes()) {
             Ok(s) => s,
             Err(_) => break,
@@ -456,13 +562,35 @@ pub fn san_moves_to_tokens(
             Err(_) => break,
         };
 
-        let token = move_to_token(&m);
-        tokens.push(token);
+        if i < max_ply {
+            let token = move_to_token(&m);
+            tokens.push(token);
+        }
+        n_valid = i + 1;
         pos.play_unchecked(m);
     }
 
-    let n = tokens.len();
-    (tokens, n)
+    let is_checkmate = pos.is_checkmate();
+    let is_stalemate = pos.is_stalemate();
+
+    (tokens, n_valid, is_checkmate, is_stalemate)
+}
+
+/// Tokenize SAN moves and return full result with terminal state.
+pub fn san_moves_to_tokens_full(
+    san_moves: &[&str],
+    max_ply: usize,
+) -> TokenizeResult {
+    let (tokens, n_valid, is_checkmate, is_stalemate) =
+        san_moves_to_tokens_with_state(san_moves, max_ply);
+    let n_tokenized = tokens.len();
+    TokenizeResult {
+        tokens,
+        n_tokenized,
+        n_total_moves: n_valid,
+        is_checkmate,
+        is_stalemate,
+    }
 }
 
 /// Batch convert: multiple games, each as a list of SAN moves.
@@ -904,5 +1032,125 @@ mod tests {
             pgn, 256, 2, "2023.12.01", "2023.12.31", &indices, 3,
         );
         assert_eq!(sampled.len(), 0);
+    }
+
+    #[test]
+    fn test_lichess_checkmate() {
+        // Scholar's mate — white checkmates on move 4
+        let pgn = r#"[Event "Rated Blitz game"]
+[Result "1-0"]
+[Termination "Normal"]
+
+1. e4 e5 2. Qh5 Nc6 3. Bc4 Nf6 4. Qxf7# 1-0
+"#;
+        let games = parse_pgn_lichess(pgn, 255, 100, 1);
+        assert_eq!(games.len(), 1);
+        let g = &games[0];
+        assert_eq!(g.outcome_token, crate::vocab::WHITE_CHECKMATES);
+        assert_eq!(g.tokens[0], crate::vocab::WHITE_CHECKMATES);
+        assert_eq!(g.game_length, 7);
+        assert_eq!(g.original_length, 7);
+    }
+
+    #[test]
+    fn test_lichess_resignation() {
+        // White resigns (no checkmate on board)
+        let pgn = r#"[Event "Rated Blitz game"]
+[Result "0-1"]
+[Termination "Normal"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 0-1
+"#;
+        let games = parse_pgn_lichess(pgn, 255, 100, 1);
+        assert_eq!(games.len(), 1);
+        let g = &games[0];
+        assert_eq!(g.outcome_token, crate::vocab::BLACK_RESIGNS);
+        assert_eq!(g.tokens[0], crate::vocab::BLACK_RESIGNS);
+    }
+
+    #[test]
+    fn test_lichess_time_forfeit() {
+        let pgn = r#"[Event "Rated Blitz game"]
+[Result "1-0"]
+[Termination "Time forfeit"]
+
+1. e4 e5 2. Nf3 Nc6 1-0
+"#;
+        let games = parse_pgn_lichess(pgn, 255, 100, 1);
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].outcome_token, crate::vocab::WHITE_WINS_ON_TIME);
+    }
+
+    #[test]
+    fn test_lichess_draw_agreement() {
+        let pgn = r#"[Event "Rated Blitz game"]
+[Result "1/2-1/2"]
+[Termination "Normal"]
+
+1. e4 e5 2. Nf3 Nc6 1/2-1/2
+"#;
+        let games = parse_pgn_lichess(pgn, 255, 100, 1);
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].outcome_token, crate::vocab::DRAW_BY_AGREEMENT);
+    }
+
+    #[test]
+    fn test_lichess_insufficient_material() {
+        let pgn = r#"[Event "Rated Blitz game"]
+[Result "1/2-1/2"]
+[Termination "Insufficient material"]
+
+1. e4 e5 2. Nf3 Nc6 1/2-1/2
+"#;
+        let games = parse_pgn_lichess(pgn, 255, 100, 1);
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].outcome_token, crate::vocab::DRAW_BY_RULE);
+    }
+
+    #[test]
+    fn test_lichess_abandoned_filtered() {
+        let pgn = r#"[Event "Rated Blitz game"]
+[Result "0-1"]
+[Termination "Abandoned"]
+
+1. e4 e5 0-1
+"#;
+        let games = parse_pgn_lichess(pgn, 255, 100, 1);
+        assert_eq!(games.len(), 0, "Abandoned games should be filtered");
+    }
+
+    #[test]
+    fn test_lichess_truncated_ply_limit() {
+        // Game with 4 moves but max_ply=2 — should be PLY_LIMIT
+        let pgn = r#"[Event "Rated Blitz game"]
+[Result "1-0"]
+[Termination "Normal"]
+
+1. e4 e5 2. Nf3 Nc6 1-0
+"#;
+        let games = parse_pgn_lichess(pgn, 2, 100, 1);
+        assert_eq!(games.len(), 1);
+        let g = &games[0];
+        assert_eq!(g.outcome_token, crate::vocab::PLY_LIMIT);
+        assert_eq!(g.game_length, 2);
+        assert_eq!(g.original_length, 4);
+        // tokens: [PLY_LIMIT, ply_1, ply_2]
+        assert_eq!(g.tokens.len(), 3);
+    }
+
+    #[test]
+    fn test_lichess_outcome_token_is_first() {
+        let pgn = r#"[Event "Rated Blitz game"]
+[Result "1-0"]
+[Termination "Time forfeit"]
+
+1. e4 e5 1-0
+"#;
+        let games = parse_pgn_lichess(pgn, 255, 100, 1);
+        let g = &games[0];
+        // First token is outcome, second is e2e4
+        assert_eq!(g.tokens[0], crate::vocab::WHITE_WINS_ON_TIME);
+        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        assert_eq!(g.tokens[1], e2e4);
     }
 }

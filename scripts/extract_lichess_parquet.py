@@ -1,36 +1,31 @@
 #!/usr/bin/env python3
 """Extract Lichess monthly PGN database dumps into PAWN-compatible Parquet.
 
-Downloads a zstd-compressed PGN from database.lichess.org, parses games via
-the Rust chess engine (tokens, clocks, evals, headers), builds a Polars
-DataFrame, and writes sharded Parquet to disk with train/val/test splits.
+Downloads zstd-compressed PGN files from database.lichess.org, parses games
+via the Rust chess engine, and writes sharded Parquet to disk with
+train/val/test splits. All months are downloaded and parsed in parallel.
 
-The output schema stores pre-tokenized move sequences as list[int16],
-clock annotations as list[uint16] (seconds remaining, 0x8000=missing),
-eval annotations as list[int16] (centipawns, mate=±(32767-N),
-0x8000=missing), and metadata columns. Player usernames are hashed to
-uint64 via Polars xxHash64 (deterministic within a Polars version).
+The output schema stores complete PAWN training sequences: the tokens column
+begins with the outcome token followed by move tokens. Outcome tokens are
+classified by replaying the full game in the Rust engine to detect checkmate,
+stalemate, etc. Games terminated by rules infraction, abandonment, or
+incomplete records are filtered out.
 
-Training months are written as chronologically-ordered shards. Holdout
-val/test data is uniformly sampled from a separate month via two-pass
-Rust-side date filtering.
-
-Designed to run on a CPU pod with the pawn Docker image.
+Player usernames are hashed to uint64 via Polars xxHash64.
 
 Usage:
     python scripts/extract_lichess_parquet.py \\
         --months 2025-01 2025-02 2025-03 \\
-        --output /workspace/lichess-parquet \\
-        --hf-repo thomas-schweich/lichess-pawn \\
-        --batch-size 500000
+        --holdout-month 2026-01 \\
+        --hf-repo thomas-schweich/pawn-lichess-full
 """
 
 import argparse
 import io
+import multiprocessing as mp
 import os
 import sys
 import time
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -43,30 +38,24 @@ import polars as pl
 # Constants
 # ---------------------------------------------------------------------------
 
-LICHESS_URL_TEMPLATE = (
-    "https://database.lichess.org/standard/"
-    "lichess_db_standard_rated_{year_month}.pgn.zst"
-)
-MAX_PLY = 255  # Max plies per game (token sequence = outcome + 255 plies)
-EVAL_MISSING = -32768  # i16::MIN sentinel for missing eval
-SHARD_TARGET_GAMES = 1_000_000  # Target games per shard
+HF_RAW_BUCKET = "thomas-schweich/raw-lichess"
+HF_RAW_FILENAME_TEMPLATE = "lichess_{year_month}.pgn.zst"
+MAX_PLY = 255
+SHARD_TARGET_GAMES = 1_000_000
 
 
-def log(msg: str) -> None:
+def log(msg: str, prefix: str = "") -> None:
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    tag = f"[{prefix}] " if prefix else ""
+    print(f"[{ts}] {tag}{msg}", flush=True)
 
 
 # ---------------------------------------------------------------------------
-# PGN streaming
+# PGN streaming + download
 # ---------------------------------------------------------------------------
 
 def stream_pgn_games(fileobj, batch_size: int):
-    """Yield batches of complete PGN game strings from a text stream.
-
-    Each batch is a single string containing `batch_size` complete games
-    (delimited by blank lines between the last movetext and next header).
-    """
+    """Yield (pgn_text, game_count) batches from a zstd-compressed stream."""
     import zstandard as zstd
 
     dctx = zstd.ZstdDecompressor()
@@ -82,7 +71,6 @@ def stream_pgn_games(fileobj, batch_size: int):
 
         if not stripped:
             if in_movetext:
-                # End of movetext — game boundary
                 game_count += 1
                 in_movetext = False
                 buf.append(line)
@@ -101,193 +89,70 @@ def stream_pgn_games(fileobj, batch_size: int):
 
         buf.append(line)
 
-    # Final batch
     if buf:
         yield "".join(buf), game_count
 
 
-def download_zst(year_month: str, output_dir: Path) -> Path:
-    """Download a Lichess zstd PGN dump to disk. Returns path to .zst file."""
-    url = LICHESS_URL_TEMPLATE.format(year_month=year_month)
-    zst_path = output_dir / f"lichess_{year_month}.pgn.zst"
+def download_zst(year_month: str, output_dir: Path, prefix: str = "") -> Path:
+    """Download a Lichess zstd PGN dump from HuggingFace bucket."""
+    from huggingface_hub import download_bucket_files
+
+    hf_filename = HF_RAW_FILENAME_TEMPLATE.format(year_month=year_month)
+    zst_path = output_dir / hf_filename
     if zst_path.exists():
-        log(f"  Using cached {zst_path} ({zst_path.stat().st_size / 1e9:.1f} GB)")
+        log(f"Using cached {zst_path} ({zst_path.stat().st_size / 1e9:.1f} GB)", prefix)
         return zst_path
 
-    log(f"  Downloading {url}")
-    req = urllib.request.Request(url)
-    req.add_header("User-Agent", "pawn-lichess-extract/1.0")
-    response = urllib.request.urlopen(req)
+    log(f"Downloading {HF_RAW_BUCKET}/{hf_filename} -> {zst_path}", prefix)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write to a temp file and rename on completion to avoid partial downloads
-    tmp_path = zst_path.with_suffix(".zst.tmp")
     t0 = time.monotonic()
-    downloaded = 0
-    try:
-        with open(tmp_path, "wb") as f:
-            while True:
-                chunk = response.read(8 * 1024 * 1024)  # 8 MB
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                elapsed = time.monotonic() - t0
-                rate_mb = (downloaded / 1e6) / elapsed if elapsed > 0 else 0
-                print(f"\r  Downloaded {downloaded / 1e9:.2f} GB ({rate_mb:.0f} MB/s)", end="", flush=True)
-        print(flush=True)
-        tmp_path.rename(zst_path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    download_bucket_files(
+        HF_RAW_BUCKET,
+        files=[(hf_filename, str(zst_path))],
+        raise_on_missing_files=True,
+    )
+    dt = time.monotonic() - t0
 
-    response.close()
-    log(f"  Saved {zst_path} ({downloaded / 1e9:.2f} GB in {time.monotonic() - t0:.0f}s)")
+    size_gb = zst_path.stat().st_size / 1e9
+    rate = (size_gb * 1000) / dt if dt > 0 else 0
+    log(f"Downloaded {size_gb:.2f} GB in {dt:.0f}s ({rate:.0f} MB/s)", prefix)
     return zst_path
 
 
-def stream_pgn_from_zst(zst_path: Path, batch_size: int):
-    """Yield PGN text batches from a local .zst file."""
-    with open(zst_path, "rb") as f:
-        yield from stream_pgn_games(f, batch_size)
-
-
-def download_month(year_month: str, output_dir: Path, batch_size: int):
-    """Download and parse a single month's PGN dump, yielding parsed batches."""
-    zst_path = download_zst(year_month, output_dir)
-    total_games = 0
-    batch_num = 0
-
-    for pgn_text, n_games_in_chunk in stream_pgn_from_zst(zst_path, batch_size):
-        if not pgn_text.strip():
-            continue
-
-        t0 = time.monotonic()
-        parsed = chess_engine.parse_pgn_enriched(
-            pgn_text, max_ply=MAX_PLY, max_games=batch_size * 2, min_ply=1
-        )
-        dt = time.monotonic() - t0
-
-        n = parsed["tokens"].shape[0]
-        total_games += n
-        batch_num += 1
-        rate = n / dt if dt > 0 else 0
-        log(f"  [{year_month}] batch {batch_num}: {n:,} games parsed in {dt:.1f}s ({rate:,.0f} games/s) | total: {total_games:,}")
-
-        yield parsed
-
-    log(f"  [{year_month}] Done — {total_games:,} games total")
-
-
-def sample_holdout(
-    zst_path: Path,
-    date_start: str,
-    date_end: str,
-    n_games: int,
-    batch_size: int,
-    seed: int,
-) -> pl.DataFrame:
-    """Uniformly sample n_games from a date range within a .zst PGN dump.
-
-    Two-pass approach:
-    1. Count games in the date range (header-only scan, no tokenization)
-    2. Generate random indices, parse only those games
-    """
-    # Pass 1: count
-    log(f"  Pass 1: counting games in [{date_start}, {date_end}]")
-    total_in_range = 0
-    t0 = time.monotonic()
-    for pgn_text, _ in stream_pgn_from_zst(zst_path, batch_size):
-        if not pgn_text.strip():
-            continue
-        total_in_range += chess_engine.count_pgn_games_in_date_range(
-            pgn_text, date_start, date_end
-        )
-    dt = time.monotonic() - t0
-    log(f"  Found {total_in_range:,} games in range ({dt:.1f}s)")
-
-    if total_in_range == 0:
-        return pl.DataFrame()
-
-    # Generate random sample indices
-    actual_n = min(n_games, total_in_range)
-    rng = np.random.default_rng(seed)
-    indices = set(rng.choice(total_in_range, size=actual_n, replace=False).tolist())
-    log(f"  Sampling {actual_n:,} of {total_in_range:,} games (seed={seed})")
-
-    # Pass 2: parse only sampled games
-    log(f"  Pass 2: parsing sampled games")
-    frames = []
-    game_offset = 0
-    t0 = time.monotonic()
-    for pgn_text, _ in stream_pgn_from_zst(zst_path, batch_size):
-        if not pgn_text.strip():
-            continue
-
-        # Count how many date-matching games are in this chunk
-        chunk_count = chess_engine.count_pgn_games_in_date_range(
-            pgn_text, date_start, date_end
-        )
-
-        # Check if any of our target indices fall in this chunk's range
-        chunk_indices = [
-            i for i in range(game_offset, game_offset + chunk_count)
-            if i in indices
-        ]
-
-        if chunk_indices:
-            parsed = chess_engine.parse_pgn_sampled(
-                pgn_text,
-                chunk_indices,
-                date_start,
-                date_end,
-                game_offset=game_offset,
-                max_ply=MAX_PLY,
-                min_ply=1,
-            )
-            n = parsed["tokens"].shape[0]
-            if n > 0:
-                frames.append(batch_to_dataframe(parsed))
-
-        game_offset += chunk_count
-
-    dt = time.monotonic() - t0
-    if not frames:
-        log(f"  No games parsed")
-        return pl.DataFrame()
-
-    result = pl.concat(frames)
-    log(f"  Parsed {len(result):,} games ({dt:.1f}s)")
-    return result
-
-
 # ---------------------------------------------------------------------------
-# DataFrame construction
+# DataFrame construction (v2: outcome token prepended, no eval)
 # ---------------------------------------------------------------------------
-
-def numpy_rows_to_list_series(
-    arr: np.ndarray, lengths: np.ndarray, name: str, inner_dtype: pl.DataType
-) -> pl.Series:
-    """Convert a 0-padded (N, max_ply) numpy array to a Polars List series,
-    trimming each row to its actual game length."""
-    rows = [arr[i, :lengths[i]].tolist() for i in range(len(arr))]
-    return pl.Series(name, rows, dtype=pl.List(inner_dtype))
-
 
 def batch_to_dataframe(parsed: dict) -> pl.DataFrame:
-    """Convert a parsed batch dict from Rust into a Polars DataFrame.
+    """Convert a parsed batch dict from parse_pgn_lichess into a Polars DataFrame.
 
-    Rust returns numpy arrays: tokens/clocks/evals as (N, max_ply),
-    scalar fields as (N,) arrays, and strings as Python lists.
+    The tokens array is (N, seq_len) where seq_len = max_ply + 1.
+    tokens[i, 0] is the outcome token, tokens[i, 1:game_length+1] are moves.
     """
-    tokens: np.ndarray = parsed["tokens"]  # (N, max_ply) i16
+    tokens: np.ndarray = parsed["tokens"]  # (N, seq_len) i16
     n = tokens.shape[0]
     if n == 0:
         return pl.DataFrame()
 
-    lengths: np.ndarray = parsed["game_lengths"]  # (N,) u16
+    game_lengths: np.ndarray = parsed["game_lengths"]  # (N,) u16 — move count
+    seq_len = tokens.shape[1]
 
-    # Parse datetime strings -> proper datetime
-    # Format: "YYYY.MM.DD HH:MM:SS"
+    # Token lists: outcome + moves, trimmed to actual length
+    # Length of token list = game_length + 1 (outcome token)
+    token_rows = [
+        tokens[i, : game_lengths[i] + 1].tolist()
+        for i in range(n)
+    ]
+
+    # Clock lists: aligned with tokens (0 for outcome slot, then per-ply clocks)
+    clocks: np.ndarray = parsed["clocks"]  # (N, max_ply) u16
+    clock_rows = [
+        [0] + clocks[i, : game_lengths[i]].tolist()
+        for i in range(n)
+    ]
+
+    # Parse datetime strings
     datetimes = []
     for dt_str in parsed["date_time"]:
         if dt_str and len(dt_str) >= 10:
@@ -302,9 +167,8 @@ def batch_to_dataframe(parsed: dict) -> pl.DataFrame:
             datetimes.append(None)
 
     df = pl.DataFrame({
-        "tokens": numpy_rows_to_list_series(tokens, lengths, "tokens", pl.Int16),
-        "clock": numpy_rows_to_list_series(parsed["clocks"], lengths, "clock", pl.UInt16),
-        "eval": numpy_rows_to_list_series(parsed["evals"], lengths, "eval", pl.Int16),
+        "tokens": pl.Series("tokens", token_rows, dtype=pl.List(pl.Int16)),
+        "clock": pl.Series("clock", clock_rows, dtype=pl.List(pl.UInt16)),
         "game_length": pl.Series("game_length", parsed["game_lengths"], dtype=pl.UInt16),
         "result": pl.Series("result", parsed["result"], dtype=pl.Utf8),
         "white_player": pl.Series("white_player", parsed["white"], dtype=pl.Utf8),
@@ -321,12 +185,7 @@ def batch_to_dataframe(parsed: dict) -> pl.DataFrame:
         "site": pl.Series("site", parsed["site"], dtype=pl.Utf8),
     })
 
-    # Hash usernames: vectorized xxHash64 via Polars.
-    # NOTE: hash() output is deterministic within a Polars version but the
-    # algorithm is not guaranteed stable across major versions. Originally
-    # recorded with Polars 1.39.3. Pin Polars version (via uv.lock) and
-    # tag the repo to ensure reproducibility. See test_enriched_pgn.py
-    # TestPlayerHashRegression for the snapshot test.
+    # Hash usernames: vectorized xxHash64 via Polars (pinned to Polars 1.39.3).
     df = df.with_columns(
         pl.col("white_player").hash().alias("white_player"),
         pl.col("black_player").hash().alias("black_player"),
@@ -336,51 +195,167 @@ def batch_to_dataframe(parsed: dict) -> pl.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Shard writing
+# Worker: process a single training month
 # ---------------------------------------------------------------------------
 
-def write_shard(
-    df: pl.DataFrame,
+def process_train_month(
+    year_month: str,
     output_dir: Path,
-    split: str,
-    shard_idx: int,
-    total_shards: int,
-) -> Path:
-    """Write a single Parquet shard with HF-compatible naming."""
-    name = f"{split}-{shard_idx:05d}-of-{total_shards:05d}.parquet"
-    path = output_dir / "data" / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(path, compression="zstd", compression_level=3)
-    size_mb = path.stat().st_size / 1024 / 1024
-    log(f"  Wrote {name}: {len(df):,} games, {size_mb:.1f} MB")
-    return path
+    batch_size: int,
+    shard_size: int,
+    max_games: int | None,
+) -> list[Path]:
+    """Download, parse, and write shards for a training month."""
+    prefix = f"train/{year_month}"
+    log("Starting", prefix)
+
+    zst_path = download_zst(year_month, output_dir, prefix)
+
+    shard_paths = []
+    shard_idx = 0
+    buffer_frames: list[pl.DataFrame] = []
+    buffer_games = 0
+    total_games = 0
+
+    def flush_shard(df: pl.DataFrame) -> None:
+        nonlocal shard_idx
+        path = output_dir / "data" / f"train-{year_month}-{shard_idx:05d}.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(path, compression="zstd", compression_level=3)
+        size_mb = path.stat().st_size / 1024 / 1024
+        log(f"Shard {shard_idx}: {len(df):,} games, {size_mb:.1f} MB", prefix)
+        shard_paths.append(path)
+        shard_idx += 1
+
+    with open(zst_path, "rb") as f:
+        for pgn_text, _ in stream_pgn_games(f, batch_size):
+            if not pgn_text.strip():
+                continue
+
+            t0 = time.monotonic()
+            parsed = chess_engine.parse_pgn_lichess(
+                pgn_text, max_ply=MAX_PLY, max_games=batch_size * 2, min_ply=1
+            )
+            dt = time.monotonic() - t0
+
+            df = batch_to_dataframe(parsed)
+            if df.is_empty():
+                continue
+
+            n = len(df)
+            if max_games and total_games + n > max_games:
+                df = df.head(max_games - total_games)
+                n = len(df)
+
+            total_games += n
+            buffer_frames.append(df)
+            buffer_games += n
+
+            rate = n / dt if dt > 0 else 0
+            log(f"Parsed {n:,} games ({rate:,.0f}/s) | total: {total_games:,}", prefix)
+
+            while buffer_games >= shard_size:
+                combined = pl.concat(buffer_frames)
+                flush_shard(combined.head(shard_size))
+                leftover = combined.slice(shard_size)
+                buffer_frames = [leftover] if len(leftover) > 0 else []
+                buffer_games = len(leftover) if len(leftover) > 0 else 0
+
+            if max_games and total_games >= max_games:
+                break
+
+    if buffer_frames:
+        combined = pl.concat(buffer_frames)
+        if len(combined) > 0:
+            flush_shard(combined)
+
+    log(f"Done — {total_games:,} games, {len(shard_paths)} shards", prefix)
+    return shard_paths
 
 
 # ---------------------------------------------------------------------------
-# HuggingFace upload
+# Worker: process holdout month (full date-range extraction, no sampling)
 # ---------------------------------------------------------------------------
 
-def upload_to_hf(output_dir: Path, hf_repo: str) -> None:
-    """Upload the output directory to HuggingFace as a dataset."""
-    from huggingface_hub import HfApi
+def process_holdout_month(
+    year_month: str,
+    output_dir: Path,
+    batch_size: int,
+    shard_size: int,
+    val_days: tuple[int, int],
+    test_days: tuple[int, int],
+) -> tuple[list[Path], list[Path]]:
+    """Download, parse, and write val/test shards from date ranges."""
+    prefix = f"holdout/{year_month}"
+    log("Starting", prefix)
 
-    api = HfApi()
-    log(f"Uploading to HuggingFace: {hf_repo}")
+    zst_path = download_zst(year_month, output_dir, prefix)
 
-    # Create repo if it doesn't exist
-    api.create_repo(hf_repo, repo_type="dataset", exist_ok=True)
+    year, mon = year_month.split("-")
+    val_start = datetime(int(year), int(mon), val_days[0])
+    val_end = datetime(int(year), int(mon), val_days[1] + 1)  # exclusive
+    test_start = datetime(int(year), int(mon), test_days[0])
+    test_end = datetime(int(year), int(mon), test_days[1] + 1)  # exclusive
 
-    # Upload the data directory
-    api.upload_folder(
-        repo_id=hf_repo,
-        folder_path=str(output_dir),
-        repo_type="dataset",
-    )
-    log(f"Upload complete: https://huggingface.co/datasets/{hf_repo}")
+    log(f"Val: day {val_days[0]}-{val_days[1]}, Test: day {test_days[0]}-{test_days[1]}", prefix)
+
+    val_buf = SplitBuffer("validation", shard_size, output_dir)
+    test_buf = SplitBuffer("test", shard_size, output_dir)
+
+    total = 0
+    past_test_end = False
+
+    with open(zst_path, "rb") as f:
+        for pgn_text, _ in stream_pgn_games(f, batch_size):
+            if not pgn_text.strip():
+                continue
+
+            t0 = time.monotonic()
+            parsed = chess_engine.parse_pgn_lichess(
+                pgn_text, max_ply=MAX_PLY, max_games=batch_size * 2, min_ply=1
+            )
+            dt = time.monotonic() - t0
+
+            df = batch_to_dataframe(parsed)
+            if df.is_empty():
+                continue
+
+            total += len(df)
+
+            val_df = df.filter(
+                (pl.col("date") >= val_start) & (pl.col("date") < val_end)
+            )
+            test_df = df.filter(
+                (pl.col("date") >= test_start) & (pl.col("date") < test_end)
+            )
+
+            if not val_df.is_empty():
+                val_buf.add(val_df)
+            if not test_df.is_empty():
+                test_buf.add(test_df)
+
+            rate = len(df) / dt if dt > 0 else 0
+            log(f"Parsed {len(df):,} ({rate:,.0f}/s) | val: {val_buf.total_games:,}, test: {test_buf.total_games:,}", prefix)
+
+            # Stop early once past test range
+            max_date = df["date"].max()
+            if max_date and max_date >= test_end:
+                log("Past test date range — stopping early", prefix)
+                break
+
+    val_buf.flush_remaining()
+    test_buf.flush_remaining()
+
+    log(f"Done — val: {val_buf.total_games:,}, test: {test_buf.total_games:,}", prefix)
+
+    val_paths = val_buf.rename_shards() if val_buf.shard_paths else []
+    test_paths = test_buf.rename_shards() if test_buf.shard_paths else []
+
+    return [str(p) for p in val_paths], [str(p) for p in test_paths]
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Shard buffer
 # ---------------------------------------------------------------------------
 
 class SplitBuffer:
@@ -423,7 +398,6 @@ class SplitBuffer:
             self.buffered = 0
 
     def _write_shard(self, df: pl.DataFrame) -> None:
-        # Write with placeholder name; rename after all shards are counted
         path = self.output_dir / f"{self.split}-temp-{self.shard_idx:05d}.parquet"
         df.write_parquet(path, compression="zstd", compression_level=3)
         size_mb = path.stat().st_size / 1024 / 1024
@@ -432,7 +406,6 @@ class SplitBuffer:
         self.shard_idx += 1
 
     def rename_shards(self) -> list[Path]:
-        """Rename temp shards to HF-compatible names with correct total count."""
         n = len(self.shard_paths)
         final = []
         for i, path in enumerate(self.shard_paths):
@@ -444,6 +417,44 @@ class SplitBuffer:
         self.shard_paths = final
         return final
 
+
+# ---------------------------------------------------------------------------
+# Multiprocessing wrappers
+# ---------------------------------------------------------------------------
+
+def _worker_train(args):
+    year_month, output_dir, batch_size, shard_size, max_games = args
+    paths = process_train_month(year_month, Path(output_dir), batch_size, shard_size, max_games)
+    return [str(p) for p in paths]
+
+
+def _worker_holdout(args):
+    year_month, output_dir, batch_size, shard_size, val_days, test_days = args
+    return process_holdout_month(
+        year_month, Path(output_dir), batch_size, shard_size, val_days, test_days
+    )
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace upload
+# ---------------------------------------------------------------------------
+
+def upload_to_hf(output_dir: Path, hf_repo: str) -> None:
+    from huggingface_hub import HfApi
+    api = HfApi()
+    log(f"Uploading to HuggingFace: {hf_repo}")
+    api.create_repo(hf_repo, repo_type="dataset", exist_ok=True)
+    api.upload_folder(
+        repo_id=hf_repo,
+        folder_path=str(output_dir),
+        repo_type="dataset",
+    )
+    log(f"Upload complete: https://huggingface.co/datasets/{hf_repo}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -459,11 +470,11 @@ def main():
     )
     parser.add_argument(
         "--hf-repo", type=str, default=None,
-        help="HuggingFace dataset repo to push to (e.g. thomas-schweich/pawn-lichess-full)"
+        help="HuggingFace dataset repo to push to"
     )
     parser.add_argument(
         "--batch-size", type=int, default=500_000,
-        help="Games per batch during parsing (controls memory usage)"
+        help="Games per batch during parsing"
     )
     parser.add_argument(
         "--shard-size", type=int, default=SHARD_TARGET_GAMES,
@@ -471,128 +482,96 @@ def main():
     )
     parser.add_argument(
         "--holdout-month", type=str, default=None,
-        help="Month to use for val/test (e.g. 2023-12). First half of month "
-             "-> val, second half -> test. Randomly samples --holdout-games "
-             "from each half."
+        help="Month for val/test (e.g. 2026-01)"
     )
     parser.add_argument(
-        "--holdout-games", type=int, default=50_000,
-        help="Number of games to sample for each of val and test (default: 50000)"
+        "--val-days", type=str, default="1-3",
+        help="Day range for validation (e.g. 1-3 for Jan 1-3)"
+    )
+    parser.add_argument(
+        "--test-days", type=str, default="15-17",
+        help="Day range for test (e.g. 15-17 for Jan 15-17)"
     )
     parser.add_argument(
         "--max-games", type=int, default=None,
-        help="Stop after this many training games (for testing)"
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for holdout sampling (default: 42)"
+        help="Stop after this many training games per month"
     )
     args = parser.parse_args()
 
-    log("=== Lichess Parquet Extraction ===")
+    # Parse day ranges
+    val_days = tuple(int(x) for x in args.val_days.split("-"))
+    test_days = tuple(int(x) for x in args.test_days.split("-"))
+
+    log("=== Lichess Parquet Extraction (v2: outcome tokens) ===")
     log(f"Training months: {args.months}")
-    log(f"Output: {args.output}")
-    log(f"Batch size: {args.batch_size:,}")
-    log(f"Shard size: {args.shard_size:,}")
     if args.holdout_month:
-        log(f"Holdout month: {args.holdout_month}")
-        log(f"Holdout games per split: {args.holdout_games:,}")
-        log(f"Holdout seed: {args.seed}")
-    if args.max_games:
-        log(f"Max training games: {args.max_games:,}")
+        log(f"Holdout month: {args.holdout_month} (val days {val_days[0]}-{val_days[1]}, test days {test_days[0]}-{test_days[1]})")
+    log(f"Output: {args.output}")
+    log(f"Batch size: {args.batch_size:,}, Shard size: {args.shard_size:,}")
+    n_workers = len(args.months) + (1 if args.holdout_month else 0)
+    log(f"Parallelism: {n_workers} workers")
     log("")
 
     args.output.mkdir(parents=True, exist_ok=True)
+    (args.output / "data").mkdir(parents=True, exist_ok=True)
 
-    # ── Phase 1: Process holdout month (val/test) ──────────────────────
-    buffers = {
-        "train": SplitBuffer("train", args.shard_size, args.output),
-        "validation": SplitBuffer("validation", args.shard_size, args.output),
-        "test": SplitBuffer("test", args.shard_size, args.output),
-    }
-
+    # ── Launch all workers in parallel ─────────────────────────────────
+    train_args = [
+        (m, str(args.output), args.batch_size, args.shard_size, args.max_games)
+        for m in args.months
+    ]
+    holdout_args = None
     if args.holdout_month:
-        log(f"\n=== Processing holdout month {args.holdout_month} ===")
-
-        # Download the zstd file (reused for both count and parse passes)
-        zst_path = download_zst(args.holdout_month, args.output)
-
-        # Date ranges: first half of month -> val, second half -> test
-        # UTCDate format is "YYYY.MM.DD"
-        year, mon = args.holdout_month.split("-")
-        val_start = f"{year}.{mon}.01"
-        val_end = f"{year}.{mon}.14"
-        test_start = f"{year}.{mon}.15"
-        test_end = f"{year}.{mon}.31"
-
-        log(f"  Val date range: [{val_start}, {val_end}]")
-        val_df = sample_holdout(
-            zst_path, val_start, val_end,
-            args.holdout_games, args.batch_size, args.seed,
+        holdout_args = (
+            args.holdout_month, str(args.output), args.batch_size,
+            args.shard_size, val_days, test_days,
         )
-        if not val_df.is_empty():
-            buffers["validation"].add(val_df)
 
-        log(f"  Test date range: [{test_start}, {test_end}]")
-        test_df = sample_holdout(
-            zst_path, test_start, test_end,
-            args.holdout_games, args.batch_size, args.seed + 1,
-        )
-        if not test_df.is_empty():
-            buffers["test"].add(test_df)
+    log(f"Spawning {n_workers} workers...")
 
-    # ── Phase 2: Process training months ───────────────────────────────
-    total_train = 0
-    stop = False
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(n_workers) as pool:
+        train_results = pool.map_async(_worker_train, train_args)
+        holdout_result = None
+        if holdout_args:
+            holdout_result = pool.apply_async(_worker_holdout, (holdout_args,))
 
-    for month in args.months:
-        if stop:
-            break
-        log(f"\n=== Processing {month} (train) ===")
+        train_shard_lists = train_results.get()
+        val_paths = []
+        test_paths = []
+        if holdout_result:
+            val_str, test_str = holdout_result.get()
+            val_paths = [Path(p) for p in val_str]
+            test_paths = [Path(p) for p in test_str]
 
-        for parsed in download_month(month, args.output, args.batch_size):
-            df = batch_to_dataframe(parsed)
-            if df.is_empty():
-                continue
+    # ── Rename train shards ────────────────────────────────────────────
+    all_train_paths = []
+    for shard_list in train_shard_lists:
+        all_train_paths.extend(Path(p) for p in shard_list)
+    all_train_paths.sort(key=lambda p: p.name)
+    n_train = len(all_train_paths)
 
-            if args.max_games:
-                remaining = args.max_games - total_train
-                if remaining <= 0:
-                    stop = True
-                    break
-                if len(df) > remaining:
-                    df = df.head(remaining)
-
-            total_train += len(df)
-            buffers["train"].add(df)
-
-            if args.max_games and total_train >= args.max_games:
-                stop = True
-                break
-
-    # Flush remaining data in each buffer
-    for buf in buffers.values():
-        buf.flush_remaining()
-
-    log(f"\n=== Renaming shards ===")
+    log(f"\n=== Renaming {n_train} train shards ===")
     final_paths = []
-    for buf in buffers.values():
-        if buf.shard_paths:
-            final_paths.extend(buf.rename_shards())
+    for i, path in enumerate(all_train_paths):
+        new_name = f"train-{i:05d}-of-{n_train:05d}.parquet"
+        new_path = path.parent / new_name
+        path.rename(new_path)
+        final_paths.append(new_path)
 
-    # Summary
+    final_paths.extend(val_paths)
+    final_paths.extend(test_paths)
+
+    # ── Summary ────────────────────────────────────────────────────────
     log(f"\n=== Summary ===")
-    total_games = sum(buf.total_games for buf in buffers.values())
-    log(f"Total games: {total_games:,}")
-    for name, buf in buffers.items():
-        if buf.total_games > 0:
-            log(f"  {name}: {buf.total_games:,} games, {len(buf.shard_paths)} shards")
+    log(f"Train: {n_train} shards")
+    log(f"Validation: {len(val_paths)} shards")
+    log(f"Test: {len(test_paths)} shards")
 
     if final_paths:
         total_size = sum(p.stat().st_size for p in final_paths)
         log(f"Total size: {total_size / 1024 / 1024 / 1024:.2f} GB")
 
-    # Upload to HuggingFace
     if args.hf_repo:
         upload_to_hf(args.output, args.hf_repo)
 

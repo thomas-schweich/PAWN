@@ -1,10 +1,10 @@
 //! Move vocabulary: the single source of truth for token ↔ UCI string mapping.
 //!
-//! Token layout (4,278 total):
+//! Token layout (4,284 total):
 //!   0        = padding
 //!   1..=4096 = base grid (64×64 src×dst pairs)
 //!   4097..=4272 = promotions (44 eligible pairs × 4 piece types)
-//!   4273..=4277 = outcome tokens (game result)
+//!   4273..=4283 = outcome tokens (game result)
 //!
 //! Square indexing: file-major within rank.
 //!   a1=0, b1=1, ..., h1=7, a2=8, ..., h8=63
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use crate::types::Termination;
 
-pub const VOCAB_SIZE: usize = 4278;
+pub const VOCAB_SIZE: usize = 4284;
 pub const PAD_TOKEN: u16 = 0;
 pub const BASE_GRID_START: u16 = 1;
 pub const BASE_GRID_END: u16 = 4096; // inclusive
@@ -25,11 +25,21 @@ pub const NUM_PROMO_TYPES: usize = 4;
 
 // Outcome tokens — must match pawn/config.py
 pub const OUTCOME_BASE: u16 = 4273;
+
+// Pretraining outcomes (random games — natural terminations)
 pub const WHITE_CHECKMATES: u16 = 4273;
 pub const BLACK_CHECKMATES: u16 = 4274;
 pub const STALEMATE: u16 = 4275;
-pub const DRAW_BY_RULE: u16 = 4276;
-pub const PLY_LIMIT: u16 = 4277;
+pub const DRAW_BY_RULE: u16 = 4276;  // 75-move, fivefold rep, insufficient material
+pub const PLY_LIMIT: u16 = 4277;     // Hit max plies (also truncated Lichess games)
+
+// Lichess-specific outcomes (finetuning data)
+pub const WHITE_RESIGNS: u16 = 4278;
+pub const BLACK_RESIGNS: u16 = 4279;
+pub const DRAW_BY_AGREEMENT: u16 = 4280;
+pub const WHITE_WINS_ON_TIME: u16 = 4281;
+pub const BLACK_WINS_ON_TIME: u16 = 4282;
+pub const DRAW_BY_TIME: u16 = 4283;
 
 /// Square names in our index order.
 pub const SQUARE_NAMES: [&str; 64] = [
@@ -155,6 +165,47 @@ pub fn termination_to_outcome(term: Termination, game_length: u16) -> u16 {
         | Termination::FivefoldRepetition
         | Termination::InsufficientMaterial => DRAW_BY_RULE,
         Termination::PlyLimit => PLY_LIMIT,
+    }
+}
+
+/// Map a Lichess game to its outcome token.
+///
+/// Uses the PGN Termination header, Result header, and whether the last
+/// move was checkmate/stalemate (determined by replaying the game).
+///
+/// Returns None for games that should be filtered (Rules infraction,
+/// Abandoned, Unterminated).
+pub fn lichess_outcome_token(
+    termination: &str,
+    result: &str,
+    is_checkmate: bool,
+    is_stalemate: bool,
+    truncated: bool,
+) -> Option<u16> {
+    if truncated {
+        return Some(PLY_LIMIT);
+    }
+
+    match termination {
+        "Normal" => {
+            match result {
+                "1-0" => Some(if is_checkmate { WHITE_CHECKMATES } else { WHITE_RESIGNS }),
+                "0-1" => Some(if is_checkmate { BLACK_CHECKMATES } else { BLACK_RESIGNS }),
+                "1/2-1/2" => Some(if is_stalemate { STALEMATE } else { DRAW_BY_AGREEMENT }),
+                _ => None,
+            }
+        }
+        "Time forfeit" => {
+            match result {
+                "1-0" => Some(WHITE_WINS_ON_TIME),
+                "0-1" => Some(BLACK_WINS_ON_TIME),
+                "1/2-1/2" => Some(DRAW_BY_TIME),
+                _ => None,
+            }
+        }
+        "Insufficient material" => Some(DRAW_BY_RULE),
+        // Filter out Rules infraction, Abandoned, Unterminated
+        _ => None,
     }
 }
 

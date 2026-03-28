@@ -34,9 +34,9 @@ class TestVocabConsistency:
         n_moves = len(vocab["token_to_move"])
         # 4096 grid + 176 promotions = 4272 move tokens
         assert n_moves == 4272
-        # 1 PAD + 4272 moves + 5 outcomes = 4278
-        from pawn.config import CLMConfig
-        assert CLMConfig().vocab_size == 1 + n_moves + 5
+        # 1 PAD + 4272 moves + 11 outcomes = 4284
+        from pawn.config import CLMConfig, N_TOTAL_OUTCOMES
+        assert CLMConfig().vocab_size == 1 + n_moves + N_TOTAL_OUTCOMES
 
     def test_outcome_tokens_not_in_move_vocab(self):
         """Outcome tokens (4273-4277) must not appear in the move vocabulary."""

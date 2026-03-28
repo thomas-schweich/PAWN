@@ -18,7 +18,7 @@ class SimpleMaskBuilder:
     """Dummy mask builder that allows all moves."""
     def __call__(self, batch):
         B, T = batch["input_ids"].shape[:2]
-        return torch.ones(B, T, 4278, dtype=torch.bool)
+        return torch.ones(B, T, CLMConfig().vocab_size, dtype=torch.bool)
 
 
 @pytest.fixture
@@ -105,7 +105,7 @@ class TestRoSACLM:
         """With zero-init, RoSACLM output should match bare backbone."""
         torch.manual_seed(42)
         backbone = PAWNCLM(CLMConfig.toy())
-        input_ids = torch.randint(0, 4278, (2, 32))
+        input_ids = torch.randint(0, CLMConfig().vocab_size, (2, 32))
 
         # Get bare backbone output BEFORE wrapping (wrapping modifies in-place)
         with torch.no_grad():
@@ -122,29 +122,29 @@ class TestRoSACLM:
 
     def test_forward_shapes(self, toy_backbone):
         model = RoSACLM(toy_backbone, rank=4)
-        input_ids = torch.randint(0, 4278, (2, 32))
+        input_ids = torch.randint(0, CLMConfig().vocab_size, (2, 32))
 
         hidden = model.forward_hidden(input_ids)
         assert hidden.shape == (2, 32, CLMConfig.toy().d_model)
 
         logits = model.project_head(hidden)
-        assert logits.shape == (2, 32, 4278)
+        assert logits.shape == (2, 32, CLMConfig().vocab_size)
 
         full_logits = model.forward(input_ids)
-        assert full_logits.shape == (2, 32, 4278)
+        assert full_logits.shape == (2, 32, CLMConfig().vocab_size)
 
     def test_forward_generate(self, toy_backbone):
         model = RoSACLM(toy_backbone, rank=4)
-        input_ids = torch.randint(0, 4278, (1, 5))
+        input_ids = torch.randint(0, CLMConfig().vocab_size, (1, 5))
 
         logits, kv_cache = model.forward_generate(input_ids)
-        assert logits.shape == (1, 1, 4278)
+        assert logits.shape == (1, 1, CLMConfig().vocab_size)
         assert len(kv_cache) == CLMConfig.toy().n_layers
 
         # Next token
-        next_id = torch.randint(0, 4278, (1, 1))
+        next_id = torch.randint(0, CLMConfig().vocab_size, (1, 1))
         logits2, kv_cache2 = model.forward_generate(next_id, kv_cache)
-        assert logits2.shape == (1, 1, 4278)
+        assert logits2.shape == (1, 1, CLMConfig().vocab_size)
 
     def test_lora_parameters(self, toy_backbone):
         model = RoSACLM(toy_backbone, rank=4, attn_targets="qkvo")
@@ -276,20 +276,20 @@ class TestRetroBottleneckCLM:
         sparse_model = SparseCLM(toy_backbone, density=0.01)
         model = RetroBottleneckCLM(sparse_model.backbone, bottleneck_dim=4)
 
-        input_ids = torch.randint(0, 4278, (2, 16))
+        input_ids = torch.randint(0, CLMConfig().vocab_size, (2, 16))
         hidden = model.forward_hidden(input_ids)
         assert hidden.shape == (2, 16, CLMConfig.toy().d_model)
 
         logits = model.forward(input_ids)
-        assert logits.shape == (2, 16, 4278)
+        assert logits.shape == (2, 16, CLMConfig().vocab_size)
 
     def test_forward_generate(self, toy_backbone):
         sparse_model = SparseCLM(toy_backbone, density=0.01)
         model = RetroBottleneckCLM(sparse_model.backbone, bottleneck_dim=4)
 
-        input_ids = torch.randint(0, 4278, (1, 5))
+        input_ids = torch.randint(0, CLMConfig().vocab_size, (1, 5))
         logits, kv_cache = model.forward_generate(input_ids)
-        assert logits.shape == (1, 1, 4278)
+        assert logits.shape == (1, 1, CLMConfig().vocab_size)
 
     def test_adapter_parameters(self, toy_backbone):
         sparse_model = SparseCLM(toy_backbone, density=0.01)

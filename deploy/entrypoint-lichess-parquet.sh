@@ -43,12 +43,16 @@ CMD=(python3 /opt/pawn/scripts/extract_lichess_parquet.py
     --output "${OUTPUT_DIR:-/workspace/lichess-parquet}"
     --batch-size "${BATCH_SIZE:-500000}"
     --shard-size "${SHARD_SIZE:-1000000}"
-    --seed "${SEED:-42}"
 )
 
 if [ -n "${HOLDOUT_MONTH:-}" ]; then
     CMD+=(--holdout-month "$HOLDOUT_MONTH")
-    CMD+=(--holdout-games "${HOLDOUT_GAMES:-50000}")
+fi
+if [ -n "${VAL_DAYS:-}" ]; then
+    CMD+=(--val-days "$VAL_DAYS")
+fi
+if [ -n "${TEST_DAYS:-}" ]; then
+    CMD+=(--test-days "$TEST_DAYS")
 fi
 if [ -n "${HF_REPO:-}" ]; then
     CMD+=(--hf-repo "$HF_REPO")
