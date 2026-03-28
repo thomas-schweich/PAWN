@@ -3,7 +3,6 @@
 
 import json
 import sys
-import tempfile
 import torch
 
 from pawn.config import CLMConfig
@@ -11,8 +10,10 @@ from pawn.model import PAWNCLM
 from pawn.checkpoint import load_backbone_weights
 from pawn.gpu import configure_gpu, apply_gpu_config
 from pawn.eval_suite.probes import extract_probe_data, train_all_probes
-from pawn.eval_suite.corpus import generate_corpus, load_corpus
-from pawn.eval_suite.diagnostics import extract_diagnostic_positions, evaluate_diagnostic_positions
+from pawn.eval_suite.diagnostics import (
+    generate_diagnostic_corpus,
+    extract_diagnostic_positions, evaluate_diagnostic_positions,
+)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cuda":
@@ -33,48 +34,46 @@ train_data = extract_probe_data(2048, 256, seed=12345)
 val_data = extract_probe_data(512, 256, seed=54321)
 print("Done.", flush=True)
 
-# Generate diagnostic corpus once
+# Generate diagnostic corpus once (quota-controlled for rare edge cases)
 print("Generating diagnostic corpus...", flush=True)
-with tempfile.TemporaryDirectory() as tmpdir:
-    corpus_path = generate_corpus(tmpdir, n_games=2048, max_ply=255, seed=99999, batch_size=2048)
-    corpus = load_corpus(corpus_path)
-    positions = extract_diagnostic_positions(corpus, min_per_category=200, max_per_category=1000)
+corpus = generate_diagnostic_corpus(n_per_category=10_000)
+positions = extract_diagnostic_positions(corpus, max_per_category=10_000)
 
-    for name, info in variants.items():
-        sep = "=" * 60
-        print(f"\n{sep}")
-        print(f"EVALUATING {name}")
-        print(sep, flush=True)
+for name, info in variants.items():
+    sep = "=" * 60
+    print(f"\n{sep}")
+    print(f"EVALUATING {name}")
+    print(sep, flush=True)
 
-        state_dict, _ = load_backbone_weights(info["path"])
-        model = PAWNCLM(info["cfg"]).to(device)
-        model.load_state_dict(state_dict)
-        model.eval()
-        print(f"Loaded: {sum(p.numel() for p in model.parameters()):,} params", flush=True)
+    state_dict, _ = load_backbone_weights(info["path"])
+    model = PAWNCLM(info["cfg"]).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    print(f"Loaded: {sum(p.numel() for p in model.parameters()):,} params", flush=True)
 
-        results = {}
+    results = {}
 
-        # Probes
-        print("\nRunning probes...", flush=True)
-        probe_results = train_all_probes(
-            model, train_data, val_data, device=device,
-            per_layer=True, n_epochs=20, verbose=True,
-        )
-        results["probes"] = probe_results
+    # Probes
+    print("\nRunning probes...", flush=True)
+    probe_results = train_all_probes(
+        model, train_data, val_data, device=device,
+        per_layer=True, n_epochs=20, verbose=True,
+    )
+    results["probes"] = probe_results
 
-        # Diagnostics
-        print("\nRunning diagnostics...", flush=True)
-        diag_results = evaluate_diagnostic_positions(model, positions, corpus, device=device)
-        results["diagnostics"] = diag_results
+    # Diagnostics
+    print("\nRunning diagnostics...", flush=True)
+    diag_results = evaluate_diagnostic_positions(model, positions, corpus, device=device)
+    results["diagnostics"] = diag_results
 
-        # Save
-        out_path = f"data/eval_{name}/eval_results.json"
-        with open(out_path, "w") as f:
-            json.dump(results, f, indent=2, default=str)
-        print(f"Saved: {out_path}", flush=True)
+    # Save
+    out_path = f"data/eval_{name}/eval_results.json"
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"Saved: {out_path}", flush=True)
 
-        del model, state_dict
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    del model, state_dict
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 print("\nALL EVALS COMPLETE", flush=True)

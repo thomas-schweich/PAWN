@@ -312,10 +312,11 @@ def parse_args():
 
 def _run_post_training_evals(slots: list[ModelSlot], args):
     """Run probes, diagnostics, and Lichess eval on best checkpoint per variant."""
-    import tempfile
     from pawn.eval_suite.probes import extract_probe_data, train_all_probes
-    from pawn.eval_suite.corpus import generate_corpus, load_corpus
-    from pawn.eval_suite.diagnostics import extract_diagnostic_positions, evaluate_diagnostic_positions
+    from pawn.eval_suite.diagnostics import (
+        generate_diagnostic_corpus,
+        extract_diagnostic_positions, evaluate_diagnostic_positions,
+    )
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -360,12 +361,11 @@ def _run_post_training_evals(slots: list[ModelSlot], args):
 
         # 2. Diagnostics
         print("  Running diagnostics...")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            corpus_path = generate_corpus(tmpdir, n_games=2048, max_ply=255, seed=99999, batch_size=2048)
-            corpus = load_corpus(corpus_path)
-            positions = extract_diagnostic_positions(corpus, min_per_category=200, max_per_category=1000)
-            diag_results = evaluate_diagnostic_positions(model, positions, corpus, device=device)
-            results["diagnostics"] = diag_results
+        corpus = generate_diagnostic_corpus(n_per_category=10_000)
+        positions = extract_diagnostic_positions(corpus, max_per_category=10_000)
+        diag_results = evaluate_diagnostic_positions(model, positions, corpus, device=device)
+        results["diagnostics"] = diag_results
+        del corpus, positions
 
         # 3. Lichess eval (if PGN provided)
         if args.lichess_pgn:

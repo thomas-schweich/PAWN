@@ -229,20 +229,16 @@ def run_improbable_task_test(
     )
 
 
-def _diagnostic_worker(checkpoint_path: str, corpus_dir: str, device: str,
-                        min_per_category: int, max_per_category: int,
+def _diagnostic_worker(checkpoint_path: str, device: str,
+                        n_per_category: int, max_per_category: int,
                         n_samples: int, batch_size: int) -> dict:
     from pawn.eval_suite.diagnostics import (
+        generate_diagnostic_corpus,
         extract_diagnostic_positions, evaluate_diagnostic_positions,
     )
     model = _load_model(checkpoint_path, device)
-    corpus = _load_corpus(corpus_dir)
-    positions = extract_diagnostic_positions(
-        corpus, min_per_category=min_per_category,
-        max_per_category=max_per_category,
-    )
-    for cat, pos_list in positions.items():
-        print(f"  {cat}: {len(pos_list)} positions")
+    corpus = generate_diagnostic_corpus(n_per_category=n_per_category)
+    positions = extract_diagnostic_positions(corpus, max_per_category=max_per_category)
     return evaluate_diagnostic_positions(
         model, positions, corpus, device,
         n_samples=n_samples, batch_size=batch_size,
@@ -251,16 +247,15 @@ def _diagnostic_worker(checkpoint_path: str, corpus_dir: str, device: str,
 
 def run_diagnostic_eval(
     checkpoint_path: str | Path,
-    corpus_dir: str | Path,
     device: str,
-    min_per_category: int = 2000,
-    max_per_category: int = 5000,
+    n_per_category: int = 10_000,
+    max_per_category: int = 10_000,
     n_samples: int = 100,
     batch_size: int = 32,
 ) -> dict:
-    """Extract diagnostic positions and evaluate model on them in an isolated worker."""
+    """Generate quota-controlled diagnostic corpus and evaluate model in an isolated worker."""
     return run_in_worker(
         _diagnostic_worker,
-        str(checkpoint_path), str(corpus_dir), device,
-        min_per_category, max_per_category, n_samples, batch_size,
+        str(checkpoint_path), device,
+        n_per_category, max_per_category, n_samples, batch_size,
     )

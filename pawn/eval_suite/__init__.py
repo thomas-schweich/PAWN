@@ -17,6 +17,7 @@ from .generation import (
     improbable_task_test,
 )
 from .diagnostics import (
+    generate_diagnostic_corpus,
     extract_diagnostic_positions,
     evaluate_diagnostic_positions,
 )

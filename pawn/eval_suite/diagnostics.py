@@ -1,4 +1,9 @@
-"""Edge-case diagnostic evaluation (§5)."""
+"""Edge-case diagnostic evaluation (§5).
+
+Uses the Rust engine's quota-controlled generator to produce a corpus
+with guaranteed coverage of rare edge cases (stalemate, double check,
+en passant, etc.) rather than relying on random sampling.
+"""
 
 import numpy as np
 import torch
@@ -8,7 +13,7 @@ import torch.nn.functional as F
 import chess_engine as engine
 
 from pawn.config import PAD_TOKEN
-from pawn.data import pack_clm_sequences, _map_termination_to_outcome
+from pawn.data import _map_termination_to_outcome
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +35,78 @@ DIAGNOSTIC_CATEGORIES = {
     "stalemate":           EDGE_BITS["STALEMATE"],
 }
 
+# Bit index for each diagnostic category
+_CAT_BIT_INDEX = {
+    name: bit_val.bit_length() - 1
+    for name, bit_val in DIAGNOSTIC_CATEGORIES.items()
+}
+
+# Terminal categories use termination codes, not per-ply stats
+_TERMINAL_CATEGORIES = {"checkmate": 0, "stalemate": 1}
+
+
+# ---------------------------------------------------------------------------
+# Corpus generation (quota-controlled)
+# ---------------------------------------------------------------------------
+
+
+def generate_diagnostic_corpus(
+    n_per_category: int = 10_000,
+    max_ply: int = 255,
+    seed: int = 42,
+    max_simulated_factor: float = 200.0,
+) -> dict:
+    """Generate a diagnostic corpus with quota-controlled edge case coverage.
+
+    Uses the Rust engine's generate_diagnostic_sets() to produce games
+    biased toward underrepresented edge cases. Each category gets at least
+    n_per_category games in the corpus.
+
+    Returns a corpus dict compatible with extract_diagnostic_positions()
+    and evaluate_diagnostic_positions().
+    """
+    # Build quota arrays: request n_per_category for each diagnostic bit,
+    # split evenly between white and black perspectives.
+    quotas_white = np.zeros(64, dtype=np.int32)
+    quotas_black = np.zeros(64, dtype=np.int32)
+
+    half = n_per_category // 2
+    for cat_name, bit_val in DIAGNOSTIC_CATEGORIES.items():
+        bit_idx = bit_val.bit_length() - 1
+        quotas_white[bit_idx] = half
+        quotas_black[bit_idx] = n_per_category - half  # handle odd n
+
+    # Total games is sum of all quotas (some games will fill multiple quotas)
+    total_games = int(quotas_white.sum() + quotas_black.sum())
+
+    print(f"  Generating diagnostic corpus: {n_per_category} per category, "
+          f"~{total_games} games max, max_simulated_factor={max_simulated_factor}...")
+
+    (move_ids, game_lengths, term_codes, per_ply_stats,
+     _white_acc, _black_acc, _qa_w, _qa_b,
+     filled_white, filled_black) = engine.generate_diagnostic_sets(
+        quotas_white, quotas_black, total_games, max_ply, seed, max_simulated_factor,
+    )
+
+    n_games = len(game_lengths)
+    print(f"  Generated {n_games} games")
+
+    # Report quota fill rates
+    for cat_name, bit_val in DIAGNOSTIC_CATEGORIES.items():
+        bit_idx = bit_val.bit_length() - 1
+        filled = int(filled_white[bit_idx]) + int(filled_black[bit_idx])
+        requested = int(quotas_white[bit_idx]) + int(quotas_black[bit_idx])
+        pct = filled / requested * 100 if requested > 0 else 0
+        status = "OK" if filled >= requested else "SHORT"
+        print(f"    {cat_name}: {filled}/{requested} ({pct:.0f}%) [{status}]")
+
+    return {
+        "move_ids": np.asarray(move_ids),
+        "game_lengths": np.asarray(game_lengths),
+        "termination_codes": np.asarray(term_codes),
+        "per_ply_stats": np.asarray(per_ply_stats),
+    }
+
 
 # ---------------------------------------------------------------------------
 # Position extraction
@@ -38,53 +115,43 @@ DIAGNOSTIC_CATEGORIES = {
 
 def extract_diagnostic_positions(
     corpus: dict,
-    min_per_category: int = 2000,
-    max_per_category: int = 5000,
+    max_per_category: int = 10_000,
 ) -> dict[str, list[dict]]:
-    """Extract diagnostic positions from corpus.
+    """Extract diagnostic positions from a corpus.
 
-    Returns dict[category_name] -> list of dicts with:
-        - game_idx: int
-        - ply: int
-        - move_ids: array of moves up to that ply
-        - game_length: int (original game length)
-        - term_code: int
-        - outcome_name: str
+    If the corpus contains pre-computed per_ply_stats (from
+    generate_diagnostic_corpus), those are used directly. Otherwise,
+    per-ply edge stats are computed on the fly.
+
+    Returns dict[category_name] -> list of position dicts.
     """
     move_ids = corpus["move_ids"]
     game_lengths = corpus["game_lengths"]
     term_codes = corpus["termination_codes"]
-    n_games = len(move_ids)
+    n_games = len(game_lengths)
 
-    # Compute per-ply edge stats in batches
-    batch_size = 50_000
-    print("  Computing per-ply edge stats...")
-    all_ply_stats = []
-    for start in range(0, n_games, batch_size):
-        end = min(start + batch_size, n_games)
-        stats, _, _ = engine.compute_edge_stats_per_ply(
-            move_ids[start:end], game_lengths[start:end]
-        )
-        all_ply_stats.append(stats)
-    per_ply_stats = np.concatenate(all_ply_stats, axis=0)
+    # Use pre-computed per-ply stats if available, otherwise compute them
+    if "per_ply_stats" in corpus:
+        per_ply_stats = corpus["per_ply_stats"]
+    else:
+        batch_size = 50_000
+        print("  Computing per-ply edge stats...")
+        all_ply_stats = []
+        for start in range(0, n_games, batch_size):
+            end = min(start + batch_size, n_games)
+            stats, _, _ = engine.compute_edge_stats_per_ply(
+                move_ids[start:end], game_lengths[start:end]
+            )
+            all_ply_stats.append(stats)
+        per_ply_stats = np.concatenate(all_ply_stats, axis=0)
 
-    # Extract positions per category
     positions = {}
-
-    # Terminal categories (checkmate, stalemate) come from termination codes,
-    # not per-ply stats. The position is post-terminal (ply = game_length),
-    # where there are no legal moves. The relevant metric is pad_prob (does
-    # the model know the game is over?), not legal_rate.
-    _TERMINAL_CATEGORIES = {"checkmate": 0, "stalemate": 1}
 
     for cat_name, bit_value in DIAGNOSTIC_CATEGORIES.items():
         print(f"  {cat_name}: scanning...", end="", flush=True)
         found = []
 
         if cat_name in _TERMINAL_CATEGORIES:
-            # Terminal: use termination codes. The "ply" is game_length,
-            # i.e., the position AFTER the last move. At this point the
-            # game is over — the model should predict PAD.
             target_tc = _TERMINAL_CATEGORIES[cat_name]
             for g in range(n_games):
                 if int(term_codes[g]) == target_tc:
@@ -92,7 +159,7 @@ def extract_diagnostic_positions(
                     outcome = _term_code_to_outcome_name(target_tc, gl)
                     found.append({
                         "game_idx": g,
-                        "ply": gl,  # post-terminal position
+                        "ply": gl,
                         "game_length": gl,
                         "term_code": target_tc,
                         "outcome_name": outcome,
