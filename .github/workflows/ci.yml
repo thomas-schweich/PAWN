@@ -35,9 +35,7 @@ jobs:
         run: cd engine && uv run --with maturin maturin develop --release
 
       - name: Install Python deps
-        run: |
-          uv sync
-          uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+        run: uv sync
 
       - name: Run tests
         run: uv run pytest tests/ -x -q
@@ -67,9 +65,7 @@ jobs:
         run: cd engine && uv run --with maturin maturin develop --release
 
       - name: Install Python deps
-        run: |
-          uv sync
-          uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+        run: uv sync
 
       - name: Pyright
         run: uv run pyright pawn/

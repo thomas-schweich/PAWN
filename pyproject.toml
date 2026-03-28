@@ -6,6 +6,7 @@ requires-python = ">=3.10,<3.13"
 license = "Apache-2.0"
 dependencies = [
     "chess-engine",
+    "torch~=2.10.0",
     "numpy~=2.2.0",
     "psutil>=5.9.0",
     "safetensors>=0.4.0",
