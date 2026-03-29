@@ -1461,7 +1461,7 @@ impl PyBatchRLEnv {
 /// - Unconditional ceiling: E[1/N_legal]
 /// - Naive conditional ceiling (0-depth): prune moves that immediately
 ///   terminate with the wrong outcome, then E[1/N_remaining]
-/// - MCTS conditional ceiling: E[max_m P(m|outcome, history)] via rollouts
+/// - MC conditional ceiling: E[max_m P(m|outcome, history)] via rollouts
 ///
 /// Outcomes are side-aware: WhiteCheckmated and BlackCheckmated are
 /// separate buckets (fixing a bug where all checkmates were conflated).
@@ -1485,6 +1485,7 @@ fn compute_accuracy_ceiling_py(
     let mut uncond_sum = 0.0f64;
     let mut cond_sum = 0.0f64;
     let mut naive_cond_sum = 0.0f64;
+    let mut corrected_cond_sum = 0.0f64;
 
     // Build per-position arrays
     let mut plies = Vec::with_capacity(n);
@@ -1493,19 +1494,24 @@ fn compute_accuracy_ceiling_py(
     let mut unconditionals = Vec::with_capacity(n);
     let mut conditionals = Vec::with_capacity(n);
     let mut naive_conditionals = Vec::with_capacity(n);
+    let mut corrected_conditionals = Vec::with_capacity(n);
     let mut outcomes = Vec::with_capacity(n);
+    let mut game_indices = Vec::with_capacity(n);
 
     for r in &results {
         uncond_sum += r.unconditional;
         cond_sum += r.conditional;
         naive_cond_sum += r.naive_conditional;
+        corrected_cond_sum += r.conditional_corrected;
         plies.push(r.ply);
         game_lengths.push(r.game_length);
         n_legals.push(r.n_legal);
         unconditionals.push(r.unconditional as f32);
         conditionals.push(r.conditional as f32);
         naive_conditionals.push(r.naive_conditional as f32);
+        corrected_conditionals.push(r.conditional_corrected as f32);
         outcomes.push(r.actual_outcome);
+        game_indices.push(r.game_idx);
     }
 
     let dict = pyo3::types::PyDict::new(py);
@@ -1516,6 +1522,7 @@ fn compute_accuracy_ceiling_py(
     dict.set_item("unconditional_ceiling", if n > 0 { uncond_sum / n as f64 } else { 0.0 })?;
     dict.set_item("naive_conditional_ceiling", if n > 0 { naive_cond_sum / n as f64 } else { 0.0 })?;
     dict.set_item("conditional_ceiling", if n > 0 { cond_sum / n as f64 } else { 0.0 })?;
+    dict.set_item("conditional_corrected_ceiling", if n > 0 { corrected_cond_sum / n as f64 } else { 0.0 })?;
 
     // Return numpy arrays for per-position data
     let np = py.import("numpy")?;
@@ -1525,8 +1532,10 @@ fn compute_accuracy_ceiling_py(
     dict.set_item("unconditional", np.call_method1("array", (unconditionals,))?)?;
     dict.set_item("naive_conditional", np.call_method1("array", (naive_conditionals,))?)?;
     dict.set_item("conditional", np.call_method1("array", (conditionals,))?)?;
+    dict.set_item("conditional_corrected", np.call_method1("array", (corrected_conditionals,))?)?;
     let outcomes_u16: Vec<u16> = outcomes.iter().map(|&x| x as u16).collect();
     dict.set_item("outcome", np.call_method1("array", (outcomes_u16,))?)?;
+    dict.set_item("game_idx", np.call_method1("array", (game_indices,))?)?;
 
     Ok(dict.into())
 }

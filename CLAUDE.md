@@ -160,7 +160,7 @@ MAIA-compatible evaluation with per-phase and per-ply accuracy. Args: `--min-eva
 uv run python scripts/compute_theoretical_ceiling.py
 ```
 
-Computes upper bounds on top-1 accuracy for random games: unconditional (E[1/N_legal] = 6.43%), naive-conditioned (1-ply filter = 6.44%), MCTS-conditioned (32 rollouts = 7.92%). CPU-intensive.
+Computes theoretical accuracy ceilings for random games via Monte Carlo rollouts: unconditional (E[1/N_legal]), naive-conditioned (1-ply filter), and MC-conditioned (Bayes-optimal with outcome knowledge). Reports a bias bracket (naive vs split-half corrected estimates) and bootstrap 95% CIs clustered by game. CPU-intensive.
 
 ### Export to HuggingFace
 

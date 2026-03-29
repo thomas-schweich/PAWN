@@ -122,7 +122,7 @@ Despite training exclusively on random games, PAWN develops rich internal repres
 
 The model also achieves >99.8% legal move rate on the base and large variants, correctly identifying legal moves from move history alone.
 
-The [theoretical accuracy ceiling](docs/ACCURACY_CEILING.md) for random game prediction is 6.43% (unconditional) to 7.92% (MCTS-conditioned on outcome). All three models exceed the unconditional ceiling, confirming they learn structure beyond move legality.
+The [theoretical accuracy ceiling](docs/ACCURACY_CEILING.md) for random game prediction is 6.52% (unconditional). The MC-conditioned ceiling (Bayes-optimal with outcome knowledge) is estimated at [6.67%, 7.34%] via split-half bias correction. All three models exceed the unconditional ceiling, confirming they exploit the outcome token to make non-uniform predictions.
 
 ## Adapter Methods
 

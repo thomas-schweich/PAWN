@@ -1,5 +1,7 @@
 //! Random game generation with deterministic seeding.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -148,12 +150,18 @@ pub struct PositionCeiling {
     /// terminal state with a different outcome than the actual game outcome.
     /// This is a 0-depth version of the conditional ceiling — no rollouts needed.
     pub naive_conditional: f64,
+    /// Split-half bias-corrected conditional ceiling: half-A selects argmax,
+    /// half-B evaluates it. Biased downward (vs conditional which is biased upward).
+    /// The true ceiling lies between conditional_corrected and conditional.
+    pub conditional_corrected: f64,
     /// The actual outcome of the game this position came from
     pub actual_outcome: u8,
     /// Ply index within the game
     pub ply: u16,
     /// Game length
     pub game_length: u16,
+    /// Index of the source game (for clustered bootstrap in Python)
+    pub game_idx: u32,
 }
 
 /// For a given position (as move token prefix), play out N random continuations
@@ -204,8 +212,8 @@ pub fn rollout_legal_moves(
 /// - Unconditional: 1/N_legal
 /// - Naive conditional (0-depth): prune legal moves that immediately terminate
 ///   with the wrong outcome, then 1/N_remaining
-/// - MCTS conditional: Monte Carlo rollouts estimate P(outcome | move),
-///   best predictor picks argmax
+/// - MC conditional: Monte Carlo rollouts estimate P(outcome | move),
+///   best predictor picks argmax. Split-half corrected to bound bias.
 ///
 /// Returns per-position results. The overall ceiling is the mean.
 pub fn compute_accuracy_ceiling(
@@ -251,6 +259,12 @@ pub fn compute_accuracy_ceiling(
 
     // Process positions in parallel
     let rollout_seed_base = base_seed.wrapping_add(1_000_000);
+    let total_work = work_items.len();
+    let progress = AtomicUsize::new(0);
+    let log_interval = (total_work / 20).max(100); // ~5% increments
+
+    eprintln!("[ceiling] {} positions to process ({} games, {:.0}% sampled, {} rollouts/move)",
+              total_work, n_games, sample_rate * 100.0, n_rollouts_per_move);
 
     work_items
         .par_iter()
@@ -285,38 +299,70 @@ pub fn compute_accuracy_ceiling(
                 unconditional // fallback: all moves lead to wrong immediate outcome
             };
 
-            // --- MCTS conditional (rollout-based) ---
-            let rollout_seed = rollout_seed_base.wrapping_add(work_idx as u64 * 1000);
-            let move_dists = rollout_legal_moves(prefix, n_rollouts_per_move, max_ply, rollout_seed);
+            // --- MC conditional (rollout-based) with split-half bias correction ---
+            let half = n_rollouts_per_move / 2;
+            let half = half.max(1); // at least 1 rollout per half
+            let seed_a = rollout_seed_base.wrapping_add(work_idx as u64 * 2000);
+            let seed_b = rollout_seed_base.wrapping_add(work_idx as u64 * 2000 + 1000);
+            let dists_a = rollout_legal_moves(prefix, half, max_ply, seed_a);
+            let dists_b = rollout_legal_moves(prefix, half, max_ply, seed_b);
 
             let outcome_idx = actual_outcome as usize;
-            let probs: Vec<f64> = move_dists
-                .iter()
-                .map(|(_, dist)| {
-                    if dist.total > 0 {
-                        dist.counts[outcome_idx] as f64 / dist.total as f64
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
 
-            let sum_probs: f64 = probs.iter().sum();
-            let conditional = if sum_probs > 0.0 {
-                let max_prob = probs.iter().cloned().fold(0.0f64, f64::max);
-                max_prob / sum_probs
+            // Compute per-move outcome probabilities from each half and combined
+            let probs_a: Vec<f64> = dists_a.iter().map(|(_, d)| {
+                if d.total > 0 { d.counts[outcome_idx] as f64 / d.total as f64 } else { 0.0 }
+            }).collect();
+            let probs_b: Vec<f64> = dists_b.iter().map(|(_, d)| {
+                if d.total > 0 { d.counts[outcome_idx] as f64 / d.total as f64 } else { 0.0 }
+            }).collect();
+            let probs_combined: Vec<f64> = dists_a.iter().zip(dists_b.iter()).map(|((_, da), (_, db))| {
+                let total = da.total + db.total;
+                if total > 0 {
+                    (da.counts[outcome_idx] + db.counts[outcome_idx]) as f64 / total as f64
+                } else {
+                    0.0
+                }
+            }).collect();
+
+            let sum_combined: f64 = probs_combined.iter().sum();
+
+            // Naive estimator: max of combined / sum of combined (biased upward)
+            let conditional = if sum_combined > 0.0 {
+                let max_combined = probs_combined.iter().cloned().fold(0.0f64, f64::max);
+                max_combined / sum_combined
             } else {
                 unconditional
             };
+
+            // Split-half corrected: A selects argmax, B evaluates (biased downward)
+            let conditional_corrected = if sum_combined > 0.0 && !probs_a.is_empty() {
+                let argmax_a = probs_a.iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                probs_b[argmax_a] / sum_combined
+            } else {
+                unconditional
+            };
+
+            let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % log_interval == 0 || done == total_work {
+                let pct = done as f64 / total_work as f64 * 100.0;
+                eprintln!("[ceiling] {done}/{total_work} positions ({pct:.0}%)");
+            }
 
             PositionCeiling {
                 n_legal,
                 unconditional,
                 conditional,
                 naive_conditional,
+                conditional_corrected,
                 actual_outcome,
                 ply: ply as u16,
                 game_length,
+                game_idx: game_idx as u32,
             }
         })
         .collect()
