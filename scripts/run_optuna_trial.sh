@@ -14,7 +14,7 @@ WD=${4:?weight_decay required}
 GRAD_NORM=${5:?max_grad_norm required}
 BS=${6:?batch_size required}
 DIM=${7:-610}
-shift 7 2>/dev/null || shift $#
+(( $# >= 7 )) && shift 7 || shift $#
 EXTRA_ARGS=("$@")
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -46,17 +46,19 @@ WALL_SECS=$(( END_TIME - START_TIME ))
 BEST=$(grep -oP 'Best val_loss=\K[0-9.]+' "$LOG_FILE" || echo "")
 
 if [ -z "$BEST" ]; then
-    cat > "$RESULT_FILE" <<EOF
-{
-  "trial": $TRIAL,
-  "status": "failed",
-  "params": {"lr": $LR, "warmup_frac": $WARMUP, "weight_decay": $WD, "max_grad_norm": $GRAD_NORM, "batch_size": $BS, "bottleneck_dim": $DIM, "extra_args": "${EXTRA_ARGS[*]:-}"},
-  "val_loss": null,
-  "val_top1": null,
-  "val_top5": null,
-  "wall_seconds": $WALL_SECS
-}
-EOF
+    jq -n \
+      --argjson trial "$TRIAL" \
+      --arg extra_args "${EXTRA_ARGS[*]:-}" \
+      --argjson wall "$WALL_SECS" \
+      '{
+        trial: $trial,
+        status: "failed",
+        params: {lr: '"$LR"', warmup_frac: '"$WARMUP"', weight_decay: '"$WD"', max_grad_norm: '"$GRAD_NORM"', batch_size: '"$BS"', bottleneck_dim: '"$DIM"', extra_args: $extra_args},
+        val_loss: null,
+        val_top1: null,
+        val_top5: null,
+        wall_seconds: $wall
+      }' > "$RESULT_FILE"
     echo "Trial $TRIAL FAILED — no val_loss found (${WALL_SECS}s)"
 else
     # Find the epoch line matching best val_loss and extract metrics
@@ -84,7 +86,7 @@ else
     fi
 
     # Epoch time (median, skip first epoch for compile warmup)
-    STEP_TIME=$(grep -oP 'Epoch.*\|\s+\K[0-9.]+(?=s)' "$LOG_FILE" 2>/dev/null | tail -20 | python3 -c "
+    EPOCH_TIME=$(grep -oP 'Epoch.*\|\s+\K[0-9.]+(?=s)' "$LOG_FILE" 2>/dev/null | tail -20 | python3 -c "
 import sys
 vals = [float(l) for l in sys.stdin if l.strip()]
 print(round(sorted(vals)[len(vals)//2], 3)) if vals else print('')
@@ -93,23 +95,26 @@ print(round(sorted(vals)[len(vals)//2], 3)) if vals else print('')
     # Run directory
     RUN_DIR=$(grep -oP 'Checkpoints saved to \K.*' "$LOG_FILE" || echo "")
 
-    cat > "$RESULT_FILE" <<EOF
-{
-  "trial": $TRIAL,
-  "status": "complete",
-  "params": {"lr": $LR, "warmup_frac": $WARMUP, "weight_decay": $WD, "max_grad_norm": $GRAD_NORM, "batch_size": $BS, "bottleneck_dim": $DIM, "extra_args": "${EXTRA_ARGS[*]:-}"},
-  "val_loss": $BEST,
-  "val_top1": ${TOP1:-null},
-  "val_top5": ${TOP5:-null},
-  "best_epoch": ${BEST_EPOCH:-null},
-  "stop_epoch": ${STOP_EPOCH:-null},
-  "train_loss": ${TRAIN_LOSS:-null},
-  "train_top1": ${TRAIN_TOP1:-null},
-  "overfit_gap": ${OVERFIT_GAP:-null},
-  "wall_seconds": $WALL_SECS,
-  "epoch_time_median": ${STEP_TIME:-null},
-  "run_dir": "${RUN_DIR:-}"
-}
-EOF
+    jq -n \
+      --argjson trial "$TRIAL" \
+      --arg extra_args "${EXTRA_ARGS[*]:-}" \
+      --arg run_dir "${RUN_DIR:-}" \
+      --argjson wall "$WALL_SECS" \
+      '{
+        trial: $trial,
+        status: "complete",
+        params: {lr: '"$LR"', warmup_frac: '"$WARMUP"', weight_decay: '"$WD"', max_grad_norm: '"$GRAD_NORM"', batch_size: '"$BS"', bottleneck_dim: '"$DIM"', extra_args: $extra_args},
+        val_loss: '"${BEST}"',
+        val_top1: '"${TOP1:-null}"',
+        val_top5: '"${TOP5:-null}"',
+        best_epoch: '"${BEST_EPOCH:-null}"',
+        stop_epoch: '"${STOP_EPOCH:-null}"',
+        train_loss: '"${TRAIN_LOSS:-null}"',
+        train_top1: '"${TRAIN_TOP1:-null}"',
+        overfit_gap: '"${OVERFIT_GAP:-null}"',
+        wall_seconds: $wall,
+        epoch_time_median: '"${EPOCH_TIME:-null}"',
+        run_dir: $run_dir
+      }' > "$RESULT_FILE"
     echo "Trial $TRIAL DONE — val_loss=$BEST top1=${TOP1:-?}% top5=${TOP5:-?}% (epoch ${BEST_EPOCH:-?}/${STOP_EPOCH:-?}, overfit_gap=${OVERFIT_GAP:-?}, ${WALL_SECS}s)"
 fi

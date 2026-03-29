@@ -263,13 +263,8 @@ class TestStripOutcomeToken:
     def test_target_shift_correct(self, original_and_stripped):
         """Targets should be input_ids shifted left by 1."""
         _, stripped = original_and_stripped
-        B, T = stripped["input_ids"].shape
-        for b in range(B):
-            for t in range(T - 1):
-                assert stripped["targets"][b, t] == stripped["input_ids"][b, t + 1], \
-                    f"Game {b}: targets[{t}]={stripped['targets'][b, t]} != " \
-                    f"input_ids[{t+1}]={stripped['input_ids'][b, t+1]}"
-            assert stripped["targets"][b, T - 1] == 0, "Last target should be PAD"
+        assert torch.equal(stripped["targets"][:, :-1], stripped["input_ids"][:, 1:])
+        assert (stripped["targets"][:, -1] == 0).all(), "Last target should be PAD"
 
     def test_loss_mask_count(self, original_and_stripped):
         """Stripped loss_mask should have one fewer True position per game."""
