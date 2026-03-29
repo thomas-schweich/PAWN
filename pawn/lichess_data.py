@@ -184,6 +184,8 @@ def prepare_lichess_dataset(
     max_ply: int = 255,
     max_games: int = 50_000,
     min_ply: int = 10,
+    elo_min: int | None = None,
+    elo_max: int | None = None,
 ) -> dict:
     """Parse a PGN or Parquet file and produce training-ready tensors.
 
@@ -203,13 +205,17 @@ def prepare_lichess_dataset(
         return prepare_lichess_parquet(
             parquet_path=pgn_path_str, max_ply=max_ply,
             max_games=max_games, min_ply=min_ply,
+            elo_min=elo_min, elo_max=elo_max,
         )
     # Check if it looks like a HF repo ID (e.g. "user/dataset")
     if "/" in pgn_path_str and not Path(pgn_path_str).exists():
         return prepare_lichess_parquet(
             hf_repo=pgn_path_str, max_ply=max_ply,
             max_games=max_games, min_ply=min_ply,
+            elo_min=elo_min, elo_max=elo_max,
         )
+    if elo_min is not None or elo_max is not None:
+        raise ValueError("Elo filtering requires Parquet data (PGN files lack Elo columns)")
     pgn_path = Path(pgn_path)
 
     # Parse with min_ply=1 so every parseable game appears in the output,
@@ -295,6 +301,8 @@ def prepare_lichess_parquet(
     max_games: int = 50_000,
     min_ply: int = 10,
     split: str = "train",
+    elo_min: int | None = None,
+    elo_max: int | None = None,
 ) -> dict:
     """Load a Parquet dataset and produce training-ready tensors.
 
@@ -310,6 +318,22 @@ def prepare_lichess_parquet(
     """
     lf = _scan_parquet(parquet_path, hf_repo, split)
     schema = lf.collect_schema()
+
+    # Elo filtering (both players must be within range)
+    if elo_min is not None or elo_max is not None:
+        if "white_elo" not in schema or "black_elo" not in schema:
+            raise ValueError(
+                "Elo filtering requires white_elo/black_elo columns in Parquet schema, "
+                f"got: {list(schema.names())}"
+            )
+        if elo_min is not None:
+            lf = lf.filter(
+                (pl.col("white_elo") >= elo_min) & (pl.col("black_elo") >= elo_min)
+            )
+        if elo_max is not None:
+            lf = lf.filter(
+                (pl.col("white_elo") < elo_max) & (pl.col("black_elo") < elo_max)
+            )
 
     if "tokens" in schema:
         return _prepare_from_tokens(lf, max_ply, max_games, min_ply)
