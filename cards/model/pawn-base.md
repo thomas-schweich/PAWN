@@ -88,13 +88,12 @@ This is the **base (default)** variant (~35.8M parameters). PAWN is designed as 
 
 ### Accuracy Ratios
 
-PAWN is trained on uniformly random chess games, so top-1 accuracy has a hard theoretical ceiling. Ratios above 100% on the unconditioned ceiling indicate the model has learned structure beyond simply identifying legal moves. See [Accuracy Ceiling Analysis](https://github.com/thomas-schweich/PAWN/blob/main/docs/ACCURACY_CEILING.md).
+PAWN is trained on uniformly random chess games, so top-1 accuracy has a hard theoretical ceiling. Ratios above 100% on the unconditioned ceiling indicate the model exploits the outcome token to make non-uniform predictions. The MC conditioned ceiling is an estimate reported as a bracket \[corrected, naive\]; see [Accuracy Ceiling Analysis](https://github.com/thomas-schweich/PAWN/blob/main/docs/ACCURACY_CEILING.md) for methodology.
 
 | Ceiling | Ratio |
 |---------|-------|
-| Unconditioned (E\[1/N_legal\] = 6.43%) | 109% |
-| Naive-conditioned (1-ply filter = 6.44%) | 109% |
-| Bayes-optimal conditioned (MCTS, 32 rollouts = 7.92%) | 89% |
+| Unconditioned (E\[1/N_legal\] = 6.52%) | 105% |
+| Bayes-optimal conditioned (MC, 128 rollouts = \[6.67, 7.34\]%) | 94–103% |
 
 
 ## Probe Results

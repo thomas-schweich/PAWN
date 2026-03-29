@@ -88,13 +88,12 @@ This is the **{{ variant_label }}** variant ({{ params }} parameters). PAWN is d
 
 ### Accuracy Ratios
 
-PAWN is trained on uniformly random chess games, so top-1 accuracy has a hard theoretical ceiling. Ratios above 100% on the unconditioned ceiling indicate the model has learned structure beyond simply identifying legal moves. See [Accuracy Ceiling Analysis](https://github.com/thomas-schweich/PAWN/blob/main/docs/ACCURACY_CEILING.md).
+PAWN is trained on uniformly random chess games, so top-1 accuracy has a hard theoretical ceiling. Ratios above 100% on the unconditioned ceiling indicate the model exploits the outcome token to make non-uniform predictions. The MC conditioned ceiling is an estimate reported as a bracket \[corrected, naive\]; see [Accuracy Ceiling Analysis](https://github.com/thomas-schweich/PAWN/blob/main/docs/ACCURACY_CEILING.md) for methodology.
 
 | Ceiling | Ratio |
 |---------|-------|
 | Unconditioned (E\[1/N_legal\] = {{ "%.2f"|format(uncond_ceiling) }}%) | {{ uncond_ratio }}% |
-| Naive-conditioned (1-ply filter = {{ "%.2f"|format(naive_ceiling) }}%) | {{ naive_ratio }}% |
-| Bayes-optimal conditioned (MCTS, 32 rollouts = {{ "%.2f"|format(mcts_ceiling) }}%) | {{ mcts_ratio }}% |
+| Bayes-optimal conditioned (MC, {{ n_rollouts }} rollouts = \[{{ "%.2f"|format(mc_corrected_ceiling) }}, {{ "%.2f"|format(mc_naive_ceiling) }}\]%) | {{ mc_corrected_ratio }}–{{ mc_naive_ratio }}% |
 {% if probes %}
 
 ## Probe Results

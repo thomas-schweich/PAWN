@@ -81,7 +81,7 @@ def count_params_from_weights(repo: str) -> int:
 CEILING_PATH = Path("data/theoretical_ceiling.json")
 
 
-def load_ceilings() -> tuple[float, float, float]:
+def load_ceilings() -> dict:
     """Load accuracy ceilings from the canonical JSON artifact."""
     if not CEILING_PATH.exists():
         raise FileNotFoundError(
@@ -89,11 +89,13 @@ def load_ceilings() -> tuple[float, float, float]:
         )
     with open(CEILING_PATH) as f:
         data = json.load(f)
-    return (
-        data["unconditional_ceiling"] * 100,
-        data["naive_conditional_ceiling"] * 100,
-        data["conditional_ceiling"] * 100,
-    )
+    return {
+        "uncond": data["unconditional_ceiling"] * 100,
+        "naive": data["naive_conditional_ceiling"] * 100,
+        "mc_naive": data["conditional_ceiling"] * 100,
+        "mc_corrected": data.get("conditional_corrected_ceiling", data["conditional_ceiling"]) * 100,
+        "n_rollouts": data.get("n_rollouts", 32),
+    }
 
 PROBE_DESCRIPTIONS = {
     "piece_type": "Per-square piece type (13 classes x 64 squares)",
@@ -239,13 +241,14 @@ def build_context(variant_key: str, variant: dict) -> dict:
         ctx["legal_rate"] *= 100
 
     # Accuracy ratios
-    uncond, naive, mcts = load_ceilings()
-    ctx["uncond_ceiling"] = uncond
-    ctx["naive_ceiling"] = naive
-    ctx["mcts_ceiling"] = mcts
-    ctx["uncond_ratio"] = round(ctx["top1"] / uncond * 100)
-    ctx["naive_ratio"] = round(ctx["top1"] / naive * 100)
-    ctx["mcts_ratio"] = round(ctx["top1"] / mcts * 100)
+    ceil = load_ceilings()
+    ctx["uncond_ceiling"] = ceil["uncond"]
+    ctx["mc_naive_ceiling"] = ceil["mc_naive"]
+    ctx["mc_corrected_ceiling"] = ceil["mc_corrected"]
+    ctx["n_rollouts"] = ceil["n_rollouts"]
+    ctx["uncond_ratio"] = round(ctx["top1"] / ceil["uncond"] * 100)
+    ctx["mc_naive_ratio"] = round(ctx["top1"] / ceil["mc_naive"] * 100)
+    ctx["mc_corrected_ratio"] = round(ctx["top1"] / ceil["mc_corrected"] * 100)
 
     # Fetch eval results for probes and diagnostics
     eval_results = fetch_eval_results(repo)
