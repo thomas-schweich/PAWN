@@ -235,11 +235,13 @@ class CLMTrainer:
         self.dataset = CLMDataset(
             train_cfg.batch_size, train_cfg.max_ply, train_cfg.base_seed,
             discard_ply_limit=train_cfg.discard_ply_limit,
+            no_outcome=train_cfg.no_outcome_token,
         )
         print("Generating validation set...")
         self.val_data = create_validation_set(
             train_cfg.val_games, train_cfg.max_ply, train_cfg.val_seed,
             discard_ply_limit=train_cfg.discard_ply_limit,
+            no_outcome=train_cfg.no_outcome_token,
         )
 
         # W&B

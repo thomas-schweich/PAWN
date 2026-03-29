@@ -98,6 +98,9 @@ class TrainingConfig:
     eval_interval: int = 500
     checkpoint_interval: int = 5000
 
+    # Outcome token
+    no_outcome_token: bool = False  # Strip outcome token from sequences
+
     # Seeds
     base_seed: int = 42
     val_seed: int = (2**63) - 1

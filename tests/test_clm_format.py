@@ -18,6 +18,7 @@ from pawn.config import (
 from pawn.data import (
     _map_termination_to_outcome,
     pack_clm_sequences,
+    strip_outcome_token,
     _to_clm_batch,
 )
 
@@ -222,3 +223,73 @@ class TestBoundaryCases:
         assert np.array_equal(r1[0], r2[0]), "input_ids should be deterministic"
         assert np.array_equal(r1[1], r2[1]), "targets should be deterministic"
         assert np.array_equal(r1[2], r2[2]), "loss_mask should be deterministic"
+
+
+# ---------------------------------------------------------------------------
+# strip_outcome_token
+# ---------------------------------------------------------------------------
+
+
+class TestStripOutcomeToken:
+    @pytest.fixture
+    def original_and_stripped(self):
+        input_ids, targets, loss_mask, move_ids, game_lengths, term_codes = \
+            engine.generate_clm_batch(32, 256, seed=42)
+        legal_grid, _ = engine.compute_legal_move_masks(move_ids, game_lengths)
+        original = {
+            "input_ids": torch.from_numpy(input_ids).long(),
+            "targets": torch.from_numpy(targets).long(),
+            "loss_mask": torch.from_numpy(loss_mask),
+            "legal_grid": torch.from_numpy(legal_grid).long(),
+            "game_lengths": torch.from_numpy(game_lengths).long(),
+        }
+        stripped = strip_outcome_token(original)
+        return original, stripped
+
+    def test_position_zero_is_move(self, original_and_stripped):
+        """After stripping, position 0 should be a move token, not outcome."""
+        _, stripped = original_and_stripped
+        for b in range(stripped["input_ids"].shape[0]):
+            tok = stripped["input_ids"][b, 0].item()
+            assert 1 <= tok <= 4272, \
+                f"Game {b}: position 0 should be move token, got {tok}"
+
+    def test_no_outcome_tokens_in_sequence(self, original_and_stripped):
+        """No outcome tokens should appear anywhere in stripped sequences."""
+        _, stripped = original_and_stripped
+        assert (stripped["input_ids"] < OUTCOME_TOKEN_BASE).all(), \
+            "Stripped sequences should not contain outcome tokens"
+
+    def test_target_shift_correct(self, original_and_stripped):
+        """Targets should be input_ids shifted left by 1."""
+        _, stripped = original_and_stripped
+        B, T = stripped["input_ids"].shape
+        for b in range(B):
+            for t in range(T - 1):
+                assert stripped["targets"][b, t] == stripped["input_ids"][b, t + 1], \
+                    f"Game {b}: targets[{t}]={stripped['targets'][b, t]} != " \
+                    f"input_ids[{t+1}]={stripped['input_ids'][b, t+1]}"
+            assert stripped["targets"][b, T - 1] == 0, "Last target should be PAD"
+
+    def test_loss_mask_count(self, original_and_stripped):
+        """Stripped loss_mask should have one fewer True position per game."""
+        original, stripped = original_and_stripped
+        for b in range(original["loss_mask"].shape[0]):
+            orig_count = original["loss_mask"][b].sum().item()
+            strip_count = stripped["loss_mask"][b].sum().item()
+            assert strip_count == orig_count - 1, \
+                f"Game {b}: expected {orig_count - 1} True positions, got {strip_count}"
+
+    def test_legal_grid_shifted(self, original_and_stripped):
+        """legal_grid should be shifted left by 1 from original."""
+        original, stripped = original_and_stripped
+        max_ply = original["legal_grid"].shape[1]
+        assert torch.equal(
+            stripped["legal_grid"][:, :max_ply - 1],
+            original["legal_grid"][:, 1:],
+        ), "legal_grid should be shifted left by 1"
+
+    def test_game_lengths_unchanged(self, original_and_stripped):
+        """game_lengths should pass through unchanged."""
+        original, stripped = original_and_stripped
+        assert torch.equal(original["game_lengths"], stripped["game_lengths"])
