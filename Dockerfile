@@ -56,18 +56,12 @@ RUN uv venv --system-site-packages && \
     uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl
 
-# Bake git version info
+# Bake git version info and set PATH for all contexts (docker exec, SSH, cron)
 ARG GIT_HASH=""
 ARG GIT_TAG=""
 ENV PAWN_GIT_HASH=${GIT_HASH} \
     PAWN_GIT_TAG=${GIT_TAG} \
-    PYTHONPATH=/opt/pawn
-
-# Persist env vars for SSH sessions
-RUN echo "export PYTHONPATH=/opt/pawn" >> /etc/environment && \
-    echo "export PAWN_GIT_HASH=${GIT_HASH}" >> /etc/environment && \
-    echo "export PAWN_GIT_TAG=${GIT_TAG}" >> /etc/environment && \
-    echo 'export PATH="/opt/pawn/.venv/bin:$PATH"' >> /etc/environment && \
-    cat /etc/environment >> /root/.bashrc
+    PYTHONPATH=/opt/pawn \
+    PATH="/opt/pawn/.venv/bin:/root/.local/bin:${PATH}"
 
 # Inherits /start.sh entrypoint from RunPod base image (SSH + Jupyter)
