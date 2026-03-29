@@ -56,6 +56,10 @@ RUN uv venv --system-site-packages && \
     uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl
 
+# Install tmux (session persistence), ripgrep (Claude Code search), jq (JSON parsing), Claude Code CLI
+RUN apt-get update && apt-get install -y --no-install-recommends tmux ripgrep jq && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
 # Bake git version info and set PATH for all contexts (docker exec, SSH, cron)
 ARG GIT_HASH=""
 ARG GIT_TAG=""
