@@ -83,8 +83,8 @@ else
         OVERFIT_GAP=""
     fi
 
-    # Step time (median from logged steps, skip first 100 for compile warmup)
-    STEP_TIME=$(grep -oP '^\s+step\s+\d+.*\|\s+\K[0-9.]+(?=s)' "$LOG_FILE" 2>/dev/null | tail -20 | python3 -c "
+    # Epoch time (median, skip first epoch for compile warmup)
+    STEP_TIME=$(grep -oP 'Epoch.*\|\s+\K[0-9.]+(?=s)' "$LOG_FILE" 2>/dev/null | tail -20 | python3 -c "
 import sys
 vals = [float(l) for l in sys.stdin if l.strip()]
 print(round(sorted(vals)[len(vals)//2], 3)) if vals else print('')
@@ -107,7 +107,7 @@ print(round(sorted(vals)[len(vals)//2], 3)) if vals else print('')
   "train_top1": ${TRAIN_TOP1:-null},
   "overfit_gap": ${OVERFIT_GAP:-null},
   "wall_seconds": $WALL_SECS,
-  "step_time_median": ${STEP_TIME:-null},
+  "epoch_time_median": ${STEP_TIME:-null},
   "run_dir": "${RUN_DIR:-}"
 }
 EOF
