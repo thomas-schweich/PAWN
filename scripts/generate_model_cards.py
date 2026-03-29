@@ -93,8 +93,8 @@ def load_ceilings() -> dict:
         "uncond": data["unconditional_ceiling"] * 100,
         "naive": data["naive_conditional_ceiling"] * 100,
         "mc_naive": data["conditional_ceiling"] * 100,
-        "mc_corrected": data.get("conditional_corrected_ceiling", data["conditional_ceiling"]) * 100,
-        "n_rollouts": data.get("n_rollouts", 32),
+        "mc_corrected": data["conditional_corrected_ceiling"] * 100,
+        "n_rollouts": data["n_rollouts"],
     }
 
 PROBE_DESCRIPTIONS = {
