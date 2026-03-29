@@ -44,7 +44,7 @@ uv run pytest tests/
 uv run python scripts/train.py --variant base --local-checkpoints
 ```
 
-PyTorch is a **base dependency** — `uv sync` always installs it (CPU build from PyPI by default). The extras (`rocm`, `cu128`) only control which GPU-accelerated build is pulled from the PyTorch index. You cannot accidentally end up without torch.
+The only extras are GPU backends (`rocm` or `cu128`). Everything else (pytest, solara, optuna, seaborn, etc.) is in base dependencies. PyTorch lives in the extras because uv can't resolve CPU/CUDA/ROCm from a single lockfile — always specify `--extra rocm` or `--extra cu128`.
 
 **GPU requirement**: `configure_gpu()` (called by every training and eval script) raises `RuntimeError` if no CUDA/ROCm GPU is detected. This prevents accidentally running GPU workloads on CPU, which is almost always a mistake. The environment variable `PAWN_ALLOW_CPU=1` overrides this check as a last resort for the rare case where CPU execution is genuinely intended (e.g. a lightweight backfill script). Unit tests do not call `configure_gpu()` and run fine on CPU without the override.
 
@@ -354,8 +354,8 @@ Supports all adapter types + architecture search. GPU affinity assigns `CUDA_VIS
 
 - **DataLoader workers must use `multiprocessing_context='spawn'`** — the Rust engine uses rayon, and fork after rayon init causes deadlocks.
 - **`SDPA_BACKEND` must be set before `torch.compile()`** — compiled code captures the backend at trace time. `apply_gpu_config()` handles this.
-- **ROCm flash attention bug**: with `torch.compile`, flash attention backward has stride issues. Use `--sdpa-math` to force the MATH SDPA backend.
+- **ROCm works**: The only known ROCm issue is a stride mismatch in flash attention backward when combined with `torch.compile` + AMP. The workaround is `--sdpa-math` (use the MATH SDPA backend instead of flash), which `configure_gpu()` applies automatically on AMD GPUs. Everything else — training, eval, adapters, data loading — works identically on ROCm and CUDA. **Do not assume bugs are ROCm-specific.** Every other time something has failed on AMD it turned out to be a bug in our code (wrong torch version installed, stale lockfile, missing dependency, etc.), not a ROCm issue.
 - **Sparse logit projection**: `forward_hidden()` returns `(B,T,d_model)`, then only loss-masked positions project through `lm_head` — avoids full `(B,T,V)` materialization.
 - **Legal mask via Rust**: `LegalMaskBuilder` replays games in Rust, returns sparse indices (~2 MB) scattered into a pre-allocated GPU buffer (vs ~70 MB dense).
-- **GPU auto-detection**: `pawn.gpu.configure_gpu()` selects compile/AMP/SDPA settings. `apply_gpu_config()` applies them. NVIDIA uses flash attention + compile; AMD uses MATH SDPA + compile.
+- **GPU auto-detection**: `pawn.gpu.configure_gpu()` selects compile/AMP/SDPA settings. `apply_gpu_config()` applies them. NVIDIA uses flash attention + compile; AMD uses MATH SDPA + compile. Both paths are tested and production-validated.
 - **Factored embeddings**: each move token decomposes into `src_embed[s] + dst_embed[d] + promo_embed[p]`, reducing embedding parameters by ~32x.
