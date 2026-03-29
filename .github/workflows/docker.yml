@@ -42,5 +42,5 @@ jobs:
           build-args: |
             GIT_HASH=${{ github.sha }}
             GIT_TAG=${{ steps.meta.outputs.tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
