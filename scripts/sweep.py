@@ -73,6 +73,10 @@ def main():
     p.add_argument("--in-process", action="store_true",
                     help="Run trials in-process (RoSA only). Shares backbone and data "
                          "across trials, enables epoch-level pruning. Faster than subprocess.")
+    p.add_argument("--elo-min", type=int, default=None,
+                    help="Minimum Elo for both players (inclusive, in-process mode)")
+    p.add_argument("--elo-max", type=int, default=None,
+                    help="Maximum Elo for both players (exclusive, in-process mode)")
     p.add_argument("--extra-args", nargs=argparse.REMAINDER, default=[],
                     help="Extra args passed to training script (after --)")
 
@@ -105,9 +109,9 @@ def main():
     )
 
     if args.in_process:
-        if args.adapter not in ("rosa", "retro-sparse", "retro-bottleneck"):
+        if args.adapter not in ("rosa", "retro-sparse", "retro-bottleneck", "rosa-ratio"):
             p.error("--in-process is currently only supported for "
-                    "--adapter rosa|retro-sparse|retro-bottleneck")
+                    "--adapter rosa|retro-sparse|retro-bottleneck|rosa-ratio")
         objective = InProcessRoSAObjective(
             adapter_type=args.adapter,
             checkpoint=args.checkpoint,
@@ -115,6 +119,8 @@ def main():
             device=args.device,
             output_base=args.output_dir,
             epochs=args.epochs,
+            elo_min=args.elo_min,
+            elo_max=args.elo_max,
         )
     else:
         # For architecture/pretrain sweeps, pass --total-steps via extra args

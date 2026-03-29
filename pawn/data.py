@@ -129,6 +129,52 @@ def _to_clm_batch(
     return pack_clm_sequences(move_ids, game_lengths, outcome_tokens, seq_len)
 
 
+def strip_outcome_token(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Remove the outcome token from position 0, shifting moves to position 0.
+
+    Original: [outcome, m1, m2, ..., mN, PAD, ...]
+    Result:   [m1, m2, ..., mN, PAD, ..., PAD]
+
+    Also shifts loss_mask and legal_grid to maintain alignment with
+    compute_legal_move_rate (prediction at position p targets ply p+1,
+    so legal_grid must shift left by 1).
+    """
+    input_ids = batch["input_ids"]
+    loss_mask = batch["loss_mask"]
+
+    # Shift input_ids left by 1 (drop outcome at position 0, pad end)
+    new_input_ids = torch.zeros_like(input_ids)
+    new_input_ids[:, :-1] = input_ids[:, 1:]
+
+    # Recompute targets from new input_ids (shifted left by 1)
+    new_targets = torch.zeros_like(new_input_ids)
+    new_targets[:, :-1] = new_input_ids[:, 1:]
+
+    # Shift loss_mask left by 1
+    new_loss_mask = torch.zeros_like(loss_mask)
+    new_loss_mask[:, :-1] = loss_mask[:, 1:]
+
+    result: dict[str, torch.Tensor] = {
+        "input_ids": new_input_ids,
+        "targets": new_targets,
+        "loss_mask": new_loss_mask,
+    }
+
+    # Shift legal_grid left by 1 to maintain alignment with predictions
+    if "legal_grid" in batch:
+        legal_grid = batch["legal_grid"]
+        new_legal = torch.zeros_like(legal_grid)
+        new_legal[:, :-1] = legal_grid[:, 1:]
+        result["legal_grid"] = new_legal
+
+    # Pass through other keys unchanged
+    for k, v in batch.items():
+        if k not in result:
+            result[k] = v
+
+    return result
+
+
 class CLMDataset(torch.utils.data.IterableDataset):
     """Generates CLM training data on-the-fly via the Rust engine.
 
@@ -137,12 +183,13 @@ class CLMDataset(torch.utils.data.IterableDataset):
     """
 
     def __init__(self, batch_size: int, max_ply: int, base_seed: int,
-                 discard_ply_limit: bool = False):
+                 discard_ply_limit: bool = False, no_outcome: bool = False):
         super().__init__()
         self.batch_size = batch_size
         self.max_ply = max_ply
         self.base_seed = base_seed
         self.discard_ply_limit = discard_ply_limit
+        self.no_outcome = no_outcome
         self._start_step = 0
         self._main_pid = os.getpid()
 
@@ -176,17 +223,21 @@ class CLMDataset(torch.utils.data.IterableDataset):
                     self.batch_size, self.max_ply, seed,
                     discard_ply_limit=self.discard_ply_limit,
                 )
-            yield {
+            batch = {
                 "input_ids": torch.from_numpy(input_ids).long(),
                 "targets": torch.from_numpy(targets).long(),
                 "loss_mask": torch.from_numpy(loss_mask),
             }
+            if self.no_outcome:
+                batch = strip_outcome_token(batch)
+            yield batch
             step += 1
 
 
 def create_validation_set(
     n_games: int, max_ply: int, seed: int,
     discard_ply_limit: bool = False,
+    no_outcome: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Generate a fixed validation set.
 
@@ -209,5 +260,8 @@ def create_validation_set(
     legal_grid, _legal_promo = engine.compute_legal_move_masks(move_ids, game_lengths)
     batch["legal_grid"] = torch.from_numpy(legal_grid).long()
     batch["game_lengths"] = torch.from_numpy(game_lengths).long()
+
+    if no_outcome:
+        batch = strip_outcome_token(batch)
 
     return batch

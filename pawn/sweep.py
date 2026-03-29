@@ -178,6 +178,58 @@ def suggest_retro_bottleneck(trial: "optuna.Trial") -> dict:
     return params
 
 
+# ---------------------------------------------------------------------------
+# RoSA ratio sweep: bottleneck vs sparse parameter allocation
+# ---------------------------------------------------------------------------
+
+# Architecture constants for pawn-base (d_model=512, n_layers=8)
+# Bottleneck: 2 positions (attn+ffn) * n_layers * 2 projections (down+up) * d_model
+_BASE_BOTTLENECK_PARAMS_PER_DIM = 4 * 8 * 512  # 16_384
+# Sparse maskable: 4 attn projections (qkvo) * n_layers * d_model^2
+_BASE_SPARSE_MASKABLE_PARAMS = 4 * 8 * 512 * 512  # 8_388_608
+
+
+def suggest_rosa_ratio(trial: "optuna.Trial") -> dict:
+    """Retro-bottleneck ratio sweep: vary bottleneck vs sparse param allocation.
+
+    For a fixed total parameter budget, sweeps the fraction allocated to
+    bottleneck adapters (rest goes to gradient-informed sparse masks).
+    Nuisance hyperparameters are fixed to focus trials on the ratio.
+    """
+    total_budget = trial.suggest_categorical("total_budget", [100_000, 250_000, 500_000])
+    bottleneck_ratio = trial.suggest_float("bottleneck_ratio", 0.05, 0.95)
+
+    # Derive bottleneck_dim and sparse density from budget split
+    bottleneck_budget = bottleneck_ratio * total_budget
+    sparse_budget = (1.0 - bottleneck_ratio) * total_budget
+
+    bottleneck_dim = max(1, round(bottleneck_budget / _BASE_BOTTLENECK_PARAMS_PER_DIM))
+    density = max(1e-5, sparse_budget / _BASE_SPARSE_MASKABLE_PARAMS)
+
+    # Log realized param counts (rounding causes deviation from target)
+    actual_bn = bottleneck_dim * _BASE_BOTTLENECK_PARAMS_PER_DIM
+    actual_sp = int(density * _BASE_SPARSE_MASKABLE_PARAMS)
+    trial.set_user_attr("actual_bottleneck_params", actual_bn)
+    trial.set_user_attr("actual_sparse_params", actual_sp)
+    trial.set_user_attr("actual_total_params", actual_bn + actual_sp)
+
+    return {
+        "mode": "retro-bottleneck",
+        "bottleneck_dim": bottleneck_dim,
+        "density": density,
+        "lr": trial.suggest_float("lr", 1e-4, 3e-3, log=True),
+        "batch_size": trial.suggest_categorical("batch_size", [64, 128]),
+        "weight_decay": 0.01,
+        "warmup_frac": 0.05,
+        "patience": 10,
+        "lora_rank": 4,
+        "lora_targets": "qkvo",
+        "warmup_steps": trial.suggest_int("warmup_steps", 64, 128, step=64),
+        "mask_samples": 32,
+        "grad_alpha": 2,
+    }
+
+
 SUGGEST_FNS = {
     "lora": suggest_lora,
     "bottleneck": suggest_bottleneck,
@@ -187,6 +239,7 @@ SUGGEST_FNS = {
     "rosa": suggest_rosa,
     "retro-sparse": suggest_retro_sparse,
     "retro-bottleneck": suggest_retro_bottleneck,
+    "rosa-ratio": suggest_rosa_ratio,
     "tiny": suggest_tiny,
     "architecture": suggest_architecture,
     "pretrain": suggest_pretrain,
@@ -201,6 +254,7 @@ ADAPTER_SCRIPTS = {
     "rosa": "scripts/train_rosa.py",
     "retro-sparse": "scripts/train_rosa.py",
     "retro-bottleneck": "scripts/train_rosa.py",
+    "rosa-ratio": "scripts/train_rosa.py",
     "tiny": "scripts/train_tiny.py",
     "pretrain": "scripts/train.py",
     "architecture": "scripts/train.py",
@@ -378,8 +432,11 @@ class InProcessRoSAObjective:
         no_compile: bool = False,
         sdpa_math: bool = False,
         max_grad_norm: float = 1.0,
+        elo_min: int | None = None,
+        elo_max: int | None = None,
     ):
-        if adapter_type not in ("rosa", "retro-sparse", "retro-bottleneck"):
+        _supported = ("rosa", "retro-sparse", "retro-bottleneck", "rosa-ratio")
+        if adapter_type not in _supported:
             raise ValueError(f"InProcessRoSAObjective does not support adapter_type={adapter_type!r}")
         self.adapter_type = adapter_type
         self.checkpoint = checkpoint
@@ -413,6 +470,7 @@ class InProcessRoSAObjective:
         # --- Parse PGN once ---
         data = prepare_lichess_dataset(
             pgn, max_ply=255, max_games=max_games, min_ply=min_ply,
+            elo_min=elo_min, elo_max=elo_max,
         )
         n_total = data["n_games"]
         n_val = min(val_games, n_total // 5)

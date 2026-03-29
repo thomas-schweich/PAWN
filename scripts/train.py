@@ -30,6 +30,8 @@ def parse_args():
     parser.add_argument("--log-dir", type=str, default=None, help="Override log directory")
     parser.add_argument("--discard-ply-limit", action="store_true",
                         help="Only train on games that ended naturally (no ply limit truncation)")
+    parser.add_argument("--no-outcome-token", action="store_true",
+                        help="Strip outcome token from sequences (ablation experiment)")
 
     # Architecture overrides (for sweeps — override the named variant)
     parser.add_argument("--d-model", type=int, default=None, help="Override d_model")
@@ -84,6 +86,8 @@ def main():
         train_cfg.log_dir = args.log_dir
     if args.discard_ply_limit:
         train_cfg.discard_ply_limit = True
+    if args.no_outcome_token:
+        train_cfg.no_outcome_token = True
 
     # Architecture overrides
     if args.d_model is not None:

@@ -288,6 +288,8 @@ def parse_args():
     p.add_argument("--eval-interval", type=int, default=500)
     p.add_argument("--checkpoint-interval", type=int, default=5000)
     p.add_argument("--discard-ply-limit", action="store_true")
+    p.add_argument("--no-outcome-token", action="store_true",
+                    help="Strip outcome token from sequences (ablation experiment)")
     p.add_argument("--patience", type=int, default=10,
                     help="Stop if no val loss improvement for N eval intervals (0=disabled)")
     p.add_argument("--wandb", action="store_true")
@@ -432,6 +434,8 @@ def main():
     print(f"Total steps: {args.total_steps}")
     if args.shm_checkpoints:
         print("Checkpoints: /dev/shm (volatile, HF push is durable store)")
+    if args.no_outcome_token:
+        print("Outcome token: DISABLED (ablation experiment)")
     print()
 
     # Linear LR scaling: lr = base_lr * (batch_size / base_batch_size)
@@ -453,6 +457,7 @@ def main():
         train_cfg.eval_interval = args.eval_interval
         train_cfg.checkpoint_interval = args.checkpoint_interval
         train_cfg.discard_ply_limit = args.discard_ply_limit
+        train_cfg.no_outcome_token = args.no_outcome_token
         train_cfg.use_wandb = args.wandb
 
         hf_repo = f"{args.hf_repo}-{name}" if args.hf_repo else None
@@ -464,11 +469,13 @@ def main():
     dataset = CLMDataset(
         args.batch_size, max_ply, base_seed=42,
         discard_ply_limit=args.discard_ply_limit,
+        no_outcome=args.no_outcome_token,
     )
 
     print("\nGenerating shared validation set...")
     val_data = create_validation_set(512, max_ply, seed=(2**63) - 1,
-                                     discard_ply_limit=args.discard_ply_limit)
+                                     discard_ply_limit=args.discard_ply_limit,
+                                     no_outcome=args.no_outcome_token)
 
     # Compile models
     if device != "cpu":
