@@ -69,8 +69,18 @@ def parse_args():
     p.add_argument("--max-games", type=int, default=12_000)
     p.add_argument("--val-games", type=int, default=2_000)
     p.add_argument("--min-ply", type=int, default=10)
+    p.add_argument("--elo-min", type=int, default=None,
+                    help="Min Elo for both players (inclusive, enables shard-parallel loading)")
+    p.add_argument("--elo-max", type=int, default=None,
+                    help="Max Elo for both players (exclusive)")
 
     # Training
+    p.add_argument("--total-steps", type=int, default=None,
+                    help="Stop after this many steps (overrides epoch count)")
+    p.add_argument("--eval-interval", type=int, default=None,
+                    help="Evaluate every N steps (default: every epoch)")
+    p.add_argument("--log-interval", type=int, default=100,
+                    help="Log training metrics every N steps")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -273,25 +283,42 @@ def main():
     model.forward_hidden = apply_gpu_config(gpu_cfg, model_module, model.forward_hidden)
 
     # Prepare data
-    print(f"\nPreparing Lichess data: {args.pgn}")
-    data = prepare_lichess_dataset(
-        args.pgn, max_ply=255, max_games=args.max_games, min_ply=args.min_ply,
-    )
-    n_total_games = data["n_games"]
-    n_val = min(args.val_games, n_total_games // 5)
-    n_train = n_total_games - n_val
-    print(f"  Train: {n_train} games, Val: {n_val} games")
-
     vocab_size = backbone.cfg.vocab_size
-
-    train_ds = LichessDataset(data, start=0, end=n_train).share_memory()
-    val_ds = LichessDataset(data, start=n_train, end=n_total_games)
-
     max_ply = 255
+    streaming = args.elo_min is not None or args.elo_max is not None
+
+    from pawn.shard_loader import ShardedLichessDataset, load_val_shards
+    if streaming:
+        print(f"\nShard-parallel loading: {args.pgn} [{args.elo_min}, {args.elo_max})")
+
+        val_data = load_val_shards(
+            args.pgn, elo_min=args.elo_min, elo_max=args.elo_max,
+            min_ply=args.min_ply, max_games=args.val_games,
+        )
+        val_ds = LichessDataset(val_data, start=0, end=val_data["n_games"])
+
+        train_ds = ShardedLichessDataset(
+            args.pgn, elo_min=args.elo_min, elo_max=args.elo_max,
+            min_ply=args.min_ply, max_games=args.max_games,
+        )
+        print(f"  Val: {len(val_ds):,} games, Train: {len(train_ds.shard_files)} shards")
+    else:
+        print(f"\nPreparing Lichess data: {args.pgn}")
+        data = prepare_lichess_dataset(
+            args.pgn, max_ply=255, max_games=args.max_games, min_ply=args.min_ply,
+        )
+        n_total_games = data["n_games"]
+        n_val = min(args.val_games, n_total_games // 5)
+        n_train = n_total_games - n_val
+        print(f"  Train: {n_train} games, Val: {n_val} games")
+        train_ds = LichessDataset(data, start=0, end=n_train).share_memory()
+        val_ds = LichessDataset(data, start=n_train, end=n_total_games)
+
     collate = LegalMaskCollate(seq_len=max_ply + 1, vocab_size=vocab_size)
     n_workers = args.num_workers
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
+        train_ds, batch_size=args.batch_size,
+        shuffle=not streaming,  # IterableDataset handles its own ordering
         num_workers=n_workers, pin_memory=True,
         persistent_workers=n_workers > 0, collate_fn=collate,
         multiprocessing_context='spawn' if n_workers > 0 else None,
@@ -308,7 +335,15 @@ def main():
     optimizer = torch.optim.AdamW(
         adapter_params, lr=args.lr, weight_decay=args.weight_decay,
     )
-    total_steps = args.epochs * len(train_loader)
+    if args.total_steps:
+        total_steps = args.total_steps
+    elif streaming:
+        assert isinstance(train_ds, ShardedLichessDataset)
+        est_games = min(args.max_games or 1_000_000, len(train_ds.shard_files) * 60_000)
+        total_steps = args.epochs * (est_games // args.batch_size)
+        print(f"  Estimated ~{est_games:,} games, ~{total_steps:,} total steps")
+    else:
+        total_steps = args.epochs * len(train_loader)
     warmup_steps = int(args.warmup_frac * total_steps)
     scheduler = cosine_warmup_schedule(optimizer, warmup_steps, total_steps)
 
@@ -378,14 +413,42 @@ def main():
     signal.signal(signal.SIGTERM, _graceful_exit)
     signal.signal(signal.SIGINT, _graceful_exit)
 
+    eval_interval = args.eval_interval
+    step_limit = args.total_steps
+
     print(f"\nTraining for up to {args.epochs} epochs ({total_steps} steps)")
     print(f"  Warmup: {warmup_steps} steps, LR: {args.lr}")
+    if eval_interval:
+        print(f"  Eval every {eval_interval} steps")
+
+    def _do_eval():
+        return evaluate(model, val_loader, mask_builder, device, use_amp=use_amp,
+                        precomputed_indices=val_legal_indices)
+
+    def _save_best(vm, ep):
+        from pawn.checkpoint import save_adapter_checkpoint
+        save_adapter_checkpoint(
+            ckpt_dir / "best", model.adapter_state_dict(),
+            config=vars(args), epoch=ep, step=global_step,
+            val_metrics=vm, optimizer=optimizer, scheduler=scheduler,
+            scaler=scaler,
+            extra={"best_val_loss": best_val_loss, "patience_counter": patience_counter},
+        )
+        if args.hf_repo and hf_branch:
+            from pawn.checkpoint import push_checkpoint_to_hf
+            try:
+                push_checkpoint_to_hf(ckpt_dir / "best", args.hf_repo, hf_branch, step=global_step)
+            except Exception as e:
+                print(f"WARNING: HF push failed: {e}")
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0.0
         epoch_top1 = 0.0
         epoch_positions = 0
+        log_loss = 0.0
+        log_top1 = 0.0
+        log_positions = 0
         t0 = time.time()
 
         for batch in train_loader:
@@ -420,28 +483,65 @@ def main():
             epoch_loss += loss.item() * n_pos
             epoch_top1 += top1 * n_pos
             epoch_positions += n_pos
+            log_loss += loss.item() * n_pos
+            log_top1 += top1 * n_pos
+            log_positions += n_pos
             global_step += 1
+
+            # Step-level logging
+            if global_step % args.log_interval == 0 and log_positions > 0:
+                avg_loss = log_loss / log_positions
+                avg_top1 = log_top1 / log_positions
+                lr = optimizer.param_groups[0]["lr"]
+                print(f"  step {global_step:6d} | loss={avg_loss:.4f} "
+                      f"top1={avg_top1:.4%} lr={lr:.2e}")
+                log_loss = log_top1 = log_positions = 0
+
+            # Step-level eval
+            if eval_interval and global_step % eval_interval == 0:
+                val_metrics = _do_eval()
+                print(f"  [eval @ step {global_step}] "
+                      f"val_loss={val_metrics['loss']:.4f} "
+                      f"val_top1={val_metrics['top1_accuracy']:.4%} "
+                      f"val_top5={val_metrics['top5_accuracy']:.4%}")
+                logger.log_train(step=global_step, epoch=epoch,
+                    lr=optimizer.param_groups[0]["lr"],
+                    val_loss=val_metrics["loss"],
+                    val_top1=val_metrics["top1_accuracy"],
+                    val_top5=val_metrics["top5_accuracy"],
+                )
+                if val_metrics["loss"] < best_val_loss:
+                    best_val_loss = val_metrics["loss"]
+                    patience_counter = 0
+                    _save_best(val_metrics, epoch)
+                else:
+                    patience_counter += 1
+                model.train()
+
+            if step_limit and global_step >= step_limit:
+                break
+            if _shutdown_requested:
+                break
 
         dt = time.time() - t0
         train_loss = epoch_loss / max(epoch_positions, 1)
         train_top1 = epoch_top1 / max(epoch_positions, 1)
 
-        do_val = (epoch % args.val_every == 0) or (epoch == args.epochs - 1)
+        # Epoch-level eval (when not using step-level eval)
+        do_val = not eval_interval and (
+            (epoch % args.val_every == 0) or (epoch == args.epochs - 1)
+        )
         if do_val:
-            val_metrics = evaluate(model, val_loader, mask_builder, device, use_amp=use_amp,
-                                   precomputed_indices=val_legal_indices)
+            val_metrics = _do_eval()
 
         weight_report = model.adapter_weight_report()
-
         logger.log_train(step=global_step, epoch=epoch,
             lr=optimizer.param_groups[0]["lr"],
-            train_loss=train_loss,
-            train_top1=train_top1,
+            train_loss=train_loss, train_top1=train_top1,
             val_loss=val_metrics["loss"],
             val_top1=val_metrics["top1_accuracy"],
             val_top5=val_metrics["top5_accuracy"],
-            epoch_time_s=dt,
-            **weight_report,
+            epoch_time_s=dt, **weight_report,
         )
 
         print(f"  Epoch {epoch:3d} | "
@@ -454,32 +554,16 @@ def main():
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 patience_counter = 0
-                from pawn.checkpoint import save_adapter_checkpoint
-                save_adapter_checkpoint(
-                    ckpt_dir / "best",
-                    model.adapter_state_dict(),
-                    config=vars(args),
-                    epoch=epoch,
-                    step=global_step,
-                    val_metrics=val_metrics,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    extra={"best_val_loss": best_val_loss, "patience_counter": patience_counter},
-                )
-                if args.hf_repo and hf_branch:
-                    from pawn.checkpoint import push_checkpoint_to_hf
-                    try:
-                        push_checkpoint_to_hf(ckpt_dir / "best", args.hf_repo, hf_branch, step=global_step)
-                        print(f"Pushed to HF: {args.hf_repo}@{hf_branch}")
-                    except Exception as e:
-                        print(f"WARNING: HF push failed: {e}")
+                _save_best(val_metrics, epoch)
             else:
                 patience_counter += 1
                 if patience_counter >= args.patience:
                     print(f"\n  Early stopping at epoch {epoch} (patience={args.patience})")
                     break
 
+        if step_limit and global_step >= step_limit:
+            print(f"\n  Reached step limit ({step_limit})")
+            break
         if _shutdown_requested:
             print("Shutdown requested, saving checkpoint...")
             break
