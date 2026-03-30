@@ -469,6 +469,7 @@ def main():
         _save_thread = threading.Thread(target=_write, daemon=True)
         _save_thread.start()
 
+    epoch = start_epoch
     for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0.0
@@ -583,7 +584,7 @@ def main():
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 patience_counter = 0
-                _save_best(val_metrics, epoch)
+                _save_checkpoint("best", epoch)
             else:
                 patience_counter += 1
                 if patience_counter >= args.patience:
