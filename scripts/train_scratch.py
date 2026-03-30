@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Train a PAWN model from scratch on Lichess games (no pretraining).
+"""Train a causal LM from scratch on Lichess games (no pretraining).
 
-Uses the full PAWNCLM architecture (factored embeddings, SwiGLU, RoPE) but
-initializes from random weights instead of loading pretrained checkpoints.
-Designed to answer: does pretraining on random games help, or is the move-
-sequence input representation itself the bottleneck?
+Uses the same transformer architecture as PAWN (factored embeddings, SwiGLU,
+RoPE) but initializes from random weights and trains directly on a single Elo
+band — no random-game pretraining, no adapter.  The resulting model is NOT
+playstyle-agnostic; it learns one band's move distribution end-to-end.
+
+Designed to answer: does PAWN pretraining help at ~10M param scale, or is the
+move-sequence input representation itself the bottleneck vs board-tensor models
+like MAIA?
 
 Usage:
-    # PAWN-small (~9.5M params) on 1700-1800 Elo, 100K steps
+    # ~9.5M params on 1700-1800 Elo, 100K steps
     uv run python scripts/train_scratch.py \
         --variant small \
         --pgn thomas-schweich/pawn-lichess-full --elo-min 1700 --elo-max 1800 \
@@ -43,15 +47,15 @@ from pawn.lichess_data import (
 
 
 # ---------------------------------------------------------------------------
-# PAWNCLM wrapper for sparse training
+# Wrapper for sparse training
 # ---------------------------------------------------------------------------
 
 class ScratchWrapper(nn.Module):
-    """Wraps PAWNCLM to expose forward_hidden/project_head for sparse training.
+    """Expose forward_hidden/project_head for the sparse logit projection path.
 
-    PAWNCLM.forward() returns full (B,T,V) logits.  For training we only need
-    logits at loss-masked positions, so this wrapper exposes the hidden-state
-    path used by the adapter training scripts.
+    The base model's forward() returns full (B,T,V) logits.  For training we
+    only need logits at loss-masked positions, so this wrapper exposes the
+    hidden-state path used by the adapter training scripts.
     """
 
     def __init__(self, pawn: PAWNCLM):
@@ -151,7 +155,7 @@ def cosine_warmup_schedule(optimizer, warmup_steps, total_steps):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train PAWNCLM from scratch on Lichess games")
+    p = argparse.ArgumentParser(description="Train a causal LM from scratch on Lichess games")
     p.add_argument("--pgn", type=str, required=True)
     p.add_argument("--log-dir", type=str, default=None)
     p.add_argument("--output-dir", type=str, default=None)
@@ -159,7 +163,7 @@ def parse_args():
     # Architecture
     p.add_argument("--variant", type=str, default="small",
                     choices=["small", "base", "large", "toy"],
-                    help="PAWNCLM variant (default: small, ~9.5M params)")
+                    help="Architecture variant (default: small, ~9.5M params)")
 
     # Data
     p.add_argument("--max-games", type=int, default=10_000_000)
@@ -242,7 +246,7 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Device: {device}")
     print(f"Output: {out_dir}")
-    print(f"Model: PAWNCLM.{args.variant}() — {n_params:,} params")
+    print(f"Model: CLMConfig.{args.variant}() — {n_params:,} params (from scratch)")
 
     # GPU config
     from pawn import model as model_module
