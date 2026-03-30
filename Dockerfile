@@ -31,7 +31,7 @@ COPY scripts/ scripts/
 RUN cd engine && uv run --no-project --with maturin maturin build --release
 
 # ── Runtime ──────────────────────────────────────────────────────────
-FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404
+FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
@@ -56,10 +56,6 @@ RUN uv venv --system-site-packages && \
     uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl
 
-# Install tmux (session persistence), ripgrep (Claude Code search), jq (JSON parsing), Claude Code CLI
-RUN apt-get update && apt-get install -y --no-install-recommends tmux ripgrep jq && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL https://claude.ai/install.sh | bash
-
 # Bake git version info and set PATH for all contexts (docker exec, SSH, cron)
 ARG GIT_HASH=""
 ARG GIT_TAG=""
@@ -69,3 +65,55 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
     PATH="/opt/pawn/.venv/bin:/root/.local/bin:${PATH}"
 
 # Inherits /start.sh entrypoint from RunPod base image (SSH + Jupyter)
+
+# ── Dev container: non-root user + Claude Code + tools ──────────────
+# Build:  docker build --target dev -t thomasschweich/pawn:dev .
+# Extends the runtime image with a non-root user, CLI tools for
+# interactive work, and a startup script that symlinks ephemeral dirs
+# to /workspace. Use `su - pawn` after SSH to run Claude Code.
+FROM runtime AS dev
+
+# CLI tools for interactive/agent work
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tmux ripgrep jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user (required for claude --dangerously-skip-permissions)
+RUN useradd -m -s /bin/bash pawn && \
+    chown -R pawn:pawn /opt/pawn
+
+# Install Claude Code as pawn user
+USER pawn
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="/home/pawn/.local/bin:/opt/pawn/.venv/bin:${PATH}"
+
+# Startup script: workspace setup and CUDA MPS
+# Run as root first: bash /home/pawn/setup-workspace.sh
+COPY --chown=pawn:pawn <<'SETUP' /home/pawn/setup-workspace.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Workspace symlinks (persistent storage) ────────────────────────
+mkdir -p /workspace/logs /workspace/sweep_results /workspace/plots \
+         /workspace/optuna-storage /opt/pawn/local
+ln -sfn /workspace/sweep_results /opt/pawn/local/optuna_results
+ln -sfn /workspace/logs /opt/pawn/logs
+echo "Workspace symlinks ready"
+
+# ── CUDA MPS (multi-process service for GPU sharing) ───────────────
+# Allows concurrent trials to share a GPU efficiently. Needs root.
+if command -v nvidia-cuda-mps-control &>/dev/null; then
+    if [ "$(id -u)" = "0" ]; then
+        nvidia-cuda-mps-control -d 2>/dev/null && echo "CUDA MPS daemon started" \
+            || echo "CUDA MPS already running or unavailable"
+    else
+        echo "Skipping MPS (run setup-workspace.sh as root to enable)"
+    fi
+fi
+
+echo "Setup complete"
+SETUP
+RUN chmod +x /home/pawn/setup-workspace.sh
+
+USER root
+# Inherits /start.sh entrypoint from RunPod base image

@@ -30,15 +30,32 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push runtime
         uses: docker/build-push-action@v6
         with:
           context: .
+          target: runtime
           push: true
           platforms: linux/amd64
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
+          build-args: |
+            GIT_HASH=${{ github.sha }}
+            GIT_TAG=${{ steps.meta.outputs.tag }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+
+      - name: Build and push dev
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: dev
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:dev
+            ${{ env.IMAGE }}:dev-${{ github.sha }}
           build-args: |
             GIT_HASH=${{ github.sha }}
             GIT_TAG=${{ steps.meta.outputs.tag }}
