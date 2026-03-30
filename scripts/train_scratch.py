@@ -22,8 +22,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import signal
+import threading
 import time
 from pathlib import Path
 
@@ -199,6 +201,8 @@ def parse_args():
     p.add_argument("--sdpa-math", action="store_true",
                     help="Use MATH SDPA backend (required for ROCm + compile)")
     p.add_argument("--num-workers", type=int, default=8)
+    p.add_argument("--resume", type=str, default=None,
+                    help="Path to checkpoint directory to resume from")
 
     ckpt_group = p.add_mutually_exclusive_group(required=True)
     ckpt_group.add_argument("--hf-repo", type=str, default=None,
@@ -324,7 +328,7 @@ def main():
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.weight_decay)
-    if args.total_steps:
+    if args.total_steps is not None:
         total_steps = args.total_steps
     elif streaming:
         est_games = min(args.max_games or 1_000_000, len(train_ds.shard_files) * 60_000)
@@ -363,10 +367,31 @@ def main():
         val_top5=baseline["top5_accuracy"],
     )
 
+    def _do_eval():
+        return evaluate(model, val_loader, mask_builder, device, use_amp=use_amp,
+                        precomputed_indices=val_legal_indices)
+
+    start_epoch = 0
     best_val_loss = float("inf")
     patience_counter = 0
     global_step = 0
     val_metrics = baseline
+
+    if args.resume:
+        from pawn.checkpoint import load_pretrain_checkpoint
+        print(f"\nResuming from: {args.resume}")
+        ckpt = load_pretrain_checkpoint(
+            args.resume, model=model.pawn, optimizer=optimizer,
+            scheduler=scheduler, scaler=scaler, device=device,
+        )
+        global_step = ckpt["global_step"]
+        tc = ckpt.get("training_config") or {}
+        best_val_loss = tc.get("best_val_loss", float("inf"))
+        patience_counter = tc.get("patience_counter", 0)
+        start_epoch = tc.get("epoch", 0)
+        print(f"  Resumed at step {global_step}, best_val_loss={best_val_loss:.4f}")
+        del ckpt
+        val_metrics = _do_eval()
 
     _shutdown_requested = False
     def _graceful_exit(signum, frame):
@@ -383,38 +408,68 @@ def main():
     if eval_interval:
         print(f"  Eval every {eval_interval} steps")
 
-    def _do_eval():
-        return evaluate(model, val_loader, mask_builder, device, use_amp=use_amp,
-                        precomputed_indices=val_legal_indices)
+    _model_config = {
+        "variant": args.variant,
+        "d_model": cfg.d_model,
+        "n_layers": cfg.n_layers,
+        "n_heads": cfg.n_heads,
+        "d_ff": cfg.d_ff,
+    }
+    _save_thread: threading.Thread | None = None
 
-    def _save_best(vm, ep):
-        from pawn.checkpoint import save_pretrain_checkpoint
-        save_pretrain_checkpoint(
-            ckpt_dir / "best",
-            model=model.pawn,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            global_step=global_step,
-            model_config={
-                "variant": args.variant,
-                "d_model": cfg.d_model,
-                "n_layers": cfg.n_layers,
-                "n_heads": cfg.n_heads,
-                "d_ff": cfg.d_ff,
-            },
-            training_config=vars(args),
+    class _StateSnapshot:
+        """Fake object whose .state_dict() returns a pre-computed snapshot."""
+        def __init__(self, sd):
+            self._sd = sd
+        def state_dict(self):
+            return self._sd
+
+    def _save_checkpoint(tag, ep):
+        """Snapshot state on main thread, write to disk in background."""
+        nonlocal _save_thread
+        if _save_thread is not None:
+            _save_thread.join()
+
+        from pawn.checkpoint import save_pretrain_checkpoint, push_checkpoint_to_hf
+
+        # Snapshot everything now — training will mutate the live objects
+        model_snap = _StateSnapshot(
+            {k: v.cpu().clone() for k, v in model.pawn.state_dict().items()}
         )
-        if args.hf_repo and hf_branch:
-            from pawn.checkpoint import push_checkpoint_to_hf
-            try:
-                push_checkpoint_to_hf(ckpt_dir / "best", args.hf_repo, hf_branch,
-                                      step=global_step)
-                print(f"Pushed to HF: {args.hf_repo}@{hf_branch}")
-            except Exception as e:
-                print(f"WARNING: HF push failed: {e}")
+        opt_snap = _StateSnapshot(copy.deepcopy(optimizer.state_dict()))
+        sched_snap = _StateSnapshot(scheduler.state_dict().copy())
+        scaler_snap = _StateSnapshot(scaler.state_dict().copy()) if scaler else None
+        step = global_step
+        train_cfg = {
+            **vars(args),
+            "best_val_loss": best_val_loss,
+            "patience_counter": patience_counter,
+            "epoch": ep,
+        }
 
-    for epoch in range(args.epochs):
+        def _write():
+            save_pretrain_checkpoint(
+                ckpt_dir / tag,
+                model=model_snap,
+                optimizer=opt_snap,
+                scheduler=sched_snap,
+                scaler=scaler_snap,
+                global_step=step,
+                model_config=_model_config,
+                training_config=train_cfg,
+            )
+            if args.hf_repo and hf_branch:
+                try:
+                    push_checkpoint_to_hf(ckpt_dir / tag, args.hf_repo, hf_branch,
+                                          step=step)
+                    print(f"Pushed to HF: {args.hf_repo}@{hf_branch}")
+                except Exception as e:
+                    print(f"WARNING: HF push failed: {e}")
+
+        _save_thread = threading.Thread(target=_write, daemon=True)
+        _save_thread.start()
+
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0.0
         epoch_top1 = 0.0
@@ -485,12 +540,16 @@ def main():
                 if val_metrics["loss"] < best_val_loss:
                     best_val_loss = val_metrics["loss"]
                     patience_counter = 0
-                    _save_best(val_metrics, epoch)
+                    _save_checkpoint("best", epoch)
                 else:
                     patience_counter += 1
+                    if patience_counter >= args.patience:
+                        print(f"\n  Early stopping at step {global_step} "
+                              f"(patience={args.patience})")
+                        break
                 model.train()
 
-            if step_limit and global_step >= step_limit:
+            if step_limit is not None and global_step >= step_limit:
                 break
             if _shutdown_requested:
                 break
@@ -531,39 +590,19 @@ def main():
                     print(f"\n  Early stopping at epoch {epoch} (patience={args.patience})")
                     break
 
-        if step_limit and global_step >= step_limit:
+        if patience_counter >= args.patience:
+            break
+        if step_limit is not None and global_step >= step_limit:
             print(f"\n  Reached step limit ({step_limit})")
             break
         if _shutdown_requested:
             print("Shutdown requested, saving checkpoint...")
             break
 
-    # Save final checkpoint
-    from pawn.checkpoint import save_pretrain_checkpoint
-    save_pretrain_checkpoint(
-        ckpt_dir / "final",
-        model=model.pawn,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        global_step=global_step,
-        model_config={
-            "variant": args.variant,
-            "d_model": cfg.d_model,
-            "n_layers": cfg.n_layers,
-            "n_heads": cfg.n_heads,
-            "d_ff": cfg.d_ff,
-        },
-        training_config=vars(args),
-    )
-    if args.hf_repo and hf_branch:
-        from pawn.checkpoint import push_checkpoint_to_hf
-        try:
-            push_checkpoint_to_hf(ckpt_dir / "final", args.hf_repo, hf_branch,
-                                  step=global_step)
-            print(f"Pushed to HF: {args.hf_repo}@{hf_branch}")
-        except Exception as e:
-            print(f"WARNING: HF push failed: {e}")
+    # Save final checkpoint (blocking — must complete before exit)
+    _save_checkpoint("final", epoch)
+    if _save_thread is not None:
+        _save_thread.join()
 
     logger.close()
     print(f"\nDone. Best val_loss={best_val_loss:.4f}")
