@@ -26,8 +26,20 @@ import torch.utils.data
 from pawn.config import OUTCOME_TOKEN_BASE, PAD_TOKEN
 
 
+def _is_local_path(path: str) -> bool:
+    """Check if a path refers to a local directory rather than an HF repo."""
+    return os.path.isdir(path)
+
+
 def _list_shards(hf_repo: str, split: str = "train") -> list[str]:
-    """List parquet shard filenames for a split in an HF dataset repo."""
+    """List parquet shard filenames for a split in an HF dataset repo or local dir."""
+    if _is_local_path(hf_repo):
+        local = Path(hf_repo)
+        return sorted(
+            str(f.relative_to(local))
+            for f in local.rglob("*.parquet")
+            if f"/{split}-" in f"/{f.name}"
+        )
     from huggingface_hub import HfApi
     api = HfApi()
     files = api.list_repo_files(hf_repo, repo_type="dataset")
@@ -114,6 +126,7 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         self.max_games = max_games
         self.seed = seed
 
+        self._local = _is_local_path(hf_repo)
         self.shard_files = _list_shards(hf_repo, split)
         if not self.shard_files:
             raise FileNotFoundError(
@@ -125,7 +138,7 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
             rng = random.Random(seed)
             rng.shuffle(self.shard_files)
 
-        self._storage_options = _hf_storage_options()
+        self._storage_options = None if self._local else _hf_storage_options()
 
     def _build_filter(self) -> pl.Expr | None:
         """Build a Polars filter expression for Elo + min_ply."""
@@ -161,10 +174,13 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
             if self.max_games and games_yielded >= self.max_games:
                 return
 
-            url = f"hf://datasets/{self.hf_repo}/{shard_file}"
+            if self._local:
+                source = str(Path(self.hf_repo) / shard_file)
+            else:
+                source = f"hf://datasets/{self.hf_repo}/{shard_file}"
             try:
                 lf = pl.scan_parquet(
-                    url, storage_options=self._storage_options or None,
+                    source, storage_options=self._storage_options or None,
                 )
                 if filt is not None:
                     lf = lf.filter(filt)
@@ -208,19 +224,23 @@ def load_val_shards(
 
     Returns a dict compatible with LichessDataset.
     """
+    local = _is_local_path(hf_repo)
     shard_files = _list_shards(hf_repo, "validation")
     if not shard_files:
         raise FileNotFoundError(f"No validation shards found in {hf_repo}")
 
-    storage_opts = _hf_storage_options()
+    storage_opts = None if local else _hf_storage_options()
     seq_len = max_ply + 1
 
     all_tokens: list[list[int]] = []
     for shard_file in shard_files:
         if len(all_tokens) >= max_games:
             break
-        url = f"hf://datasets/{hf_repo}/{shard_file}"
-        lf = pl.scan_parquet(url, storage_options=storage_opts or None)
+        if local:
+            source = str(Path(hf_repo) / shard_file)
+        else:
+            source = f"hf://datasets/{hf_repo}/{shard_file}"
+        lf = pl.scan_parquet(source, storage_options=storage_opts or None)
 
         filters = []
         if elo_min is not None:
