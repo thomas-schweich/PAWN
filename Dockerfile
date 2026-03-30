@@ -87,7 +87,7 @@ USER pawn
 RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH="/home/pawn/.local/bin:/opt/pawn/.venv/bin:${PATH}"
 
-# Startup script: workspace setup, data prefetch, and CUDA MPS
+# Startup script: workspace setup and CUDA MPS
 # Run as root first: bash /home/pawn/setup-workspace.sh
 COPY --chown=pawn:pawn <<'SETUP' /home/pawn/setup-workspace.sh
 #!/usr/bin/env bash
@@ -109,59 +109,6 @@ if command -v nvidia-cuda-mps-control &>/dev/null; then
     else
         echo "Skipping MPS (run setup-workspace.sh as root to enable)"
     fi
-fi
-
-# ── Prefetch filtered dataset to /dev/shm ──────────────────────────
-# Downloads from HF, filters to 1800-1900 Elo, and writes filtered
-# parquet shards to /dev/shm (~2-4GB). Training scripts can then pass
-# --pgn /dev/shm/pawn-lichess-1800 instead of the HF repo ID for
-# zero-latency local reads with no network dependency.
-DATA_DIR="/dev/shm/pawn-lichess-1800"
-if [ ! -d "$DATA_DIR" ] || [ -z "$(ls -A "$DATA_DIR" 2>/dev/null)" ]; then
-    echo "Prefetching 1800-1900 Elo data to /dev/shm..."
-    mkdir -p "$DATA_DIR"
-    chmod 777 "$DATA_DIR"
-    uv run python -c "
-import polars as pl, os, sys
-sys.path.insert(0, '/opt/pawn')
-from pawn.shard_loader import _list_shards, _hf_storage_options
-
-repo = 'thomas-schweich/pawn-lichess-full'
-opts = _hf_storage_options()
-out_dir = '$DATA_DIR'
-
-for split in ['train', 'validation']:
-    shards = _list_shards(repo, split)
-    print(f'Filtering {len(shards)} {split} shards to 1800-1900 Elo...', flush=True)
-    for i, shard in enumerate(shards):
-        url = f'hf://datasets/{repo}/{shard}'
-        try:
-            df = (
-                pl.scan_parquet(url, storage_options=opts or None)
-                .filter(
-                    (pl.col('white_elo') >= 1800) & (pl.col('black_elo') >= 1800)
-                    & (pl.col('white_elo') < 1900) & (pl.col('black_elo') < 1900)
-                    & (pl.col('game_length') >= 10)
-                )
-                .collect()
-            )
-            if len(df) > 0:
-                out_path = os.path.join(out_dir, shard)
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                df.write_parquet(out_path)
-            if (i + 1) % 50 == 0:
-                print(f'  [{i+1}/{len(shards)}] {split}', flush=True)
-        except Exception as e:
-            print(f'  Warning: {shard}: {e}', flush=True)
-    print(f'  {split} done', flush=True)
-
-# Report size
-import subprocess
-result = subprocess.run(['du', '-sh', out_dir], capture_output=True, text=True)
-print(f'Prefetch complete: {result.stdout.strip()}')
-"
-else
-    echo "Data already in $DATA_DIR"
 fi
 
 echo "Setup complete"

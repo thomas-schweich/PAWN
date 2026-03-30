@@ -73,6 +73,8 @@ def parse_args():
                     help="Min Elo for both players (inclusive, enables shard-parallel loading)")
     p.add_argument("--elo-max", type=int, default=None,
                     help="Max Elo for both players (exclusive)")
+    p.add_argument("--cache-dir", type=str, default=None,
+                    help="Prefetch filtered shards to this dir (e.g. /dev/shm)")
 
     # Training
     p.add_argument("--total-steps", type=int, default=None,
@@ -294,12 +296,14 @@ def main():
         val_data = load_val_shards(
             args.pgn, elo_min=args.elo_min, elo_max=args.elo_max,
             min_ply=args.min_ply, max_games=args.val_games,
+            cache_dir=args.cache_dir,
         )
         val_ds = LichessDataset(val_data, start=0, end=val_data["n_games"])
 
         train_ds = ShardedLichessDataset(
             args.pgn, elo_min=args.elo_min, elo_max=args.elo_max,
             min_ply=args.min_ply, max_games=args.max_games,
+            cache_dir=args.cache_dir,
         )
         print(f"  Val: {len(val_ds):,} games, Train: {len(train_ds.shard_files)} shards")
     else:
