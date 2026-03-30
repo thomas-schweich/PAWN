@@ -111,40 +111,15 @@ if command -v nvidia-cuda-mps-control &>/dev/null; then
     fi
 fi
 
-# ── Prefetch dataset to /dev/shm ───────────────────────────────────
-# Downloads all parquet shards (~4GB for 1800-1900 Elo band once
-# filtered). Polars file cache lives in /dev/shm for zero-latency
-# reads across all concurrent trials.
-POLARS_CACHE="/dev/shm/polars-cache"
-mkdir -p "$POLARS_CACHE"
-# Make writable by pawn user
-chmod 777 "$POLARS_CACHE"
-
-# Set polars cache env for pawn user
+# ── Polars file cache on /workspace ────────────────────────────────
+# Polars caches whole parquet files (~140MB each, ~40GB for all 289
+# shards). Cache on /workspace so it persists across pod restarts.
+# /dev/shm would be faster but the full dataset won't fit in RAM.
+POLARS_CACHE="/workspace/polars-cache"
+mkdir -p "$POLARS_CACHE" 2>/dev/null || true
+chmod 777 "$POLARS_CACHE" 2>/dev/null || true
 grep -q POLARS_FILE_CACHE_DIR /home/pawn/.bashrc 2>/dev/null || \
-    echo 'export POLARS_FILE_CACHE_DIR=/dev/shm/polars-cache' >> /home/pawn/.bashrc
-
-# Warm the cache by scanning each shard individually (avoids glob rate limits)
-echo "Warming Polars cache in /dev/shm (first run downloads from HF)..."
-POLARS_FILE_CACHE_DIR="$POLARS_CACHE" uv run python -c "
-import polars as pl, os, sys
-sys.path.insert(0, '/opt/pawn')
-from pawn.shard_loader import _list_shards, _hf_storage_options
-
-repo = 'thomas-schweich/pawn-lichess-full'
-shards = _list_shards(repo)
-opts = _hf_storage_options()
-total = 0
-for i, shard in enumerate(shards):
-    url = f'hf://datasets/{repo}/{shard}'
-    try:
-        n = pl.scan_parquet(url, storage_options=opts or None).select(pl.len()).collect().item()
-        total += n
-        print(f'  [{i+1}/{len(shards)}] {shard}: {n:,} rows', flush=True)
-    except Exception as e:
-        print(f'  [{i+1}/{len(shards)}] {shard}: FAILED ({e})', flush=True)
-print(f'Cache warmed: {total:,} total rows across {len(shards)} shards')
-"
+    echo 'export POLARS_FILE_CACHE_DIR=/workspace/polars-cache' >> /home/pawn/.bashrc
 
 echo "Setup complete"
 SETUP
