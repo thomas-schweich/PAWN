@@ -52,13 +52,9 @@ SWEEP_EOF
 # CRITICAL: Verify GPUs are available. Training on CPU wastes the entire budget.
 python3 -c "import torch; assert torch.cuda.is_available(), 'NO GPU'; print(f'GPUs: {torch.cuda.device_count()}x {torch.cuda.get_device_name(0)}, {torch.cuda.get_device_properties(0).total_memory/1e9:.0f}GB each')"
 
-# Start CUDA MPS for efficient GPU sharing across concurrent trials
-export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
-export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log
-mkdir -p $CUDA_MPS_PIPE_DIRECTORY $CUDA_MPS_LOG_DIRECTORY
-nvidia-cuda-mps-control -d
-echo "MPS daemon started"
-ps aux | grep mps | grep -v grep
+# CUDA MPS should already be running (started by setup-workspace.sh).
+# Verify it's active:
+ps aux | grep nvidia-cuda-mps | grep -v grep || echo "WARNING: MPS not running. Ask the user to run setup-workspace.sh as root."
 ```
 
 Then create the Optuna study:
@@ -330,7 +326,7 @@ These are targets, not hard deadlines. The priority order is: **map the Pareto f
 
 - **NaN loss:** Kill immediately, tell Optuna as FAIL. Use `--amp-dtype bfloat16` for long runs.
 - **VRAM approaching 150GB:** Reduce concurrency. MPS doesn't prevent OOM.
-- **MPS daemon crash:** Check with `ps aux | grep mps`. Restart with `nvidia-cuda-mps-control -d`.
+- **MPS daemon crash:** Check with `ps aux | grep mps`. If gone, ask the user to re-run `setup-workspace.sh` as root.
 - **Step time regression:** Compare against Phase 1 baselines. If a trial is 3x slower than expected, check compile status.
 - **Train/val gap > 0.3:** Overfitting. The model needs more data or regularization.
 
