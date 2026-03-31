@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir maturin
 
 # Cache Cargo dependency downloads — only re-fetched when Cargo.toml/lock change
 WORKDIR /build/engine
-COPY engine/Cargo.toml engine/Cargo.lock engine/pyproject.toml ./
+COPY engine/Cargo.toml engine/Cargo.lock ./
 
 # Stub out the expected source layout so Cargo can resolve the crate,
 # then fetch dependencies into a cached layer. The real source files
@@ -34,6 +34,7 @@ RUN mkdir -p src python/chess_engine && \
     cargo fetch
 
 # Now copy actual source and build the wheel
+COPY engine/pyproject.toml ./
 COPY engine/src/ src/
 COPY engine/python/ python/
 RUN maturin build --release
@@ -45,7 +46,7 @@ ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
 
 # Copy `uv` from their official distroless image.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
 
 # Lockfile first — Python deps only re-installed when dependencies change
 WORKDIR /opt/pawn
@@ -66,7 +67,32 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
     PYTHONPATH=/opt/pawn \
     PATH="/opt/pawn/.venv/bin:${PATH}"
 
-# Inherits /start.sh entrypoint from RunPod base image (SSH + Jupyter)
+# Entrypoint wrapper: workspace setup + CUDA MPS, then hand off to RunPod
+COPY <<'ENTRYPOINT_WRAPPER' /opt/pawn/entrypoint.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Workspace symlinks (persistent storage) ────────────────────────
+if mkdir -p /workspace/logs /workspace/sweep_results /workspace/plots \
+            /workspace/optuna-storage /opt/pawn/local 2>/dev/null; then
+    ln -sfn /workspace/sweep_results /opt/pawn/local/optuna_results
+    ln -sfn /workspace/logs /opt/pawn/logs
+    echo "Workspace symlinks ready"
+else
+    echo "WARNING: /workspace not available — skipping symlinks"
+fi
+
+# ── CUDA MPS (multi-process service for GPU sharing) ───────────────
+if command -v nvidia-cuda-mps-control &>/dev/null; then
+    nvidia-cuda-mps-control -d 2>/dev/null && echo "CUDA MPS daemon started" \
+        || echo "CUDA MPS already running or unavailable"
+fi
+
+# Hand off to RunPod entrypoint (SSH + Jupyter)
+exec /start.sh
+ENTRYPOINT_WRAPPER
+RUN chmod +x /opt/pawn/entrypoint.sh
+ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
 
 # ── Dev container: non-root user + Claude Code + tools ──────────────
 # Build:  docker build --target dev -t thomasschweich/pawn:dev .
@@ -119,25 +145,3 @@ exec su - pawn -c "
 "
 CLAUDE_DEV
 RUN chmod +x /usr/local/bin/claude-dev
-COPY <<'ENTRYPOINT_WRAPPER' /opt/pawn/entrypoint.sh
-#!/usr/bin/env bash
-set -euo pipefail
-
-# ── Workspace symlinks (persistent storage) ────────────────────────
-mkdir -p /workspace/logs /workspace/sweep_results /workspace/plots \
-         /workspace/optuna-storage /opt/pawn/local
-ln -sfn /workspace/sweep_results /opt/pawn/local/optuna_results
-ln -sfn /workspace/logs /opt/pawn/logs
-echo "Workspace symlinks ready"
-
-# ── CUDA MPS (multi-process service for GPU sharing) ───────────────
-if command -v nvidia-cuda-mps-control &>/dev/null; then
-    nvidia-cuda-mps-control -d 2>/dev/null && echo "CUDA MPS daemon started" \
-        || echo "CUDA MPS already running or unavailable"
-fi
-
-# Hand off to RunPod entrypoint (SSH + Jupyter)
-exec /start.sh
-ENTRYPOINT_WRAPPER
-RUN chmod +x /opt/pawn/entrypoint.sh
-ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
