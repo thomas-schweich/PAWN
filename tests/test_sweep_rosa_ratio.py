@@ -162,4 +162,4 @@ def test_registered_in_suggest_fns():
 
 def test_registered_in_adapter_scripts():
     assert "rosa-ratio" in ADAPTER_SCRIPTS
-    assert ADAPTER_SCRIPTS["rosa-ratio"] == "scripts/train_rosa.py"
+    assert ADAPTER_SCRIPTS["rosa-ratio"] == "scripts/legacy/train_rosa.py"

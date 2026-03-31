@@ -246,16 +246,16 @@ SUGGEST_FNS = {
 }
 
 ADAPTER_SCRIPTS = {
-    "lora": "scripts/train_lora.py",
-    "bottleneck": "scripts/train_bottleneck.py",
-    "film": "scripts/train_film.py",
-    "sparse": "scripts/train_sparse.py",
-    "hybrid": "scripts/train_hybrid.py",
-    "rosa": "scripts/train_rosa.py",
-    "retro-sparse": "scripts/train_rosa.py",
-    "retro-bottleneck": "scripts/train_rosa.py",
-    "rosa-ratio": "scripts/train_rosa.py",
-    "tiny": "scripts/train_tiny.py",
+    "lora": "scripts/legacy/train_lora.py",
+    "bottleneck": "scripts/legacy/train_bottleneck.py",
+    "film": "scripts/legacy/train_film.py",
+    "sparse": "scripts/legacy/train_sparse.py",
+    "hybrid": "scripts/legacy/train_hybrid.py",
+    "rosa": "scripts/legacy/train_rosa.py",
+    "retro-sparse": "scripts/legacy/train_rosa.py",
+    "retro-bottleneck": "scripts/legacy/train_rosa.py",
+    "rosa-ratio": "scripts/legacy/train_rosa.py",
+    "tiny": "scripts/legacy/train_tiny.py",
     "pretrain": "scripts/train.py",
     "architecture": "scripts/train.py",
 }

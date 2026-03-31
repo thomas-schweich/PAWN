@@ -12,7 +12,7 @@ Strategies:
   sparse      -- Random binary mask weight perturbations
   rosa        -- Gradient-informed sparse + LoRA (3-phase)
   hybrid      -- LoRA + FiLM combined
-  tiny        -- From-scratch standalone transformer (no backbone)
+  specialized_clm -- From-scratch standalone transformer (no backbone)
   unfreeze    -- Fine-tune top N backbone layers directly
 
 Usage:
@@ -55,7 +55,7 @@ from pawn.lichess_data import (
 
 STRATEGIES = [
     "bottleneck", "lora", "film", "sparse",
-    "rosa", "hybrid", "tiny", "unfreeze",
+    "rosa", "hybrid", "specialized_clm", "unfreeze",
 ]
 
 
@@ -161,8 +161,8 @@ def parse_args():
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--val-every", type=int, default=1)
     p.add_argument("--amp-dtype", type=str, default="float16",
-                    choices=["float16", "bfloat16"],
-                    help="AMP dtype (float16 or bfloat16)")
+                    choices=["float16", "bfloat16", "none"],
+                    help="AMP dtype (float16, bfloat16, or none to disable)")
 
     # Device / precision
     p.add_argument("--device", type=str, default="cuda")
@@ -206,7 +206,7 @@ def cosine_warmup_schedule(optimizer, warmup_steps: int, total_steps: int):
 
 def sparse_forward(model, ids, msk, legal_mask, amp_dtype, device):
     with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_dtype is not None):
-        hidden = model.forward_hidden(ids, msk)
+        hidden = model.forward_hidden(ids)
         valid_hidden = hidden[msk]
         valid_logits = model.project_head(valid_hidden)
     valid_legal = legal_mask[msk]
@@ -293,8 +293,8 @@ def build_model(args, device):
     strategy = args.strategy
     layers = parse_layers(args.adapter_layers)
 
-    if strategy == "tiny":
-        return _build_tiny(args, device)
+    if strategy == "specialized_clm":
+        return _build_specialized_clm(args, device)
 
     # All other strategies need a backbone
     print(f"Loading backbone: {args.checkpoint}")
@@ -421,23 +421,27 @@ def _build_unfreeze(backbone, args, device):
 
     # Wrap backbone so it has forward_hidden and project_head
     class UnfreezeWrapper(nn.Module):
-        def __init__(self, bb):
+        def __init__(self, bb: nn.Module):
             super().__init__()
             self.bb = bb
-            self.cfg = bb.cfg
+            self.cfg = bb.cfg  # type: ignore[attr-defined]
 
-        def forward_hidden(self, input_ids, attention_mask=None):
-            return self.bb.forward_hidden(input_ids, attention_mask)
+        def forward_hidden(self, input_ids: torch.Tensor,
+                           attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+            return self.bb.forward_hidden(input_ids, attention_mask)  # type: ignore[attr-defined]
 
-        def project_head(self, x):
-            return self.bb.lm_head(x)
+        def project_head(self, x: torch.Tensor) -> torch.Tensor:
+            return self.bb.lm_head(x)  # type: ignore[attr-defined]
+
+        def load_adapter_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+            self.bb.load_state_dict(state, strict=False)
 
     model = UnfreezeWrapper(backbone).to(device)
     return model, params, n, state_dict_fn, weight_report_fn
 
 
-def _build_tiny(args, device):
-    from scripts.legacy.train_tiny import TinyChessLM
+def _build_specialized_clm(args, device):
+    from pawn.specialized_clm import SpecializedCLM
 
     d_model = args.d_model or 84
     n_layers = args.n_layers or 2
@@ -445,7 +449,7 @@ def _build_tiny(args, device):
     d_ff = d_model * 4
     vocab_size = CLMConfig().vocab_size
 
-    model = TinyChessLM(
+    model = SpecializedCLM(
         vocab_size=vocab_size, d_model=d_model,
         n_layers=n_layers, n_heads=n_heads, d_ff=d_ff,
     ).to(device)
@@ -591,7 +595,7 @@ def rosa_build_phase3(warmup_model, masks, args, device):
     sparse_model = SparseCLM(
         backbone, density=args.density or 0.01,
         attn_targets=attn_targets,
-        adapt_ffn=args.lora_ffn,
+        adapt_ffn=args.sparse_ffn,
     )
 
     # Overwrite random masks with gradient-derived masks
@@ -603,7 +607,7 @@ def rosa_build_phase3(warmup_model, masks, args, device):
                 key = f"layer{layer_idx}.{proj_name}"
                 if key in masks:
                     module.mask.copy_(masks[key])
-        if args.lora_ffn:
+        if args.sparse_ffn:
             for proj_name in _FFN_TARGETS:
                 module = getattr(block.ffn, proj_name, None)
                 if isinstance(module, SparseLinear):
@@ -641,7 +645,7 @@ def build_config_json(args, param_count: int) -> dict:
         "param_count": param_count,
 
         # Backbone
-        "checkpoint": args.checkpoint if args.strategy != "tiny" else None,
+        "checkpoint": args.checkpoint if args.strategy != "specialized_clm" else None,
         "pgn": args.pgn,
         "elo_min": args.elo_min,
         "elo_max": args.elo_max,
@@ -675,8 +679,8 @@ def build_config_json(args, param_count: int) -> dict:
 
         # Sparse
         "density": args.density if args.strategy in ("sparse", "rosa") else None,
-        "sparse_targets": args.sparse_targets if args.strategy == "sparse" else None,
-        "sparse_ffn": args.sparse_ffn if args.strategy == "sparse" else None,
+        "sparse_targets": args.sparse_targets if args.strategy in ("sparse", "rosa") else None,
+        "sparse_ffn": args.sparse_ffn if args.strategy in ("sparse", "rosa") else None,
 
         # Mask generation
         "rosa_mode": args.rosa_mode if args.strategy == "rosa" else None,
@@ -688,9 +692,9 @@ def build_config_json(args, param_count: int) -> dict:
         "use_output_film": args.use_output_film if args.strategy in ("film", "hybrid") else None,
 
         # From-scratch
-        "d_model": args.d_model if args.strategy == "tiny" else None,
-        "n_layers": args.n_layers if args.strategy == "tiny" else None,
-        "n_heads": args.n_heads if args.strategy == "tiny" else None,
+        "d_model": args.d_model if args.strategy == "specialized_clm" else None,
+        "n_layers": args.n_layers if args.strategy == "specialized_clm" else None,
+        "n_heads": args.n_heads if args.strategy == "specialized_clm" else None,
 
         # Unfreeze
         "unfreeze_layers": list(parse_layers(args.unfreeze_layers) or ()) if args.strategy == "unfreeze" else None,
@@ -821,7 +825,7 @@ def train(model, trainable_params, train_loader, val_loader, mask_builder,
             except Exception as e:
                 print(f"WARNING: HF push failed: {e}")
 
-    epoch = start_epoch - 1
+    epoch = max(start_epoch, 0)
     for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0.0
@@ -894,6 +898,9 @@ def train(model, trainable_params, train_loader, val_loader, mask_builder,
                     _save_best(val_metrics, epoch)
                 else:
                     patience_counter += 1
+                    if patience_counter >= args.patience:
+                        print(f"\n  Early stopping at step {global_step} (patience={args.patience})")
+                        break
                 model.train()
 
             if step_limit and global_step >= step_limit:
@@ -940,6 +947,8 @@ def train(model, trainable_params, train_loader, val_loader, mask_builder,
                     print(f"\n  Early stopping at epoch {epoch} (patience={args.patience})")
                     break
 
+        if eval_interval and patience_counter >= args.patience:
+            break  # step-based early stopping triggered inside batch loop
         if step_limit and global_step >= step_limit:
             print(f"\n  Reached step limit ({step_limit})")
             break
@@ -966,7 +975,8 @@ def train(model, trainable_params, train_loader, val_loader, mask_builder,
 def main():
     args = parse_args()
     device = args.device
-    amp_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.amp_dtype]
+    amp_dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "none": None}
+    amp_dtype = amp_dtype_map[args.amp_dtype]
 
     log_dir = Path(args.log_dir) if args.log_dir else Path(__file__).resolve().parent.parent / "logs"
     logger = MetricsLogger(str(log_dir), run_prefix=args.strategy, device=device)
@@ -979,11 +989,10 @@ def main():
     # GPU config
     from pawn import model as model_module
     gpu_cfg = configure_gpu(
-        device, no_compile=args.no_compile, no_amp=False,
+        device, no_compile=args.no_compile, no_amp=(amp_dtype is None),
         sdpa_math=args.sdpa_math,
     )
-    # Override AMP dtype
-    gpu_cfg["use_amp"] = True
+    gpu_cfg["use_amp"] = amp_dtype is not None
     gpu_cfg["amp_dtype"] = amp_dtype
 
     # Build model

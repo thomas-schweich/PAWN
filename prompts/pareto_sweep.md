@@ -92,7 +92,7 @@ The unified training script `scripts/train_adapter.py` supports 8 adaptation str
 | `sparse` | Random binary mask weight perturbations | 10K-2.7M | Underperforms bottleneck at all scales tested. |
 | `rosa` | LoRA warmup + gradient masks + joint training | 50K-10M | 3-phase. Co-trained sparse may differ from retro. |
 | `hybrid` | LoRA + FiLM combined | 30K-500K | Tested once at 65K (34.1%). Underexplored. |
-| `tiny` | From-scratch standalone CLM (no backbone) | 50K-5M | Only 1 data point (529K=30.9%). Key comparison. |
+| `specialized_clm` | From-scratch standalone CLM (no backbone) | 50K-5M | Only 1 data point (529K=30.9%). Key comparison. |
 | `unfreeze` | Fine-tune top N backbone layers | 2.6M-5.2M | Untested. Qualitatively different from adapters. |
 
 ### How to Run Trials
@@ -137,7 +137,7 @@ The script writes `config.json` (full normalized config with nulls for irrelevan
 **FiLM** (film, hybrid):
 - `--use-output-film`
 
-**From-scratch** (tiny only):
+**From-scratch** (specialized_clm only):
 - `--d-model N --n-layers N --n-heads N`
 - No `--checkpoint` needed (ignored)
 
@@ -159,13 +159,13 @@ Bottleneck: n_positions × n_layers × 2 × 512 × bottleneck_dim
 LoRA:       n_targets × n_layers × 2 × 512 × rank  (+ FFN if enabled)
 FiLM:       n_layers × 2 × 512 (+ vocab_size if output_film)
 Sparse:     density × n_targets × n_layers × 512 × 512
-Tiny:       ~d_model² × n_layers × 12  (rough estimate)
+Specialized CLM: ~d_model² × n_layers × 12  (rough estimate)
 Unfreeze:   ~2.6M per layer (full transformer block)
 ```
 
 ### Tiny Model Canonical Sizes
 
-For the `tiny` strategy, use these predetermined architectures:
+For the `specialized_clm` strategy, use these predetermined architectures:
 
 | Budget | d_model | n_layers | n_heads | ~Params |
 |--------|---------|----------|---------|---------|
@@ -197,7 +197,7 @@ You have ~75 existing data points from the previous bottleneck sweep and README 
 | bottleneck | 1.0M | — | 43.5% | dim=64 |
 | bottleneck | 524K | — | 41.7% | dim=32 |
 | sparse | 2.7M | — | 44.7% | density=0.081, qkvo+FFN |
-| tiny | 529K | — | 30.9% | d=84, 2 layers, from scratch |
+| specialized_clm | 529K | — | 30.9% | d=84, 2 layers, from scratch |
 
 **Note:** Only seed results from the 1800-1900 Elo band. Results from other Elo ranges are not comparable.
 
@@ -249,7 +249,7 @@ Strategy-specific params are conditional on strategy choice. Handle the conditio
 - **sparse**: derive `density` from budget. Choose `sparse_targets`, `sparse_ffn`.
 - **rosa**: derive `density` + optionally `bottleneck_dim` from budget. Choose `rosa_mode`, `lora_rank`.
 - **hybrid**: split budget between LoRA rank and FiLM.
-- **tiny**: snap to nearest canonical size from the table above.
+- **specialized_clm**: snap to nearest canonical size from the table above.
 - **unfreeze**: `unfreeze_layers` from budget (1 layer = ~2.6M, 2 layers = ~5.2M).
 
 **Procedure:**
@@ -277,7 +277,7 @@ Use `--no-compile` for these runs only if compile overhead is still problematic.
 
 **Key questions to answer:**
 - Does LoRA beat bottleneck at low param counts?
-- Can tiny from-scratch models match adapted models at any scale?
+- Can specialized CLMs (from-scratch) match adapted models at any scale?
 - Does unfreeze (direct fine-tuning) outperform structured adapters?
 - At what param count does bottleneck become the clear winner?
 
@@ -333,5 +333,5 @@ These are targets, not hard deadlines. The priority order is: **map the Pareto f
 ## Acceptable Outcomes (in order of preference)
 
 1. **Clear Pareto front** across 10K-10M params with 5+ strategies represented, reproducibility evidence, and per-ply accuracy curves for winners
-2. **Pareto front** with a surprise finding (e.g., LoRA dominates bottleneck below 100K, or tiny CLM catches up at 2M params)
+2. **Pareto front** with a surprise finding (e.g., LoRA dominates bottleneck below 100K, or specialized CLM catches up at 2M params)
 3. **Strategy ranking** at 3+ budget tiers with evidence for the best hypernetwork-friendly architecture at each tier

@@ -37,12 +37,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 TRAIN_SCRIPTS = {
     "pawn": {"project": PROJECT_ROOT, "script": "scripts/train.py"},
-    "film": {"project": PROJECT_ROOT, "script": "scripts/train_film.py"},
-    "lora": {"project": PROJECT_ROOT, "script": "scripts/train_lora.py"},
-    "hybrid": {"project": PROJECT_ROOT, "script": "scripts/train_hybrid.py"},
-    "sparse": {"project": PROJECT_ROOT, "script": "scripts/train_sparse.py"},
-    "bottleneck": {"project": PROJECT_ROOT, "script": "scripts/train_bottleneck.py"},
-    "tiny": {"project": PROJECT_ROOT, "script": "scripts/train_tiny.py"},
+    "film": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_film.py"},
+    "lora": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_lora.py"},
+    "hybrid": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_hybrid.py"},
+    "sparse": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_sparse.py"},
+    "bottleneck": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_bottleneck.py"},
+    "tiny": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_tiny.py"},
 }
 
 # ---------------------------------------------------------------------------
