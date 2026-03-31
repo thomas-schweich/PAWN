@@ -96,10 +96,12 @@ ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
 
 # ── Dev container: non-root user + Claude Code + tools ──────────────
 # Build:  docker build --target dev -t thomasschweich/pawn:dev .
-# Extends the runtime image with a non-root user, CLI tools for
-# interactive work, and a startup script that symlinks ephemeral dirs
-# to /workspace. Use `su - pawn` after SSH to run Claude Code.
-FROM runtime AS dev
+# Built independently (not FROM runtime) so all /opt/pawn files are
+# owned by pawn from the start, avoiding a slow chown -R layer.
+FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS dev
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy
 
 # CLI tools for interactive/agent work
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -117,14 +119,32 @@ set -g renumber-windows on
 set -g set-clipboard on
 TMUX
 
-# Create non-root user (required for claude --dangerously-skip-permissions)
-RUN useradd -m -s /bin/bash pawn && \
-    chown -R pawn:pawn /opt/pawn
+# Create non-root user before any COPY --chown
+RUN useradd -m -s /bin/bash pawn
 
-# Install Claude Code as pawn user
+COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
+
+# Install deps as pawn user — everything under /opt/pawn is owned correctly
+WORKDIR /opt/pawn
+COPY --chown=pawn:pawn pyproject.toml uv.lock ./
+COPY --from=builder --chown=pawn:pawn /build/engine/target/wheels/*.whl /tmp/
 USER pawn
+RUN uv venv --system-site-packages && \
+    uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
+    uv pip install /tmp/*.whl && rm -rf /tmp/*.whl
+
+# Source code
+COPY --chown=pawn:pawn . .
+
+# Install Claude Code
 RUN curl -fsSL https://claude.ai/install.sh | bash
-ENV PATH="/home/pawn/.local/bin:/opt/pawn/.venv/bin:${PATH}"
+
+ARG GIT_HASH=""
+ARG GIT_TAG=""
+ENV PAWN_GIT_HASH=${GIT_HASH} \
+    PAWN_GIT_TAG=${GIT_TAG} \
+    PYTHONPATH=/opt/pawn \
+    PATH="/home/pawn/.local/bin:/opt/pawn/.venv/bin:${PATH}"
 
 # Convenience script: drop into pawn user with claude in a tmux session.
 # Starts bash first, then sends the claude command as keystrokes so that
@@ -145,3 +165,30 @@ exec su - pawn -c "
 "
 CLAUDE_DEV
 RUN chmod +x /usr/local/bin/claude-dev
+
+# Entrypoint wrapper: workspace setup + CUDA MPS, then hand off to RunPod
+COPY <<'ENTRYPOINT_WRAPPER' /opt/pawn/entrypoint.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Workspace symlinks (persistent storage) ────────────────────────
+if mkdir -p /workspace/logs /workspace/sweep_results /workspace/plots \
+            /workspace/optuna-storage /opt/pawn/local 2>/dev/null; then
+    ln -sfn /workspace/sweep_results /opt/pawn/local/optuna_results
+    ln -sfn /workspace/logs /opt/pawn/logs
+    echo "Workspace symlinks ready"
+else
+    echo "WARNING: /workspace not available — skipping symlinks"
+fi
+
+# ── CUDA MPS (multi-process service for GPU sharing) ───────────────
+if command -v nvidia-cuda-mps-control &>/dev/null; then
+    nvidia-cuda-mps-control -d 2>/dev/null && echo "CUDA MPS daemon started" \
+        || echo "CUDA MPS already running or unavailable"
+fi
+
+# Hand off to RunPod entrypoint (SSH + Jupyter)
+exec /start.sh
+ENTRYPOINT_WRAPPER
+RUN chmod +x /opt/pawn/entrypoint.sh
+ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
