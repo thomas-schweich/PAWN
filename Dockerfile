@@ -49,6 +49,7 @@ COPY tests/ tests/
 COPY deploy/ deploy/
 COPY docs/ docs/
 COPY cards/ cards/
+COPY prompts/ prompts/
 
 # Install engine wheel, then sync Python deps from lockfile
 COPY --from=builder /build/engine/target/wheels/*.whl /tmp/
