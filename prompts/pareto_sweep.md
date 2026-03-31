@@ -68,6 +68,16 @@ Initialize lab notes at `/workspace/lab_notes.md`.
 
 **GPU verification is not optional.** If the check fails, STOP. Do not train on CPU.
 
+## Backup to HuggingFace
+
+Periodically sync all results to the HF bucket. Run this at every phase boundary and every ~2 hours:
+
+```bash
+hf sync /workspace hf://buckets/thomas-schweich/pawn-pareto-sweep-03-30-2026
+```
+
+This uploads everything: sweep results, checkpoints, Optuna DB, lab notes, logs, and plots. If the pod dies, all work is recoverable from the bucket.
+
 ## Known Infrastructure Issues
 
 These were discovered during the previous sweep. Do not waste time rediscovering them:
