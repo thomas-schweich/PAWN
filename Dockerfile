@@ -19,101 +19,126 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
+RUN pip install --no-cache-dir maturin
 
-WORKDIR /build
-COPY engine/ engine/
-COPY pyproject.toml uv.lock ./
-COPY pawn/ pawn/
-COPY scripts/ scripts/
+# Cache Cargo dependency downloads — only re-fetched when Cargo.toml/lock change
+WORKDIR /build/engine
+COPY engine/Cargo.toml engine/Cargo.lock ./
 
-RUN cd engine && uv run --no-project --with maturin maturin build --release
+# Stub out the expected source layout so Cargo can resolve the crate,
+# then fetch dependencies into a cached layer. The real source files
+# are copied in the next step — only Cargo.toml/lock changes trigger
+# a re-download.
+RUN mkdir -p src python/chess_engine && \
+    touch src/lib.rs python/chess_engine/__init__.py && \
+    cargo fetch
 
-# ── Runtime ──────────────────────────────────────────────────────────
-FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS runtime
+# Now copy actual source and build the wheel
+COPY engine/pyproject.toml ./
+COPY engine/src/ src/
+COPY engine/python/ python/
+RUN maturin build --release
+
+# ── Deps: install Python dependencies (shared by runtime + dev) ─────
+FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS deps
 
 ENV PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    UV_CACHE_DIR=/tmp/uv-cache
 
-# Install uv
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
+COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
 
-# Project files + lockfile
 WORKDIR /opt/pawn
 COPY pyproject.toml uv.lock ./
-COPY pawn/ pawn/
-COPY scripts/ scripts/
-COPY tests/ tests/
-COPY deploy/ deploy/
-COPY docs/ docs/
-COPY cards/ cards/
-
-# Install engine wheel, then sync Python deps from lockfile
 COPY --from=builder /build/engine/target/wheels/*.whl /tmp/
 RUN uv venv --system-site-packages && \
     uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl
 
-# Bake git version info and set PATH for all contexts (docker exec, SSH, cron)
+# ── Runtime ──────────────────────────────────────────────────────────
+FROM deps AS runtime
+
+COPY . .
+
 ARG GIT_HASH=""
 ARG GIT_TAG=""
 ENV PAWN_GIT_HASH=${GIT_HASH} \
     PAWN_GIT_TAG=${GIT_TAG} \
     PYTHONPATH=/opt/pawn \
-    PATH="/opt/pawn/.venv/bin:/root/.local/bin:${PATH}"
+    PATH="/opt/pawn/.venv/bin:${PATH}"
 
-# Inherits /start.sh entrypoint from RunPod base image (SSH + Jupyter)
+COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
+RUN chmod +x /opt/pawn/entrypoint.sh
+ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
 
 # ── Dev container: non-root user + Claude Code + tools ──────────────
 # Build:  docker build --target dev -t thomasschweich/pawn:dev .
-# Extends the runtime image with a non-root user, CLI tools for
-# interactive work, and a startup script that symlinks ephemeral dirs
-# to /workspace. Use `su - pawn` after SSH to run Claude Code.
-FROM runtime AS dev
+# Built independently (not FROM runtime) so all /opt/pawn files are
+# owned by pawn from the start, avoiding a slow chown -R layer.
+FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS dev
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    UV_CACHE_DIR=/tmp/uv-cache
 
 # CLI tools for interactive/agent work
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tmux ripgrep jq \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user (required for claude --dangerously-skip-permissions)
+# Developer-friendly tmux defaults
+RUN cat <<'TMUX' > /etc/tmux.conf
+set -g mouse on
+set -g history-limit 50000
+set -g default-terminal "tmux-256color"
+set -g base-index 1
+setw -g pane-base-index 1
+set -g renumber-windows on
+set -g set-clipboard on
+TMUX
+
+COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
+
+# Create non-root user, then copy installed deps with correct ownership
 RUN useradd -m -s /bin/bash pawn && \
-    chown -R pawn:pawn /opt/pawn
+    mkdir -p /opt/pawn && chown pawn:pawn /opt/pawn
+COPY --from=deps --chown=pawn:pawn /opt/pawn /opt/pawn
 
-# Install Claude Code as pawn user
+# Source code + entrypoint
 USER pawn
-RUN curl -fsSL https://claude.ai/install.sh | bash
-ENV PATH="/home/pawn/.local/bin:/opt/pawn/.venv/bin:${PATH}"
+WORKDIR /opt/pawn
+COPY --chown=pawn:pawn . .
 
-# Startup script: workspace setup and CUDA MPS
-# Run as root first: bash /home/pawn/setup-workspace.sh
-COPY --chown=pawn:pawn <<'SETUP' /home/pawn/setup-workspace.sh
+# Install Claude Code
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+ARG GIT_HASH=""
+ARG GIT_TAG=""
+ENV PAWN_GIT_HASH=${GIT_HASH} \
+    PAWN_GIT_TAG=${GIT_TAG} \
+    PYTHONPATH=/opt/pawn \
+    PATH="/home/pawn/.local/bin:/opt/pawn/.venv/bin:${PATH}"
+
+# Convenience script: drop into pawn user with claude in a tmux session.
+# Starts bash first, then sends the claude command as keystrokes so that
+# CTRL+Z safely suspends to a shell prompt (fg to resume) instead of
+# leaving the pane in an irrecoverable state.
+USER root
+COPY <<'CLAUDE_DEV' /usr/local/bin/claude-dev
 #!/usr/bin/env bash
 set -euo pipefail
-
-# ── Workspace symlinks (persistent storage) ────────────────────────
-mkdir -p /workspace/logs /workspace/sweep_results /workspace/plots \
-         /workspace/optuna-storage /opt/pawn/local
-ln -sfn /workspace/sweep_results /opt/pawn/local/optuna_results
-ln -sfn /workspace/logs /opt/pawn/logs
-echo "Workspace symlinks ready"
-
-# ── CUDA MPS (multi-process service for GPU sharing) ───────────────
-# Allows concurrent trials to share a GPU efficiently. Needs root.
-if command -v nvidia-cuda-mps-control &>/dev/null; then
-    if [ "$(id -u)" = "0" ]; then
-        nvidia-cuda-mps-control -d 2>/dev/null && echo "CUDA MPS daemon started" \
-            || echo "CUDA MPS already running or unavailable"
-    else
-        echo "Skipping MPS (run setup-workspace.sh as root to enable)"
+SESSION="claude"
+exec su - pawn -c "
+    if tmux has-session -t $SESSION 2>/dev/null; then
+        exec tmux attach -t $SESSION
     fi
-fi
+    tmux new-session -d -s $SESSION -c /opt/pawn
+    tmux send-keys -t $SESSION 'cd /opt/pawn && claude --dangerously-skip-permissions' Enter
+    exec tmux attach -t $SESSION
+"
+CLAUDE_DEV
+RUN chmod +x /usr/local/bin/claude-dev
 
-echo "Setup complete"
-SETUP
-RUN chmod +x /home/pawn/setup-workspace.sh
-
-USER root
-# Inherits /start.sh entrypoint from RunPod base image
+COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
+RUN chmod +x /opt/pawn/entrypoint.sh
+ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
