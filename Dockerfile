@@ -97,6 +97,8 @@ set -g renumber-windows on
 set -g set-clipboard on
 TMUX
 
+COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
+
 # Create non-root user, then copy installed deps with correct ownership
 RUN useradd -m -s /bin/bash pawn && \
     mkdir -p /opt/pawn && chown pawn:pawn /opt/pawn
