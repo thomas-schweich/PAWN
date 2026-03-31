@@ -43,7 +43,8 @@ RUN maturin build --release
 FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    UV_CACHE_DIR=/tmp/uv-cache
 
 # Copy `uv` from their official distroless image.
 COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
@@ -101,7 +102,8 @@ ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
 FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS dev
 
 ENV PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    UV_CACHE_DIR=/tmp/uv-cache
 
 # CLI tools for interactive/agent work
 RUN apt-get update && apt-get install -y --no-install-recommends \
