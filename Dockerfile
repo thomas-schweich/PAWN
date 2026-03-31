@@ -127,6 +127,7 @@ RUN useradd -m -s /bin/bash pawn
 COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
 
 # Install deps as pawn user — everything under /opt/pawn is owned correctly
+RUN mkdir -p /opt/pawn && chown pawn:pawn /opt/pawn
 WORKDIR /opt/pawn
 COPY --chown=pawn:pawn pyproject.toml uv.lock ./
 COPY --from=builder --chown=pawn:pawn /build/engine/target/wheels/*.whl /tmp/
