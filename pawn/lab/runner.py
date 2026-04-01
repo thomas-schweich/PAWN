@@ -39,6 +39,15 @@ def _format_duration(seconds: float | None) -> str:
 
 
 def _is_alive(pid: int) -> bool:
+    """Check if a process is alive. Reaps zombies as a side effect."""
+    # First try to reap — if the process is our child zombie, waitpid clears it
+    try:
+        rpid, status = os.waitpid(pid, os.WNOHANG)
+        if rpid != 0:
+            return False  # reaped a zombie — process is done
+    except ChildProcessError:
+        pass  # not our child, fall through to kill check
+    # Check via signal
     try:
         os.kill(pid, 0)
         return True
@@ -289,19 +298,17 @@ class TrialRunner:
         (self.workspace / "optuna-storage").mkdir(parents=True, exist_ok=True)
 
     def _discover_gpus(self) -> None:
-        """Detect GPUs via nvidia-smi."""
+        """Detect GPUs via PyTorch (works for both CUDA and ROCm)."""
         try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=name,memory.total",
-                 "--format=csv,noheader,nounits"],
-                text=True, timeout=10,
-            )
-            for i, line in enumerate(out.strip().splitlines()):
-                parts = [p.strip() for p in line.split(",")]
-                self.gpu_names.append(parts[0])
-                self.gpu_vram_mb.append(int(float(parts[1])))
-            self.gpu_count = len(self.gpu_names)
+            import torch
+            if not torch.cuda.is_available():
+                log.warning("No GPUs available (torch.cuda.is_available() = False)")
+                return
+            self.gpu_count = torch.cuda.device_count()
             for i in range(self.gpu_count):
+                self.gpu_names.append(torch.cuda.get_device_name(i))
+                props = torch.cuda.get_device_properties(i)
+                self.gpu_vram_mb.append(props.total_memory // (1024 * 1024))
                 self.gpu_assignments.setdefault(i, None)
             log.info("Found %d GPUs: %s", self.gpu_count, self.gpu_names)
         except Exception as e:
@@ -372,21 +379,20 @@ class TrialRunner:
         self.gpu_assignments[gpu_id] = None
 
     def gpu_utilization(self) -> list[dict[str, Any]]:
-        """Query current GPU memory usage."""
+        """Query current GPU memory usage via PyTorch."""
         try:
-            out = subprocess.check_output(
-                ["nvidia-smi",
-                 "--query-gpu=index,memory.used,memory.total,utilization.gpu",
-                 "--format=csv,noheader,nounits"],
-                text=True, timeout=10,
-            )
+            import torch
             result = []
-            for line in out.strip().splitlines():
-                idx, used, total, util = [p.strip() for p in line.split(",")]
+            for i in range(self.gpu_count):
+                allocated = torch.cuda.memory_allocated(i) // (1024 * 1024)
+                reserved = torch.cuda.memory_reserved(i) // (1024 * 1024)
+                total = self.gpu_vram_mb[i] if i < len(self.gpu_vram_mb) else 0
                 result.append({
-                    "gpu": int(idx), "used_mb": int(float(used)),
-                    "total_mb": int(float(total)), "utilization_pct": int(float(util)),
-                    "assigned_trial": self.gpu_assignments.get(int(idx)),
+                    "gpu": i,
+                    "allocated_mb": allocated,
+                    "reserved_mb": reserved,
+                    "total_mb": total,
+                    "assigned_trial": self.gpu_assignments.get(i),
                 })
             return result
         except Exception:
@@ -442,7 +448,7 @@ class TrialRunner:
         script = str(self.code_dir / "scripts" / "train_adapter.py")
         trial_log_dir = str(self.log_dir / f"trial_{trial_id:04d}")
 
-        cmd = [self.python, script, "--strategy", strategy]
+        cmd = [*self.python.split(), script, "--strategy", strategy]
         # Base args
         ba = dict(base_args)
         ba.setdefault("log_dir", trial_log_dir)
@@ -559,9 +565,12 @@ class TrialRunner:
                 loss = rec.get("train/loss") or rec.get("train_loss")
                 if loss is not None:
                     trial.last_train_loss = loss
+                # Step rate: prefer step_time, fall back to elapsed/step
                 st = rec.get("step_time")
                 if st and st > 0:
                     trial.steps_per_sec = 1.0 / st
+                elif rec.get("elapsed") and trial.current_step > 0:
+                    trial.steps_per_sec = trial.current_step / rec["elapsed"]
                 # Adapter scripts log val in train records
                 vl = rec.get("val_loss") or rec.get("val/loss")
                 if vl is not None and (trial.best_val_loss is None or vl < trial.best_val_loss):
