@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "pawn-lab": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "python", "-m", "pawn.lab"],
+      "env": {}
+    }
+  }
+}
