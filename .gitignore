@@ -45,3 +45,4 @@ runpodctl.tar.gz
 .playwright-mcp/
 .env
 study.sqlite
+checkpoints/
