@@ -26,7 +26,7 @@ dependencies = [
     "optuna>=4.0.0",
     "optuna-dashboard>=0.17.0",
     # Lab manager MCP server
-    "mcp>=1.0.0",
+    "fastmcp>=2.0.0",
     # Dev
     "pyright>=1.1.0",
     "pytest~=9.0.0",
