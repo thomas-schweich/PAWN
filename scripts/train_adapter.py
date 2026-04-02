@@ -825,7 +825,7 @@ def train(model, trainable_params, train_loader, val_loader, mask_builder,
             except Exception as e:
                 print(f"WARNING: HF push failed: {e}")
 
-    epoch = max(start_epoch, 0)
+    epoch = start_epoch  # default if loop doesn't execute (resume past end)
     for epoch in range(start_epoch, args.epochs):
         if hasattr(train_loader.dataset, 'set_epoch'):
             train_loader.dataset.set_epoch(epoch)
