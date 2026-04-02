@@ -28,7 +28,7 @@ ps aux | grep -E 'python.*train|python.*sweep|python.*eval' | grep -v grep
 
 ### 2. Orient
 
-First, check the `## Lab Notes` section at the end of CLAUDE.md — this is the fastest way to understand what's been tried, what's planned, and what's running. If resuming after compaction, this is your primary context.
+First, read `runs/lab-notes.md` — this is your handwritten research log with what's been tried, what's planned, and what's running. It survives context compaction via a PostCompact hook that re-injects it.
 
 Also read `/workspace/pod_manager.md` (auto-maintained by the lab server) for the structured tables and recent events.
 
@@ -38,7 +38,7 @@ Also read `/workspace/pod_manager.md` (auto-maintained by the lab server) for th
 Use CronCreate to schedule a recurring check-in. The interval depends on the workload — see [Check-In Intervals](#check-in-intervals) below.
 
 **Prompt for the cron job:**
-> Run `date`, then call `lab_events` to see what completed or failed. For each completed trial, add notes via `lab_notes` with your assessment (promising? dominated? surprising?). For running trials, call `lab_log` to check real-time step progress, train loss, and LR. If events indicate a state change (trial completed/failed/killed), call `lab_status` for the full picture. Check if any GPUs are idle — if so and the objective has more work, launch or resume. If all work is done and GPUs are idle, warn the user that the pod should be stopped. Update the `## Lab Notes` section at the end of CLAUDE.md with current state, results, and next steps.
+> Run `date`, then call `lab_events` to see what completed or failed. For each completed trial, add notes via `lab_notes` with your assessment (promising? dominated? surprising?). For running trials, call `lab_log` to check real-time step progress, train loss, and LR. If events indicate a state change (trial completed/failed/killed), call `lab_status` for the full picture. Check if any GPUs are idle — if so and the objective has more work, launch or resume. If all work is done and GPUs are idle, warn the user that the pod should be stopped. Update `runs/lab-notes.md` with current state, results, and next steps.
 
 The cron is your heartbeat — it's how you:
 - Notice trial completions and launch the next trial (keeping GPUs saturated)
@@ -164,7 +164,7 @@ You are the decision-maker. Your job at each check-in is **expert judgment**:
    - Are there obvious gaps in coverage?
    - Should the check-in interval change? (see [Check-In Intervals](#check-in-intervals))
 
-5. **Update lab notes.** Append a timestamped entry to the `## Lab Notes` section at the end of CLAUDE.md. Include what completed, what's running, what you learned, and what's next. This is the primary handoff mechanism for continuation agents.
+5. **Update lab notes.** Append a timestamped entry to `runs/lab-notes.md`. Include what completed, what's running, what you learned, and what's next. This is the primary handoff mechanism for continuation agents.
 
 6. **Check for idle GPUs.** If GPUs are idle and there's more work to do, launch or resume.
 
@@ -182,11 +182,11 @@ You are the decision-maker. Your job at each check-in is **expert judgment**:
 - **SIGTERM for graceful shutdown** of training processes. They save a checkpoint before exiting.
 - **HF backups**: Periodically `hf sync /workspace hf://buckets/<repo>` if a bucket is configured.
 
-## Lab Notes in CLAUDE.md
+## Lab Notes
 
-Maintain a `## Lab Notes` section at the end of CLAUDE.md (the repo-level one, not the skills file). This is your handwritten research log — it survives context compaction because CLAUDE.md is always loaded into the conversation.
+Maintain `runs/lab-notes.md` as your handwritten research log. It survives context compaction via a PostCompact hook that re-injects its contents.
 
-Update it at every check-in and after every strategic decision. Include:
+Update it at every full check-in and after every strategic decision. Include:
 - **What you've tried** — trial configs and results, one line each
 - **What you've learned** — patterns (e.g. "bs=64 caps at val_loss=2.06, bs≥128 needed")
 - **What's planned** — next trials to launch, phase transitions, open questions
@@ -198,8 +198,8 @@ Keep it concise — this is a working scratchpad, not a report. A continuation a
 
 ## On Context Compaction
 
-The lab server persists its own state — trials, events, and the progress log survive restarts. The cron fires into fresh context. On recovery:
-1. Read the `## Lab Notes` section of CLAUDE.md — this is the fastest way to orient
+The lab server persists its own state — trials, events, and the progress log survive restarts. The PostCompact hook re-injects `runs/lab-notes.md`. On recovery:
+1. Read the lab notes (injected automatically, or read `runs/lab-notes.md`)
 2. Call `lab_status` to see current state
 3. Call `lab_events` to catch up on what happened since the notes were last updated
 4. Resume from where the notes say you left off

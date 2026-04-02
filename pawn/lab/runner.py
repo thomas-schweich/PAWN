@@ -47,7 +47,10 @@ class TrialRunner:
     ):
         ws = workspace or os.environ.get("PAWN_WORKSPACE")
         if ws is None:
-            ws = "/workspace" if Path("/workspace").exists() else str(Path.cwd())
+            # On pods: /workspace. Locally: runs/ under the repo root.
+            ws = "/workspace" if Path("/workspace").exists() else str(
+                Path(__file__).resolve().parents[2] / "runs"
+            )
         self.workspace = Path(ws)
         self.code_dir = Path(
             code_dir
