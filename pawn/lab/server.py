@@ -13,27 +13,9 @@ from pawn.lab.runner import TrialRunner
 
 log = logging.getLogger("pawn.lab")
 
-_session: Any = None  # low-level MCP session, captured for background notifications
-
 
 def _json(data: Any) -> str:
     return json.dumps(data, indent=2, default=str)
-
-
-async def _notify_via_session(message: str) -> None:
-    """Send a notification via the captured low-level MCP session.
-
-    ctx.info() only works inside a tool handler. Background monitor tasks
-    use this instead, which writes directly to the stored session object.
-    """
-    if _session is None:
-        log.warning("Notification skipped (no session): %s", message)
-        return
-    try:
-        await _session.send_log_message(level="info", data=message, logger="pawn-lab")
-        log.info("Notification sent: %s", message)
-    except Exception as e:
-        log.warning("Notification failed: %s — %s", message, e)
 
 
 @asynccontextmanager
@@ -48,132 +30,125 @@ async def _lifespan(server: FastMCP):
 mcp = FastMCP("pawn-lab", lifespan=_lifespan)
 
 
-def _wire_notifications(ctx: Context, runner: TrialRunner) -> None:
-    """Capture the low-level session for background notifications."""
-    global _session
-    if runner._notify is not None:
-        return
-    try:
-        _session = ctx.session
-        runner.set_notify(_notify_via_session)
-        log.info("Captured MCP session for notifications")
-    except Exception:
-        pass
+def _runner(ctx: Context) -> TrialRunner:
+    return ctx.lifespan_context["runner"]
 
+
+# -----------------------------------------------------------------------
+# Tools
+# -----------------------------------------------------------------------
 
 @mcp.tool
 async def lab_status(ctx: Context) -> str:
-    """Current lab status: GPU count/type/VRAM, running trials with step progress and ETAs, sweep progress, elapsed time, estimated cost. Call this first to orient."""
-    runner: TrialRunner = ctx.lifespan_context["runner"]
-    _wire_notifications(ctx, runner)
-    return _json(runner.status())
+    """Compact lab status: GPUs, running trials (ID, strategy, key HPs, step/total, ETA, val_loss), counts, elapsed time, cost."""
+    return _json(_runner(ctx).status())
 
 
 @mcp.tool
 async def lab_launch(strategy: str, ctx: Context, params: dict[str, Any] | None = None, base_args: dict[str, Any] | None = None) -> str:
-    """Launch a single trial on the next free GPU. Returns trial_id and full config. The process runs in background with CUDA_VISIBLE_DEVICES isolation. Use base_args for data/training config (checkpoint, pgn, total_steps, etc.) and params for hyperparameters (lr, bottleneck_dim, etc.). Params use underscores -- they're converted to CLI --flags automatically (e.g. lora_rank -> --lora-rank, no_compile -> --no-compile)."""
-    runner: TrialRunner = ctx.lifespan_context["runner"]
-    _wire_notifications(ctx, runner)
+    """Launch a single trial on the next free GPU. Params use underscores, converted to CLI --flags (e.g. lora_rank -> --lora-rank, no_compile -> --no-compile). Returns trial_id and config."""
     try:
-        tid = await runner.launch(strategy, params, base_args)
-        return _json(runner.trials[tid].to_dict())
+        tid = await _runner(ctx).launch(strategy, params, base_args)
+        return _json(_runner(ctx).trials[tid].to_dict())
     except RuntimeError as e:
         return _json({"error": str(e)})
 
 
 @mcp.tool
-async def lab_sweep(
-    strategies: list[str],
-    n_trials: int,
-    base_args: dict[str, Any],
-    ctx: Context,
-    pinned_params: dict[str, Any] | None = None,
-    search_space: dict[str, Any] | None = None,
-    study_name: str = "sweep",
-    directions: list[str] | None = None,
-) -> str:
-    """Configure and start an Optuna-driven autopilot sweep. Trials auto-launch on free GPUs and auto-advance when completed. Use search_space to define what Optuna searches over and pinned_params for values to fix. If search_space is omitted, built-in distributions for the strategy are used."""
-    runner: TrialRunner = ctx.lifespan_context["runner"]
-    _wire_notifications(ctx, runner)
-    result = await runner.configure_sweep(
-        strategies=strategies,
-        n_trials=n_trials,
-        base_args=base_args,
-        pinned_params=pinned_params,
-        search_space=search_space,
+async def lab_suggest(ctx: Context, search_space: str | None = None, strategy: str | None = None, study_name: str = "suggest", directions: str = '["minimize"]') -> str:
+    """Get an Optuna suggestion based on completed trial results. Creates an ephemeral study, seeds it with all completed trials, and asks for the next config to try. Returns suggested params — you decide whether to launch.
+
+    search_space: JSON string of {param: {type, low, high, log?, choices?}}. Omit to use built-in distributions for the strategy.
+    directions: JSON string of optimization directions, e.g. '["minimize"]' or '["minimize", "minimize"]'.
+    """
+    from pawn.lab.sweep import builtin_distributions, parse_distribution
+    import optuna
+
+    runner = _runner(ctx)
+    parsed_directions = json.loads(directions)
+
+    # Build distributions
+    if search_space:
+        specs = json.loads(search_space) if isinstance(search_space, str) else search_space
+        dists = {k: parse_distribution(v) for k, v in specs.items()}
+    elif strategy:
+        dists = builtin_distributions(strategy)
+    else:
+        return _json({"error": "Provide search_space or strategy"})
+
+    # Create ephemeral study and seed with completed results
+    study = optuna.create_study(
         study_name=study_name,
-        directions=directions,
+        directions=parsed_directions,
     )
-    return _json(result)
 
+    # Seed from completed trials
+    seeded = 0
+    for t in runner.trials.values():
+        if t.status != "completed" or t.best_val_loss is None:
+            continue
+        trial_dists = {k: v for k, v in dists.items() if k in t.params}
+        if not trial_dists:
+            continue
+        trial_params = {k: v for k, v in t.params.items() if k in dists}
+        values = [t.best_val_loss]
+        if len(parsed_directions) > 1 and t.actual_param_count is not None:
+            values.append(float(t.actual_param_count))
+        try:
+            frozen = optuna.trial.create_trial(
+                params=trial_params, distributions=trial_dists,
+                values=values, state=optuna.trial.TrialState.COMPLETE,
+            )
+            study.add_trial(frozen)
+            seeded += 1
+        except Exception:
+            pass  # skip incompatible trials
 
-@mcp.tool
-async def lab_seed(strategy: str, params: str, values: str, ctx: Context) -> str:
-    """Seed a prior result into the Optuna study so the sampler can learn from it. Use to import results from previous experiments. Pass params as JSON object string and values as JSON array string."""
-    runner: TrialRunner = ctx.lifespan_context["runner"]
-    _wire_notifications(ctx, runner)
-    parsed_params = json.loads(params) if isinstance(params, str) else params
-    parsed_values = json.loads(values) if isinstance(values, str) else values
-    result = await runner.seed_trial(strategy, parsed_params, parsed_values)
-    return _json(result)
+    # Ask for suggestion
+    trial = study.ask(dists)
+    return _json({
+        "suggested_params": trial.params,
+        "seeded_from": seeded,
+        "study_trials": len(study.trials),
+    })
 
 
 @mcp.tool
 async def lab_kill(trial_id: int, ctx: Context) -> str:
-    """Kill a running trial by its trial_id. Sends SIGTERM for graceful shutdown (the training script saves a checkpoint before exiting). If autopilot is on, a replacement trial is auto-launched."""
-    runner: TrialRunner = ctx.lifespan_context["runner"]
-    _wire_notifications(ctx, runner)
-    return _json(await runner.kill(trial_id))
-
-
-@mcp.tool
-async def lab_pause(ctx: Context) -> str:
-    """Pause autopilot. Running trials continue to completion but no new trials are launched. Use when changing strategy or reviewing results."""
-    runner: TrialRunner = ctx.lifespan_context["runner"]
-    return _json(await runner.pause())
-
-
-@mcp.tool
-async def lab_resume(ctx: Context) -> str:
-    """Resume autopilot. Immediately fills all free GPUs with new trials."""
-    runner: TrialRunner = ctx.lifespan_context["runner"]
-    _wire_notifications(ctx, runner)
-    return _json(await runner.resume())
-
-
-@mcp.tool
-async def lab_pin(params: dict[str, Any], ctx: Context) -> str:
-    """Pin parameters for all future trials. Pinned params override Optuna suggestions and are excluded from the search space. Useful after discovering a value is clearly best (e.g. batch_size=256). Cumulative -- call multiple times to pin more params."""
-    runner: TrialRunner = ctx.lifespan_context["runner"]
-    return _json(runner.pin(params))
+    """Kill a running trial by ID (sends SIGTERM for graceful shutdown)."""
+    return _json(await _runner(ctx).kill(trial_id))
 
 
 @mcp.tool
 async def lab_results(ctx: Context) -> str:
-    """Results table for all trials (completed, failed, killed) plus the Pareto front (non-dominated set sorted by param_count). Each row includes trial_id, strategy, param_count, val_loss, accuracy, status, notes, and key hyperparameters."""
-    runner: TrialRunner = ctx.lifespan_context["runner"]
-    return _json(runner.results())
+    """All trials with val_loss, accuracy, param count, wall time, key HPs, status, notes. Includes Pareto front."""
+    return _json(_runner(ctx).results())
 
 
 @mcp.tool
 async def lab_events(ctx: Context, since: int = 0) -> str:
-    """Get events since a sequence number. Event types: trial_started, trial_completed, trial_failed, trial_killed, gpu_idle, health_warning, sweep_started, sweep_complete. Use since=0 for all events, or pass the latest_seq from a prior call to get only new events."""
-    runner: TrialRunner = ctx.lifespan_context["runner"]
+    """Events since a sequence number. Types: trial_started, trial_completed, trial_failed, trial_killed, gpu_idle, health_warning. Use since=0 for all."""
+    runner = _runner(ctx)
     events = runner.events_since(since)
     return _json({"events": events, "latest_seq": runner.event_seq})
 
 
 @mcp.tool
+async def lab_log(trial_id: int, ctx: Context, lines: int = 50) -> str:
+    """Last N lines of a trial's stdout/stderr log. Use to debug failures or check training output."""
+    return _json(_runner(ctx).trial_log(trial_id, lines))
+
+
+@mcp.tool
 async def lab_notes(trial_id: int, notes: str, ctx: Context) -> str:
-    """Add agent notes to a trial. Use during check-ins to record your assessment: is this trial promising? Dominated? Surprising? Notes appear in the results table and progress log."""
-    runner: TrialRunner = ctx.lifespan_context["runner"]
-    return _json(runner.add_notes(trial_id, notes))
+    """Add notes to a trial. Notes appear in results table and progress log."""
+    return _json(_runner(ctx).add_notes(trial_id, notes))
 
 
 @mcp.tool
 async def lab_set_cost(cost_per_hour: float, ctx: Context) -> str:
-    """Set the $/hr rate for cost tracking. Shows estimated spend in lab_status. Example: 3.59 for H200 SXM on RunPod."""
-    runner: TrialRunner = ctx.lifespan_context["runner"]
+    """Set $/hr rate for cost tracking (e.g. 3.59 for H200 SXM on RunPod)."""
+    runner = _runner(ctx)
     runner.cost_per_hour = cost_per_hour
     runner._save_state()
     return _json({"cost_per_hour": runner.cost_per_hour})

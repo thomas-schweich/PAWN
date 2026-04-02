@@ -1,13 +1,8 @@
-"""Optuna sweep helpers: search spaces, study management, result reporting."""
+"""Optuna search space definitions for PAWN adapter strategies."""
 
 from __future__ import annotations
 
-import logging
 from typing import Any
-
-from pawn.lab.state import Trial
-
-log = logging.getLogger("pawn.lab")
 
 
 def builtin_distributions(strategy: str) -> dict[str, Any]:
@@ -90,60 +85,3 @@ def parse_distribution(spec: dict[str, Any]) -> Any:
     elif t == "categorical":
         return d.CategoricalDistribution(spec["choices"])
     raise ValueError(f"Unknown distribution type: {t}")
-
-
-def get_or_create_study(
-    workspace: str,
-    study_name: str,
-    directions: list[str],
-) -> Any:
-    """Create or load an Optuna study backed by SQLite."""
-    import optuna
-    storage = f"sqlite:///{workspace}/optuna-storage/lab.db"
-    return optuna.create_study(
-        study_name=study_name,
-        storage=storage,
-        directions=directions,
-        load_if_exists=True,
-    )
-
-
-def pick_strategy(
-    strategies: list[str],
-    trials: dict[int, Trial],
-    sweep_launched: int,
-) -> str:
-    """Pick next strategy: round-robin biased toward least-explored."""
-    if len(strategies) == 1:
-        return strategies[0]
-    counts: dict[str, int] = {s: 0 for s in strategies}
-    for t in trials.values():
-        if t.strategy in counts:
-            counts[t.strategy] += 1
-    min_count = min(counts.values())
-    candidates = [s for s, c in counts.items() if c == min_count]
-    return candidates[sweep_launched % len(candidates)]
-
-
-def tell_optuna(
-    study: Any,
-    trial: Trial,
-    directions: list[str],
-) -> None:
-    """Report trial results to Optuna."""
-    if trial.optuna_number is None:
-        return
-    values: list[float] = []
-    if trial.best_val_loss is not None:
-        values.append(trial.best_val_loss)
-    else:
-        values.append(float("inf"))
-    # Multi-objective: add param_count if directions has 2 entries
-    if len(directions) > 1 and trial.actual_param_count is not None:
-        values.append(float(trial.actual_param_count))
-    elif len(directions) > 1:
-        values.append(float("inf"))
-    try:
-        study.tell(trial.optuna_number, values)
-    except Exception as e:
-        log.warning("Optuna tell failed for trial %d: %s", trial.trial_id, e)

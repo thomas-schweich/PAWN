@@ -1,9 +1,8 @@
-"""Trial runner: process lifecycle, metrics monitoring, Optuna autopilot.
+"""Trial runner: process lifecycle and metrics monitoring.
 
 The runner manages GPU-isolated training processes, polls their metrics files,
-detects failures, and optionally drives Optuna-based hyperparameter sweeps.
-State is persisted to JSON so the runner can recover after MCP server restarts
-while training processes continue running.
+and detects failures. State is persisted to JSON so the runner can recover
+after MCP server restarts while training processes continue running.
 """
 
 from __future__ import annotations
@@ -20,13 +19,6 @@ from typing import Any
 
 from pawn.lab.monitor import check_health, is_alive, read_metrics, try_reap
 from pawn.lab.state import Trial, _format_duration, _now_iso
-from pawn.lab.sweep import (
-    builtin_distributions,
-    get_or_create_study,
-    parse_distribution,
-    pick_strategy,
-    tell_optuna,
-)
 
 log = logging.getLogger("pawn.lab")
 
@@ -45,7 +37,7 @@ def _params_to_cli(params: dict[str, Any]) -> list[str]:
 
 
 class TrialRunner:
-    """Manages GPU-isolated training processes with optional Optuna autopilot."""
+    """Manages GPU-isolated training processes."""
 
     def __init__(
         self,
@@ -76,20 +68,7 @@ class TrialRunner:
         self.gpu_count: int = 0
         self.gpu_names: list[str] = []
         self.gpu_vram_mb: list[int] = []
-        self.gpu_assignments: dict[int, int | None] = {}  # gpu -> trial_id|None
-
-        # Sweep
-        self.autopilot: bool = False
-        self.sweep_strategies: list[str] = []
-        self.sweep_base_args: dict[str, Any] = {}
-        self.sweep_search_space: dict[str, Any] = {}  # raw JSON specs, persistable
-        self.sweep_distributions: dict[str, Any] = {}  # parsed Optuna objects, in-memory only
-        self.pinned_params: dict[str, Any] = {}
-        self.sweep_n_trials: int = 0
-        self.sweep_launched: int = 0
-        self.sweep_study_name: str = "sweep"
-        self.sweep_directions: list[str] = ["minimize"]
-        self._study: Any = None  # optuna.Study
+        self.gpu_assignments: dict[int, int | None] = {}
 
         # Events
         self.events: list[dict[str, Any]] = []
@@ -100,7 +79,6 @@ class TrialRunner:
         # Async
         self._monitor_tasks: dict[int, asyncio.Task[None]] = {}
         self._metrics_offsets: dict[int, int] = {}
-        self._notify: Any = None  # async callback for MCP notifications
 
         self._ensure_dirs()
         self._gpus_discovered = False
@@ -112,11 +90,6 @@ class TrialRunner:
     def _ensure_dirs(self) -> None:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir.mkdir(parents=True, exist_ok=True)
-        (self.workspace / "optuna-storage").mkdir(parents=True, exist_ok=True)
-
-    def set_notify(self, callback: Any) -> None:
-        """Set an async callback for pushing notifications to the client."""
-        self._notify = callback
 
     def _discover_gpus(self) -> None:
         """Detect GPUs via a subprocess to avoid loading torch into this process.
@@ -160,15 +133,6 @@ class TrialRunner:
         state = {
             "next_trial_id": self.next_trial_id,
             "trials": {str(k): v.to_dict() for k, v in self.trials.items()},
-            "autopilot": self.autopilot,
-            "sweep_strategies": self.sweep_strategies,
-            "sweep_base_args": self.sweep_base_args,
-            "sweep_search_space": self.sweep_search_space,
-            "pinned_params": self.pinned_params,
-            "sweep_n_trials": self.sweep_n_trials,
-            "sweep_launched": self.sweep_launched,
-            "sweep_study_name": self.sweep_study_name,
-            "sweep_directions": self.sweep_directions,
             "event_seq": self.event_seq,
             "start_time": self.start_time,
             "cost_per_hour": self.cost_per_hour,
@@ -185,19 +149,6 @@ class TrialRunner:
             self.next_trial_id = state.get("next_trial_id", 0)
             for k, v in state.get("trials", {}).items():
                 self.trials[int(k)] = Trial.from_dict(v)
-            self.autopilot = state.get("autopilot", False)
-            self.sweep_strategies = state.get("sweep_strategies", [])
-            self.sweep_base_args = state.get("sweep_base_args", {})
-            self.sweep_search_space = state.get("sweep_search_space", {})
-            if self.sweep_search_space:
-                self.sweep_distributions = {
-                    k: parse_distribution(v) for k, v in self.sweep_search_space.items()
-                }
-            self.pinned_params = state.get("pinned_params", {})
-            self.sweep_n_trials = state.get("sweep_n_trials", 0)
-            self.sweep_launched = state.get("sweep_launched", 0)
-            self.sweep_study_name = state.get("sweep_study_name", "sweep")
-            self.sweep_directions = state.get("sweep_directions", ["minimize"])
             self.event_seq = state.get("event_seq", 0)
             self.start_time = state.get("start_time", self.start_time)
             self.cost_per_hour = state.get("cost_per_hour")
@@ -252,8 +203,8 @@ class TrialRunner:
         trial_id = self.next_trial_id
         self.next_trial_id += 1
 
-        merged_params = {**self.pinned_params, **(params or {})}
-        merged_base = {**(base_args or self.sweep_base_args)}
+        merged_params = dict(params or {})
+        merged_base = dict(base_args or {})
         cmd = self._build_command(strategy, merged_params, merged_base, trial_id)
 
         trial = Trial(
@@ -286,12 +237,10 @@ class TrialRunner:
         trial_log_dir = str(self.log_dir / f"trial_{trial_id:04d}")
 
         cmd = [*self.python.split(), script, "--strategy", strategy]
-        # Base args
         ba = dict(base_args)
         ba.setdefault("log_dir", trial_log_dir)
         ba.setdefault("local_checkpoints", True)
         cmd.extend(_params_to_cli(ba))
-        # Suggested hyperparams
         cmd.extend(_params_to_cli(params))
         return cmd
 
@@ -339,24 +288,23 @@ class TrialRunner:
                     log.warning("Trial %d health issue: %s", trial_id, issue)
                     self._emit("health_warning", trial_id, {"issue": issue})
 
-            # Process exited -- final metrics read
+            # Process exited — final metrics read
             read_metrics(trial, self.log_dir, self._metrics_offsets)
 
-            # Determine outcome
             exit_code = try_reap(trial.pid) if trial.pid else None
             if exit_code == 0 or trial.best_val_loss is not None:
-                await self._on_complete(trial_id)
+                self._complete(trial_id)
             else:
                 reason = f"exit code {exit_code}" if exit_code is not None else "process exited"
-                await self._on_failed(trial_id, reason)
+                self._fail(trial_id, reason)
 
         except asyncio.CancelledError:
             pass
         except Exception as e:
             log.error("Monitor error for trial %d: %s", trial_id, e, exc_info=True)
-            await self._on_failed(trial_id, str(e))
+            self._fail(trial_id, str(e))
 
-    async def _on_complete(self, trial_id: int) -> None:
+    def _complete(self, trial_id: int) -> None:
         trial = self.trials[trial_id]
         trial.status = "completed"
         trial.end_time = time.time()
@@ -370,32 +318,12 @@ class TrialRunner:
             "param_count": trial.actual_param_count,
             "steps": trial.current_step,
         })
-        # Notify client
-        vl = f"{trial.best_val_loss:.4f}" if trial.best_val_loss else "?"
-        acc = f"{trial.best_accuracy:.1%}" if trial.best_accuracy else "?"
-        await self._push(
-            f"Trial {trial_id} completed: {trial.strategy}, "
-            f"val_loss={vl}, acc={acc}, params={trial.actual_param_count}"
-        )
-        # Report to Optuna
-        if self._study and trial.optuna_number is not None:
-            tell_optuna(self._study, trial, self.sweep_directions)
-        # Autopilot: launch next
-        if self.autopilot and self.sweep_launched < self.sweep_n_trials:
-            await self._autopilot_next()
-        elif self.autopilot and self._all_done():
-            self.autopilot = False
-            self._emit("sweep_complete", data={"total_trials": self.sweep_launched})
-            await self._push("Sweep complete -- all trials finished.")
-        # Check if all GPUs idle
         if all(v is None for v in self.gpu_assignments.values()):
             self._emit("gpu_idle", data={"message": "All GPUs are idle"})
-            if not self.autopilot:
-                await self._push("All GPUs are idle. Pod is burning money.")
         self._save_state()
         self.render_progress_log()
 
-    async def _on_failed(self, trial_id: int, reason: str) -> None:
+    def _fail(self, trial_id: int, reason: str) -> None:
         trial = self.trials[trial_id]
         trial.status = "failed"
         trial.end_time = time.time()
@@ -403,14 +331,6 @@ class TrialRunner:
             self._release_gpu(trial.gpu_id)
         log.warning("Trial %d failed: %s", trial_id, reason)
         self._emit("trial_failed", trial_id, {"reason": reason})
-        await self._push(f"Trial {trial_id} FAILED: {trial.strategy}, reason: {reason}")
-        # Report failure to Optuna
-        if self._study and trial.optuna_number is not None:
-            import optuna
-            self._study.tell(trial.optuna_number, state=optuna.trial.TrialState.FAIL)
-        # Autopilot: launch replacement
-        if self.autopilot and self.sweep_launched < self.sweep_n_trials:
-            await self._autopilot_next()
         self._save_state()
         self.render_progress_log()
 
@@ -430,29 +350,17 @@ class TrialRunner:
         trial.end_time = time.time()
         if trial.gpu_id is not None:
             self._release_gpu(trial.gpu_id)
-        # Cancel monitor
         task = self._monitor_tasks.pop(trial_id, None)
         if task:
             task.cancel()
         self._emit("trial_killed", trial_id)
-        # Autopilot: launch replacement
-        if self.autopilot and self.sweep_launched < self.sweep_n_trials:
-            await self._autopilot_next()
         self._save_state()
         self.render_progress_log()
         return {"killed": trial_id}
 
     # =======================================================================
-    # Events & notifications
+    # Events
     # =======================================================================
-
-    async def _push(self, message: str) -> None:
-        """Push a notification to the client (if callback is set)."""
-        if self._notify:
-            try:
-                await self._notify(message)
-            except Exception as e:
-                log.debug("Notification failed: %s", e)
 
     def _emit(
         self,
@@ -469,7 +377,6 @@ class TrialRunner:
             "data": data or {},
         }
         self.events.append(event)
-        # Append to persistent log
         try:
             with open(self.events_path, "a") as f:
                 f.write(json.dumps(event, default=str) + "\n")
@@ -480,159 +387,34 @@ class TrialRunner:
         return [e for e in self.events if e["seq"] > seq]
 
     # =======================================================================
-    # Sweep / autopilot
-    # =======================================================================
-
-    def _get_study(self) -> Any:
-        if self._study is None:
-            self._study = get_or_create_study(
-                str(self.workspace), self.sweep_study_name, self.sweep_directions,
-            )
-        return self._study
-
-    async def configure_sweep(
-        self,
-        strategies: list[str],
-        n_trials: int,
-        base_args: dict[str, Any],
-        pinned_params: dict[str, Any] | None = None,
-        search_space: dict[str, Any] | None = None,
-        study_name: str = "sweep",
-        directions: list[str] | None = None,
-    ) -> dict[str, Any]:
-        """Configure and start an autopilot sweep."""
-        self.sweep_strategies = strategies
-        self.sweep_base_args = base_args
-        self.pinned_params = pinned_params or {}
-        self.sweep_n_trials = n_trials
-        self.sweep_launched = 0
-        self.sweep_study_name = study_name
-        self.sweep_directions = directions or ["minimize"]
-
-        # Build distributions
-        if search_space:
-            self.sweep_search_space = search_space  # persist raw specs
-            self.sweep_distributions = {
-                k: parse_distribution(v) for k, v in search_space.items()
-            }
-        else:
-            merged: dict[str, Any] = {}
-            for s in strategies:
-                merged.update(builtin_distributions(s))
-            self.sweep_distributions = merged
-
-        self.autopilot = True
-        self._study = None  # reset to pick up new study_name
-        self._emit("sweep_started", data={
-            "strategies": strategies, "n_trials": n_trials,
-        })
-
-        # Fill all free GPUs
-        launched = 0
-        while self._find_free_gpu() is not None and self.sweep_launched < n_trials:
-            await self._autopilot_next()
-            launched += 1
-
-        self._save_state()
-        return {"status": "sweep_started", "launched": launched, "total": n_trials}
-
-    async def _autopilot_next(self) -> None:
-        """Ask Optuna for next trial and launch it."""
-        if self._find_free_gpu() is None:
-            return
-
-        study = self._get_study()
-
-        # Pick strategy (round-robin biased toward under-represented)
-        strategy = pick_strategy(
-            self.sweep_strategies, self.trials, self.sweep_launched,
-        )
-
-        # Get distributions: prefer explicit sweep config, fall back to built-in
-        if self.sweep_distributions:
-            dists = dict(self.sweep_distributions)
-        else:
-            dists = builtin_distributions(strategy)
-        dists = {k: v for k, v in dists.items() if k not in self.pinned_params}
-
-        trial = study.ask(dists)
-
-        params = {**trial.params}
-        self.sweep_launched += 1
-
-        trial_id = await self.launch(strategy, params, self.sweep_base_args)
-        self.trials[trial_id].optuna_number = trial.number
-
-    def _all_done(self) -> bool:
-        """Check if all launched sweep trials are finished."""
-        running = [t for t in self.trials.values()
-                   if t.status == "running" and t.optuna_number is not None]
-        return len(running) == 0 and self.sweep_launched >= self.sweep_n_trials
-
-    async def pause(self) -> dict[str, Any]:
-        self.autopilot = False
-        self._save_state()
-        return {"status": "paused", "running": sum(
-            1 for t in self.trials.values() if t.status == "running"
-        )}
-
-    async def resume(self) -> dict[str, Any]:
-        self.autopilot = True
-        launched = 0
-        while self._find_free_gpu() is not None and self.sweep_launched < self.sweep_n_trials:
-            await self._autopilot_next()
-            launched += 1
-        self._save_state()
-        return {"status": "resumed", "launched": launched}
-
-    def pin(self, params: dict[str, Any]) -> dict[str, Any]:
-        self.pinned_params.update(params)
-        self._save_state()
-        return {"pinned": self.pinned_params}
-
-    async def seed_trial(
-        self, strategy: str, params: dict[str, Any], values: list[float],
-    ) -> dict[str, Any]:
-        """Seed an existing result into the Optuna study."""
-        import optuna
-        study = self._get_study()
-        # Use sweep distributions if available (must match study), else builtin
-        if self.sweep_distributions:
-            all_dists = self.sweep_distributions
-        else:
-            try:
-                all_dists = builtin_distributions(strategy)
-            except ValueError:
-                all_dists = {}
-        dists = {k: v for k, v in all_dists.items() if k in params}
-        frozen = optuna.trial.create_trial(
-            params=params,
-            distributions=dists,
-            values=values,
-            state=optuna.trial.TrialState.COMPLETE,
-        )
-        study.add_trial(frozen)
-        return {"seeded": True, "study": study.study_name}
-
-    # =======================================================================
     # Reporting
     # =======================================================================
 
     def status(self) -> dict[str, Any]:
-        running = [t.to_dict() for t in self.trials.values() if t.status == "running"]
+        running = []
+        for t in self.trials.values():
+            if t.status == "running":
+                running.append({
+                    "trial": t.trial_id, "strategy": t.strategy,
+                    "step": t.current_step, "total": t.total_steps,
+                    "sps": round(t.steps_per_sec, 2),
+                    "eta": _format_duration(t.eta_seconds()),
+                    "val_loss": t.best_val_loss, "acc": t.best_accuracy,
+                    "params": t.actual_param_count, "pid": t.pid, "gpu": t.gpu_id,
+                    "key_hp": {k: v for k, v in t.params.items()
+                               if k in ("lr", "lora_rank", "bottleneck_dim",
+                                        "density", "d_model", "n_layers", "batch_size")},
+                })
         elapsed = time.time() - self.start_time
         cost = (self.cost_per_hour * elapsed / 3600) if self.cost_per_hour else None
         return {
             "gpus": self.gpu_utilization(),
             "gpu_count": self.gpu_count,
             "gpu_names": self.gpu_names,
-            "running_trials": running,
+            "running": running,
             "total_trials": len(self.trials),
             "completed": sum(1 for t in self.trials.values() if t.status == "completed"),
             "failed": sum(1 for t in self.trials.values() if t.status == "failed"),
-            "autopilot": self.autopilot,
-            "sweep_progress": f"{self.sweep_launched}/{self.sweep_n_trials}"
-                if self.sweep_n_trials else None,
             "elapsed": _format_duration(elapsed),
             "cost_per_hour": self.cost_per_hour,
             "estimated_cost": round(cost, 2) if cost else None,
@@ -641,20 +423,18 @@ class TrialRunner:
     def results(self) -> dict[str, Any]:
         rows = []
         for t in sorted(self.trials.values(), key=lambda t: t.trial_id):
+            elapsed = (t.end_time - t.start_time) if t.end_time and t.start_time else None
             rows.append({
-                "trial": t.trial_id,
-                "strategy": t.strategy,
-                "params": t.actual_param_count,
-                "steps": t.current_step,
-                "val_loss": t.best_val_loss,
-                "accuracy": t.best_accuracy,
-                "status": t.status,
-                "notes": t.notes,
-                "key_params": {k: v for k, v in t.params.items()
-                               if k in ("lr", "lora_rank", "bottleneck_dim", "density",
-                                        "d_model", "n_layers", "batch_size")},
+                "trial": t.trial_id, "strategy": t.strategy,
+                "params": t.actual_param_count, "steps": t.current_step,
+                "val_loss": t.best_val_loss, "accuracy": t.best_accuracy,
+                "status": t.status, "notes": t.notes,
+                "wall_time": _format_duration(elapsed),
+                "key_hp": {k: v for k, v in t.params.items()
+                           if k in ("lr", "lora_rank", "bottleneck_dim", "density",
+                                    "d_model", "n_layers", "batch_size")},
             })
-        # Compute Pareto front (for multi-objective)
+        # Pareto front (non-dominated by param_count vs val_loss)
         pareto: list[dict[str, Any]] = []
         completed = [r for r in rows if r["status"] == "completed" and r["val_loss"] is not None]
         completed.sort(key=lambda r: (r["params"] or float("inf")))
@@ -664,6 +444,17 @@ class TrialRunner:
                 pareto.append(r)
                 best_loss = r["val_loss"]
         return {"trials": rows, "pareto_front": pareto}
+
+    def trial_log(self, trial_id: int, lines: int = 50) -> dict[str, Any]:
+        """Return the last N lines of a trial's stdout log."""
+        trial = self.trials.get(trial_id)
+        if not trial:
+            return {"error": f"Trial {trial_id} not found"}
+        log_path = Path(trial.log_path)
+        if not log_path.exists():
+            return {"error": f"Log file not found: {trial.log_path}"}
+        all_lines = log_path.read_text().splitlines()
+        return {"trial": trial_id, "lines": all_lines[-lines:]}
 
     def add_notes(self, trial_id: int, notes: str) -> dict[str, Any]:
         trial = self.trials.get(trial_id)
@@ -681,28 +472,20 @@ class TrialRunner:
         """Render pod_manager.md from current state."""
         lines: list[str] = ["# Pod Manager Log\n"]
 
-        # Environment
         lines.append("## Environment")
         lines.append(f"- GPUs: {self.gpu_count}x {self.gpu_names[0] if self.gpu_names else '?'}, "
                       f"{self.gpu_vram_mb[0] if self.gpu_vram_mb else '?'} MB each")
         lines.append(f"- Persistent storage: {self.workspace}")
-        if self.sweep_strategies:
-            lines.append(f"- Objective: sweep {', '.join(self.sweep_strategies)}")
         lines.append("")
 
-        # Status
         elapsed = time.time() - self.start_time
         lines.append("## Current Status")
         lines.append(f"- Uptime: {_format_duration(elapsed)}")
-        lines.append(f"- Autopilot: {'ON' if self.autopilot else 'OFF'}")
-        if self.sweep_n_trials:
-            lines.append(f"- Sweep: {self.sweep_launched}/{self.sweep_n_trials} launched")
         if self.cost_per_hour:
             cost = self.cost_per_hour * elapsed / 3600
             lines.append(f"- Cost: ${self.cost_per_hour}/hr, ~${cost:.2f} so far")
         lines.append("")
 
-        # Active processes
         running = [t for t in self.trials.values() if t.status == "running"]
         if running:
             lines.append("## Active Processes")
@@ -717,7 +500,6 @@ class TrialRunner:
                 )
             lines.append("")
 
-        # Results table
         completed = [t for t in self.trials.values()
                      if t.status in ("completed", "failed", "killed")]
         if completed:
@@ -734,7 +516,6 @@ class TrialRunner:
                 )
             lines.append("")
 
-        # Recent events
         recent = self.events[-10:]
         if recent:
             lines.append("## Recent Events")
@@ -760,7 +541,6 @@ class TrialRunner:
         """Re-attach to running processes from persisted state."""
         self._load_state()
 
-        # Reload events from persistent log
         if self.events_path.exists():
             self.events = []
             for line in self.events_path.read_text().splitlines():
@@ -771,7 +551,6 @@ class TrialRunner:
             if self.events:
                 self.event_seq = max(e.get("seq", 0) for e in self.events)
 
-        # Check which "running" trials are still alive
         for trial_id, trial in self.trials.items():
             if trial.status != "running":
                 continue
