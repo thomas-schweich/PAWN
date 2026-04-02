@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import random
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -230,7 +231,6 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
             )
 
         if shuffle_shards:
-            import random
             rng = random.Random(seed)
             rng.shuffle(self.shard_files)
 
@@ -275,8 +275,6 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         return self.shard_files[info.id::info.num_workers]
 
     def __iter__(self):
-        import random
-
         shards = list(self._worker_shards())
         rng = random.Random(self.seed + self._epoch)
 
@@ -298,6 +296,7 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
 
         filt = self._build_filter()
         games_yielded = 0
+        shuffle = self.shuffle_shards
         buf: list[dict[str, Any]] = []
         buf_size = self.shuffle_buffer_size
 
@@ -333,24 +332,26 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
                 token_lists, self.max_ply, self.seq_len,
             )
 
-            # Add games to shuffle buffer
             n = len(token_lists)
             for i in range(n):
                 if worker_limit is not None and games_yielded >= worker_limit:
                     break
-                buf.append({
+                game = {
                     "input_ids": batch["input_ids"][i],
                     "targets": batch["targets"][i],
                     "loss_mask": batch["loss_mask"][i],
                     "move_ids": batch["move_ids"][i],
                     "game_length": int(batch["game_lengths"][i]),
-                })
+                }
                 games_yielded += 1
 
-                if len(buf) >= buf_size:
-                    yield from _flush()
+                if shuffle:
+                    buf.append(game)
+                    if len(buf) >= buf_size:
+                        yield from _flush()
+                else:
+                    yield game
 
-        # Flush remaining games
         if buf:
             yield from _flush()
 
