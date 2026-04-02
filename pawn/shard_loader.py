@@ -297,13 +297,36 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         filt = self._build_filter()
         games_yielded = 0
         shuffle = self.shuffle_shards
-        buf: list[dict[str, Any]] = []
         buf_size = self.shuffle_buffer_size
+        np_rng = np.random.RandomState(self.seed + self._epoch)
 
-        def _flush() -> Iterator[dict[str, Any]]:
-            rng.shuffle(buf)
-            yield from buf
-            buf.clear()
+        # Accumulate shard batches as columnar arrays for vectorized shuffle
+        buf_ids: list[Any] = []
+        buf_tgt: list[Any] = []
+        buf_mask: list[Any] = []
+        buf_moves: list[Any] = []
+        buf_lengths: list[Any] = []
+        buf_n = 0
+
+        def _flush_buf() -> Iterator[dict[str, Any]]:
+            nonlocal buf_n
+            ids = torch.cat(buf_ids)
+            tgt = torch.cat(buf_tgt)
+            mask = torch.cat(buf_mask)
+            moves = np.concatenate(buf_moves)
+            lengths = np.concatenate(buf_lengths)
+            perm = np_rng.permutation(len(ids))
+            for j in perm:
+                yield {
+                    "input_ids": ids[j],
+                    "targets": tgt[j],
+                    "loss_mask": mask[j],
+                    "move_ids": moves[j],
+                    "game_length": int(lengths[j]),
+                }
+            buf_ids.clear(); buf_tgt.clear(); buf_mask.clear()
+            buf_moves.clear(); buf_lengths.clear()
+            buf_n = 0
 
         for shard_file in shards:
             if worker_limit is not None and games_yielded >= worker_limit:
@@ -333,27 +356,33 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
             )
 
             n = len(token_lists)
-            for i in range(n):
-                if worker_limit is not None and games_yielded >= worker_limit:
-                    break
-                game = {
-                    "input_ids": batch["input_ids"][i],
-                    "targets": batch["targets"][i],
-                    "loss_mask": batch["loss_mask"][i],
-                    "move_ids": batch["move_ids"][i],
-                    "game_length": int(batch["game_lengths"][i]),
-                }
-                games_yielded += 1
+            # Trim to worker limit
+            if worker_limit is not None:
+                n = min(n, worker_limit - games_yielded)
 
-                if shuffle:
-                    buf.append(game)
-                    if len(buf) >= buf_size:
-                        yield from _flush()
-                else:
-                    yield game
+            if shuffle:
+                buf_ids.append(batch["input_ids"][:n])
+                buf_tgt.append(batch["targets"][:n])
+                buf_mask.append(batch["loss_mask"][:n])
+                buf_moves.append(batch["move_ids"][:n])
+                buf_lengths.append(batch["game_lengths"][:n])
+                buf_n += n
+                games_yielded += n
+                if buf_n >= buf_size:
+                    yield from _flush_buf()
+            else:
+                for i in range(n):
+                    yield {
+                        "input_ids": batch["input_ids"][i],
+                        "targets": batch["targets"][i],
+                        "loss_mask": batch["loss_mask"][i],
+                        "move_ids": batch["move_ids"][i],
+                        "game_length": int(batch["game_lengths"][i]),
+                    }
+                    games_yielded += 1
 
-        if buf:
-            yield from _flush()
+        if buf_n > 0:
+            yield from _flush_buf()
 
 
 def load_val_shards(
