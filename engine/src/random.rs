@@ -73,6 +73,23 @@ pub fn generate_one_game_with_labels(seed: u64, max_ply: usize) -> GameRecord {
 
 /// Generate a single random game without labels (utility function).
 pub fn generate_one_game(seed: u64, max_ply: usize) -> (Vec<u16>, u16, Termination) {
+    generate_one_game_inner(seed, max_ply, false)
+}
+
+/// Generate a random game that always takes mate-in-1 when available.
+///
+/// At each ply, checks whether any legal move delivers immediate checkmate.
+/// If so, plays that move and ends the game. Otherwise picks randomly as usual.
+/// This produces shorter games with more decisive endings.
+pub fn generate_one_game_force_mate(seed: u64, max_ply: usize) -> (Vec<u16>, u16, Termination) {
+    generate_one_game_inner(seed, max_ply, true)
+}
+
+fn generate_one_game_inner(
+    seed: u64,
+    max_ply: usize,
+    force_mate: bool,
+) -> (Vec<u16>, u16, Termination) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut state = GameState::new();
     let mut move_ids = Vec::with_capacity(max_ply);
@@ -83,10 +100,33 @@ pub fn generate_one_game(seed: u64, max_ply: usize) -> (Vec<u16>, u16, Terminati
         }
 
         let tokens = state.legal_move_tokens();
-        let chosen = tokens[rng.gen_range(0..tokens.len())];
+
+        let chosen = if force_mate {
+            // Check each legal move for immediate checkmate
+            find_mate_in_one(&state, &tokens).unwrap_or_else(|| {
+                tokens[rng.gen_range(0..tokens.len())]
+            })
+        } else {
+            tokens[rng.gen_range(0..tokens.len())]
+        };
+
         state.make_move(chosen).unwrap();
         move_ids.push(chosen);
     }
+}
+
+/// Check if any of the given legal moves delivers immediate checkmate.
+/// Returns the first mating move found, or None.
+fn find_mate_in_one(state: &GameState, tokens: &[u16]) -> Option<u16> {
+    for &token in tokens {
+        let mut test = state.clone();
+        test.make_move(token).unwrap();
+        // After the move, if the opponent has no legal moves and is in check → checkmate
+        if test.legal_moves().is_empty() && test.is_check() {
+            return Some(token);
+        }
+    }
+    None
 }
 
 /// Resolved game outcome with side-aware checkmate.
@@ -487,6 +527,39 @@ mod tests {
         assert_eq!(m1, m2);
         assert_eq!(l1, l2);
         assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn test_force_mate_deterministic() {
+        let (m1, l1, t1) = generate_one_game_force_mate(123, 256);
+        let (m2, l2, t2) = generate_one_game_force_mate(123, 256);
+        assert_eq!(m1, m2);
+        assert_eq!(l1, l2);
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn test_force_mate_shorter_games() {
+        // Force-mate games should be shorter on average because they
+        // end as soon as mate-in-1 is available
+        let n = 100;
+        let seeds = derive_game_seeds(42, n);
+        let normal_lengths: Vec<u16> = seeds.iter()
+            .map(|&s| generate_one_game(s, 256).1)
+            .collect();
+        let force_lengths: Vec<u16> = seeds.iter()
+            .map(|&s| generate_one_game_force_mate(s, 256).1)
+            .collect();
+        let avg_normal: f64 = normal_lengths.iter().map(|&l| l as f64).sum::<f64>() / n as f64;
+        let avg_force: f64 = force_lengths.iter().map(|&l| l as f64).sum::<f64>() / n as f64;
+        // Force-mate should be <= normal for every game (same seed, same random choices
+        // except mate is taken when available)
+        for i in 0..n {
+            assert!(force_lengths[i] <= normal_lengths[i],
+                "Game {}: force={} > normal={}", i, force_lengths[i], normal_lengths[i]);
+        }
+        assert!(avg_force < avg_normal,
+            "Expected shorter avg: force={:.1} normal={:.1}", avg_force, avg_normal);
     }
 
     #[test]

@@ -143,13 +143,14 @@ fn generate_checkmate_training_batch<'py>(
 
 /// Generate random games without labels. Spec §7.3.
 #[pyfunction]
-#[pyo3(signature = (n_games, max_ply=256, seed=42, discard_ply_limit=false))]
+#[pyo3(signature = (n_games, max_ply=256, seed=42, discard_ply_limit=false, force_mate=false))]
 fn generate_random_games<'py>(
     py: Python<'py>,
     n_games: usize,
     max_ply: usize,
     seed: u64,
     discard_ply_limit: bool,
+    force_mate: bool,
 ) -> PyResult<(
     Bound<'py, PyArray2<i16>>,
     Bound<'py, PyArray1<i16>>,
@@ -158,6 +159,8 @@ fn generate_random_games<'py>(
     let result = py.allow_threads(|| {
         if discard_ply_limit {
             batch::generate_completed_games(n_games, max_ply, seed)
+        } else if force_mate {
+            batch::generate_random_games_force_mate(n_games, max_ply, seed)
         } else {
             batch::generate_random_games(n_games, max_ply, seed)
         }
@@ -177,13 +180,14 @@ fn generate_random_games<'py>(
 /// input_ids = [outcome, ply_1, ..., ply_N, PAD, ...] (seq_len per row).
 /// move_ids are the raw moves (seq_len-1 per row) for replay operations.
 #[pyfunction]
-#[pyo3(signature = (batch_size, seq_len=256, seed=42, discard_ply_limit=false))]
+#[pyo3(signature = (batch_size, seq_len=256, seed=42, discard_ply_limit=false, force_mate=false))]
 fn generate_clm_batch<'py>(
     py: Python<'py>,
     batch_size: usize,
     seq_len: usize,
     seed: u64,
     discard_ply_limit: bool,
+    force_mate: bool,
 ) -> PyResult<(
     Bound<'py, PyArray2<i16>>,   // input_ids (B, seq_len)
     Bound<'py, PyArray2<i16>>,   // targets (B, seq_len)
@@ -193,7 +197,7 @@ fn generate_clm_batch<'py>(
     Bound<'py, PyArray1<u8>>,    // termination_codes (B,)
 )> {
     let result = py.allow_threads(|| {
-        batch::generate_clm_batch(batch_size, seq_len, seed, discard_ply_limit)
+        batch::generate_clm_batch(batch_size, seq_len, seed, discard_ply_limit, force_mate)
     });
 
     let max_ply = seq_len - 1;
