@@ -85,6 +85,7 @@ class TrialRunner:
 
         self._ensure_dirs()
         self._gpus_discovered = False
+        self._mps_active: bool | None = None  # lazy-detected
 
     # =======================================================================
     # Setup
@@ -163,27 +164,52 @@ class TrialRunner:
     # GPU management
     # =======================================================================
 
+    def _is_mps_active(self) -> bool:
+        """Detect if CUDA MPS daemon is running."""
+        if self._mps_active is None:
+            try:
+                out = subprocess.check_output(
+                    ["pgrep", "-f", "nvidia-cuda-mps"],
+                    text=True, timeout=5,
+                )
+                self._mps_active = bool(out.strip())
+            except Exception:
+                self._mps_active = False
+            if self._mps_active:
+                log.info("CUDA MPS detected — GPU isolation disabled, "
+                         "MPS handles multi-process sharing")
+        return self._mps_active
+
     def _find_free_gpu(self) -> int | None:
         self._discover_gpus()
+        if self._is_mps_active():
+            # MPS handles sharing — always return GPU 0 (no isolation)
+            return 0 if self.gpu_count > 0 else None
         for gpu_id, trial_id in self.gpu_assignments.items():
             if trial_id is None:
                 return gpu_id
         return None
 
     def _assign_gpu(self, trial_id: int, gpu_id: int) -> None:
-        self.gpu_assignments[gpu_id] = trial_id
+        if not self._is_mps_active():
+            self.gpu_assignments[gpu_id] = trial_id
 
     def _release_gpu(self, gpu_id: int) -> None:
-        self.gpu_assignments[gpu_id] = None
+        if not self._is_mps_active():
+            self.gpu_assignments[gpu_id] = None
 
     def gpu_utilization(self) -> list[dict[str, Any]]:
         """Return GPU info without importing torch into this process."""
         self._discover_gpus()
+        mps = self._is_mps_active()
+        running = sum(1 for t in self.trials.values() if t.status == "running")
         return [
             {
                 "gpu": i,
                 "total_mb": self.gpu_vram_mb[i] if i < len(self.gpu_vram_mb) else 0,
                 "assigned_trial": self.gpu_assignments.get(i),
+                "mps": mps,
+                "running_trials": running if mps else (1 if self.gpu_assignments.get(i) is not None else 0),
             }
             for i in range(self.gpu_count)
         ]
@@ -286,9 +312,9 @@ class TrialRunner:
         return cmd
 
     async def _spawn(self, trial: Trial) -> None:
-        """Start the training process with GPU isolation."""
+        """Start the training process, with GPU isolation unless MPS is active."""
         env = os.environ.copy()
-        if trial.gpu_id is not None:
+        if trial.gpu_id is not None and not self._is_mps_active():
             env["CUDA_VISIBLE_DEVICES"] = str(trial.gpu_id)
 
         Path(trial.log_path).parent.mkdir(parents=True, exist_ok=True)
