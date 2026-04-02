@@ -236,14 +236,14 @@ class CLMTrainer:
             train_cfg.batch_size, train_cfg.max_ply, train_cfg.base_seed,
             discard_ply_limit=train_cfg.discard_ply_limit,
             no_outcome=train_cfg.no_outcome_token,
-            force_mate=train_cfg.force_mate,
+            mate_boost=train_cfg.mate_boost,
         )
         print("Generating validation set...")
         self.val_data = create_validation_set(
             train_cfg.val_games, train_cfg.max_ply, train_cfg.val_seed,
             discard_ply_limit=train_cfg.discard_ply_limit,
             no_outcome=train_cfg.no_outcome_token,
-            force_mate=train_cfg.force_mate,
+            mate_boost=train_cfg.mate_boost,
         )
 
         # W&B

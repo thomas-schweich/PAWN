@@ -56,7 +56,7 @@ pub fn generate_diagnostic_sets(
         let games: Vec<(Vec<u16>, u16, Termination, Vec<u64>, u64, u64)> = (0..batch_count)
             .into_par_iter()
             .map(|i| {
-                let (moves, length, term) = generate_one_game(game_seed + i as u64, max_ply);
+                let (moves, length, term) = generate_one_game(game_seed + i as u64, max_ply, 0.0);
                 let (ply_bits, w_acc, b_acc) = compute_game_stats(&moves, length as usize);
                 (moves, length, term, ply_bits, w_acc, b_acc)
             })

@@ -100,7 +100,7 @@ class TrainingConfig:
 
     # Ablations
     no_outcome_token: bool = False  # Strip outcome token from sequences
-    force_mate: bool = False  # Always take mate-in-1 when available
+    mate_boost: float = 0.0  # Probability of taking mate-in-1 (0.0=random, 1.0=always)
 
     # Seeds
     base_seed: int = 42

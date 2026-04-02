@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn test_extract_initial_position() {
         // Generate a short game and check the initial board state
-        let batch = generate_random_games(1, 256, 42);
+        let batch = generate_random_games(1, 256, 42, 0.0, false);
         let states = extract_board_states(&batch.move_ids, &batch.game_lengths, 256);
 
         // Ply 0: initial position, white to move

@@ -41,7 +41,7 @@ mod tests {
 
     #[test]
     fn test_validate_valid_games() {
-        let batch = generate_random_games(10, 256, 42);
+        let batch = generate_random_games(10, 256, 42, 0.0, false);
         let (valid, first_ill) = validate_games(
             &batch.move_ids,
             &batch.game_lengths,
