@@ -6,9 +6,9 @@ I've found PAWN to be a viable testbed for finetuning and augmentation methods a
 
 Finetuning PAWN has proven significantly more parameter-efficient than training new models from scratch and requires minimal compute resources.
 
-Feel free to use PAWN in your own experiments. Note that PAWN was developed as a personal project by a single developer and has not been published or audited. If you spot a bug, please help out by creating an issue or PR.
+Feel free to use PAWN in your own experiments. Note that PAWN was developed as a personal project by a single developer and his imaginary friend (Claude) and has not been published or audited. If you spot a bug or inaccuracy, please help out by creating an issue or PR.
 
-**PAWN is under active development and is not yet stable.**
+**PAWN is under active development and is not yet stable. All results are preliminary.**
 
 ## Model Variants
 

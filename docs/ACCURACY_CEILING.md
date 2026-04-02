@@ -12,8 +12,8 @@ At each position, the move is drawn uniformly from N legal moves. The best
 a predictor can do is pick one at random: accuracy = 1/N. Averaged over all
 positions in random games, this gives **6.52%** (95% CI [6.44, 6.61]).
 
-A model that exceeds this ceiling has learned to use the outcome token to
-make non-uniform predictions — assigning higher probability to moves that
+A model that exceeds this ceiling may have learned to use the outcome token 
+to make non-uniform predictions — assigning higher probability to moves that
 are more consistent with the known game outcome.
 
 ### Naive conditional ceiling: 6.53%
@@ -98,7 +98,7 @@ For a model with top-1 accuracy A:
 | base (36M) | 6.86% | 105% | 94% | 103% |
 | small (10M) | 6.73% | 103% | 92% | 101% |
 
-All models exceed the unconditional ceiling, confirming they exploit the
+All models exceed the unconditional ceiling, suggesting they exploit the
 outcome token. Against the MC corrected ceiling, all models appear to be
 at or slightly above the estimate — expected, since the corrected estimate
 is biased downward. The true ceiling lies somewhere in the bracket, and
@@ -188,6 +188,3 @@ follows:
      Corrected = P̂_B[argmax(P̂_A)] / Σ P̂_combined.
 4. Report means with bootstrap 95% CIs (resampled by game to account for
    within-game correlation).
-
-See [CEILING_POSTMORTEM.md](CEILING_POSTMORTEM.md) for a detailed comparison
-with the original computation and discussion of implications.
