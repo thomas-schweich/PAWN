@@ -61,6 +61,19 @@ async def lab_kill(trial_id: int, ctx: Context) -> str:
 
 
 @mcp.tool
+async def lab_resume(trial_id: int, ctx: Context, total_steps: int | None = None, pause_after_steps: int | None = None) -> str:
+    """Resume a completed/paused trial from its best checkpoint. Creates a new trial with the same config plus --resume. Override total_steps or pause_after_steps for the continuation. Use for iterative narrowing: launch N trials with pause_after_steps=2000, pick the best, resume with pause_after_steps=4000, repeat until confident, then resume with no pause to train to completion."""
+    overrides: dict[str, Any] = {}
+    if pause_after_steps is not None:
+        overrides["pause_after_steps"] = pause_after_steps
+    try:
+        new_id = await _runner(ctx).resume_trial(trial_id, total_steps=total_steps, base_args_overrides=overrides or None)
+        return _json(_runner(ctx).trials[new_id].to_dict())
+    except RuntimeError as e:
+        return _json({"error": str(e)})
+
+
+@mcp.tool
 async def lab_results(strategy: str, ctx: Context) -> str:
     """All trials with val_loss, accuracy, param count, wall time, key HPs, status, notes. Includes Pareto front and 3 Optuna suggestions for what to try next. Strategy determines the search space for suggestions: bottleneck, lora, film, sparse, hybrid, specialized_clm, unfreeze, rosa, retro-sparse, retro-bottleneck."""
     return _json(_runner(ctx).results(strategy))

@@ -171,6 +171,8 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--resume", type=str, default=None,
                     help="Path to checkpoint to resume from")
+    p.add_argument("--pause-after-steps", type=int, default=None,
+                    help="Save checkpoint and exit after this many steps (for explore-then-resume workflows)")
 
     ckpt_group = p.add_mutually_exclusive_group(required=True)
     ckpt_group.add_argument("--hf-repo", type=str, default=None)
@@ -654,6 +656,7 @@ def build_config_json(args, param_count: int) -> dict:
 
         # Training
         "total_steps": args.total_steps,
+        "pause_after_steps": args.pause_after_steps,
         "eval_interval": args.eval_interval,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -801,6 +804,7 @@ def train(model, trainable_params, train_loader, val_loader, mask_builder,
 
     eval_interval = args.eval_interval
     step_limit = args.total_steps
+    pause_step = args.pause_after_steps
 
     print(f"\nTraining for up to {args.epochs} epochs ({total_steps} steps)")
     print(f"  Warmup: {warmup_steps} steps, LR: {args.lr}, AMP: {args.amp_dtype}")
@@ -907,6 +911,8 @@ def train(model, trainable_params, train_loader, val_loader, mask_builder,
 
             if step_limit and global_step >= step_limit:
                 break
+            if pause_step and global_step >= pause_step:
+                break
             if _shutdown:
                 break
 
@@ -953,6 +959,9 @@ def train(model, trainable_params, train_loader, val_loader, mask_builder,
             break  # step-based early stopping triggered inside batch loop
         if step_limit and global_step >= step_limit:
             print(f"\n  Reached step limit ({step_limit})")
+            break
+        if pause_step and global_step >= pause_step:
+            print(f"\n  Paused at step {global_step} (--pause-after-steps {pause_step})")
             break
         if _shutdown:
             print("Shutdown requested, saving checkpoint...")

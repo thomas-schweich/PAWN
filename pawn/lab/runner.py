@@ -232,6 +232,44 @@ class TrialRunner:
         self.render_progress_log()
         return trial_id
 
+    async def resume_trial(
+        self,
+        trial_id: int,
+        total_steps: int | None = None,
+        base_args_overrides: dict[str, Any] | None = None,
+    ) -> int:
+        """Resume a completed/failed trial from its best checkpoint.
+
+        Creates a new trial with the same strategy, params, and base_args,
+        plus --resume pointing to the best checkpoint. Optionally override
+        total_steps or other base_args for the continuation.
+        """
+        old = self.trials.get(trial_id)
+        if not old:
+            raise RuntimeError(f"Trial {trial_id} not found")
+        if not old.run_dir:
+            raise RuntimeError(f"Trial {trial_id} has no run directory")
+
+        # Find best checkpoint
+        ckpt_dir = Path(old.run_dir) / "checkpoints" / "best"
+        if not ckpt_dir.exists():
+            ckpt_dir = Path(old.run_dir) / "checkpoints" / "final"
+        if not ckpt_dir.exists():
+            raise RuntimeError(f"No checkpoint found for trial {trial_id}")
+
+        # Build new base_args from old trial, with overrides.
+        # Clear pause_after_steps by default so resumed trials don't
+        # re-pause at the same step. The caller can set a new pause.
+        new_base = dict(old.base_args)
+        new_base.pop("pause_after_steps", None)
+        new_base["resume"] = str(ckpt_dir)
+        if total_steps is not None:
+            new_base["total_steps"] = total_steps
+        if base_args_overrides:
+            new_base.update(base_args_overrides)
+
+        return await self.launch(old.strategy, dict(old.params), new_base)
+
     def _build_command(
         self, strategy: str, params: dict[str, Any], base_args: dict[str, Any],
         trial_id: int,
