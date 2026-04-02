@@ -82,7 +82,8 @@ class TrialRunner:
         self.autopilot: bool = False
         self.sweep_strategies: list[str] = []
         self.sweep_base_args: dict[str, Any] = {}
-        self.sweep_distributions: dict[str, Any] = {}
+        self.sweep_search_space: dict[str, Any] = {}  # raw JSON specs, persistable
+        self.sweep_distributions: dict[str, Any] = {}  # parsed Optuna objects, in-memory only
         self.pinned_params: dict[str, Any] = {}
         self.sweep_n_trials: int = 0
         self.sweep_launched: int = 0
@@ -162,6 +163,7 @@ class TrialRunner:
             "autopilot": self.autopilot,
             "sweep_strategies": self.sweep_strategies,
             "sweep_base_args": self.sweep_base_args,
+            "sweep_search_space": self.sweep_search_space,
             "pinned_params": self.pinned_params,
             "sweep_n_trials": self.sweep_n_trials,
             "sweep_launched": self.sweep_launched,
@@ -186,6 +188,11 @@ class TrialRunner:
             self.autopilot = state.get("autopilot", False)
             self.sweep_strategies = state.get("sweep_strategies", [])
             self.sweep_base_args = state.get("sweep_base_args", {})
+            self.sweep_search_space = state.get("sweep_search_space", {})
+            if self.sweep_search_space:
+                self.sweep_distributions = {
+                    k: parse_distribution(v) for k, v in self.sweep_search_space.items()
+                }
             self.pinned_params = state.get("pinned_params", {})
             self.sweep_n_trials = state.get("sweep_n_trials", 0)
             self.sweep_launched = state.get("sweep_launched", 0)
@@ -504,6 +511,7 @@ class TrialRunner:
 
         # Build distributions
         if search_space:
+            self.sweep_search_space = search_space  # persist raw specs
             self.sweep_distributions = {
                 k: parse_distribution(v) for k, v in search_space.items()
             }
