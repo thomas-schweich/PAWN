@@ -41,7 +41,10 @@ local/
 
 # Misc
 runpodctl.tar.gz
-.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/manage-pod/
 .playwright-mcp/
 .env
 study.sqlite
