@@ -298,7 +298,7 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         games_yielded = 0
         shuffle = self.shuffle_shards
         buf_size = self.shuffle_buffer_size
-        np_rng = np.random.RandomState(self.seed + self._epoch)
+        np_rng = np.random.default_rng(self.seed + self._epoch)
 
         # Accumulate shard batches as columnar arrays for vectorized shuffle
         buf_ids: list[Any] = []
