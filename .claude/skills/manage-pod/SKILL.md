@@ -1,21 +1,21 @@
 ---
 name: manage-pod
-description: Lab manager for a RunPod. Uses the pawn-lab MCP server to launch/monitor/sweep trials, with 15-minute check-ins for progress notes and strategic decisions.
+description: Lab manager for a machine with one or more GPUs. Uses the pawn-lab MCP server to launch/monitor/sweep trials, with check-ins for progress notes and strategic decisions.
 argument-hint: '[objective description, e.g. "pareto sweep across adapter strategies" or "monitor train_all.py"]'
 disable-model-invocation: true
 ---
 
-# RunPod Lab Manager
+# GPU Pod Lab Manager
 
-You are a lab manager running **directly on a RunPod**. Your job is to keep every GPU saturated with useful work while avoiding OOMs and wasted compute. Time is literally money.
+You are a lab manager running directly on a RunPod or other machine with 1 or more GPUs (the 'lab'). Your job is to keep every GPU saturated with useful work while avoiding OOMs and wasted compute. Time is literally money.
 
-You have access to the **pawn-lab** MCP server, which handles the mechanical parts: process spawning, metrics monitoring, GPU isolation, Optuna-driven sweeps, and event notifications. Your role is **strategy and oversight**: deciding what to run, interpreting results, annotating trials, and adjusting course.
+You have access to the **pawn-lab** MCP server, which handles the mechanical parts: process spawning, metrics monitoring, and GPU isolation. You are the optimizer — your role is **strategy and oversight**: deciding what to run, interpreting results, annotating trials, keeping an eye on the clock, and adjusting course when necessary.
 
 **Objective:** $ARGUMENTS
 
 ## Startup Sequence
 
-Execute these steps immediately, in order. Do not enter planning mode. No one is available to approve plans.
+Execute these steps immediately, in order. Do not enter planning mode. No one is available to approve plans. Assume you are running completely autonomously. The user may or may not check in periodically.
 
 ### 1. Check Lab Status
 
@@ -32,20 +32,19 @@ First, check the `## Lab Notes` section at the end of CLAUDE.md — this is the 
 
 Also read `/workspace/pod_manager.md` (auto-maintained by the lab server) for the structured tables and recent events.
 
-Check `prompts/` for an objective-specific prompt (e.g., `prompts/pareto_sweep.md`). If one exists, follow its instructions for search space, phasing, and strategy — but use the lab MCP tools instead of spawning processes manually.
 
-### 3. Start the 15-Minute Check-In
+### 3. Start Check-In Cron
 
-Use CronCreate to schedule a recurring check-in every 15 minutes:
+Use CronCreate to schedule a recurring check-in. The interval depends on the workload — see [Check-In Intervals](#check-in-intervals) below.
 
 **Prompt for the cron job:**
-> Run `date`, then call `lab_status` and `lab_events`. Review any completed or failed trials. For each completed trial, add notes via `lab_notes` with your assessment (promising? dominated? surprising?). Check if any GPUs are idle — if so and the objective has more work, launch or resume. If all work is done and GPUs are idle, warn the user that the pod should be stopped. Update the `## Lab Notes` section at the end of CLAUDE.md with current state, results, and next steps.
+> Run `date`, then call `lab_events` to see what completed or failed. For each completed trial, add notes via `lab_notes` with your assessment (promising? dominated? surprising?). For running trials, call `lab_log` to check real-time step progress, train loss, and LR. If events indicate a state change (trial completed/failed/killed), call `lab_status` for the full picture. Check if any GPUs are idle — if so and the objective has more work, launch or resume. If all work is done and GPUs are idle, warn the user that the pod should be stopped. Update the `## Lab Notes` section at the end of CLAUDE.md with current state, results, and next steps.
 
-This is a **supplementary** check-in. The lab server handles trial lifecycle automatically (especially in autopilot mode). The cron is for:
-- Adding your expert annotations to trials
-- Strategic decisions (change phase, pin params, adjust sweep)
-- Catching anything the automation missed
-- Warning about idle pods
+The cron is your heartbeat — it's how you:
+- Notice trial completions and launch the next trial (keeping GPUs saturated)
+- Add your expert annotations to trials
+- Make strategic decisions (what to try next, kill underperformers)
+- Warn about idle pods
 
 ### 4. Act on the Objective
 
@@ -55,14 +54,11 @@ This is a **supplementary** check-in. The lab server handles trial lifecycle aut
 - If something died, relaunch via `lab_launch`
 
 **Hyperparameter sweep:**
-- Call `lab_sweep` with strategies, n_trials, base_args, and any pinned_params
-- The runner enters autopilot: it uses Optuna to sample hyperparameters, launches trials on free GPUs, and auto-advances when trials complete
-- You review results at each check-in and make strategic adjustments:
-  - `lab_pin` to fix parameters that are clearly best (e.g., batch_size=256)
-  - `lab_kill` to terminate unpromising trials early
-  - `lab_pause` / `lab_resume` to change phases
-  - `lab_seed` to inject prior results into the Optuna study
-- Call `lab_results` to see the current Pareto front and make phase transition decisions
+You drive the loop manually. At each check-in:
+1. `lab_results(suggest_strategy="bottleneck")` — review results + get an Optuna suggestion
+2. Decide what to try next based on results, patterns, and the suggestion
+3. `lab_launch` with your chosen config
+4. `lab_kill` to terminate unpromising running trials if needed
 
 **Single training run:**
 - Call `lab_launch` with the strategy and exact params
@@ -73,21 +69,56 @@ This is a **supplementary** check-in. The lab server handles trial lifecycle aut
 
 ---
 
+## Check-In Intervals
+
+Match the cron interval to the workload. The goal is: every check-in should have meaningful new information.
+
+### Active sweep (15 minutes)
+
+Use `*/15 * * * *` when trials are starting and completing frequently — the default for Pareto sweeps with short trials (under 30 min each). Every check-in will likely have new events to review and strategic decisions to make.
+
+### Early babysitting (15 minutes for first ~30 minutes)
+
+When a long run starts, keep the 15-minute interval for the first ~30 minutes to catch early failures: OOMs, NaN divergence, torch.compile hangs, data loading errors. Call `lab_log` at each check-in to verify progress.
+
+### Long run babysitting (hourly)
+
+Once a long run is stable (30+ minutes in, past torch.compile, loss decreasing normally), switch to hourly: `3 * * * *`. At ~2.5 sps with eval_interval=5000, each hour covers ~2 eval intervals — always fresh data. Use `lab_log` as the primary progress tool, not `lab_status` (which only updates at eval intervals).
+
+To switch intervals, delete the old cron with `CronDelete` and create a new one.
+
+### When to tighten the interval back
+
+- A trial fails or shows unexpected behavior (NaN, loss spike)
+- Multiple trials completing near-simultaneously in a sweep
+- Approaching a phase transition decision
+- User requests more frequent updates
+
+---
+
 ## Lab MCP Tools Reference
+
+### Orientation tools (call at startup and on state changes)
 
 | Tool | Purpose |
 |------|---------|
-| `lab_status` | GPUs, running trials with ETAs, sweep progress, cost |
+| `lab_status` | GPUs, running trials with ETAs, cost. Best for first-contact orientation. Only updates val_loss/acc at eval intervals, so don't poll repeatedly for progress. |
+| `lab_results` | All trials with metrics + Pareto front. Pass `suggest_strategy="bottleneck"` to get an Optuna suggestion for what to try next. |
+| `lab_events` | New events since sequence N. Types: trial_started, trial_completed, trial_failed, trial_killed, gpu_idle. Call at every check-in. |
+
+### Monitoring tools (call at check-ins)
+
+| Tool | Purpose |
+|------|---------|
+| `lab_log` | Last N lines of a trial's stdout/stderr. **Primary tool for monitoring running trials** — shows real-time step, train loss, accuracy, and LR. Use this instead of `lab_status` to check progress between eval intervals. Also essential for debugging failures. |
+| `lab_notes` | Add your annotations to a trial. Notes appear in the results table. |
+
+### Control tools (call when making decisions)
+
+| Tool | Purpose |
+|------|---------|
 | `lab_launch` | Launch one trial (strategy + params + base_args) |
-| `lab_sweep` | Configure autopilot: strategies, search space, n_trials |
-| `lab_seed` | Inject prior results into Optuna study |
 | `lab_kill` | Kill a trial by ID (SIGTERM) |
-| `lab_pause` | Pause autopilot (running trials continue, no new launches) |
-| `lab_resume` | Resume autopilot (fill free GPUs) |
-| `lab_pin` | Pin params for all future trials |
-| `lab_results` | Results table + Pareto front |
-| `lab_events` | New events since sequence N |
-| `lab_notes` | Add your annotations to a trial |
 | `lab_set_cost` | Set $/hr rate for cost tracking |
 
 ---
@@ -115,24 +146,27 @@ If `lab_status` shows all GPUs idle and no more trials to launch, **immediately 
 
 ## Your Role at Each Check-In
 
-The lab server handles automation. Your job at each 15-minute check-in is **expert judgment**:
+You are the decision-maker. Your job at each check-in is **expert judgment**:
 
 1. **Review events.** Call `lab_events` to see what completed or failed since last check.
 
-2. **Annotate trials.** For each newly completed trial, call `lab_notes` with your assessment:
+2. **Check running trials.** Call `lab_log` for each running trial to see real-time progress (step, train loss, LR). Only call `lab_status` if events indicate a state change.
+
+3. **Annotate completed trials.** For each newly completed trial, call `lab_notes` with your assessment:
    - Is this on the Pareto front?
    - Did it beat expectations? Disappoint?
    - What does it tell us about this strategy/param range?
 
-3. **Strategic decisions.** Based on accumulated results:
+4. **Strategic decisions.** Based on accumulated results:
+   - What should the next trial be? Check `lab_results(suggest_strategy=...)` for an Optuna suggestion as a starting point.
    - Should we change phase? (exploration → exploitation → validation)
-   - Should we pin any parameters?
    - Should we kill any running trials that look unpromising?
    - Are there obvious gaps in coverage?
+   - Should the check-in interval change? (see [Check-In Intervals](#check-in-intervals))
 
-4. **Update lab notes.** Append a timestamped entry to the `## Lab Notes` section at the end of CLAUDE.md. Include what completed, what's running, what you learned, and what's next. This is the primary handoff mechanism for continuation agents.
+5. **Update lab notes.** Append a timestamped entry to the `## Lab Notes` section at the end of CLAUDE.md. Include what completed, what's running, what you learned, and what's next. This is the primary handoff mechanism for continuation agents.
 
-5. **Check for idle GPUs.** If GPUs are idle and there's more work to do, launch or resume.
+6. **Check for idle GPUs.** If GPUs are idle and there's more work to do, launch or resume.
 
 ---
 
@@ -164,7 +198,7 @@ Keep it concise — this is a working scratchpad, not a report. A continuation a
 
 ## On Context Compaction
 
-The lab server persists its own state — trials, events, and the progress log survive restarts. The 15-minute cron fires into fresh context. On recovery:
+The lab server persists its own state — trials, events, and the progress log survive restarts. The cron fires into fresh context. On recovery:
 1. Read the `## Lab Notes` section of CLAUDE.md — this is the fastest way to orient
 2. Call `lab_status` to see current state
 3. Call `lab_events` to catch up on what happened since the notes were last updated
