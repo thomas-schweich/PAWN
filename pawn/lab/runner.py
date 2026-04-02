@@ -448,15 +448,26 @@ class TrialRunner:
                            if k in ("lr", "lora_rank", "bottleneck_dim", "density",
                                     "d_model", "n_layers", "batch_size")},
             })
-        # Pareto front (non-dominated by param_count vs val_loss)
+        # Pareto front: trials not dominated on (param_count, val_loss).
+        # A trial is dominated if another trial has both fewer (or equal)
+        # params AND lower (or equal) val_loss, with at least one strict.
+        completed = [r for r in rows if r["status"] == "completed"
+                     and r["val_loss"] is not None and r["params"] is not None]
         pareto: list[dict[str, Any]] = []
-        completed = [r for r in rows if r["status"] == "completed" and r["val_loss"] is not None]
-        completed.sort(key=lambda r: (r["params"] or float("inf")))
-        best_loss = float("inf")
         for r in completed:
-            if r["val_loss"] is not None and r["val_loss"] < best_loss:
+            dominated = False
+            for other in completed:
+                if other is r:
+                    continue
+                if (other["params"] <= r["params"]
+                        and other["val_loss"] <= r["val_loss"]
+                        and (other["params"] < r["params"]
+                             or other["val_loss"] < r["val_loss"])):
+                    dominated = True
+                    break
+            if not dominated:
                 pareto.append(r)
-                best_loss = r["val_loss"]
+        pareto.sort(key=lambda r: r["params"])
 
         result: dict[str, Any] = {"trials": rows, "pareto_front": pareto}
 
