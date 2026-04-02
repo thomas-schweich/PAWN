@@ -170,6 +170,15 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
     Each DataLoader worker gets a disjoint partition of shard URLs and
     lazily loads them via Polars hf:// — one shard per HTTP request,
     no glob, no rate limits.
+
+    ``max_games`` is a **global** limit across all DataLoader workers.
+    Each worker yields at most ``max_games // num_workers`` games (worker 0
+    gets the remainder).  When there are no workers (``num_workers=None``),
+    the full ``max_games`` budget applies.
+
+    Shard order is re-shuffled at the start of every epoch using a
+    deterministic seed derived from ``seed + epoch``, so multi-epoch
+    training sees games in a different order each pass.
     """
 
     def __init__(
@@ -215,6 +224,7 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
             rng = random.Random(seed)
             rng.shuffle(self.shard_files)
 
+        self._epoch = 0
         self._storage_options = None if self._local else _hf_storage_options()
 
     def _build_filter(self) -> pl.Expr | None:
@@ -243,13 +253,31 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         return self.shard_files[info.id::info.num_workers]
 
     def __iter__(self):
-        shards = self._worker_shards()
+        import random
+
+        # Re-shuffle this worker's shards with an epoch-dependent seed so
+        # each epoch sees a different shard order (deterministic).
+        shards = list(self._worker_shards())
+        rng = random.Random(self.seed + self._epoch)
+        rng.shuffle(shards)
+
+        # Compute per-worker game limit from the global max_games.
+        worker_limit: int | None = None
+        if self.max_games is not None:
+            info = torch.utils.data.get_worker_info()
+            if info is not None:
+                base = self.max_games // info.num_workers
+                remainder = self.max_games % info.num_workers
+                worker_limit = base + (1 if info.id < remainder else 0)
+            else:
+                worker_limit = self.max_games
+
         filt = self._build_filter()
         games_yielded = 0
 
         for shard_file in shards:
-            if self.max_games and games_yielded >= self.max_games:
-                return
+            if worker_limit is not None and games_yielded >= worker_limit:
+                break
 
             if self._local:
                 source = str(Path(self.hf_repo) / shard_file)
@@ -277,8 +305,8 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
             # Yield individual games from this shard
             n = len(token_lists)
             for i in range(n):
-                if self.max_games and games_yielded >= self.max_games:
-                    return
+                if worker_limit is not None and games_yielded >= worker_limit:
+                    break
                 yield {
                     "input_ids": batch["input_ids"][i],
                     "targets": batch["targets"][i],
@@ -287,6 +315,8 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
                     "game_length": int(batch["game_lengths"][i]),
                 }
                 games_yielded += 1
+
+        self._epoch += 1
 
 
 def load_val_shards(
