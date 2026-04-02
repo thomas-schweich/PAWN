@@ -27,13 +27,13 @@ All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.0
 - a token for each game outcome (`WHITE_CHECKMATES`, `BLACK_CHECKMATES`, `STALEMATE`, `DRAW_BY_RULE`, `PLY_LIMIT`),
 - and a padding token.
 
-Notably, the vocabulary includes impossible moves like `a1a1` and `b1a5`. PAWN naturally learns to avoid these since they don't appear in its training examples.
+PAWN learns to avoid impossible moves like `a1a1` and `b1a5` since they don't appear in its training examples.
 
-Conceptually, each token is best thought of as a move in UCI notation -- they are effectively coordinates. They do not include any information on the type of piece, side to play, or any direct geometric or board state information other than the factored nature of the embeddings.
+Tokens are best thought of as a move in UCI notation -- coordinate pairs. They do not include any information on the type of piece, side to play, or direct board state information.
 
-For example, `e2e4` is the token that represents the king's pawn opening, but only when it's the first ply in the sequence (moving a rook from e2 to e4 in the late game would use the same token). The model learns to track which type of piece is on each square at any given moment entirely of its own accord.
+For example, `e2e4` could double push the king's pawn, but the same token would be used for moving a rook from e2 to e4 in the late game. The model learns to track which type of piece is on each square at any given ply.
 
-For that matter, it isn't told what piece types exist, what movement patterns they follow, or indeed the concept of a piece. All of that understanding comes purely from observation and can be isolated via [linear probes](https://arxiv.org/abs/1610.01644) (Alain & Bengio, 2016).
+It also isn't told what piece types exist, what movement patterns they follow, or indeed the concept of a piece. All of that understanding comes from observation and can be isolated via [linear probes](https://arxiv.org/abs/1610.01644) (Alain & Bengio, 2016).
 
 ## Quickstart
 
@@ -50,7 +50,7 @@ uv sync --extra cu128   # NVIDIA GPU (or --extra rocm for AMD)
 
 ### Train an adapter
 
-Weights and data load directly from HuggingFace -- no submodules or local files needed:
+Weights and data can be loaded directly from HuggingFace:
 
 ```bash
 uv run python scripts/train_bottleneck.py \
@@ -79,7 +79,7 @@ uv run python -m pawn.dashboard --log-dir logs  # real-time monitoring
 
 ## Datasets
 
-These datasets are for **adapter training (behavioral cloning)**, not for pretraining PAWN itself. PAWN is pretrained exclusively on random legal games generated on-the-fly -- it never sees human or engine games during pretraining. The datasets below provide real gameplay data for finetuning the frozen PAWN backbone into player models that mimic specific playstyles or skill levels.
+These datasets are for adapter training (behavioral cloning), not for pretraining PAWN itself. PAWN is pretrained exclusively on random legal games generated on-the-fly -- it never sees human or engine games during pretraining. The datasets below provide real gameplay data for finetuning the frozen PAWN backbone into player models that mimic specific playstyles or skill levels.
 
 | Dataset | Games | Description | Link |
 |---------|-------|-------------|------|
@@ -104,7 +104,7 @@ Ply tokens use a factored embedding: each move is decomposed into source square 
 
 The model's predictions are not masked to legal moves during training; it has to determine what moves are currently legal based on the sequence of moves so far.
 
-No attempt is made to provide the model with information about other pieces. In other words, it only thinks in moves. There is no equivalent of the multi-plane 8x8xN board representation used by e.g. [AlphaZero](https://arxiv.org/abs/1712.01815) (Silver et al., 2018) and [Lc0](https://github.com/LeelaChessZero/lc0). Any and all state representation and geometry is learned by the model internally.
+No attempt is made to provide the model with information about other pieces. In other words, it only thinks in moves. There is no equivalent of the multi-plane 8x8xN board representation used by e.g. [AlphaZero](https://arxiv.org/abs/1712.01815) (Silver et al., 2018) and [Lc0](https://github.com/LeelaChessZero/lc0), so any and all state representation is learned by the model internally.
 
 ## What the Model Learns
 
@@ -137,7 +137,7 @@ PAWN ships with six adapter implementations for fine-tuning the frozen backbone 
 | **Sparse** | 503K-2.7M | 40.2-44.7% | Random binary mask on frozen weights |
 | **[LoRA](https://arxiv.org/abs/2106.09685)** | ~65K | 34.1% | Low-rank attention projection adapters |
 | **Hybrid** | ~65K | 34.1% | LoRA + FiLM combined |
-| **[FiLM](https://arxiv.org/abs/1709.07871)** | ~17K | 30.3% | Per-channel affine modulation |
+| **[FiLM](https://arxiv.org/abs/1709.07871)** | ~17K | 30.3% | Per-channel affine modulation* |
 
 A 524K bottleneck adapter achieves 42.2% accuracy predicting moves by 1800-rated Lichess players, vs. 30.9% for a standalone model with the same architecture and parameter count -- an ~11 percentage point "free" accuracy lift from the frozen backbone.
 
@@ -174,6 +174,8 @@ The engine generates training data on-the-fly via `chess_engine.generate_random_
 - [Training](docs/TRAINING.md) -- pretraining, adapter training, deployment
 - [Adapters](docs/ADAPTERS.md) -- adapter methods, results, quick start
 - [Accuracy Ceiling](docs/ACCURACY_CEILING.md) -- theoretical limits for random game prediction
+
+\*None of the existing experiments use FiLM to condition on anything. The existing FiLM experiments ask the question, 'how does FiLM perform when all parameters are learned'.
 
 ## Acknowledgments
 
