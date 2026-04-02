@@ -27,11 +27,13 @@ async def _notify_via_session(message: str) -> None:
     use this instead, which writes directly to the stored session object.
     """
     if _session is None:
+        log.warning("Notification skipped (no session): %s", message)
         return
     try:
         await _session.send_log_message(level="info", data=message, logger="pawn-lab")
+        log.info("Notification sent: %s", message)
     except Exception as e:
-        log.debug("Failed to send notification: %s", e)
+        log.warning("Notification failed: %s — %s", message, e)
 
 
 @asynccontextmanager
