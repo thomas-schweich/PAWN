@@ -55,74 +55,15 @@ async def lab_launch(strategy: str, ctx: Context, params: dict[str, Any] | None 
 
 
 @mcp.tool
-async def lab_suggest(ctx: Context, search_space: str | None = None, strategy: str | None = None, study_name: str = "suggest", directions: str = '["minimize"]') -> str:
-    """Get an Optuna suggestion based on completed trial results. Creates an ephemeral study, seeds it with all completed trials, and asks for the next config to try. Returns suggested params — you decide whether to launch.
-
-    search_space: JSON string of {param: {type, low, high, log?, choices?}}. Omit to use built-in distributions for the strategy.
-    directions: JSON string of optimization directions, e.g. '["minimize"]' or '["minimize", "minimize"]'.
-    """
-    from pawn.lab.sweep import builtin_distributions, parse_distribution
-    import optuna
-
-    runner = _runner(ctx)
-    parsed_directions = json.loads(directions)
-
-    # Build distributions
-    if search_space:
-        specs = json.loads(search_space) if isinstance(search_space, str) else search_space
-        dists = {k: parse_distribution(v) for k, v in specs.items()}
-    elif strategy:
-        dists = builtin_distributions(strategy)
-    else:
-        return _json({"error": "Provide search_space or strategy"})
-
-    # Create ephemeral study and seed with completed results
-    study = optuna.create_study(
-        study_name=study_name,
-        directions=parsed_directions,
-    )
-
-    # Seed from completed trials
-    seeded = 0
-    for t in runner.trials.values():
-        if t.status != "completed" or t.best_val_loss is None:
-            continue
-        trial_dists = {k: v for k, v in dists.items() if k in t.params}
-        if not trial_dists:
-            continue
-        trial_params = {k: v for k, v in t.params.items() if k in dists}
-        values = [t.best_val_loss]
-        if len(parsed_directions) > 1 and t.actual_param_count is not None:
-            values.append(float(t.actual_param_count))
-        try:
-            frozen = optuna.trial.create_trial(
-                params=trial_params, distributions=trial_dists,
-                values=values, state=optuna.trial.TrialState.COMPLETE,
-            )
-            study.add_trial(frozen)
-            seeded += 1
-        except Exception:
-            pass  # skip incompatible trials
-
-    # Ask for suggestion
-    trial = study.ask(dists)
-    return _json({
-        "suggested_params": trial.params,
-        "seeded_from": seeded,
-        "study_trials": len(study.trials),
-    })
-
-
-@mcp.tool
 async def lab_kill(trial_id: int, ctx: Context) -> str:
     """Kill a running trial by ID (sends SIGTERM for graceful shutdown)."""
     return _json(await _runner(ctx).kill(trial_id))
 
 
 @mcp.tool
-async def lab_results(ctx: Context) -> str:
-    """All trials with val_loss, accuracy, param count, wall time, key HPs, status, notes. Includes Pareto front."""
-    return _json(_runner(ctx).results())
+async def lab_results(ctx: Context, suggest_strategy: str | None = None) -> str:
+    """All trials with val_loss, accuracy, param count, wall time, key HPs, status, notes. Includes Pareto front. If suggest_strategy is set (e.g. 'bottleneck'), includes an Optuna suggestion for what to try next based on completed results."""
+    return _json(_runner(ctx).results(suggest_strategy))
 
 
 @mcp.tool

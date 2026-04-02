@@ -420,7 +420,7 @@ class TrialRunner:
             "estimated_cost": round(cost, 2) if cost else None,
         }
 
-    def results(self) -> dict[str, Any]:
+    def results(self, suggest_strategy: str | None = None) -> dict[str, Any]:
         rows = []
         for t in sorted(self.trials.values(), key=lambda t: t.trial_id):
             elapsed = (t.end_time - t.start_time) if t.end_time and t.start_time else None
@@ -443,7 +443,52 @@ class TrialRunner:
             if r["val_loss"] is not None and r["val_loss"] < best_loss:
                 pareto.append(r)
                 best_loss = r["val_loss"]
-        return {"trials": rows, "pareto_front": pareto}
+
+        result: dict[str, Any] = {"trials": rows, "pareto_front": pareto}
+
+        # Optuna suggestion (ephemeral study seeded from completed trials)
+        if suggest_strategy and completed:
+            suggestion = self._suggest(suggest_strategy, completed)
+            if suggestion:
+                result["optuna_suggestion"] = suggestion
+
+        return result
+
+    def _suggest(self, strategy: str, completed: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Create an ephemeral Optuna study, seed it, and return a suggestion."""
+        try:
+            import optuna
+            from pawn.lab.sweep import builtin_distributions
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+            dists = builtin_distributions(strategy)
+            study = optuna.create_study(study_name="suggest", direction="minimize")
+
+            seeded = 0
+            for r in completed:
+                hp = r.get("key_hp", {})
+                trial_dists = {k: v for k, v in dists.items() if k in hp}
+                trial_params = {k: v for k, v in hp.items() if k in dists}
+                if not trial_dists:
+                    continue
+                try:
+                    frozen = optuna.trial.create_trial(
+                        params=trial_params, distributions=trial_dists,
+                        values=[r["val_loss"]], state=optuna.trial.TrialState.COMPLETE,
+                    )
+                    study.add_trial(frozen)
+                    seeded += 1
+                except Exception:
+                    pass
+
+            if seeded == 0:
+                return None
+
+            trial = study.ask(dists)
+            return {"params": trial.params, "seeded_from": seeded}
+        except Exception as e:
+            log.debug("Suggestion failed: %s", e)
+            return None
 
     def trial_log(self, trial_id: int, lines: int = 50) -> dict[str, Any]:
         """Return the last N lines of a trial's stdout log."""
