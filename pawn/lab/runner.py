@@ -284,6 +284,7 @@ class TrialRunner:
         # Async
         self._monitor_tasks: dict[int, asyncio.Task[None]] = {}
         self._metrics_offsets: dict[int, int] = {}
+        self._notify: Any = None  # async callback for MCP notifications
 
         self._ensure_dirs()
         self._discover_gpus()
@@ -296,6 +297,10 @@ class TrialRunner:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir.mkdir(parents=True, exist_ok=True)
         (self.workspace / "optuna-storage").mkdir(parents=True, exist_ok=True)
+
+    def set_notify(self, callback: Any) -> None:
+        """Set an async callback for pushing notifications to the client."""
+        self._notify = callback
 
     def _discover_gpus(self) -> None:
         """Detect GPUs via PyTorch (works for both CUDA and ROCm)."""
@@ -614,6 +619,13 @@ class TrialRunner:
             "param_count": trial.actual_param_count,
             "steps": trial.current_step,
         })
+        # Notify client
+        vl = f"{trial.best_val_loss:.4f}" if trial.best_val_loss else "?"
+        acc = f"{trial.best_accuracy:.1%}" if trial.best_accuracy else "?"
+        await self._push(
+            f"Trial {trial_id} completed: {trial.strategy}, "
+            f"val_loss={vl}, acc={acc}, params={trial.actual_param_count}"
+        )
         # Report to Optuna
         if self._study and trial.optuna_number is not None:
             self._tell_optuna(trial)
@@ -623,9 +635,12 @@ class TrialRunner:
         elif self.autopilot and self._all_done():
             self.autopilot = False
             self._emit("sweep_complete", data={"total_trials": self.sweep_launched})
+            await self._push("Sweep complete — all trials finished.")
         # Check if all GPUs idle
         if all(v is None for v in self.gpu_assignments.values()):
             self._emit("gpu_idle", data={"message": "All GPUs are idle"})
+            if not self.autopilot:
+                await self._push("All GPUs are idle. Pod is burning money.")
         self._save_state()
         self.render_progress_log()
 
@@ -637,6 +652,7 @@ class TrialRunner:
             self._release_gpu(trial.gpu_id)
         log.warning("Trial %d failed: %s", trial_id, reason)
         self._emit("trial_failed", trial_id, {"reason": reason})
+        await self._push(f"Trial {trial_id} FAILED: {trial.strategy}, reason: {reason}")
         # Report failure to Optuna
         if self._study and trial.optuna_number is not None:
             import optuna
@@ -676,8 +692,16 @@ class TrialRunner:
         return {"killed": trial_id}
 
     # =======================================================================
-    # Events
+    # Events & notifications
     # =======================================================================
+
+    async def _push(self, message: str) -> None:
+        """Push a notification to the client (if callback is set)."""
+        if self._notify:
+            try:
+                await self._notify(message)
+            except Exception as e:
+                log.debug("Notification failed: %s", e)
 
     def _emit(
         self,

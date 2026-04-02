@@ -19,10 +19,27 @@ log = logging.getLogger("pawn.lab")
 from pawn.lab.runner import TrialRunner
 
 _runner: TrialRunner | None = None
+_session: Any = None  # ServerSession, captured on first tool call
 
 
 def _json(data: Any) -> str:
     return json.dumps(data, indent=2, default=str)
+
+
+async def _notify_channel(message: str) -> None:
+    """Send a channel notification to Claude Code via the MCP session.
+
+    Uses send_log_message as the transport — Claude Code surfaces these
+    as notifications in the conversation. Falls back silently if the
+    session isn't available yet.
+    """
+    if _session is None:
+        log.debug("No session yet, skipping notification: %s", message)
+        return
+    try:
+        await _session.send_log_message(level="info", data=message, logger="pawn-lab")
+    except Exception as e:
+        log.debug("Failed to send notification: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +316,19 @@ TOOLS = [
 
 async def _handle_tool(name: str, args: dict[str, Any]) -> str:
     """Dispatch a tool call to the runner. Returns JSON string."""
+    global _session
     assert _runner is not None
+
+    # Capture the session on first tool call (for async notifications)
+    if _session is None:
+        try:
+            from mcp.server.lowlevel.server import request_ctx
+            ctx = request_ctx.get()
+            _session = ctx.session
+            _runner.set_notify(_notify_channel)
+            log.info("Captured MCP session for notifications")
+        except (LookupError, ImportError):
+            pass
 
     if name == "lab_status":
         return _json(_runner.status())
