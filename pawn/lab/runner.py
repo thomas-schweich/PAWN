@@ -118,23 +118,33 @@ class TrialRunner:
         self._notify = callback
 
     def _discover_gpus(self) -> None:
-        """Detect GPUs via PyTorch (works for both CUDA and ROCm).
+        """Detect GPUs via a subprocess to avoid loading torch into this process.
 
-        Called lazily on first need to avoid importing torch at server startup.
+        Torch's ROCm/HIP runtime spawns background threads that busy-spin,
+        burning ~30% CPU permanently. Running discovery in a subprocess
+        keeps the MCP server process clean.
         """
         if self._gpus_discovered:
             return
         self._gpus_discovered = True
         try:
-            import torch
-            if not torch.cuda.is_available():
-                log.warning("No GPUs available (torch.cuda.is_available() = False)")
-                return
-            self.gpu_count = torch.cuda.device_count()
-            for i in range(self.gpu_count):
-                self.gpu_names.append(torch.cuda.get_device_name(i))
-                props = torch.cuda.get_device_properties(i)
-                self.gpu_vram_mb.append(props.total_memory // (1024 * 1024))
+            out = subprocess.check_output(
+                [
+                    self.python.split()[0], "-c",
+                    "import json, torch; "
+                    "gpus = [{"
+                    "'name': torch.cuda.get_device_name(i), "
+                    "'vram_mb': torch.cuda.get_device_properties(i).total_memory // (1024*1024)"
+                    "} for i in range(torch.cuda.device_count())]; "
+                    "print(json.dumps(gpus))",
+                ],
+                text=True, timeout=30,
+            )
+            gpus = json.loads(out.strip())
+            self.gpu_count = len(gpus)
+            for i, g in enumerate(gpus):
+                self.gpu_names.append(g["name"])
+                self.gpu_vram_mb.append(g["vram_mb"])
                 self.gpu_assignments.setdefault(i, None)
             log.info("Found %d GPUs: %s", self.gpu_count, self.gpu_names)
         except Exception as e:
@@ -206,25 +216,16 @@ class TrialRunner:
         self.gpu_assignments[gpu_id] = None
 
     def gpu_utilization(self) -> list[dict[str, Any]]:
-        """Query current GPU memory usage via PyTorch."""
+        """Return GPU info without importing torch into this process."""
         self._discover_gpus()
-        try:
-            import torch
-            result = []
-            for i in range(self.gpu_count):
-                allocated = torch.cuda.memory_allocated(i) // (1024 * 1024)
-                reserved = torch.cuda.memory_reserved(i) // (1024 * 1024)
-                total = self.gpu_vram_mb[i] if i < len(self.gpu_vram_mb) else 0
-                result.append({
-                    "gpu": i,
-                    "allocated_mb": allocated,
-                    "reserved_mb": reserved,
-                    "total_mb": total,
-                    "assigned_trial": self.gpu_assignments.get(i),
-                })
-            return result
-        except Exception:
-            return []
+        return [
+            {
+                "gpu": i,
+                "total_mb": self.gpu_vram_mb[i] if i < len(self.gpu_vram_mb) else 0,
+                "assigned_trial": self.gpu_assignments.get(i),
+            }
+            for i in range(self.gpu_count)
+        ]
 
     # =======================================================================
     # Trial lifecycle
