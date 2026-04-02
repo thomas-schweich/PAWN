@@ -98,8 +98,9 @@ class TrainingConfig:
     eval_interval: int = 500
     checkpoint_interval: int = 5000
 
-    # Outcome token
+    # Ablations
     no_outcome_token: bool = False  # Strip outcome token from sequences
+    force_mate: bool = False  # Always take mate-in-1 when available
 
     # Seeds
     base_seed: int = 42
