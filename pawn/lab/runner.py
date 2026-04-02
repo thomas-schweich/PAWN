@@ -588,12 +588,15 @@ class TrialRunner:
         """Seed an existing result into the Optuna study."""
         import optuna
         study = self._get_study()
-        dists: dict[str, Any] = {}
-        try:
-            all_dists = builtin_distributions(strategy)
-            dists = {k: v for k, v in all_dists.items() if k in params}
-        except ValueError:
-            pass
+        # Use sweep distributions if available (must match study), else builtin
+        if self.sweep_distributions:
+            all_dists = self.sweep_distributions
+        else:
+            try:
+                all_dists = builtin_distributions(strategy)
+            except ValueError:
+                all_dists = {}
+        dists = {k: v for k, v in all_dists.items() if k in params}
         frozen = optuna.trial.create_trial(
             params=params,
             distributions=dists,
