@@ -102,7 +102,7 @@ class TrialRunner:
         self._notify: Any = None  # async callback for MCP notifications
 
         self._ensure_dirs()
-        self._discover_gpus()
+        self._gpus_discovered = False
 
     # =======================================================================
     # Setup
@@ -118,7 +118,13 @@ class TrialRunner:
         self._notify = callback
 
     def _discover_gpus(self) -> None:
-        """Detect GPUs via PyTorch (works for both CUDA and ROCm)."""
+        """Detect GPUs via PyTorch (works for both CUDA and ROCm).
+
+        Called lazily on first need to avoid importing torch at server startup.
+        """
+        if self._gpus_discovered:
+            return
+        self._gpus_discovered = True
         try:
             import torch
             if not torch.cuda.is_available():
@@ -187,6 +193,7 @@ class TrialRunner:
     # =======================================================================
 
     def _find_free_gpu(self) -> int | None:
+        self._discover_gpus()
         for gpu_id, trial_id in self.gpu_assignments.items():
             if trial_id is None:
                 return gpu_id
@@ -200,6 +207,7 @@ class TrialRunner:
 
     def gpu_utilization(self) -> list[dict[str, Any]]:
         """Query current GPU memory usage via PyTorch."""
+        self._discover_gpus()
         try:
             import torch
             result = []
