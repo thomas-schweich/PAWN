@@ -16,7 +16,9 @@ Usage:
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -179,6 +181,9 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
     Shard order is re-shuffled at the start of every epoch using a
     deterministic seed derived from ``seed + epoch``, so multi-epoch
     training sees games in a different order each pass.
+
+    Games are accumulated in a shuffle buffer (default 50K games) and
+    yielded in random order, mixing games across shards within each batch.
     """
 
     def __init__(
@@ -191,6 +196,7 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         max_ply: int = 255,
         max_games: int | None = None,
         shuffle_shards: bool = True,
+        shuffle_buffer: int = 50_000,
         seed: int = 42,
         cache_dir: str | None = None,
     ):
@@ -210,6 +216,7 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         self.max_ply = max_ply
         self.seq_len = max_ply + 1
         self.max_games = max_games
+        self.shuffle_buffer_size = shuffle_buffer
         self.seed = seed
 
         self._local = _is_local_path(hf_repo)
@@ -274,6 +281,13 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
 
         filt = self._build_filter()
         games_yielded = 0
+        buf: list[dict[str, Any]] = []
+        buf_size = self.shuffle_buffer_size
+
+        def _flush() -> Iterator[dict[str, Any]]:
+            rng.shuffle(buf)
+            yield from buf
+            buf.clear()
 
         for shard_file in shards:
             if worker_limit is not None and games_yielded >= worker_limit:
@@ -302,19 +316,26 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
                 token_lists, self.max_ply, self.seq_len,
             )
 
-            # Yield individual games from this shard
+            # Add games to shuffle buffer
             n = len(token_lists)
             for i in range(n):
                 if worker_limit is not None and games_yielded >= worker_limit:
                     break
-                yield {
+                buf.append({
                     "input_ids": batch["input_ids"][i],
                     "targets": batch["targets"][i],
                     "loss_mask": batch["loss_mask"][i],
                     "move_ids": batch["move_ids"][i],
                     "game_length": int(batch["game_lengths"][i]),
-                }
+                })
                 games_yielded += 1
+
+                if len(buf) >= buf_size:
+                    yield from _flush()
+
+        # Flush remaining games
+        if buf:
+            yield from _flush()
 
         self._epoch += 1
 
