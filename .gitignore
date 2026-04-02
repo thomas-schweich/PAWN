@@ -49,3 +49,9 @@ runpodctl.tar.gz
 .env
 study.sqlite
 checkpoints/
+
+# pawn-lab MCP server ephemeral files
+lab_state.json
+lab_events.jsonl
+pod_manager.md
+sweep_results/
