@@ -106,11 +106,13 @@ async def lab_sweep(
 
 
 @mcp.tool
-async def lab_seed(strategy: str, params: dict[str, Any], values: list[float], ctx: Context) -> str:
-    """Seed a prior result into the Optuna study so the sampler can learn from it. Use to import results from previous experiments."""
+async def lab_seed(strategy: str, params: str, values: str, ctx: Context) -> str:
+    """Seed a prior result into the Optuna study so the sampler can learn from it. Use to import results from previous experiments. Pass params as JSON object string and values as JSON array string."""
     runner: TrialRunner = ctx.lifespan_context["runner"]
     _wire_notifications(ctx, runner)
-    result = await runner.seed_trial(strategy, params, values)
+    parsed_params = json.loads(params) if isinstance(params, str) else params
+    parsed_values = json.loads(values) if isinstance(values, str) else values
+    result = await runner.seed_trial(strategy, parsed_params, parsed_values)
     return _json(result)
 
 
