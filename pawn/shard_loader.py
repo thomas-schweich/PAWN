@@ -16,7 +16,10 @@ Usage:
 from __future__ import annotations
 
 import os
+import random
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -170,6 +173,21 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
     Each DataLoader worker gets a disjoint partition of shard URLs and
     lazily loads them via Polars hf:// — one shard per HTTP request,
     no glob, no rate limits.
+
+    ``max_games`` is a **global** limit across all DataLoader workers.
+    Each worker yields ``max_games // num_workers`` games, with the
+    remainder distributed across workers 0..R-1 (one extra game each).
+    When there are no workers, the full ``max_games`` budget applies.
+
+    Shard order is re-shuffled at the start of every iteration using a
+    deterministic seed derived from ``seed + epoch``. Call
+    ``set_epoch(n)`` from the training loop before each epoch — this is
+    required because DataLoader workers get forked copies of the dataset
+    object (same pattern as ``DistributedSampler``). When
+    ``shuffle_shards=False``, no reshuffling occurs.
+
+    Games are accumulated in a shuffle buffer (default 50K games) and
+    yielded in random order, mixing games across shards within each batch.
     """
 
     def __init__(
@@ -182,6 +200,7 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         max_ply: int = 255,
         max_games: int | None = None,
         shuffle_shards: bool = True,
+        shuffle_buffer: int = 50_000,
         seed: int = 42,
         cache_dir: str | None = None,
     ):
@@ -201,6 +220,7 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         self.max_ply = max_ply
         self.seq_len = max_ply + 1
         self.max_games = max_games
+        self.shuffle_buffer_size = shuffle_buffer
         self.seed = seed
 
         self._local = _is_local_path(hf_repo)
@@ -211,11 +231,23 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
             )
 
         if shuffle_shards:
-            import random
             rng = random.Random(seed)
             rng.shuffle(self.shard_files)
 
+        self.shuffle_shards = shuffle_shards
+        self._epoch = 0
         self._storage_options = None if self._local else _hf_storage_options()
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch for deterministic shard reshuffling.
+
+        Call this from the training loop before each epoch. Required because
+        DataLoader workers (with persistent_workers=False) get forked copies
+        of the dataset — auto-incrementing ``_epoch`` in the worker doesn't
+        propagate back to the main process. This follows the same pattern as
+        ``DistributedSampler.set_epoch()``.
+        """
+        self._epoch = epoch
 
     def _build_filter(self) -> pl.Expr | None:
         """Build a Polars filter expression for Elo + min_ply."""
@@ -243,13 +275,62 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         return self.shard_files[info.id::info.num_workers]
 
     def __iter__(self):
-        shards = self._worker_shards()
+        shards = list(self._worker_shards())
+        rng = random.Random(self.seed + self._epoch)
+
+        # Re-shuffle shards with an epoch-dependent seed so each epoch sees
+        # a different order. Only when shuffle_shards=True (the default).
+        if self.shuffle_shards:
+            rng.shuffle(shards)
+
+        # Compute per-worker game limit from the global max_games.
+        worker_limit: int | None = None
+        if self.max_games is not None:
+            info = torch.utils.data.get_worker_info()
+            if info is not None:
+                base = self.max_games // info.num_workers
+                remainder = self.max_games % info.num_workers
+                worker_limit = base + (1 if info.id < remainder else 0)
+            else:
+                worker_limit = self.max_games
+
         filt = self._build_filter()
         games_yielded = 0
+        shuffle = self.shuffle_shards
+        buf_size = self.shuffle_buffer_size
+        np_rng = np.random.default_rng(self.seed + self._epoch)
+
+        # Accumulate shard batches as columnar arrays for vectorized shuffle
+        buf_ids: list[Any] = []
+        buf_tgt: list[Any] = []
+        buf_mask: list[Any] = []
+        buf_moves: list[Any] = []
+        buf_lengths: list[Any] = []
+        buf_n = 0
+
+        def _flush_buf() -> Iterator[dict[str, Any]]:
+            nonlocal buf_n
+            ids = torch.cat(buf_ids)
+            tgt = torch.cat(buf_tgt)
+            mask = torch.cat(buf_mask)
+            moves = np.concatenate(buf_moves)
+            lengths = np.concatenate(buf_lengths)
+            perm = np_rng.permutation(len(ids))
+            for j in perm:
+                yield {
+                    "input_ids": ids[j],
+                    "targets": tgt[j],
+                    "loss_mask": mask[j],
+                    "move_ids": moves[j],
+                    "game_length": int(lengths[j]),
+                }
+            buf_ids.clear(); buf_tgt.clear(); buf_mask.clear()
+            buf_moves.clear(); buf_lengths.clear()
+            buf_n = 0
 
         for shard_file in shards:
-            if self.max_games and games_yielded >= self.max_games:
-                return
+            if worker_limit is not None and games_yielded >= worker_limit:
+                break
 
             if self._local:
                 source = str(Path(self.hf_repo) / shard_file)
@@ -274,19 +355,34 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
                 token_lists, self.max_ply, self.seq_len,
             )
 
-            # Yield individual games from this shard
             n = len(token_lists)
-            for i in range(n):
-                if self.max_games and games_yielded >= self.max_games:
-                    return
-                yield {
-                    "input_ids": batch["input_ids"][i],
-                    "targets": batch["targets"][i],
-                    "loss_mask": batch["loss_mask"][i],
-                    "move_ids": batch["move_ids"][i],
-                    "game_length": int(batch["game_lengths"][i]),
-                }
-                games_yielded += 1
+            # Trim to worker limit
+            if worker_limit is not None:
+                n = min(n, worker_limit - games_yielded)
+
+            if shuffle:
+                buf_ids.append(batch["input_ids"][:n])
+                buf_tgt.append(batch["targets"][:n])
+                buf_mask.append(batch["loss_mask"][:n])
+                buf_moves.append(batch["move_ids"][:n])
+                buf_lengths.append(batch["game_lengths"][:n])
+                buf_n += n
+                games_yielded += n
+                if buf_n >= buf_size:
+                    yield from _flush_buf()
+            else:
+                for i in range(n):
+                    yield {
+                        "input_ids": batch["input_ids"][i],
+                        "targets": batch["targets"][i],
+                        "loss_mask": batch["loss_mask"][i],
+                        "move_ids": batch["move_ids"][i],
+                        "game_length": int(batch["game_lengths"][i]),
+                    }
+                    games_yielded += 1
+
+        if buf_n > 0:
+            yield from _flush_buf()
 
 
 def load_val_shards(
