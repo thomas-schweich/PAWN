@@ -67,7 +67,6 @@ class Trial:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Trial:
-        # Strip computed fields that aren't constructor params
-        d = {k: v for k, v in d.items()
-             if k not in ("eta_seconds", "eta_human", "elapsed_human")}
-        return cls(**d)
+        import dataclasses
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})

@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pawn.lab.monitor import check_health, is_alive, read_metrics, try_reap
+from pawn.lab.monitor import check_health, is_alive, read_metrics
 from pawn.lab.state import Trial, _format_duration, _now_iso
 
 log = logging.getLogger("pawn.lab")
@@ -255,15 +255,16 @@ class TrialRunner:
 
         Path(trial.log_path).parent.mkdir(parents=True, exist_ok=True)
         log_fd = open(trial.log_path, "w")
-
-        proc = subprocess.Popen(
-            trial.cli_command,
-            stdout=log_fd,
-            stderr=subprocess.STDOUT,
-            env=env,
-            cwd=str(self.code_dir),
-        )
-        log_fd.close()
+        try:
+            proc = subprocess.Popen(
+                trial.cli_command,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                env=env,
+                cwd=str(self.code_dir),
+            )
+        finally:
+            log_fd.close()
 
         trial.pid = proc.pid
         trial.status = "running"
@@ -278,12 +279,16 @@ class TrialRunner:
     async def _monitor(self, trial_id: int) -> None:
         """Poll a running trial: check process + read metrics."""
         trial = self.trials[trial_id]
+        exit_code: int | None = None
         try:
             while trial.status == "running":
                 await asyncio.sleep(5.0)
 
-                if trial.pid and not is_alive(trial.pid):
-                    break
+                if trial.pid:
+                    alive, code = is_alive(trial.pid)
+                    if not alive:
+                        exit_code = code
+                        break
 
                 read_metrics(trial, self.log_dir, self._metrics_offsets)
                 issue = check_health(trial)
@@ -294,8 +299,13 @@ class TrialRunner:
             # Process exited — final metrics read
             read_metrics(trial, self.log_dir, self._metrics_offsets)
 
-            exit_code = try_reap(trial.pid) if trial.pid else None
-            if exit_code == 0 or trial.best_val_loss is not None:
+            if trial.status == "killed":
+                # kill() set the status; we just need to release the GPU
+                # now that the process has actually exited
+                if trial.gpu_id is not None:
+                    self._release_gpu(trial.gpu_id)
+                self._save_state()
+            elif exit_code == 0 or trial.best_val_loss is not None:
                 self._complete(trial_id)
             else:
                 reason = f"exit code {exit_code}" if exit_code is not None else "process exited"
@@ -338,7 +348,13 @@ class TrialRunner:
         self.render_progress_log()
 
     async def kill(self, trial_id: int) -> dict[str, Any]:
-        """Kill a running trial via SIGTERM."""
+        """Kill a running trial via SIGTERM.
+
+        Sets status to 'killed' and sends SIGTERM, but lets the monitor
+        task detect the actual process exit and release the GPU. This
+        avoids a window where the GPU appears free while the process is
+        still doing graceful shutdown (checkpoint saving).
+        """
         trial = self.trials.get(trial_id)
         if not trial:
             return {"error": f"Trial {trial_id} not found"}
@@ -351,11 +367,6 @@ class TrialRunner:
                 pass
         trial.status = "killed"
         trial.end_time = time.time()
-        if trial.gpu_id is not None:
-            self._release_gpu(trial.gpu_id)
-        task = self._monitor_tasks.pop(trial_id, None)
-        if task:
-            task.cancel()
         self._emit("trial_killed", trial_id)
         self._save_state()
         self.render_progress_log()
@@ -602,7 +613,11 @@ class TrialRunner:
         for trial_id, trial in self.trials.items():
             if trial.status != "running":
                 continue
-            if trial.pid and is_alive(trial.pid):
+            if trial.pid:
+                alive, _ = is_alive(trial.pid)
+            else:
+                alive = False
+            if alive:
                 log.info("Recovering trial %d (PID %d)", trial_id, trial.pid)
                 self._monitor_tasks[trial_id] = asyncio.create_task(
                     self._monitor(trial_id)
@@ -612,11 +627,22 @@ class TrialRunner:
             else:
                 log.warning("Trial %d (PID %d) no longer running", trial_id, trial.pid)
                 read_metrics(trial, self.log_dir, self._metrics_offsets)
+                trial.end_time = time.time()
                 if trial.best_val_loss is not None:
                     trial.status = "completed"
+                    self._emit("trial_completed", trial_id, {
+                        "best_val_loss": trial.best_val_loss,
+                        "best_accuracy": trial.best_accuracy,
+                        "param_count": trial.actual_param_count,
+                        "steps": trial.current_step,
+                        "recovered": True,
+                    })
                 else:
                     trial.status = "failed"
-                trial.end_time = time.time()
+                    self._emit("trial_failed", trial_id, {
+                        "reason": "process exited during server downtime",
+                        "recovered": True,
+                    })
 
         self._save_state()
         self.render_progress_log()
@@ -626,6 +652,9 @@ class TrialRunner:
 
     def shutdown(self) -> None:
         """Save state on shutdown. Training processes continue independently."""
+        for task in self._monitor_tasks.values():
+            task.cancel()
+        self._monitor_tasks.clear()
         self._save_state()
         self.render_progress_log()
         log.info("Runner shutdown (training processes continue)")

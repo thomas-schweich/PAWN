@@ -14,34 +14,28 @@ from pawn.lab.state import Trial
 log = logging.getLogger("pawn.lab")
 
 
-def try_reap(pid: int) -> int | None:
-    """Reap a child process (non-blocking). Returns exit code or None."""
-    try:
-        rpid, status = os.waitpid(pid, os.WNOHANG)
-        if rpid == 0:
-            return None
-        return os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
-    except ChildProcessError:
-        return None  # not our child (recovered process)
+def is_alive(pid: int) -> tuple[bool, int | None]:
+    """Check if a process is alive. Returns (alive, exit_code).
 
-
-def is_alive(pid: int) -> bool:
-    """Check if a process is alive. Reaps zombies as a side effect."""
-    # First try to reap -- if the process is our child zombie, waitpid clears it
+    Reaps zombies as a side effect. exit_code is set when the process
+    was reaped (our child) or None if still alive / not our child.
+    """
+    # First try to reap — if the process is our child zombie, waitpid clears it
     try:
         rpid, status = os.waitpid(pid, os.WNOHANG)
         if rpid != 0:
-            return False  # reaped a zombie -- process is done
+            code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+            return False, code
     except ChildProcessError:
         pass  # not our child, fall through to kill check
     # Check via signal
     try:
         os.kill(pid, 0)
-        return True
+        return True, None
     except ProcessLookupError:
-        return False
+        return False, None
     except PermissionError:
-        return True  # exists but can't signal
+        return True, None  # exists but can't signal
 
 
 def read_metrics(
@@ -50,7 +44,7 @@ def read_metrics(
     offsets: dict[int, int],
 ) -> None:
     """Read new lines from the trial's metrics.jsonl, updating trial in-place."""
-    # Find run dir if not yet discovered -- pick the most recent
+    # Find run dir if not yet discovered — pick the most recent
     if trial.run_dir is None:
         trial_log_dir = log_dir / f"trial_{trial.trial_id:04d}"
         metrics_files = sorted(
@@ -123,6 +117,7 @@ def check_health(trial: Trial) -> str | None:
     """Return a health issue string, or None if healthy."""
     loss = trial.last_train_loss
     if loss is not None and (math.isnan(loss) or math.isinf(loss)):
-        if trial.current_step > 500:
+        threshold = min(500, trial.total_steps // 5) if trial.total_steps > 0 else 500
+        if trial.current_step > threshold:
             return "NaN/Inf loss"
     return None
