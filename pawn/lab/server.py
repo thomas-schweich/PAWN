@@ -33,31 +33,50 @@ TOOLS = [
     {
         "name": "lab_status",
         "description": (
-            "Current lab status: GPU utilization, running trials with ETAs, "
-            "sweep progress, elapsed time, and estimated cost."
+            "Current lab status: GPU count/type/VRAM, running trials with step "
+            "progress and ETAs, sweep progress, elapsed time, estimated cost. "
+            "Call this first to orient."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "lab_launch",
         "description": (
-            "Launch a single trial on the next free GPU. "
-            "Provide strategy name and optional hyperparameters."
+            "Launch a single trial on the next free GPU. Returns trial_id and "
+            "full config. The process runs in background with CUDA_VISIBLE_DEVICES "
+            "isolation. Use base_args for data/training config (checkpoint, pgn, "
+            "total_steps, etc.) and params for hyperparameters (lr, bottleneck_dim, "
+            "etc.). Params use underscores — they're converted to CLI --flags "
+            "automatically (e.g. lora_rank -> --lora-rank, no_compile -> --no-compile)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "strategy": {
                     "type": "string",
-                    "description": "Adapter strategy (lora, bottleneck, film, sparse, etc.)",
+                    "description": (
+                        "Adapter strategy: bottleneck, lora, film, sparse, "
+                        "rosa, hybrid, specialized_clm, or unfreeze"
+                    ),
                 },
                 "params": {
                     "type": "object",
-                    "description": "Hyperparameters (lr, lora_rank, etc.)",
+                    "description": (
+                        "Hyperparameters as {name: value}. Examples: "
+                        "{lr: 5e-4, bottleneck_dim: 32, batch_size: 64, "
+                        "adapter_layers: '8,9', no_compile: true}"
+                    ),
                 },
                 "base_args": {
                     "type": "object",
-                    "description": "Base CLI args (checkpoint, pgn, total_steps, etc.)",
+                    "description": (
+                        "Fixed CLI args for data and training. Examples: "
+                        "{checkpoint: 'thomas-schweich/pawn-base', "
+                        "pgn: 'thomas-schweich/pawn-lichess-full', "
+                        "elo_min: 1800, elo_max: 1900, total_steps: 2000, "
+                        "eval_interval: 500, max_games: 1000000, "
+                        "sdpa_math: true, amp_dtype: 'bfloat16', num_workers: 2}"
+                    ),
                 },
             },
             "required": ["strategy"],
@@ -66,8 +85,10 @@ TOOLS = [
     {
         "name": "lab_sweep",
         "description": (
-            "Configure and start an autopilot sweep. The runner will use Optuna "
-            "to sample hyperparameters and auto-launch trials as GPUs free up."
+            "Configure and start an Optuna-driven autopilot sweep. Trials auto-launch "
+            "on free GPUs and auto-advance when completed. Use search_space to define "
+            "what Optuna searches over and pinned_params for values to fix. If "
+            "search_space is omitted, built-in distributions for the strategy are used."
         ),
         "inputSchema": {
             "type": "object",
@@ -75,31 +96,54 @@ TOOLS = [
                 "strategies": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of strategies to sweep over",
+                    "description": (
+                        "Strategies to sweep. Example: ['bottleneck', 'lora']"
+                    ),
                 },
                 "n_trials": {
                     "type": "integer",
-                    "description": "Total number of trials to run",
+                    "description": "Total trials to run (sequentially on 1 GPU, parallel on N GPUs)",
                 },
                 "base_args": {
                     "type": "object",
-                    "description": "Fixed CLI args for all trials (checkpoint, pgn, etc.)",
+                    "description": (
+                        "Fixed CLI args applied to every trial. Must include "
+                        "checkpoint, pgn. Example: {checkpoint: 'thomas-schweich/pawn-large', "
+                        "pgn: 'thomas-schweich/pawn-lichess-full', elo_min: 1800, "
+                        "elo_max: 1900, total_steps: 2000, eval_interval: 500, "
+                        "sdpa_math: true, amp_dtype: 'bfloat16'}"
+                    ),
                 },
                 "pinned_params": {
                     "type": "object",
-                    "description": "Params to fix (not searched by Optuna)",
+                    "description": (
+                        "Params to fix for all trials (excluded from Optuna search). "
+                        "Example: {bottleneck_dim: 1953, adapter_layers: '8,9'}"
+                    ),
                 },
                 "search_space": {
                     "type": "object",
-                    "description": "Custom search space as {param: {type, low, high, ...}}. "
-                    "Omit to use built-in distributions per strategy.",
+                    "description": (
+                        "Custom search space as {param: distribution_spec}. "
+                        "Distribution types: "
+                        "{type: 'float', low: 1e-4, high: 2e-3, log: true}, "
+                        "{type: 'int', low: 1, high: 10, step: 1}, "
+                        "{type: 'categorical', choices: [64, 128, 256]}. "
+                        "Omit to use built-in distributions for the strategy."
+                    ),
                 },
-                "study_name": {"type": "string", "default": "sweep"},
+                "study_name": {
+                    "type": "string",
+                    "default": "sweep",
+                    "description": "Optuna study name (persisted to SQLite)",
+                },
                 "directions": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optimization directions (e.g. ['minimize', 'minimize'] for "
-                    "val_loss + param_count)",
+                    "description": (
+                        "Optimization directions. ['minimize'] for val_loss only, "
+                        "['minimize', 'minimize'] for val_loss + param_count (Pareto)"
+                    ),
                 },
             },
             "required": ["strategies", "n_trials", "base_args"],
@@ -108,21 +152,24 @@ TOOLS = [
     {
         "name": "lab_seed",
         "description": (
-            "Seed an existing result into the Optuna study. Use this to prime "
-            "the sampler with prior experiments."
+            "Seed a prior result into the Optuna study so the sampler can learn "
+            "from it. Use to import results from previous experiments."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "strategy": {"type": "string"},
+                "strategy": {"type": "string", "description": "Strategy that was used"},
                 "params": {
                     "type": "object",
-                    "description": "The hyperparameters used",
+                    "description": "Hyperparameters used (e.g. {lr: 5e-4, bottleneck_dim: 64})",
                 },
                 "values": {
                     "type": "array",
                     "items": {"type": "number"},
-                    "description": "Objective values (e.g. [val_loss] or [val_loss, param_count])",
+                    "description": (
+                        "Objective values matching study directions. "
+                        "[val_loss] for single-objective, [val_loss, param_count] for Pareto"
+                    ),
                 },
             },
             "required": ["strategy", "params", "values"],
@@ -130,37 +177,48 @@ TOOLS = [
     },
     {
         "name": "lab_kill",
-        "description": "Kill a running trial by ID (sends SIGTERM for graceful shutdown).",
+        "description": (
+            "Kill a running trial by its trial_id. Sends SIGTERM for graceful "
+            "shutdown (the training script saves a checkpoint before exiting). "
+            "If autopilot is on, a replacement trial is auto-launched."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "trial_id": {"type": "integer"},
+                "trial_id": {"type": "integer", "description": "Trial ID to kill"},
             },
             "required": ["trial_id"],
         },
     },
     {
         "name": "lab_pause",
-        "description": "Pause autopilot — running trials continue but no new ones launch.",
+        "description": (
+            "Pause autopilot. Running trials continue to completion but no new "
+            "trials are launched. Use when changing strategy or reviewing results."
+        ),
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "lab_resume",
-        "description": "Resume autopilot — fill free GPUs with new trials.",
+        "description": (
+            "Resume autopilot. Immediately fills all free GPUs with new trials."
+        ),
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "lab_pin",
         "description": (
             "Pin parameters for all future trials. Pinned params override Optuna "
-            "suggestions (e.g. pin batch_size=256 after discovering it's best)."
+            "suggestions and are excluded from the search space. Useful after "
+            "discovering a value is clearly best (e.g. batch_size=256). "
+            "Cumulative — call multiple times to pin more params."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "params": {
                     "type": "object",
-                    "description": "Parameters to pin (e.g. {batch_size: 256})",
+                    "description": "Params to pin. Example: {batch_size: 256, warmup_frac: 0.05}",
                 },
             },
             "required": ["params"],
@@ -169,22 +227,28 @@ TOOLS = [
     {
         "name": "lab_results",
         "description": (
-            "Get the results table and Pareto front for all completed trials."
+            "Results table for all trials (completed, failed, killed) plus the "
+            "Pareto front (non-dominated set sorted by param_count). Each row "
+            "includes trial_id, strategy, param_count, val_loss, accuracy, status, "
+            "notes, and key hyperparameters."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "lab_events",
         "description": (
-            "Get events since a given sequence number. Returns trial completions, "
-            "failures, health warnings, and other events the agent should act on."
+            "Get events since a sequence number. Event types: trial_started, "
+            "trial_completed, trial_failed, trial_killed, gpu_idle, "
+            "health_warning, sweep_started, sweep_complete. "
+            "Use since=0 for all events, or pass the latest_seq from a prior "
+            "call to get only new events."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "since": {
                     "type": "integer",
-                    "description": "Sequence number to read from (0 = all events)",
+                    "description": "Return events with seq > this value. 0 = all events.",
                     "default": 0,
                 },
             },
@@ -193,16 +257,17 @@ TOOLS = [
     {
         "name": "lab_notes",
         "description": (
-            "Add agent notes to a trial. Use during check-ins to record observations, "
-            "findings, or decisions about specific trials."
+            "Add agent notes to a trial. Use during check-ins to record your "
+            "assessment: is this trial promising? Dominated? Surprising? "
+            "Notes appear in the results table and progress log."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "trial_id": {"type": "integer"},
+                "trial_id": {"type": "integer", "description": "Trial to annotate"},
                 "notes": {
                     "type": "string",
-                    "description": "Free-text notes (replaces existing notes for this trial)",
+                    "description": "Your assessment (replaces existing notes for this trial)",
                 },
             },
             "required": ["trial_id", "notes"],
@@ -210,11 +275,17 @@ TOOLS = [
     },
     {
         "name": "lab_set_cost",
-        "description": "Set the $/hr rate for cost tracking.",
+        "description": (
+            "Set the $/hr rate for cost tracking. Shows estimated spend in "
+            "lab_status. Example: 3.59 for H200 SXM on RunPod."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "cost_per_hour": {"type": "number"},
+                "cost_per_hour": {
+                    "type": "number",
+                    "description": "Cost in $/hr for this pod",
+                },
             },
             "required": ["cost_per_hour"],
         },

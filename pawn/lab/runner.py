@@ -774,11 +774,11 @@ class TrialRunner:
         # Pick strategy (round-robin biased toward under-represented)
         strategy = self._pick_strategy()
 
-        # Get distributions for this strategy, minus pinned params
-        try:
+        # Get distributions: prefer explicit sweep config, fall back to built-in
+        if self.sweep_distributions:
+            dists = dict(self.sweep_distributions)
+        else:
             dists = _builtin_distributions(strategy)
-        except ValueError:
-            dists = self.sweep_distributions
         dists = {k: v for k, v in dists.items() if k not in self.pinned_params}
 
         trial = study.ask(dists)
