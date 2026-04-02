@@ -523,12 +523,15 @@ class TrialRunner:
         """Read new lines from the trial's metrics.jsonl."""
         trial = self.trials[trial_id]
 
-        # Find run dir if not yet discovered
+        # Find run dir if not yet discovered — pick the most recent
         if trial.run_dir is None:
             trial_log_dir = self.log_dir / f"trial_{trial_id:04d}"
-            for mf in trial_log_dir.glob("*/metrics.jsonl"):
-                trial.run_dir = str(mf.parent)
-                break
+            metrics_files = sorted(
+                trial_log_dir.glob("*/metrics.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            if metrics_files:
+                trial.run_dir = str(metrics_files[-1].parent)
         if trial.run_dir is None:
             return
 
