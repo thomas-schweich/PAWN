@@ -434,7 +434,7 @@ class TrialRunner:
             "estimated_cost": round(cost, 2) if cost else None,
         }
 
-    def results(self, suggest_strategy: str | None = None) -> dict[str, Any]:
+    def results(self, strategy: str) -> dict[str, Any]:
         rows = []
         for t in sorted(self.trials.values(), key=lambda t: t.trial_id):
             elapsed = (t.end_time - t.start_time) if t.end_time and t.start_time else None
@@ -470,17 +470,11 @@ class TrialRunner:
         pareto.sort(key=lambda r: r["params"])
 
         result: dict[str, Any] = {"trials": rows, "pareto_front": pareto}
-
-        # Optuna suggestion (ephemeral study seeded from completed trials)
-        if suggest_strategy and completed:
-            suggestion = self._suggest(suggest_strategy, completed)
-            if suggestion:
-                result["optuna_suggestion"] = suggestion
-
+        result["suggestions"] = self._suggest(strategy, completed)
         return result
 
-    def _suggest(self, strategy: str, completed: list[dict[str, Any]]) -> dict[str, Any] | None:
-        """Create an ephemeral Optuna study, seed it, and return a suggestion."""
+    def _suggest(self, strategy: str, completed: list[dict[str, Any]], n: int = 3) -> list[dict[str, Any]]:
+        """Create an ephemeral Optuna study, seed it, and return N suggestions."""
         try:
             import optuna
             from pawn.lab.sweep import builtin_distributions
@@ -506,14 +500,14 @@ class TrialRunner:
                 except Exception:
                     pass
 
-            if seeded == 0:
-                return None
-
-            trial = study.ask(dists)
-            return {"params": trial.params, "seeded_from": seeded}
+            suggestions = []
+            for _ in range(n):
+                trial = study.ask(dists)
+                suggestions.append(trial.params)
+            return suggestions
         except Exception as e:
             log.debug("Suggestion failed: %s", e)
-            return None
+            return []
 
     def trial_log(self, trial_id: int, lines: int = 50) -> dict[str, Any]:
         """Return the last N lines of a trial's stdout log."""

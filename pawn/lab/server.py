@@ -61,9 +61,9 @@ async def lab_kill(trial_id: int, ctx: Context) -> str:
 
 
 @mcp.tool
-async def lab_results(ctx: Context, suggest_strategy: str | None = None) -> str:
-    """All trials with val_loss, accuracy, param count, wall time, key HPs, status, notes. Includes Pareto front. If suggest_strategy is set (e.g. 'bottleneck'), includes an Optuna suggestion for what to try next based on completed results."""
-    return _json(_runner(ctx).results(suggest_strategy))
+async def lab_results(strategy: str, ctx: Context) -> str:
+    """All trials with val_loss, accuracy, param count, wall time, key HPs, status, notes. Includes Pareto front and 3 Optuna suggestions for what to try next. Strategy determines the search space for suggestions: bottleneck, lora, film, sparse, hybrid, specialized_clm, unfreeze, rosa, retro-sparse, retro-bottleneck."""
+    return _json(_runner(ctx).results(strategy))
 
 
 @mcp.tool
