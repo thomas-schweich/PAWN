@@ -300,10 +300,19 @@ class TrialRunner:
             read_metrics(trial, self.log_dir, self._metrics_offsets)
 
             if trial.status == "killed":
-                # kill() set the status; we just need to release the GPU
-                # now that the process has actually exited
+                # Wait for the process to actually exit before releasing GPU.
+                # kill() sends SIGTERM but graceful shutdown (checkpoint save)
+                # can take 30-60s. The while loop above exits immediately when
+                # status changes to "killed", so we poll here.
+                if trial.pid:
+                    while True:
+                        alive, _ = is_alive(trial.pid)
+                        if not alive:
+                            break
+                        await asyncio.sleep(1.0)
                 if trial.gpu_id is not None:
                     self._release_gpu(trial.gpu_id)
+                read_metrics(trial, self.log_dir, self._metrics_offsets)
                 self._save_state()
             elif exit_code == 0 or trial.best_val_loss is not None:
                 self._complete(trial_id)
