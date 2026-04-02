@@ -174,13 +174,16 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
     no glob, no rate limits.
 
     ``max_games`` is a **global** limit across all DataLoader workers.
-    Each worker yields at most ``max_games // num_workers`` games (worker 0
-    gets the remainder).  When there are no workers (``num_workers=None``),
-    the full ``max_games`` budget applies.
+    Each worker yields ``max_games // num_workers`` games, with the
+    remainder distributed across workers 0..R-1 (one extra game each).
+    When there are no workers, the full ``max_games`` budget applies.
 
-    Shard order is re-shuffled at the start of every epoch using a
-    deterministic seed derived from ``seed + epoch``, so multi-epoch
-    training sees games in a different order each pass.
+    Shard order is re-shuffled at the start of every iteration using a
+    deterministic seed derived from ``seed + epoch``. Call
+    ``set_epoch(n)`` from the training loop before each epoch — this is
+    required because DataLoader workers get forked copies of the dataset
+    object (same pattern as ``DistributedSampler``). When
+    ``shuffle_shards=False``, no reshuffling occurs.
 
     Games are accumulated in a shuffle buffer (default 50K games) and
     yielded in random order, mixing games across shards within each batch.
@@ -231,8 +234,20 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
             rng = random.Random(seed)
             rng.shuffle(self.shard_files)
 
+        self.shuffle_shards = shuffle_shards
         self._epoch = 0
         self._storage_options = None if self._local else _hf_storage_options()
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch for deterministic shard reshuffling.
+
+        Call this from the training loop before each epoch. Required because
+        DataLoader workers (with persistent_workers=False) get forked copies
+        of the dataset — auto-incrementing ``_epoch`` in the worker doesn't
+        propagate back to the main process. This follows the same pattern as
+        ``DistributedSampler.set_epoch()``.
+        """
+        self._epoch = epoch
 
     def _build_filter(self) -> pl.Expr | None:
         """Build a Polars filter expression for Elo + min_ply."""
@@ -262,11 +277,13 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
     def __iter__(self):
         import random
 
-        # Re-shuffle this worker's shards with an epoch-dependent seed so
-        # each epoch sees a different shard order (deterministic).
         shards = list(self._worker_shards())
         rng = random.Random(self.seed + self._epoch)
-        rng.shuffle(shards)
+
+        # Re-shuffle shards with an epoch-dependent seed so each epoch sees
+        # a different order. Only when shuffle_shards=True (the default).
+        if self.shuffle_shards:
+            rng.shuffle(shards)
 
         # Compute per-worker game limit from the global max_games.
         worker_limit: int | None = None
@@ -336,8 +353,6 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         # Flush remaining games
         if buf:
             yield from _flush()
-
-        self._epoch += 1
 
 
 def load_val_shards(

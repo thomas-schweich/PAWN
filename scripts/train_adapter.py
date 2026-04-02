@@ -827,6 +827,8 @@ def train(model, trainable_params, train_loader, val_loader, mask_builder,
 
     epoch = max(start_epoch, 0)
     for epoch in range(start_epoch, args.epochs):
+        if hasattr(train_loader.dataset, 'set_epoch'):
+            train_loader.dataset.set_epoch(epoch)
         model.train()
         epoch_loss = 0.0
         epoch_top1 = 0.0
