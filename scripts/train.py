@@ -32,6 +32,8 @@ def parse_args():
                         help="Only train on games that ended naturally (no ply limit truncation)")
     parser.add_argument("--no-outcome-token", action="store_true",
                         help="Strip outcome token from sequences (ablation experiment)")
+    parser.add_argument("--mate-boost", type=float, default=0.0,
+                        help="Probability of taking mate-in-1 when available (0.0=random, 1.0=always)")
 
     # Architecture overrides (for sweeps — override the named variant)
     parser.add_argument("--d-model", type=int, default=None, help="Override d_model")
@@ -88,6 +90,8 @@ def main():
         train_cfg.discard_ply_limit = True
     if args.no_outcome_token:
         train_cfg.no_outcome_token = True
+    if args.mate_boost > 0.0:
+        train_cfg.mate_boost = args.mate_boost
 
     # Architecture overrides
     if args.d_model is not None:

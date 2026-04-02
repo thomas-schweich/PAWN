@@ -84,33 +84,59 @@ pub fn generate_training_batch(batch_size: usize, max_ply: usize, seed: u64) -> 
     }
 }
 
-/// Generate random games without labels. Spec §7.3.
-pub fn generate_random_games(n_games: usize, max_ply: usize, seed: u64) -> GameBatch {
-    let seeds = derive_game_seeds(seed, n_games);
-    let results: Vec<(Vec<u16>, u16, Termination)> = seeds
-        .into_par_iter()
-        .map(|s| generate_one_game(s, max_ply))
-        .collect();
-
-    let mut move_ids = vec![0i16; n_games * max_ply];
-    let mut game_lengths = Vec::with_capacity(n_games);
-    let mut termination_codes = Vec::with_capacity(n_games);
-
-    for (b, (moves, length, term)) in results.iter().enumerate() {
-        game_lengths.push(*length as i16);
-        termination_codes.push(term.as_u8());
-
-        for t in 0..(*length as usize) {
-            move_ids[b * max_ply + t] = moves[t] as i16;
+/// Generate random games without labels.
+///
+/// `mate_boost`: probability of taking mate-in-1 when available (0.0 = random, 1.0 = always).
+/// `discard_ply_limit`: if true, discard games that hit the ply limit and generate
+///   extra games until `n_games` completed games are collected.
+pub fn generate_random_games(
+    n_games: usize, max_ply: usize, seed: u64,
+    mate_boost: f64, discard_ply_limit: bool,
+) -> GameBatch {
+    let pack = |results: &[(Vec<u16>, u16, Termination)]| -> GameBatch {
+        let n = results.len();
+        let mut move_ids = vec![0i16; n * max_ply];
+        let mut game_lengths = Vec::with_capacity(n);
+        let mut termination_codes = Vec::with_capacity(n);
+        for (b, (moves, length, term)) in results.iter().enumerate() {
+            game_lengths.push(*length as i16);
+            termination_codes.push(term.as_u8());
+            for t in 0..(*length as usize) {
+                move_ids[b * max_ply + t] = moves[t] as i16;
+            }
         }
-    }
+        GameBatch { move_ids, game_lengths, termination_codes, n_games: n, max_ply }
+    };
 
-    GameBatch {
-        move_ids,
-        game_lengths,
-        termination_codes,
-        n_games,
-        max_ply,
+    if discard_ply_limit {
+        // Over-generate and filter
+        let batch_size = 4096.max(n_games * 2);
+        let mut collected: Vec<(Vec<u16>, u16, Termination)> = Vec::with_capacity(n_games);
+        let mut game_seed = seed;
+        while collected.len() < n_games {
+            let seeds = derive_game_seeds(game_seed, batch_size);
+            let results: Vec<(Vec<u16>, u16, Termination)> = seeds
+                .into_par_iter()
+                .map(|s| generate_one_game(s, max_ply, mate_boost))
+                .collect();
+            game_seed += batch_size as u64;
+            for result in results {
+                if result.2 != Termination::PlyLimit {
+                    collected.push(result);
+                    if collected.len() >= n_games {
+                        break;
+                    }
+                }
+            }
+        }
+        pack(&collected)
+    } else {
+        let seeds = derive_game_seeds(seed, n_games);
+        let results: Vec<(Vec<u16>, u16, Termination)> = seeds
+            .into_par_iter()
+            .map(|s| generate_one_game(s, max_ply, mate_boost))
+            .collect();
+        pack(&results)
     }
 }
 
@@ -159,53 +185,6 @@ pub fn generate_checkmate_training_batch(
     }
 }
 
-/// Generate random games, discarding any that hit the ply limit.
-/// Only keeps games that ended naturally (checkmate, stalemate, draw rules).
-pub fn generate_completed_games(n_games: usize, max_ply: usize, seed: u64) -> GameBatch {
-    let batch_size = 4096.max(n_games * 2);
-    let mut collected: Vec<(Vec<u16>, u16, Termination)> = Vec::with_capacity(n_games);
-    let mut game_seed = seed;
-
-    while collected.len() < n_games {
-        let seeds = derive_game_seeds(game_seed, batch_size);
-        let results: Vec<(Vec<u16>, u16, Termination)> = seeds
-            .into_par_iter()
-            .map(|s| generate_one_game(s, max_ply))
-            .collect();
-
-        game_seed += batch_size as u64;
-
-        for result in results {
-            if result.2 != Termination::PlyLimit {
-                collected.push(result);
-                if collected.len() >= n_games {
-                    break;
-                }
-            }
-        }
-    }
-
-    let mut move_ids = vec![0i16; n_games * max_ply];
-    let mut game_lengths = Vec::with_capacity(n_games);
-    let mut termination_codes = Vec::with_capacity(n_games);
-
-    for (b, (moves, length, term)) in collected.iter().enumerate() {
-        game_lengths.push(*length as i16);
-        termination_codes.push(term.as_u8());
-        for t in 0..(*length as usize) {
-            move_ids[b * max_ply + t] = moves[t] as i16;
-        }
-    }
-
-    GameBatch {
-        move_ids,
-        game_lengths,
-        termination_codes,
-        n_games,
-        max_ply,
-    }
-}
-
 /// Generate checkmate-only games with target counts per winner color.
 /// Generates games in parallel batches, discarding non-checkmates in real time.
 pub fn generate_checkmate_games(
@@ -229,7 +208,7 @@ pub fn generate_checkmate_games(
         let batch_seeds = derive_game_seeds(game_seed, batch_size);
         let results: Vec<(Vec<u16>, u16, Termination)> = batch_seeds
             .into_par_iter()
-            .map(|s| generate_one_game(s, max_ply))
+            .map(|s| generate_one_game(s, max_ply, 0.0))
             .collect();
 
         game_seed += batch_size as u64;
@@ -308,13 +287,12 @@ pub fn generate_clm_batch(
     seq_len: usize,
     seed: u64,
     discard_ply_limit: bool,
+    mate_boost: f64,
 ) -> CLMBatch {
     let max_ply = seq_len - 1;
 
-    let game_batch = if discard_ply_limit {
-        generate_completed_games(batch_size, max_ply, seed)
-    } else {
-        generate_random_games(batch_size, max_ply, seed)
+    let game_batch = {
+        generate_random_games(batch_size, max_ply, seed, mate_boost, discard_ply_limit)
     };
 
     let mut input_ids = vec![0i16; batch_size * seq_len];
@@ -389,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_random_games() {
-        let batch = generate_random_games(8, 256, 42);
+        let batch = generate_random_games(8, 256, 42, 0.0, false);
         assert_eq!(batch.move_ids.len(), 8 * 256);
         assert_eq!(batch.game_lengths.len(), 8);
     }
@@ -429,7 +407,7 @@ mod tests {
     #[test]
     fn test_clm_batch_format() {
         let seq_len = 256;
-        let batch = generate_clm_batch(8, seq_len, 42, false);
+        let batch = generate_clm_batch(8, seq_len, 42, false, 0.0);
         assert_eq!(batch.input_ids.len(), 8 * seq_len);
         assert_eq!(batch.targets.len(), 8 * seq_len);
         assert_eq!(batch.loss_mask.len(), 8 * seq_len);
@@ -482,8 +460,8 @@ mod tests {
 
     #[test]
     fn test_clm_batch_deterministic() {
-        let b1 = generate_clm_batch(4, 256, 99, false);
-        let b2 = generate_clm_batch(4, 256, 99, false);
+        let b1 = generate_clm_batch(4, 256, 99, false, 0.0);
+        let b2 = generate_clm_batch(4, 256, 99, false, 0.0);
         assert_eq!(b1.input_ids, b2.input_ids);
         assert_eq!(b1.targets, b2.targets);
         assert_eq!(b1.loss_mask, b2.loss_mask);
@@ -492,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_clm_batch_outcome_correctness() {
-        let batch = generate_clm_batch(32, 256, 42, false);
+        let batch = generate_clm_batch(32, 256, 42, false, 0.0);
         for b in 0..32 {
             let gl = batch.game_lengths[b] as usize;
             let tc = batch.termination_codes[b];

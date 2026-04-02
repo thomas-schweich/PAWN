@@ -71,8 +71,11 @@ pub fn generate_one_game_with_labels(seed: u64, max_ply: usize) -> GameRecord {
     }
 }
 
-/// Generate a single random game without labels (utility function).
-pub fn generate_one_game(seed: u64, max_ply: usize) -> (Vec<u16>, u16, Termination) {
+/// Generate a single random game without labels.
+///
+/// `mate_boost` controls mate-in-1 probability: 0.0 = pure random (default),
+/// 1.0 = always take mate when available, values in between interpolate.
+pub fn generate_one_game(seed: u64, max_ply: usize, mate_boost: f64) -> (Vec<u16>, u16, Termination) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut state = GameState::new();
     let mut move_ids = Vec::with_capacity(max_ply);
@@ -83,10 +86,37 @@ pub fn generate_one_game(seed: u64, max_ply: usize) -> (Vec<u16>, u16, Terminati
         }
 
         let tokens = state.legal_move_tokens();
-        let chosen = tokens[rng.gen_range(0..tokens.len())];
+
+        let chosen = if mate_boost > 0.0 {
+            if let Some(mate_move) = find_mate_in_one(&state, &tokens) {
+                if mate_boost >= 1.0 || rng.gen::<f64>() < mate_boost {
+                    mate_move
+                } else {
+                    tokens[rng.gen_range(0..tokens.len())]
+                }
+            } else {
+                tokens[rng.gen_range(0..tokens.len())]
+            }
+        } else {
+            tokens[rng.gen_range(0..tokens.len())]
+        };
+
         state.make_move(chosen).unwrap();
         move_ids.push(chosen);
     }
+}
+
+/// Check if any of the given legal moves delivers immediate checkmate.
+/// Returns the first mating move found, or None.
+fn find_mate_in_one(state: &GameState, tokens: &[u16]) -> Option<u16> {
+    for &token in tokens {
+        let mut test = state.clone();
+        test.make_move(token).unwrap();
+        if test.legal_moves().is_empty() && test.is_check() {
+            return Some(token);
+        }
+    }
+    None
 }
 
 /// Resolved game outcome with side-aware checkmate.
@@ -228,7 +258,7 @@ pub fn compute_accuracy_ceiling(
     // Generate all games first
     let games: Vec<(Vec<u16>, u16, Termination)> = game_seeds
         .par_iter()
-        .map(|&seed| generate_one_game(seed, max_ply))
+        .map(|&seed| generate_one_game(seed, max_ply, 0.0))
         .collect();
 
     // Resolve each game's Termination to a side-aware Outcome
@@ -466,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_generate_game() {
-        let (moves, length, term) = generate_one_game(42, 256);
+        let (moves, length, _term) = generate_one_game(42, 256, 0.0);
         assert_eq!(moves.len(), length as usize);
         assert!(length > 0);
         assert!(length <= 256);
@@ -482,18 +512,66 @@ mod tests {
 
     #[test]
     fn test_deterministic() {
-        let (m1, l1, t1) = generate_one_game(123, 256);
-        let (m2, l2, t2) = generate_one_game(123, 256);
+        let (m1, l1, t1) = generate_one_game(123, 256, 0.0);
+        let (m2, l2, t2) = generate_one_game(123, 256, 0.0);
         assert_eq!(m1, m2);
         assert_eq!(l1, l2);
         assert_eq!(t1, t2);
     }
 
     #[test]
+    fn test_mate_boost_deterministic() {
+        let (m1, l1, t1) = generate_one_game(123, 256, 1.0);
+        let (m2, l2, t2) = generate_one_game(123, 256, 1.0);
+        assert_eq!(m1, m2);
+        assert_eq!(l1, l2);
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn test_mate_boost_shorter_games() {
+        let n = 100;
+        let seeds = derive_game_seeds(42, n);
+        let normal_lengths: Vec<u16> = seeds.iter()
+            .map(|&s| generate_one_game(s, 256, 0.0).1)
+            .collect();
+        let boost_lengths: Vec<u16> = seeds.iter()
+            .map(|&s| generate_one_game(s, 256, 1.0).1)
+            .collect();
+        let avg_normal: f64 = normal_lengths.iter().map(|&l| l as f64).sum::<f64>() / n as f64;
+        let avg_boost: f64 = boost_lengths.iter().map(|&l| l as f64).sum::<f64>() / n as f64;
+        for i in 0..n {
+            assert!(boost_lengths[i] <= normal_lengths[i],
+                "Game {}: boost={} > normal={}", i, boost_lengths[i], normal_lengths[i]);
+        }
+        assert!(avg_boost < avg_normal,
+            "Expected shorter avg: boost={:.1} normal={:.1}", avg_boost, avg_normal);
+    }
+
+    #[test]
+    fn test_mate_boost_intermediate() {
+        // mate_boost=0.5 should produce checkmate rate between 0.0 and 1.0
+        let n = 200;
+        let seeds = derive_game_seeds(99, n);
+        let mates_0: usize = seeds.iter()
+            .filter(|&&s| generate_one_game(s, 256, 0.0).2 == Termination::Checkmate)
+            .count();
+        let mates_half: usize = seeds.iter()
+            .filter(|&&s| generate_one_game(s, 256, 0.5).2 == Termination::Checkmate)
+            .count();
+        let mates_1: usize = seeds.iter()
+            .filter(|&&s| generate_one_game(s, 256, 1.0).2 == Termination::Checkmate)
+            .count();
+        assert!(mates_half > mates_0,
+            "0.5 boost ({}) should have more mates than 0.0 ({})", mates_half, mates_0);
+        assert!(mates_half < mates_1,
+            "0.5 boost ({}) should have fewer mates than 1.0 ({})", mates_half, mates_1);
+    }
+
+    #[test]
     fn test_different_seeds() {
-        let (m1, _, _) = generate_one_game(1, 256);
-        let (m2, _, _) = generate_one_game(2, 256);
-        // Very unlikely to be the same
+        let (m1, _, _) = generate_one_game(1, 256, 0.0);
+        let (m2, _, _) = generate_one_game(2, 256, 0.0);
         assert_ne!(m1, m2);
     }
 }

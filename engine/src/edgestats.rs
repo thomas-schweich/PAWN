@@ -725,7 +725,7 @@ mod tests {
     #[test]
     fn test_initial_position_bits() {
         // Generate a short game and check initial ply
-        let batch = generate_random_games(1, 256, 42);
+        let batch = generate_random_games(1, 256, 42, 0.0, false);
         let (per_ply, white, black) = compute_edge_stats_per_ply(
             &batch.move_ids, &batch.game_lengths, 256,
         );
@@ -742,7 +742,7 @@ mod tests {
 
     #[test]
     fn test_edge_stats_accumulators() {
-        let batch = generate_random_games(10, 256, 42);
+        let batch = generate_random_games(10, 256, 42, 0.0, false);
         let (_, white, black) = compute_edge_stats_per_ply(
             &batch.move_ids, &batch.game_lengths, 256,
         );

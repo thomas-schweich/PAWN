@@ -183,13 +183,15 @@ class CLMDataset(torch.utils.data.IterableDataset):
     """
 
     def __init__(self, batch_size: int, max_ply: int, base_seed: int,
-                 discard_ply_limit: bool = False, no_outcome: bool = False):
+                 discard_ply_limit: bool = False, no_outcome: bool = False,
+                 mate_boost: float = 0.0):
         super().__init__()
         self.batch_size = batch_size
         self.max_ply = max_ply
         self.base_seed = base_seed
         self.discard_ply_limit = discard_ply_limit
         self.no_outcome = no_outcome
+        self.mate_boost = mate_boost
         self._start_step = 0
         self._main_pid = os.getpid()
 
@@ -222,6 +224,7 @@ class CLMDataset(torch.utils.data.IterableDataset):
                 engine.generate_clm_batch(
                     self.batch_size, self.max_ply, seed,
                     discard_ply_limit=self.discard_ply_limit,
+                    mate_boost=self.mate_boost,
                 )
             batch = {
                 "input_ids": torch.from_numpy(input_ids).long(),
@@ -238,6 +241,7 @@ def create_validation_set(
     n_games: int, max_ply: int, seed: int,
     discard_ply_limit: bool = False,
     no_outcome: bool = False,
+    mate_boost: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Generate a fixed validation set.
 
@@ -249,6 +253,7 @@ def create_validation_set(
     input_ids, targets, loss_mask, move_ids, game_lengths, _tc = \
         engine.generate_clm_batch(
             n_games, max_ply, seed, discard_ply_limit=discard_ply_limit,
+            mate_boost=mate_boost,
         )
     batch = {
         "input_ids": torch.from_numpy(input_ids).long(),
