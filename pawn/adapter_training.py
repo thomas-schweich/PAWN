@@ -559,7 +559,7 @@ def rosa_mask_generation(
 
     use_amp = amp_dtype is not None
     masks = generate_gradient_masks(
-        model,
+        model,  # type: ignore[arg-type]
         train_loader,
         mask_builder,
         density=args.density or 0.01,
@@ -799,7 +799,7 @@ def train(
     elif streaming:
         est_games = min(
             args.max_games or 1_000_000,
-            len(train_loader.dataset.shard_files) * 60_000,
+            len(train_loader.dataset.shard_files) * 60_000,  # type: ignore[union-attr]
         )
         total_steps = args.epochs * (est_games // args.batch_size)
     else:
@@ -824,13 +824,13 @@ def train(
         if "adapter_state_dict" in ckpt:
             state = ckpt["adapter_state_dict"]
             if hasattr(model, "load_adapter_state_dict"):
-                model.load_adapter_state_dict(state)
+                model.load_adapter_state_dict(state)  # type: ignore[operator]
             elif hasattr(model, "load_lora_state_dict"):
-                model.load_lora_state_dict(state)
+                model.load_lora_state_dict(state)  # type: ignore[operator]
             elif hasattr(model, "load_film_state_dict"):
-                model.load_film_state_dict(state)
+                model.load_film_state_dict(state)  # type: ignore[operator]
             elif hasattr(model, "load_sparse_state_dict"):
-                model.load_sparse_state_dict(state)
+                model.load_sparse_state_dict(state)  # type: ignore[operator]
             else:
                 model.load_state_dict(state, strict=False)
         if ckpt.get("optimizer_state_dict"):
@@ -945,7 +945,7 @@ def train(
     epoch = start_epoch  # default if loop doesn't execute (resume past end)
     for epoch in range(start_epoch, args.epochs):
         if hasattr(train_loader.dataset, "set_epoch"):
-            train_loader.dataset.set_epoch(epoch)
+            train_loader.dataset.set_epoch(epoch)  # type: ignore[union-attr]
         model.train()
         epoch_loss = 0.0
         epoch_top1 = 0.0
