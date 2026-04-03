@@ -55,10 +55,11 @@ The cron is your heartbeat — it's how you:
 
 **Hyperparameter sweep:**
 You drive the loop manually. At each check-in:
-1. `lab_results(suggest_strategy="bottleneck")` — review results + get an Optuna suggestion
-2. Decide what to try next based on results, patterns, and the suggestion
-3. `lab_launch` with your chosen config
-4. `lab_kill` to terminate unpromising running trials if needed
+1. `lab_schema` — discover all RunConfig fields (call once at startup)
+2. `lab_results(strategy="bottleneck")` — review results + get Optuna suggestions
+3. Decide what to try next based on results, patterns, and the suggestion
+4. `lab_launch(config={"run_type": "adapter", "strategy": "lora", "lora_rank": 4, "lr": 3e-4, ...})` — launch with a full RunConfig dict
+5. `lab_kill` to terminate unpromising running trials if needed
 
 **Single training run:**
 - Call `lab_launch` with the strategy and exact params
@@ -103,7 +104,8 @@ To switch intervals, delete the old cron with `CronDelete` and create a new one.
 | Tool | Purpose |
 |------|---------|
 | `lab_status` | GPUs, running trials with ETAs, cost. Best for first-contact orientation. Only updates val_loss/acc at eval intervals, so don't poll repeatedly for progress. |
-| `lab_results` | All trials with metrics + Pareto front. Pass `suggest_strategy="bottleneck"` to get an Optuna suggestion for what to try next. |
+| `lab_results` | All trials with metrics + Pareto front + Optuna suggestions. Optionally pass `strategy` to filter. |
+| `lab_schema` | Returns JSON Schema for all RunConfig fields. Call before `lab_launch` to discover available parameters. |
 | `lab_events` | New events since sequence N. Types: trial_started, trial_completed, trial_failed, trial_killed, gpu_idle. Call at every check-in. |
 
 ### Monitoring tools (call at check-ins)
@@ -117,7 +119,7 @@ To switch intervals, delete the old cron with `CronDelete` and create a new one.
 
 | Tool | Purpose |
 |------|---------|
-| `lab_launch` | Launch one trial (strategy + params + base_args) |
+| `lab_launch` | Launch one trial from a RunConfig dict. Call `lab_schema` first to see all fields. |
 | `lab_kill` | Kill a trial by ID (SIGTERM) |
 | `lab_set_cost` | Set $/hr rate for cost tracking |
 

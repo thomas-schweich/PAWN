@@ -29,7 +29,7 @@ class Trial:
     strategy: str
     params: dict[str, Any]
     cli_command: list[str]
-    base_args: dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(default_factory=dict)
     status: str = "queued"
     pid: int | None = None
     gpu_id: int | None = None
