@@ -23,17 +23,20 @@ from pawn.lab.state import Trial, _format_duration, _now_iso
 log = logging.getLogger("pawn.lab")
 
 
-def _params_to_cli(params: dict[str, Any]) -> list[str]:
-    """Convert a param dict to CLI args: lr=3e-4 -> ['--lr', '3e-4']."""
-    args: list[str] = []
-    for k, v in params.items():
-        flag = f"--{k.replace('_', '-')}"
-        if isinstance(v, bool):
-            if v:
-                args.append(flag)
-        else:
-            args.extend([flag, str(v)])
-    return args
+def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Validate a config dict against RunConfig and return the normalized dict.
+
+    Raises ``pydantic.ValidationError`` on bad input.
+    """
+    from pydantic import TypeAdapter
+
+    from pawn.run_config import AdapterConfig, PretrainConfig
+
+    run_type = config.get("run_type")
+    ta = TypeAdapter(
+        PretrainConfig if run_type == "pretrain" else AdapterConfig
+    )
+    return ta.validate_python(config).model_dump()
 
 
 class TrialRunner:
@@ -194,11 +197,29 @@ class TrialRunner:
 
     async def launch(
         self,
-        strategy: str,
+        config: dict[str, Any],
+        *,
+        # Legacy compat: if strategy/params/base_args are passed, merge
+        # them into a config dict automatically.
+        strategy: str | None = None,
         params: dict[str, Any] | None = None,
         base_args: dict[str, Any] | None = None,
     ) -> int:
-        """Launch a single trial. Returns trial_id."""
+        """Launch a single trial. Returns trial_id.
+
+        ``config`` is a dict matching ``RunConfig`` (either
+        ``PretrainConfig`` or ``AdapterConfig``).  It is validated and
+        written to a JSON file, then passed to ``scripts/train.py
+        --config``.
+        """
+        # Legacy shim: build a config dict from strategy/params/base_args
+        if strategy is not None:
+            merged: dict[str, Any] = {"run_type": "adapter", "strategy": strategy}
+            merged.update(base_args or {})
+            merged.update(params or {})
+            merged.update(config or {})
+            config = merged
+
         gpu_id = self._find_free_gpu()
         if gpu_id is None:
             raise RuntimeError(f"No free GPU (all {self.gpu_count} assigned)")
@@ -206,45 +227,48 @@ class TrialRunner:
         trial_id = self.next_trial_id
         self.next_trial_id += 1
 
-        merged_params = dict(params or {})
-        merged_base = dict(base_args or {})
-        cmd = self._build_command(strategy, merged_params, merged_base, trial_id)
+        # Apply defaults
+        trial_log_dir = str(self.log_dir / f"trial_{trial_id:04d}")
+        config.setdefault("log_dir", trial_log_dir)
+        config.setdefault("local_checkpoints", True)
 
+        # Validate via Pydantic
+        validated = _validate_config(config)
+        cmd = self._build_command(validated, trial_id)
+
+        strategy_display = validated.get("strategy") or validated.get("variant", "pretrain")
         trial = Trial(
             trial_id=trial_id,
-            strategy=strategy,
-            params=merged_params,
+            strategy=strategy_display,
+            config=validated,
+            params=validated,
             cli_command=cmd,
-            base_args=merged_base,
             gpu_id=gpu_id,
             log_path=str(self.results_dir / f"trial_{trial_id:04d}.log"),
-            total_steps=merged_base.get("total_steps", 0)
-                or merged_params.get("total_steps", 0),
+            total_steps=validated.get("total_steps", 0) or 0,
         )
         self.trials[trial_id] = trial
         self._assign_gpu(trial_id, gpu_id)
 
         await self._spawn(trial)
         self._emit("trial_started", trial_id, {
-            "strategy": strategy, "gpu": gpu_id, "params": merged_params,
+            "strategy": strategy_display, "gpu": gpu_id,
+            "config": validated,
         })
         self._save_state()
         self.render_progress_log()
         return trial_id
 
     def _build_command(
-        self, strategy: str, params: dict[str, Any], base_args: dict[str, Any],
-        trial_id: int,
+        self, config: dict[str, Any], trial_id: int,
     ) -> list[str]:
-        script = str(self.code_dir / "scripts" / "train_adapter.py")
-        trial_log_dir = str(self.log_dir / f"trial_{trial_id:04d}")
+        script = str(self.code_dir / "scripts" / "train.py")
+        config_dir = self.log_dir / f"trial_{trial_id:04d}"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "run_config.json"
+        config_path.write_text(json.dumps(config, indent=2, default=str))
 
-        cmd = [*self.python.split(), script, "--strategy", strategy]
-        ba = dict(base_args)
-        ba.setdefault("log_dir", trial_log_dir)
-        ba.setdefault("local_checkpoints", True)
-        cmd.extend(_params_to_cli(ba))
-        cmd.extend(_params_to_cli(params))
+        cmd = [*self.python.split(), script, "--config", str(config_path)]
         return cmd
 
     async def _spawn(self, trial: Trial) -> None:
@@ -417,6 +441,7 @@ class TrialRunner:
         running = []
         for t in self.trials.values():
             if t.status == "running":
+                cfg = t.config or t.params
                 running.append({
                     "trial": t.trial_id, "strategy": t.strategy,
                     "step": t.current_step, "total": t.total_steps,
@@ -424,7 +449,7 @@ class TrialRunner:
                     "eta": _format_duration(t.eta_seconds()),
                     "val_loss": t.best_val_loss, "acc": t.best_accuracy,
                     "params": t.actual_param_count, "pid": t.pid, "gpu": t.gpu_id,
-                    "key_hp": {k: v for k, v in t.params.items()
+                    "key_hp": {k: v for k, v in cfg.items()
                                if k in ("lr", "lora_rank", "bottleneck_dim",
                                         "density", "d_model", "n_layers", "batch_size")},
                 })
@@ -443,17 +468,18 @@ class TrialRunner:
             "estimated_cost": round(cost, 2) if cost else None,
         }
 
-    def results(self, strategy: str) -> dict[str, Any]:
+    def results(self, strategy: str | None = None) -> dict[str, Any]:
         rows = []
         for t in sorted(self.trials.values(), key=lambda t: t.trial_id):
             elapsed = (t.end_time - t.start_time) if t.end_time and t.start_time else None
+            cfg = t.config or t.params
             rows.append({
                 "trial": t.trial_id, "strategy": t.strategy,
                 "params": t.actual_param_count, "steps": t.current_step,
                 "val_loss": t.best_val_loss, "accuracy": t.best_accuracy,
                 "status": t.status, "notes": t.notes,
                 "wall_time": _format_duration(elapsed),
-                "key_hp": {k: v for k, v in t.params.items()
+                "key_hp": {k: v for k, v in cfg.items()
                            if k in ("lr", "lora_rank", "bottleneck_dim", "density",
                                     "d_model", "n_layers", "batch_size")},
             })
@@ -478,8 +504,17 @@ class TrialRunner:
                 pareto.append(r)
         pareto.sort(key=lambda r: r["params"])
 
+        # Infer strategy for suggestions from completed trials if not provided
+        suggest_strategy = strategy
+        if suggest_strategy is None and completed:
+            strategies = {r["strategy"] for r in completed}
+            if len(strategies) == 1:
+                suggest_strategy = strategies.pop()
         result: dict[str, Any] = {"trials": rows, "pareto_front": pareto}
-        result["suggestions"] = self._suggest(strategy, completed)
+        if suggest_strategy:
+            result["suggestions"] = self._suggest(suggest_strategy, completed)
+        else:
+            result["suggestions"] = []
         return result
 
     def _suggest(self, strategy: str, completed: list[dict[str, Any]], n: int = 3) -> list[dict[str, Any]]:
