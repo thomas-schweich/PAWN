@@ -24,7 +24,7 @@ def train_tmpdir():
         yield Path(d)
 
 
-def _wait_for_training_start(proc: subprocess.Popen, timeout: float = 60) -> None:
+def _wait_for_training_start(proc: subprocess.Popen, timeout: float = 30) -> None:
     """Wait until the training process prints 'Starting training'."""
     deadline = time.time() + timeout
     assert proc.stdout is not None
@@ -49,7 +49,8 @@ def test_sigterm_produces_valid_checkpoint(train_tmpdir):
             sys.executable, "scripts/train.py",
             "--run-type", "pretrain", "--variant", "toy",
             "--local-checkpoints",
-            "--total-steps", "5000",
+            "--total-steps", "500",
+            "--batch-size", "16",
             "--device", "cpu",
             "--num-workers", "0",
             "--log-dir", str(log_dir),
@@ -103,7 +104,8 @@ def test_sigterm_does_not_leave_tmp_dirs(train_tmpdir):
             sys.executable, "scripts/train.py",
             "--run-type", "pretrain", "--variant", "toy",
             "--local-checkpoints",
-            "--total-steps", "5000",
+            "--total-steps", "500",
+            "--batch-size", "16",
             "--device", "cpu",
             "--num-workers", "0",
             "--log-dir", str(log_dir),
