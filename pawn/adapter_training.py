@@ -896,6 +896,7 @@ def train(
 
     eval_interval = args.eval_interval
     step_limit = args.total_steps
+    pause_step = getattr(args, 'pause_after_steps', None)
 
     print(f"\nTraining for up to {args.epochs} epochs ({total_steps} steps)")
     print(
@@ -1040,6 +1041,8 @@ def train(
 
             if step_limit and global_step >= step_limit:
                 break
+            if pause_step and global_step >= pause_step:
+                break
             if _shutdown:
                 break
 
@@ -1095,6 +1098,9 @@ def train(
             break  # step-based early stopping triggered inside batch loop
         if step_limit and global_step >= step_limit:
             print(f"\n  Reached step limit ({step_limit})")
+            break
+        if pause_step and global_step >= pause_step:
+            print(f"\n  Paused at step {global_step} (pause_after_steps={pause_step})")
             break
         if _shutdown:
             print("Shutdown requested, saving checkpoint...")

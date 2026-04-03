@@ -35,6 +35,7 @@ class BaseRunConfig(BaseModel):
     patience: int | None = None
     eval_interval: int | None = None
     log_interval: int = 100
+    pause_after_steps: int | None = None
 
     # Ablations -----------------------------------------------------------
     mate_boost: float = 0.0

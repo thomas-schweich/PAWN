@@ -88,6 +88,7 @@ class TrialRunner:
 
         self._ensure_dirs()
         self._gpus_discovered = False
+        self._mps_active: bool | None = None
 
     # =======================================================================
     # Setup
@@ -166,18 +167,37 @@ class TrialRunner:
     # GPU management
     # =======================================================================
 
+    def _is_mps_active(self) -> bool:
+        """Detect if CUDA MPS daemon is running."""
+        if self._mps_active is None:
+            try:
+                out = subprocess.check_output(
+                    ["pgrep", "-f", "nvidia-cuda-mps"],
+                    text=True, timeout=5,
+                )
+                self._mps_active = bool(out.strip())
+            except Exception:
+                self._mps_active = False
+            if self._mps_active:
+                log.info("CUDA MPS detected — GPU isolation disabled")
+        return self._mps_active
+
     def _find_free_gpu(self) -> int | None:
         self._discover_gpus()
+        if self._is_mps_active():
+            return 0 if self.gpu_count > 0 else None
         for gpu_id, trial_id in self.gpu_assignments.items():
             if trial_id is None:
                 return gpu_id
         return None
 
     def _assign_gpu(self, trial_id: int, gpu_id: int) -> None:
-        self.gpu_assignments[gpu_id] = trial_id
+        if not self._is_mps_active():
+            self.gpu_assignments[gpu_id] = trial_id
 
     def _release_gpu(self, gpu_id: int) -> None:
-        self.gpu_assignments[gpu_id] = None
+        if not self._is_mps_active():
+            self.gpu_assignments[gpu_id] = None
 
     def gpu_utilization(self) -> list[dict[str, Any]]:
         """Return GPU info without importing torch into this process."""
@@ -187,6 +207,7 @@ class TrialRunner:
                 "gpu": i,
                 "total_mb": self.gpu_vram_mb[i] if i < len(self.gpu_vram_mb) else 0,
                 "assigned_trial": self.gpu_assignments.get(i),
+                "mps": self._is_mps_active(),
             }
             for i in range(self.gpu_count)
         ]
@@ -259,6 +280,35 @@ class TrialRunner:
         self.render_progress_log()
         return trial_id
 
+    async def resume_trial(
+        self,
+        trial_id: int,
+        total_steps: int | None = None,
+        pause_after_steps: int | None = None,
+    ) -> int:
+        """Resume a completed/failed trial from its best checkpoint."""
+        old = self.trials.get(trial_id)
+        if not old:
+            raise RuntimeError(f"Trial {trial_id} not found")
+        if not old.run_dir:
+            raise RuntimeError(f"Trial {trial_id} has no run directory")
+
+        ckpt_dir = Path(old.run_dir) / "checkpoints" / "best"
+        if not ckpt_dir.exists():
+            ckpt_dir = Path(old.run_dir) / "checkpoints" / "final"
+        if not ckpt_dir.exists():
+            raise RuntimeError(f"No checkpoint found for trial {trial_id}")
+
+        new_config = dict(old.config)
+        new_config.pop("pause_after_steps", None)
+        new_config["resume"] = str(ckpt_dir)
+        if total_steps is not None:
+            new_config["total_steps"] = total_steps
+        if pause_after_steps is not None:
+            new_config["pause_after_steps"] = pause_after_steps
+
+        return await self.launch(new_config)
+
     def _build_command(
         self, config: dict[str, Any], trial_id: int,
     ) -> list[str]:
@@ -272,9 +322,9 @@ class TrialRunner:
         return cmd
 
     async def _spawn(self, trial: Trial) -> None:
-        """Start the training process with GPU isolation."""
+        """Start the training process, with GPU isolation unless MPS is active."""
         env = os.environ.copy()
-        if trial.gpu_id is not None:
+        if trial.gpu_id is not None and not self._is_mps_active():
             env["CUDA_VISIBLE_DEVICES"] = str(trial.gpu_id)
 
         Path(trial.log_path).parent.mkdir(parents=True, exist_ok=True)

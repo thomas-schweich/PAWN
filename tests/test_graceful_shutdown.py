@@ -47,12 +47,11 @@ def test_sigterm_produces_valid_checkpoint(train_tmpdir):
     proc = subprocess.Popen(
         [
             sys.executable, "scripts/train.py",
-            "--toy",
+            "--run-type", "pretrain", "--variant", "toy",
             "--local-checkpoints",
             "--total-steps", "5000",
             "--device", "cpu",
             "--num-workers", "0",
-            "--checkpoint-dir", str(ckpt_dir),
             "--log-dir", str(log_dir),
         ],
         stdout=subprocess.PIPE,
@@ -102,12 +101,11 @@ def test_sigterm_does_not_leave_tmp_dirs(train_tmpdir):
     proc = subprocess.Popen(
         [
             sys.executable, "scripts/train.py",
-            "--toy",
+            "--run-type", "pretrain", "--variant", "toy",
             "--local-checkpoints",
             "--total-steps", "5000",
             "--device", "cpu",
             "--num-workers", "0",
-            "--checkpoint-dir", str(ckpt_dir),
             "--log-dir", str(log_dir),
         ],
         stdout=subprocess.PIPE,

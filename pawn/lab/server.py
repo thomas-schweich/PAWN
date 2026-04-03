@@ -61,6 +61,16 @@ async def lab_kill(trial_id: int, ctx: Context) -> str:
 
 
 @mcp.tool
+async def lab_resume(trial_id: int, ctx: Context, total_steps: int | None = None, pause_after_steps: int | None = None) -> str:
+    """Resume a completed/paused trial from its best checkpoint. Creates a new trial with the same config plus --resume. Override total_steps or pause_after_steps for iterative narrowing."""
+    try:
+        new_id = await _runner(ctx).resume_trial(trial_id, total_steps=total_steps, pause_after_steps=pause_after_steps)
+        return _json(_runner(ctx).trials[new_id].to_dict())
+    except RuntimeError as e:
+        return _json({"error": str(e)})
+
+
+@mcp.tool
 async def lab_results(ctx: Context, strategy: str | None = None) -> str:
     """All trials with val_loss, accuracy, param count, wall time, key HPs, status, notes. Includes Pareto front and Optuna suggestions. Optionally filter by strategy."""
     return _json(_runner(ctx).results(strategy))
