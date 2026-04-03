@@ -92,7 +92,7 @@ def main():
     print()
 
     # Process in batches for progress reporting
-    batch_size = getattr(args, 'batch_games', None) or max(100, args.n_games // 10)
+    batch_size = max(100, args.n_games // 10)
     n_batches = (args.n_games + batch_size - 1) // batch_size
 
     all_outcomes = []
@@ -273,7 +273,7 @@ def main():
         "mc_conditioning_boost": float(boost),
         "mc_corrected_conditioning_boost": float(boost_corr),
         "bias_bracket_pp": float((cond - cond_corr) * 100),
-        "n_positions": int(result["n_positions"]),
+        "n_positions": total_positions,
         "n_games": args.n_games,
         "n_rollouts": args.rollouts,
         "sample_rate": args.sample_rate,
