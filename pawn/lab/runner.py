@@ -295,9 +295,15 @@ class TrialRunner:
         if not old.run_dir:
             raise RuntimeError(f"Trial {trial_id} has no run directory")
 
-        ckpt_dir = Path(old.run_dir) / "checkpoints" / "best"
+        ckpt_base = Path(old.run_dir) / "checkpoints"
+        ckpt_dir = ckpt_base / "best"
         if not ckpt_dir.exists():
-            ckpt_dir = Path(old.run_dir) / "checkpoints" / "final"
+            ckpt_dir = ckpt_base / "final"
+        if not ckpt_dir.exists():
+            # Pretraining uses step_XXXXXXXX naming — pick the highest step
+            step_dirs = sorted(ckpt_base.glob("step_*"))
+            if step_dirs:
+                ckpt_dir = step_dirs[-1]
         if not ckpt_dir.exists():
             raise RuntimeError(f"No checkpoint found for trial {trial_id}")
 

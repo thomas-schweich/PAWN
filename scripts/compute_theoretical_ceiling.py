@@ -91,25 +91,92 @@ def main():
     print(f"  Seed: {args.seed}")
     print()
 
+    # Process in batches for progress reporting
+    batch_size = getattr(args, 'batch_games', None) or max(100, args.n_games // 10)
+    n_batches = (args.n_games + batch_size - 1) // batch_size
+
+    all_outcomes = []
+    all_conditionals = []
+    all_corrected = []
+    all_naive = []
+    all_unconditionals = []
+    all_game_ids = []
+    all_plies = []
+    all_game_lengths = []
+    total_positions = 0
+    game_id_offset = 0
+
     t0 = time.time()
-    result = engine.compute_accuracy_ceiling(
-        n_games=args.n_games,
-        max_ply=255,
-        n_rollouts=args.rollouts,
-        sample_rate=args.sample_rate,
-        seed=args.seed,
-    )
+    games_done = 0
+
+    for batch_idx in range(n_batches):
+        batch_n = min(batch_size, args.n_games - games_done)
+        batch_seed = args.seed + batch_idx * 100000
+
+        bt = time.time()
+        result = engine.compute_accuracy_ceiling(
+            n_games=batch_n,
+            max_ply=255,
+            n_rollouts=args.rollouts,
+            sample_rate=args.sample_rate,
+            seed=batch_seed,
+        )
+        batch_elapsed = time.time() - bt
+
+        n_pos = result["n_positions"]
+        total_positions += n_pos
+        games_done += batch_n
+
+        # Accumulate per-position arrays
+        all_outcomes.append(np.asarray(result["outcome"]))
+        all_conditionals.append(np.asarray(result["conditional"]))
+        all_corrected.append(np.asarray(result["conditional_corrected"]))
+        all_naive.append(np.asarray(result["naive_conditional"]))
+        all_unconditionals.append(np.asarray(result["unconditional"]))
+        all_game_ids.append(np.asarray(result["game_idx"]) + game_id_offset)
+        all_plies.append(np.asarray(result["ply"]))
+        all_game_lengths.append(np.asarray(result["game_length"]))
+        game_id_offset += batch_n
+
+        # Running estimates
+        uc_so_far = np.concatenate(all_unconditionals).mean()
+        mc_so_far = np.concatenate(all_conditionals).mean()
+        mc_corr_so_far = np.concatenate(all_corrected).mean()
+        bracket = (mc_so_far - mc_corr_so_far) * 100
+
+        elapsed_so_far = time.time() - t0
+        rate = games_done / elapsed_so_far
+        eta = (args.n_games - games_done) / rate if rate > 0 else 0
+
+        print(
+            f"[batch {batch_idx+1}/{n_batches}] "
+            f"{games_done}/{args.n_games} games, {total_positions:,} positions | "
+            f"uncond={uc_so_far:.4f}  mc=[{mc_corr_so_far:.4f}, {mc_so_far:.4f}] "
+            f"bracket={bracket:.3f}pp | "
+            f"{batch_elapsed:.0f}s/batch, ETA {eta/60:.0f}m",
+            flush=True,
+        )
+
     elapsed = time.time() - t0
 
-    uncond = result["unconditional_ceiling"]
-    naive_cond = result["naive_conditional_ceiling"]
-    cond = result["conditional_ceiling"]
-    cond_corr = result["conditional_corrected_ceiling"]
+    # Concatenate all batches
+    outcomes = np.concatenate(all_outcomes)
+    conditionals = np.concatenate(all_conditionals)
+    corrected_conditionals = np.concatenate(all_corrected)
+    naive_conditionals = np.concatenate(all_naive)
+    unconditionals = np.concatenate(all_unconditionals)
+    game_ids = np.concatenate(all_game_ids)
+
+    uncond = float(unconditionals.mean())
+    naive_cond = float(naive_conditionals.mean())
+    cond = float(conditionals.mean())
+    cond_corr = float(corrected_conditionals.mean())
     boost_naive = naive_cond / uncond if uncond > 0 else 0
     boost = cond / uncond if uncond > 0 else 0
     boost_corr = cond_corr / uncond if uncond > 0 else 0
 
-    print(f"Positions sampled: {result['n_positions']:,}")
+    print()
+    print(f"Positions sampled: {total_positions:,}")
     print(f"Unconditional ceiling:         {uncond:.4f} ({uncond*100:.2f}%)")
     print(f"Naive conditional ceiling:     {naive_cond:.4f} ({naive_cond*100:.2f}%)  {boost_naive:.2f}x")
     print(f"MC conditional (naive est.):   {cond:.4f} ({cond*100:.2f}%)  {boost:.2f}x  [biased up]")
@@ -117,14 +184,6 @@ def main():
     print(f"  Bias bracket width:          {(cond - cond_corr)*100:.3f}pp")
     print(f"Time: {elapsed:.0f}s")
     print()
-
-    # Per-position arrays
-    outcomes = np.asarray(result["outcome"])
-    conditionals = np.asarray(result["conditional"])
-    corrected_conditionals = np.asarray(result["conditional_corrected"])
-    naive_conditionals = np.asarray(result["naive_conditional"])
-    unconditionals = np.asarray(result["unconditional"])
-    game_ids = np.asarray(result["game_idx"])
 
     outcome_names = [
         "W checkmated", "B checkmated", "Stalemate", "75-move",
@@ -167,8 +226,8 @@ def main():
     print()
 
     # Per-ply-from-end breakdown
-    plies = np.asarray(result["ply"])
-    game_lengths = np.asarray(result["game_length"])
+    plies = np.concatenate(all_plies)
+    game_lengths = np.concatenate(all_game_lengths)
     plies_from_end = game_lengths - plies
 
     print("Ceiling by distance from game end:")

@@ -171,6 +171,7 @@ def run_pretrain(config: PretrainConfig) -> None:
     if config.eval_interval is not None:
         train_cfg.eval_interval = config.eval_interval
     train_cfg.checkpoint_interval = config.checkpoint_interval
+    train_cfg.pause_after_steps = config.pause_after_steps
     if config.log_dir:
         train_cfg.log_dir = config.log_dir
     train_cfg.use_wandb = config.wandb

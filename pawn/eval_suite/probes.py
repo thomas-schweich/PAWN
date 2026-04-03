@@ -226,11 +226,16 @@ def _extract_hidden_states(
     device: str,
     layer_idx: int,
     max_batch: int = 64,
+    no_outcome_token: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract hidden states at one layer for all valid positions.
 
     Uses early-stop forward: only computes transformer layers up to
     layer_idx, avoiding wasted compute and GPU memory for later layers.
+
+    When no_outcome_token=True, strips the outcome token from position 0
+    before feeding to the model (which was trained without it) and adjusts
+    the position offset accordingly.
 
     Returns (h_valid, valid_mask) on CPU:
         h_valid: (N_valid, d_model) — hidden states at move positions
@@ -241,6 +246,14 @@ def _extract_hidden_states(
     N, T = input_ids.shape
     max_ply = data["boards"].shape[1]
     d_model = model.cfg.d_model
+
+    if no_outcome_token:
+        # Strip outcome token at position 0; moves start at position 0 now
+        input_ids = input_ids[:, 1:]
+        loss_mask = loss_mask[:, 1:]
+        ply_offset = 0  # moves are at positions 0..max_ply-1
+    else:
+        ply_offset = 1  # moves are at positions 1..max_ply (position 0 is outcome)
 
     # Pre-compute valid mask and total count to pre-allocate output
     game_lengths = data["game_lengths"]
@@ -258,7 +271,7 @@ def _extract_hidden_states(
         batch_mask = loss_mask[start:end].to(device)
 
         h = _forward_to_layer(model, batch_ids, batch_mask, layer_idx)
-        h = h[:, 1:max_ply + 1, :]  # (B, max_ply, d_model)
+        h = h[:, ply_offset:ply_offset + max_ply, :]  # (B, max_ply, d_model)
 
         batch_valid = valid_mask[start:end]  # (B, max_ply)
         h_flat = h.cpu().reshape(B * max_ply, d_model)
@@ -402,6 +415,7 @@ def train_single_probe(
     lr: float = 1e-3,
     batch_size: int = 256,
     layer_idx: int = -1,
+    no_outcome_token: bool = False,
 ) -> dict:
     """Train a single probe (extracts hidden states internally).
 
@@ -409,8 +423,8 @@ def train_single_probe(
     train_all_probes which extracts hidden states once per layer.
     """
     model.eval()
-    train_h, train_valid = _extract_hidden_states(model, train_data, device, layer_idx)
-    val_h, val_valid = _extract_hidden_states(model, val_data, device, layer_idx)
+    train_h, train_valid = _extract_hidden_states(model, train_data, device, layer_idx, no_outcome_token=no_outcome_token)
+    val_h, val_valid = _extract_hidden_states(model, val_data, device, layer_idx, no_outcome_token=no_outcome_token)
 
     train_t = _extract_targets(probe_name, train_data, train_valid)
     val_t = _extract_targets(probe_name, val_data, val_valid)
@@ -471,11 +485,15 @@ def train_all_probes(
     lr: float = 1e-3,
     probe_names: list[str] | None = None,
     verbose: bool = True,
+    no_outcome_token: bool = False,
 ) -> dict:
     """Train all probes per-layer.
 
     Loops LAYER-first, PROBE-second: hidden states are extracted once per
     layer and reused across all probes, eliminating redundant forward passes.
+
+    When no_outcome_token=True, the outcome token is stripped from input
+    sequences before feeding to the model.
 
     Returns nested dict: results[probe_name][layer_name] = metrics
     """
@@ -499,8 +517,8 @@ def train_all_probes(
             torch.cuda.empty_cache()
 
         # Extract hidden states ONCE for this layer
-        train_h, train_valid = _extract_hidden_states(model, train_data, device, li)
-        val_h, val_valid = _extract_hidden_states(model, val_data, device, li)
+        train_h, train_valid = _extract_hidden_states(model, train_data, device, li, no_outcome_token=no_outcome_token)
+        val_h, val_valid = _extract_hidden_states(model, val_data, device, li, no_outcome_token=no_outcome_token)
 
         # Train every probe on these hidden states
         for pname in probe_names:
