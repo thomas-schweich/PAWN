@@ -50,7 +50,7 @@ async def lab_launch(config: dict[str, Any], ctx: Context) -> str:
     try:
         tid = await _runner(ctx).launch(config)
         return _json(_runner(ctx).trials[tid].to_dict())
-    except (RuntimeError, Exception) as e:
+    except Exception as e:
         return _json({"error": str(e)})
 
 

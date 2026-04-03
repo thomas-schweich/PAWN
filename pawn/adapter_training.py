@@ -299,7 +299,7 @@ def _build_sparse(
     from pawn.adapters.sparse import SparseCLM
 
     density = args.density or 0.01
-    attn_targets = ATTN_PRESETS[args.sparse_targets]
+    attn_targets = ATTN_PRESETS[args.sparse_targets or "qkvo"]
     model = SparseCLM(
         backbone,
         density=density,
@@ -610,7 +610,7 @@ def rosa_build_phase3(
     torch.cuda.empty_cache()
 
     backbone = load_backbone(args.checkpoint, device)
-    attn_targets = ATTN_PRESETS[args.lora_targets]
+    attn_targets = ATTN_PRESETS[args.lora_targets or "qkvo"]
 
     sparse_model = SparseCLM(
         backbone,
@@ -805,7 +805,7 @@ def train(
     else:
         total_steps = args.epochs * len(train_loader)
 
-    warmup_steps = int(args.warmup_frac * total_steps)
+    warmup_steps = args.warmup_steps if args.warmup_steps is not None else int(args.warmup_frac * total_steps)
     scheduler = cosine_warmup_schedule(optimizer, warmup_steps, total_steps)
     scaler = torch.amp.GradScaler() if amp_dtype is not None else None
 
@@ -896,7 +896,7 @@ def train(
 
     eval_interval = args.eval_interval
     step_limit = args.total_steps
-    pause_step = getattr(args, 'pause_after_steps', None)
+    pause_step = args.pause_after_steps
 
     print(f"\nTraining for up to {args.epochs} epochs ({total_steps} steps)")
     print(
@@ -1031,7 +1031,7 @@ def train(
                     _save_best(val_metrics, epoch)
                 else:
                     patience_counter += 1
-                    if patience_counter >= args.patience:
+                    if args.patience is not None and patience_counter >= args.patience:
                         print(
                             f"\n  Early stopping at step {global_step} "
                             f"(patience={args.patience})"
@@ -1087,14 +1087,14 @@ def train(
                 _save_best(val_metrics, epoch)
             else:
                 patience_counter += 1
-                if patience_counter >= args.patience:
+                if args.patience is not None and patience_counter >= args.patience:
                     print(
                         f"\n  Early stopping at epoch {epoch} "
                         f"(patience={args.patience})"
                     )
                     break
 
-        if eval_interval and patience_counter >= args.patience:
+        if eval_interval and args.patience is not None and patience_counter >= args.patience:
             break  # step-based early stopping triggered inside batch loop
         if step_limit and global_step >= step_limit:
             print(f"\n  Reached step limit ({step_limit})")

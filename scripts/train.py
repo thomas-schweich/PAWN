@@ -159,6 +159,10 @@ def run_pretrain(config: PretrainConfig) -> None:
     train_cfg.weight_decay = config.weight_decay
     if config.warmup_steps is not None:
         train_cfg.warmup_steps = config.warmup_steps
+    elif config.total_steps is not None:
+        train_cfg.warmup_steps = int(config.warmup_frac * config.total_steps)
+    else:
+        train_cfg.warmup_steps = int(config.warmup_frac * train_cfg.total_steps)
     train_cfg.max_grad_norm = config.max_grad_norm
     train_cfg.discard_ply_limit = config.discard_ply_limit
     train_cfg.no_outcome_token = config.no_outcome_token
@@ -461,10 +465,10 @@ def main() -> None:
     raw = _parse_cli()
 
     run_type = raw.get("run_type")
-    if run_type is None:
+    if run_type not in ("pretrain", "adapter"):
         _die(
-            "Must specify run type via --run-type (pretrain|adapter) "
-            "or in the JSON config"
+            f"run_type must be 'pretrain' or 'adapter', got {run_type!r}. "
+            "Specify via --run-type or in the JSON config."
         )
 
     ta = TypeAdapter(

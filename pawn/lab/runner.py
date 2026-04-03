@@ -33,6 +33,8 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
     from pawn.run_config import AdapterConfig, PretrainConfig
 
     run_type = config.get("run_type")
+    if run_type not in ("pretrain", "adapter"):
+        raise ValueError(f"run_type must be 'pretrain' or 'adapter', got {run_type!r}")
     ta = TypeAdapter(
         PretrainConfig if run_type == "pretrain" else AdapterConfig
     )
