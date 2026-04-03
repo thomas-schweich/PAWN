@@ -24,7 +24,7 @@ def train_tmpdir():
         yield Path(d)
 
 
-def _wait_for_training_start(proc: subprocess.Popen, timeout: float = 30) -> None:
+def _wait_for_training_start(proc: subprocess.Popen, timeout: float = 60) -> None:
     """Wait until the training process prints 'Starting training'."""
     deadline = time.time() + timeout
     assert proc.stdout is not None

@@ -481,8 +481,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        mp.set_start_method("forkserver", force=True)
-    except ValueError:
-        mp.set_start_method("spawn", force=True)
+    mp.set_start_method("spawn", force=True)
     main()
