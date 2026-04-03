@@ -44,6 +44,10 @@ def main():
     parser.add_argument("--n-epochs", type=int, default=20, help="Probe training epochs")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--run", type=str, default=None, help="Only evaluate this run dir name")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Evaluate a single checkpoint path directly (skips log-dir scan)")
+    parser.add_argument("--no-outcome-token", action="store_true",
+                        help="Strip outcome token from sequences (auto-detected from checkpoint config)")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -57,21 +61,34 @@ def main():
 
     # Find all runs with checkpoints
     runs = []
-    for config_path in sorted(log_dir.glob("run_*/config.json")):
-        run_dir = config_path.parent
-        if args.run and run_dir.name != args.run:
-            continue
-        # Find checkpoints: directory-based (safetensors) or legacy .pt
-        checkpoints = sorted(
-            [d for d in run_dir.glob("checkpoints/step_*") if d.is_dir()]
-            or list(run_dir.glob("checkpoints/step_*.pt"))
-        )
-        if not checkpoints:
-            continue
-        latest = checkpoints[-1]
-        with open(config_path) as f:
-            cfg = json.load(f)
-        runs.append((run_dir, latest, cfg))
+    if args.checkpoint:
+        # Direct checkpoint path — build a minimal run entry
+        ckpt_path = Path(args.checkpoint)
+        # Try to load config from checkpoint dir
+        cfg = {}
+        cfg_file = ckpt_path / "config.json"
+        if cfg_file.exists():
+            with open(cfg_file) as f:
+                cfg = json.load(f)
+        run_dir = log_dir
+        run_dir.mkdir(parents=True, exist_ok=True)
+        runs.append((run_dir, ckpt_path, cfg))
+    else:
+        for config_path in sorted(log_dir.glob("run_*/config.json")):
+            run_dir = config_path.parent
+            if args.run and run_dir.name != args.run:
+                continue
+            # Find checkpoints: directory-based (safetensors) or legacy .pt
+            checkpoints = sorted(
+                [d for d in run_dir.glob("checkpoints/step_*") if d.is_dir()]
+                or list(run_dir.glob("checkpoints/step_*.pt"))
+            )
+            if not checkpoints:
+                continue
+            latest = checkpoints[-1]
+            with open(config_path) as f:
+                cfg = json.load(f)
+            runs.append((run_dir, latest, cfg))
 
     if not runs:
         print("No runs with checkpoints found.")
@@ -100,9 +117,15 @@ def main():
 
         model = load_model_from_checkpoint(str(ckpt_path), device)
 
+        # Auto-detect no_outcome_token from checkpoint config
+        no_outcome = args.no_outcome_token or train_cfg.get("no_outcome_token", False)
+        if no_outcome:
+            print(f"  [no_outcome_token=True] Stripping outcome token from probe inputs")
+
         results = train_all_probes(
             model, train_data, val_data, device,
             per_layer=True, n_epochs=args.n_epochs, verbose=True,
+            no_outcome_token=no_outcome,
         )
 
         # Save results
@@ -112,6 +135,7 @@ def main():
             "step": int(step),
             "variant": variant,
             "discard_ply_limit": discard,
+            "no_outcome_token": no_outcome,
             "model_config": model_cfg,
             "probes": {
                 pname: {

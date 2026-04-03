@@ -517,6 +517,13 @@ class CLMTrainer:
                     self.save_checkpoint()
                     break
 
+                if (self.cfg.pause_after_steps
+                        and self.global_step >= self.cfg.pause_after_steps):
+                    print(f"\n  Paused at step {self.global_step} "
+                          f"(pause_after_steps={self.cfg.pause_after_steps})")
+                    self.save_checkpoint()
+                    break
+
                 if _shutdown_requested:
                     print(f"\nShutdown requested (signal {_shutdown_signal}), "
                           f"saving checkpoint at step {self.global_step}...")
