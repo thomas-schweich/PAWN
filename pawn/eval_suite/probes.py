@@ -929,20 +929,23 @@ def train_all_probes(
         sel_val_h = [all_val_h[i] for i in layer_indices]
         del all_train_h, all_val_h
     else:
-        # Single layer — use the original per-layer extractor to avoid
-        # computing and caching all layers just to discard them.
+        # Single layer — extract all layers in one pass (with AMP) but
+        # keep only the requested one.
         li = layer_indices[0]
         if verbose:
-            print(f"Extracting hidden states for layer {layer_names[0]}...")
-        train_h, train_valid = _extract_hidden_states(
-            model, train_data, device, li, no_outcome_token=no_outcome_token,
+            print(f"Extracting hidden states for layer {layer_names[0]} "
+                  f"(single forward pass)...")
+        all_train_h, train_valid = _extract_all_hidden_states(
+            model, train_data, device,
+            no_outcome_token=no_outcome_token, use_amp=use_amp,
         )
-        val_h, val_valid = _extract_hidden_states(
-            model, val_data, device, li, no_outcome_token=no_outcome_token,
+        all_val_h, val_valid = _extract_all_hidden_states(
+            model, val_data, device,
+            no_outcome_token=no_outcome_token, use_amp=use_amp,
         )
-        sel_train_h = [train_h]
-        sel_val_h = [val_h]
-        del train_h, val_h
+        sel_train_h = [all_train_h[li]]
+        sel_val_h = [all_val_h[li]]
+        del all_train_h, all_val_h
 
     if verbose:
         print(f"  {len(sel_train_h[0]):,} train positions, "
