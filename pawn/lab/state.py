@@ -40,6 +40,7 @@ class Trial:
     total_steps: int = 0
     steps_per_sec: float = 0.0
     last_train_loss: float | None = None
+    last_train_acc: float | None = None
     best_val_loss: float | None = None
     best_accuracy: float | None = None
     actual_param_count: int | None = None
@@ -48,8 +49,9 @@ class Trial:
     run_dir: str | None = None
     # Sweep
     optuna_number: int | None = None
-    # Agent notes
+    # Agent annotations
     notes: str = ""
+    tags: list[str] = field(default_factory=list)
 
     def eta_seconds(self) -> float | None:
         if self.steps_per_sec > 0 and self.total_steps > self.current_step:
