@@ -81,6 +81,7 @@ class TrialRunner:
         # Events
         self.events: list[dict[str, Any]] = []
         self.event_seq: int = 0
+        self._last_events_seq: int = 0
         self.start_time: float = time.time()
         self.cost_per_hour: float | None = None
 
@@ -488,8 +489,17 @@ class TrialRunner:
         except OSError as e:
             log.error("Failed to write event: %s", e)
 
-    def events_since(self, seq: int = 0) -> list[dict[str, Any]]:
-        return [e for e in self.events if e["seq"] > seq]
+    def events_since(self, seq: int | None = None) -> tuple[list[dict[str, Any]], int]:
+        """Return events since seq and update the cursor.
+
+        If seq is None, returns events since the last call (auto-tracking).
+        Returns (events, latest_seq).
+        """
+        if seq is None:
+            seq = self._last_events_seq
+        events = [e for e in self.events if e["seq"] > seq]
+        self._last_events_seq = self.event_seq
+        return events, self.event_seq
 
     # =======================================================================
     # Reporting

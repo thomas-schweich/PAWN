@@ -73,11 +73,11 @@ async def lab_results(ctx: Context, strategy: str | None = None) -> dict[str, An
 
 
 @mcp.tool
-async def lab_events(ctx: Context, since: int = 0) -> dict[str, Any]:
-    """Events since a sequence number. Types: trial_started, trial_completed, trial_failed, trial_killed, gpu_idle, health_warning. Use since=0 for all."""
+async def lab_events(ctx: Context, since: int | None = None) -> dict[str, Any]:
+    """Events since a sequence number. Types: trial_started, trial_completed, trial_failed, trial_killed, gpu_idle, health_warning. Omit 'since' to get events since last call (auto-tracked). Pass since=0 for all events."""
     runner = _runner(ctx)
-    events = runner.events_since(since)
-    return {"events": events, "latest_seq": runner.event_seq}
+    events, latest_seq = runner.events_since(since)
+    return {"events": events, "latest_seq": latest_seq}
 
 
 @mcp.tool
