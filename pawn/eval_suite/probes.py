@@ -277,6 +277,7 @@ def _extract_hidden_states(
     layer_idx: int,
     max_batch: int = 64,
     no_outcome_token: bool = False,
+    use_amp: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract hidden states at one layer for all valid positions.
 
@@ -286,6 +287,9 @@ def _extract_hidden_states(
     When no_outcome_token=True, strips the outcome token from position 0
     before feeding to the model (which was trained without it) and adjusts
     the position offset accordingly.
+
+    Args:
+        use_amp: use float16 autocast for the forward pass (GPU only).
 
     Returns (h_valid, valid_mask) on CPU:
         h_valid: (N_valid, d_model) — hidden states at move positions
@@ -314,14 +318,20 @@ def _extract_hidden_states(
     h_out = torch.empty(n_valid, d_model)
     offset = 0
 
+    amp_enabled = use_amp and device != "cpu"
+
     for start in range(0, N, max_batch):
         end = min(start + max_batch, N)
         B = end - start
         batch_ids = input_ids[start:end].to(device)
         batch_mask = loss_mask[start:end].to(device)
 
-        h = _forward_to_layer(model, batch_ids, batch_mask, layer_idx)
-        h = h[:, ply_offset:ply_offset + max_ply, :]  # (B, max_ply, d_model)
+        if amp_enabled:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                h = _forward_to_layer(model, batch_ids, batch_mask, layer_idx)
+        else:
+            h = _forward_to_layer(model, batch_ids, batch_mask, layer_idx)
+        h = h[:, ply_offset:ply_offset + max_ply, :].float()  # (B, max_ply, d_model)
 
         batch_valid = valid_mask[start:end]  # (B, max_ply)
         h_flat = h.cpu().reshape(B * max_ply, d_model)
@@ -894,7 +904,7 @@ def train_all_probes(
     Returns nested dict: ``results[probe_name][layer_name] = metrics``
     """
     if probe_names is None:
-        probe_names = [p for p in PROBES if p in PROBES]
+        probe_names = list(PROBES.keys())
 
     n_layers = model.cfg.n_layers
     layer_indices = list(range(n_layers + 1)) if per_layer else [n_layers]
@@ -929,23 +939,22 @@ def train_all_probes(
         sel_val_h = [all_val_h[i] for i in layer_indices]
         del all_train_h, all_val_h
     else:
-        # Single layer — extract all layers in one pass (with AMP) but
-        # keep only the requested one.
+        # Single layer — use the early-stop extractor to avoid allocating
+        # CPU tensors for all n_layers+1 layers just to discard them.
         li = layer_indices[0]
         if verbose:
-            print(f"Extracting hidden states for layer {layer_names[0]} "
-                  f"(single forward pass)...")
-        all_train_h, train_valid = _extract_all_hidden_states(
-            model, train_data, device,
+            print(f"Extracting hidden states for layer {layer_names[0]}...")
+        train_h, train_valid = _extract_hidden_states(
+            model, train_data, device, li,
             no_outcome_token=no_outcome_token, use_amp=use_amp,
         )
-        all_val_h, val_valid = _extract_all_hidden_states(
-            model, val_data, device,
+        val_h, val_valid = _extract_hidden_states(
+            model, val_data, device, li,
             no_outcome_token=no_outcome_token, use_amp=use_amp,
         )
-        sel_train_h = [all_train_h[li]]
-        sel_val_h = [all_val_h[li]]
-        del all_train_h, all_val_h
+        sel_train_h = [train_h]
+        sel_val_h = [val_h]
+        del train_h, val_h
 
     if verbose:
         print(f"  {len(sel_train_h[0]):,} train positions, "
