@@ -459,12 +459,21 @@ class TrialRunner:
                 os.kill(trial.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+        # Final metrics read before marking killed
+        read_metrics(trial, self.log_dir, self._metrics_offsets)
         trial.status = "killed"
         trial.end_time = time.time()
         self._emit("trial_killed", trial_id)
         self._save_state()
         self.render_progress_log()
-        return {"killed": trial_id}
+        return {
+            "killed": trial_id,
+            "step": trial.current_step,
+            "train_loss": trial.last_train_loss,
+            "train_acc": trial.last_train_acc,
+            "val_loss": trial.best_val_loss,
+            "val_acc": trial.best_accuracy,
+        }
 
     # =======================================================================
     # Events
