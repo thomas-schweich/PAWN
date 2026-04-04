@@ -469,10 +469,10 @@ def _compute_mae(logits: torch.Tensor, targets: torch.Tensor) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _compute_batched_loss(
+def _compute_batched_loss_per_layer(
     logits: torch.Tensor, targets: torch.Tensor, loss_type: str, n_outputs: int,
 ) -> torch.Tensor:
-    """Sum of per-layer mean losses (equivalent to independent training with AdamW).
+    """Per-layer mean losses. Returns ``(L,)`` tensor.
 
     logits: ``(L, B, n_outputs)``
     targets: ``(B, ...)`` shared across layers.
@@ -483,23 +483,23 @@ def _compute_batched_loss(
         flat_logits = logits.reshape(L * B, -1)
         flat_targets = targets.unsqueeze(0).expand(L, -1).reshape(L * B)
         per = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        return per.reshape(L, B).mean(dim=1).sum()
+        return per.reshape(L, B).mean(dim=1)
 
     elif loss_type == "ce_per_square":
         flat_logits = logits.reshape(-1, 13)
         flat_targets = targets.unsqueeze(0).expand(L, B, 64).reshape(-1)
         per = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        return per.reshape(L, -1).mean(dim=1).sum()
+        return per.reshape(L, -1).mean(dim=1)
 
     elif loss_type == "bce":
         exp_t = targets.unsqueeze(0).expand_as(logits)
         per = F.binary_cross_entropy_with_logits(logits, exp_t, reduction="none")
-        return per.reshape(L, -1).mean(dim=1).sum()
+        return per.reshape(L, -1).mean(dim=1)
 
     elif loss_type == "mse":
         exp_t = targets.unsqueeze(0).expand_as(logits)
         per = F.mse_loss(logits, exp_t, reduction="none")
-        return per.reshape(L, -1).mean(dim=1).sum()
+        return per.reshape(L, -1).mean(dim=1)
 
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
@@ -528,10 +528,12 @@ def _compute_batched_accuracy(
         return (preds == targets.unsqueeze(0)).float().mean(dim=(1, 2))
 
     elif loss_type == "mse":
-        exp_t = targets.unsqueeze(0).expand_as(logits)
-        ss_res = ((logits - exp_t) ** 2).sum(dim=(1, 2))
-        ss_tot = ((exp_t - exp_t.mean(dim=1, keepdim=True)) ** 2).sum(dim=(1, 2))
-        return 1.0 - ss_res / (ss_tot + 1e-8)
+        # MSE R² requires global ss_res/ss_tot accumulation — per-batch R²
+        # is statistically noisy. Use _eval_batched_in_batches which handles
+        # this correctly. This branch should not be called directly.
+        raise NotImplementedError(
+            "Use _eval_batched_in_batches for MSE probes (requires global R² accumulation)"
+        )
 
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
@@ -717,7 +719,8 @@ def _eval_batched_in_batches(
             accs = _compute_batched_accuracy(logits, t_batch, loss_type, n_outputs)
             total_correct += accs * B
             total += B
-        return (total_correct / max(total, 1)).cpu()
+        assert total > 0, "Empty validation set — cannot compute accuracy"
+        return (total_correct / total).cpu()
 
 
 def _eval_batched_loss_in_batches(
@@ -740,10 +743,7 @@ def _eval_batched_loss_in_batches(
         t_batch = targets[i:i + batch_size].to(device)
         B = h_batch.shape[1]
         logits = probe(h_batch)  # (L, B, n_out)
-
-        for l in range(L):
-            loss_val = _compute_loss(logits[l], t_batch, loss_type, n_outputs).item()
-            total_loss[l] += loss_val * B
+        total_loss += _compute_batched_loss_per_layer(logits, t_batch, loss_type, n_outputs) * B
         total += B
 
     return (total_loss / max(total, 1)).cpu()
@@ -816,7 +816,7 @@ def _train_probe_all_layers(
             t_batch = train_t[idx].to(device)
 
             logits = probe(h_batch)  # (L, B, n_outputs)
-            loss = _compute_batched_loss(logits, t_batch, loss_type, n_outputs)
+            loss = _compute_batched_loss_per_layer(logits, t_batch, loss_type, n_outputs).sum()
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -971,15 +971,17 @@ def train_all_probes(
 
         if verbose:
             loss_type = PROBES[pname][1]
-            best_idx = max(range(len(layer_results)),
-                          key=lambda i: layer_results[i]["best_accuracy"])
-            m = layer_results[best_idx]
+            # Print per-layer metrics
+            accs = [r["best_accuracy"] for r in layer_results]
+            best_idx = max(range(len(accs)), key=lambda i: accs[i])
             if loss_type == "mse":
-                print(f"  {pname:>20s}: best R²={m['best_accuracy']:.4f} "
-                      f"MAE={m.get('mae', 0):.3f} @ {layer_names[best_idx]}")
+                vals = [f"{a:.3f}" for a in accs]
+                print(f"  {pname:>20s}: R² {' → '.join(vals)}  "
+                      f"(best={accs[best_idx]:.4f} @ {layer_names[best_idx]})")
             else:
-                print(f"  {pname:>20s}: best={m['best_accuracy']:.4f} "
-                      f"@ {layer_names[best_idx]}")
+                vals = [f"{a:.3f}" for a in accs]
+                print(f"  {pname:>20s}: {' → '.join(vals)}  "
+                      f"(best={accs[best_idx]:.4f} @ {layer_names[best_idx]})")
 
         del train_t, val_t
 
