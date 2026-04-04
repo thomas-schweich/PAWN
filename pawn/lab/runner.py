@@ -505,7 +505,8 @@ class TrialRunner:
                     "step": t.current_step, "total": t.total_steps,
                     "sps": round(t.steps_per_sec, 2),
                     "eta": _format_duration(t.eta_seconds()),
-                    "val_loss": t.best_val_loss, "acc": t.best_accuracy,
+                    "train_loss": t.last_train_loss, "train_acc": t.last_train_acc,
+                    "val_loss": t.best_val_loss, "val_acc": t.best_accuracy,
                     "params": t.actual_param_count, "pid": t.pid, "gpu": t.gpu_id,
                     "key_hp": {k: v for k, v in cfg.items()
                                if k in ("lr", "lora_rank", "bottleneck_dim",

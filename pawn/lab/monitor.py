@@ -95,6 +95,9 @@ def read_metrics(
                 trial.steps_per_sec = 1.0 / st
             elif rec.get("elapsed") and trial.current_step > 0:
                 trial.steps_per_sec = trial.current_step / rec["elapsed"]
+            train_acc = rec.get("train/accuracy") or rec.get("train_top1")
+            if train_acc is not None:
+                trial.last_train_acc = train_acc
             # Adapter scripts log val in train records
             vl = rec.get("val_loss") or rec.get("val/loss")
             if vl is not None and (trial.best_val_loss is None or vl < trial.best_val_loss):

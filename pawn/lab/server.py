@@ -36,7 +36,7 @@ def _runner(ctx: Context) -> TrialRunner:
 
 @mcp.tool
 async def lab_status(ctx: Context) -> dict[str, Any]:
-    """Compact lab status: GPUs, running trials (ID, strategy, key HPs, step/total, ETA, val_loss), counts, elapsed time, cost."""
+    """Compact lab status: GPUs, running trials (ID, strategy, key HPs, step/total, ETA, train_loss, train_acc, val_loss, val_acc), counts, elapsed time, cost. Train metrics update every log_interval steps; val metrics update at eval_interval. Use lab_log for real-time stdout."""
     return _runner(ctx).status()
 
 

@@ -40,6 +40,7 @@ class Trial:
     total_steps: int = 0
     steps_per_sec: float = 0.0
     last_train_loss: float | None = None
+    last_train_acc: float | None = None
     best_val_loss: float | None = None
     best_accuracy: float | None = None
     actual_param_count: int | None = None
