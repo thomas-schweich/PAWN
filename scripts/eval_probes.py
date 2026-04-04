@@ -48,6 +48,8 @@ def main():
                         help="Evaluate a single checkpoint path directly (skips log-dir scan)")
     parser.add_argument("--no-outcome-token", action="store_true",
                         help="Strip outcome token from sequences (auto-detected from checkpoint config)")
+    parser.add_argument("--top-layer-only", action="store_true",
+                        help="Only probe the top layer (skip per-layer sweep)")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -124,8 +126,8 @@ def main():
 
         results = train_all_probes(
             model, train_data, val_data, device,
-            per_layer=True, n_epochs=args.n_epochs, verbose=True,
-            no_outcome_token=no_outcome,
+            per_layer=not args.top_layer_only, n_epochs=args.n_epochs, verbose=True,
+            no_outcome_token=no_outcome, use_amp=(device != "cpu"),
         )
 
         # Save results

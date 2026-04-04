@@ -5,6 +5,7 @@ material_count, legal_move_count, halfmove_clock, game_phase, is_square_attacked
 """
 
 import gc
+import math
 
 import numpy as np
 import torch
@@ -46,6 +47,25 @@ class LinearProbe(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x)
+
+
+class BatchedLinearProbe(nn.Module):
+    """L independent linear probes packed into a single batched matmul.
+
+    Trains all layers for one probe simultaneously via ``torch.bmm``,
+    analogous to how ``train_all.py`` trains multiple model variants
+    on shared data batches.
+    """
+
+    def __init__(self, n_probes: int, d_model: int, n_outputs: int):
+        super().__init__()
+        scale = 1.0 / math.sqrt(d_model)
+        self.weight = nn.Parameter(torch.randn(n_probes, d_model, n_outputs) * scale)
+        self.bias = nn.Parameter(torch.zeros(n_probes, 1, n_outputs))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (L, B, d_model) -> (L, B, n_outputs)"""
+        return torch.bmm(x, self.weight) + self.bias
 
 
 # ---------------------------------------------------------------------------
@@ -149,10 +169,12 @@ def get_probe_targets(
     elif probe_name == "material_count":
         boards = data["boards"][B_idx, ply_indices]  # (N, 8, 8)
         flat = boards.reshape(-1, 64)
-        counts = []
-        for piece_id in _WHITE_PIECES + _BLACK_PIECES:
-            counts.append((flat == piece_id).sum(dim=-1).float())
-        return torch.stack(counts, dim=-1)  # (N, 10)
+        # Vectorized: broadcast compare all 10 piece types at once
+        piece_ids = torch.tensor(
+            _WHITE_PIECES + _BLACK_PIECES, dtype=flat.dtype, device=flat.device,
+        )
+        # (N, 64, 1) == (1, 1, 10) -> (N, 64, 10) -> sum over squares -> (N, 10)
+        return (flat.unsqueeze(-1) == piece_ids.view(1, 1, -1)).float().sum(dim=1)
 
     elif probe_name == "legal_move_count":
         return data["legal_move_counts"][B_idx, ply_indices].unsqueeze(-1)
@@ -219,6 +241,34 @@ def _forward_to_layer(
     return x
 
 
+def _forward_all_layers(
+    model: PAWNCLM,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Run model forward once, returning hidden states at every layer.
+
+    Returns list of length ``n_layers + 1``:
+    ``[embed_out, layer_0_out, ..., layer_{n-1}_out]``.
+    Each element is ``(B, T, d_model)``.
+    """
+    x = model.embed(input_ids)
+    outputs = [x]
+
+    T = input_ids.shape[1]
+    causal = model.causal_mask[:T, :T]
+    padding = attention_mask.unsqueeze(1).unsqueeze(2)
+    mask = causal.unsqueeze(0) & padding
+    rope_cos = model.rope_cos[:, :, :T, :]
+    rope_sin = model.rope_sin[:, :, :T, :]
+
+    for layer in model.layers:
+        x = layer(x, rope_cos, rope_sin, mask)
+        outputs.append(x)
+
+    return outputs
+
+
 @torch.no_grad()
 def _extract_hidden_states(
     model: PAWNCLM,
@@ -227,6 +277,7 @@ def _extract_hidden_states(
     layer_idx: int,
     max_batch: int = 64,
     no_outcome_token: bool = False,
+    use_amp: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract hidden states at one layer for all valid positions.
 
@@ -236,6 +287,9 @@ def _extract_hidden_states(
     When no_outcome_token=True, strips the outcome token from position 0
     before feeding to the model (which was trained without it) and adjusts
     the position offset accordingly.
+
+    Args:
+        use_amp: use float16 autocast for the forward pass (GPU only).
 
     Returns (h_valid, valid_mask) on CPU:
         h_valid: (N_valid, d_model) — hidden states at move positions
@@ -264,14 +318,20 @@ def _extract_hidden_states(
     h_out = torch.empty(n_valid, d_model)
     offset = 0
 
+    amp_enabled = use_amp and device != "cpu"
+
     for start in range(0, N, max_batch):
         end = min(start + max_batch, N)
         B = end - start
         batch_ids = input_ids[start:end].to(device)
         batch_mask = loss_mask[start:end].to(device)
 
-        h = _forward_to_layer(model, batch_ids, batch_mask, layer_idx)
-        h = h[:, ply_offset:ply_offset + max_ply, :]  # (B, max_ply, d_model)
+        if amp_enabled:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                h = _forward_to_layer(model, batch_ids, batch_mask, layer_idx)
+        else:
+            h = _forward_to_layer(model, batch_ids, batch_mask, layer_idx)
+        h = h[:, ply_offset:ply_offset + max_ply, :].float()  # (B, max_ply, d_model)
 
         batch_valid = valid_mask[start:end]  # (B, max_ply)
         h_flat = h.cpu().reshape(B * max_ply, d_model)
@@ -283,6 +343,80 @@ def _extract_hidden_states(
         del h, batch_ids, batch_mask
 
     return h_out, valid_mask
+
+
+@torch.no_grad()
+def _extract_all_hidden_states(
+    model: PAWNCLM,
+    data: dict,
+    device: str,
+    max_batch: int = 64,
+    no_outcome_token: bool = False,
+    use_amp: bool = False,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """Extract hidden states at ALL layers via a single forward pass.
+
+    Instead of calling ``_forward_to_layer`` once per layer (which
+    re-computes all preceding layers each time, O(n_layers^2) total work),
+    this runs the model forward once and caches every layer's output.
+
+    Args:
+        use_amp: use float16 autocast for the forward pass (CUDA only).
+
+    Returns ``(all_h, valid_mask)``:
+        all_h: list of ``(N_valid, d_model)`` CPU tensors, one per layer
+            (embed + n transformer layers).
+        valid_mask: ``(N, max_ply)`` bool tensor.
+    """
+    input_ids = data["input_ids"]
+    loss_mask = data["loss_mask"]
+    N, T = input_ids.shape
+    max_ply = data["boards"].shape[1]
+    d_model = model.cfg.d_model
+    n_out_layers = model.cfg.n_layers + 1
+
+    if no_outcome_token:
+        input_ids = input_ids[:, 1:]
+        loss_mask = loss_mask[:, 1:]
+        ply_offset = 0
+    else:
+        ply_offset = 1
+
+    game_lengths = data["game_lengths"]
+    ply_grid = torch.arange(max_ply).unsqueeze(0)
+    valid_mask = ply_grid < torch.from_numpy(game_lengths).long().unsqueeze(1)
+    n_valid = int(valid_mask.sum())
+
+    all_h = [torch.empty(n_valid, d_model) for _ in range(n_out_layers)]
+    offsets = [0] * n_out_layers
+
+    amp_enabled = use_amp and device != "cpu"
+
+    for start in range(0, N, max_batch):
+        end = min(start + max_batch, N)
+        B = end - start
+        batch_ids = input_ids[start:end].to(device)
+        batch_mask = loss_mask[start:end].to(device)
+
+        if amp_enabled:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                layer_outputs = _forward_all_layers(model, batch_ids, batch_mask)
+        else:
+            layer_outputs = _forward_all_layers(model, batch_ids, batch_mask)
+
+        batch_valid = valid_mask[start:end]
+        m_flat = batch_valid.reshape(B * max_ply)
+        n = int(m_flat.sum())
+
+        for li, h in enumerate(layer_outputs):
+            h_slice = h[:, ply_offset:ply_offset + max_ply, :].float()
+            h_flat = h_slice.cpu().reshape(B * max_ply, d_model)
+            all_h[li][offsets[li]:offsets[li] + n] = h_flat[m_flat]
+            offsets[li] += n
+
+        del layer_outputs, batch_ids, batch_mask
+
+    return all_h, valid_mask
 
 
 def _extract_targets(
@@ -338,6 +472,81 @@ def _compute_accuracy(logits: torch.Tensor, targets: torch.Tensor, loss_type: st
 def _compute_mae(logits: torch.Tensor, targets: torch.Tensor) -> float:
     """Mean absolute error for regression probes."""
     return (logits - targets).abs().mean().item()
+
+
+# ---------------------------------------------------------------------------
+# Batched loss / accuracy (multi-layer probes)
+# ---------------------------------------------------------------------------
+
+
+def _compute_batched_loss_per_layer(
+    logits: torch.Tensor, targets: torch.Tensor, loss_type: str, n_outputs: int,
+) -> torch.Tensor:
+    """Per-layer mean losses. Returns ``(L,)`` tensor.
+
+    logits: ``(L, B, n_outputs)``
+    targets: ``(B, ...)`` shared across layers.
+    """
+    L, B, _ = logits.shape
+
+    if loss_type == "ce":
+        flat_logits = logits.reshape(L * B, -1)
+        flat_targets = targets.unsqueeze(0).expand(L, -1).reshape(L * B)
+        per = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+        return per.reshape(L, B).mean(dim=1)
+
+    elif loss_type == "ce_per_square":
+        flat_logits = logits.reshape(-1, 13)
+        flat_targets = targets.unsqueeze(0).expand(L, B, 64).reshape(-1)
+        per = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+        return per.reshape(L, -1).mean(dim=1)
+
+    elif loss_type == "bce":
+        exp_t = targets.unsqueeze(0).expand_as(logits)
+        per = F.binary_cross_entropy_with_logits(logits, exp_t, reduction="none")
+        return per.reshape(L, -1).mean(dim=1)
+
+    elif loss_type == "mse":
+        exp_t = targets.unsqueeze(0).expand_as(logits)
+        per = F.mse_loss(logits, exp_t, reduction="none")
+        return per.reshape(L, -1).mean(dim=1)
+
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}")
+
+
+def _compute_batched_accuracy(
+    logits: torch.Tensor, targets: torch.Tensor, loss_type: str, n_outputs: int,
+) -> torch.Tensor:
+    """Per-layer accuracy. Returns ``(L,)`` tensor.
+
+    For MSE probes returns per-batch R² (caller should accumulate ss_res/ss_tot
+    for global R²).
+    """
+    L, B, _ = logits.shape
+
+    if loss_type == "ce":
+        preds = logits.argmax(-1)  # (L, B)
+        return (preds == targets.unsqueeze(0)).float().mean(dim=1)
+
+    elif loss_type == "ce_per_square":
+        preds = logits.reshape(L, B, 64, 13).argmax(-1)  # (L, B, 64)
+        return (preds == targets.unsqueeze(0)).float().mean(dim=(1, 2))
+
+    elif loss_type == "bce":
+        preds = (logits > 0).float()
+        return (preds == targets.unsqueeze(0)).float().mean(dim=(1, 2))
+
+    elif loss_type == "mse":
+        # MSE R² requires global ss_res/ss_tot accumulation — per-batch R²
+        # is statistically noisy. Use _eval_batched_in_batches which handles
+        # this correctly. This branch should not be called directly.
+        raise NotImplementedError(
+            "Use _eval_batched_in_batches for MSE probes (requires global R² accumulation)"
+        )
+
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}")
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +684,194 @@ def _eval_mae_in_batches(probe: LinearProbe, h: torch.Tensor, t: torch.Tensor, d
     return total_ae / total if total > 0 else 0.0
 
 
+# ---------------------------------------------------------------------------
+# Batched multi-layer probe training
+# ---------------------------------------------------------------------------
+
+
+def _eval_batched_in_batches(
+    probe: BatchedLinearProbe,
+    all_h: list[torch.Tensor],
+    targets: torch.Tensor,
+    loss_type: str,
+    n_outputs: int,
+    device: str,
+    batch_size: int,
+) -> torch.Tensor:
+    """Per-layer accuracy/R² using batched probe. Returns ``(L,)`` CPU tensor."""
+    L = len(all_h)
+    n = len(all_h[0])
+
+    if loss_type == "mse":
+        # Accumulate ss_res and ss_tot globally for correct R²
+        ss_res = torch.zeros(L, device=device)
+        ss_tot = torch.zeros(L, device=device)
+        t_mean = targets.to(device).mean(dim=0, keepdim=True)  # (1, n_out)
+
+        for i in range(0, n, batch_size):
+            h_batch = torch.stack([h[i:i + batch_size] for h in all_h]).to(device)
+            t_batch = targets[i:i + batch_size].to(device)
+            logits = probe(h_batch)
+            exp_t = t_batch.unsqueeze(0).expand_as(logits)
+            ss_res += ((logits - exp_t) ** 2).sum(dim=(1, 2))
+            ss_tot += ((exp_t - t_mean.unsqueeze(0)) ** 2).sum(dim=(1, 2))
+
+        return (1.0 - ss_res / (ss_tot + 1e-8)).cpu()
+
+    else:
+        total_correct = torch.zeros(L, device=device)
+        total = 0
+        for i in range(0, n, batch_size):
+            h_batch = torch.stack([h[i:i + batch_size] for h in all_h]).to(device)
+            t_batch = targets[i:i + batch_size].to(device)
+            B = h_batch.shape[1]
+            logits = probe(h_batch)
+            accs = _compute_batched_accuracy(logits, t_batch, loss_type, n_outputs)
+            total_correct += accs * B
+            total += B
+        assert total > 0, "Empty validation set — cannot compute accuracy"
+        return (total_correct / total).cpu()
+
+
+def _eval_batched_loss_in_batches(
+    probe: BatchedLinearProbe,
+    all_h: list[torch.Tensor],
+    targets: torch.Tensor,
+    loss_type: str,
+    n_outputs: int,
+    device: str,
+    batch_size: int,
+) -> torch.Tensor:
+    """Per-layer loss. Returns ``(L,)`` CPU tensor."""
+    L = len(all_h)
+    n = len(all_h[0])
+    total_loss = torch.zeros(L, device=device)
+    total = 0
+
+    for i in range(0, n, batch_size):
+        h_batch = torch.stack([h[i:i + batch_size] for h in all_h]).to(device)
+        t_batch = targets[i:i + batch_size].to(device)
+        B = h_batch.shape[1]
+        logits = probe(h_batch)  # (L, B, n_out)
+        total_loss += _compute_batched_loss_per_layer(logits, t_batch, loss_type, n_outputs) * B
+        total += B
+
+    return (total_loss / max(total, 1)).cpu()
+
+
+def _eval_batched_mae_in_batches(
+    probe: BatchedLinearProbe,
+    all_h: list[torch.Tensor],
+    targets: torch.Tensor,
+    device: str,
+    batch_size: int,
+) -> torch.Tensor:
+    """Per-layer MAE. Returns ``(L,)`` CPU tensor."""
+    L = len(all_h)
+    n = len(all_h[0])
+    total_ae = torch.zeros(L, device=device)
+    total = 0
+
+    for i in range(0, n, batch_size):
+        h_batch = torch.stack([h[i:i + batch_size] for h in all_h]).to(device)
+        t_batch = targets[i:i + batch_size].to(device)
+        B = h_batch.shape[1]
+        logits = probe(h_batch)
+        exp_t = t_batch.unsqueeze(0).expand_as(logits)
+        total_ae += (logits - exp_t).abs().sum(dim=(1, 2))
+        total += B
+
+    return (total_ae / max(total, 1)).cpu()
+
+
+def _train_probe_all_layers(
+    probe_name: str,
+    all_train_h: list[torch.Tensor],
+    all_val_h: list[torch.Tensor],
+    train_t: torch.Tensor,
+    val_t: torch.Tensor,
+    d_model: int,
+    device: str,
+    n_epochs: int = 20,
+    lr: float = 1e-3,
+    batch_size: int = 256,
+) -> list[dict]:
+    """Train one probe across all layers simultaneously using ``BatchedLinearProbe``.
+
+    Hidden states from every layer are stacked into ``(L, B, d_model)``
+    mini-batches and processed via a single ``torch.bmm`` call, analogous to
+    how ``train_all.py`` trains three model variants on shared data batches.
+
+    Returns list of per-layer result dicts (same format as ``_train_probe_on_hidden``).
+    """
+    n_probes = len(all_train_h)
+    n_outputs, loss_type, _ = PROBES[probe_name]
+
+    probe = BatchedLinearProbe(n_probes, d_model, n_outputs).to(device)
+    optimizer = torch.optim.AdamW(probe.parameters(), lr=lr)
+
+    n_train = len(all_train_h[0])
+    best_val_acc = torch.full((n_probes,), -float("inf"))
+
+    eval_bs = batch_size * 4
+
+    for _epoch in range(n_epochs):
+        perm = torch.randperm(n_train)
+
+        probe.train()
+        for i in range(0, n_train, batch_size):
+            idx = perm[i:i + batch_size]
+            # Stack hidden states from all layers: (L, B, d_model)
+            h_batch = torch.stack([h[idx] for h in all_train_h]).to(device)
+            t_batch = train_t[idx].to(device)
+
+            logits = probe(h_batch)  # (L, B, n_outputs)
+            loss = _compute_batched_loss_per_layer(logits, t_batch, loss_type, n_outputs).sum()
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        probe.eval()
+        with torch.no_grad():
+            val_accs = _eval_batched_in_batches(
+                probe, all_val_h, val_t, loss_type, n_outputs, device, eval_bs,
+            )
+            best_val_acc = torch.maximum(best_val_acc, val_accs)
+
+    # Final evaluation
+    probe.eval()
+    with torch.no_grad():
+        final_accs = _eval_batched_in_batches(
+            probe, all_val_h, val_t, loss_type, n_outputs, device, eval_bs,
+        )
+        final_losses = _eval_batched_loss_in_batches(
+            probe, all_val_h, val_t, loss_type, n_outputs, device, eval_bs,
+        )
+
+        maes = None
+        if loss_type == "mse":
+            maes = _eval_batched_mae_in_batches(
+                probe, all_val_h, val_t, device, eval_bs,
+            )
+
+        results = []
+        for l in range(n_probes):
+            result = {
+                "accuracy": final_accs[l].item(),
+                "loss": final_losses[l].item(),
+                "best_accuracy": best_val_acc[l].item(),
+                "n_train": n_train,
+                "n_val": len(all_val_h[0]),
+            }
+            if maes is not None:
+                result["mae"] = maes[l].item()
+            results.append(result)
+
+    del probe, optimizer
+    return results
+
+
 def train_all_probes(
     model: PAWNCLM,
     train_data: dict,
@@ -486,62 +883,116 @@ def train_all_probes(
     probe_names: list[str] | None = None,
     verbose: bool = True,
     no_outcome_token: bool = False,
+    use_amp: bool = False,
 ) -> dict:
-    """Train all probes per-layer.
+    """Train all probes across all layers.
 
-    Loops LAYER-first, PROBE-second: hidden states are extracted once per
-    layer and reused across all probes, eliminating redundant forward passes.
+    Two key optimizations over the naive layer-first approach:
 
-    When no_outcome_token=True, the outcome token is stripped from input
-    sequences before feeding to the model.
+    1. **Single-pass extraction**: Hidden states for *all* layers are extracted
+       via one forward pass through the model (eliminates the O(n_layers²)
+       redundancy of per-layer ``_forward_to_layer``).
 
-    Returns nested dict: results[probe_name][layer_name] = metrics
+    2. **Batched probe training**: For each probe, all layers are trained
+       simultaneously via ``BatchedLinearProbe`` (``torch.bmm`` on stacked
+       ``(L, B, d_model)`` mini-batches), similar to how ``train_all.py``
+       trains three model variants on shared data.
+
+    Args:
+        use_amp: use float16 autocast for the forward pass (CUDA only).
+
+    Returns nested dict: ``results[probe_name][layer_name] = metrics``
     """
     if probe_names is None:
-        probe_names = [p for p in PROBES if p in PROBES]
+        probe_names = list(PROBES.keys())
 
     n_layers = model.cfg.n_layers
     layer_indices = list(range(n_layers + 1)) if per_layer else [n_layers]
-    layer_names = (["embed"] + [f"layer_{i}" for i in range(n_layers)]) if per_layer else [f"layer_{n_layers - 1}"]
+    layer_names = (
+        ["embed"] + [f"layer_{i}" for i in range(n_layers)]
+    ) if per_layer else [f"layer_{n_layers - 1}"]
 
     model.eval()
     results = {pname: {} for pname in probe_names if pname in PROBES}
 
-    for li, lname in zip(layer_indices, layer_names):
+    # ------------------------------------------------------------------
+    # Phase 1: extract hidden states for all layers in a single pass
+    # ------------------------------------------------------------------
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if per_layer:
         if verbose:
-            print(f"\n--- Layer: {lname} ---")
+            print(f"Extracting hidden states for {len(layer_indices)} layers "
+                  f"(single forward pass)...")
+        all_train_h, train_valid = _extract_all_hidden_states(
+            model, train_data, device,
+            no_outcome_token=no_outcome_token, use_amp=use_amp,
+        )
+        all_val_h, val_valid = _extract_all_hidden_states(
+            model, val_data, device,
+            no_outcome_token=no_outcome_token, use_amp=use_amp,
+        )
+        # Select only requested layers
+        sel_train_h = [all_train_h[i] for i in layer_indices]
+        sel_val_h = [all_val_h[i] for i in layer_indices]
+        del all_train_h, all_val_h
+    else:
+        # Single layer — use the early-stop extractor to avoid allocating
+        # CPU tensors for all n_layers+1 layers just to discard them.
+        li = layer_indices[0]
+        if verbose:
+            print(f"Extracting hidden states for layer {layer_names[0]}...")
+        train_h, train_valid = _extract_hidden_states(
+            model, train_data, device, li,
+            no_outcome_token=no_outcome_token, use_amp=use_amp,
+        )
+        val_h, val_valid = _extract_hidden_states(
+            model, val_data, device, li,
+            no_outcome_token=no_outcome_token, use_amp=use_amp,
+        )
+        sel_train_h = [train_h]
+        sel_val_h = [val_h]
+        del train_h, val_h
 
-        # Free stale allocator caches before the next round of extractions
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    if verbose:
+        print(f"  {len(sel_train_h[0]):,} train positions, "
+              f"{len(sel_val_h[0]):,} val positions")
 
-        # Extract hidden states ONCE for this layer
-        train_h, train_valid = _extract_hidden_states(model, train_data, device, li, no_outcome_token=no_outcome_token)
-        val_h, val_valid = _extract_hidden_states(model, val_data, device, li, no_outcome_token=no_outcome_token)
+    # ------------------------------------------------------------------
+    # Phase 2: train each probe across all layers simultaneously
+    # ------------------------------------------------------------------
+    for pname in probe_names:
+        if pname not in PROBES:
+            continue
 
-        # Train every probe on these hidden states
-        for pname in probe_names:
-            if pname not in PROBES:
-                continue
-            train_t = _extract_targets(pname, train_data, train_valid)
-            val_t = _extract_targets(pname, val_data, val_valid)
+        train_t = _extract_targets(pname, train_data, train_valid)
+        val_t = _extract_targets(pname, val_data, val_valid)
 
-            metrics = _train_probe_on_hidden(
-                pname, train_h, train_t, val_h, val_t,
-                model.cfg.d_model, device, n_epochs, lr,
-            )
+        layer_results = _train_probe_all_layers(
+            pname, sel_train_h, sel_val_h, train_t, val_t,
+            model.cfg.d_model, device, n_epochs, lr,
+        )
+
+        for lname, metrics in zip(layer_names, layer_results):
             results[pname][lname] = metrics
 
-            if verbose:
-                loss_type = PROBES[pname][1]
-                if loss_type == "mse":
-                    print(f"  {pname:>20s}: R²={metrics['best_accuracy']:.4f}  MAE={metrics.get('mae', 0):.3f}")
-                else:
-                    print(f"  {pname:>20s}: {metrics['best_accuracy']:.4f}")
+        if verbose:
+            loss_type = PROBES[pname][1]
+            # Print per-layer metrics
+            accs = [r["best_accuracy"] for r in layer_results]
+            best_idx = max(range(len(accs)), key=lambda i: accs[i])
+            if loss_type == "mse":
+                vals = [f"{a:.3f}" for a in accs]
+                print(f"  {pname:>20s}: R² {' → '.join(vals)}  "
+                      f"(best={accs[best_idx]:.4f} @ {layer_names[best_idx]})")
+            else:
+                vals = [f"{a:.3f}" for a in accs]
+                print(f"  {pname:>20s}: {' → '.join(vals)}  "
+                      f"(best={accs[best_idx]:.4f} @ {layer_names[best_idx]})")
 
-            del train_t, val_t
+        del train_t, val_t
 
-        del train_h, val_h, train_valid, val_valid
-
+    del sel_train_h, sel_val_h
     return results
