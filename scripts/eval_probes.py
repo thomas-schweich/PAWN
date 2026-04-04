@@ -125,7 +125,7 @@ def main():
         results = train_all_probes(
             model, train_data, val_data, device,
             per_layer=True, n_epochs=args.n_epochs, verbose=True,
-            no_outcome_token=no_outcome,
+            no_outcome_token=no_outcome, use_amp=(device == "cuda"),
         )
 
         # Save results
