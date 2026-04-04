@@ -228,6 +228,7 @@ class TrialRunner:
         strategy: str | None = None,
         params: dict[str, Any] | None = None,
         base_args: dict[str, Any] | None = None,
+        tags: list[str] | None = None,
     ) -> int:
         """Launch a single trial. Returns trial_id.
 
@@ -270,6 +271,7 @@ class TrialRunner:
             gpu_id=gpu_id,
             log_path=str(self.results_dir / f"trial_{trial_id:04d}.log"),
             total_steps=validated.get("total_steps", 0) or 0,
+            tags=tags or [],
         )
         self.trials[trial_id] = trial
         self._assign_gpu(trial_id, gpu_id)
@@ -316,7 +318,7 @@ class TrialRunner:
         if pause_after_steps is not None:
             new_config["pause_after_steps"] = pause_after_steps
 
-        return await self.launch(new_config)
+        return await self.launch(new_config, tags=old.tags)
 
     def _build_command(
         self, config: dict[str, Any], trial_id: int,
@@ -537,16 +539,19 @@ class TrialRunner:
             "estimated_cost": round(cost, 2) if cost else None,
         }
 
-    def results(self, strategy: str | None = None) -> dict[str, Any]:
+    def results(self, strategy: str | None = None, tag: str | None = None) -> dict[str, Any]:
         rows = []
-        for t in sorted(self.trials.values(), key=lambda t: t.trial_id):
+        trials = sorted(self.trials.values(), key=lambda t: t.trial_id)
+        if tag:
+            trials = [t for t in trials if tag in t.tags]
+        for t in trials:
             elapsed = (t.end_time - t.start_time) if t.end_time and t.start_time else None
             cfg = t.config or t.params
             rows.append({
                 "trial": t.trial_id, "strategy": t.strategy,
                 "params": t.actual_param_count, "steps": t.current_step,
                 "val_loss": t.best_val_loss, "accuracy": t.best_accuracy,
-                "status": t.status, "notes": t.notes,
+                "status": t.status, "notes": t.notes, "tags": t.tags,
                 "wall_time": _format_duration(elapsed),
                 "key_hp": {k: v for k, v in cfg.items()
                            if k in ("lr", "lora_rank", "bottleneck_dim", "density",

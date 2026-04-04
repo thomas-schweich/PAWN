@@ -41,10 +41,10 @@ async def lab_status(ctx: Context) -> dict[str, Any]:
 
 
 @mcp.tool
-async def lab_launch(config: dict[str, Any], ctx: Context) -> dict[str, Any]:
-    """Launch a trial from a RunConfig dict. Use lab_schema to discover all fields. The config must include run_type ('pretrain' or 'adapter'). For adapter runs, include 'strategy'. Example: {"run_type": "adapter", "strategy": "lora", "lora_rank": 4, "lr": 3e-4, "local_checkpoints": true}."""
+async def lab_launch(config: dict[str, Any], ctx: Context, tags: list[str] | None = None) -> dict[str, Any]:
+    """Launch a trial from a RunConfig dict. Use lab_schema to discover all fields. The config must include run_type ('pretrain' or 'adapter'). Optionally pass tags for grouping (e.g. ["phase1", "mate-boost"])."""
     try:
-        tid = await _runner(ctx).launch(config)
+        tid = await _runner(ctx).launch(config, tags=tags)
         return _runner(ctx).trials[tid].to_dict()
     except Exception as e:
         return {"error": str(e)}
@@ -67,9 +67,9 @@ async def lab_resume(trial_id: int, ctx: Context, total_steps: int | None = None
 
 
 @mcp.tool
-async def lab_results(ctx: Context, strategy: str | None = None) -> dict[str, Any]:
-    """All trials with val_loss, accuracy, param count, wall time, key HPs, status, notes. Includes Pareto front and Optuna suggestions. Optionally filter by strategy."""
-    return _runner(ctx).results(strategy)
+async def lab_results(ctx: Context, strategy: str | None = None, tag: str | None = None) -> dict[str, Any]:
+    """All trials with val_loss, accuracy, param count, wall time, key HPs, status, notes, tags. Includes Pareto front and Optuna suggestions. Filter by strategy and/or tag (e.g. tag="phase2")."""
+    return _runner(ctx).results(strategy, tag=tag)
 
 
 @mcp.tool
