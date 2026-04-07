@@ -611,17 +611,17 @@ def main():
             pass
     if not cpu_name:
         cpu_name = platform.processor() or platform.machine() or "unknown"
-    n_cores = multiprocessing.cpu_count() or 0
+    cpu_count = multiprocessing.cpu_count() or 0
 
     info: dict = {
         "python": sys.version.split()[0],
         "os": platform.system(),
         "arch": platform.machine(),
         "cpu": cpu_name,
-        "cores": n_cores,
+        "cpu_count": cpu_count,
     }
 
-    print(f"CPU: {cpu_name} ({n_cores} cores)")
+    print(f"CPU: {cpu_name} ({cpu_count} CPUs)")
 
     # Detect GPU platform for SDPA backend selection
     sdpa_backend = None
