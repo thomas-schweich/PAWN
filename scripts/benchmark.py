@@ -824,7 +824,7 @@ def main():
                 sys.exit(1)
         else:
             info["gpu"] = torch.cuda.get_device_name(0)
-            vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             info["vram_gb"] = round(vram_gb, 1)
             from torch.nn.attention import SDPBackend
 
