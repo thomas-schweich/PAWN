@@ -290,6 +290,7 @@ def save_pretrain_checkpoint(
     global_step: int,
     model_config: dict,
     training_config: dict,
+    extra: dict | None = None,
 ) -> None:
     """Save a pretraining checkpoint atomically.
 
@@ -319,6 +320,8 @@ def save_pretrain_checkpoint(
                 torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
             ),
         }
+        if extra:
+            training_state.update(extra)
         with open(tmp / "training_state.json", "w") as f:
             json.dump(training_state, f, indent=2, default=_json_default)
 
@@ -365,6 +368,9 @@ def load_pretrain_checkpoint(
             "global_step": ckpt.get("global_step", 0),
             "model_config": ckpt.get("model_config"),
             "training_config": ckpt.get("training_config"),
+            "best_val_loss": None,
+            "best_late_legality": None,
+            "patience_counter": None,
         }
 
     # New directory format — verify integrity first
@@ -400,6 +406,9 @@ def load_pretrain_checkpoint(
         "global_step": ts.get("global_step", 0),
         "model_config": config.get("model_config"),
         "training_config": config.get("training_config"),
+        "best_val_loss": ts.get("best_val_loss"),
+        "best_late_legality": ts.get("best_late_legality"),
+        "patience_counter": ts.get("patience_counter"),
     }
 
 

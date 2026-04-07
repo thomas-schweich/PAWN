@@ -66,6 +66,15 @@ def builtin_distributions(strategy: str) -> dict[str, Any]:
     spaces["rosa"] = rosa_common
     spaces["retro-sparse"] = rosa_common
     spaces["retro-bottleneck"] = {**rosa_common, "bottleneck_dim": Cat([4, 8, 16])}
+    spaces["pretrain"] = {
+        "lr": Float(1e-5, 1e-3, log=True),
+        "batch_size": Cat([64, 128, 256]),
+        "weight_decay": Float(0.0, 0.1),
+        "warmup_frac": Float(0.0, 0.15),
+        "d_model": Cat([256, 384, 512, 640]),
+        "n_layers": Cat([6, 8, 10, 12]),
+        "n_heads": Cat([4, 8]),
+    }
 
     if strategy not in spaces:
         raise ValueError(f"No built-in search space for strategy '{strategy}'. "
