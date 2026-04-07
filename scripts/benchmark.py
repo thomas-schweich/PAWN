@@ -549,14 +549,22 @@ def bench_dataloader(
 
 _WORKER_SCRIPT = '''
 """Worker process for concurrency benchmark. Runs N training steps and
-reports wall time back to the parent via a result file."""
-import sys, time, json, torch
+reports wall time back to the parent via a result file.
+
+Uses a barrier file protocol to synchronize workers:
+1. Each worker sets up model, compiles, and runs warmup independently
+2. Writes a "ready" sentinel file
+3. Waits until all N ready files exist (barrier)
+4. All workers start timed iterations roughly simultaneously
+"""
+import sys, time, json, os, torch
 import torch.nn.functional as F
 import pawn.model as model_module
 from pawn.config import CLMConfig
 from pawn.model import PAWNCLM, clm_loss
 from torch.nn.attention import SDPBackend
 import chess_engine as engine
+from pathlib import Path
 
 batch_size = int(sys.argv[1])
 n_warmup = int(sys.argv[2])
@@ -565,6 +573,9 @@ sdpa_backend_name = sys.argv[4]   # "MATH" or "NONE"
 variant = sys.argv[5]
 adapter_type = sys.argv[6]        # "none", "lora", "film", "bottleneck"
 result_path = sys.argv[7]
+worker_id = int(sys.argv[8])
+n_workers = int(sys.argv[9])
+barrier_dir = sys.argv[10]
 
 device = "cuda"
 cfg = getattr(CLMConfig, variant)()
@@ -622,12 +633,24 @@ def step():
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
 
-# Warmup (includes compilation)
+# Warmup (includes compilation) — each worker does this independently
 for _ in range(n_warmup):
     step()
 torch.cuda.synchronize()
 
-# Timed iterations
+# Signal ready and wait for all workers to finish compilation
+ready_file = Path(barrier_dir) / f"ready_{worker_id}"
+ready_file.touch()
+
+# Spin-wait for all workers (with timeout)
+deadline = time.monotonic() + 300  # 5 min barrier timeout
+while time.monotonic() < deadline:
+    ready_count = sum(1 for f in Path(barrier_dir).glob("ready_*"))
+    if ready_count >= n_workers:
+        break
+    time.sleep(0.05)
+
+# Timed iterations — all workers start roughly simultaneously
 times = []
 for _ in range(n_iter):
     torch.cuda.synchronize()
@@ -722,13 +745,17 @@ def bench_concurrency(
 
             sweep_start = time.perf_counter()
 
+            # Create barrier directory for worker synchronization
+            barrier_dir = Path(tempfile.mkdtemp(prefix="pawn_bench_barrier_"))
+
             # Launch all workers, pinned to GPU 0
             procs: list[subprocess.Popen[str]] = []
-            for rf in result_files:
+            for i, rf in enumerate(result_files):
                 p = subprocess.Popen(
                     [sys.executable, str(worker_file),
                      str(batch_size), str(n_warmup), str(n_iter),
-                     sdpa_name, variant, adapter, str(rf)],
+                     sdpa_name, variant, adapter, str(rf),
+                     str(i), str(n_procs), str(barrier_dir)],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                     env=worker_env,
                 )
@@ -755,6 +782,8 @@ def bench_concurrency(
                         for line in stderr.strip().splitlines()[-3:]:
                             print(f"      {line}")
 
+            import shutil as _shutil
+
             if timed_out:
                 print(f"    Timeout ({timeout_secs:.0f}s) — GPU thrashing, stopping sweep")
                 for p in procs:
@@ -762,20 +791,24 @@ def bench_concurrency(
                     p.wait()
                 for rf in result_files:
                     rf.unlink(missing_ok=True)
+                _shutil.rmtree(barrier_dir, ignore_errors=True)
                 break
 
             if oom:
                 print(f"    OOM with N={n_procs} — stopping sweep")
                 for rf in result_files:
                     rf.unlink(missing_ok=True)
+                _shutil.rmtree(barrier_dir, ignore_errors=True)
                 break
 
             if failed:
                 for rf in result_files:
                     rf.unlink(missing_ok=True)
+                _shutil.rmtree(barrier_dir, ignore_errors=True)
                 break
 
-            # Collect results
+            # Collect results and clean up
+            _shutil.rmtree(barrier_dir, ignore_errors=True)
             worker_results = []
             for rf in result_files:
                 try:
