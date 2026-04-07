@@ -1,12 +1,10 @@
 # PAWN — multi-GPU Docker image for RunPod and bare-metal workloads
 #
 # Built automatically by CI on merge to main and pushed to Docker Hub.
-#
-# CUDA targets use python:3.12-slim — PyTorch cu128 wheels bundle their
-# own CUDA runtime, so no nvidia/cuda base image is needed.
-#
-# ROCm targets use rocm/dev-ubuntu-24.04 — PyTorch ROCm wheels require
-# system-installed ROCm libraries (HIP, rocBLAS, MIOpen, etc.).
+# All targets use python:3.12-slim as the base. PyTorch cu128 wheels
+# bundle their own CUDA runtime; PyTorch ROCm wheels bundle their own
+# ROCm/HIP libraries. No nvidia/cuda or rocm base image needed — the
+# only host requirements are the GPU kernel drivers.
 #
 # Targets:
 #   runtime       — CUDA production image (default)
@@ -54,10 +52,10 @@ RUN maturin build --release
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# CUDA stages — python:3.12-slim base, PyTorch wheels bundle CUDA runtime
+# CUDA stages (--extra cu128)
 # ═══════════════════════════════════════════════════════════════════════
 
-# ── Deps (CUDA): install Python dependencies ────────────────────────
+# ── Deps (CUDA) ──────────────────────────────────────────────────────
 FROM python:3.12-slim AS deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -94,8 +92,7 @@ COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
 
-# ── Dev (CUDA): non-root user + Claude Code + tools ─────────────────
-# Build:  docker build --target dev -t thomasschweich/pawn:dev .
+# ── Dev (CUDA) ───────────────────────────────────────────────────────
 # Built independently (not FROM runtime) so all /opt/pawn files are
 # owned by pawn from the start, avoiding a slow chown -R layer.
 FROM python:3.12-slim AS dev
@@ -165,15 +162,16 @@ ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# ROCm stages — rocm/dev-ubuntu-24.04 base (provides HIP, rocBLAS, etc.)
-# PyTorch ROCm wheels do NOT bundle ROCm runtime libraries.
+# ROCm stages (--extra rocm)
+# Same python:3.12-slim base — the ROCm torch wheel (~2.8 GB) bundles
+# HIP, rocBLAS, MIOpen, etc. inside the wheel itself.
 # ═══════════════════════════════════════════════════════════════════════
 
-# ── Deps (ROCm): install Python dependencies ────────────────────────
-FROM rocm/dev-ubuntu-24.04:7.1.1-complete AS deps-rocm
+# ── Deps (ROCm) ──────────────────────────────────────────────────────
+FROM python:3.12-slim AS deps-rocm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        openssh-server python3.12 python3.12-venv python3.12-dev \
+        openssh-server \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 
@@ -186,7 +184,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
 WORKDIR /opt/pawn
 COPY pyproject.toml uv.lock ./
 COPY --from=builder /build/engine/target/wheels/*.whl /tmp/
-RUN uv venv --python python3.12 && \
+RUN uv venv && \
     uv sync --extra rocm --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl ${UV_CACHE_DIR}
 
@@ -206,9 +204,8 @@ COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
 
-# ── Dev (ROCm): non-root user + Claude Code + tools ─────────────────
-# Build:  docker build --target dev-rocm -t thomasschweich/pawn:dev-rocm .
-FROM rocm/dev-ubuntu-24.04:7.1.1-complete AS dev-rocm
+# ── Dev (ROCm) ───────────────────────────────────────────────────────
+FROM python:3.12-slim AS dev-rocm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server tmux ripgrep jq curl git \
