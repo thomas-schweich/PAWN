@@ -66,7 +66,7 @@ corresponding entry below.
 - Expected: `_extract_elos_from_pgn(path, max_games=N)` returns at most N entries.
 - Actual: Returns N+1 entries when the PGN has more than N games. On each `[Event ...]` line the previous game is flushed and, if `len(elos) >= max_games`, we `break`. The `break` exits before `white_elo/black_elo` are reset, and the post-loop `if in_headers: elos.append(...)` appends the already-flushed previous game a second time. With max_games=2 and 3 input games we get `[(1200,1250),(1600,1650),(1600,1650)]`.
 - Repro: cd /home/tas/pawn && UV_CACHE_DIR="/home/tas/pawn/.uv-cache" uv run pytest tests/eval/test_lichess.py::TestExtractElosFromPGN::test_max_games_respected -v
-- Notes: Fix: either set `in_headers = False` before breaking, or replace the `if in_headers` post-loop flush with a tail-flush guard that tracks whether the last game was already appended. Simpler: move `break` before the `elos.append` and flush explicitly outside the loop body instead.
+- Notes: Fix: set `in_headers = False` before breaking, or move `break` before the `elos.append` and flush outside the loop body.
 
 ## BUG-701: autoregressive_generate mask_illegal uses mismatched vocab_size with the Rust engine
 - Status: verified (lead Wave 4: confirmed — generation.py:189 calls `env.get_legal_token_masks_batch(all_indices)` without passing `vocab_size`, so the pyo3 default of 4278 wins over `cfg_vocab_size=4284`; `_mask_buf.copy_` fails with a shape-mismatch RuntimeError)

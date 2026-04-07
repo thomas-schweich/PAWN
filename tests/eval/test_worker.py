@@ -317,8 +317,8 @@ class TestRunDiagnosticEval:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end (real subprocess) — single smoke test to confirm multiprocessing
-# actually works with a trivial function. Kept tiny to avoid slowness.
+# End-to-end (real subprocess) — single smoke test confirming multiprocessing
+# works with a trivial function. Kept tiny to avoid slowness.
 # ---------------------------------------------------------------------------
 
 

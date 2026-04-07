@@ -715,10 +715,7 @@ mod tests {
 
     #[test]
     fn test_mate_in_one_boost_actually_finds_mate() {
-        // For seeds where the game naturally mates near the end, boost=1.0 should
-        // not miss the mate. Check that with boost=1.0, any game that could have
-        // been mated was mated.
-        // Simpler test: games with boost=1.0 should have checkmate rate >= baseline.
+        // Games with boost=1.0 should have checkmate rate >= the no-boost baseline.
         let n = 200;
         let seeds = derive_game_seeds(777, n);
         let mates_0: usize = seeds.iter()

@@ -70,7 +70,7 @@ class TestRMSNorm:
         norm = RMSNorm(32)
         x = torch.randn(4, 8, 32)
         out_x = norm(x)
-        # Scaling by 100 should give essentially the same result (eps negligible)
+        # Scaling by 100 produces the same output (RMSNorm is scale-invariant)
         out_100x = norm(x * 100.0)
         assert torch.allclose(out_x, out_100x, atol=1e-3)
 

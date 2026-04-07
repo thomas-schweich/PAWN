@@ -807,9 +807,7 @@ mod tests {
 
     #[test]
     fn test_en_passant_availability() {
-        // Spec: 1. e2e4 d7d5 — before exd5, the legal EP setup is:
-        // Actually for EP, we need: 1. e4 then black pushes adjacent pawn 2 squares.
-        // So: 1. e2e4 a7a6 2. e4e5 d7d5 — now white can capture en passant (exd6).
+        // 1. e2e4 a7a6 2. e4e5 d7d5 — white can capture en passant (exd6).
         let max_ply = 16;
         let mut move_ids = vec![0i16; max_ply];
         move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;  // e2e4
@@ -852,29 +850,13 @@ mod tests {
         // ply 2 (after both moves, white to move): exd5 is a legal pawn capture.
         let bits = per_ply[2];
         assert_ne!(bits & PAWN_CAPTURE_AVAILABLE, 0, "White should be able to play exd5");
-        // Not EP (that would require a 2-square double push just played by opponent adjacent)
-        // Actually d7d5 IS adjacent to e4, so... hmm. Let's check if EP is set here.
-        // After 1.e4 d5, white to move, black's d-pawn just pushed 2 squares from d7 to d5.
-        // EP would require black's d-pawn to be on the EP square. But EP only happens when a pawn
-        // passes through a square where it could be captured. Here, white's e4 pawn can capture
-        // d5 (regular capture, on d5). No EP: EP would be if black had a pawn on d7 that pushed
-        // past an adjacent enemy pawn.
-        // Wait: after black plays d7d5, white's e4 pawn is adjacent to d5. White could capture
-        // en passant IF black moved through white's attack zone. d7-d5 passes through d6, which
-        // is not attacked by e4. So no EP here.
-        // But shakmaty may still set EP if the passed-through square is theoretically captureable.
-        // Let's just check pawn capture is available.
+        // EP is also available here (d7→d5 passes d6, adjacent to e4).
     }
 
     #[test]
     fn test_terminal_state_no_pin_bits() {
-        // When legal moves is empty, compute_ply_bits returns only terminal bits
-        // plus termination bits. No pin/pawn capture etc.
-        // We test this with a quick scholar's mate game.
-        // Moves: 1. e4 e5 2. Bc4 Nc6 3. Qh5 Nf6 4. Qxf7#
-        // Need to build tokens manually for these SAN moves.
-        // Simpler: use generated games and check that if IN_CHECK is set with no legal moves,
-        // it's CHECKMATE (not pin). Look for a game that ends in checkmate.
+        // Find a random game ending in checkmate and verify the terminal ply
+        // has IN_CHECK + CHECKMATE set, with no pin/capture bits.
         let batch = generate_random_games(200, 256, 99, 0.0, false);
         let (per_ply, _, _) = compute_edge_stats_per_ply(
             &batch.move_ids, &batch.game_lengths, 256,

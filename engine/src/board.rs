@@ -709,21 +709,7 @@ mod tests {
 
     #[test]
     fn test_halfmove_clock_resets_on_capture() {
-        // Build up a non-zero halfmove clock using knight moves, then capture to prove reset.
-        // 1. g1f3 (clock=1) 2. b8c6 (clock=2) 3. f3e5 (non-capture knight move, clock=3)
-        // Actually f3e5 is not a capture — e5 is empty. But we need clock > 0 before a capture.
-        // Sequence: 1. g1f3 b8c6 2. f3d4 (clock=3) d7d5 (pawn resets to 0)
-        // That uses a pawn move for the reset, not a capture. Let's use a pure capture:
-        // 1. g1f3 (clock=1) 2. b8c6 (clock=2) 3. e2e4 (pawn -> clock=0) — no, we want non-pawn
-        // moves to build clock, then a capture (non-pawn) to show reset.
-        //
-        // Sequence: 1.Nf3 Nc6 2.Nd4 (non-capture, clock=3) Nd4... no, Nxd4 requires a piece on d4
-        //
-        // Simpler: 1.e4 d5 -> exd5 is a capture, but clock is 0 since e4 is a pawn move.
-        // Best approach: use knight moves to build clock, then make a knight capture.
-        //
-        // 1.Nf3 Nc6 2.Ng5 (clock=3) Nd4 (clock=4)
-        // Then: 3.Nxf7 is a capture (knight takes f7 pawn).
+        // Four knight moves to build clock > 0, then Nxf7 captures the f7 pawn.
         let state = replay_ucis(&["g1f3", "b8c6", "f3g5", "c6d4"]);
         assert!(state.halfmove_clock() > 0,
             "Clock should be > 0 after four non-pawn non-capture moves, got {}",
@@ -1036,8 +1022,7 @@ mod tests {
         // Setup to allow black to O-O-O: 1.Nf3 Nc6 2.e3 d5 3.Be2 Bd7 4.O-O Qd6 5.d3 O-O-O
         // Shorter: we just need to clear B8, C8, D8 and ensure king/rook haven't moved
         // Play: 1.e4 d5 2.d4 c6 3.d5 Nd7 4.dxc6 Qc7 5.cxb7 Nb6 6.bxa8=Q Bb7 7.Qxb7 Qxb7 — too complex
-        // Simpler: 1.d4 Nc6 2.d5 Nb8 3.d6 c7xd6 no — try
-        // 1. e4 b6 2. d4 Bb7 3. Nc3 Nc6 4. Bf4 Qc8 5. Qd2 Nb8 6. O-O-O (queenside white)
+        // 1. e4 b6 2. d4 Bb7 3. Nc3 Nc6 4. Bf4 Qc8 5. Qd2 Nb8 6. O-O-O
         let state = replay_ucis(&[
             "e2e4", "b7b6", "d2d4", "c8b7", "b1c3", "b8c6",
             "c1f4", "d8c8", "d1d2", "c6b8", "e1c1" // White O-O-O

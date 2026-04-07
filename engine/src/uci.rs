@@ -300,14 +300,8 @@ mod tests {
 
     #[test]
     fn test_uci_promotion_all_pieces() {
-        // Build up to a legal promotion by capturing to b8 via en passant chain:
-        // 1. a4 b5 2. axb5 c5 3. bxc6 d5 4. c7 d4 5. c7b8=?
-        // Wait: 3. bxc6 - b5 captures c5 pawn via en passant? c7c5 just happened (double push),
-        // so b5xc6 EP is legal (captures c-pawn, white pawn on c6). Then 4. c7 (advance to c7).
-        // Now black to move. Then 5. c7xb8=Q captures black's knight.
+        // Advance a white pawn to c7 via captures, then promote c7xb8=Q/R/B/N.
         let prefix = vec!["a2a4", "b7b5", "a4b5", "c7c5", "b5c6", "d7d5", "c6c7"];
-        // black to move — any move. Then c7b8q is promotion by capture of rook? no, b8 has knight.
-        // Actually b8 has a knight (black). c7xb8 captures knight, promotes.
         let black_move = "a7a6";
         let targets = vec!["c7b8q", "c7b8r", "c7b8b", "c7b8n"];
 
@@ -352,14 +346,7 @@ mod tests {
 
     #[test]
     fn test_san_to_uci_disambiguator() {
-        // Both knights could go to d2: 1. Nc3 Nc6 2. Nb5 Nb8 3. Nc3 (which knight went to c3?)
-        // This is a forced disambiguation since knight was on b5.
-        // Simpler: use Nbd2 disambiguator. Setup both knights.
-        // 1. Nf3 Nf6 2. Nc3 Nc6 3. Nb1 Nb8 4. Ng1 — nope, need two knights able to reach the same square.
-        // 1. Nf3 e5 2. Nc3 — white knights on f3,c3. "Nd5" ambiguous to both knights? No, Nd5 would only be reachable by c3.
-        // Standard test: Nbd2 - knights on b1 and f1(e1?) -> d2. E.g.: 1. d3 Nf6 2. Nd2 Nc6 3. Ngf3 — Nd2 was b1d2 (only one knight could go to d2), then Ngf3 (knight on g1→f3) unambiguous.
-        // Easier test: 1. Nf3 d5 2. Ne5 Nd7 3. Nxd7 Nxd7 - black knights on c6 and d7 both could take/go.
-        // For testability just use a SAN without disambiguation, just verify shakmaty resolves correctly.
+        // Verify SAN→UCI resolves knight moves correctly.
         let san = vec!["e4", "e5", "Nf3", "Nc6", "Nc3"];
         let (uci, n) = san_to_uci(&san);
         assert_eq!(n, 5);
