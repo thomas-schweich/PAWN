@@ -79,6 +79,7 @@ class BenchmarkReport:
     platform_info: dict = field(default_factory=dict)
     engine_results: list[dict] = field(default_factory=list)
     backbone_results: list[dict] = field(default_factory=list)
+    dataloader_results: list[dict] = field(default_factory=list)
     adapter_results: list[dict] = field(default_factory=list)
 
 
@@ -429,6 +430,108 @@ def bench_backbone(
     return results
 
 
+# ── Dataloader-inclusive benchmarks (GPU) ─────────────────────────────────────
+
+def bench_dataloader(
+    batch_size: int,
+    device: str,
+    n_iter: int,
+    n_warmup: int,
+    sdpa_backend,
+) -> list[TimingResult]:
+    """Benchmark end-to-end training steps with DataLoader data generation.
+
+    Runs pawn-base in compiled mode with workers=0 and workers=2 to measure
+    the impact of data loading on training throughput.
+    """
+    import torch
+    import torch.utils.data
+    import pawn.model as model_module
+    from pawn.config import CLMConfig
+    from pawn.data import CLMDataset
+    from pawn.model import PAWNCLM
+
+    results = []
+    cfg = CLMConfig.base()
+
+    print("\n" + "=" * 72)
+    print(" DATALOADER-INCLUSIVE BENCHMARKS (GPU)")
+    print("=" * 72)
+    print(f"  model=base  batch_size={batch_size}  device={device}  n_iter={n_iter}")
+    print(f"  AMP: bf16  SDPA: {sdpa_backend.name if sdpa_backend else 'default (flash)'}")
+
+    for num_workers in [0, 2]:
+        label = f"dataloader/base [compiled, workers={num_workers}]"
+        print(f"\n  {label} ...")
+
+        model_module.SDPA_BACKEND = sdpa_backend
+
+        model = PAWNCLM(cfg).to(device)
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"    params: {n_params:,}")
+
+        forward_fn = torch.compile(model.forward_train)
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=3e-4, weight_decay=0.01, betas=(0.9, 0.95),
+        )
+        scaler = torch.amp.GradScaler(device, enabled=True)
+
+        dataset = CLMDataset(
+            batch_size=batch_size, max_ply=256, base_seed=42,
+        )
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=None, num_workers=num_workers,
+            multiprocessing_context="spawn" if num_workers > 0 else None,
+            pin_memory=(num_workers > 0),
+        )
+        batch_iter = iter(loader)
+
+        def step():
+            batch = next(batch_iter)
+            batch = {
+                k: v.to(device, non_blocking=True) for k, v in batch.items()
+            }
+            model.train()
+            with torch.amp.autocast(device, dtype=torch.bfloat16, enabled=True):
+                loss, _metrics = forward_fn(
+                    batch["input_ids"], batch["loss_mask"], batch["targets"],
+                )
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        try:
+            gpu_timing = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter,
+                                  reset_peak_memory=True)
+        except torch.cuda.OutOfMemoryError:
+            print(f"    OOM — skipping (try smaller --batch-size)")
+            del model, optimizer, scaler, loader, batch_iter
+            torch.cuda.empty_cache()
+            continue
+
+        peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
+
+        r = make_result(
+            label, gpu_timing.times,
+            throughput_count=batch_size,
+            throughput_unit="samples/s",
+            peak_memory_mb=peak_mb,
+            warmup_secs=gpu_timing.warmup_secs,
+            n_warmup=gpu_timing.n_warmup,
+        )
+        results.append(r)
+        print(f"    {r.summary_line()}")
+
+        del model, optimizer, scaler, loader, batch_iter
+        torch.cuda.empty_cache()
+
+    return results
+
+
 # ── Adapter benchmarks (GPU) ─────────────────────────────────────────────────
 
 def bench_adapters(
@@ -539,6 +642,7 @@ def bench_adapters(
 def print_summary(
     engine_results: list[TimingResult],
     backbone_results: list[TimingResult],
+    dataloader_results: list[TimingResult],
     adapter_results: list[TimingResult],
 ):
     print("\n" + "=" * 72)
@@ -555,6 +659,11 @@ def print_summary(
         for r in backbone_results:
             print(f"    {r.summary_line()}")
 
+    if dataloader_results:
+        print("\n  Dataloader-inclusive training (GPU):")
+        for r in dataloader_results:
+            print(f"    {r.summary_line()}")
+
     if adapter_results:
         print("\n  Adapter training (GPU):")
         for r in adapter_results:
@@ -567,6 +676,7 @@ def save_json(
     path: str,
     engine_results: list[TimingResult],
     backbone_results: list[TimingResult],
+    dataloader_results: list[TimingResult],
     adapter_results: list[TimingResult],
     platform_info: dict,
 ):
@@ -575,6 +685,7 @@ def save_json(
         platform_info=platform_info,
         engine_results=[asdict(r) for r in engine_results],
         backbone_results=[asdict(r) for r in backbone_results],
+        dataloader_results=[asdict(r) for r in dataloader_results],
         adapter_results=[asdict(r) for r in adapter_results],
     )
     Path(path).write_text(json.dumps(asdict(report), indent=2))
@@ -707,6 +818,7 @@ def main():
     # Run benchmarks
     engine_results: list[TimingResult] = []
     backbone_results: list[TimingResult] = []
+    dataloader_results: list[TimingResult] = []
     adapter_results: list[TimingResult] = []
 
     if do_engine:
@@ -720,6 +832,10 @@ def main():
             do_compile, do_eager, args.n_iter, args.n_warmup,
             sdpa_backend,
         )
+        dataloader_results = bench_dataloader(
+            args.batch_size, args.device, args.n_iter, args.n_warmup,
+            sdpa_backend,
+        )
     if do_adapters:
         adapter_results = bench_adapters(
             args.adapters, args.batch_size, args.device,
@@ -728,11 +844,13 @@ def main():
         )
 
     # Summary
-    print_summary(engine_results, backbone_results, adapter_results)
+    print_summary(engine_results, backbone_results, dataloader_results,
+                  adapter_results)
 
     if args.json:
         save_json(
-            args.json, engine_results, backbone_results, adapter_results, info,
+            args.json, engine_results, backbone_results, dataloader_results,
+            adapter_results, info,
         )
 
 
