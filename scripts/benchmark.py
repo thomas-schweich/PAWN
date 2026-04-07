@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import statistics
 import sys
@@ -768,7 +769,13 @@ def main():
             pass
     if not cpu_name:
         cpu_name = platform.processor() or platform.machine() or "unknown"
-    cpu_count = multiprocessing.cpu_count() or 0
+    # os.sched_getaffinity respects cgroup cpuset limits (e.g. RunPod vCPUs),
+    # unlike multiprocessing.cpu_count() which reports the host's total.
+    try:
+        cpu_count = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        # sched_getaffinity is Linux-only; fall back on other platforms
+        cpu_count = multiprocessing.cpu_count() or 0
 
     # System RAM
     try:
