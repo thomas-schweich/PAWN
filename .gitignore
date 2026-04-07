@@ -21,6 +21,7 @@ target/
 *.d
 
 # IDE
+.idea
 .idea/
 .vscode/
 *.swp
@@ -45,6 +46,19 @@ pytest-of-*/
 
 # Local working files
 local/
+
+# Pod/container shell dotfiles
+.bash_profile
+.bashrc
+.profile
+.zprofile
+.zshrc
+.gitconfig
+.gitmodules
+.ripgreprc
+
+# Pytest tmp_path leftovers
+/tmp*/
 
 # Misc
 runpodctl.tar.gz
