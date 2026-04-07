@@ -39,6 +39,7 @@ def _run_help(script_name: str, timeout: float = 60.0) -> subprocess.CompletedPr
 
 ARGPARSE_SCRIPTS = [
     "backfill_metrics.py",
+    "benchmark.py",
     "benchmark_stockfish_nodes.py",
     "compute_theoretical_ceiling.py",
     "eval_accuracy.py",
