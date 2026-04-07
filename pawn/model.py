@@ -66,8 +66,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x.float() * norm).to(x.dtype) * self.weight
+        x_f = x.float() if x.dtype != torch.float32 else x
+        norm = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x_f * norm).to(x.dtype) * self.weight
 
 
 def _apply_rope(
@@ -79,14 +80,15 @@ def _apply_rope(
     x: (B, n_heads, T, head_dim)
     rope_cos, rope_sin: (1, 1, T, head_dim // 2)
     """
-    x_r = x.float().reshape(*x.shape[:-1], -1, 2)
+    x_f = x.float() if x.dtype != torch.float32 else x
+    x_r = x_f.reshape(*x.shape[:-1], -1, 2)
     x0, x1 = x_r.unbind(-1)
 
     out0 = x0 * rope_cos - x1 * rope_sin
     out1 = x0 * rope_sin + x1 * rope_cos
 
     out = torch.stack([out0, out1], dim=-1).reshape(x.shape)
-    return out.to(x.dtype)
+    return out.to(x.dtype) if x.dtype != torch.float32 else out
 
 
 def _precompute_rope_freqs(dim: int, max_len: int, base: float = 10000.0) -> torch.Tensor:
@@ -438,6 +440,36 @@ class PAWNCLM(nn.Module):
             accuracy = (preds == valid_targets).float().mean()
 
         return loss, {"loss": loss.detach(), "accuracy": accuracy}
+
+    def forward_eval(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return final hidden states (B, T, d_model) without lm_head projection.
+
+        Use for memory-efficient evaluation: project only needed positions
+        through lm_head on the caller side instead of materializing the full
+        (B, T, vocab_size) logits tensor.
+        """
+        x = self.embed(input_ids)
+
+        T = input_ids.shape[1]
+        if T > self.rope_cos.shape[2]:
+            raise ValueError(
+                f"Sequence length {T} exceeds max {self.rope_cos.shape[2]}"
+            )
+        causal = self.causal_mask[:T, :T]
+        padding = attention_mask.unsqueeze(1).unsqueeze(2)
+        mask = causal.unsqueeze(0) & padding
+
+        rope_cos = self.rope_cos[:, :, :T, :]
+        rope_sin = self.rope_sin[:, :, :T, :]
+
+        for layer in self.layers:
+            x = layer(x, rope_cos, rope_sin, mask)
+
+        return self.final_norm(x)
 
     def forward_generate(
         self,

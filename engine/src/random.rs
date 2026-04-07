@@ -6,7 +6,9 @@ use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 
-use crate::board::GameState;
+use shakmaty::{Chess, MoveList, Position};
+
+use crate::board::{move_to_token, GameState};
 use crate::types::Termination;
 
 /// Derive N independent sub-seeds from a single base seed.
@@ -44,8 +46,11 @@ pub fn generate_one_game_with_labels(seed: u64, max_ply: usize) -> GameRecord {
     let mut legal_promos = Vec::with_capacity(max_ply);
 
     loop {
-        // Check termination before making a move
-        if let Some(term) = state.check_termination(max_ply) {
+        // Compute legal moves ONCE per ply — drives termination check, labels, and move selection
+        let (grid, promo, tokens, legal) = state.legal_move_all();
+
+        // Check termination using the pre-computed move list
+        if let Some(term) = state.check_termination_with_legal(max_ply, &legal) {
             let game_length = state.ply() as u16;
             return GameRecord {
                 move_ids,
@@ -58,11 +63,9 @@ pub fn generate_one_game_with_labels(seed: u64, max_ply: usize) -> GameRecord {
 
         // Record legal moves BEFORE making the move — these are the labels
         // for the current position (the moves the current side can choose from)
-        legal_grids.push(state.legal_move_grid());
-        legal_promos.push(state.legal_promo_mask());
+        legal_grids.push(grid);
+        legal_promos.push(promo);
 
-        // Pick and play a random legal move
-        let tokens = state.legal_move_tokens();
         debug_assert!(!tokens.is_empty(), "No legal moves but termination not detected");
 
         let chosen = tokens[rng.gen_range(0..tokens.len())];
@@ -81,14 +84,17 @@ pub fn generate_one_game(seed: u64, max_ply: usize, mate_boost: f64) -> (Vec<u16
     let mut move_ids = Vec::with_capacity(max_ply);
 
     loop {
-        if let Some(term) = state.check_termination(max_ply) {
+        // Compute legal moves ONCE per ply
+        let legal = state.legal_moves();
+
+        if let Some(term) = state.check_termination_with_legal(max_ply, &legal) {
             return (move_ids, state.ply() as u16, term);
         }
 
-        let tokens = state.legal_move_tokens();
+        let tokens: Vec<u16> = legal.iter().map(|m| move_to_token(m)).collect();
 
         let chosen = if mate_boost > 0.0 {
-            if let Some(mate_move) = find_mate_in_one(&state, &tokens) {
+            if let Some(mate_move) = find_mate_in_one(state.position(), &legal) {
                 if mate_boost >= 1.0 || rng.gen::<f64>() < mate_boost {
                     mate_move
                 } else {
@@ -106,14 +112,14 @@ pub fn generate_one_game(seed: u64, max_ply: usize, mate_boost: f64) -> (Vec<u16
     }
 }
 
-/// Check if any of the given legal moves delivers immediate checkmate.
-/// Returns the first mating move found, or None.
-fn find_mate_in_one(state: &GameState, tokens: &[u16]) -> Option<u16> {
-    for &token in tokens {
-        let mut test = state.clone();
-        test.make_move(token).unwrap();
-        if test.legal_moves().is_empty() && test.is_check() {
-            return Some(token);
+/// Check if any legal move delivers immediate checkmate.
+/// Works on the raw Chess position + MoveList to avoid cloning Vec fields.
+fn find_mate_in_one(pos: &Chess, legal: &MoveList) -> Option<u16> {
+    for m in legal {
+        let mut test_pos = pos.clone(); // ~64 bytes of bitboards, no heap alloc
+        test_pos.play_unchecked(m.clone());
+        if test_pos.is_checkmate() {
+            return Some(move_to_token(m));
         }
     }
     None
@@ -433,7 +439,9 @@ pub fn generate_checkmate_examples(
                 let mut move_ids = Vec::with_capacity(max_ply);
 
                 loop {
-                    if let Some(term) = state.check_termination(max_ply) {
+                    let legal = state.legal_moves();
+
+                    if let Some(term) = state.check_termination_with_legal(max_ply, &legal) {
                         if term != Termination::Checkmate || move_ids.is_empty() {
                             return None; // not a checkmate game
                         }
@@ -445,8 +453,9 @@ pub fn generate_checkmate_examples(
                             replay.make_move(tok).unwrap();
                         }
 
-                        let legal_grid = replay.legal_move_grid();
-                        let legal_tokens = replay.legal_move_tokens();
+                        let replay_legal = replay.legal_moves();
+                        let (legal_grid, _) = crate::board::decompose_legal_moves(&replay_legal);
+                        let legal_tokens: Vec<u16> = replay_legal.iter().map(|m| move_to_token(m)).collect();
 
                         // Test each legal move: does it deliver checkmate?
                         let mut checkmate_grid = [0u64; 64];
@@ -468,7 +477,7 @@ pub fn generate_checkmate_examples(
                         });
                     }
 
-                    let tokens = state.legal_move_tokens();
+                    let tokens: Vec<u16> = legal.iter().map(|m| move_to_token(m)).collect();
                     let chosen = tokens[rng.gen_range(0..tokens.len())];
                     state.make_move(chosen).unwrap();
                     move_ids.push(chosen);
