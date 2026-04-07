@@ -20,6 +20,14 @@
 #
 # IMPORTANT: Always attach a network volume. Set HF_TOKEN as a pod env var.
 
+# ── Caddy: single static binary for reverse-proxying the dashboard ──
+FROM python:3.12-slim AS caddy
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" \
+       -o /usr/local/bin/caddy \
+    && chmod +x /usr/local/bin/caddy \
+    && rm -rf /var/lib/apt/lists/*
+
 # ── Builder: compile Rust engine wheel ───────────────────────────────
 FROM python:3.12-slim AS builder
 
@@ -63,6 +71,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 
+COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
+
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_CACHE_DIR=/tmp/uv-cache
@@ -102,6 +112,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server tini tmux ripgrep jq curl git \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
+
+COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
@@ -177,6 +189,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 
+COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
+
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_CACHE_DIR=/tmp/uv-cache
@@ -214,6 +228,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server tini tmux ripgrep jq curl git \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
+
+COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \

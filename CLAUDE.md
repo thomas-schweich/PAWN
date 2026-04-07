@@ -293,6 +293,7 @@ Total cost is remarkably consistent ($30-39) across viable GPUs. The choice is w
 - **Set `HF_TOKEN` as a pod environment variable** for automatic HuggingFace authentication. The entrypoint persists it to `~/.cache/huggingface/token`.
 - `PAWN_MODEL=thomas-schweich/pawn-base` — auto-pull a checkpoint on startup (runner target).
 - `PAWN_CMD` — training command to execute (alternative to Docker CMD args).
+- `PAWN_DASHBOARD=0` — disable the auto-started dashboard + Caddy proxy (enabled by default).
 
 ### Pod Safety
 
@@ -344,6 +345,8 @@ python -m pawn.dashboard --log-dir logs
 ```
 
 Reads `metrics.jsonl` files, no dependency on training packages. Auto-detects run type from config fields. Shows loss curves, accuracy, LR schedules, GPU utilization, patience clocks, and adapter-specific diagnostics. Requires restart for code changes (no hot reload).
+
+**On RunPod pods**, the dashboard starts automatically and is proxied through Caddy on port 8888. Access it via the RunPod HTTP proxy URL (the "Connect" button → port 8888). Set `PAWN_DASHBOARD=0` as a pod environment variable to disable it.
 
 ## Logs
 

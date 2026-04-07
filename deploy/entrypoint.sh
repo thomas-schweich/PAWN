@@ -30,6 +30,13 @@ if command -v nvidia-cuda-mps-control &>/dev/null; then
         || echo "CUDA MPS already running or unavailable"
 fi
 
+# ── Dashboard + Caddy reverse proxy (port 8888 → Solara 8765) ──────
+if [ "${PAWN_DASHBOARD:-1}" != "0" ]; then
+    python -m pawn.dashboard --host 127.0.0.1 --port 8765 --log-dir /opt/pawn/logs &
+    caddy run --config /opt/pawn/deploy/Caddyfile &
+    echo "Dashboard proxied on port 8888"
+fi
+
 # ── Configure and start SSH as the foreground process ────────────────
 # tini (PID 1) reaps zombies and forwards signals.
 if [ -x "$(command -v sshd)" ]; then
