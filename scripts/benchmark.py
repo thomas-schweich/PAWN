@@ -75,12 +75,24 @@ class TimingResult:
 
 
 @dataclass
+class ConcurrencyResult:
+    n_models: int
+    step_ms: float              # wall time for one round (all N models stepped)
+    per_model_ms: float         # step_ms / n_models
+    total_throughput: float     # total samples/s across all models
+    per_model_throughput: float # samples/s per model
+    peak_memory_mb: float
+    efficiency: float           # per_model_throughput / single_model_throughput
+
+
+@dataclass
 class BenchmarkReport:
     timestamp: str = ""
     platform_info: dict = field(default_factory=dict)
     engine_results: list[dict] = field(default_factory=list)
     backbone_results: list[dict] = field(default_factory=list)
     dataloader_results: list[dict] = field(default_factory=list)
+    concurrency_results: list[dict] = field(default_factory=list)
     adapter_results: list[dict] = field(default_factory=list)
 
 
@@ -533,6 +545,231 @@ def bench_dataloader(
     return results
 
 
+# ── Concurrency sweep (GPU) ──────────────────────────────────────────────────
+
+_WORKER_SCRIPT = '''
+"""Worker process for concurrency benchmark. Runs N training steps and
+reports wall time back to the parent via a result file."""
+import sys, time, json, torch
+import pawn.model as model_module
+from pawn.config import CLMConfig
+from pawn.model import PAWNCLM
+from torch.nn.attention import SDPBackend
+import chess_engine as engine
+
+batch_size = int(sys.argv[1])
+n_warmup = int(sys.argv[2])
+n_iter = int(sys.argv[3])
+sdpa_backend_name = sys.argv[4]   # "MATH" or "NONE"
+variant = sys.argv[5]
+result_path = sys.argv[6]
+
+device = "cuda"
+cfg = getattr(CLMConfig, variant)()
+
+if sdpa_backend_name != "NONE":
+    model_module.SDPA_BACKEND = getattr(SDPBackend, sdpa_backend_name)
+
+model = PAWNCLM(cfg).to(device)
+forward_fn = torch.compile(model.forward_train)
+optimizer = torch.optim.AdamW(
+    model.parameters(), lr=3e-4, weight_decay=0.01, betas=(0.9, 0.95))
+scaler = torch.amp.GradScaler(device, enabled=True)
+
+input_ids, targets, loss_mask, *_ = engine.generate_clm_batch(batch_size, 256, seed=42)
+batch = {
+    "input_ids": torch.from_numpy(input_ids).long().to(device),
+    "targets": torch.from_numpy(targets).long().to(device),
+    "loss_mask": torch.from_numpy(loss_mask).to(device),
+}
+
+def step():
+    model.train()
+    with torch.amp.autocast(device, dtype=torch.bfloat16, enabled=True):
+        loss, _ = forward_fn(batch["input_ids"], batch["loss_mask"], batch["targets"])
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad(set_to_none=True)
+
+# Warmup (includes compilation)
+for _ in range(n_warmup):
+    step()
+torch.cuda.synchronize()
+
+# Timed iterations
+times = []
+for _ in range(n_iter):
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    step()
+    torch.cuda.synchronize()
+    times.append(time.perf_counter() - t0)
+
+peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
+
+json.dump({"times": times, "peak_memory_mb": peak_mb}, open(result_path, "w"))
+'''
+
+
+def bench_concurrency(
+    batch_size: int,
+    device: str,
+    n_iter: int,
+    n_warmup: int,
+    sdpa_backend,
+    variant: str = "small",
+    max_n: int = 10,
+) -> list[ConcurrencyResult]:
+    """Sweep N concurrent training processes to find peak total throughput.
+
+    Spawns N independent Python processes, each running a compiled training
+    loop on the same GPU. Measures aggregate throughput and per-process
+    throughput. Stops when per-process throughput drops below the N=1
+    baseline or OOM is hit.
+    """
+    import subprocess
+    import tempfile
+
+    sdpa_name = sdpa_backend.name if sdpa_backend else "NONE"
+
+    print("\n" + "=" * 72)
+    print(" CONCURRENCY SWEEP (GPU)")
+    print("=" * 72)
+    print(f"  model={variant}  batch_size={batch_size}  device={device}")
+    print(f"  mode=compiled  {n_warmup} warmup + {n_iter} timed iterations per process")
+    print(f"  AMP: bf16  SDPA: {sdpa_name}")
+
+    # Write worker script to a temp file
+    worker_file = Path(tempfile.mktemp(suffix=".py", prefix="pawn_bench_worker_"))
+    worker_file.write_text(_WORKER_SCRIPT)
+
+    results: list[ConcurrencyResult] = []
+    single_throughput: float | None = None
+
+    try:
+        for n_procs in range(1, max_n + 1):
+            print(f"\n  N={n_procs} ...")
+
+            # Create result files for each worker
+            result_files = [
+                Path(tempfile.mktemp(suffix=".json", prefix=f"pawn_bench_r{i}_"))
+                for i in range(n_procs)
+            ]
+
+            # Launch all workers
+            procs: list[subprocess.Popen[str]] = []
+            for rf in result_files:
+                p = subprocess.Popen(
+                    [sys.executable, str(worker_file),
+                     str(batch_size), str(n_warmup), str(n_iter),
+                     sdpa_name, variant, str(rf)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                procs.append(p)
+
+            # Wait for all workers
+            oom = False
+            failed = False
+            for p in procs:
+                p.wait()
+                if p.returncode != 0:
+                    stderr = (p.stderr.read() if p.stderr else "")
+                    if "OutOfMemoryError" in stderr or "out of memory" in stderr.lower():
+                        oom = True
+                    else:
+                        failed = True
+                        print(f"    Worker failed (exit {p.returncode}):")
+                        # Print last few lines of stderr
+                        for line in stderr.strip().splitlines()[-3:]:
+                            print(f"      {line}")
+
+            if oom:
+                print(f"    OOM with N={n_procs} — stopping sweep")
+                for rf in result_files:
+                    rf.unlink(missing_ok=True)
+                break
+
+            if failed:
+                for rf in result_files:
+                    rf.unlink(missing_ok=True)
+                break
+
+            # Collect results
+            worker_results = []
+            for rf in result_files:
+                try:
+                    data = json.loads(rf.read_text())
+                    worker_results.append(data)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    pass
+                rf.unlink(missing_ok=True)
+
+            if len(worker_results) != n_procs:
+                print(f"    Only {len(worker_results)}/{n_procs} workers reported — stopping")
+                break
+
+            # Each worker ran independently; wall time is the max across workers
+            # (they ran in parallel, so total time = slowest worker)
+            all_means = []
+            total_peak_mb = 0.0
+            for wr in worker_results:
+                times_ms = [t * 1000 for t in wr["times"]]
+                all_means.append(statistics.mean(times_ms))
+                total_peak_mb = max(total_peak_mb, wr["peak_memory_mb"])
+
+            # The effective wall time per "round" is the slowest worker
+            wall_ms = max(all_means)
+            # Total throughput: all N processes produce batch_size samples in wall_ms
+            total_throughput = n_procs * batch_size / wall_ms * 1000
+            per_model_throughput = total_throughput / n_procs
+
+            if single_throughput is None:
+                single_throughput = per_model_throughput
+
+            efficiency = per_model_throughput / single_throughput
+
+            cr = ConcurrencyResult(
+                n_models=n_procs,
+                step_ms=round(wall_ms, 1),
+                per_model_ms=round(wall_ms, 1),
+                total_throughput=round(total_throughput),
+                per_model_throughput=round(per_model_throughput),
+                peak_memory_mb=round(total_peak_mb),
+                efficiency=round(efficiency, 3),
+            )
+            results.append(cr)
+
+            eff_pct = efficiency * 100
+            marker = ""
+            if n_procs > 1 and efficiency < 1.0:
+                marker = " ← sequential is faster per-job"
+            print(f"    wall: {wall_ms:.0f}ms"
+                  f"  total: {total_throughput:.0f} samples/s"
+                  f"  per-job: {per_model_throughput:.0f} samples/s"
+                  f"  efficiency: {eff_pct:.1f}%"
+                  f"  peak mem: {total_peak_mb:.0f} MB{marker}")
+
+            # Stop if per-job throughput has dropped below single-job
+            if n_procs > 1 and efficiency < 1.0:
+                best = max(results, key=lambda r: r.total_throughput)
+                print(f"\n  Peak total throughput: N={best.n_models}"
+                      f" ({best.total_throughput} samples/s)")
+                break
+        else:
+            if results:
+                best = max(results, key=lambda r: r.total_throughput)
+                print(f"\n  Peak total throughput: N={best.n_models}"
+                      f" ({best.total_throughput} samples/s)"
+                      f" — max_n={max_n} reached without degradation")
+    finally:
+        worker_file.unlink(missing_ok=True)
+
+    return results
+
+
 # ── Adapter benchmarks (GPU) ─────────────────────────────────────────────────
 
 def bench_adapters(
@@ -644,6 +881,7 @@ def print_summary(
     engine_results: list[TimingResult],
     backbone_results: list[TimingResult],
     dataloader_results: list[TimingResult],
+    concurrency_results: list[ConcurrencyResult],
     adapter_results: list[TimingResult],
 ):
     print("\n" + "=" * 72)
@@ -665,6 +903,15 @@ def print_summary(
         for r in dataloader_results:
             print(f"    {r.summary_line()}")
 
+    if concurrency_results:
+        print("\n  Concurrency sweep (GPU):")
+        print(f"    {'N':>3s}  {'round ms':>9s}  {'total samp/s':>12s}"
+              f"  {'per-model samp/s':>16s}  {'efficiency':>10s}  {'mem MB':>7s}")
+        for cr in concurrency_results:
+            print(f"    {cr.n_models:>3d}  {cr.step_ms:>9.0f}  {cr.total_throughput:>12.0f}"
+                  f"  {cr.per_model_throughput:>16.0f}  {cr.efficiency:>9.1%}"
+                  f"  {cr.peak_memory_mb:>7.0f}")
+
     if adapter_results:
         print("\n  Adapter training (GPU):")
         for r in adapter_results:
@@ -678,6 +925,7 @@ def save_json(
     engine_results: list[TimingResult],
     backbone_results: list[TimingResult],
     dataloader_results: list[TimingResult],
+    concurrency_results: list[ConcurrencyResult],
     adapter_results: list[TimingResult],
     platform_info: dict,
 ):
@@ -687,6 +935,7 @@ def save_json(
         engine_results=[asdict(r) for r in engine_results],
         backbone_results=[asdict(r) for r in backbone_results],
         dataloader_results=[asdict(r) for r in dataloader_results],
+        concurrency_results=[asdict(r) for r in concurrency_results],
         adapter_results=[asdict(r) for r in adapter_results],
     )
     Path(path).write_text(json.dumps(asdict(report), indent=2))
@@ -1069,6 +1318,7 @@ def main():
     engine_results: list[TimingResult] = []
     backbone_results: list[TimingResult] = []
     dataloader_results: list[TimingResult] = []
+    concurrency_results: list[ConcurrencyResult] = []
     adapter_results: list[TimingResult] = []
 
     if do_engine:
@@ -1086,6 +1336,10 @@ def main():
             args.batch_size, args.device, args.n_iter, args.n_warmup,
             sdpa_backend,
         )
+        concurrency_results = bench_concurrency(
+            args.batch_size, args.device, args.n_iter, args.n_warmup,
+            sdpa_backend,
+        )
     if do_adapters:
         adapter_results = bench_adapters(
             args.adapters, args.batch_size, args.device,
@@ -1095,12 +1349,12 @@ def main():
 
     # Summary
     print_summary(engine_results, backbone_results, dataloader_results,
-                  adapter_results)
+                  concurrency_results, adapter_results)
 
     if args.json:
         save_json(
             args.json, engine_results, backbone_results, dataloader_results,
-            adapter_results, info,
+            concurrency_results, adapter_results, info,
         )
 
 
