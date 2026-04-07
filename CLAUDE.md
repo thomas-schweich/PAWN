@@ -223,15 +223,32 @@ from the trainer. Load via HF repo ID (e.g. `--checkpoint thomas-schweich/pawn-b
 
 ### Docker Image
 
-A single Docker image (`thomasschweich/pawn:latest`) is **automatically built and pushed to Docker Hub by CI** on every merge to main. No manual builds needed.
+Docker images are **automatically built and pushed to Docker Hub by CI** on every merge to main. No manual builds needed.
 
-The image is based on `python:3.12-slim` with openssh-server and all Python deps (including PyTorch cu128 + bundled CUDA runtime) installed via uv. No nvidia/cuda or runpod base image needed — the only host requirement is the NVIDIA kernel driver. Code lives at `/opt/pawn` on pods. SSH in and run experiments directly.
+| Tag | Target | Base | GPU |
+|-----|--------|------|-----|
+| `thomasschweich/pawn:latest` | `runtime` | `python:3.12-slim` | CUDA (cu128 wheels bundle runtime) |
+| `thomasschweich/pawn:dev` | `dev` | `python:3.12-slim` | CUDA + Claude Code + tmux |
+| `thomasschweich/pawn:rocm` | `runtime-rocm` | `rocm/dev-ubuntu-24.04:7.1.1` | ROCm 7.1 |
+| `thomasschweich/pawn:dev-rocm` | `dev-rocm` | `rocm/dev-ubuntu-24.04:7.1.1` | ROCm 7.1 + Claude Code + tmux |
+
+CUDA images use `python:3.12-slim` — PyTorch cu128 wheels bundle their own CUDA runtime, so no nvidia/cuda base is needed. The only host requirement is the NVIDIA kernel driver.
+
+ROCm images use `rocm/dev-ubuntu-24.04:7.1.1-complete` because PyTorch ROCm wheels require system-installed ROCm libraries (HIP, rocBLAS, MIOpen, etc.).
+
+Code lives at `/opt/pawn` on all images. SSH in and run experiments directly.
 
 To build locally (rarely needed):
 ```bash
-docker build --platform linux/amd64 \
+# CUDA
+docker build --platform linux/amd64 --target runtime \
     --build-arg GIT_HASH=$(git rev-parse HEAD) \
     -t thomasschweich/pawn:latest .
+
+# ROCm
+docker build --platform linux/amd64 --target runtime-rocm \
+    --build-arg GIT_HASH=$(git rev-parse HEAD) \
+    -t thomasschweich/pawn:rocm .
 ```
 
 ### Pod Lifecycle

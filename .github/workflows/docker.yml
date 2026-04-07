@@ -30,7 +30,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push runtime
+      # ── CUDA images ──────────────────────────────────────────────────
+      - name: Build and push runtime (CUDA)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -46,7 +47,7 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
 
-      - name: Build and push dev
+      - name: Build and push dev (CUDA)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -61,3 +62,36 @@ jobs:
             GIT_TAG=${{ steps.meta.outputs.tag }}
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+
+      # ── ROCm images ─────────────────────────────────────────────────
+      - name: Build and push runtime (ROCm)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime-rocm
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:rocm
+            ${{ env.IMAGE }}:rocm-${{ github.sha }}
+          build-args: |
+            GIT_HASH=${{ github.sha }}
+            GIT_TAG=${{ steps.meta.outputs.tag }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-rocm
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-rocm,mode=max
+
+      - name: Build and push dev (ROCm)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: dev-rocm
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:dev-rocm
+            ${{ env.IMAGE }}:dev-rocm-${{ github.sha }}
+          build-args: |
+            GIT_HASH=${{ github.sha }}
+            GIT_TAG=${{ steps.meta.outputs.tag }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-rocm
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-rocm,mode=max
