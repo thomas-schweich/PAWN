@@ -30,45 +30,20 @@ class TestIsRocm:
         mocker.patch("torch.cuda.is_available", return_value=False)
         assert is_rocm() is False
 
-    @pytest.mark.parametrize("name", [
-        "AMD Radeon RX 7900 XTX",  # matches "radeon" + "rx "
-        "AMD Radeon Pro W7900",    # matches "radeon"
-        "Radeon Pro VII",          # matches "radeon"
-        "AMD MI300X",              # matches "mi3"
-        "AMD Instinct MI300X",     # matches "mi3"
-    ])
-    def test_returns_true_for_amd_names(self, mocker, name):
+    def test_returns_true_when_hip_present(self, mocker):
         mocker.patch("torch.cuda.is_available", return_value=True)
-        mocker.patch("torch.cuda.get_device_name", return_value=name)
+        mocker.patch.object(torch.version, "hip", "6.1.0", create=True)
         assert is_rocm() is True
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG-200: is_rocm heuristic misses 'AMD Instinct MI250X' (no 'mi ' substring, no 'mi3')",
-    )
-    def test_is_rocm_matches_mi250x(self, mocker):
-        """AMD Instinct MI250X is a production ROCm card but is missed.
-
-        `get_device_name()` returns 'AMD Instinct MI250X'. When lowercased,
-        neither 'mi ' nor 'mi3' is present, so the heuristic returns False.
-        """
+    def test_returns_true_for_mi250x(self, mocker):
+        """AMD Instinct MI250X — previously BUG-200, now detected via torch.version.hip."""
         mocker.patch("torch.cuda.is_available", return_value=True)
-        mocker.patch(
-            "torch.cuda.get_device_name",
-            return_value="AMD Instinct MI250X",
-        )
+        mocker.patch.object(torch.version, "hip", "5.7.0", create=True)
         assert is_rocm() is True
 
-    @pytest.mark.parametrize("name", [
-        "NVIDIA GeForce RTX 4090",
-        "NVIDIA H100 PCIe",
-        "NVIDIA A100-SXM4-80GB",
-        "NVIDIA L40S",
-        "Tesla V100",
-    ])
-    def test_returns_false_for_nvidia_names(self, mocker, name):
+    def test_returns_false_when_hip_is_none(self, mocker):
         mocker.patch("torch.cuda.is_available", return_value=True)
-        mocker.patch("torch.cuda.get_device_name", return_value=name)
+        mocker.patch.object(torch.version, "hip", None)
         assert is_rocm() is False
 
 
@@ -104,7 +79,8 @@ class TestConfigureGpuNvidia:
     @pytest.fixture(autouse=True)
     def _mock_nvidia(self, mocker):
         mocker.patch("torch.cuda.is_available", return_value=True)
-        mocker.patch("torch.cuda.get_device_name", return_value="NVIDIA H100 PCIe")
+        mocker.patch("torch.cuda.get_device_name", return_value="NVIDIA H100")
+        mocker.patch("pawn.gpu.is_rocm", return_value=False)
 
     def test_compile_and_amp_enabled(self):
         cfg = configure_gpu()
@@ -139,7 +115,8 @@ class TestConfigureGpuAmd:
     @pytest.fixture(autouse=True)
     def _mock_amd(self, mocker):
         mocker.patch("torch.cuda.is_available", return_value=True)
-        mocker.patch("torch.cuda.get_device_name", return_value="AMD Radeon RX 7900 XTX")
+        mocker.patch("torch.cuda.get_device_name", return_value="AMD Instinct MI300X")
+        mocker.patch("pawn.gpu.is_rocm", return_value=True)
 
     def test_sdpa_math_selected_on_amd_with_compile(self):
         from torch.nn.attention import SDPBackend

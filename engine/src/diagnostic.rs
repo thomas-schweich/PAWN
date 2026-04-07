@@ -149,17 +149,29 @@ pub fn generate_diagnostic_sets(
     let mut per_ply_stats = vec![0u64; n_games * max_ply];
     let mut game_lengths_flat = Vec::with_capacity(n_games);
 
+    // Recompute accumulators from only the bits that fit in the output stride,
+    // so output.white/black always agree with output.per_ply_stats.
+    let mut final_white_acc = Vec::with_capacity(n_games);
+    let mut final_black_acc = Vec::with_capacity(n_games);
+
     for (i, moves) in accepted_moves.iter().enumerate() {
         let length = accepted_lengths[i] as usize;
         for t in 0..length {
             move_ids_flat[i * max_ply + t] = moves[t] as i16;
         }
-        // Copy pre-computed per-ply bits (length+1 entries, cap at max_ply)
         let ply_bits = &accepted_ply_bits[i];
         let copy_len = ply_bits.len().min(max_ply);
         per_ply_stats[i * max_ply..i * max_ply + copy_len]
             .copy_from_slice(&ply_bits[..copy_len]);
         game_lengths_flat.push(accepted_lengths[i] as i16);
+
+        let mut w = 0u64;
+        let mut b = 0u64;
+        for t in 0..copy_len {
+            if t % 2 == 0 { w |= ply_bits[t]; } else { b |= ply_bits[t]; }
+        }
+        final_white_acc.push(w);
+        final_black_acc.push(b);
     }
 
     DiagnosticOutput {
@@ -167,8 +179,8 @@ pub fn generate_diagnostic_sets(
         game_lengths: game_lengths_flat,
         termination_codes: accepted_terms.iter().map(|t| t.as_u8()).collect(),
         per_ply_stats,
-        white: accepted_white_acc,
-        black: accepted_black_acc,
+        white: final_white_acc,
+        black: final_black_acc,
         quota_assignment_white: assignment_white,
         quota_assignment_black: assignment_black,
         quotas_filled_white: filled_white.to_vec(),
@@ -180,6 +192,10 @@ pub fn generate_diagnostic_sets(
 
 /// Compute per-ply edge stats + per-game accumulators for a single game.
 /// Returns (ply_bits, white_accumulator, black_accumulator).
+///
+/// The returned ply_bits has `length + 1` entries (including the terminal
+/// position). Accumulators are derived from these entries directly so
+/// they always agree with the per-ply vector.
 fn compute_game_stats(moves: &[u16], length: usize) -> (Vec<u64>, u64, u64) {
     let mut move_ids = vec![0i16; length];
     for t in 0..length {
@@ -187,17 +203,29 @@ fn compute_game_stats(moves: &[u16], length: usize) -> (Vec<u64>, u64, u64) {
     }
 
     let game_lengths = vec![length as i16];
-    let max_ply = length.max(1);
+    let max_ply = (length + 1).max(1);
     let mut padded = vec![0i16; max_ply];
     padded[..length].copy_from_slice(&move_ids);
 
-    let (per_ply, white, black) = edgestats::compute_edge_stats_per_ply(
+    let (per_ply, _white, _black) = edgestats::compute_edge_stats_per_ply(
         &padded,
         &game_lengths,
         max_ply,
     );
 
-    (per_ply, white[0], black[0])
+    // Derive accumulators from the per_ply vector so they are always
+    // consistent with what downstream code sees.
+    let mut white_acc = 0u64;
+    let mut black_acc = 0u64;
+    for t in 0..per_ply.len() {
+        if t % 2 == 0 {
+            white_acc |= per_ply[t];
+        } else {
+            black_acc |= per_ply[t];
+        }
+    }
+
+    (per_ply, white_acc, black_acc)
 }
 
 #[cfg(test)]
@@ -366,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG-100: per_ply_stats omits terminal-ply bits; accumulators include them"]
+    // Previously BUG-100: fixed by passing max_ply = length + 1 in compute_game_stats.
     fn test_per_ply_stats_match_accumulators() {
         // per_ply_stats should OR by color to match white/black accumulators
         // across accepted games.

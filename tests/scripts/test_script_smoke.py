@@ -49,18 +49,12 @@ ARGPARSE_SCRIPTS = [
     "generate_model_cards.py",
     "generate_stockfish_data.py",
     "profile_step.py",
+    "run_evals_local.py",
+    "run_evals_toplayer.py",
     "split_dataset.py",
     "train_adapter.py",
     "train_all.py",
 ]
-
-
-# Scripts that ignore --help and eagerly execute their pipeline.
-# Tracked as BUG-500 / BUG-501.
-_NO_HELP_SUPPORT = {
-    "run_evals_local.py": "BUG-500: script executes eagerly, ignores --help",
-    "run_evals_toplayer.py": "BUG-501: script executes eagerly, ignores --help",
-}
 
 
 @pytest.mark.parametrize("script", ARGPARSE_SCRIPTS)
@@ -75,12 +69,6 @@ def test_script_help_exits_cleanly(script):
     assert "usage:" in r.stdout, (
         f"{script} --help stdout missing 'usage:' line: {r.stdout!r}"
     )
-
-
-@pytest.mark.parametrize("script", sorted(_NO_HELP_SUPPORT))
-def test_eager_scripts_support_help(script):
-    """BUG-500/501: run_evals_{local,toplayer}.py should honor --help."""
-    pytest.xfail(reason=_NO_HELP_SUPPORT[script])
 
 
 # =====================================================================
@@ -138,7 +126,7 @@ def test_script_source_parses(script):
 def test_all_argparse_scripts_are_covered():
     """Every script with argparse should be listed in ARGPARSE_SCRIPTS."""
     import re
-    known = set(ARGPARSE_SCRIPTS) | set(IMPORTABLE_SCRIPTS) | set(_NO_HELP_SUPPORT)
+    known = set(ARGPARSE_SCRIPTS) | set(IMPORTABLE_SCRIPTS)
     for path in sorted(SCRIPTS.glob("*.py")):
         source = path.read_text()
         # Look for argparse.ArgumentParser

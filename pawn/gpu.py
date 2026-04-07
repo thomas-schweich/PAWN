@@ -17,8 +17,7 @@ def is_rocm() -> bool:
     import torch
     if not torch.cuda.is_available():
         return False
-    name = torch.cuda.get_device_name(0).lower()
-    return "radeon" in name or "rx " in name or "mi " in name or "mi3" in name
+    return getattr(torch.version, "hip", None) is not None
 
 
 def configure_gpu(

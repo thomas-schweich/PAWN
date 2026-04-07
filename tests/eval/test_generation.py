@@ -273,11 +273,6 @@ class TestAnalyzeGeneratedGames:
 # ---------------------------------------------------------------------------
 
 
-_VOCAB_MISMATCH_REASON = (
-    "BUG-701: get_legal_token_masks_batch defaults to vocab_size=4278 "
-    "but CLMConfig.vocab_size=4284, causing shape mismatch in "
-    "autoregressive_generate when mask_illegal=True"
-)
 
 
 class TestAutoregressiveGenerate:
@@ -310,7 +305,6 @@ class TestAutoregressiveGenerate:
         assert (gen["sequences"][:, 0] == WHITE_CHECKMATES).all()
 
     @pytest.mark.unit
-    @pytest.mark.xfail(strict=True, reason=_VOCAB_MISMATCH_REASON)
     def test_mask_illegal_produces_legal_moves_only(self, toy_model, cpu_device):
         """With mask_illegal=True, no forfeits should happen."""
         torch.manual_seed(0)
@@ -413,7 +407,6 @@ class TestPoisonedPrefixTest:
         assert isinstance(results, dict)
 
     @pytest.mark.unit
-    @pytest.mark.xfail(strict=True, reason=_VOCAB_MISMATCH_REASON)
     def test_smoke_with_enough_games(self, toy_model, cpu_device, toy_corpus):
         results = poisoned_prefix_test(
             toy_model, toy_corpus, cpu_device,

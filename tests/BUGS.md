@@ -29,7 +29,7 @@ corresponding entry below.
 <!-- Workers append entries below. Lead reconciles and updates statuses in Wave 4. -->
 
 ## BUG-100: diagnostic per_ply_stats omit terminal-ply bits that are included in per-game accumulators
-- Status: verified (lead Wave 4: confirmed — diagnostic.rs:190 passes `max_ply=length.max(1)` to edgestats, which then truncates the terminal slot via `copy_len = min(length+1, max_ply) = length` in edgestats.rs:700)
+- Status: fixed
 - Discoverer: B (Rust IO)
 - Test: engine/src/diagnostic.rs::tests::test_per_ply_stats_match_accumulators
 - Source: engine/src/diagnostic.rs:183-201 (compute_game_stats uses max_ply=length)
@@ -39,7 +39,7 @@ corresponding entry below.
 - Notes: Fix: pass max_ply = length + 1 (or any value strictly greater than length) into compute_edge_stats_per_ply so the terminal slot is included. Alternatively change compute_game_stats to explicitly size per_ply with length + 1.
 
 ## BUG-200: is_rocm() heuristic misses AMD Instinct MI250X
-- Status: verified (lead Wave 4: confirmed — gpu.py:21 matches only 'radeon'/'rx '/'mi '/'mi3'; "amd instinct mi250x" contains none of these substrings; canonical fix is `torch.version.hip is not None`)
+- Status: fixed
 - Discoverer: C (Python Infra)
 - Test: tests/core/test_gpu.py::TestIsRocm::test_is_rocm_matches_mi250x
 - Source: pawn/gpu.py:21
@@ -49,7 +49,7 @@ corresponding entry below.
 - Notes: Add 'mi2' to the match list, or better, check torch.version.hip is not None (the canonical ROCm detection). The MI300 series is coincidentally covered by 'mi3' but the heuristic is fragile.
 
 ## BUG-500: run_evals_local.py ignores --help and runs eagerly at import time
-- Status: verified (lead Wave 4: confirmed — no argparse, no `__main__` guard; module-level code at line 18 calls `configure_gpu()` unconditionally)
+- Status: fixed
 - Discoverer: H (Lab + Dashboard + Scripts)
 - Test: tests/scripts/test_script_smoke.py::test_eager_scripts_support_help[run_evals_local.py]
 - Source: scripts/run_evals_local.py:1-46 (no argparse, no __main__ guard)
@@ -59,7 +59,7 @@ corresponding entry below.
 - Notes: Wrap everything below the imports in a `main()` function guarded by `if __name__ == "__main__":`, add an `argparse.ArgumentParser` so `--help` short-circuits before the expensive corpus generation. Also update the hardcoded paths to support `--checkpoint` overrides.
 
 ## BUG-700: _extract_elos_from_pgn double-flushes when max_games is reached
-- Status: verified (lead Wave 4: confirmed — lichess.py:97 `break` exits before resetting `in_headers`, so the post-loop flush at line 110 re-appends the already-flushed previous game)
+- Status: fixed
 - Discoverer: G (Eval Suite)
 - Test: tests/eval/test_lichess.py::TestExtractElosFromPGN::test_max_games_respected
 - Source: pawn/eval_suite/lichess.py:82-113
@@ -69,7 +69,7 @@ corresponding entry below.
 - Notes: Fix: set `in_headers = False` before breaking, or move `break` before the `elos.append` and flush outside the loop body.
 
 ## BUG-701: autoregressive_generate mask_illegal uses mismatched vocab_size with the Rust engine
-- Status: verified (lead Wave 4: confirmed — generation.py:189 calls `env.get_legal_token_masks_batch(all_indices)` without passing `vocab_size`, so the pyo3 default of 4278 wins over `cfg_vocab_size=4284`; `_mask_buf.copy_` fails with a shape-mismatch RuntimeError)
+- Status: fixed
 - Discoverer: G (Eval Suite)
 - Test: tests/eval/test_generation.py::TestAutoregressiveGenerate::test_mask_illegal_produces_legal_moves_only
 - Source: pawn/eval_suite/generation.py:189-191, engine/src/lib.rs:1356 (PyBatchRLEnv.get_legal_token_masks_batch)
@@ -79,7 +79,7 @@ corresponding entry below.
 - Notes: Fix: call `env.get_legal_token_masks_batch(all_indices, cfg_vocab_size)` in generation.py, or update the pyo3 default to the current `VOCAB_SIZE` (4284). The Rust constant in `engine/src/vocab.rs` is already 4284; the pyo3 default in `engine/src/lib.rs:1356` is stale.
 
 ## BUG-501: run_evals_toplayer.py ignores --help and runs eagerly at import time
-- Status: verified (lead Wave 4: confirmed — same defect as BUG-500; near-duplicate of run_evals_local.py)
+- Status: fixed
 - Discoverer: H (Lab + Dashboard + Scripts)
 - Test: tests/scripts/test_script_smoke.py::test_eager_scripts_support_help[run_evals_toplayer.py]
 - Source: scripts/run_evals_toplayer.py:1-50 (no argparse, no __main__ guard)

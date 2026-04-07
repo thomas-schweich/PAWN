@@ -101,7 +101,6 @@ class TestExtractElosFromPGN:
         assert 1950 in black_elos
 
     @pytest.mark.unit
-    @pytest.mark.xfail(strict=True, reason="BUG-700: _extract_elos_from_pgn double-flushes when max_games reached")
     def test_max_games_respected(self, pgn_file: Path):
         elos = _extract_elos_from_pgn(pgn_file, max_games=2)
         # When max is reached, parser breaks early; may return <= max
