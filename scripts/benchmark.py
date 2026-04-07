@@ -81,8 +81,8 @@ class ConcurrencyResult:
     per_model_ms: float         # step_ms / n_models
     total_throughput: float     # total samples/s across all models
     per_model_throughput: float # samples/s per model
-    peak_memory_mb: float
-    efficiency: float           # per_model_throughput / single_model_throughput
+    total_vram_mb: float        # sum of peak VRAM across all processes
+    speedup: float              # total_throughput / single_model_throughput
 
 
 @dataclass
@@ -714,11 +714,11 @@ def bench_concurrency(
             # Each worker ran independently; wall time is the max across workers
             # (they ran in parallel, so total time = slowest worker)
             all_means = []
-            total_peak_mb = 0.0
+            total_vram_mb = 0.0
             for wr in worker_results:
                 times_ms = [t * 1000 for t in wr["times"]]
                 all_means.append(statistics.mean(times_ms))
-                total_peak_mb = max(total_peak_mb, wr["peak_memory_mb"])
+                total_vram_mb += wr["peak_memory_mb"]
 
             # The effective wall time per "round" is the slowest worker
             wall_ms = max(all_means)
@@ -729,7 +729,7 @@ def bench_concurrency(
             if single_throughput is None:
                 single_throughput = per_model_throughput
 
-            efficiency = per_model_throughput / single_throughput
+            speedup = total_throughput / single_throughput
 
             cr = ConcurrencyResult(
                 n_models=n_procs,
@@ -737,17 +737,16 @@ def bench_concurrency(
                 per_model_ms=round(wall_ms, 1),
                 total_throughput=round(total_throughput),
                 per_model_throughput=round(per_model_throughput),
-                peak_memory_mb=round(total_peak_mb),
-                efficiency=round(efficiency, 3),
+                total_vram_mb=round(total_vram_mb),
+                speedup=round(speedup, 2),
             )
             results.append(cr)
 
-            eff_pct = efficiency * 100
             print(f"    wall: {wall_ms:.0f}ms"
                   f"  total: {total_throughput:.0f} samples/s"
                   f"  per-job: {per_model_throughput:.0f} samples/s"
-                  f"  efficiency: {eff_pct:.1f}%"
-                  f"  peak mem: {total_peak_mb:.0f} MB")
+                  f"  speedup: {speedup:.2f}x"
+                  f"  VRAM: {total_vram_mb:.0f} MB")
 
             # Stop when total throughput decreases (adding a process hurt)
             if len(results) >= 2:
@@ -906,13 +905,15 @@ def print_summary(
             print(f"    {r.summary_line()}")
 
     if concurrency_results:
+        best_n = max(concurrency_results, key=lambda r: r.total_throughput).n_models
         print("\n  Concurrency sweep (GPU):")
-        print(f"    {'N':>3s}  {'round ms':>9s}  {'total samp/s':>12s}"
-              f"  {'per-model samp/s':>16s}  {'efficiency':>10s}  {'mem MB':>7s}")
+        print(f"    {'':>1s} {'N':>3s}  {'round ms':>9s}  {'total samp/s':>12s}"
+              f"  {'per-job samp/s':>14s}  {'speedup':>7s}  {'VRAM MB':>8s}")
         for cr in concurrency_results:
-            print(f"    {cr.n_models:>3d}  {cr.step_ms:>9.0f}  {cr.total_throughput:>12.0f}"
-                  f"  {cr.per_model_throughput:>16.0f}  {cr.efficiency:>9.1%}"
-                  f"  {cr.peak_memory_mb:>7.0f}")
+            marker = "*" if cr.n_models == best_n else " "
+            print(f"    {marker} {cr.n_models:>3d}  {cr.step_ms:>9.0f}  {cr.total_throughput:>12.0f}"
+                  f"  {cr.per_model_throughput:>14.0f}  {cr.speedup:>6.2f}x"
+                  f"  {cr.total_vram_mb:>8.0f}")
 
     if adapter_results:
         print("\n  Adapter training (GPU):")
