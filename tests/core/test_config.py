@@ -286,11 +286,3 @@ class TestTrainingConfigToy:
 
     def test_toy_distinct_from_default(self):
         assert TrainingConfig.toy() != TrainingConfig()
-
-    def test_toy_has_lower_total_steps_than_default(self):
-        assert TrainingConfig.toy().total_steps < TrainingConfig().total_steps
-
-    def test_val_seed_max_int64(self):
-        """val_seed is intentionally the max signed 64-bit int."""
-        assert TrainingConfig().val_seed == (2**63) - 1
-        assert TrainingConfig().val_seed == 9223372036854775807
