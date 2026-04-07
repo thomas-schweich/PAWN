@@ -596,11 +596,32 @@ def main():
     do_eager = not args.compile_only
 
     # Platform info
+    import multiprocessing
+    cpu_name = ""
+    # platform.processor() is unreliable on Linux (often empty or just arch);
+    # read /proc/cpuinfo for the actual model name
+    if platform.system() == "Linux":
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        cpu_name = line.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+    if not cpu_name:
+        cpu_name = platform.processor() or platform.machine() or "unknown"
+    n_cores = multiprocessing.cpu_count() or 0
+
     info: dict = {
         "python": sys.version.split()[0],
         "os": platform.system(),
         "arch": platform.machine(),
+        "cpu": cpu_name,
+        "cores": n_cores,
     }
+
+    print(f"CPU: {cpu_name} ({n_cores} cores)")
 
     # Detect GPU platform for SDPA backend selection
     sdpa_backend = None
