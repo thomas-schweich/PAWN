@@ -20,6 +20,17 @@
 #
 # IMPORTANT: Always attach a network volume. Set HF_TOKEN as a pod env var.
 
+# ── Caddy: single static binary for reverse-proxying the dashboard ──
+FROM python:3.12-slim AS caddy
+ARG CADDY_VERSION=2.11.2
+ARG CADDY_SHA256=6d07b9bda92ac46e3b874e90dabc33192eca7e64c4b36ea661f4fd7dd27a5129
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64&version=v${CADDY_VERSION}" \
+       -o /usr/local/bin/caddy \
+    && echo "${CADDY_SHA256}  /usr/local/bin/caddy" | sha256sum -c \
+    && chmod +x /usr/local/bin/caddy \
+    && rm -rf /var/lib/apt/lists/*
+
 # ── Builder: compile Rust engine wheel ───────────────────────────────
 FROM python:3.12-slim AS builder
 
@@ -63,6 +74,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 
+COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
+
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_CACHE_DIR=/tmp/uv-cache
@@ -88,6 +101,7 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
     PYTHONPATH=/opt/pawn \
     PATH="/opt/pawn/.venv/bin:${PATH}"
 
+EXPOSE 8888
 COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["tini", "--"]
@@ -102,6 +116,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server tini tmux ripgrep jq curl git \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
+
+COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
@@ -157,6 +173,7 @@ exec su - pawn -c "
 CLAUDE_DEV
 RUN chmod +x /usr/local/bin/claude-dev
 
+EXPOSE 8888
 COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["tini", "--"]
@@ -176,6 +193,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server tini \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
+
+COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
@@ -202,6 +221,7 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
     PYTHONPATH=/opt/pawn \
     PATH="/opt/pawn/.venv/bin:${PATH}"
 
+EXPOSE 8888
 COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["tini", "--"]
@@ -214,6 +234,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server tini tmux ripgrep jq curl git \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
+
+COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
@@ -268,6 +290,7 @@ exec su - pawn -c "
 CLAUDE_DEV
 RUN chmod +x /usr/local/bin/claude-dev
 
+EXPOSE 8888
 COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["tini", "--"]
