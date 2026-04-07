@@ -21,8 +21,7 @@ if [ -n "${PUBLIC_KEY:-}" ]; then
 fi
 if [ -x "$(command -v sshd)" ]; then
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-    /usr/sbin/sshd &
-    sleep 1
+    /usr/sbin/sshd
 fi
 
 # Pull checkpoint from HuggingFace if PAWN_MODEL is set

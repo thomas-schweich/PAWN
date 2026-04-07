@@ -59,7 +59,7 @@ RUN maturin build --release
 FROM python:3.12-slim AS deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        openssh-server \
+        openssh-server tini \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 
@@ -90,7 +90,8 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
 
 COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
-ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
+ENTRYPOINT ["tini", "--"]
+CMD ["/opt/pawn/entrypoint.sh"]
 
 # ── Dev (CUDA) ───────────────────────────────────────────────────────
 # Built independently (not FROM runtime) so all /opt/pawn files are
@@ -98,7 +99,7 @@ ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
 FROM python:3.12-slim AS dev
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        openssh-server tmux ripgrep jq curl git \
+        openssh-server tini tmux ripgrep jq curl git \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 
@@ -158,7 +159,8 @@ RUN chmod +x /usr/local/bin/claude-dev
 
 COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
-ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
+ENTRYPOINT ["tini", "--"]
+CMD ["/opt/pawn/entrypoint.sh"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -171,7 +173,7 @@ ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
 FROM python:3.12-slim AS deps-rocm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        openssh-server \
+        openssh-server tini \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 
@@ -202,13 +204,14 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
 
 COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
-ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
+ENTRYPOINT ["tini", "--"]
+CMD ["/opt/pawn/entrypoint.sh"]
 
 # ── Dev (ROCm) ───────────────────────────────────────────────────────
 FROM python:3.12-slim AS dev-rocm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        openssh-server tmux ripgrep jq curl git \
+        openssh-server tini tmux ripgrep jq curl git \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 
@@ -267,4 +270,5 @@ RUN chmod +x /usr/local/bin/claude-dev
 
 COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
-ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
+ENTRYPOINT ["tini", "--"]
+CMD ["/opt/pawn/entrypoint.sh"]

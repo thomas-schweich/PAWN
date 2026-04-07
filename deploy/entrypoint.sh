@@ -30,15 +30,14 @@ if command -v nvidia-cuda-mps-control &>/dev/null; then
         || echo "CUDA MPS already running or unavailable"
 fi
 
-# ── Start SSH daemon ─────────────────────────────────────────────────
+# ── Configure and start SSH as the foreground process ────────────────
+# tini (PID 1) reaps zombies and forwards signals.
 if [ -x "$(command -v sshd)" ]; then
-    # Allow root login with key (RunPod convention)
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-    /usr/sbin/sshd
-    echo "SSH daemon started"
+    echo "PAWN container ready — starting sshd"
+    exec /usr/sbin/sshd -D
 fi
 
-echo "PAWN container ready"
-
-# Keep container alive (RunPod expects a foreground process)
+# Fallback if sshd is somehow missing
+echo "PAWN container ready (no sshd found)"
 exec sleep infinity
