@@ -37,3 +37,76 @@ impl PromoType {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_termination_as_u8_values() {
+        // Must match the comment in PyGameState.check_termination (0-5)
+        assert_eq!(Termination::Checkmate.as_u8(), 0);
+        assert_eq!(Termination::Stalemate.as_u8(), 1);
+        assert_eq!(Termination::SeventyFiveMoveRule.as_u8(), 2);
+        assert_eq!(Termination::FivefoldRepetition.as_u8(), 3);
+        assert_eq!(Termination::InsufficientMaterial.as_u8(), 4);
+        assert_eq!(Termination::PlyLimit.as_u8(), 5);
+    }
+
+    #[test]
+    fn test_termination_discriminants_stable() {
+        // Verify #[repr(u8)] assignments via explicit cast
+        assert_eq!(Termination::Checkmate as u8, 0);
+        assert_eq!(Termination::PlyLimit as u8, 5);
+    }
+
+    #[test]
+    fn test_termination_equality_and_clone() {
+        let a = Termination::Checkmate;
+        let b = a;
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_ne!(Termination::Checkmate, Termination::Stalemate);
+    }
+
+    #[test]
+    fn test_promo_type_from_index_valid() {
+        assert_eq!(PromoType::from_index(0), Some(PromoType::Queen));
+        assert_eq!(PromoType::from_index(1), Some(PromoType::Rook));
+        assert_eq!(PromoType::from_index(2), Some(PromoType::Bishop));
+        assert_eq!(PromoType::from_index(3), Some(PromoType::Knight));
+    }
+
+    #[test]
+    fn test_promo_type_from_index_invalid() {
+        assert_eq!(PromoType::from_index(4), None);
+        assert_eq!(PromoType::from_index(99), None);
+        assert_eq!(PromoType::from_index(u8::MAX), None);
+    }
+
+    #[test]
+    fn test_promo_type_discriminants() {
+        // Must match vocab's q=0, r=1, b=2, n=3 order
+        assert_eq!(PromoType::Queen as u8, 0);
+        assert_eq!(PromoType::Rook as u8, 1);
+        assert_eq!(PromoType::Bishop as u8, 2);
+        assert_eq!(PromoType::Knight as u8, 3);
+    }
+
+    #[test]
+    fn test_promo_type_roundtrip() {
+        for i in 0..4u8 {
+            let pt = PromoType::from_index(i).unwrap();
+            assert_eq!(pt as u8, i);
+        }
+    }
+
+    #[test]
+    fn test_promo_type_equality_and_copy() {
+        let a = PromoType::Queen;
+        let b = a;  // Copy
+        assert_eq!(a, b);
+        assert_ne!(PromoType::Queen, PromoType::Rook);
+    }
+}

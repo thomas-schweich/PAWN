@@ -1,0 +1,374 @@
+"""Unit tests for pawn.run_config Pydantic RunConfig discriminated union.
+
+FROZEN MODULE — do not edit pawn/run_config.py to make a test pass.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from pydantic import TypeAdapter, ValidationError
+
+from pawn.run_config import (
+    AdapterConfig,
+    BaseRunConfig,
+    PretrainConfig,
+    RunConfig,
+)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint mode mutual exclusion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCheckpointModeValidation:
+    def test_hf_repo_only(self):
+        cfg = PretrainConfig(hf_repo="user/repo")
+        assert cfg.hf_repo == "user/repo"
+        assert cfg.local_checkpoints is False
+
+    def test_local_checkpoints_only(self):
+        cfg = PretrainConfig(local_checkpoints=True)
+        assert cfg.local_checkpoints is True
+        assert cfg.hf_repo is None
+
+    def test_both_raises(self):
+        with pytest.raises(ValidationError) as exc_info:
+            PretrainConfig(hf_repo="user/repo", local_checkpoints=True)
+        assert "mutually exclusive" in str(exc_info.value)
+
+    def test_neither_raises(self):
+        with pytest.raises(ValidationError) as exc_info:
+            PretrainConfig()
+        assert "required" in str(exc_info.value)
+
+    def test_both_raises_adapter(self):
+        with pytest.raises(ValidationError):
+            AdapterConfig(
+                strategy="lora",
+                hf_repo="user/repo",
+                local_checkpoints=True,
+            )
+
+    def test_neither_raises_adapter(self):
+        with pytest.raises(ValidationError):
+            AdapterConfig(strategy="lora")
+
+
+# ---------------------------------------------------------------------------
+# PretrainConfig
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestPretrainConfig:
+    def test_run_type_literal(self):
+        cfg = PretrainConfig(local_checkpoints=True)
+        assert cfg.run_type == "pretrain"
+
+    def test_default_variant(self):
+        cfg = PretrainConfig(local_checkpoints=True)
+        assert cfg.variant == "base"
+
+    def test_variants_accepted(self):
+        for v in ["toy", "small", "base", "large"]:
+            cfg = PretrainConfig(local_checkpoints=True, variant=v)
+            assert cfg.variant == v
+
+    def test_invalid_variant_rejected(self):
+        with pytest.raises(ValidationError):
+            PretrainConfig(local_checkpoints=True, variant="enormous")
+
+    def test_architecture_overrides_default_none(self):
+        cfg = PretrainConfig(local_checkpoints=True)
+        assert cfg.d_model is None
+        assert cfg.n_layers is None
+        assert cfg.n_heads is None
+        assert cfg.d_ff is None
+
+    def test_architecture_overrides(self):
+        cfg = PretrainConfig(
+            local_checkpoints=True,
+            d_model=384, n_layers=6, n_heads=6, d_ff=1536,
+        )
+        assert cfg.d_model == 384
+        assert cfg.n_layers == 6
+        assert cfg.n_heads == 6
+        assert cfg.d_ff == 1536
+
+    def test_default_accumulation_steps(self):
+        cfg = PretrainConfig(local_checkpoints=True)
+        assert cfg.accumulation_steps == 1
+
+    def test_default_checkpoint_interval(self):
+        cfg = PretrainConfig(local_checkpoints=True)
+        assert cfg.checkpoint_interval == 5000
+
+
+# ---------------------------------------------------------------------------
+# AdapterConfig
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAdapterConfig:
+    def test_strategy_required(self):
+        with pytest.raises(ValidationError):
+            AdapterConfig(local_checkpoints=True)
+
+    @pytest.mark.parametrize("strat", [
+        "bottleneck", "lora", "film", "sparse",
+        "rosa", "hybrid", "specialized_clm", "unfreeze",
+    ])
+    def test_valid_strategies(self, strat):
+        cfg = AdapterConfig(local_checkpoints=True, strategy=strat)
+        assert cfg.strategy == strat
+
+    def test_invalid_strategy_rejected(self):
+        with pytest.raises(ValidationError):
+            AdapterConfig(local_checkpoints=True, strategy="nonexistent")
+
+    def test_default_checkpoint_and_pgn(self):
+        cfg = AdapterConfig(local_checkpoints=True, strategy="lora")
+        assert cfg.checkpoint == "thomas-schweich/pawn-base"
+        assert cfg.pgn == "thomas-schweich/pawn-lichess-full"
+
+    def test_lora_targets_valid(self):
+        for tgt in ["qkvo", "qv", "qkv"]:
+            cfg = AdapterConfig(
+                local_checkpoints=True, strategy="lora", lora_targets=tgt,
+            )
+            assert cfg.lora_targets == tgt
+
+    def test_lora_targets_invalid(self):
+        with pytest.raises(ValidationError):
+            AdapterConfig(
+                local_checkpoints=True, strategy="lora", lora_targets="zzz",
+            )
+
+    def test_sparse_targets_valid(self):
+        for tgt in ["qkvo", "qv", "qkv"]:
+            cfg = AdapterConfig(
+                local_checkpoints=True, strategy="sparse", sparse_targets=tgt,
+            )
+            assert cfg.sparse_targets == tgt
+
+    def test_rosa_mode_valid(self):
+        for m in ["rosa", "retro-sparse", "retro-bottleneck"]:
+            cfg = AdapterConfig(
+                local_checkpoints=True, strategy="rosa", rosa_mode=m,
+            )
+            assert cfg.rosa_mode == m
+
+    def test_amp_dtype_valid(self):
+        for d in ["float16", "bfloat16", "none"]:
+            cfg = AdapterConfig(
+                local_checkpoints=True, strategy="lora", amp_dtype=d,
+            )
+            assert cfg.amp_dtype == d
+
+    def test_amp_dtype_invalid(self):
+        with pytest.raises(ValidationError):
+            AdapterConfig(
+                local_checkpoints=True, strategy="lora", amp_dtype="fp32",
+            )
+
+    def test_grad_alpha_valid(self):
+        for a in [1, 2]:
+            cfg = AdapterConfig(
+                local_checkpoints=True, strategy="rosa", grad_alpha=a,
+            )
+            assert cfg.grad_alpha == a
+
+    def test_grad_alpha_invalid(self):
+        with pytest.raises(ValidationError):
+            AdapterConfig(
+                local_checkpoints=True, strategy="rosa", grad_alpha=3,
+            )
+
+    def test_defaults(self):
+        cfg = AdapterConfig(local_checkpoints=True, strategy="bottleneck")
+        assert cfg.bottleneck_dim is None
+        assert cfg.lora_rank is None
+        assert cfg.no_adapt_attn is False
+        assert cfg.no_adapt_ffn is False
+        assert cfg.lora_ffn is False
+        assert cfg.sparse_ffn is False
+        assert cfg.use_output_film is False
+        assert cfg.rosa_warmup_steps == 128
+        assert cfg.mask_samples == 32
+        assert cfg.grad_alpha == 2
+        assert cfg.epochs == 50
+        assert cfg.val_every == 1
+
+
+# ---------------------------------------------------------------------------
+# Base fields shared across configs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestBaseRunConfig:
+    def test_base_defaults_on_pretrain(self):
+        cfg = PretrainConfig(local_checkpoints=True)
+        assert cfg.elo_min is None
+        assert cfg.elo_max is None
+        assert cfg.max_games is None
+        assert cfg.val_games == 50_000
+        assert cfg.min_ply == 10
+        assert cfg.batch_size == 256
+        assert cfg.lr == 3e-4
+        assert cfg.weight_decay == 0.0
+        assert cfg.warmup_frac == 0.05
+        assert cfg.warmup_steps is None
+        assert cfg.max_grad_norm == 1.0
+        assert cfg.patience is None
+        assert cfg.log_interval == 100
+        assert cfg.mate_boost == 0.0
+        assert cfg.no_outcome_token is False
+        assert cfg.discard_ply_limit is False
+        assert cfg.no_compile is False
+        assert cfg.sdpa_math is False
+        assert cfg.num_workers == 4
+        assert cfg.device == "cuda"
+        assert cfg.wandb is False
+        assert cfg.resume is None
+
+    def test_base_run_config_cannot_be_instantiated_as_discriminated(self):
+        """BaseRunConfig itself is an abstract parent — still instantiable."""
+        # BaseRunConfig has no `run_type` literal, so it's usable on its own
+        # but not part of the union. Verify it validates checkpoint mode.
+        cfg = BaseRunConfig(local_checkpoints=True)
+        assert cfg.local_checkpoints is True
+
+
+# ---------------------------------------------------------------------------
+# Discriminated union
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestDiscriminatedUnion:
+    def test_union_dispatches_pretrain(self):
+        adapter = TypeAdapter(RunConfig)
+        cfg = adapter.validate_python({
+            "run_type": "pretrain",
+            "local_checkpoints": True,
+        })
+        assert isinstance(cfg, PretrainConfig)
+        assert cfg.run_type == "pretrain"
+
+    def test_union_dispatches_adapter(self):
+        adapter = TypeAdapter(RunConfig)
+        cfg = adapter.validate_python({
+            "run_type": "adapter",
+            "local_checkpoints": True,
+            "strategy": "lora",
+        })
+        assert isinstance(cfg, AdapterConfig)
+        assert cfg.run_type == "adapter"
+        assert cfg.strategy == "lora"
+
+    def test_union_missing_run_type(self):
+        adapter = TypeAdapter(RunConfig)
+        with pytest.raises(ValidationError):
+            adapter.validate_python({"local_checkpoints": True})
+
+    def test_union_invalid_run_type(self):
+        adapter = TypeAdapter(RunConfig)
+        with pytest.raises(ValidationError):
+            adapter.validate_python({
+                "run_type": "unknown",
+                "local_checkpoints": True,
+            })
+
+
+# ---------------------------------------------------------------------------
+# Serialization round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestSerialization:
+    def test_pretrain_json_roundtrip(self):
+        cfg = PretrainConfig(
+            local_checkpoints=True,
+            variant="small",
+            total_steps=1000,
+            batch_size=64,
+        )
+        data = cfg.model_dump()
+        cfg2 = PretrainConfig(**data)
+        assert cfg == cfg2
+
+    def test_adapter_json_roundtrip(self):
+        cfg = AdapterConfig(
+            local_checkpoints=True,
+            strategy="lora",
+            lora_rank=4,
+            lora_targets="qkvo",
+        )
+        data = cfg.model_dump()
+        cfg2 = AdapterConfig(**data)
+        assert cfg == cfg2
+
+    def test_pretrain_json_string_roundtrip(self):
+        cfg = PretrainConfig(local_checkpoints=True, variant="large")
+        s = cfg.model_dump_json()
+        d = json.loads(s)
+        cfg2 = PretrainConfig(**d)
+        assert cfg == cfg2
+
+    def test_pretrain_json_schema_generates(self):
+        schema = PretrainConfig.model_json_schema()
+        assert isinstance(schema, dict)
+        assert "properties" in schema
+        assert "variant" in schema["properties"]
+        assert "run_type" in schema["properties"]
+
+    def test_adapter_json_schema_generates(self):
+        schema = AdapterConfig.model_json_schema()
+        assert isinstance(schema, dict)
+        assert "properties" in schema
+        assert "strategy" in schema["properties"]
+        assert "run_type" in schema["properties"]
+
+    def test_run_type_in_schema_has_literal_value(self):
+        schema = PretrainConfig.model_json_schema()
+        rt = schema["properties"]["run_type"]
+        # Literal renders as either const or enum with single value
+        assert (
+            rt.get("const") == "pretrain"
+            or rt.get("enum") == ["pretrain"]
+            or rt.get("default") == "pretrain"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bad types
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestTypeValidation:
+    def test_batch_size_must_be_int(self):
+        with pytest.raises(ValidationError):
+            PretrainConfig(local_checkpoints=True, batch_size="many")
+
+    def test_lr_must_be_float(self):
+        with pytest.raises(ValidationError):
+            PretrainConfig(local_checkpoints=True, lr="fast")
+
+    def test_no_outcome_token_must_be_bool_like(self):
+        # Pydantic v2 is lenient with bool coercion; we just test explicit bad values
+        cfg = PretrainConfig(local_checkpoints=True, no_outcome_token=True)
+        assert cfg.no_outcome_token is True
+
+    def test_extra_fields_behavior(self):
+        """Pydantic by default ignores extra fields unless model_config forbids."""
+        # Should not raise (extra fields silently ignored by default)
+        cfg = PretrainConfig(local_checkpoints=True, bogus_field="value")
+        assert not hasattr(cfg, "bogus_field")

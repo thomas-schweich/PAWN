@@ -1139,6 +1139,312 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_clock_zero() {
+        assert_eq!(parse_clock("0:00:00"), Some(0));
+    }
+
+    #[test]
+    fn test_parse_clock_bad_parts() {
+        assert_eq!(parse_clock("1:2"), None);
+        assert_eq!(parse_clock("a:b:c"), None);
+        assert_eq!(parse_clock(""), None);
+        assert_eq!(parse_clock("1:00"), None);
+    }
+
+    #[test]
+    fn test_parse_clock_caps_at_max() {
+        // Very large time: should cap at 0x7FFF = 32767
+        assert_eq!(parse_clock("99:59:59"), Some(0x7FFF));
+        // 9:06:07 = 32767 exactly → capped
+        assert_eq!(parse_clock("9:06:07"), Some(0x7FFF));
+    }
+
+    #[test]
+    fn test_parse_eval_bad() {
+        assert_eq!(parse_eval("abc"), None);
+        assert_eq!(parse_eval(""), None);
+        assert_eq!(parse_eval("#"), None);
+    }
+
+    #[test]
+    fn test_parse_eval_centipawn_precision() {
+        // Conversion: cp = round(f * 100)
+        assert_eq!(parse_eval("0.01"), Some(1));
+        assert_eq!(parse_eval("-0.01"), Some(-1));
+        assert_eq!(parse_eval("1.00"), Some(100));
+        assert_eq!(parse_eval("3.14"), Some(314));
+    }
+
+    #[test]
+    fn test_parse_eval_mate_zero() {
+        // #0 would be invalid; parse_eval uses max(1).
+        // rest = "0", n = 0, abs_n = 1, mate_val = 32766, and n>0 is false → negate → -32766
+        assert_eq!(parse_eval("#0"), Some(-32766));
+    }
+
+    #[test]
+    fn test_parse_header_line_empty_value() {
+        assert_eq!(
+            parse_header_line(r#"[Event ""]"#),
+            Some(("Event".to_string(), "".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_header_line_invalid() {
+        // Missing brackets
+        assert!(parse_header_line(r#"White "alice""#).is_none());
+        // No space separator
+        assert!(parse_header_line(r#"[White"alice"]"#).is_none());
+    }
+
+    #[test]
+    fn test_pgn_lichess_headers_preserved() {
+        // The full header set needed for downstream processing should be present.
+        let pgn = r#"[Event "Rated Rapid game"]
+[Site "https://lichess.org/abc"]
+[White "alice"]
+[Black "bob"]
+[Result "1-0"]
+[WhiteElo "1873"]
+[BlackElo "1844"]
+[ECO "C20"]
+[Opening "King's Pawn Game"]
+[TimeControl "600+0"]
+[Termination "Normal"]
+[UTCDate "2025.01.15"]
+
+1. e4 { [%clk 0:10:00] } e5 { [%clk 0:09:58] } 2. Nf3 { [%clk 0:09:50] } Nc6 { [%clk 0:09:45] } 3. Bc4 { [%clk 0:09:40] } Bc5 { [%clk 0:09:35] } 4. c3 { [%clk 0:09:30] } Nf6 { [%clk 0:09:25] } 5. d4 { [%clk 0:09:20] } exd4 { [%clk 0:09:15] } 6. cxd4 { [%clk 0:09:10] } Bb4+ { [%clk 0:09:05] } 7. Nc3 { [%clk 0:09:00] } 1-0
+"#;
+        let games = parse_pgn_lichess(pgn, 255, 100, 5);
+        assert_eq!(games.len(), 1);
+        let g = &games[0];
+        // All important headers preserved
+        assert_eq!(g.headers.get("WhiteElo").unwrap(), "1873");
+        assert_eq!(g.headers.get("BlackElo").unwrap(), "1844");
+        assert_eq!(g.headers.get("ECO").unwrap(), "C20");
+        assert_eq!(g.headers.get("Opening").unwrap(), "King's Pawn Game");
+        assert_eq!(g.headers.get("TimeControl").unwrap(), "600+0");
+        assert_eq!(g.headers.get("UTCDate").unwrap(), "2025.01.15");
+        assert_eq!(g.headers.get("Result").unwrap(), "1-0");
+    }
+
+    #[test]
+    fn test_pgn_enriched_min_ply_filter() {
+        // Short game filtered out by min_ply
+        let pgn = r#"[Event "Test"]
+
+1. e4 e5 1-0
+"#;
+        let games = parse_pgn_enriched(pgn, 256, 100, 10);
+        assert_eq!(games.len(), 0, "short game should be filtered by min_ply");
+
+        let games = parse_pgn_enriched(pgn, 256, 100, 2);
+        assert_eq!(games.len(), 1);
+    }
+
+    #[test]
+    fn test_pgn_enriched_max_games_limit() {
+        let pgn = r#"[Event "G1"]
+
+1. e4 e5 1-0
+
+[Event "G2"]
+
+1. d4 d5 0-1
+
+[Event "G3"]
+
+1. c4 e5 1/2-1/2
+"#;
+        let games = parse_pgn_enriched(pgn, 256, 2, 2);
+        assert_eq!(games.len(), 2, "max_games=2 limits output");
+    }
+
+    #[test]
+    fn test_lichess_black_checkmates() {
+        // Black plays Fool's mate: 1. f3 e5 2. g4 Qh4# — black checkmates white
+        let pgn = r#"[Event "Rated Blitz game"]
+[Result "0-1"]
+[Termination "Normal"]
+
+1. f3 e5 2. g4 Qh4# 0-1
+"#;
+        let games = parse_pgn_lichess(pgn, 255, 100, 1);
+        assert_eq!(games.len(), 1);
+        let g = &games[0];
+        assert_eq!(g.outcome_token, crate::vocab::BLACK_CHECKMATES);
+        assert_eq!(g.tokens[0], crate::vocab::BLACK_CHECKMATES);
+    }
+
+    #[test]
+    fn test_lichess_white_resigns() {
+        let pgn = r#"[Event "Rated Blitz game"]
+[Result "0-1"]
+[Termination "Normal"]
+
+1. e4 e5 2. Nf3 Nc6 0-1
+"#;
+        let games = parse_pgn_lichess(pgn, 255, 100, 1);
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].outcome_token, crate::vocab::BLACK_RESIGNS);
+    }
+
+    #[test]
+    fn test_lichess_rules_infraction_filtered() {
+        let pgn = r#"[Event "Rated Blitz game"]
+[Result "0-1"]
+[Termination "Rules infraction"]
+
+1. e4 e5 0-1
+"#;
+        let games = parse_pgn_lichess(pgn, 255, 100, 1);
+        assert_eq!(games.len(), 0, "Rules infraction games should be filtered");
+    }
+
+    #[test]
+    fn test_lichess_unterminated_filtered() {
+        let pgn = r#"[Event "Rated Blitz game"]
+[Result "*"]
+[Termination "Unterminated"]
+
+1. e4 e5 *
+"#;
+        let games = parse_pgn_lichess(pgn, 255, 100, 1);
+        assert_eq!(games.len(), 0, "Unterminated games should be filtered");
+    }
+
+    #[test]
+    fn test_san_to_tokens_illegal_stops_early() {
+        // e5 is illegal for white as first move (pawn can't move diagonally without capture).
+        let moves = vec!["e4", "e5", "Ke2", "Ke7"]; // Ke2 requires king to move (legal)
+        let (_, n) = san_moves_to_tokens(&moves, 256);
+        assert_eq!(n, 4, "all 4 moves should parse");
+
+        // Now test invalid move
+        let moves = vec!["e4", "Qxf7"]; // Qxf7 not legal immediately
+        let (_, n) = san_moves_to_tokens(&moves, 256);
+        assert!(n < 2, "Qxf7 is not legal after 1.e4");
+    }
+
+    #[test]
+    fn test_san_to_tokens_promotion() {
+        // A promotion game: setup, then promote a pawn
+        let moves = vec![
+            "a4", "b5", "axb5", "c5", "bxc6", "d5", "c7", "d4", "cxb8=Q",
+        ];
+        let (tokens, n) = san_moves_to_tokens(&moves, 256);
+        assert_eq!(n, 9, "all 9 moves should parse including promotion");
+        // The last move is a promotion; token should be in the promo range
+        let last_tok = tokens[8];
+        assert!(last_tok >= crate::vocab::PROMO_START && last_tok <= crate::vocab::PROMO_END,
+            "promotion token 0x{:x} should be in range [{}, {}]", last_tok,
+            crate::vocab::PROMO_START, crate::vocab::PROMO_END);
+    }
+
+    #[test]
+    fn test_extract_san_moves_underpromotion() {
+        // SAN underpromotion markers
+        let text = "1. e4 e5 2. a5 b6 3. a6 b5 4. a7 b4 5. a8=N 1-0";
+        let moves = extract_san_moves(text).unwrap();
+        assert_eq!(moves.last().unwrap(), "a8=N");
+    }
+
+    #[test]
+    fn test_extract_san_draw_result() {
+        let text = "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 1/2-1/2";
+        let moves = extract_san_moves(text).unwrap();
+        assert_eq!(moves.len(), 6);
+    }
+
+    #[test]
+    fn test_extract_san_unfinished_result() {
+        let text = "1. e4 e5 *";
+        let moves = extract_san_moves(text).unwrap();
+        assert_eq!(moves.len(), 2);
+    }
+
+    #[test]
+    fn test_date_range_exclusive_header_ignored() {
+        // UTCDate header that's out of range shouldn't leak to parsed game.
+        let pgn = r#"[Event "Out of range"]
+[UTCDate "2020.01.01"]
+
+1. e4 e5 1-0
+
+[Event "In range"]
+[UTCDate "2025.01.15"]
+
+1. d4 d5 0-1
+"#;
+        let count = count_games_in_date_range(pgn, "2025.01.01", "2025.12.31");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_tokenize_result_fields() {
+        let moves = vec!["f3", "e5", "g4", "Qh4"]; // fool's mate setup (no #)
+        let result = san_moves_to_tokens_full(&moves, 256);
+        assert_eq!(result.n_tokenized, 4);
+        assert_eq!(result.n_total_moves, 4);
+        // Qh4 IS checkmate from this position (Fool's Mate)
+        assert!(result.is_checkmate);
+        assert!(!result.is_stalemate);
+    }
+
+    #[test]
+    fn test_tokenize_result_truncation() {
+        // 4 moves, max_ply=2: n_tokenized=2 but n_total_moves=4.
+        let moves = vec!["e4", "e5", "Nf3", "Nc6"];
+        let result = san_moves_to_tokens_full(&moves, 2);
+        assert_eq!(result.n_tokenized, 2);
+        assert_eq!(result.n_total_moves, 4);
+        assert!(!result.is_checkmate);
+    }
+
+    #[test]
+    fn test_batch_san_to_tokens_shape() {
+        let games = vec![
+            vec!["e4", "e5"],
+            vec!["d4", "d5", "c4"],
+        ];
+        let (flat, lengths) = batch_san_to_tokens(&games, 8);
+        assert_eq!(flat.len(), 2 * 8);
+        assert_eq!(lengths, vec![2, 3]);
+        // Check padding beyond lengths is zero
+        assert_eq!(flat[2], 0); // game 0 ply 2 (padding)
+        assert_eq!(flat[7], 0); // game 0 ply 7 (padding)
+        assert_eq!(flat[8 + 3], 0); // game 1 ply 3 (padding)
+    }
+
+    #[test]
+    fn test_parse_comment_clock_only() {
+        let mut clk = CLOCK_NONE;
+        let mut ev = EVAL_NONE;
+        parse_comment("[%clk 0:05:30]", &mut clk, &mut ev);
+        assert_eq!(clk, 330);
+        assert_eq!(ev, EVAL_NONE);
+    }
+
+    #[test]
+    fn test_parse_comment_eval_only() {
+        let mut clk = CLOCK_NONE;
+        let mut ev = EVAL_NONE;
+        parse_comment("[%eval 1.50]", &mut clk, &mut ev);
+        assert_eq!(clk, CLOCK_NONE);
+        assert_eq!(ev, 150);
+    }
+
+    #[test]
+    fn test_parse_comment_empty() {
+        let mut clk = CLOCK_NONE;
+        let mut ev = EVAL_NONE;
+        parse_comment("just a comment", &mut clk, &mut ev);
+        assert_eq!(clk, CLOCK_NONE);
+        assert_eq!(ev, EVAL_NONE);
+    }
+
+    #[test]
     fn test_lichess_outcome_token_is_first() {
         let pgn = r#"[Event "Rated Blitz game"]
 [Result "1-0"]

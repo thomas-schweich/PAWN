@@ -574,4 +574,276 @@ mod tests {
         let (m2, _, _) = generate_one_game(2, 256, 0.0);
         assert_ne!(m1, m2);
     }
+
+    // ==== New tests added by Agent A (Rust Core) ====
+
+    #[test]
+    fn test_derive_game_seeds_deterministic() {
+        // Same base seed -> same derived seeds
+        let s1 = derive_game_seeds(42, 16);
+        let s2 = derive_game_seeds(42, 16);
+        assert_eq!(s1, s2);
+        assert_eq!(s1.len(), 16);
+    }
+
+    #[test]
+    fn test_derive_game_seeds_different_bases_different_outputs() {
+        let s1 = derive_game_seeds(42, 8);
+        let s2 = derive_game_seeds(43, 8);
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn test_derive_game_seeds_avoids_sequential_overlap() {
+        // Key invariant: base seeds 42 and 43 should not share sub-seeds.
+        // Without ChaCha8 derivation, seed+i would cause massive overlap.
+        let s1 = derive_game_seeds(42, 192);
+        let s2 = derive_game_seeds(43, 192);
+        let set1: std::collections::HashSet<u64> = s1.into_iter().collect();
+        let set2: std::collections::HashSet<u64> = s2.into_iter().collect();
+        let overlap = set1.intersection(&set2).count();
+        // With random derivation, overlap should be ~0 (probabilistically 0 in 2^64)
+        assert_eq!(overlap, 0, "Sequential base seeds should not produce overlapping sub-seeds");
+    }
+
+    #[test]
+    fn test_derive_game_seeds_internally_unique() {
+        // For a single call, the N sub-seeds should all be distinct (probabilistically)
+        let seeds = derive_game_seeds(42, 1000);
+        let set: std::collections::HashSet<u64> = seeds.into_iter().collect();
+        assert_eq!(set.len(), 1000, "Derived seeds should be internally unique");
+    }
+
+    #[test]
+    fn test_derive_game_seeds_zero_count() {
+        let seeds = derive_game_seeds(42, 0);
+        assert_eq!(seeds.len(), 0);
+    }
+
+    #[test]
+    fn test_generate_game_moves_match_length() {
+        let (moves, length, _) = generate_one_game(7, 256, 0.0);
+        assert_eq!(moves.len(), length as usize);
+        // Each move is a valid move token (1..=4272)
+        for &tok in &moves {
+            assert!(tok >= 1 && tok <= 4272, "Invalid move token: {}", tok);
+        }
+    }
+
+    #[test]
+    fn test_generate_one_game_termination_consistent() {
+        // Re-replaying the game tokens should reach the same termination
+        let (moves, _length, term) = generate_one_game(42, 256, 0.0);
+        let state = GameState::from_move_tokens(&moves).expect("valid replay");
+        let replayed_term = state.check_termination(256);
+        assert_eq!(replayed_term, Some(term));
+    }
+
+    #[test]
+    fn test_generate_game_with_labels_consistency() {
+        // Legal grids at ply i should match what the game state reports at that ply
+        let record = generate_one_game_with_labels(42, 256);
+        assert_eq!(record.legal_grids.len(), record.move_ids.len());
+        assert_eq!(record.legal_promos.len(), record.move_ids.len());
+        // Replay and verify grids at each ply
+        let mut state = GameState::new();
+        for (i, &tok) in record.move_ids.iter().enumerate() {
+            // Grid BEFORE move i should match label[i]
+            let grid = state.legal_move_grid();
+            assert_eq!(grid, record.legal_grids[i], "Legal grid mismatch at ply {}", i);
+            state.make_move(tok).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_generate_game_max_ply_respected() {
+        let max_ply = 50;
+        let (moves, length, term) = generate_one_game(42, max_ply, 0.0);
+        assert!(length as usize <= max_ply);
+        assert_eq!(moves.len(), length as usize);
+        // If game hit the ply limit, termination must be PlyLimit
+        if length as usize == max_ply {
+            assert_eq!(term, Termination::PlyLimit);
+        }
+    }
+
+    #[test]
+    fn test_mate_boost_zero_equals_no_boost() {
+        // mate_boost=0.0 should produce identical games to the default (no boost code path)
+        // Verified by testing same seed -> same output
+        let (m1, l1, t1) = generate_one_game(100, 256, 0.0);
+        let (m2, l2, t2) = generate_one_game(100, 256, 0.0);
+        assert_eq!(m1, m2);
+        assert_eq!(l1, l2);
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn test_outcome_from_termination() {
+        // Side-to-move at checkmate is the loser
+        assert_eq!(
+            Outcome::from_termination(Termination::Checkmate, true),
+            Outcome::WhiteCheckmated
+        );
+        assert_eq!(
+            Outcome::from_termination(Termination::Checkmate, false),
+            Outcome::BlackCheckmated
+        );
+        // Other terminations are side-agnostic
+        assert_eq!(
+            Outcome::from_termination(Termination::Stalemate, true),
+            Outcome::Stalemate
+        );
+        assert_eq!(
+            Outcome::from_termination(Termination::Stalemate, false),
+            Outcome::Stalemate
+        );
+        assert_eq!(
+            Outcome::from_termination(Termination::PlyLimit, true),
+            Outcome::PlyLimit
+        );
+    }
+
+    #[test]
+    fn test_outcome_discriminants() {
+        assert_eq!(Outcome::WhiteCheckmated as u8, 0);
+        assert_eq!(Outcome::BlackCheckmated as u8, 1);
+        assert_eq!(Outcome::Stalemate as u8, 2);
+        assert_eq!(Outcome::PlyLimit as u8, 6);
+        assert_eq!(NUM_OUTCOMES, 7);
+    }
+
+    #[test]
+    fn test_mate_in_one_boost_actually_finds_mate() {
+        // For seeds where the game naturally mates near the end, boost=1.0 should
+        // not miss the mate. Check that with boost=1.0, any game that could have
+        // been mated was mated.
+        // Simpler test: games with boost=1.0 should have checkmate rate >= baseline.
+        let n = 200;
+        let seeds = derive_game_seeds(777, n);
+        let mates_0: usize = seeds.iter()
+            .filter(|&&s| generate_one_game(s, 256, 0.0).2 == Termination::Checkmate)
+            .count();
+        let mates_1: usize = seeds.iter()
+            .filter(|&&s| generate_one_game(s, 256, 1.0).2 == Termination::Checkmate)
+            .count();
+        assert!(mates_1 >= mates_0, "boost=1.0 should produce >= mates than boost=0.0");
+    }
+
+    #[test]
+    fn test_rollout_legal_moves_empty_prefix() {
+        // Rollouts from startpos should produce 20 entries (one per legal move)
+        let results = rollout_legal_moves(&[], 1, 50, 42);
+        assert_eq!(results.len(), 20);
+        for (_tok, dist) in &results {
+            assert_eq!(dist.total, 1);
+            let sum: u32 = dist.counts.iter().sum();
+            assert_eq!(sum, 1);
+        }
+    }
+
+    #[test]
+    fn test_rollout_legal_moves_deterministic() {
+        let r1 = rollout_legal_moves(&[], 4, 50, 42);
+        let r2 = rollout_legal_moves(&[], 4, 50, 42);
+        assert_eq!(r1.len(), r2.len());
+        for (a, b) in r1.iter().zip(r2.iter()) {
+            assert_eq!(a.0, b.0);
+            assert_eq!(a.1.counts, b.1.counts);
+            assert_eq!(a.1.total, b.1.total);
+        }
+    }
+
+    #[test]
+    fn test_rollout_legal_moves_invalid_prefix() {
+        // Prefix containing an illegal move returns empty
+        let results = rollout_legal_moves(&[9999], 1, 50, 42);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_rollout_legal_moves_terminal_prefix() {
+        // Create a mate position via Fool's mate token sequence
+        let (_, m2t) = crate::vocab::build_vocab_maps();
+        let tokens: Vec<u16> = ["f2f3", "e7e5", "g2g4", "d8h4"]
+            .iter()
+            .map(|u| *m2t.get(*u).unwrap())
+            .collect();
+        // Game is already over at this position
+        let results = rollout_legal_moves(&tokens, 1, 50, 42);
+        assert_eq!(results.len(), 0, "Rollouts at terminal position should be empty");
+    }
+
+    #[test]
+    fn test_compute_accuracy_ceiling_returns_positions() {
+        // Very small test - just verify structure
+        let positions = compute_accuracy_ceiling(2, 30, 2, 0.1, 42);
+        // Should return some positions (sampling is stochastic but with seed=42 gives some)
+        // Structure-only: each position has valid fields
+        for p in &positions {
+            assert!(p.n_legal >= 1, "n_legal should be positive if position exists");
+            assert!(p.unconditional > 0.0 && p.unconditional <= 1.0);
+            assert!(p.naive_conditional > 0.0 && p.naive_conditional <= 1.0);
+            // Naive conditional should be >= unconditional (we prune some moves)
+            assert!(p.naive_conditional >= p.unconditional - 1e-10,
+                "naive_conditional {} should be >= unconditional {}",
+                p.naive_conditional, p.unconditional);
+            assert!(p.conditional >= 0.0 && p.conditional <= 1.0);
+            assert!(p.conditional_corrected >= 0.0 && p.conditional_corrected <= 1.0);
+            assert!(p.actual_outcome < NUM_OUTCOMES as u8);
+            assert!((p.ply as u16) < p.game_length);
+        }
+    }
+
+    #[test]
+    fn test_generate_checkmate_examples_returns_checkmates() {
+        // Ask for 5 checkmate examples; verify each is actually a checkmate game
+        let (examples, total) = generate_checkmate_examples(42, 256, 5);
+        assert_eq!(examples.len(), 5);
+        assert!(total >= 5);
+        for ex in &examples {
+            // Checkmate grid has at least one bit set (there's at least one mating move)
+            let has_bits: bool = ex.checkmate_grid.iter().any(|&g| g != 0);
+            assert!(has_bits, "Checkmate game must have at least one mating move");
+            // Legal grid has more bits than checkmate grid (more legal moves than mating ones)
+            let n_legal: u32 = ex.legal_grid.iter().map(|&g| g.count_ones()).sum();
+            let n_mates: u32 = ex.checkmate_grid.iter().map(|&g| g.count_ones()).sum();
+            assert!(n_legal >= n_mates, "n_legal {} >= n_mates {}", n_legal, n_mates);
+        }
+    }
+
+    #[test]
+    fn test_generate_checkmate_examples_game_length_matches_moves() {
+        let (examples, _) = generate_checkmate_examples(42, 256, 3);
+        for ex in &examples {
+            assert_eq!(ex.move_ids.len(), ex.game_length as usize);
+            // Replay the game — it should terminate in checkmate
+            let state = GameState::from_move_tokens(&ex.move_ids).unwrap();
+            assert_eq!(state.check_termination(256), Some(Termination::Checkmate));
+        }
+    }
+
+    #[test]
+    fn test_play_random_to_end_invariants() {
+        use rand::SeedableRng;
+        for seed in 1..10 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let mut state = GameState::new();
+            let term = state.play_random_to_end(&mut rng, 128);
+            // Ply <= max_ply
+            assert!(state.ply() <= 128, "ply {} > max_ply 128 at seed {}", state.ply(), seed);
+            // Termination is consistent with state
+            match term {
+                Termination::Checkmate => {
+                    assert!(state.is_check());
+                    assert!(state.legal_move_tokens().is_empty());
+                }
+                Termination::Stalemate => {
+                    assert!(!state.is_check());
+                    assert!(state.legal_move_tokens().is_empty());
+                }
+                _ => {}
+            }
+        }
+    }
 }

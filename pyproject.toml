@@ -31,6 +31,9 @@ dependencies = [
     # Dev
     "pyright>=1.1.0",
     "pytest~=9.0.0",
+    "pytest-mock>=3.12.0",
+    "hypothesis>=6.100.0",
+    "syrupy>=4.7.0",
     "ipykernel>=7.2.0",
 ]
 
@@ -89,3 +92,11 @@ exclude = ["pawn/dashboard"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "unit: pure-function / no-I/O tests",
+    "integration: multi-module flows, may touch filesystem",
+    "smoke: end-to-end sanity checks (import + minimal execution)",
+    "slow: tests that take >5s (excluded from default CI)",
+    "gpu: tests that require a CUDA/ROCm GPU",
+    "known_bug: tests that document a currently-broken behavior (paired with xfail)",
+]

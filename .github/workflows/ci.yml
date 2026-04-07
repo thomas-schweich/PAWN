@@ -43,4 +43,4 @@ jobs:
         run: uv run pyright pawn/
 
       - name: Tests
-        run: uv run pytest tests/ -x -q
+        run: uv run pytest tests/ -x -q -m "not gpu"

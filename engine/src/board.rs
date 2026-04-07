@@ -545,4 +545,502 @@ mod tests {
         let uci = vocab::token_to_uci(token).unwrap();
         assert_eq!(uci, "e1g1");
     }
+
+    // ==== New tests added by Agent A (Rust Core) ====
+
+    // Helper: construct a GameState by playing a list of UCI strings.
+    fn replay_ucis(ucis: &[&str]) -> GameState {
+        let mut state = GameState::new();
+        let (_, m2t) = vocab::build_vocab_maps();
+        for uci in ucis {
+            let token = *m2t.get(*uci).unwrap_or_else(|| panic!("unknown uci: {}", uci));
+            state.make_move(token).unwrap_or_else(|e| panic!("Illegal {}: {}", uci, e));
+        }
+        state
+    }
+
+    #[test]
+    fn test_square_specific_mappings() {
+        // Explicit mappings - file-major layout
+        assert_eq!(shakmaty_sq_to_ours(Square::A1), 0);
+        assert_eq!(shakmaty_sq_to_ours(Square::H1), 7);
+        assert_eq!(shakmaty_sq_to_ours(Square::A2), 8);
+        assert_eq!(shakmaty_sq_to_ours(Square::E2), 12);
+        assert_eq!(shakmaty_sq_to_ours(Square::E4), 28);
+        assert_eq!(shakmaty_sq_to_ours(Square::E8), 60);
+        assert_eq!(shakmaty_sq_to_ours(Square::H8), 63);
+        // And inverses
+        assert_eq!(our_sq_to_shakmaty(0), Square::A1);
+        assert_eq!(our_sq_to_shakmaty(28), Square::E4);
+        assert_eq!(our_sq_to_shakmaty(63), Square::H8);
+    }
+
+    #[test]
+    fn test_piece_to_code_all_pieces() {
+        // None -> 0
+        assert_eq!(piece_to_code(None), 0);
+        // White pieces: 1..=6 for P,N,B,R,Q,K
+        assert_eq!(piece_to_code(Some(Piece { color: Color::White, role: Role::Pawn })), 1);
+        assert_eq!(piece_to_code(Some(Piece { color: Color::White, role: Role::Knight })), 2);
+        assert_eq!(piece_to_code(Some(Piece { color: Color::White, role: Role::Bishop })), 3);
+        assert_eq!(piece_to_code(Some(Piece { color: Color::White, role: Role::Rook })), 4);
+        assert_eq!(piece_to_code(Some(Piece { color: Color::White, role: Role::Queen })), 5);
+        assert_eq!(piece_to_code(Some(Piece { color: Color::White, role: Role::King })), 6);
+        // Black pieces: 7..=12
+        assert_eq!(piece_to_code(Some(Piece { color: Color::Black, role: Role::Pawn })), 7);
+        assert_eq!(piece_to_code(Some(Piece { color: Color::Black, role: Role::King })), 12);
+    }
+
+    #[test]
+    fn test_initial_position_board_array() {
+        let state = GameState::new();
+        let board = state.board_array();
+        // Rank 1 (index 0): white pieces
+        assert_eq!(board[0][0], 4); // White rook a1
+        assert_eq!(board[0][1], 2); // White knight b1
+        assert_eq!(board[0][2], 3); // White bishop c1
+        assert_eq!(board[0][3], 5); // White queen d1
+        assert_eq!(board[0][4], 6); // White king e1
+        // Rank 2 (index 1): all white pawns
+        for file in 0..8 {
+            assert_eq!(board[1][file], 1, "rank 2 file {} should be white pawn", file);
+        }
+        // Rank 3-6: empty
+        for rank in 2..6 {
+            for file in 0..8 {
+                assert_eq!(board[rank][file], 0, "middle square r{} f{} should be empty", rank, file);
+            }
+        }
+        // Rank 7 (index 6): all black pawns
+        for file in 0..8 {
+            assert_eq!(board[6][file], 7, "rank 7 file {} should be black pawn", file);
+        }
+        // Rank 8 (index 7): black pieces
+        assert_eq!(board[7][0], 10); // Black rook a8
+        assert_eq!(board[7][4], 12); // Black king e8
+    }
+
+    #[test]
+    fn test_board_array_values_in_range() {
+        // Play a few moves and ensure all board values stay in [0, 12]
+        let state = replay_ucis(&["e2e4", "e7e5", "g1f3", "b8c6"]);
+        let board = state.board_array();
+        for rank in 0..8 {
+            for file in 0..8 {
+                let v = board[rank][file];
+                assert!(v >= 0 && v <= 12, "out of range piece code {} at r{} f{}", v, rank, file);
+            }
+        }
+    }
+
+    #[test]
+    fn test_initial_castling_rights_all_set() {
+        let state = GameState::new();
+        // All four rights should be set at startpos
+        assert_eq!(state.castling_rights_bits(), 0b1111);
+    }
+
+    #[test]
+    fn test_castling_rights_lost_when_king_moves() {
+        // Move king after clearing: e2e4 e7e5 (king can't move yet); instead:
+        // Play: e2e4 e7e5 e1e2 => white loses both castling rights
+        let state = replay_ucis(&["e2e4", "e7e5", "e1e2"]);
+        let bits = state.castling_rights_bits();
+        // White kingside (bit 0) and queenside (bit 1) cleared
+        assert_eq!(bits & 0b0011, 0, "White castling rights should be lost, got {:#b}", bits);
+        // Black still has both
+        assert_eq!(bits & 0b1100, 0b1100);
+    }
+
+    #[test]
+    fn test_castling_rights_lost_when_rook_moves() {
+        // Play: a2a4 e7e5 a1a3 => white loses queenside
+        let state = replay_ucis(&["a2a4", "e7e5", "a1a3"]);
+        let bits = state.castling_rights_bits();
+        // Queenside (bit 1) cleared, kingside (bit 0) intact
+        assert_eq!(bits & 0b0001, 0b0001, "White kingside intact");
+        assert_eq!(bits & 0b0010, 0, "White queenside lost");
+    }
+
+    #[test]
+    fn test_ep_square_no_ep_initially() {
+        let state = GameState::new();
+        assert_eq!(state.ep_square(), -1);
+    }
+
+    #[test]
+    fn test_ep_square_after_pawn_double_push() {
+        // e2e4 - sets ep square, but only legal_ep_square = Some iff capture is pseudolegal.
+        // After e2e4, black can capture en passant only if a black pawn is adjacent to e4 -
+        // which isn't true initially. So legal_ep_square should be None.
+        let state = replay_ucis(&["e2e4"]);
+        assert_eq!(state.ep_square(), -1, "No black pawn adjacent -> legal_ep_square is None");
+
+        // After e4 d5, white's d2 pawn has no adjacency. After e4 f5, black's f-pawn at f5 adjacent to e4.
+        // Play: e2e4, f7f5, e4e5, d7d5 => white's e5 pawn is adjacent to d5 (black's just-pushed pawn).
+        // EP square should be d6 (square BEHIND the d7-d5 push).
+        let state = replay_ucis(&["e2e4", "f7f5", "e4e5", "d7d5"]);
+        let ep = state.ep_square();
+        // d6 = file=3, rank=5 -> 5*8+3 = 43
+        assert_eq!(ep, 43, "EP square after d7d5 with adjacent e5 pawn should be d6 (43)");
+    }
+
+    #[test]
+    fn test_halfmove_clock_zero_initially() {
+        let state = GameState::new();
+        assert_eq!(state.halfmove_clock(), 0);
+    }
+
+    #[test]
+    fn test_halfmove_clock_resets_on_pawn_move() {
+        // Initial clock=0; play Nf3 (clock=1), then e7e5 (pawn, resets to 0)
+        let state = replay_ucis(&["g1f3"]);
+        assert_eq!(state.halfmove_clock(), 1);
+        let state = replay_ucis(&["g1f3", "e7e5"]);
+        assert_eq!(state.halfmove_clock(), 0);
+    }
+
+    #[test]
+    fn test_halfmove_clock_increments_on_knight_move() {
+        // Knight moves twice: g1f3, b8c6 -> clock=2
+        let state = replay_ucis(&["g1f3", "b8c6"]);
+        assert_eq!(state.halfmove_clock(), 2);
+    }
+
+    #[test]
+    fn test_halfmove_clock_resets_on_capture() {
+        // e2e4, d7d5, e4d5 (pawn capture) -> clock=0
+        let state = replay_ucis(&["e2e4", "d7d5", "e4d5"]);
+        assert_eq!(state.halfmove_clock(), 0);
+        // Continue with knight moves to increment
+        let state = replay_ucis(&["e2e4", "d7d5", "e4d5", "g8f6"]);
+        assert_eq!(state.halfmove_clock(), 1);
+    }
+
+    #[test]
+    fn test_is_check_startpos() {
+        let state = GameState::new();
+        assert!(!state.is_check());
+    }
+
+    #[test]
+    fn test_is_check_after_checkgiving_move() {
+        // Scholar's mate sequence partial: e2e4 e7e5 d1h5 b8c6 f1c4 g8f6 h5f7#
+        // After h5f7#, black is in check AND mated
+        let state = replay_ucis(&["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"]);
+        assert!(state.is_check(), "Black should be in check after h5f7#");
+    }
+
+    #[test]
+    fn test_scholars_mate_checkmate_detection() {
+        // Classic Scholar's mate: 4-move checkmate delivered by white
+        let state = replay_ucis(&["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"]);
+        // game_length = 7 (odd => white made last move)
+        assert_eq!(state.ply(), 7);
+        let term = state.check_termination(256);
+        assert_eq!(term, Some(Termination::Checkmate));
+        // No legal moves for black
+        assert_eq!(state.legal_move_tokens().len(), 0);
+    }
+
+    #[test]
+    fn test_fools_mate_checkmate() {
+        // Fool's mate: f2f3 e7e5 g2g4 d8h4# (black wins in 4 ply)
+        let state = replay_ucis(&["f2f3", "e7e5", "g2g4", "d8h4"]);
+        assert_eq!(state.ply(), 4);
+        let term = state.check_termination(256);
+        assert_eq!(term, Some(Termination::Checkmate));
+        // White has no legal moves
+        assert_eq!(state.legal_move_tokens().len(), 0);
+        assert!(state.is_check());
+    }
+
+    #[test]
+    fn test_make_move_illegal_token() {
+        let mut state = GameState::new();
+        // e1e2 (king stepping forward) is not legal at startpos (pawn in the way)
+        let token = vocab::base_grid_token(4, 12);
+        let result = state.make_move(token);
+        assert!(result.is_err());
+        // State should not have advanced
+        assert_eq!(state.ply(), 0);
+    }
+
+    #[test]
+    fn test_make_move_invalid_token() {
+        let mut state = GameState::new();
+        // PAD token is never a legal move
+        let result = state.make_move(vocab::PAD_TOKEN);
+        assert!(result.is_err());
+        // Outcome token
+        let result = state.make_move(vocab::OUTCOME_BASE);
+        assert!(result.is_err());
+        assert_eq!(state.ply(), 0);
+    }
+
+    #[test]
+    fn test_ply_increments_with_each_move() {
+        let mut state = GameState::new();
+        assert_eq!(state.ply(), 0);
+        let (_, m2t) = vocab::build_vocab_maps();
+        state.make_move(*m2t.get("e2e4").unwrap()).unwrap();
+        assert_eq!(state.ply(), 1);
+        state.make_move(*m2t.get("e7e5").unwrap()).unwrap();
+        assert_eq!(state.ply(), 2);
+    }
+
+    #[test]
+    fn test_turn_alternates() {
+        let mut state = GameState::new();
+        assert_eq!(state.turn(), Color::White);
+        assert!(state.is_white_to_move());
+        let (_, m2t) = vocab::build_vocab_maps();
+        state.make_move(*m2t.get("e2e4").unwrap()).unwrap();
+        assert_eq!(state.turn(), Color::Black);
+        assert!(!state.is_white_to_move());
+        state.make_move(*m2t.get("e7e5").unwrap()).unwrap();
+        assert_eq!(state.turn(), Color::White);
+    }
+
+    #[test]
+    fn test_move_history_appends() {
+        let mut state = GameState::new();
+        assert_eq!(state.move_history().len(), 0);
+        let (_, m2t) = vocab::build_vocab_maps();
+        let t = *m2t.get("e2e4").unwrap();
+        state.make_move(t).unwrap();
+        assert_eq!(state.move_history().len(), 1);
+        assert_eq!(state.move_history()[0], t);
+    }
+
+    #[test]
+    fn test_from_move_tokens_replay() {
+        // Construct game from tokens and verify ply
+        let (_, m2t) = vocab::build_vocab_maps();
+        let tokens: Vec<u16> = ["e2e4", "e7e5", "g1f3", "b8c6"]
+            .iter()
+            .map(|u| *m2t.get(*u).unwrap())
+            .collect();
+        let state = GameState::from_move_tokens(&tokens).unwrap();
+        assert_eq!(state.ply(), 4);
+        assert_eq!(state.move_history(), &tokens[..]);
+    }
+
+    #[test]
+    fn test_from_move_tokens_invalid_returns_error() {
+        let (_, m2t) = vocab::build_vocab_maps();
+        // Start legal, then include an illegal move
+        let tokens: Vec<u16> = vec![
+            *m2t.get("e2e4").unwrap(),
+            *m2t.get("a1a8").unwrap(), // rook cannot jump to a8 with a2 pawn blocking
+        ];
+        let result = GameState::from_move_tokens(&tokens);
+        match result {
+            Ok(_) => panic!("Expected error, got Ok"),
+            Err(e) => assert!(e.contains("ply 1"), "error message doesn't mention ply 1: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_legal_moves_count_after_e4() {
+        // After e4, black has 20 legal moves (same as white had at start)
+        let state = replay_ucis(&["e2e4"]);
+        let tokens = state.legal_move_tokens();
+        assert_eq!(tokens.len(), 20);
+    }
+
+    #[test]
+    fn test_legal_move_grid_matches_tokens_count() {
+        let state = GameState::new();
+        let tokens = state.legal_move_tokens();
+        let grid = state.legal_move_grid();
+        let total_bits: u32 = grid.iter().map(|g| g.count_ones()).sum();
+        assert_eq!(total_bits as usize, tokens.len());
+    }
+
+    #[test]
+    fn test_fen_startpos() {
+        let state = GameState::new();
+        let fen = state.fen();
+        // Startpos FEN
+        assert!(fen.starts_with("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+            "got FEN: {}", fen);
+    }
+
+    #[test]
+    fn test_uci_position_string_startpos() {
+        let state = GameState::new();
+        assert_eq!(state.uci_position_string(), "position startpos");
+    }
+
+    #[test]
+    fn test_uci_position_string_with_moves() {
+        let state = replay_ucis(&["e2e4", "e7e5"]);
+        assert_eq!(state.uci_position_string(), "position startpos moves e2e4 e7e5");
+    }
+
+    #[test]
+    fn test_legal_promo_mask_none_initially() {
+        let state = GameState::new();
+        let mask = state.legal_promo_mask();
+        for pair in 0..44 {
+            for t in 0..4 {
+                assert!(!mask[pair][t], "No promotions initially");
+            }
+        }
+    }
+
+    #[test]
+    fn test_legal_moves_full_matches_components() {
+        let state = replay_ucis(&["e2e4", "e7e5", "g1f3"]);
+        let (indices_f, promos_f, mask_f) = state.legal_moves_full();
+        let (indices_s, promos_s) = state.legal_moves_structured();
+        let mask_m = state.legal_moves_grid_mask();
+        assert_eq!(indices_f, indices_s);
+        assert_eq!(promos_f, promos_s);
+        for i in 0..4096 {
+            assert_eq!(mask_f[i], mask_m[i], "mask mismatch at {}", i);
+        }
+    }
+
+    #[test]
+    fn test_move_to_token_token_to_move_roundtrip() {
+        // At startpos, every legal move round-trips through move_to_token / token_to_move
+        let state = GameState::new();
+        let legal = state.position().legal_moves();
+        for m in &legal {
+            let tok = move_to_token(m);
+            let m2 = token_to_move(state.position(), tok);
+            assert!(m2.is_some(), "roundtrip failed for move");
+            // Same source and destination (castling moves are represented differently but compare by token)
+            assert_eq!(move_to_token(&m2.unwrap()), tok);
+        }
+    }
+
+    #[test]
+    fn test_token_to_move_illegal_returns_none() {
+        let state = GameState::new();
+        // a1a8 is not a legal move at startpos (rook blocked)
+        let token = vocab::base_grid_token(0, 56);
+        assert!(token_to_move(state.position(), token).is_none());
+    }
+
+    #[test]
+    fn test_token_to_move_invalid_token_none() {
+        let state = GameState::new();
+        // PAD token
+        assert!(token_to_move(state.position(), vocab::PAD_TOKEN).is_none());
+        // Outcome token
+        assert!(token_to_move(state.position(), vocab::OUTCOME_BASE).is_none());
+    }
+
+    #[test]
+    fn test_make_random_move_advances_state() {
+        use rand::SeedableRng;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42);
+        let mut state = GameState::new();
+        let tok = state.make_random_move(&mut rng);
+        assert!(tok.is_some());
+        assert_eq!(state.ply(), 1);
+    }
+
+    #[test]
+    fn test_fivefold_repetition_false_at_start() {
+        let state = GameState::new();
+        assert!(!state.is_fivefold_repetition());
+    }
+
+    #[test]
+    fn test_play_random_to_end_finishes() {
+        use rand::SeedableRng;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+        let mut state = GameState::new();
+        let _term = state.play_random_to_end(&mut rng, 256);
+        // Should terminate with ply <= 256
+        assert!(state.ply() <= 256);
+        // Should be terminated
+        assert!(state.check_termination(256).is_some());
+    }
+
+    #[test]
+    fn test_check_termination_none_at_start() {
+        let state = GameState::new();
+        assert!(state.check_termination(256).is_none());
+    }
+
+    #[test]
+    fn test_check_termination_ply_limit() {
+        // Play until ply limit hit (use small max_ply)
+        use rand::SeedableRng;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42);
+        let mut state = GameState::new();
+        while state.check_termination(10).is_none() && state.ply() < 10 {
+            if state.make_random_move(&mut rng).is_none() {
+                break;
+            }
+        }
+        // At ply=10 with max_ply=10, should return PlyLimit (unless game ended earlier)
+        // seed=42 games don't end that fast, so expect PlyLimit
+        if state.ply() == 10 {
+            assert_eq!(state.check_termination(10), Some(Termination::PlyLimit));
+        }
+    }
+
+    #[test]
+    fn test_make_move_uci_returns_uci_string() {
+        let mut state = GameState::new();
+        let tok = vocab::base_grid_token(12, 28); // e2e4
+        let uci = state.make_move_uci(tok).unwrap();
+        assert_eq!(uci, "e2e4");
+        assert_eq!(state.ply(), 1);
+    }
+
+    #[test]
+    fn test_castling_kingside_white() {
+        // Set up castling: e4, e5, Nf3, Nc6, Bc4, Nf6, O-O
+        let state = replay_ucis(&["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6", "e1g1"]);
+        // After O-O, king is on g1
+        let board = state.board_array();
+        assert_eq!(board[0][6], 6, "White king should be on g1");
+        assert_eq!(board[0][5], 4, "Rook should be on f1");
+        assert_eq!(board[0][4], 0, "e1 should be empty");
+        assert_eq!(board[0][7], 0, "h1 should be empty");
+        // White has lost all castling rights
+        assert_eq!(state.castling_rights_bits() & 0b0011, 0);
+    }
+
+    #[test]
+    fn test_castling_queenside_black() {
+        // Setup to allow black to O-O-O: 1.Nf3 Nc6 2.e3 d5 3.Be2 Bd7 4.O-O Qd6 5.d3 O-O-O
+        // Shorter: we just need to clear B8, C8, D8 and ensure king/rook haven't moved
+        // Play: 1.e4 d5 2.d4 c6 3.d5 Nd7 4.dxc6 Qc7 5.cxb7 Nb6 6.bxa8=Q Bb7 7.Qxb7 Qxb7 — too complex
+        // Simpler: 1.d4 Nc6 2.d5 Nb8 3.d6 c7xd6 no — try
+        // 1. e4 b6 2. d4 Bb7 3. Nc3 Nc6 4. Bf4 Qc8 5. Qd2 Nb8 6. O-O-O (queenside white)
+        let state = replay_ucis(&[
+            "e2e4", "b7b6", "d2d4", "c8b7", "b1c3", "b8c6",
+            "c1f4", "d8c8", "d1d2", "c6b8", "e1c1" // White O-O-O
+        ]);
+        let board = state.board_array();
+        // After O-O-O, white king is on c1 (index 2)
+        assert_eq!(board[0][2], 6, "White king should be on c1");
+        assert_eq!(board[0][3], 4, "Rook should be on d1");
+        assert_eq!(board[0][0], 0, "a1 should be empty");
+    }
+
+    #[test]
+    fn test_en_passant_capture_execution() {
+        // Set up: 1.e4 Nf6 2.e5 d5 — now e5 pawn can capture d6 en passant
+        let state = replay_ucis(&["e2e4", "g8f6", "e4e5", "d7d5"]);
+        // EP square should be d6 (index 43)
+        assert_eq!(state.ep_square(), 43);
+        // Execute e5d6 (en passant)
+        let state2 = replay_ucis(&["e2e4", "g8f6", "e4e5", "d7d5", "e5d6"]);
+        let board = state2.board_array();
+        // d5 black pawn should be captured (empty)
+        assert_eq!(board[4][3], 0, "d5 should be empty after ep");
+        // d6 should have white pawn
+        assert_eq!(board[5][3], 1, "d6 should have white pawn");
+        // Halfmove clock resets to 0 (capture)
+        assert_eq!(state2.halfmove_clock(), 0);
+    }
 }

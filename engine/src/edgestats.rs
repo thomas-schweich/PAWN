@@ -752,4 +752,224 @@ mod tests {
         assert_eq!(white, white2);
         assert_eq!(black, black2);
     }
+
+    #[test]
+    fn test_edge_case_bits_unique() {
+        // Each named bit must be a unique power of 2.
+        let m = edge_case_bits();
+        let mut seen = std::collections::HashSet::new();
+        for (name, &bit) in &m {
+            assert!(bit.count_ones() == 1, "{} not a single bit: 0x{:x}", name, bit);
+            assert!(seen.insert(bit), "{} has duplicate bit", name);
+        }
+    }
+
+    #[test]
+    fn test_edge_case_bits_count_43() {
+        // Spec says 43 named bits.
+        let m = edge_case_bits();
+        assert_eq!(m.len(), 43, "exactly 43 named edge-case bits");
+    }
+
+    #[test]
+    fn test_edge_case_bits_fit_in_u64() {
+        // All named bits must fit within u64 (index < 64).
+        let m = edge_case_bits();
+        for (name, &bit) in &m {
+            let idx = bit.trailing_zeros();
+            assert!(idx < 64, "{} has bit index {} which doesn't fit in u64", name, idx);
+        }
+    }
+
+    #[test]
+    fn test_startpos_no_edge_cases() {
+        // From the starting position: no check, no mate, no EP, no promo, no pins.
+        let max_ply = 8;
+        let mut move_ids = vec![0i16; max_ply];
+        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;
+        let game_lengths = vec![1i16];
+
+        let (per_ply, _, _) = compute_edge_stats_per_ply(&move_ids, &game_lengths, max_ply);
+        let bits = per_ply[0];
+
+        // None of these should be set at startpos
+        assert_eq!(bits & IN_CHECK, 0);
+        assert_eq!(bits & IN_DOUBLE_CHECK, 0);
+        assert_eq!(bits & CHECKMATE, 0);
+        assert_eq!(bits & STALEMATE, 0);
+        assert_eq!(bits & PIN_RESTRICTS_MOVEMENT, 0);
+        assert_eq!(bits & PAWN_CAPTURE_AVAILABLE, 0);
+        assert_eq!(bits & PROMOTION_AVAILABLE, 0);
+        assert_eq!(bits & EP_CAPTURE_AVAILABLE, 0);
+        assert_eq!(bits & CASTLE_LEGAL_KINGSIDE, 0);
+        assert_eq!(bits & CASTLE_LEGAL_QUEENSIDE, 0);
+    }
+
+    #[test]
+    fn test_en_passant_availability() {
+        // Spec: 1. e2e4 d7d5 — before exd5, the legal EP setup is:
+        // Actually for EP, we need: 1. e4 then black pushes adjacent pawn 2 squares.
+        // So: 1. e2e4 a7a6 2. e4e5 d7d5 — now white can capture en passant (exd6).
+        let max_ply = 16;
+        let mut move_ids = vec![0i16; max_ply];
+        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;  // e2e4
+        move_ids[1] = crate::vocab::base_grid_token(48, 40) as i16;  // a7a6
+        move_ids[2] = crate::vocab::base_grid_token(28, 36) as i16;  // e4e5
+        move_ids[3] = crate::vocab::base_grid_token(51, 35) as i16;  // d7d5
+        let game_lengths = vec![4i16];
+
+        let (per_ply, _, _) = compute_edge_stats_per_ply(&move_ids, &game_lengths, max_ply);
+
+        // ply 4 is terminal. Need to look at per_ply[4] (after the 4 moves) where
+        // white is to move with EP available.
+        let bits_ply4 = per_ply[4];
+        assert_ne!(bits_ply4 & EP_CAPTURE_AVAILABLE, 0, "EP should be available after d7d5");
+        // EP square is on file d (file index 3)
+        assert_ne!(bits_ply4 & EP_FILE_D, 0, "EP square should be on file D");
+        // Should NOT be in check
+        assert_eq!(bits_ply4 & IN_CHECK, 0, "White should not be in check");
+        // Should NOT have promotion available
+        assert_eq!(bits_ply4 & PROMOTION_AVAILABLE, 0, "No promotion available so early");
+    }
+
+    #[test]
+    fn test_pawn_capture_available() {
+        // 1. e2e4 d7d5 — white can now play exd5 (pawn capture).
+        let max_ply = 8;
+        let mut move_ids = vec![0i16; max_ply];
+        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;  // e2e4
+        move_ids[1] = crate::vocab::base_grid_token(51, 35) as i16;  // d7d5
+        let game_lengths = vec![2i16];
+
+        let (per_ply, _, _) = compute_edge_stats_per_ply(&move_ids, &game_lengths, max_ply);
+
+        // ply 2 (after both moves, white to move): exd5 is a legal pawn capture.
+        let bits = per_ply[2];
+        assert_ne!(bits & PAWN_CAPTURE_AVAILABLE, 0, "White should be able to play exd5");
+        // Not EP (that would require a 2-square double push just played by opponent adjacent)
+        // Actually d7d5 IS adjacent to e4, so... hmm. Let's check if EP is set here.
+        // After 1.e4 d5, white to move, black's d-pawn just pushed 2 squares from d7 to d5.
+        // EP would require black's d-pawn to be on the EP square. But EP only happens when a pawn
+        // passes through a square where it could be captured. Here, white's e4 pawn can capture
+        // d5 (regular capture, on d5). No EP: EP would be if black had a pawn on d7 that pushed
+        // past an adjacent enemy pawn.
+        // Wait: after black plays d7d5, white's e4 pawn is adjacent to d5. White could capture
+        // en passant IF black moved through white's attack zone. d7-d5 passes through d6, which
+        // is not attacked by e4. So no EP here.
+        // But shakmaty may still set EP if the passed-through square is theoretically captureable.
+        // Let's just check pawn capture is available.
+    }
+
+    #[test]
+    fn test_terminal_state_no_pin_bits() {
+        // When legal moves is empty, compute_ply_bits returns only terminal bits
+        // plus termination bits. No pin/pawn capture etc.
+        // We test this with a quick scholar's mate game.
+        // Moves: 1. e4 e5 2. Bc4 Nc6 3. Qh5 Nf6 4. Qxf7#
+        // Need to build tokens manually for these SAN moves.
+        // Simpler: use generated games and check that if IN_CHECK is set with no legal moves,
+        // it's CHECKMATE (not pin). Look for a game that ends in checkmate.
+        let batch = generate_random_games(200, 256, 99, 0.0, false);
+        let (per_ply, _, _) = compute_edge_stats_per_ply(
+            &batch.move_ids, &batch.game_lengths, 256,
+        );
+
+        // Find a terminal position that's checkmate (IN_CHECK & CHECKMATE both set)
+        let mut found_mate = false;
+        for b in 0..200usize {
+            let length = batch.game_lengths[b] as usize;
+            if length >= 256 { continue; }
+            let term_bits = per_ply[b * 256 + length];
+            if term_bits & CHECKMATE != 0 {
+                // Design choice (per compute_ply_bits): CHECKMATE is returned alone
+                // so terminal positions don't pollute non-terminal category counts.
+                // IN_CHECK is NOT set on checkmate-terminal ply.
+                assert_eq!(term_bits & IN_CHECK, 0, "CHECKMATE terminal ply does not also set IN_CHECK (design)");
+                // Should not have STALEMATE
+                assert_eq!(term_bits & STALEMATE, 0, "CHECKMATE and STALEMATE mutually exclusive");
+                // Should not have pawn capture / castling / pin bits
+                assert_eq!(term_bits & PAWN_CAPTURE_AVAILABLE, 0, "terminal mate has no moves");
+                assert_eq!(term_bits & CASTLE_LEGAL_KINGSIDE, 0);
+                assert_eq!(term_bits & PIN_RESTRICTS_MOVEMENT, 0);
+                found_mate = true;
+                break;
+            }
+        }
+        assert!(found_mate, "expected at least one checkmate in 200 random games");
+    }
+
+    #[test]
+    fn test_stalemate_detected() {
+        // Find a stalemate terminal position in random games.
+        let batch = generate_random_games(500, 256, 7, 0.0, false);
+        let (per_ply, _, _) = compute_edge_stats_per_ply(
+            &batch.move_ids, &batch.game_lengths, 256,
+        );
+
+        let mut found_stalemate = false;
+        for b in 0..500usize {
+            let length = batch.game_lengths[b] as usize;
+            if length >= 256 { continue; }
+            let term_bits = per_ply[b * 256 + length];
+            if term_bits & STALEMATE != 0 {
+                // STALEMATE should not set IN_CHECK, CHECKMATE
+                assert_eq!(term_bits & IN_CHECK, 0, "STALEMATE does not set IN_CHECK");
+                assert_eq!(term_bits & CHECKMATE, 0, "STALEMATE not CHECKMATE");
+                found_stalemate = true;
+                break;
+            }
+        }
+        // May not find one in 500 random games, so don't hard-fail
+        if !found_stalemate {
+            eprintln!("no stalemate found in 500 random games (not a failure)");
+        }
+    }
+
+    #[test]
+    fn test_per_ply_and_per_game_agree() {
+        // per_game accumulator must equal OR of per_ply bits by color.
+        let max_ply = 256;
+        let batch = generate_random_games(5, max_ply, 2024, 0.0, false);
+        let (per_ply, white, black) = compute_edge_stats_per_ply(
+            &batch.move_ids, &batch.game_lengths, max_ply,
+        );
+
+        for b in 0..5usize {
+            let length = batch.game_lengths[b] as usize;
+            let mut w_or = 0u64;
+            let mut b_or = 0u64;
+            // Bits at index t come from the side to move at ply t:
+            // ply t even = white, odd = black. The terminal ply also needs to be OR'd.
+            for t in 0..=length {
+                if t >= max_ply { break; }
+                let bits = per_ply[b * max_ply + t];
+                if t % 2 == 0 {
+                    w_or |= bits;
+                } else {
+                    b_or |= bits;
+                }
+            }
+            assert_eq!(white[b], w_or, "game {}: white accumulator mismatch", b);
+            assert_eq!(black[b], b_or, "game {}: black accumulator mismatch", b);
+        }
+    }
+
+    #[test]
+    fn test_castle_available_after_italian() {
+        // Italian Game: 1. e4 e5 2. Nf3 Nc6 3. Bc4 Nf6 — now white can castle kingside.
+        let max_ply = 16;
+        let mut move_ids = vec![0i16; max_ply];
+        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
+        move_ids[1] = crate::vocab::base_grid_token(52, 36) as i16; // e7e5
+        move_ids[2] = crate::vocab::base_grid_token(6, 21) as i16;  // g1f3
+        move_ids[3] = crate::vocab::base_grid_token(57, 42) as i16; // b8c6
+        move_ids[4] = crate::vocab::base_grid_token(5, 26) as i16;  // f1c4
+        move_ids[5] = crate::vocab::base_grid_token(62, 45) as i16; // g8f6
+        let game_lengths = vec![6i16];
+
+        let (per_ply, _, _) = compute_edge_stats_per_ply(&move_ids, &game_lengths, max_ply);
+        // At ply 6 (white's turn after 3 full moves), O-O should be legal
+        let bits = per_ply[6];
+        assert_ne!(bits & CASTLE_LEGAL_KINGSIDE, 0, "kingside castle should be legal after Italian setup");
+    }
 }
