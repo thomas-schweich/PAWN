@@ -54,6 +54,8 @@ class TimingResult:
     throughput: float | None = None      # items/sec (games, steps, etc.)
     throughput_unit: str = ""
     peak_memory_mb: float | None = None  # GPU peak memory
+    warmup_ms: float | None = None       # total warmup time (compilation + first runs)
+    n_warmup: int | None = None          # number of warmup iterations
 
     def summary_line(self) -> str:
         parts = [
@@ -66,6 +68,8 @@ class TimingResult:
             parts.append(f"  {self.throughput:>10.0f} {self.throughput_unit}")
         if self.peak_memory_mb is not None:
             parts.append(f"  {self.peak_memory_mb:>7.0f} MB")
+        if self.warmup_ms is not None and self.n_warmup is not None:
+            parts.append(f"  warmup: {self.warmup_ms:.0f}ms ({self.n_warmup} iters)")
         return "  ".join(parts)
 
 
@@ -92,21 +96,37 @@ def time_cpu(fn, *, n_warmup: int = 2, n_iter: int = 10) -> list[float]:
     return times
 
 
+@dataclass
+class GPUTimingResult:
+    """Raw timing data from time_gpu."""
+    times: list[float]         # timed iteration durations (seconds)
+    warmup_secs: float         # total warmup wall time (seconds)
+    n_warmup: int              # number of warmup iterations
+
+
 def time_gpu(fn, *, n_warmup: int = 3, n_iter: int = 10,
-             reset_peak_memory: bool = False) -> list[float]:
+             reset_peak_memory: bool = False) -> GPUTimingResult:
     """Time a GPU function with CUDA synchronization.
+
+    Returns timed iteration durations plus total warmup time (which includes
+    compilation overhead for torch.compile'd functions).
 
     When reset_peak_memory is True, peak memory stats are reset after warmup
     so the caller gets steady-state memory usage, not compilation overhead.
     """
     import torch
 
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    warmup_start = time.perf_counter()
     for _ in range(n_warmup):
         fn()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-        if reset_peak_memory:
-            torch.cuda.reset_peak_memory_stats()
+    warmup_secs = time.perf_counter() - warmup_start
+
+    if torch.cuda.is_available() and reset_peak_memory:
+        torch.cuda.reset_peak_memory_stats()
 
     times = []
     for _ in range(n_iter):
@@ -117,7 +137,7 @@ def time_gpu(fn, *, n_warmup: int = 3, n_iter: int = 10,
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         times.append(time.perf_counter() - t0)
-    return times
+    return GPUTimingResult(times=times, warmup_secs=warmup_secs, n_warmup=n_warmup)
 
 
 def make_result(
@@ -127,6 +147,8 @@ def make_result(
     throughput_count: int | None = None,
     throughput_unit: str = "",
     peak_memory_mb: float | None = None,
+    warmup_secs: float | None = None,
+    n_warmup: int | None = None,
 ) -> TimingResult:
     times_ms = [t * 1000 for t in times]
     mean = statistics.mean(times_ms)
@@ -141,6 +163,8 @@ def make_result(
         throughput=(throughput_count / mean * 1000) if throughput_count is not None else None,
         throughput_unit=throughput_unit,
         peak_memory_mb=peak_memory_mb,
+        warmup_ms=warmup_secs * 1000 if warmup_secs is not None else None,
+        n_warmup=n_warmup,
     )
 
 
@@ -377,8 +401,8 @@ def bench_backbone(
             )
 
             try:
-                times = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter,
-                                 reset_peak_memory=True)
+                gpu_timing = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter,
+                                      reset_peak_memory=True)
             except torch.cuda.OutOfMemoryError:
                 print(f"    OOM — skipping (try smaller --batch-size)")
                 del model, optimizer, scaler
@@ -388,10 +412,12 @@ def bench_backbone(
             peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
 
             r = make_result(
-                label, times,
+                label, gpu_timing.times,
                 throughput_count=batch_size,
                 throughput_unit="samples/s",
                 peak_memory_mb=peak_mb,
+                warmup_secs=gpu_timing.warmup_secs if use_compile else None,
+                n_warmup=gpu_timing.n_warmup if use_compile else None,
             )
             results.append(r)
             print(f"    {r.summary_line()}")
@@ -481,8 +507,8 @@ def bench_adapters(
             )
 
             try:
-                times = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter,
-                                 reset_peak_memory=True)
+                gpu_timing = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter,
+                                      reset_peak_memory=True)
             except torch.cuda.OutOfMemoryError:
                 print(f"    OOM — skipping (try smaller --batch-size)")
                 del adapter_model, backbone, optimizer, scaler
@@ -492,10 +518,12 @@ def bench_adapters(
             peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
 
             r = make_result(
-                label, times,
+                label, gpu_timing.times,
                 throughput_count=batch_size,
                 throughput_unit="samples/s",
                 peak_memory_mb=peak_mb,
+                warmup_secs=gpu_timing.warmup_secs if use_compile else None,
+                n_warmup=gpu_timing.n_warmup if use_compile else None,
             )
             results.append(r)
             print(f"    {r.summary_line()}")
