@@ -22,9 +22,12 @@
 
 # ── Caddy: single static binary for reverse-proxying the dashboard ──
 FROM python:3.12-slim AS caddy
+ARG CADDY_VERSION=2.11.2
+ARG CADDY_SHA256=6d07b9bda92ac46e3b874e90dabc33192eca7e64c4b36ea661f4fd7dd27a5129
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
-    && curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" \
+    && curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64&version=v${CADDY_VERSION}" \
        -o /usr/local/bin/caddy \
+    && echo "${CADDY_SHA256}  /usr/local/bin/caddy" | sha256sum -c \
     && chmod +x /usr/local/bin/caddy \
     && rm -rf /var/lib/apt/lists/*
 
@@ -98,6 +101,7 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
     PYTHONPATH=/opt/pawn \
     PATH="/opt/pawn/.venv/bin:${PATH}"
 
+EXPOSE 8888
 COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["tini", "--"]
@@ -169,6 +173,7 @@ exec su - pawn -c "
 CLAUDE_DEV
 RUN chmod +x /usr/local/bin/claude-dev
 
+EXPOSE 8888
 COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["tini", "--"]
@@ -216,6 +221,7 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
     PYTHONPATH=/opt/pawn \
     PATH="/opt/pawn/.venv/bin:${PATH}"
 
+EXPOSE 8888
 COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["tini", "--"]
@@ -284,6 +290,7 @@ exec su - pawn -c "
 CLAUDE_DEV
 RUN chmod +x /usr/local/bin/claude-dev
 
+EXPOSE 8888
 COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
 RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["tini", "--"]

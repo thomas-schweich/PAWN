@@ -32,6 +32,7 @@ fi
 
 # ── Dashboard + Caddy reverse proxy (port 8888 → Solara 8765) ──────
 if [ "${PAWN_DASHBOARD:-1}" != "0" ]; then
+    echo "Starting dashboard on 127.0.0.1:8765..."
     python -m pawn.dashboard --host 127.0.0.1 --port 8765 --log-dir /opt/pawn/logs &
     caddy run --config /opt/pawn/deploy/Caddyfile &
     echo "Dashboard proxied on port 8888"
