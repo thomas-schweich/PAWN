@@ -44,8 +44,10 @@ jobs:
           build-args: |
             GIT_HASH=${{ github.sha }}
             GIT_TAG=${{ steps.meta.outputs.tag }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-builder
+            type=registry,ref=${{ env.IMAGE }}:buildcache-runtime
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-runtime,mode=max
 
       - name: Build and push dev (CUDA)
         uses: docker/build-push-action@v6
@@ -60,8 +62,11 @@ jobs:
           build-args: |
             GIT_HASH=${{ github.sha }}
             GIT_TAG=${{ steps.meta.outputs.tag }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-builder
+            type=registry,ref=${{ env.IMAGE }}:buildcache-runtime
+            type=registry,ref=${{ env.IMAGE }}:buildcache-dev
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-dev,mode=max
 
       # ── ROCm images ─────────────────────────────────────────────────
       - name: Build and push runtime (ROCm)
@@ -77,8 +82,10 @@ jobs:
           build-args: |
             GIT_HASH=${{ github.sha }}
             GIT_TAG=${{ steps.meta.outputs.tag }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-rocm
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-rocm,mode=max
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-builder
+            type=registry,ref=${{ env.IMAGE }}:buildcache-runtime-rocm
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-runtime-rocm,mode=max
 
       - name: Build and push dev (ROCm)
         uses: docker/build-push-action@v6
@@ -93,5 +100,8 @@ jobs:
           build-args: |
             GIT_HASH=${{ github.sha }}
             GIT_TAG=${{ steps.meta.outputs.tag }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-rocm
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-rocm,mode=max
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-builder
+            type=registry,ref=${{ env.IMAGE }}:buildcache-runtime-rocm
+            type=registry,ref=${{ env.IMAGE }}:buildcache-dev-rocm
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-dev-rocm,mode=max
