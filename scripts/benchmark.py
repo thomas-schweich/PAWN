@@ -700,6 +700,7 @@ def bench_concurrency(
 
     results: list[ConcurrencyResult] = []
     single_throughput: float | None = None
+    baseline_wall_secs: float | None = None  # N=1 total wall time
 
     try:
         for n_procs in range(1, max_n + 1):
@@ -710,6 +711,16 @@ def bench_concurrency(
                 Path(tempfile.mktemp(suffix=".json", prefix=f"pawn_bench_r{i}_"))
                 for i in range(n_procs)
             ]
+
+            # Timeout: for N=1, be generous (10 min for compilation).
+            # For N>1, allow N * baseline * 3 — if it takes longer than that,
+            # the GPU is thrashing and we should stop.
+            if baseline_wall_secs is not None:
+                timeout_secs = max(baseline_wall_secs * n_procs * 3, 60)
+            else:
+                timeout_secs = 600  # 10 min for N=1 (includes compilation)
+
+            sweep_start = time.perf_counter()
 
             # Launch all workers, pinned to GPU 0
             procs: list[subprocess.Popen[str]] = []
@@ -723,11 +734,17 @@ def bench_concurrency(
                 )
                 procs.append(p)
 
-            # Wait for all workers
+            # Wait for all workers with timeout
             oom = False
             failed = False
+            timed_out = False
             for p in procs:
-                p.wait()
+                remaining = timeout_secs - (time.perf_counter() - sweep_start)
+                try:
+                    p.wait(timeout=max(remaining, 1))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    break
                 if p.returncode != 0:
                     stderr = (p.stderr.read() if p.stderr else "")
                     if "OutOfMemoryError" in stderr or "out of memory" in stderr.lower():
@@ -735,9 +752,17 @@ def bench_concurrency(
                     else:
                         failed = True
                         print(f"    Worker failed (exit {p.returncode}):")
-                        # Print last few lines of stderr
                         for line in stderr.strip().splitlines()[-3:]:
                             print(f"      {line}")
+
+            if timed_out:
+                print(f"    Timeout ({timeout_secs:.0f}s) — GPU thrashing, stopping sweep")
+                for p in procs:
+                    p.kill()
+                    p.wait()
+                for rf in result_files:
+                    rf.unlink(missing_ok=True)
+                break
 
             if oom:
                 print(f"    OOM with N={n_procs} — stopping sweep")
@@ -781,6 +806,8 @@ def bench_concurrency(
 
             if single_throughput is None:
                 single_throughput = per_model_throughput
+                # Record N=1 total wall time for timeout calculation
+                baseline_wall_secs = time.perf_counter() - sweep_start
 
             speedup = total_throughput / single_throughput
 
