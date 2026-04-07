@@ -193,19 +193,6 @@ def compute_legal_move_rate_from_preds(
 
 
 
-def _sparse_argmax(hidden: torch.Tensor, lm_head: nn.Linear) -> torch.Tensor:
-    """Compute argmax predictions without materializing full (B,T,V) logits.
-
-    Projects one timestep at a time through lm_head.
-    Peak memory: (B, V) per step instead of (B, T, V) all at once.
-    """
-    B, T, _D = hidden.shape
-    preds = torch.empty(B, T, dtype=torch.long, device=hidden.device)
-    for t in range(T):
-        preds[:, t] = lm_head(hidden[:, t]).argmax(dim=-1)
-    return preds
-
-
 def _get_grad_norm(model: nn.Module) -> float:
     grads = [p.grad.data for p in model.parameters() if p.grad is not None]
     if not grads:
@@ -432,13 +419,12 @@ class CLMTrainer:
                 top5_acc = (top5 == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
                 metrics["top5_accuracy"] = top5_acc
 
-                # Legal move rate: project one ply at a time to get argmax preds
+                # Legal move rate: reuse already-computed valid_logits argmax
                 if has_legal:
                     legal_grid = self.val_data["legal_grid"][start:end].to(self.device, non_blocking=True)
                     game_lengths = self.val_data["game_lengths"][start:end].to(self.device, non_blocking=True)
-                    B, T_seq = input_ids.shape
-                    with torch.amp.autocast(self.device, enabled=self.cfg.use_amp):
-                        preds = _sparse_argmax(hidden, model.lm_head)
+                    preds = torch.zeros_like(loss_mask, dtype=torch.long)
+                    preds[loss_mask] = valid_logits.argmax(dim=-1)
                     legal_rate = compute_legal_move_rate_from_preds(
                         preds, legal_grid, loss_mask, game_lengths,
                     )

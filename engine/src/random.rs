@@ -454,7 +454,7 @@ pub fn generate_checkmate_examples(
                         }
 
                         let replay_legal = replay.legal_moves();
-                        let legal_grid = replay.legal_move_grid();
+                        let (legal_grid, _) = crate::board::decompose_legal_moves(&replay_legal);
                         let legal_tokens: Vec<u16> = replay_legal.iter().map(|m| move_to_token(m)).collect();
 
                         // Test each legal move: does it deliver checkmate?

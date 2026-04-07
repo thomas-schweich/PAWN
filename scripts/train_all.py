@@ -223,7 +223,7 @@ class ModelSlot:
 
     @torch.no_grad()
     def evaluate(self, val_data: dict[str, torch.Tensor]) -> dict[str, float]:
-        from pawn.trainer import compute_legal_move_rate_from_preds, _sparse_argmax
+        from pawn.trainer import compute_legal_move_rate_from_preds
 
         self.model.eval()
         n = val_data["input_ids"].shape[0]
@@ -257,12 +257,12 @@ class ModelSlot:
                 (top5 == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
             )
 
-            # Legal move rate: project one ply at a time to get argmax preds
+            # Legal move rate: reuse already-computed valid_logits argmax
             if has_legal:
                 legal_grid = val_data["legal_grid"][start:end].to(self.device, non_blocking=True)
                 game_lengths = val_data["game_lengths"][start:end].to(self.device, non_blocking=True)
-                with torch.amp.autocast(self.device, enabled=self.train_cfg.use_amp):
-                    preds = _sparse_argmax(hidden, self.model.lm_head)
+                preds = torch.zeros_like(loss_mask, dtype=torch.long)
+                preds[loss_mask] = valid_logits.argmax(dim=-1)
                 metrics["legal_move_rate"] = compute_legal_move_rate_from_preds(
                     preds, legal_grid, loss_mask, game_lengths,
                 )
