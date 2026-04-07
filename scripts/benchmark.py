@@ -16,9 +16,11 @@ Usage:
     uv run python scripts/benchmark.py --gpu-only
     uv run python scripts/benchmark.py --variants small base --batch-size 128
     uv run python scripts/benchmark.py --adapters lora film
-    uv run python scripts/benchmark.py --no-compile        # eager only
-    uv run python scripts/benchmark.py --compile-only       # compiled only
-    uv run python scripts/benchmark.py --json results.json  # machine-readable output
+    uv run python scripts/benchmark.py --no-backbone         # skip backbone, run adapters only
+    uv run python scripts/benchmark.py --no-adapters         # skip adapters, run backbone only
+    uv run python scripts/benchmark.py --no-compile          # eager only
+    uv run python scripts/benchmark.py --compile-only        # compiled only
+    uv run python scripts/benchmark.py --json results.json   # machine-readable output
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import statistics
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -89,14 +92,21 @@ def time_cpu(fn, *, n_warmup: int = 2, n_iter: int = 10) -> list[float]:
     return times
 
 
-def time_gpu(fn, *, n_warmup: int = 3, n_iter: int = 10) -> list[float]:
-    """Time a GPU function with CUDA synchronization."""
+def time_gpu(fn, *, n_warmup: int = 3, n_iter: int = 10,
+             reset_peak_memory: bool = False) -> list[float]:
+    """Time a GPU function with CUDA synchronization.
+
+    When reset_peak_memory is True, peak memory stats are reset after warmup
+    so the caller gets steady-state memory usage, not compilation overhead.
+    """
     import torch
 
     for _ in range(n_warmup):
         fn()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+        if reset_peak_memory:
+            torch.cuda.reset_peak_memory_stats()
 
     times = []
     for _ in range(n_iter):
@@ -128,7 +138,7 @@ def make_result(
         min_ms=min(times_ms),
         max_ms=max(times_ms),
         stdev_ms=statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0,
-        throughput=(throughput_count / mean * 1000) if throughput_count else None,
+        throughput=(throughput_count / mean * 1000) if throughput_count is not None else None,
         throughput_unit=throughput_unit,
         peak_memory_mb=peak_memory_mb,
     )
@@ -171,6 +181,8 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
     ))
 
     # 3. Random games with discard_ply_limit=True
+    #    Engine discards ply-limit games and retries, so actual returned count
+    #    equals n_games but wall time reflects extra generation work.
     print("  [3/7] generate_random_games (discard_ply_limit) ...")
     times = time_cpu(
         lambda: engine.generate_random_games(
@@ -190,7 +202,7 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
     )
     results.append(make_result(
         "engine/generate_clm_batch", times,
-        throughput_count=n_games, throughput_unit="batches·games/s",
+        throughput_count=n_games, throughput_unit="games/s",
     ))
 
     # Pre-generate games for downstream benchmarks
@@ -363,10 +375,10 @@ def bench_backbone(
             step = _make_backbone_step(
                 model, optimizer, scaler, batch, device, forward_fn,
             )
-            torch.cuda.reset_peak_memory_stats()
 
             try:
-                times = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter)
+                times = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter,
+                                 reset_peak_memory=True)
             except torch.cuda.OutOfMemoryError:
                 print(f"    OOM — skipping (try smaller --batch-size)")
                 del model, optimizer, scaler
@@ -467,10 +479,10 @@ def bench_adapters(
                 adapter_model, optimizer, scaler, batch, device, forward_fn,
                 trainable,
             )
-            torch.cuda.reset_peak_memory_stats()
 
             try:
-                times = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter)
+                times = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter,
+                                 reset_peak_memory=True)
             except torch.cuda.OutOfMemoryError:
                 print(f"    OOM — skipping (try smaller --batch-size)")
                 del adapter_model, backbone, optimizer, scaler
@@ -531,7 +543,7 @@ def save_json(
     platform_info: dict,
 ):
     report = BenchmarkReport(
-        timestamp=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        timestamp=datetime.now().astimezone().isoformat(timespec="seconds"),
         platform_info=platform_info,
         engine_results=[asdict(r) for r in engine_results],
         backbone_results=[asdict(r) for r in backbone_results],
@@ -569,6 +581,10 @@ def main():
                         help="Adapter types to benchmark (default: lora film bottleneck)")
     parser.add_argument("--batch-size", type=int, default=256,
                         help="Batch size for GPU benchmarks (default: 256)")
+    parser.add_argument("--no-backbone", action="store_true",
+                        help="Skip backbone benchmarks")
+    parser.add_argument("--no-adapters", action="store_true",
+                        help="Skip adapter benchmarks")
     parser.add_argument("--device", type=str, default="cuda")
 
     # Compile modes
@@ -592,6 +608,8 @@ def main():
 
     do_engine = not args.gpu_only
     do_gpu = not args.engine_only
+    do_backbone = do_gpu and not args.no_backbone
+    do_adapters = do_gpu and not args.no_adapters
     do_compile = not args.no_compile
     do_eager = not args.compile_only
 
@@ -625,7 +643,7 @@ def main():
 
     # Detect GPU platform for SDPA backend selection
     sdpa_backend = None
-    if do_gpu:
+    if do_backbone or do_adapters:
         import torch
         from pawn.gpu import is_rocm
 
@@ -634,7 +652,7 @@ def main():
         if not torch.cuda.is_available():
             if do_engine:
                 print("No GPU available — running engine benchmarks only.")
-                do_gpu = False
+                do_backbone = do_adapters = False
             else:
                 print("ERROR: No GPU available.", file=sys.stderr)
                 sys.exit(1)
@@ -668,12 +686,13 @@ def main():
             args.engine_games, args.n_iter, args.n_warmup,
         )
 
-    if do_gpu:
+    if do_backbone:
         backbone_results = bench_backbone(
             args.variants, args.batch_size, args.device,
             do_compile, do_eager, args.n_iter, args.n_warmup,
             sdpa_backend,
         )
+    if do_adapters:
         adapter_results = bench_adapters(
             args.adapters, args.batch_size, args.device,
             do_compile, do_eager, args.n_iter, args.n_warmup,
