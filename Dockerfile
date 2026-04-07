@@ -1,8 +1,9 @@
 # PAWN — single image for all RunPod workloads
 #
 # Built automatically by CI on merge to main and pushed to Docker Hub.
-# Uses the RunPod base image (CUDA + SSH + Jupyter) with uv for
-# reproducible Python dependency management.
+# Uses python:3.12-slim as the base — PyTorch cu128 wheels bring their
+# own CUDA runtime libraries, so no nvidia/cuda base image is needed.
+# The only host requirement is the NVIDIA kernel driver (RunPod provides this).
 #
 # Usage: create a RunPod template pointing at thomasschweich/pawn:latest,
 # SSH in, and run experiments. Code lives at /opt/pawn.
@@ -39,8 +40,13 @@ COPY engine/src/ src/
 COPY engine/python/ python/
 RUN maturin build --release
 
-# ── Deps: install Python dependencies (shared by runtime + dev) ─────
-FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS deps
+# ── Deps: install Python dependencies ────────────────────────────────
+FROM python:3.12-slim AS deps
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
@@ -51,9 +57,9 @@ COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
 WORKDIR /opt/pawn
 COPY pyproject.toml uv.lock ./
 COPY --from=builder /build/engine/target/wheels/*.whl /tmp/
-RUN uv venv --system-site-packages && \
+RUN uv venv && \
     uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
-    uv pip install /tmp/*.whl && rm -rf /tmp/*.whl
+    uv pip install /tmp/*.whl && rm -rf /tmp/*.whl ${UV_CACHE_DIR}
 
 # ── Runtime ──────────────────────────────────────────────────────────
 FROM deps AS runtime
@@ -75,16 +81,16 @@ ENTRYPOINT ["/opt/pawn/entrypoint.sh"]
 # Build:  docker build --target dev -t thomasschweich/pawn:dev .
 # Built independently (not FROM runtime) so all /opt/pawn files are
 # owned by pawn from the start, avoiding a slow chown -R layer.
-FROM runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404 AS dev
+FROM python:3.12-slim AS dev
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-server tmux ripgrep jq curl git \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_CACHE_DIR=/tmp/uv-cache
-
-# CLI tools for interactive/agent work
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        tmux ripgrep jq \
-    && rm -rf /var/lib/apt/lists/*
 
 # Developer-friendly tmux defaults
 RUN cat <<'TMUX' > /etc/tmux.conf

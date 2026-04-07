@@ -11,11 +11,34 @@ else
     echo "WARNING: /workspace not available — skipping symlinks"
 fi
 
+# ── HF token persistence ─────────────────────────────────────────────
+if [ -n "${HF_TOKEN:-}" ]; then
+    mkdir -p ~/.cache/huggingface
+    echo -n "$HF_TOKEN" > ~/.cache/huggingface/token
+fi
+
+# ── SSH key injection (RunPod sets PUBLIC_KEY env var) ────────────────
+if [ -n "${PUBLIC_KEY:-}" ]; then
+    mkdir -p ~/.ssh
+    echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys
+    chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
+fi
+
 # ── CUDA MPS (multi-process service for GPU sharing) ───────────────
 if command -v nvidia-cuda-mps-control &>/dev/null; then
     nvidia-cuda-mps-control -d 2>/dev/null && echo "CUDA MPS daemon started" \
         || echo "CUDA MPS already running or unavailable"
 fi
 
-# Hand off to RunPod entrypoint (SSH + Jupyter)
-exec /start.sh
+# ── Start SSH daemon ─────────────────────────────────────────────────
+if [ -x "$(command -v sshd)" ]; then
+    # Allow root login with key (RunPod convention)
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+    /usr/sbin/sshd
+    echo "SSH daemon started"
+fi
+
+echo "PAWN container ready"
+
+# Keep container alive (RunPod expects a foreground process)
+exec sleep infinity

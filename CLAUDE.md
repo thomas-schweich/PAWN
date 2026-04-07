@@ -225,7 +225,7 @@ from the trainer. Load via HF repo ID (e.g. `--checkpoint thomas-schweich/pawn-b
 
 A single Docker image (`thomasschweich/pawn:latest`) is **automatically built and pushed to Docker Hub by CI** on every merge to main. No manual builds needed.
 
-The image is based on `runpod/pytorch` (CUDA + SSH + Jupyter) with all Python deps pre-installed. Code lives at `/opt/pawn` on pods. SSH in and run experiments directly.
+The image is based on `python:3.12-slim` with openssh-server and all Python deps (including PyTorch cu128 + bundled CUDA runtime) installed via uv. No nvidia/cuda or runpod base image needed — the only host requirement is the NVIDIA kernel driver. Code lives at `/opt/pawn` on pods. SSH in and run experiments directly.
 
 To build locally (rarely needed):
 ```bash

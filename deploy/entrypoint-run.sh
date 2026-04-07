@@ -1,6 +1,6 @@
 #!/bin/bash
 # Entrypoint for auto-stop runner target.
-# Starts Runpod's SSH/Jupyter in the background, runs the command, then exits.
+# Starts SSH in the background, runs the command, then exits.
 set -e
 
 cd /opt/pawn
@@ -13,10 +13,16 @@ if [ -n "$HF_TOKEN" ]; then
     echo -n "$HF_TOKEN" > /root/.cache/huggingface/token
 fi
 
-# Let Runpod's own start script handle SSH, Jupyter, key injection, etc.
-if [ -f /start.sh ]; then
-    /start.sh &
-    sleep 2  # give sshd a moment to bind
+# Inject SSH keys and start daemon for debugging access
+if [ -n "${PUBLIC_KEY:-}" ]; then
+    mkdir -p ~/.ssh
+    echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys
+    chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
+fi
+if [ -x "$(command -v sshd)" ]; then
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+    /usr/sbin/sshd &
+    sleep 1
 fi
 
 # Pull checkpoint from HuggingFace if PAWN_MODEL is set
