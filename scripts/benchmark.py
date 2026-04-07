@@ -743,21 +743,23 @@ def bench_concurrency(
             results.append(cr)
 
             eff_pct = efficiency * 100
-            marker = ""
-            if n_procs > 1 and efficiency < 1.0:
-                marker = " ← sequential is faster per-job"
             print(f"    wall: {wall_ms:.0f}ms"
                   f"  total: {total_throughput:.0f} samples/s"
                   f"  per-job: {per_model_throughput:.0f} samples/s"
                   f"  efficiency: {eff_pct:.1f}%"
-                  f"  peak mem: {total_peak_mb:.0f} MB{marker}")
+                  f"  peak mem: {total_peak_mb:.0f} MB")
 
-            # Stop if per-job throughput has dropped below single-job
-            if n_procs > 1 and efficiency < 1.0:
-                best = max(results, key=lambda r: r.total_throughput)
-                print(f"\n  Peak total throughput: N={best.n_models}"
-                      f" ({best.total_throughput} samples/s)")
-                break
+            # Stop when total throughput decreases (adding a process hurt)
+            if len(results) >= 2:
+                prev_total = results[-2].total_throughput
+                if total_throughput <= prev_total:
+                    print(f"\n  Total throughput decreased: N={n_procs}"
+                          f" ({total_throughput:.0f}) ≤ N={n_procs - 1}"
+                          f" ({prev_total:.0f}) — stopping sweep")
+                    best = max(results, key=lambda r: r.total_throughput)
+                    print(f"  Peak total throughput: N={best.n_models}"
+                          f" ({best.total_throughput} samples/s)")
+                    break
         else:
             if results:
                 best = max(results, key=lambda r: r.total_throughput)
