@@ -301,6 +301,54 @@ impl GameState {
         mask
     }
 
+    /// Compute grid + promo mask from a single `legal_moves()` call.
+    /// Use when both are needed (e.g. label replay) to avoid 2x move generation.
+    pub fn legal_move_grid_and_promo(&self) -> ([u64; 64], [[bool; 4]; 44]) {
+        let legal = self.pos.legal_moves();
+        decompose_legal_moves(&legal)
+    }
+
+    /// Compute grid, promo mask, and token list from a single `legal_moves()` call.
+    /// Use in game generation where all three are needed, avoiding 3x+ move generation.
+    /// Also returns the raw MoveList for mate-in-1 checks.
+    pub fn legal_move_all(&self) -> ([u64; 64], [[bool; 4]; 44], Vec<u16>, MoveList) {
+        let legal = self.pos.legal_moves();
+        let (grid, mask) = decompose_legal_moves(&legal);
+        let tokens: Vec<u16> = legal.iter().map(|m| move_to_token(m)).collect();
+        (grid, mask, tokens, legal)
+    }
+
+    /// Check termination using a pre-computed MoveList, avoiding a redundant
+    /// `legal_moves()` call. The caller must pass the same legal moves that
+    /// correspond to the current position.
+    pub fn check_termination_with_legal(&self, max_ply: usize, legal: &MoveList) -> Option<Termination> {
+        if legal.is_empty() {
+            if self.pos.is_check() {
+                return Some(Termination::Checkmate);
+            } else {
+                return Some(Termination::Stalemate);
+            }
+        }
+
+        if self.ply() >= max_ply {
+            return Some(Termination::PlyLimit);
+        }
+
+        if self.halfmove_clock >= 150 {
+            return Some(Termination::SeventyFiveMoveRule);
+        }
+
+        if self.is_fivefold_repetition() {
+            return Some(Termination::FivefoldRepetition);
+        }
+
+        if self.pos.is_insufficient_material() {
+            return Some(Termination::InsufficientMaterial);
+        }
+
+        None
+    }
+
     /// Extract board state for probing.
     pub fn board_array(&self) -> [[i8; 8]; 8] {
         let mut board = [[0i8; 8]; 8];
@@ -493,6 +541,35 @@ impl GameState {
             }
         }
     }
+}
+
+/// Decompose a pre-computed MoveList into a grid and promo mask in a single pass.
+pub fn decompose_legal_moves(legal: &MoveList) -> ([u64; 64], [[bool; 4]; 44]) {
+    let mut grid = [0u64; 64];
+    let mut mask = [[false; 4]; 44];
+
+    for m in legal {
+        let token = move_to_token(m);
+        if let Some((src, dst, _promo)) = vocab::decompose_token(token) {
+            grid[src as usize] |= 1u64 << dst;
+        }
+        if let Move::Normal { from, to, promotion: Some(role), .. } = m {
+            let src = shakmaty_sq_to_ours(*from);
+            let dst = shakmaty_sq_to_ours(*to);
+            if let Some(pair_idx) = vocab::promo_pair_index(src, dst) {
+                let promo_type = match role {
+                    Role::Queen => 0,
+                    Role::Rook => 1,
+                    Role::Bishop => 2,
+                    Role::Knight => 3,
+                    _ => continue,
+                };
+                mask[pair_idx][promo_type] = true;
+            }
+        }
+    }
+
+    (grid, mask)
 }
 
 #[cfg(test)]

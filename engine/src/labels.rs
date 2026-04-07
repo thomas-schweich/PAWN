@@ -27,9 +27,10 @@ pub fn compute_legal_move_masks(
             let mut game_promos = Vec::with_capacity(length);
 
             for t in 0..length {
-                // Record legal moves BEFORE making the move
-                game_grids.push(state.legal_move_grid());
-                game_promos.push(state.legal_promo_mask());
+                // Record legal moves BEFORE making the move — single legal_moves() call
+                let (grid, promo) = state.legal_move_grid_and_promo();
+                game_grids.push(grid);
+                game_promos.push(promo);
 
                 let token = move_ids[b * max_ply + t] as u16;
                 state.make_move(token).expect("Move should be legal during replay");

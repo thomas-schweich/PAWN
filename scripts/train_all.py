@@ -23,10 +23,11 @@ from pathlib import Path
 
 import torch
 import torch.multiprocessing as mp
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from pawn.config import CLMConfig, TrainingConfig
-from pawn.model import PAWNCLM, clm_loss
+from pawn.model import PAWNCLM
 from pawn.data import CLMDataset, create_validation_set
 from pawn.gpu import configure_gpu
 from pawn.checkpoint import save_pretrain_checkpoint, push_checkpoint_to_hf
@@ -124,9 +125,9 @@ class ModelSlot:
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Forward + backward. Returns raw GPU tensor metrics (no .item() sync)."""
         self.model.train()
-        input_ids = batch["input_ids"].to(self.device)
-        targets = batch["targets"].to(self.device)
-        loss_mask = batch["loss_mask"].to(self.device)
+        input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+        targets = batch["targets"].to(self.device, non_blocking=True)
+        loss_mask = batch["loss_mask"].to(self.device, non_blocking=True)
 
         with torch.amp.autocast(self.device, enabled=self.train_cfg.use_amp):
             loss, metrics = self.model.forward_train(input_ids, loss_mask, targets)
@@ -222,7 +223,7 @@ class ModelSlot:
 
     @torch.no_grad()
     def evaluate(self, val_data: dict[str, torch.Tensor]) -> dict[str, float]:
-        from pawn.trainer import compute_legal_move_rate
+        from pawn.trainer import compute_legal_move_rate_from_preds, _sparse_argmax
 
         self.model.eval()
         n = val_data["input_ids"].shape[0]
@@ -233,28 +234,37 @@ class ModelSlot:
 
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
-            input_ids = val_data["input_ids"][start:end].to(self.device)
-            targets = val_data["targets"][start:end].to(self.device)
-            loss_mask = val_data["loss_mask"][start:end].to(self.device)
+            input_ids = val_data["input_ids"][start:end].to(self.device, non_blocking=True)
+            targets = val_data["targets"][start:end].to(self.device, non_blocking=True)
+            loss_mask = val_data["loss_mask"][start:end].to(self.device, non_blocking=True)
 
             with torch.amp.autocast(self.device, enabled=self.train_cfg.use_amp):
-                logits, _ = self.model(input_ids, loss_mask)
-                _, metrics = clm_loss(logits, targets, loss_mask)
+                # Get hidden states without materializing full (B,T,V) logits
+                hidden = self.model.forward_eval(input_ids, loss_mask)
+
+                # Sparse projection: only valid positions through lm_head
+                valid_hidden = hidden[loss_mask]
+                valid_logits = self.model.lm_head(valid_hidden)
+                valid_targets = targets[loss_mask]
+
+            loss = F.cross_entropy(valid_logits, valid_targets)
+            accuracy = (valid_logits.argmax(-1) == valid_targets).float().mean().item()
+            metrics: dict[str, float] = {"loss": loss.item(), "accuracy": accuracy}
 
             # Top-5 accuracy
-            valid_logits = logits[loss_mask]
-            valid_targets = targets[loss_mask]
             top5 = valid_logits.topk(5, dim=-1).indices
             metrics["top5_accuracy"] = (
                 (top5 == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
             )
 
-            # Legal move rate
+            # Legal move rate: project one ply at a time to get argmax preds
             if has_legal:
-                legal_grid = val_data["legal_grid"][start:end].to(self.device)
-                game_lengths = val_data["game_lengths"][start:end].to(self.device)
-                metrics["legal_move_rate"] = compute_legal_move_rate(
-                    logits, legal_grid, loss_mask, game_lengths,
+                legal_grid = val_data["legal_grid"][start:end].to(self.device, non_blocking=True)
+                game_lengths = val_data["game_lengths"][start:end].to(self.device, non_blocking=True)
+                with torch.amp.autocast(self.device, enabled=self.train_cfg.use_amp):
+                    preds = _sparse_argmax(hidden, self.model.lm_head)
+                metrics["legal_move_rate"] = compute_legal_move_rate_from_preds(
+                    preds, legal_grid, loss_mask, game_lengths,
                 )
 
             for k, v in metrics.items():
@@ -492,7 +502,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=(device != "cpu"),
         persistent_workers=(args.num_workers > 0),
-        prefetch_factor=1 if args.num_workers > 0 else None,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
     # Signal handling
@@ -519,15 +529,13 @@ def main():
     active_slots = list(slots)  # slots still training
 
     for batch in loader:
-        # Forward + backward for active models only (no .item() sync)
+        # Forward + backward + optimizer step per model so CUDA can overlap
+        # Adam updates (memory-bound) with the next model's forward (compute-bound)
         all_metrics: dict[str, dict[str, torch.Tensor]] = {}
+        all_grad_norms: dict[str, float] = {}
         for slot in active_slots:
             metrics = slot.train_step(batch)
             all_metrics[slot.name] = metrics
-
-        # Optimizer step for active models
-        all_grad_norms: dict[str, float] = {}
-        for slot in active_slots:
             gn = slot.optimizer_step()
             all_grad_norms[slot.name] = gn
 

@@ -409,19 +409,19 @@ def _prepare_v2_tokens(
     """
     N = len(token_lists)
 
-    # Build input_ids directly: pad each token list to seq_len
-    input_ids = torch.zeros(N, seq_len, dtype=torch.long)
     game_lengths = np.zeros(N, dtype=np.int16)
     move_ids = np.zeros((N, max_ply), dtype=np.int16)
 
+    # Bulk numpy construction to avoid per-game torch.tensor() overhead
+    ids_np = np.zeros((N, seq_len), dtype=np.int64)
     for i, toks in enumerate(token_lists):
         # toks = [outcome, move_1, ..., move_K]
         n_moves = min(len(toks) - 1, max_ply)
         game_lengths[i] = n_moves
         length = min(len(toks), seq_len)
-        input_ids[i, :length] = torch.tensor(toks[:length], dtype=torch.long)
-        # move_ids for legal mask computation (moves only, no outcome)
+        ids_np[i, :length] = toks[:length]
         move_ids[i, :n_moves] = toks[1 : n_moves + 1]
+    input_ids = torch.from_numpy(ids_np)
 
     # Apply min_ply filter
     if min_ply > 1:

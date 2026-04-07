@@ -17,10 +17,11 @@ from datetime import datetime, timezone
 import psutil
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from pawn.config import CLMConfig, TrainingConfig
-from pawn.model import PAWNCLM, clm_loss
+from pawn.model import PAWNCLM
 from pawn.data import CLMDataset, create_validation_set
 from pawn.logging import MetricsLogger
 
@@ -115,28 +116,39 @@ def compute_legal_move_rate(
 ) -> float:
     """Compute fraction of argmax predictions that are legal moves.
 
+    Wrapper that computes preds from logits for backward compatibility.
+    Prefer compute_legal_move_rate_from_preds when hidden states are available.
+    """
+    preds = logits.argmax(dim=-1)
+    return compute_legal_move_rate_from_preds(preds, legal_grid, loss_mask, game_lengths)
+
+
+def compute_legal_move_rate_from_preds(
+    preds: torch.Tensor,
+    legal_grid: torch.Tensor,
+    loss_mask: torch.Tensor,
+    game_lengths: torch.Tensor,
+) -> float:
+    """Compute fraction of argmax predictions that are legal moves.
+
     Evaluated at positions 0 through game_lengths (inclusive), matching the
     loss_mask semantics (which includes the end-of-game PAD prediction).
 
     Args:
-        logits: (B, T, vocab_size)
+        preds: (B, T) argmax token predictions
         legal_grid: (B, max_ply, 64) bit-packed legal moves from engine
         loss_mask: (B, T) bool
         game_lengths: (B,) int
     """
-    B, T, V = logits.shape
+    B, T = preds.shape
     max_ply = legal_grid.shape[1]
 
     with torch.no_grad():
-        # Positions where target is an actual move or end-of-game PAD:
-        # 0..game_lengths in CLM indexing (matches loss_mask <= semantics)
-        move_mask = torch.arange(T, device=logits.device).unsqueeze(0) <= game_lengths.unsqueeze(1)
+        move_mask = torch.arange(T, device=preds.device).unsqueeze(0) <= game_lengths.unsqueeze(1)
         move_mask = move_mask & loss_mask
 
         if not move_mask.any():
             return 0.0
-
-        preds = logits.argmax(dim=-1)  # (B, T)
 
         # Unpack legal grid to dense: (B, max_ply, 64, 64) -> flatten to (B, max_ply, 4096)
         legal_dense = unpack_grid(legal_grid)  # (B, max_ply, 64, 64)
@@ -144,10 +156,10 @@ def compute_legal_move_rate(
 
         n_plies = min(T, max_ply)
         valid_count = 0
-        legal_acc = torch.tensor(0, dtype=torch.long, device=logits.device)
+        legal_acc = torch.tensor(0, dtype=torch.long, device=preds.device)
 
         # Promo token -> grid index lookup (lazily built, cached)
-        promo_grid_idx = _get_promo_grid_index(logits.device)  # (176,)
+        promo_grid_idx = _get_promo_grid_index(preds.device)  # (176,)
 
         for p in range(n_plies):
             pos_mask = move_mask[:, p]  # (B,)
@@ -157,7 +169,7 @@ def compute_legal_move_rate(
             batch_preds = preds[pos_mask, p]  # (N,)
             batch_legal = legal_flat[pos_mask, p]  # (N, 4096)
             n = len(batch_preds)
-            arange_n = torch.arange(n, device=logits.device)
+            arange_n = torch.arange(n, device=preds.device)
 
             # Base grid tokens (1-4096): grid index = token - 1
             is_base = (batch_preds >= 1) & (batch_preds <= 4096)
@@ -179,6 +191,19 @@ def compute_legal_move_rate(
             return 0.0
         return legal_acc.item() / valid_count
 
+
+
+def _sparse_argmax(hidden: torch.Tensor, lm_head: nn.Linear) -> torch.Tensor:
+    """Compute argmax predictions without materializing full (B,T,V) logits.
+
+    Projects one timestep at a time through lm_head.
+    Peak memory: (B, V) per step instead of (B, T, V) all at once.
+    """
+    B, T, _D = hidden.shape
+    preds = torch.empty(B, T, dtype=torch.long, device=hidden.device)
+    for t in range(T):
+        preds[:, t] = lm_head(hidden[:, t]).argmax(dim=-1)
+    return preds
 
 
 def _get_grad_norm(model: nn.Module) -> float:
@@ -341,9 +366,9 @@ class CLMTrainer:
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         self.model.train()
 
-        input_ids = batch["input_ids"].to(self.device)
-        targets = batch["targets"].to(self.device)
-        loss_mask = batch["loss_mask"].to(self.device)
+        input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+        targets = batch["targets"].to(self.device, non_blocking=True)
+        loss_mask = batch["loss_mask"].to(self.device, non_blocking=True)
 
         model = self._eager_model()
 
@@ -384,28 +409,40 @@ class CLMTrainer:
 
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
-            input_ids = self.val_data["input_ids"][start:end].to(self.device)
-            targets = self.val_data["targets"][start:end].to(self.device)
-            loss_mask = self.val_data["loss_mask"][start:end].to(self.device)
+            input_ids = self.val_data["input_ids"][start:end].to(self.device, non_blocking=True)
+            targets = self.val_data["targets"][start:end].to(self.device, non_blocking=True)
+            loss_mask = self.val_data["loss_mask"][start:end].to(self.device, non_blocking=True)
 
-            with torch.amp.autocast(self.device, enabled=self.cfg.use_amp):
-                logits, _layer_outputs = model(input_ids, loss_mask)
-                del _layer_outputs
-                _, metrics = clm_loss(logits, targets, loss_mask)
+            with torch.no_grad():
+                with torch.amp.autocast(self.device, enabled=self.cfg.use_amp):
+                    # Get hidden states without materializing full (B,T,V) logits
+                    hidden = model.forward_eval(input_ids, loss_mask)
 
-            # Top-5 accuracy
-            valid_logits = logits[loss_mask]
-            valid_targets = targets[loss_mask]
-            top5 = valid_logits.topk(5, dim=-1).indices
-            top5_acc = (top5 == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
-            metrics["top5_accuracy"] = top5_acc
+                    # Sparse projection: only valid positions through lm_head
+                    valid_hidden = hidden[loss_mask]
+                    valid_logits = model.lm_head(valid_hidden)
+                    valid_targets = targets[loss_mask]
 
-            # Legal move rate (if legal grid available)
-            if has_legal:
-                legal_grid = self.val_data["legal_grid"][start:end].to(self.device)
-                game_lengths = self.val_data["game_lengths"][start:end].to(self.device)
-                legal_rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
-                metrics["legal_move_rate"] = legal_rate
+                loss = F.cross_entropy(valid_logits, valid_targets)
+                accuracy = (valid_logits.argmax(-1) == valid_targets).float().mean().item()
+                metrics: dict[str, float] = {"loss": loss.item(), "accuracy": accuracy}
+
+                # Top-5 accuracy
+                top5 = valid_logits.topk(5, dim=-1).indices
+                top5_acc = (top5 == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
+                metrics["top5_accuracy"] = top5_acc
+
+                # Legal move rate: project one ply at a time to get argmax preds
+                if has_legal:
+                    legal_grid = self.val_data["legal_grid"][start:end].to(self.device, non_blocking=True)
+                    game_lengths = self.val_data["game_lengths"][start:end].to(self.device, non_blocking=True)
+                    B, T_seq = input_ids.shape
+                    with torch.amp.autocast(self.device, enabled=self.cfg.use_amp):
+                        preds = _sparse_argmax(hidden, model.lm_head)
+                    legal_rate = compute_legal_move_rate_from_preds(
+                        preds, legal_grid, loss_mask, game_lengths,
+                    )
+                    metrics["legal_move_rate"] = legal_rate
 
             for k, v in metrics.items():
                 total_metrics[k] = total_metrics.get(k, 0.0) + v
@@ -426,7 +463,7 @@ class CLMTrainer:
             num_workers=num_workers,
             pin_memory=(self.device != "cpu"),
             persistent_workers=(num_workers > 0),
-            prefetch_factor=1 if num_workers > 0 else None,
+            prefetch_factor=2 if num_workers > 0 else None,
         )
 
         _shutdown_requested = False
