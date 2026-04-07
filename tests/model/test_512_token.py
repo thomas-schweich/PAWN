@@ -366,20 +366,37 @@ class TestPlyRangeFilter:
 
     @pytest.mark.integration
     def test_min_ply_excludes_early(self, setup):
-        """Setting min_ply > 0 excludes early plies from the computation."""
-        rate_all = compute_legal_move_rate_from_preds(
-            setup["preds"], setup["legal_grid"], setup["loss_mask"],
-            setup["game_lengths"],
+        """Setting min_ply > 0 excludes early plies from the computation.
+
+        Uses ground-truth preds for the first 10 plies and zeros (illegal)
+        for the rest.  Full-range rate should be moderate (mix of legal and
+        illegal), but restricting to [0, 10) should be ~1.0 since those plies
+        have the real moves.  Restricting to [10, ∞) should be ~0.0 since
+        those plies have all-zero (PAD) predictions which are never legal.
+        """
+        split = 10
+        # Build preds: ground-truth for plies < split, zeros elsewhere
+        preds = torch.zeros_like(setup["preds"])
+        preds[:, :split] = setup["preds"][:, :split]
+
+        rate_early = compute_legal_move_rate_from_preds(
+            preds, setup["legal_grid"], setup["loss_mask"],
+            setup["game_lengths"], max_ply_limit=split,
         )
         rate_late = compute_legal_move_rate_from_preds(
-            setup["preds"], setup["legal_grid"], setup["loss_mask"],
-            setup["game_lengths"], min_ply=10,
+            preds, setup["legal_grid"], setup["loss_mask"],
+            setup["game_lengths"], min_ply=split,
         )
-        assert rate_all > 0.0
-        assert rate_late > 0.0
-        # With ground-truth preds both should be high, but they cover
-        # different subsets so may differ slightly
-        assert isinstance(rate_late, float)
+        rate_all = compute_legal_move_rate_from_preds(
+            preds, setup["legal_grid"], setup["loss_mask"],
+            setup["game_lengths"],
+        )
+        # Early range has real moves → high legality
+        assert rate_early > 0.8
+        # Late range has PAD predictions → ~0% legality
+        assert rate_late < 0.05
+        # Full range mixes both → between the two extremes
+        assert rate_late < rate_all < rate_early
 
     @pytest.mark.integration
     def test_max_ply_limit_excludes_late(self, setup):
