@@ -321,6 +321,11 @@ def save_pretrain_checkpoint(
             ),
         }
         if extra:
+            collisions = extra.keys() & training_state.keys()
+            if collisions:
+                raise ValueError(
+                    f"extra keys collide with training_state: {collisions}"
+                )
             training_state.update(extra)
         with open(tmp / "training_state.json", "w") as f:
             json.dump(training_state, f, indent=2, default=_json_default)
@@ -457,6 +462,11 @@ def save_adapter_checkpoint(
         if scaler is not None:
             training_state["scaler_state_dict"] = scaler.state_dict()
         if extra:
+            collisions = extra.keys() & training_state.keys()
+            if collisions:
+                raise ValueError(
+                    f"extra keys collide with training_state: {collisions}"
+                )
             training_state.update(extra)
 
         with open(tmp / "training_state.json", "w") as f:
