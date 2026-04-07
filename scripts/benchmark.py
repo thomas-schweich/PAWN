@@ -693,6 +693,231 @@ def save_json(
     print(f"Results saved to {path}")
 
 
+# ── System info collection ───────────────────────────────────────────────────
+
+def _collect_cpu_cache() -> dict[str, str]:
+    """Read CPU cache hierarchy from sysfs. Best-effort, Linux only."""
+    cache: dict[str, str] = {}
+    cache_dir = Path("/sys/devices/system/cpu/cpu0/cache")
+    if not cache_dir.exists():
+        return cache
+
+    for idx_dir in sorted(cache_dir.glob("index*")):
+        try:
+            level = (idx_dir / "level").read_text().strip()
+            cache_type = (idx_dir / "type").read_text().strip()
+            size = (idx_dir / "size").read_text().strip()
+        except OSError:
+            continue
+
+        if cache_type == "Data":
+            cache[f"l{level}d"] = size
+        elif cache_type == "Instruction":
+            cache[f"l{level}i"] = size
+        elif cache_type == "Unified":
+            # Check if L3 is shared across all assigned CPUs
+            if level == "3":
+                try:
+                    shared = (idx_dir / "shared_cpu_list").read_text().strip()
+                    cache["l3_shared_cpus"] = shared
+                except OSError:
+                    pass
+            cache[f"l{level}"] = size
+
+    return cache
+
+
+def _collect_system_info() -> dict:
+    """Collect CPU, RAM, and cache info."""
+    import multiprocessing
+
+    cpu_name = ""
+    cpu_mhz = 0.0
+    if platform.system() == "Linux":
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("model name") and not cpu_name:
+                        cpu_name = line.split(":", 1)[1].strip()
+                    elif line.startswith("cpu MHz") and not cpu_mhz:
+                        cpu_mhz = float(line.split(":", 1)[1].strip())
+                    if cpu_name and cpu_mhz:
+                        break
+        except OSError:
+            pass
+    if not cpu_name:
+        cpu_name = platform.processor() or platform.machine() or "unknown"
+
+    # Max frequency from cpufreq (more reliable than current MHz)
+    try:
+        max_khz = int(Path("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+                       .read_text().strip())
+        cpu_mhz = max_khz / 1000
+    except (OSError, ValueError):
+        pass  # keep /proc/cpuinfo MHz if available
+
+    try:
+        cpu_count = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpu_count = multiprocessing.cpu_count() or 0
+
+    # System RAM
+    ram_gb = 0.0
+    try:
+        import psutil
+        ram_gb = psutil.virtual_memory().total / (1024**3)
+    except ImportError:
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        ram_gb = int(line.split()[1]) / (1024**2)
+                        break
+        except OSError:
+            pass
+
+    info: dict = {
+        "python": sys.version.split()[0],
+        "os": platform.system(),
+        "arch": platform.machine(),
+        "cpu": cpu_name,
+        "cpu_count": cpu_count,
+        "ram_gb": round(ram_gb, 1),
+    }
+    if cpu_mhz:
+        info["cpu_mhz"] = round(cpu_mhz)
+
+    cache = _collect_cpu_cache()
+    if cache:
+        info["cache"] = cache
+
+    return info
+
+
+def _collect_gpu_info() -> dict:
+    """Collect GPU info from torch and system tools. Best-effort."""
+    import subprocess
+    import torch
+
+    props = torch.cuda.get_device_properties(0)
+    info: dict = {
+        "torch": torch.__version__,
+        "gpu": props.name,
+        "vram_gb": round(props.total_memory / (1024**3), 1),
+        "gpu_sm_count": props.multi_processor_count,
+    }
+
+    # L2 cache (exposed by torch on some GPUs)
+    l2 = getattr(props, "L2_cache_size", 0)
+    if l2:
+        info["gpu_l2_mb"] = round(l2 / (1024**2), 1)
+
+    # Try nvidia-smi for clock speeds
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=clocks.max.graphics,clocks.max.mem",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            parts = out.stdout.strip().split(", ")
+            if len(parts) == 2:
+                info["gpu_clock_mhz"] = int(parts[0])
+                info["gpu_mem_clock_mhz"] = int(parts[1])
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+
+    # Try rocm-smi for clock speeds
+    if not info.get("gpu_clock_mhz"):
+        try:
+            out = subprocess.run(
+                ["rocm-smi", "--showclkfrq", "--json"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0:
+                import json as json_mod
+                data = json_mod.loads(out.stdout)
+                # rocm-smi JSON format varies; try common keys
+                for card_data in data.values():
+                    if isinstance(card_data, dict):
+                        for k, v in card_data.items():
+                            if "sclk" in k.lower() and "max" in k.lower():
+                                info["gpu_clock_mhz"] = int(
+                                    str(v).replace("Mhz", "").strip())
+                            elif "mclk" in k.lower() and "max" in k.lower():
+                                info["gpu_mem_clock_mhz"] = int(
+                                    str(v).replace("Mhz", "").strip())
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError,
+                KeyError):
+            pass
+
+    return info
+
+
+def _print_system_info(info: dict) -> None:
+    """Print system info header."""
+    cpu_line = f"CPU: {info['cpu']} ({info['cpu_count']} CPUs)"
+    if info.get("cpu_mhz"):
+        cpu_line += f" @ {info['cpu_mhz']} MHz"
+    print(cpu_line)
+
+    if info.get("ram_gb"):
+        print(f"RAM: {info['ram_gb']:.1f} GB")
+
+    cache = info.get("cache", {})
+    if cache:
+        parts = []
+        if "l1d" in cache:
+            parts.append(f"L1d: {cache['l1d']}")
+        if "l2" in cache:
+            parts.append(f"L2: {cache['l2']}")
+        if "l3" in cache:
+            shared = cache.get("l3_shared_cpus", "")
+            l3_str = f"L3: {cache['l3']}"
+            # If L3 is shared with more CPUs than we're assigned, note it
+            if shared:
+                try:
+                    assigned = len(os.sched_getaffinity(0))
+                    # Parse "0-15" style ranges
+                    shared_count = sum(
+                        int(r.split("-")[1]) - int(r.split("-")[0]) + 1
+                        if "-" in r else 1
+                        for r in shared.split(",")
+                    )
+                    if shared_count > assigned:
+                        l3_str += " (shared)"
+                except (AttributeError, OSError, ValueError):
+                    pass
+            parts.append(l3_str)
+        if parts:
+            print(f"Cache: {', '.join(parts)}")
+
+
+def _print_gpu_info(info: dict, sdpa_backend) -> None:
+    """Print GPU info header."""
+    gpu_line = f"GPU: {info['gpu']} ({info['platform']}, {info['vram_gb']:.1f} GB VRAM"
+    if info.get("gpu_clock_mhz"):
+        gpu_line += f", {info['gpu_clock_mhz']} MHz"
+    if info.get("gpu_mem_clock_mhz"):
+        gpu_line += f", mem {info['gpu_mem_clock_mhz']} MHz"
+    gpu_line += ")"
+    print(gpu_line)
+
+    extras = []
+    if info.get("gpu_sm_count"):
+        extras.append(f"{info['gpu_sm_count']} SMs")
+    if info.get("gpu_l2_mb"):
+        extras.append(f"L2: {info['gpu_l2_mb']} MB")
+    if extras:
+        print(f"      {', '.join(extras)}")
+
+    import torch
+    print(f"PyTorch: {torch.__version__}")
+    print(f"SDPA backend: {sdpa_backend.name if sdpa_backend else 'default (flash)'}")
+    print(f"AMP dtype: bfloat16")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -754,66 +979,14 @@ def main():
     do_eager = not args.compile_only
 
     # Platform info
-    import multiprocessing
-    cpu_name = ""
-    # platform.processor() is unreliable on Linux (often empty or just arch);
-    # read /proc/cpuinfo for the actual model name
-    if platform.system() == "Linux":
-        try:
-            with open("/proc/cpuinfo") as f:
-                for line in f:
-                    if line.startswith("model name"):
-                        cpu_name = line.split(":", 1)[1].strip()
-                        break
-        except OSError:
-            pass
-    if not cpu_name:
-        cpu_name = platform.processor() or platform.machine() or "unknown"
-    # os.sched_getaffinity respects cgroup cpuset limits (e.g. RunPod vCPUs),
-    # unlike multiprocessing.cpu_count() which reports the host's total.
-    try:
-        cpu_count = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        # sched_getaffinity is Linux-only; fall back on other platforms
-        cpu_count = multiprocessing.cpu_count() or 0
-
-    # System RAM
-    try:
-        import psutil
-        ram_gb = psutil.virtual_memory().total / (1024**3)
-    except ImportError:
-        # psutil not available — fall back to /proc/meminfo on Linux
-        ram_gb = 0.0
-        try:
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        ram_kb = int(line.split()[1])
-                        ram_gb = ram_kb / (1024**2)
-                        break
-        except OSError:
-            pass
-
-    info: dict = {
-        "python": sys.version.split()[0],
-        "os": platform.system(),
-        "arch": platform.machine(),
-        "cpu": cpu_name,
-        "cpu_count": cpu_count,
-        "ram_gb": round(ram_gb, 1),
-    }
-
-    print(f"CPU: {cpu_name} ({cpu_count} CPUs)")
-    if ram_gb:
-        print(f"RAM: {ram_gb:.1f} GB")
+    info = _collect_system_info()
+    _print_system_info(info)
 
     # Detect GPU platform for SDPA backend selection
     sdpa_backend = None
     if do_backbone or do_adapters:
         import torch
         from pawn.gpu import is_rocm
-
-        info["torch"] = torch.__version__
 
         if not torch.cuda.is_available():
             if do_engine:
@@ -823,26 +996,20 @@ def main():
                 print("ERROR: No GPU available.", file=sys.stderr)
                 sys.exit(1)
         else:
-            info["gpu"] = torch.cuda.get_device_name(0)
-            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            info["vram_gb"] = round(vram_gb, 1)
+            gpu_info = _collect_gpu_info()
+            info.update(gpu_info)
             from torch.nn.attention import SDPBackend
 
             if is_rocm():
                 info["platform"] = "ROCm"
                 info["hip"] = torch.version.hip
-                # ROCm: MATH backend avoids flash attn backward bug with compile
                 sdpa_backend = SDPBackend.MATH
             else:
                 info["platform"] = "CUDA"
                 info["cuda"] = torch.version.cuda
-                # NVIDIA: default SDPA (flash attention)
                 sdpa_backend = None
 
-            print(f"GPU: {info['gpu']} ({info['platform']}, {vram_gb:.1f} GB)")
-            print(f"PyTorch: {torch.__version__}")
-            print(f"SDPA backend: {sdpa_backend.name if sdpa_backend else 'default (flash)'}")
-            print(f"AMP dtype: bfloat16")
+            _print_gpu_info(info, sdpa_backend)
 
     # Run benchmarks
     engine_results: list[TimingResult] = []
