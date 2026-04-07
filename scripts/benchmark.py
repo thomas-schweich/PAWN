@@ -551,9 +551,10 @@ _WORKER_SCRIPT = '''
 """Worker process for concurrency benchmark. Runs N training steps and
 reports wall time back to the parent via a result file."""
 import sys, time, json, torch
+import torch.nn.functional as F
 import pawn.model as model_module
 from pawn.config import CLMConfig
-from pawn.model import PAWNCLM
+from pawn.model import PAWNCLM, clm_loss
 from torch.nn.attention import SDPBackend
 import chess_engine as engine
 
@@ -562,7 +563,8 @@ n_warmup = int(sys.argv[2])
 n_iter = int(sys.argv[3])
 sdpa_backend_name = sys.argv[4]   # "MATH" or "NONE"
 variant = sys.argv[5]
-result_path = sys.argv[6]
+adapter_type = sys.argv[6]        # "none", "lora", "film", "bottleneck"
+result_path = sys.argv[7]
 
 device = "cuda"
 cfg = getattr(CLMConfig, variant)()
@@ -570,10 +572,32 @@ cfg = getattr(CLMConfig, variant)()
 if sdpa_backend_name != "NONE":
     model_module.SDPA_BACKEND = getattr(SDPBackend, sdpa_backend_name)
 
-model = PAWNCLM(cfg).to(device)
-forward_fn = torch.compile(model.forward_train)
+backbone = PAWNCLM(cfg).to(device)
+
+# Optionally wrap in an adapter
+if adapter_type == "lora":
+    from pawn.adapters.lora import LoRACLM
+    model = LoRACLM(backbone, rank=4, attn_targets="qkvo").to(device)
+elif adapter_type == "film":
+    from pawn.adapters.film import FiLMCLM
+    model = FiLMCLM(backbone, use_output_film=True).to(device)
+elif adapter_type == "bottleneck":
+    from pawn.adapters.bottleneck import BottleneckCLM
+    model = BottleneckCLM(backbone, bottleneck_dim=8).to(device)
+else:
+    model = backbone
+
+is_adapter = adapter_type != "none"
+
+if is_adapter:
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    forward_fn = torch.compile(model.forward)
+else:
+    trainable = list(model.parameters())
+    forward_fn = torch.compile(model.forward_train)
+
 optimizer = torch.optim.AdamW(
-    model.parameters(), lr=3e-4, weight_decay=0.01, betas=(0.9, 0.95))
+    trainable, lr=3e-4, weight_decay=0.01, betas=(0.9, 0.95))
 scaler = torch.amp.GradScaler(device, enabled=True)
 
 input_ids, targets, loss_mask, *_ = engine.generate_clm_batch(batch_size, 256, seed=42)
@@ -586,10 +610,14 @@ batch = {
 def step():
     model.train()
     with torch.amp.autocast(device, dtype=torch.bfloat16, enabled=True):
-        loss, _ = forward_fn(batch["input_ids"], batch["loss_mask"], batch["targets"])
+        if is_adapter:
+            logits = forward_fn(batch["input_ids"])
+            loss, _ = clm_loss(logits, batch["targets"], batch["loss_mask"])
+        else:
+            loss, _ = forward_fn(batch["input_ids"], batch["loss_mask"], batch["targets"])
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
     scaler.step(optimizer)
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
@@ -621,14 +649,18 @@ def bench_concurrency(
     n_warmup: int,
     sdpa_backend,
     variant: str = "small",
+    adapter: str = "none",
     max_n: int = 10,
 ) -> list[ConcurrencyResult]:
     """Sweep N concurrent training processes to find peak total throughput.
 
     Spawns N independent Python processes, each running a compiled training
     loop on the same GPU. Measures aggregate throughput and per-process
-    throughput. Stops when per-process throughput drops below the N=1
-    baseline or OOM is hit.
+    throughput. Stops when total throughput decreases or OOM is hit.
+
+    Args:
+        variant: backbone model size (toy/small/base/large)
+        adapter: adapter type to wrap the backbone (none/lora/film/bottleneck)
     """
     import subprocess
     import tempfile
@@ -638,7 +670,11 @@ def bench_concurrency(
     print("\n" + "=" * 72)
     print(" CONCURRENCY SWEEP (GPU)")
     print("=" * 72)
-    print(f"  model={variant}  batch_size={batch_size}  device={device}")
+    config_str = f"  model={variant}"
+    if adapter != "none":
+        config_str += f"+{adapter}"
+    config_str += f"  batch_size={batch_size}  device={device}"
+    print(config_str)
     print(f"  mode=compiled  {n_warmup} warmup + {n_iter} timed iterations per process")
     print(f"  AMP: bf16  SDPA: {sdpa_name}")
 
@@ -681,7 +717,7 @@ def bench_concurrency(
                 p = subprocess.Popen(
                     [sys.executable, str(worker_file),
                      str(batch_size), str(n_warmup), str(n_iter),
-                     sdpa_name, variant, str(rf)],
+                     sdpa_name, variant, adapter, str(rf)],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                     env=worker_env,
                 )
@@ -1294,6 +1330,14 @@ def main():
                         help="Skip adapter benchmarks")
     parser.add_argument("--device", type=str, default="cuda")
 
+    # Concurrency sweep options
+    parser.add_argument("--sweep-variant", type=str, default="small",
+                        choices=["toy", "small", "base", "large"],
+                        help="Backbone variant for concurrency sweep (default: small)")
+    parser.add_argument("--sweep-adapter", type=str, default="none",
+                        choices=["none", "lora", "film", "bottleneck"],
+                        help="Adapter for concurrency sweep (default: none)")
+
     # Compile modes
     compile_group = parser.add_mutually_exclusive_group()
     compile_group.add_argument("--no-compile", action="store_true",
@@ -1326,14 +1370,15 @@ def main():
 
     # Detect GPU platform for SDPA backend selection
     sdpa_backend = None
-    if do_backbone or do_adapters:
+    do_gpu_any = do_backbone or do_adapters or do_gpu
+    if do_gpu_any:
         import torch
         from pawn.gpu import is_rocm
 
         if not torch.cuda.is_available():
             if do_engine:
                 print("No GPU available — running engine benchmarks only.")
-                do_backbone = do_adapters = False
+                do_backbone = do_adapters = do_gpu = False
             else:
                 print("ERROR: No GPU available.", file=sys.stderr)
                 sys.exit(1)
@@ -1375,9 +1420,11 @@ def main():
             args.batch_size, args.device, args.n_iter, args.n_warmup,
             sdpa_backend,
         )
+    if do_gpu:
         concurrency_results = bench_concurrency(
             args.batch_size, args.device, args.n_iter, args.n_warmup,
-            sdpa_backend,
+            sdpa_backend, variant=args.sweep_variant,
+            adapter=args.sweep_adapter,
         )
     if do_adapters:
         adapter_results = bench_adapters(
