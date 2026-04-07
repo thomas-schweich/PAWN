@@ -36,42 +36,43 @@ pub fn generate_training_batch(batch_size: usize, max_ply: usize, seed: u64) -> 
         .map(|s| generate_one_game_with_labels(s, max_ply))
         .collect();
 
-    // Pack into flat arrays
+    // Scalar-per-game metadata (sequential — tiny)
+    let game_lengths: Vec<i16> = records.iter().map(|r| r.game_length as i16).collect();
+    let termination_codes: Vec<u8> = records.iter().map(|r| r.termination.as_u8()).collect();
+
+    // Pack bulk arrays in parallel — each game writes to a non-overlapping region
     let total_ply = batch_size * max_ply;
     let mut move_ids = vec![0i16; total_ply];
-    let mut game_lengths = Vec::with_capacity(batch_size);
     let mut legal_move_grid = vec![0u64; total_ply * 64];
     let mut legal_promo_mask = vec![false; total_ply * 44 * 4];
-    let mut termination_codes = Vec::with_capacity(batch_size);
 
-    for (b, record) in records.iter().enumerate() {
-        let length = record.game_length as usize;
-        game_lengths.push(record.game_length as i16);
-        termination_codes.push(record.termination.as_u8());
+    move_ids
+        .par_chunks_mut(max_ply)
+        .zip(legal_move_grid.par_chunks_mut(max_ply * 64))
+        .zip(legal_promo_mask.par_chunks_mut(max_ply * 44 * 4))
+        .zip(records.par_iter())
+        .for_each(|(((ids_row, grid_row), promo_row), record)| {
+            let length = record.game_length as usize;
 
-        // Copy move_ids (remaining positions are already 0 = PAD)
-        for t in 0..length {
-            move_ids[b * max_ply + t] = record.move_ids[t] as i16;
-        }
+            for t in 0..length {
+                ids_row[t] = record.move_ids[t] as i16;
+            }
 
-        // Copy legal move grids (positions beyond game_length are already 0)
-        for t in 0..length {
-            let grid_offset = (b * max_ply + t) * 64;
-            debug_assert_eq!(record.legal_grids[t].len(), 64);
-            legal_move_grid[grid_offset..grid_offset + 64]
-                .copy_from_slice(&record.legal_grids[t]);
-        }
+            for t in 0..length {
+                let grid_offset = t * 64;
+                grid_row[grid_offset..grid_offset + 64]
+                    .copy_from_slice(&record.legal_grids[t]);
+            }
 
-        // Copy promotion masks (contiguous layout: [[bool; 4]; 44] = [bool; 176])
-        for t in 0..length {
-            let promo_offset = (b * max_ply + t) * 44 * 4;
-            // Safety: [[bool; 4]; 44] has identical layout to [bool; 176]
-            let flat: &[bool; 176] = unsafe {
-                &*(&record.legal_promos[t] as *const [[bool; 4]; 44] as *const [bool; 176])
-            };
-            legal_promo_mask[promo_offset..promo_offset + 176].copy_from_slice(flat);
-        }
-    }
+            for t in 0..length {
+                let promo_offset = t * 44 * 4;
+                // Safety: [[bool; 4]; 44] has identical layout to [bool; 176]
+                let flat: &[bool; 176] = unsafe {
+                    &*(&record.legal_promos[t] as *const [[bool; 4]; 44] as *const [bool; 176])
+                };
+                promo_row[promo_offset..promo_offset + 176].copy_from_slice(flat);
+            }
+        });
 
     TrainingBatch {
         move_ids,
