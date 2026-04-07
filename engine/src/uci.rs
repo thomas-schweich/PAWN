@@ -272,6 +272,130 @@ mod tests {
     }
 
     #[test]
+    fn test_uci_malformed_strings() {
+        // Too short
+        assert!(parse_uci_move("e2e", &Chess::default()).is_none());
+        // Too long (beyond promo)
+        assert!(parse_uci_move("e2e4qq", &Chess::default()).is_none());
+        // Empty
+        assert!(parse_uci_move("", &Chess::default()).is_none());
+        // Out of range squares
+        assert!(parse_uci_move("z1e4", &Chess::default()).is_none());
+        assert!(parse_uci_move("e9e4", &Chess::default()).is_none());
+    }
+
+    #[test]
+    fn test_uci_castling_queenside() {
+        // Setup: 1. e4 e5 2. Qh5 Nc6 3. Qh4 Nf6 (... to setup)
+        // Easier: setup queenside castling prerequisites.
+        // 1. d4 d5 2. Nc3 Nc6 3. Bf4 Bf5 4. Qd2 Qd7 5. O-O-O
+        let moves = vec![
+            "d2d4", "d7d5", "b1c3", "b8c6", "c1f4", "c8f5",
+            "d1d2", "d8d7", "e1c1",
+        ];
+        let (tokens, n) = uci_moves_to_tokens(&moves, 256);
+        assert_eq!(n, 9, "queenside castling setup and O-O-O all legal");
+        assert_eq!(tokens.len(), 9);
+    }
+
+    #[test]
+    fn test_uci_promotion_all_pieces() {
+        // Advance a white pawn to c7 via captures, then promote c7xb8=Q/R/B/N.
+        let prefix = vec!["a2a4", "b7b5", "a4b5", "c7c5", "b5c6", "d7d5", "c6c7"];
+        let black_move = "a7a6";
+        let targets = vec!["c7b8q", "c7b8r", "c7b8b", "c7b8n"];
+
+        for target in &targets {
+            let mut moves = prefix.clone();
+            moves.push(black_move);
+            moves.push(target);
+            let (tokens, n) = uci_moves_to_tokens(&moves, 256);
+            assert_eq!(n, 9, "promotion {} should be legal", target);
+            let promo_tok = tokens[8];
+            assert!(
+                promo_tok >= crate::vocab::PROMO_START && promo_tok <= crate::vocab::PROMO_END,
+                "promotion token out of range: {}", promo_tok
+            );
+        }
+    }
+
+    #[test]
+    fn test_uci_moves_to_tokens_max_ply_cap() {
+        let moves = vec!["e2e4", "e7e5", "g1f3", "b8c6", "f1c4"];
+        let (tokens, n) = uci_moves_to_tokens(&moves, 3);
+        assert_eq!(n, 3);
+        assert_eq!(tokens.len(), 3);
+    }
+
+    #[test]
+    fn test_uci_bad_promo_char() {
+        // Promotion with invalid piece char 'x'. Build to promotion with same chain.
+        let moves = vec!["a2a4", "b7b5", "a4b5", "c7c5", "b5c6", "d7d5", "c6c7", "a7a6", "c7b8x"];
+        let (_, n) = uci_moves_to_tokens(&moves, 256);
+        assert_eq!(n, 8, "bad promotion char should stop parsing");
+    }
+
+    #[test]
+    fn test_san_to_uci_promotion() {
+        // Promotion: 1.a4 b5 2.axb5 c5 3.bxc6 d5 4.c7 d4 5.cxb8=Q
+        let san = vec!["a4", "b5", "axb5", "c5", "bxc6", "d5", "c7", "d4", "cxb8=Q"];
+        let (uci, n) = san_to_uci(&san);
+        assert_eq!(n, 9);
+        assert_eq!(uci[8], "c7b8q");
+    }
+
+    #[test]
+    fn test_san_to_uci_disambiguator() {
+        // Verify SAN→UCI resolves knight moves correctly.
+        let san = vec!["e4", "e5", "Nf3", "Nc6", "Nc3"];
+        let (uci, n) = san_to_uci(&san);
+        assert_eq!(n, 5);
+        assert_eq!(uci[2], "g1f3");
+        assert_eq!(uci[4], "b1c3");
+    }
+
+    #[test]
+    fn test_san_to_uci_stops_on_invalid() {
+        let san = vec!["e4", "InvalidMove", "Nf3"];
+        let (uci, n) = san_to_uci(&san);
+        assert_eq!(n, 1);
+        assert_eq!(uci.len(), 1);
+    }
+
+    #[test]
+    fn test_batch_san_to_uci_parallel() {
+        let games = vec![
+            vec!["e4", "e5"],
+            vec!["d4", "d5", "c4"],
+            vec!["Nf3", "Nf6"],
+        ];
+        let results = batch_san_to_uci(&games);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].1, 2);
+        assert_eq!(results[1].1, 3);
+        assert_eq!(results[2].1, 2);
+        assert_eq!(results[0].0, vec!["e2e4", "e7e5"]);
+        assert_eq!(results[1].0, vec!["d2d4", "d7d5", "c2c4"]);
+        assert_eq!(results[2].0, vec!["g1f3", "g8f6"]);
+    }
+
+    #[test]
+    fn test_uci_ep_capture() {
+        // 1. e4 a6 2. e5 d5 3. exd6 (en passant)
+        let moves = vec!["e2e4", "a7a6", "e4e5", "d7d5", "e5d6"];
+        let (_, n) = uci_moves_to_tokens(&moves, 256);
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn test_uci_uppercase_promotion() {
+        // Promotion with uppercase Q
+        let moves = vec!["a2a4", "b7b5", "a4b5", "c7c5", "b5c6", "d7d5", "c6c7", "a7a6", "c7b8Q"];
+        let (_, n) = uci_moves_to_tokens(&moves, 256);
+        assert_eq!(n, 9, "uppercase Q promotion should parse");
+    }
+
+    #[test]
     fn test_roundtrip_san_uci_tokens() {
         // SAN -> UCI -> tokens should match SAN -> tokens
         let san = vec!["e4", "e5", "Nf3", "Nc6", "Bb5"];

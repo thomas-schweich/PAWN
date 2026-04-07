@@ -94,6 +94,7 @@ def _extract_elos_from_pgn(pgn_path: Path, max_games: int) -> list[tuple[int, in
                 if in_headers:
                     elos.append((white_elo, black_elo))
                     if len(elos) >= max_games:
+                        in_headers = False
                         break
                 white_elo = 1500
                 black_elo = 1500

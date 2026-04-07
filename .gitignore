@@ -35,6 +35,13 @@ Thumbs.db
 
 # uv (track root lockfile only)
 engine/uv.lock
+.uv-cache/
+
+# Test artifacts
+.hypothesis/
+.pytest_cache/
+pytest-of-*/
+.mpl-cache/
 
 # Local working files
 local/

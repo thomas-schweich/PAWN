@@ -333,6 +333,169 @@ fn worker_play(
     results
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_self_move_detects_a1a1() {
+        assert!(UciEngine::is_self_move("a1a1"));
+        assert!(UciEngine::is_self_move("e4e4"));
+        assert!(UciEngine::is_self_move("h8h8"));
+    }
+
+    #[test]
+    fn test_is_self_move_rejects_actual_moves() {
+        assert!(!UciEngine::is_self_move("e2e4"));
+        assert!(!UciEngine::is_self_move("g1f3"));
+        assert!(!UciEngine::is_self_move("a1h8"));
+    }
+
+    #[test]
+    fn test_is_self_move_short_string() {
+        // Needs at least 4 chars
+        assert!(!UciEngine::is_self_move(""));
+        assert!(!UciEngine::is_self_move("a1"));
+        assert!(!UciEngine::is_self_move("abc"));
+    }
+
+    #[test]
+    fn test_is_self_move_with_promotion() {
+        // Self-move with promotion suffix (technically not a real move but we accept the 4 char check)
+        assert!(UciEngine::is_self_move("a1a1q"));
+    }
+
+    #[test]
+    fn test_find_val_basic() {
+        let parts = vec!["info", "depth", "10", "score", "cp", "42", "pv", "e2e4"];
+        assert_eq!(UciEngine::find_val(&parts, "depth"), Some("10"));
+        assert_eq!(UciEngine::find_val(&parts, "score"), Some("cp"));
+        assert_eq!(UciEngine::find_val(&parts, "pv"), Some("e2e4"));
+        assert_eq!(UciEngine::find_val(&parts, "nope"), None);
+    }
+
+    #[test]
+    fn test_find_val_trailing_key() {
+        // Key is last in list (no val)
+        let parts = vec!["info", "depth"];
+        assert_eq!(UciEngine::find_val(&parts, "depth"), None);
+    }
+
+    #[test]
+    fn test_parse_score_cp() {
+        let parts = vec!["info", "score", "cp", "42", "pv", "e2e4"];
+        assert_eq!(UciEngine::parse_score(&parts), Some(42.0));
+    }
+
+    #[test]
+    fn test_parse_score_cp_negative() {
+        let parts = vec!["info", "score", "cp", "-150", "pv", "e2e4"];
+        assert_eq!(UciEngine::parse_score(&parts), Some(-150.0));
+    }
+
+    #[test]
+    fn test_parse_score_mate_winning() {
+        let parts = vec!["info", "score", "mate", "3", "pv", "e2e4"];
+        assert_eq!(UciEngine::parse_score(&parts), Some(30_000.0));
+    }
+
+    #[test]
+    fn test_parse_score_mate_losing() {
+        let parts = vec!["info", "score", "mate", "-2", "pv", "e2e4"];
+        assert_eq!(UciEngine::parse_score(&parts), Some(-30_000.0));
+    }
+
+    #[test]
+    fn test_parse_score_missing() {
+        let parts = vec!["info", "depth", "10"];
+        assert_eq!(UciEngine::parse_score(&parts), None);
+    }
+
+    #[test]
+    fn test_parse_score_unknown_type() {
+        // Unknown score type (e.g., "xx")
+        let parts = vec!["info", "score", "xx", "42"];
+        assert_eq!(UciEngine::parse_score(&parts), None);
+    }
+
+    #[test]
+    fn test_softmax_sample_empty() {
+        let mut rng = StdRng::seed_from_u64(42);
+        assert!(softmax_sample(&[], 1.0, &mut rng).is_none());
+    }
+
+    #[test]
+    fn test_softmax_sample_single() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let cands = vec![("e2e4".to_string(), 0.5)];
+        assert_eq!(softmax_sample(&cands, 1.0, &mut rng), Some("e2e4".to_string()));
+    }
+
+    #[test]
+    fn test_softmax_sample_zero_temp_picks_best() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let cands = vec![
+            ("e2e4".to_string(), 10.0),
+            ("d2d4".to_string(), 50.0),
+            ("c2c4".to_string(), 25.0),
+        ];
+        // T=0 → argmax
+        assert_eq!(softmax_sample(&cands, 0.0, &mut rng), Some("d2d4".to_string()));
+    }
+
+    #[test]
+    fn test_softmax_sample_negative_temp_picks_best() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let cands = vec![
+            ("e2e4".to_string(), 10.0),
+            ("d2d4".to_string(), 50.0),
+        ];
+        // Negative T: treated like T<=0 → argmax
+        assert_eq!(softmax_sample(&cands, -1.0, &mut rng), Some("d2d4".to_string()));
+    }
+
+    #[test]
+    fn test_softmax_sample_distribution() {
+        // At high temperature, sampling should sometimes hit lower-scored candidates.
+        let cands = vec![
+            ("m1".to_string(), 0.0),
+            ("m2".to_string(), 0.0),
+            ("m3".to_string(), 0.0),
+        ];
+        // Equal scores: uniform distribution, all 3 should be reachable.
+        let mut seen = std::collections::HashSet::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        for _ in 0..100 {
+            let r = softmax_sample(&cands, 1.0, &mut rng);
+            seen.insert(r.unwrap());
+        }
+        assert_eq!(seen.len(), 3, "uniform sampling should cover all candidates");
+    }
+
+    #[test]
+    fn test_softmax_deterministic_with_seed() {
+        let cands = vec![
+            ("m1".to_string(), 0.0),
+            ("m2".to_string(), 10.0),
+            ("m3".to_string(), 20.0),
+        ];
+        let mut rng1 = StdRng::seed_from_u64(42);
+        let mut rng2 = StdRng::seed_from_u64(42);
+        for _ in 0..10 {
+            let r1 = softmax_sample(&cands, 0.5, &mut rng1);
+            let r2 = softmax_sample(&cands, 0.5, &mut rng2);
+            assert_eq!(r1, r2, "same seed → same sample");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires stockfish binary"]
+    fn test_generate_engine_games_integration() {
+        // Would call generate_engine_games with a real Stockfish binary.
+        // Skipped in unit tests to avoid requiring an external engine.
+    }
+}
+
 /// Generate self-play games using an external UCI engine (Stockfish, Lc0, etc).
 ///
 /// Spawns `n_workers` engine processes, each playing its share of games.

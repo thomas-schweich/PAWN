@@ -391,4 +391,328 @@ mod tests {
         assert_eq!(termination_to_outcome(Termination::InsufficientMaterial, 60), DRAW_BY_RULE);
         assert_eq!(termination_to_outcome(Termination::PlyLimit, 255), PLY_LIMIT);
     }
+
+    // ==== New tests added by Agent A (Rust Core) ====
+
+    #[test]
+    fn test_vocab_constants() {
+        // VOCAB_SIZE must match docs: 1 PAD + 4096 grid + 176 promo + 11 outcome = 4284
+        assert_eq!(VOCAB_SIZE, 4284);
+        assert_eq!(PAD_TOKEN, 0);
+        assert_eq!(BASE_GRID_START, 1);
+        assert_eq!(BASE_GRID_END, 4096);
+        assert_eq!(PROMO_START, 4097);
+        assert_eq!(PROMO_END, 4272);
+        // 4272 - 4097 + 1 = 176 promotion tokens
+        assert_eq!(PROMO_END - PROMO_START + 1, 176);
+        assert_eq!(NUM_PROMO_PAIRS, 44);
+        assert_eq!(NUM_PROMO_TYPES, 4);
+        assert_eq!(NUM_PROMO_PAIRS * NUM_PROMO_TYPES, 176);
+        // Outcome base starts right after promo end
+        assert_eq!(OUTCOME_BASE, PROMO_END + 1);
+        assert_eq!(OUTCOME_BASE, 4273);
+        // 11 outcome tokens: 4273..=4283
+        assert_eq!(DRAW_BY_TIME, 4283);
+        assert_eq!(DRAW_BY_TIME as usize - OUTCOME_BASE as usize + 1, 11);
+    }
+
+    #[test]
+    fn test_all_outcome_tokens_distinct_and_in_range() {
+        // All 11 outcome tokens distinct and within [OUTCOME_BASE, VOCAB_SIZE)
+        let outcomes = [
+            WHITE_CHECKMATES, BLACK_CHECKMATES, STALEMATE, DRAW_BY_RULE, PLY_LIMIT,
+            WHITE_RESIGNS, BLACK_RESIGNS, DRAW_BY_AGREEMENT,
+            WHITE_WINS_ON_TIME, BLACK_WINS_ON_TIME, DRAW_BY_TIME,
+        ];
+        for &t in &outcomes {
+            assert!(t >= OUTCOME_BASE, "outcome {} < OUTCOME_BASE", t);
+            assert!((t as usize) < VOCAB_SIZE, "outcome {} >= VOCAB_SIZE", t);
+        }
+        // Check distinctness
+        let mut sorted = outcomes.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), outcomes.len(), "outcome tokens must be distinct");
+    }
+
+    #[test]
+    fn test_square_names_indexing_exhaustive() {
+        // Verify ALL 64 square names match the file-major formula: file=i%8, rank=i/8
+        for i in 0..64 {
+            let name = SQUARE_NAMES[i];
+            let chars: Vec<char> = name.chars().collect();
+            assert_eq!(chars.len(), 2);
+            let file = chars[0] as u8 - b'a';
+            let rank = chars[1] as u8 - b'1';
+            assert_eq!(file as usize, i % 8, "file mismatch for idx {}: {}", i, name);
+            assert_eq!(rank as usize, i / 8, "rank mismatch for idx {}: {}", i, name);
+        }
+    }
+
+    #[test]
+    fn test_base_grid_token_exhaustive_roundtrip() {
+        // Every (src, dst) pair in [0..64, 0..64] => token => roundtrip back
+        for src in 0u8..64 {
+            for dst in 0u8..64 {
+                let token = base_grid_token(src, dst);
+                assert!(token >= BASE_GRID_START && token <= BASE_GRID_END);
+                let (s, d, p) = decompose_token(token).unwrap();
+                assert_eq!(s, src);
+                assert_eq!(d, dst);
+                assert_eq!(p, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_promo_pair_index_lookup() {
+        // Every pair in the array should be findable via the lookup table
+        for (i, &(s, d)) in promo_pairs().iter().enumerate() {
+            assert_eq!(promo_pair_index(s, d), Some(i));
+        }
+        // A non-promotion pair (e.g. e2e4: src=12, dst=28) returns None
+        assert!(promo_pair_index(12, 28).is_none());
+        // Mid-board src should not be a promotion
+        assert!(promo_pair_index(32, 40).is_none());
+    }
+
+    #[test]
+    fn test_promo_pairs_all_unique() {
+        let pairs = promo_pairs();
+        let mut seen = std::collections::HashSet::new();
+        for &(s, d) in pairs.iter() {
+            assert!(seen.insert((s, d)), "Duplicate promo pair ({}, {})", s, d);
+        }
+        assert_eq!(seen.len(), NUM_PROMO_PAIRS);
+    }
+
+    #[test]
+    fn test_promo_pair_ordering() {
+        // Pair indices 0..8: white straight (file f -> file f)
+        let pairs = promo_pairs();
+        for f in 0..8u8 {
+            assert_eq!(pairs[f as usize], (48 + f, 56 + f));
+        }
+        // Pairs 8..15: white left-capture (file f -> file f-1, f=1..=7)
+        for (i, f) in (1..8u8).enumerate() {
+            assert_eq!(pairs[8 + i], (48 + f, 56 + f - 1));
+        }
+        // Pairs 15..22: white right-capture (file f -> file f+1, f=0..=6)
+        for (i, f) in (0..7u8).enumerate() {
+            assert_eq!(pairs[15 + i], (48 + f, 56 + f + 1));
+        }
+        // Pairs 22..30: black straight (file f -> file f), src rank 1 -> dst rank 0
+        for f in 0..8u8 {
+            assert_eq!(pairs[22 + f as usize], (8 + f, f));
+        }
+    }
+
+    #[test]
+    fn test_promo_token_exhaustive_roundtrip() {
+        // For every promo pair and every promo type, token -> decompose -> reconstruct
+        for (pair_idx, &(src, dst)) in promo_pairs().iter().enumerate() {
+            for promo_type in 0u8..4 {
+                let token = promo_token(src, dst, promo_type).unwrap();
+                let expected = PROMO_START + (pair_idx as u16) * 4 + (promo_type as u16);
+                assert_eq!(token, expected);
+                assert!(token >= PROMO_START && token <= PROMO_END);
+                // Decompose returns promo_type+1 (1..=4) since 0 means "no promo"
+                let (s, d, p) = decompose_token(token).unwrap();
+                assert_eq!(s, src);
+                assert_eq!(d, dst);
+                assert_eq!(p, promo_type + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_promo_token_invalid_pair() {
+        // Non-promotion pair returns None
+        assert!(promo_token(0, 0, 0).is_none()); // a1a1 is not a promo
+        assert!(promo_token(12, 28, 0).is_none()); // e2e4 is not a promo
+    }
+
+    #[test]
+    fn test_promo_token_invalid_type() {
+        // White straight a7a8 (src=48, dst=56) is valid
+        assert!(promo_token(48, 56, 0).is_some());
+        // promo_type >= 4 is invalid
+        assert!(promo_token(48, 56, 4).is_none());
+        assert!(promo_token(48, 56, 99).is_none());
+    }
+
+    #[test]
+    fn test_token_to_uci_specific_cases() {
+        // Base grid
+        assert_eq!(token_to_uci(1).unwrap(), "a1a1"); // src=0, dst=0
+        assert_eq!(token_to_uci(64).unwrap(), "a1h8"); // src=0, dst=63
+        assert_eq!(token_to_uci(65).unwrap(), "b1a1"); // src=1, dst=0
+        assert_eq!(token_to_uci(4096).unwrap(), "h8h8"); // src=63, dst=63
+
+        // a7a8q - first white promo
+        let t_a7a8q = promo_token(48, 56, 0).unwrap();
+        assert_eq!(t_a7a8q, PROMO_START);
+        assert_eq!(token_to_uci(t_a7a8q).unwrap(), "a7a8q");
+
+        // a7a8n - first white promo, knight
+        let t_a7a8n = promo_token(48, 56, 3).unwrap();
+        assert_eq!(token_to_uci(t_a7a8n).unwrap(), "a7a8n");
+
+        // a2a1q - first black promo
+        let t_a2a1q = promo_token(8, 0, 0).unwrap();
+        assert_eq!(token_to_uci(t_a2a1q).unwrap(), "a2a1q");
+    }
+
+    #[test]
+    fn test_token_to_uci_all_promo_types() {
+        // Verify order q,r,b,n for promo types 0..4
+        let expected = ["q", "r", "b", "n"];
+        for promo_type in 0u8..4 {
+            let token = promo_token(48, 56, promo_type).unwrap();
+            let uci = token_to_uci(token).unwrap();
+            assert!(uci.ends_with(expected[promo_type as usize]),
+                "promo_type {} -> {} should end with {}", promo_type, uci, expected[promo_type as usize]);
+        }
+    }
+
+    #[test]
+    fn test_token_to_uci_none_for_invalid() {
+        assert!(token_to_uci(PAD_TOKEN).is_none());
+        assert!(token_to_uci(OUTCOME_BASE).is_none());
+        assert!(token_to_uci(DRAW_BY_TIME).is_none());
+        assert!(token_to_uci(PLY_LIMIT).is_none());
+    }
+
+    #[test]
+    fn test_decompose_token_all_outcomes_none() {
+        // All 11 outcome tokens (4273..=4283) should return None
+        for token in OUTCOME_BASE..=DRAW_BY_TIME {
+            assert!(decompose_token(token).is_none(),
+                "outcome token {} should return None", token);
+        }
+    }
+
+    #[test]
+    fn test_decompose_token_out_of_range() {
+        // Tokens beyond vocab size should return None
+        assert!(decompose_token(VOCAB_SIZE as u16).is_none());
+        assert!(decompose_token(5000).is_none());
+        assert!(decompose_token(u16::MAX).is_none());
+    }
+
+    #[test]
+    fn test_build_vocab_maps_bijective() {
+        let (t2m, m2t) = build_vocab_maps();
+        // 4096 grid + 176 promo = 4272 entries
+        assert_eq!(t2m.len(), 4272);
+        assert_eq!(m2t.len(), 4272);
+        // Verify all mappings are consistent
+        for (&token, uci) in &t2m {
+            assert_eq!(m2t.get(uci), Some(&token),
+                "Inconsistent mapping: token {} -> {}", token, uci);
+        }
+        for (uci, &token) in &m2t {
+            assert_eq!(t2m.get(&token), Some(uci),
+                "Inconsistent mapping: {} -> token {}", uci, token);
+        }
+    }
+
+    #[test]
+    fn test_build_vocab_maps_uci_format() {
+        let (_, m2t) = build_vocab_maps();
+        // Every UCI in the map is either 4 chars (base) or 5 chars (promo)
+        for (uci, &token) in &m2t {
+            if token >= PROMO_START {
+                assert_eq!(uci.len(), 5, "promo UCI should be 5 chars: {}", uci);
+            } else {
+                assert_eq!(uci.len(), 4, "base UCI should be 4 chars: {}", uci);
+            }
+        }
+    }
+
+    #[test]
+    fn test_token_to_src_dst_ignores_promo() {
+        // src=48 (a7), dst=56 (a8), promo=queen
+        let token = promo_token(48, 56, 0).unwrap();
+        assert_eq!(token_to_src_dst(token), (48, 56));
+        // Same for non-promo
+        let token = base_grid_token(12, 28);
+        assert_eq!(token_to_src_dst(token), (12, 28));
+    }
+
+    #[test]
+    fn test_promo_pairs_cover_all_rank_7_destinations() {
+        // White promotes: every file has a straight push and capture combinations
+        // All 22 white pairs must have dst on rank 7 (indices 56..64)
+        // And each rank-7 dst must be reached from at least one src
+        let pairs = promo_pairs();
+        let mut white_dsts = std::collections::HashSet::new();
+        for i in 0..22 {
+            let (_, dst) = pairs[i];
+            assert!(dst >= 56 && dst < 64);
+            white_dsts.insert(dst);
+        }
+        // All 8 files on rank 7 are reachable
+        assert_eq!(white_dsts.len(), 8);
+        // Same for black: all dsts on rank 0
+        let mut black_dsts = std::collections::HashSet::new();
+        for i in 22..44 {
+            let (_, dst) = pairs[i];
+            assert!(dst < 8);
+            black_dsts.insert(dst);
+        }
+        assert_eq!(black_dsts.len(), 8);
+    }
+
+    #[test]
+    fn test_lichess_outcome_token_normal_results() {
+        // Normal termination - checkmate wins
+        assert_eq!(lichess_outcome_token("Normal", "1-0", true, false, false), Some(WHITE_CHECKMATES));
+        assert_eq!(lichess_outcome_token("Normal", "0-1", true, false, false), Some(BLACK_CHECKMATES));
+        // Normal - resignation (not checkmate)
+        assert_eq!(lichess_outcome_token("Normal", "1-0", false, false, false), Some(WHITE_RESIGNS));
+        assert_eq!(lichess_outcome_token("Normal", "0-1", false, false, false), Some(BLACK_RESIGNS));
+        // Normal - stalemate vs draw agreement
+        assert_eq!(lichess_outcome_token("Normal", "1/2-1/2", false, true, false), Some(STALEMATE));
+        assert_eq!(lichess_outcome_token("Normal", "1/2-1/2", false, false, false), Some(DRAW_BY_AGREEMENT));
+    }
+
+    #[test]
+    fn test_lichess_outcome_token_time_forfeit() {
+        assert_eq!(lichess_outcome_token("Time forfeit", "1-0", false, false, false), Some(WHITE_WINS_ON_TIME));
+        assert_eq!(lichess_outcome_token("Time forfeit", "0-1", false, false, false), Some(BLACK_WINS_ON_TIME));
+        assert_eq!(lichess_outcome_token("Time forfeit", "1/2-1/2", false, false, false), Some(DRAW_BY_TIME));
+    }
+
+    #[test]
+    fn test_lichess_outcome_token_insufficient_material() {
+        assert_eq!(lichess_outcome_token("Insufficient material", "1/2-1/2", false, false, false), Some(DRAW_BY_RULE));
+    }
+
+    #[test]
+    fn test_lichess_outcome_token_truncated() {
+        // Truncated games (max_ply exceeded) always become PLY_LIMIT regardless
+        assert_eq!(lichess_outcome_token("Normal", "1-0", true, false, true), Some(PLY_LIMIT));
+        assert_eq!(lichess_outcome_token("Time forfeit", "0-1", false, false, true), Some(PLY_LIMIT));
+        assert_eq!(lichess_outcome_token("Abandoned", "1-0", false, false, true), Some(PLY_LIMIT));
+    }
+
+    #[test]
+    fn test_lichess_outcome_token_filtered() {
+        // Rules infraction, Abandoned, Unterminated are filtered out
+        assert!(lichess_outcome_token("Abandoned", "1-0", false, false, false).is_none());
+        assert!(lichess_outcome_token("Rules infraction", "0-1", false, false, false).is_none());
+        assert!(lichess_outcome_token("Unterminated", "*", false, false, false).is_none());
+        // Unknown results with Normal termination are None
+        assert!(lichess_outcome_token("Normal", "*", false, false, false).is_none());
+    }
+
+    #[test]
+    fn test_token_ranges_dont_overlap() {
+        // PAD=0 is alone, base grid 1..=4096, promo 4097..=4272, outcome 4273..=4283
+        assert_eq!(PAD_TOKEN + 1, BASE_GRID_START);
+        assert_eq!(BASE_GRID_END + 1, PROMO_START);
+        assert_eq!(PROMO_END + 1, OUTCOME_BASE);
+        // Total vocab = 4284 accounts for all: 0 + [1,4283] = 4284 tokens
+    }
 }

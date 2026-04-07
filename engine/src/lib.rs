@@ -1353,7 +1353,7 @@ impl PyBatchRLEnv {
 
     /// Legal move token masks: numpy bool (B, vocab_size).
     /// Includes promotion tokens — correct for autoregressive generation.
-    #[pyo3(signature = (game_indices, vocab_size=4278))]
+    #[pyo3(signature = (game_indices, vocab_size=4284))]
     fn get_legal_token_masks_batch<'py>(
         &self,
         py: Python<'py>,
@@ -1570,4 +1570,148 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_engine_games_py, m)?)?;
     m.add_function(wrap_pyfunction!(compute_accuracy_ceiling_py, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for lib.rs: PyO3 glue, vocab constants visibility, and
+    //! cross-module dispatch invariants.
+    //!
+    //! PyO3-wrapped functions cannot be called directly in unit tests (they
+    //! require a Python interpreter), so these tests exercise the underlying
+    //! Rust functions and verify the module layout.
+
+    use super::*;
+
+    #[test]
+    fn test_vocab_constants_accessible() {
+        // Ensure core vocab constants are publicly reachable from lib.rs,
+        // which is needed by PyO3 glue.
+        assert_eq!(vocab::VOCAB_SIZE, 4284);
+        assert_eq!(vocab::PAD_TOKEN, 0);
+        assert_eq!(vocab::BASE_GRID_START, 1);
+        assert_eq!(vocab::BASE_GRID_END, 4096);
+        assert_eq!(vocab::PROMO_START, 4097);
+        assert_eq!(vocab::PROMO_END, 4272);
+        assert_eq!(vocab::OUTCOME_BASE, 4273);
+        assert_eq!(vocab::NUM_PROMO_PAIRS, 44);
+    }
+
+    #[test]
+    fn test_vocab_outcome_symbols_accessible() {
+        // The 11 outcome token consts must be in scope (used by Python via bindings)
+        assert_eq!(vocab::WHITE_CHECKMATES, 4273);
+        assert_eq!(vocab::BLACK_CHECKMATES, 4274);
+        assert_eq!(vocab::STALEMATE, 4275);
+        assert_eq!(vocab::DRAW_BY_RULE, 4276);
+        assert_eq!(vocab::PLY_LIMIT, 4277);
+        assert_eq!(vocab::WHITE_RESIGNS, 4278);
+        assert_eq!(vocab::BLACK_RESIGNS, 4279);
+        assert_eq!(vocab::DRAW_BY_AGREEMENT, 4280);
+        assert_eq!(vocab::WHITE_WINS_ON_TIME, 4281);
+        assert_eq!(vocab::BLACK_WINS_ON_TIME, 4282);
+        assert_eq!(vocab::DRAW_BY_TIME, 4283);
+    }
+
+    #[test]
+    fn test_decompose_token_dispatch_pad_range() {
+        // Dispatch: PAD_TOKEN returns None
+        assert!(vocab::decompose_token(vocab::PAD_TOKEN).is_none());
+    }
+
+    #[test]
+    fn test_decompose_token_dispatch_base_grid_range() {
+        // Dispatch: tokens in [1, 4096] go to base grid branch (promo=0)
+        let samples = [1u16, 2, 64, 128, 4095, 4096];
+        for &t in &samples {
+            let decomp = vocab::decompose_token(t);
+            assert!(decomp.is_some(), "token {} should decompose", t);
+            let (_, _, promo) = decomp.unwrap();
+            assert_eq!(promo, 0, "base grid token {} should have promo=0", t);
+        }
+    }
+
+    #[test]
+    fn test_decompose_token_dispatch_promo_range() {
+        // Dispatch: tokens in [4097, 4272] go to promo branch (promo >= 1)
+        let samples = [4097u16, 4098, 4099, 4100, 4200, 4272];
+        for &t in &samples {
+            let decomp = vocab::decompose_token(t);
+            assert!(decomp.is_some(), "token {} should decompose", t);
+            let (_, _, promo) = decomp.unwrap();
+            assert!(promo >= 1 && promo <= 4, "promo token {} should have 1<=promo<=4", t);
+        }
+    }
+
+    #[test]
+    fn test_decompose_token_dispatch_outcome_range() {
+        // Dispatch: tokens >= OUTCOME_BASE (4273) return None
+        for t in vocab::OUTCOME_BASE..=vocab::DRAW_BY_TIME {
+            assert!(vocab::decompose_token(t).is_none(),
+                "outcome token {} should not decompose", t);
+        }
+    }
+
+    #[test]
+    fn test_decompose_token_boundary_values() {
+        // Boundaries between ranges
+        assert!(vocab::decompose_token(0).is_none()); // PAD
+        assert!(vocab::decompose_token(1).is_some()); // first grid
+        assert!(vocab::decompose_token(4096).is_some()); // last grid
+        assert!(vocab::decompose_token(4097).is_some()); // first promo
+        assert!(vocab::decompose_token(4272).is_some()); // last promo
+        assert!(vocab::decompose_token(4273).is_none()); // first outcome
+    }
+
+    #[test]
+    fn test_termination_enum_consistent_with_u8_mapping() {
+        // PyGameState.check_termination returns i8 with this mapping:
+        // 0=Checkmate, 1=Stalemate, 2=SeventyFiveMoveRule, 3=Fivefold, 4=Insufficient, 5=PlyLimit
+        assert_eq!(types::Termination::Checkmate as u8, 0);
+        assert_eq!(types::Termination::Stalemate as u8, 1);
+        assert_eq!(types::Termination::SeventyFiveMoveRule as u8, 2);
+        assert_eq!(types::Termination::FivefoldRepetition as u8, 3);
+        assert_eq!(types::Termination::InsufficientMaterial as u8, 4);
+        assert_eq!(types::Termination::PlyLimit as u8, 5);
+    }
+
+    #[test]
+    fn test_module_exports_hello() {
+        // Pure Rust test of the hello() function that's exported to Python
+        assert_eq!(hello(), "pawn-engine ready");
+    }
+
+    #[test]
+    fn test_build_vocab_maps_has_expected_entries() {
+        // The export_move_vocabulary binding relies on build_vocab_maps; verify
+        // it returns the correct cardinality.
+        let (t2m, m2t) = vocab::build_vocab_maps();
+        // 4096 grid + 176 promo = 4272 entries (no PAD/outcome)
+        assert_eq!(t2m.len(), 4272);
+        assert_eq!(m2t.len(), 4272);
+        // Specific expected entries
+        assert_eq!(t2m.get(&1).map(|s| s.as_str()), Some("a1a1"));
+        assert_eq!(m2t.get("e2e4").copied(), Some(vocab::base_grid_token(12, 28)));
+    }
+
+    #[test]
+    fn test_promo_pairs_accessible_from_lib() {
+        // PyO3 export_move_vocabulary accesses promo_pairs via vocab::
+        let pairs = vocab::promo_pairs();
+        assert_eq!(pairs.len(), 44);
+    }
+
+    #[test]
+    fn test_square_names_accessible_from_lib() {
+        // PyO3 export_move_vocabulary accesses SQUARE_NAMES
+        assert_eq!(vocab::SQUARE_NAMES.len(), 64);
+        assert_eq!(vocab::SQUARE_NAMES[0], "a1");
+        assert_eq!(vocab::SQUARE_NAMES[63], "h8");
+    }
+
+    #[test]
+    fn test_promo_pieces_accessible_from_lib() {
+        assert_eq!(vocab::PROMO_PIECES.len(), 4);
+        assert_eq!(vocab::PROMO_PIECES, ["q", "r", "b", "n"]);
+    }
 }

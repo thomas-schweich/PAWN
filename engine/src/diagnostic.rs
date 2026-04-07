@@ -149,17 +149,29 @@ pub fn generate_diagnostic_sets(
     let mut per_ply_stats = vec![0u64; n_games * max_ply];
     let mut game_lengths_flat = Vec::with_capacity(n_games);
 
+    // Recompute accumulators from only the bits that fit in the output stride,
+    // so output.white/black always agree with output.per_ply_stats.
+    let mut final_white_acc = Vec::with_capacity(n_games);
+    let mut final_black_acc = Vec::with_capacity(n_games);
+
     for (i, moves) in accepted_moves.iter().enumerate() {
         let length = accepted_lengths[i] as usize;
         for t in 0..length {
             move_ids_flat[i * max_ply + t] = moves[t] as i16;
         }
-        // Copy pre-computed per-ply bits (length+1 entries, cap at max_ply)
         let ply_bits = &accepted_ply_bits[i];
         let copy_len = ply_bits.len().min(max_ply);
         per_ply_stats[i * max_ply..i * max_ply + copy_len]
             .copy_from_slice(&ply_bits[..copy_len]);
         game_lengths_flat.push(accepted_lengths[i] as i16);
+
+        let mut w = 0u64;
+        let mut b = 0u64;
+        for t in 0..copy_len {
+            if t % 2 == 0 { w |= ply_bits[t]; } else { b |= ply_bits[t]; }
+        }
+        final_white_acc.push(w);
+        final_black_acc.push(b);
     }
 
     DiagnosticOutput {
@@ -167,8 +179,8 @@ pub fn generate_diagnostic_sets(
         game_lengths: game_lengths_flat,
         termination_codes: accepted_terms.iter().map(|t| t.as_u8()).collect(),
         per_ply_stats,
-        white: accepted_white_acc,
-        black: accepted_black_acc,
+        white: final_white_acc,
+        black: final_black_acc,
         quota_assignment_white: assignment_white,
         quota_assignment_black: assignment_black,
         quotas_filled_white: filled_white.to_vec(),
@@ -180,6 +192,10 @@ pub fn generate_diagnostic_sets(
 
 /// Compute per-ply edge stats + per-game accumulators for a single game.
 /// Returns (ply_bits, white_accumulator, black_accumulator).
+///
+/// The returned ply_bits has `length + 1` entries (including the terminal
+/// position). Accumulators are derived from these entries directly so
+/// they always agree with the per-ply vector.
 fn compute_game_stats(moves: &[u16], length: usize) -> (Vec<u64>, u64, u64) {
     let mut move_ids = vec![0i16; length];
     for t in 0..length {
@@ -187,17 +203,29 @@ fn compute_game_stats(moves: &[u16], length: usize) -> (Vec<u64>, u64, u64) {
     }
 
     let game_lengths = vec![length as i16];
-    let max_ply = length.max(1);
+    let max_ply = (length + 1).max(1);
     let mut padded = vec![0i16; max_ply];
     padded[..length].copy_from_slice(&move_ids);
 
-    let (per_ply, white, black) = edgestats::compute_edge_stats_per_ply(
+    let (per_ply, _white, _black) = edgestats::compute_edge_stats_per_ply(
         &padded,
         &game_lengths,
         max_ply,
     );
 
-    (per_ply, white[0], black[0])
+    // Derive accumulators from the per_ply vector so they are always
+    // consistent with what downstream code sees.
+    let mut white_acc = 0u64;
+    let mut black_acc = 0u64;
+    for t in 0..per_ply.len() {
+        if t % 2 == 0 {
+            white_acc |= per_ply[t];
+        } else {
+            black_acc |= per_ply[t];
+        }
+    }
+
+    (per_ply, white_acc, black_acc)
 }
 
 #[cfg(test)]
@@ -229,5 +257,163 @@ mod tests {
             "move_ids length must be a multiple of n_games");
         assert!(output.quotas_filled_white[0] >= 1,
             "Should find at least some games with white IN_CHECK");
+    }
+
+    #[test]
+    fn test_quota_never_exceeded() {
+        // Quota should be an upper bound: filled[i] <= quotas[i] for every bit.
+        let mut quotas_white = [0i32; 64];
+        let mut quotas_black = [0i32; 64];
+        quotas_white[0] = 5;   // IN_CHECK white
+        quotas_white[5] = 3;   // PAWN_CAPTURE_AVAILABLE white
+        quotas_black[0] = 4;   // IN_CHECK black
+        quotas_black[5] = 2;   // PAWN_CAPTURE_AVAILABLE black
+
+        let output = generate_diagnostic_sets(
+            &quotas_white, &quotas_black, 30, 256, 42, 50.0,
+        );
+
+        for i in 0..64 {
+            assert!(output.quotas_filled_white[i] <= quotas_white[i],
+                "white quota bit {} exceeded: filled={} > requested={}",
+                i, output.quotas_filled_white[i], quotas_white[i]);
+            assert!(output.quotas_filled_black[i] <= quotas_black[i],
+                "black quota bit {} exceeded: filled={} > requested={}",
+                i, output.quotas_filled_black[i], quotas_black[i]);
+        }
+
+        // Verify the test is non-vacuous: at least some quotas were actually filled.
+        let total_filled: i32 = output.quotas_filled_white.iter().sum::<i32>()
+            + output.quotas_filled_black.iter().sum::<i32>();
+        assert!(total_filled > 0, "test is vacuous: no quotas were filled at all");
+    }
+
+    #[test]
+    fn test_total_games_cap_respected() {
+        // Number of accepted games must be <= total_games requested.
+        let mut quotas_white = [0i32; 64];
+        let quotas_black = [0i32; 64];
+        quotas_white[0] = 100; // Way more than possible to find
+
+        let output = generate_diagnostic_sets(
+            &quotas_white, &quotas_black, 5, 256, 42, 10.0,
+        );
+
+        assert!(output.n_games <= 5, "accepted more than total_games");
+    }
+
+    #[test]
+    fn test_max_simulated_factor_respected() {
+        // With a tight max_simulated_factor we may not fill all quotas.
+        // But the result should still have valid structure.
+        let mut quotas_white = [0i32; 64];
+        let quotas_black = [0i32; 64];
+        quotas_white[0] = 10;
+
+        let output = generate_diagnostic_sets(
+            &quotas_white, &quotas_black, 10, 256, 42, 1.0,
+            // max_simulated = 10 * 1.0 = 10 — very tight
+        );
+
+        // max_simulated is 10 per total_games, so at most 10 games simulated
+        assert!(output.n_games <= 10);
+        assert!(output.move_ids.len() == output.n_games * 256);
+        assert!(output.per_ply_stats.len() == output.n_games * 256);
+    }
+
+    #[test]
+    fn test_deterministic_with_same_seed() {
+        // Same seed + quotas should produce identical output.
+        let mut quotas_white = [0i32; 64];
+        let quotas_black = [0i32; 64];
+        quotas_white[0] = 5;
+
+        let o1 = generate_diagnostic_sets(&quotas_white, &quotas_black, 20, 256, 1234, 20.0);
+        let o2 = generate_diagnostic_sets(&quotas_white, &quotas_black, 20, 256, 1234, 20.0);
+
+        assert_eq!(o1.n_games, o2.n_games);
+        assert_eq!(o1.move_ids, o2.move_ids);
+        assert_eq!(o1.game_lengths, o2.game_lengths);
+        assert_eq!(o1.quota_assignment_white, o2.quota_assignment_white);
+        assert_eq!(o1.quota_assignment_black, o2.quota_assignment_black);
+    }
+
+    #[test]
+    fn test_different_seeds_differ() {
+        let mut quotas_white = [0i32; 64];
+        let quotas_black = [0i32; 64];
+        quotas_white[0] = 5;
+
+        let o1 = generate_diagnostic_sets(&quotas_white, &quotas_black, 20, 256, 1, 20.0);
+        let o2 = generate_diagnostic_sets(&quotas_white, &quotas_black, 20, 256, 2, 20.0);
+
+        // At least some moves should differ with different seeds
+        assert_ne!(o1.move_ids, o2.move_ids, "different seeds should produce different games");
+    }
+
+    #[test]
+    fn test_quota_assignment_bit_matches_game_bit() {
+        // For an assigned game, the assigned bit should actually be present in
+        // the corresponding color's accumulator.
+        let mut quotas_white = [0i32; 64];
+        let mut quotas_black = [0i32; 64];
+        quotas_white[0] = 5;
+        quotas_black[0] = 5;
+
+        let output = generate_diagnostic_sets(&quotas_white, &quotas_black, 20, 256, 42, 100.0);
+
+        for i in 0..output.n_games {
+            let qa_w = output.quota_assignment_white[i];
+            let qa_b = output.quota_assignment_black[i];
+            if qa_w != 0 {
+                assert_eq!(qa_w.count_ones(), 1, "game {} qa_w should have exactly one bit", i);
+                assert_ne!(output.white[i] & qa_w, 0,
+                    "game {} assigned white bit {:064b} not in white acc {:064b}", i, qa_w, output.white[i]);
+            }
+            if qa_b != 0 {
+                assert_eq!(qa_b.count_ones(), 1, "game {} qa_b should have exactly one bit", i);
+                assert_ne!(output.black[i] & qa_b, 0,
+                    "game {} assigned black bit {:064b} not in black acc {:064b}", i, qa_b, output.black[i]);
+            }
+            // Can't have both colors assigned for same game
+            assert!(qa_w == 0 || qa_b == 0, "game {} assigned to both colors", i);
+        }
+    }
+
+    #[test]
+    fn test_terminations_are_valid_codes() {
+        let mut quotas_white = [0i32; 64];
+        let quotas_black = [0i32; 64];
+        quotas_white[0] = 3;
+        let output = generate_diagnostic_sets(&quotas_white, &quotas_black, 10, 256, 42, 20.0);
+
+        for &tc in &output.termination_codes {
+            // Termination codes should be valid (at most a small range)
+            assert!(tc < 10, "invalid termination code {}", tc);
+        }
+    }
+
+    #[test]
+    // Previously BUG-100: fixed by passing max_ply = length + 1 in compute_game_stats.
+    fn test_per_ply_stats_match_accumulators() {
+        // per_ply_stats should OR by color to match white/black accumulators
+        // across accepted games.
+        let mut quotas_white = [0i32; 64];
+        let quotas_black = [0i32; 64];
+        quotas_white[0] = 2;
+        let output = generate_diagnostic_sets(&quotas_white, &quotas_black, 5, 256, 42, 20.0);
+
+        for i in 0..output.n_games {
+            let length = output.game_lengths[i] as usize;
+            let mut w_or = 0u64;
+            let mut b_or = 0u64;
+            for t in 0..=length {
+                if t >= 256 { break; }
+                let bits = output.per_ply_stats[i * 256 + t];
+                if t % 2 == 0 { w_or |= bits; } else { b_or |= bits; }
+            }
+            assert_eq!(output.white[i], w_or, "game {} white mismatch", i);
+            assert_eq!(output.black[i], b_or, "game {} black mismatch", i);
+        }
     }
 }

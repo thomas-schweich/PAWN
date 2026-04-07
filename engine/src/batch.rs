@@ -489,4 +489,326 @@ mod tests {
                 "Game {} outcome mismatch: tc={}, gl={}", b, tc, gl);
         }
     }
+
+    // ==== New tests added by Agent A (Rust Core) ====
+
+    #[test]
+    fn test_training_batch_row_major_layout() {
+        // Verify row-major layout: move_ids[b * max_ply + t] is game b's move at ply t
+        let batch = generate_training_batch(3, 64, 42);
+        assert_eq!(batch.batch_size, 3);
+        assert_eq!(batch.max_ply, 64);
+        for b in 0..3 {
+            let gl = batch.game_lengths[b] as usize;
+            for t in 0..gl {
+                let tok = batch.move_ids[b * 64 + t];
+                // Tokens should be valid move tokens (1..=4272)
+                assert!(tok >= 1 && tok <= 4272,
+                    "Invalid token at b={} t={}: {}", b, t, tok);
+            }
+        }
+    }
+
+    #[test]
+    fn test_training_batch_termination_codes_in_range() {
+        let batch = generate_training_batch(8, 256, 42);
+        // All six Termination enum discriminants
+        let valid_discriminants: [u8; 6] = [
+            Termination::Checkmate.as_u8(),          // 0
+            Termination::Stalemate.as_u8(),          // 1
+            Termination::SeventyFiveMoveRule.as_u8(), // 2
+            Termination::FivefoldRepetition.as_u8(),  // 3
+            Termination::InsufficientMaterial.as_u8(), // 4
+            Termination::PlyLimit.as_u8(),            // 5
+        ];
+        for (b, &code) in batch.termination_codes.iter().enumerate() {
+            assert!(
+                valid_discriminants.contains(&code),
+                "Game {}: termination code {} is not a valid Termination discriminant (expected one of {:?})",
+                b, code, valid_discriminants
+            );
+            // Also verify the round-trip: code maps back to a known variant
+            let _variant = match code {
+                0 => Termination::Checkmate,
+                1 => Termination::Stalemate,
+                2 => Termination::SeventyFiveMoveRule,
+                3 => Termination::FivefoldRepetition,
+                4 => Termination::InsufficientMaterial,
+                5 => Termination::PlyLimit,
+                other => panic!("Game {}: unmapped termination code {}", b, other),
+            };
+        }
+    }
+
+    #[test]
+    fn test_training_batch_legal_grid_matches_moves() {
+        // For each played move, the grid at that ply must have the src->dst bit set
+        let batch = generate_training_batch(2, 64, 42);
+        for b in 0..2 {
+            let gl = batch.game_lengths[b] as usize;
+            for t in 0..gl {
+                let tok = batch.move_ids[b * 64 + t] as u16;
+                let (src, dst, _promo) = vocab::decompose_token(tok).unwrap();
+                let grid_offset = (b * 64 + t) * 64;
+                let src_row = batch.legal_move_grid[grid_offset + src as usize];
+                assert!((src_row >> dst) & 1 == 1,
+                    "Played move ({},{}) at b={} t={} not in legal grid", src, dst, b, t);
+            }
+        }
+    }
+
+    #[test]
+    fn test_training_batch_grid_empty_after_game_end() {
+        let batch = generate_training_batch(2, 256, 42);
+        for b in 0..2 {
+            let gl = batch.game_lengths[b] as usize;
+            // All positions after game_length have zeroed grids
+            for t in gl..256 {
+                let grid_offset = (b * 256 + t) * 64;
+                for src in 0..64 {
+                    let val = batch.legal_move_grid[grid_offset + src];
+                    assert_eq!(val, 0,
+                        "Grid at b={} t={} src={} should be 0 after game end (gl={}), got {:#x}",
+                        b, t, src, gl, val);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_training_batch_promo_mask_empty_after_game_end() {
+        let batch = generate_training_batch(2, 256, 42);
+        for b in 0..2 {
+            let gl = batch.game_lengths[b] as usize;
+            for t in gl..256 {
+                let promo_offset = (b * 256 + t) * 44 * 4;
+                for i in 0..(44 * 4) {
+                    assert!(!batch.legal_promo_mask[promo_offset + i],
+                        "Promo mask at b={} t={} i={} should be false after game end", b, t, i);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_random_games_termination_codes_match_games() {
+        use crate::board::GameState;
+        let batch = generate_random_games(16, 256, 42, 0.0, false);
+        for b in 0..16 {
+            let code = batch.termination_codes[b];
+            // Basic range check
+            assert!(code <= 5, "Termination code {} out of range", code);
+
+            // Replay the game and verify the termination code matches the actual terminal state
+            let gl = batch.game_lengths[b] as usize;
+            let move_tokens: Vec<u16> = (0..gl)
+                .map(|t| batch.move_ids[b * 256 + t] as u16)
+                .collect();
+            let state = GameState::from_move_tokens(&move_tokens)
+                .expect("replay should succeed");
+            let actual_term = state.check_termination(256)
+                .expect("replayed game should be terminal");
+            assert_eq!(
+                actual_term.as_u8(), code,
+                "Game {}: replayed termination {:?} (={}) != reported code {}",
+                b, actual_term, actual_term.as_u8(), code
+            );
+
+            // Additionally verify the termination semantics match the board state
+            match actual_term {
+                Termination::Checkmate => {
+                    assert!(state.is_check(), "Game {}: checkmate requires check", b);
+                    assert!(state.legal_move_tokens().is_empty(),
+                        "Game {}: checkmate requires no legal moves", b);
+                }
+                Termination::Stalemate => {
+                    assert!(!state.is_check(), "Game {}: stalemate must not be check", b);
+                    assert!(state.legal_move_tokens().is_empty(),
+                        "Game {}: stalemate requires no legal moves", b);
+                }
+                Termination::PlyLimit => {
+                    assert_eq!(gl, 256, "Game {}: PlyLimit should have gl=max_ply", b);
+                }
+                _ => {} // draw rules checked internally by check_termination
+            }
+        }
+    }
+
+    #[test]
+    fn test_random_games_pad_after_length() {
+        let batch = generate_random_games(4, 128, 42, 0.0, false);
+        for b in 0..4 {
+            let gl = batch.game_lengths[b] as usize;
+            for t in gl..128 {
+                assert_eq!(batch.move_ids[b * 128 + t], 0,
+                    "Position {} after gl={} should be PAD", t, gl);
+            }
+        }
+    }
+
+    #[test]
+    fn test_random_games_discard_ply_limit() {
+        // With discard_ply_limit=true, no game should have code=5 (PlyLimit=5)
+        // Use a small max_ply so ply limits happen easily
+        let batch = generate_random_games(8, 40, 42, 0.0, true);
+        assert_eq!(batch.n_games, 8);
+        for &code in &batch.termination_codes {
+            assert_ne!(code, 5, "discard_ply_limit=true should not produce PlyLimit games");
+        }
+    }
+
+    #[test]
+    fn test_random_games_keep_ply_limit() {
+        // With discard_ply_limit=false and small max_ply, we should see PlyLimit games
+        let batch = generate_random_games(64, 30, 42, 0.0, false);
+        let n_ply_limit = batch.termination_codes.iter().filter(|&&c| c == 5).count();
+        assert!(n_ply_limit > 0, "Should produce some PlyLimit games with small max_ply");
+    }
+
+    #[test]
+    fn test_random_games_deterministic() {
+        let b1 = generate_random_games(4, 128, 99, 0.0, false);
+        let b2 = generate_random_games(4, 128, 99, 0.0, false);
+        assert_eq!(b1.move_ids, b2.move_ids);
+        assert_eq!(b1.game_lengths, b2.game_lengths);
+        assert_eq!(b1.termination_codes, b2.termination_codes);
+    }
+
+    #[test]
+    fn test_random_games_discard_deterministic() {
+        // discard path must also be deterministic
+        let b1 = generate_random_games(4, 40, 99, 0.0, true);
+        let b2 = generate_random_games(4, 40, 99, 0.0, true);
+        assert_eq!(b1.move_ids, b2.move_ids);
+        assert_eq!(b1.game_lengths, b2.game_lengths);
+    }
+
+    #[test]
+    fn test_clm_batch_seq_len_consistency() {
+        let batch = generate_clm_batch(4, 32, 42, false, 0.0);
+        assert_eq!(batch.seq_len, 32);
+        assert_eq!(batch.max_ply, 31); // seq_len - 1
+        assert_eq!(batch.input_ids.len(), 4 * 32);
+        assert_eq!(batch.move_ids.len(), 4 * 31);
+    }
+
+    #[test]
+    fn test_clm_batch_shift_by_one() {
+        // Verify targets[t] == input_ids[t+1] for all t < seq_len-1
+        let batch = generate_clm_batch(4, 64, 42, false, 0.0);
+        for b in 0..4 {
+            let row = b * 64;
+            for t in 0..63 {
+                assert_eq!(batch.targets[row + t], batch.input_ids[row + t + 1],
+                    "targets[{}] != input_ids[{}]", t, t + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_clm_batch_loss_mask_covers_outcome_and_moves() {
+        let batch = generate_clm_batch(4, 64, 42, false, 0.0);
+        for b in 0..4 {
+            let gl = batch.game_lengths[b] as usize;
+            let row = b * 64;
+            // Positions 0..=gl should be true (outcome + all game moves)
+            for t in 0..=gl {
+                assert!(batch.loss_mask[row + t], "mask[{}] should be true", t);
+            }
+            // After gl, should be false
+            for t in (gl + 1)..64 {
+                assert!(!batch.loss_mask[row + t], "mask[{}] should be false", t);
+            }
+        }
+    }
+
+    #[test]
+    fn test_clm_batch_move_ids_copied_correctly() {
+        // move_ids in CLMBatch is the raw game moves (seq_len-1 wide)
+        let batch = generate_clm_batch(2, 32, 42, false, 0.0);
+        for b in 0..2 {
+            let gl = batch.game_lengths[b] as usize;
+            let max_ply = 31;
+            for t in 0..gl {
+                let raw = batch.move_ids[b * max_ply + t];
+                // input_ids[row + t+1] should equal raw move
+                assert_eq!(batch.input_ids[b * 32 + 1 + t], raw,
+                    "input_ids[{}] should equal move_ids[{}]={}", 1 + t, t, raw);
+            }
+        }
+    }
+
+    #[test]
+    fn test_checkmate_games_termination_all_checkmate() {
+        // Every game returned from generate_checkmate_games is a checkmate
+        let (batch, total) = generate_checkmate_games(2, 2, 256, 42);
+        assert!(total >= 4);
+        for &code in &batch.termination_codes {
+            assert_eq!(code, Termination::Checkmate.as_u8(),
+                "generate_checkmate_games should return only checkmates");
+        }
+    }
+
+    #[test]
+    fn test_checkmate_games_split_by_parity() {
+        // First n_white_wins entries are white wins (odd ply),
+        // remaining are black wins (even ply)
+        let (batch, _) = generate_checkmate_games(3, 2, 256, 42);
+        assert_eq!(batch.n_games, 5);
+        for i in 0..3 {
+            let gl = batch.game_lengths[i];
+            assert_eq!(gl % 2, 1, "White win game {} should have odd length, got {}", i, gl);
+        }
+        for i in 3..5 {
+            let gl = batch.game_lengths[i];
+            assert_eq!(gl % 2, 0, "Black win game {} should have even length, got {}", i, gl);
+        }
+    }
+
+    #[test]
+    fn test_checkmate_training_batch_targets_nonempty() {
+        let batch = generate_checkmate_training_batch(3, 256, 42);
+        assert_eq!(batch.n_games, 3);
+        for b in 0..3 {
+            let grid = &batch.checkmate_targets[b * 64..(b + 1) * 64];
+            // At least one mating move exists
+            let any_bits: u32 = grid.iter().map(|&g| g.count_ones()).sum();
+            assert!(any_bits > 0, "Checkmate target grid for game {} is empty", b);
+        }
+    }
+
+    #[test]
+    fn test_checkmate_training_batch_legal_grid_bounds_targets() {
+        // Every bit in checkmate_targets should also be in legal_grids
+        let batch = generate_checkmate_training_batch(3, 256, 42);
+        for b in 0..3 {
+            for s in 0..64 {
+                let legal = batch.legal_grids[b * 64 + s];
+                let target = batch.checkmate_targets[b * 64 + s];
+                assert_eq!(target & legal, target,
+                    "Checkmate target bits not in legal grid at b={} s={}", b, s);
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_clm_batch_mate_boost_deterministic() {
+        let b1 = generate_clm_batch(4, 64, 42, false, 0.5);
+        let b2 = generate_clm_batch(4, 64, 42, false, 0.5);
+        assert_eq!(b1.input_ids, b2.input_ids);
+        assert_eq!(b1.game_lengths, b2.game_lengths);
+    }
+
+    #[test]
+    fn test_clm_batch_discard_no_ply_limit_outcomes() {
+        // With discard_ply_limit=true, outcome token at pos 0 is never PLY_LIMIT (4277)
+        let batch = generate_clm_batch(8, 40, 42, true, 0.0);
+        for b in 0..8 {
+            let outcome = batch.input_ids[b * 40] as u16;
+            assert_ne!(outcome, vocab::PLY_LIMIT,
+                "discard_ply_limit=true should not produce PLY_LIMIT outcome");
+            // Term code should also not be 5 (PlyLimit)
+            assert_ne!(batch.termination_codes[b], 5);
+        }
+    }
 }

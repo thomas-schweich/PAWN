@@ -224,6 +224,190 @@ mod tests {
     }
 
     #[test]
+    fn test_startpos_has_20_legal_moves() {
+        // White has exactly 20 legal moves from the starting position.
+        // Build a single-move "game" where move_ids[0] = e2e4, game_length = 1.
+        // The mask at ply 0 should have 20 true entries.
+        let max_ply = 8;
+        let vocab_size = crate::vocab::VOCAB_SIZE;
+        let mut move_ids = vec![0i16; max_ply];
+        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
+        let game_lengths = vec![1i16];
+
+        let masks = compute_legal_token_masks(&move_ids, &game_lengths, max_ply, vocab_size);
+        let count: usize = (0..vocab_size).filter(|&v| masks[v]).count();
+        assert_eq!(count, 20, "Starting position should have 20 legal moves");
+
+        // e2e4 should be among them
+        let e2e4 = crate::vocab::base_grid_token(12, 28) as usize;
+        assert!(masks[e2e4]);
+    }
+
+    #[test]
+    fn test_grid_matches_token_mask() {
+        // For non-promotion moves, token = base_grid_token(src, dst), and the
+        // per-src 64-bit dst grid should match the dense token mask.
+        let max_ply = 8;
+        let vocab_size = crate::vocab::VOCAB_SIZE;
+        let mut move_ids = vec![0i16; max_ply];
+        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
+        let game_lengths = vec![1i16];
+
+        let (grids, _promos) = compute_legal_move_masks(&move_ids, &game_lengths, max_ply);
+        let token_masks = compute_legal_token_masks(&move_ids, &game_lengths, max_ply, vocab_size);
+
+        // Count legal pairs from the grid: each bit set in grid[src] = one legal (src,dst).
+        let mut grid_count = 0usize;
+        for src in 0..64usize {
+            grid_count += grids[src].count_ones() as usize;
+        }
+
+        // At startpos, no promotions are possible; every (src,dst) pair corresponds
+        // to a unique base-grid token. They should be equal.
+        let token_count: usize = (0..vocab_size).filter(|&v| token_masks[v]).count();
+        assert_eq!(grid_count, token_count, "grid and token counts must match at startpos");
+        assert_eq!(grid_count, 20);
+    }
+
+    #[test]
+    fn test_mask_is_before_move() {
+        // Verify alignment: mask[ply=1] should reflect legal moves AFTER move[0].
+        // After e2e4, black has 20 legal moves (symmetric).
+        let max_ply = 8;
+        let vocab_size = crate::vocab::VOCAB_SIZE;
+        let mut move_ids = vec![0i16; max_ply];
+        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
+        move_ids[1] = crate::vocab::base_grid_token(52, 36) as i16; // e7e5
+        let game_lengths = vec![2i16];
+
+        let masks = compute_legal_token_masks(&move_ids, &game_lengths, max_ply, vocab_size);
+
+        // mask at ply=0: white's turn, e2e4 is a legal option (20 moves)
+        let ply0_count: usize = (0..vocab_size).filter(|&v| masks[v]).count();
+        assert_eq!(ply0_count, 20, "ply 0 = startpos, 20 legal moves");
+        assert!(masks[crate::vocab::base_grid_token(12, 28) as usize], "e2e4 legal at ply 0");
+
+        // mask at ply=1: after e2e4, black has 20 moves
+        let ply1_off = vocab_size;
+        let ply1_count: usize = (0..vocab_size).filter(|&v| masks[ply1_off + v]).count();
+        assert_eq!(ply1_count, 20, "ply 1 = after e2e4, black has 20 legal moves");
+        assert!(masks[ply1_off + crate::vocab::base_grid_token(52, 36) as usize], "e7e5 legal at ply 1");
+        // e2e4 should NOT be legal at ply 1 (wrong side, pawn moved)
+        assert!(!masks[ply1_off + crate::vocab::base_grid_token(12, 28) as usize]);
+    }
+
+    #[test]
+    fn test_sparse_padding_pad_token() {
+        // Sparse mask must include a PAD token slot at position `length` so loss
+        // is finite for that target position. Only PAD should be legal there —
+        // no move tokens should appear after game end.
+        let max_ply = 8;
+        let seq_len = max_ply + 1;
+        let vocab_size = crate::vocab::VOCAB_SIZE;
+        let mut move_ids = vec![0i16; max_ply];
+        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;
+        let game_lengths = vec![1i16];
+
+        let sparse = compute_legal_token_masks_sparse(
+            &move_ids, &game_lengths, max_ply, seq_len, vocab_size,
+        );
+
+        // At position length=1, PAD token should be present.
+        // PAD_TOKEN = 0, so index = game_base + length * vocab_size + 0 = vocab_size
+        let expected_pad_idx = (1 * vocab_size) as i64;
+        assert!(sparse.contains(&expected_pad_idx), "sparse must include PAD token at position length");
+
+        // Verify PAD is the ONLY token at position `length` — no move tokens
+        // should be legal after game end.
+        let pos_start = (1 * vocab_size) as i64;
+        let pos_end = (2 * vocab_size) as i64;
+        let tokens_at_length: Vec<i64> = sparse.iter()
+            .copied()
+            .filter(|&idx| idx >= pos_start && idx < pos_end)
+            .collect();
+        assert_eq!(
+            tokens_at_length.len(), 1,
+            "exactly one token (PAD) should be legal at position length, found {}",
+            tokens_at_length.len()
+        );
+        assert_eq!(
+            tokens_at_length[0], expected_pad_idx,
+            "the only token at position length should be PAD (index {}), got {}",
+            expected_pad_idx, tokens_at_length[0]
+        );
+    }
+
+    #[test]
+    fn test_sparse_indices_in_range() {
+        // All sparse indices must fall within [0, batch * seq_len * vocab_size).
+        let batch_size = 4;
+        let max_ply = 64;
+        let seq_len = max_ply + 1;
+        let vocab_size = crate::vocab::VOCAB_SIZE;
+        let batch = crate::batch::generate_training_batch(batch_size, max_ply, 123);
+
+        let sparse = compute_legal_token_masks_sparse(
+            &batch.move_ids, &batch.game_lengths, max_ply, seq_len, vocab_size,
+        );
+
+        let total = (batch_size * seq_len * vocab_size) as i64;
+        for &idx in &sparse {
+            assert!(idx >= 0 && idx < total, "index {} out of range [0, {})", idx, total);
+        }
+    }
+
+    #[test]
+    fn test_empty_batch() {
+        // Zero-size batch should not crash.
+        let max_ply = 8;
+        let vocab_size = crate::vocab::VOCAB_SIZE;
+        let move_ids: Vec<i16> = vec![];
+        let game_lengths: Vec<i16> = vec![];
+
+        let dense = compute_legal_token_masks(&move_ids, &game_lengths, max_ply, vocab_size);
+        assert_eq!(dense.len(), 0);
+
+        let sparse = compute_legal_token_masks_sparse(
+            &move_ids, &game_lengths, max_ply, max_ply + 1, vocab_size,
+        );
+        assert_eq!(sparse.len(), 0);
+    }
+
+    #[test]
+    fn test_grids_zero_past_game_length() {
+        // Positions beyond game_length should have all-zero grids, but the last
+        // valid ply (length-1) should have non-zero legal moves (boundary check).
+        let max_ply = 64;
+        let mut move_ids = vec![0i16; max_ply];
+        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
+        move_ids[1] = crate::vocab::base_grid_token(52, 36) as i16; // e7e5
+        let game_lengths = vec![2i16];
+
+        let (grids, _) = compute_legal_move_masks(&move_ids, &game_lengths, max_ply);
+
+        // Verify the last valid ply (index length-1 = 1) has a non-zero grid.
+        // At ply 1 (after e2e4, black to move), black has 20 legal moves.
+        let last_valid_ply = 1;
+        let mut any_nonzero = false;
+        for src in 0..64 {
+            let off = (0 * max_ply + last_valid_ply) * 64 + src;
+            if grids[off] != 0 {
+                any_nonzero = true;
+                break;
+            }
+        }
+        assert!(any_nonzero, "grid at last valid ply (index {}) should NOT be all-zero", last_valid_ply);
+
+        // Beyond ply 2, all grid entries should be 0
+        for t in 2..max_ply {
+            for src in 0..64 {
+                let off = (0 * max_ply + t) * 64 + src;
+                assert_eq!(grids[off], 0, "grid at ply {} src {} should be zero", t, src);
+            }
+        }
+    }
+
+    #[test]
     fn test_sparse_matches_dense() {
         let batch_size = 8;
         let max_ply = 256;

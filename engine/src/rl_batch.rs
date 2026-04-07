@@ -469,4 +469,271 @@ mod tests {
         // Starting position has 20 legal moves
         assert_eq!(structured[0].0.len(), 20);
     }
+
+    #[test]
+    fn test_apply_moves_legal() {
+        let mut env = BatchRLEnv::new(2, 256, 42);
+        env.reset();
+        // e2e4 is legal for both games
+        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let (flags, codes) = env.apply_moves(&[0, 1], &[e2e4, e2e4]);
+        assert_eq!(flags, vec![true, true]);
+        assert_eq!(codes, vec![-1, -1]); // still going
+    }
+
+    #[test]
+    fn test_apply_moves_illegal_forfeits() {
+        let mut env = BatchRLEnv::new(2, 256, 42);
+        env.reset();
+        // PAD token (0) is never legal
+        let (flags, codes) = env.apply_moves(&[0, 1], &[0u16, 0u16]);
+        assert_eq!(flags, vec![false, false]);
+        assert_eq!(codes, vec![-3, -3]); // forfeit
+    }
+
+    #[test]
+    fn test_all_terminated_after_forfeit() {
+        let mut env = BatchRLEnv::new(2, 256, 42);
+        env.reset();
+        let _ = env.apply_moves(&[0, 1], &[0u16, 0u16]);
+        assert!(env.all_terminated());
+    }
+
+    #[test]
+    fn test_get_move_histories_startpos() {
+        let mut env = BatchRLEnv::new(2, 256, 42);
+        env.reset();
+        let (flat, lengths) = env.get_move_histories(&[0, 1]);
+        assert_eq!(flat.len(), 2 * 256);
+        assert_eq!(lengths, vec![0i32, 0i32]);
+        // all entries should be 0 since no moves played
+        assert!(flat.iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn test_get_move_histories_after_move() {
+        let mut env = BatchRLEnv::new(1, 256, 42);
+        env.reset();
+        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let _ = env.apply_moves(&[0], &[e2e4]);
+        let (flat, lengths) = env.get_move_histories(&[0]);
+        assert_eq!(lengths, vec![1i32]);
+        assert_eq!(flat[0], e2e4 as i64);
+    }
+
+    #[test]
+    fn test_get_legal_token_masks_batch_size() {
+        let mut env = BatchRLEnv::new(3, 256, 42);
+        env.reset();
+        let vocab_size = crate::vocab::VOCAB_SIZE;
+        let masks = env.get_legal_token_masks_batch(&[0, 1, 2], vocab_size);
+        assert_eq!(masks.len(), 3 * vocab_size);
+        // Each game has 20 legal moves at startpos
+        for bi in 0..3 {
+            let count: usize = (0..vocab_size)
+                .filter(|&v| masks[bi * vocab_size + v])
+                .count();
+            assert_eq!(count, 20, "game {} should have 20 legal moves", bi);
+        }
+    }
+
+    #[test]
+    fn test_get_plies() {
+        let mut env = BatchRLEnv::new(2, 256, 42);
+        env.reset();
+        let plies = env.get_plies(&[0, 1]);
+        assert_eq!(plies, vec![0u32, 0u32]);
+
+        // Apply a move and check ply goes up
+        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let _ = env.apply_moves(&[0], &[e2e4]);
+        let plies = env.get_plies(&[0, 1]);
+        assert_eq!(plies, vec![1u32, 0u32]);
+    }
+
+    #[test]
+    fn test_get_fens_startpos() {
+        let mut env = BatchRLEnv::new(2, 256, 42);
+        env.reset();
+        let fens = env.get_fens(&[0, 1]);
+        assert_eq!(fens.len(), 2);
+        // Starting FEN has "rnbqkbnr" on rank 8
+        assert!(fens[0].contains("rnbqkbnr"));
+        assert!(fens[1].contains("rnbqkbnr"));
+        // Starting white to move: "w"
+        assert!(fens[0].contains(" w "));
+    }
+
+    #[test]
+    fn test_get_outcomes_initial() {
+        let mut env = BatchRLEnv::new(4, 256, 42);
+        env.reset();
+        let (term, forf, rew, plies, codes, colors) = env.get_outcomes();
+        assert_eq!(term, vec![false; 4]);
+        assert_eq!(forf, vec![false; 4]);
+        assert_eq!(rew, vec![0.0f32; 4]);
+        assert_eq!(plies, vec![0u32; 4]);
+        assert_eq!(codes, vec![-1i8; 4]);
+        // First half white, second half black
+        assert_eq!(colors, vec![true, true, false, false]);
+    }
+
+    #[test]
+    fn test_apply_moves_to_terminated_game_noop() {
+        let mut env = BatchRLEnv::new(1, 256, 42);
+        env.reset();
+        // Force termination via invalid move
+        let _ = env.apply_moves(&[0], &[0u16]);
+        assert!(env.all_terminated());
+        // Try another move — should be rejected
+        let (flags, codes) = env.apply_moves(&[0], &[0u16]);
+        assert_eq!(flags, vec![false]);
+        assert_eq!(codes[0], -3); // still the original termination code
+    }
+
+    #[test]
+    fn test_load_prefixes_basic() {
+        let mut env = BatchRLEnv::new(2, 256, 42);
+        env.reset();
+        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let e7e5 = crate::vocab::base_grid_token(52, 36);
+        let max_ply = 8;
+        let move_ids = vec![e2e4, e7e5, 0, 0, 0, 0, 0, 0,  // game 0: 2 moves
+                            e2e4, 0, 0, 0, 0, 0, 0, 0];   // game 1: 1 move
+        let lengths = vec![2u32, 1u32];
+        let tc = env.load_prefixes(&move_ids, &lengths, 2, max_ply);
+        assert_eq!(tc, vec![-1i8, -1i8]);
+        let plies = env.get_plies(&[0, 1]);
+        assert_eq!(plies, vec![2u32, 1u32]);
+    }
+
+    #[test]
+    fn test_active_games_disjoint() {
+        // agent_games and opponent_games together must cover all non-terminated games
+        let mut env = BatchRLEnv::new(4, 256, 42);
+        env.reset();
+        let agent = env.active_agent_games();
+        let opp = env.active_opponent_games();
+
+        // No overlap
+        for a in &agent {
+            assert!(!opp.contains(a), "game {} should not be in both", a);
+        }
+        // Union is all games (none terminated)
+        let mut all: Vec<u32> = agent.iter().chain(opp.iter()).copied().collect();
+        all.sort();
+        assert_eq!(all, vec![0u32, 1u32, 2u32, 3u32]);
+    }
+
+    #[test]
+    fn test_meta_reports_agent_color() {
+        let mut env = BatchRLEnv::new(4, 256, 42);
+        env.reset();
+        // First half = white, second half = black
+        let (a_w, _, _, _, _, _) = env.meta(0);
+        assert!(a_w);
+        let (a_w, _, _, _, _, _) = env.meta(1);
+        assert!(a_w);
+        let (a_w, _, _, _, _, _) = env.meta(2);
+        assert!(!a_w);
+        let (a_w, _, _, _, _, _) = env.meta(3);
+        assert!(!a_w);
+    }
+
+    #[test]
+    fn test_get_sentinel_tokens() {
+        let mut env = BatchRLEnv::new(2, 256, 42);
+        env.reset();
+        let sent = env.get_sentinel_tokens(&[0, 1]);
+        assert_eq!(sent.len(), 2);
+        // Each sentinel should be a legal move token (not PAD)
+        assert_ne!(sent[0], crate::vocab::PAD_TOKEN);
+        assert_ne!(sent[1], crate::vocab::PAD_TOKEN);
+
+        // Verify each sentinel token is actually a legal move in the corresponding game
+        // by checking it appears in get_legal_token_masks_batch.
+        let vocab_size = crate::vocab::VOCAB_SIZE;
+        let masks = env.get_legal_token_masks_batch(&[0, 1], vocab_size);
+        for (bi, &tok) in sent.iter().enumerate() {
+            let idx = bi * vocab_size + tok as usize;
+            assert!(
+                masks[idx],
+                "sentinel token {} for game {} is not marked as legal in get_legal_token_masks_batch",
+                tok, bi
+            );
+        }
+
+        // Also test after making a move (different position), sentinels are still legal
+        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let _ = env.apply_moves(&[0], &[e2e4]);
+        let sent_after = env.get_sentinel_tokens(&[0, 1]);
+        let masks_after = env.get_legal_token_masks_batch(&[0, 1], vocab_size);
+        for (bi, &tok) in sent_after.iter().enumerate() {
+            let idx = bi * vocab_size + tok as usize;
+            assert!(
+                masks_after[idx],
+                "post-move sentinel token {} for game {} is not legal",
+                tok, bi
+            );
+        }
+        // Game 0 now has black to move — sentinel should differ from game 1 (still white to move)
+        // (different positions should generally yield different sentinels, though not guaranteed)
+        assert_ne!(sent_after[0], crate::vocab::PAD_TOKEN);
+        assert_ne!(sent_after[1], crate::vocab::PAD_TOKEN);
+    }
+
+    #[test]
+    fn test_reset_clears_state() {
+        let mut env = BatchRLEnv::new(2, 256, 42);
+        env.reset();
+        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let _ = env.apply_moves(&[0], &[e2e4]);
+        let plies = env.get_plies(&[0]);
+        assert_eq!(plies[0], 1);
+
+        env.reset();
+        let plies = env.get_plies(&[0]);
+        assert_eq!(plies[0], 0, "after reset, ply count should be zero");
+    }
+
+    #[test]
+    fn test_legal_token_masks_change_with_position() {
+        // Starting from different positions, masks should differ.
+        let mut env = BatchRLEnv::new(2, 256, 42);
+        env.reset();
+        let vocab_size = crate::vocab::VOCAB_SIZE;
+        let masks_before = env.get_legal_token_masks_batch(&[0, 1], vocab_size);
+        // They should be identical at start
+        assert_eq!(
+            &masks_before[..vocab_size],
+            &masks_before[vocab_size..2 * vocab_size]
+        );
+
+        // Apply e2e4 to game 0 only
+        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let _ = env.apply_moves(&[0], &[e2e4]);
+        let masks_after = env.get_legal_token_masks_batch(&[0, 1], vocab_size);
+        // Game 0 now has black to move (different masks), game 1 still startpos
+        assert_ne!(
+            &masks_after[..vocab_size],
+            &masks_after[vocab_size..2 * vocab_size],
+            "masks should differ when games diverge"
+        );
+    }
+
+    #[test]
+    fn test_get_uci_positions_startpos() {
+        let mut env = BatchRLEnv::new(1, 256, 42);
+        env.reset();
+        let pos = env.get_uci_positions(&[0]);
+        assert_eq!(pos.len(), 1);
+        // UCI position string should start with "startpos" or "position startpos"
+        assert!(pos[0].contains("startpos"), "got: {}", pos[0]);
+    }
+
+    #[test]
+    fn test_n_games_accessor() {
+        let env = BatchRLEnv::new(7, 256, 42);
+        assert_eq!(env.n_games(), 7);
+    }
 }
