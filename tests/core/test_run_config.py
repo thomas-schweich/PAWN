@@ -217,7 +217,7 @@ class TestBaseRunConfig:
         assert cfg.elo_min is None
         assert cfg.elo_max is None
         assert cfg.max_games is None
-        assert cfg.val_games == 50_000
+        assert cfg.val_games == 512  # PretrainConfig overrides BaseRunConfig's 50K
         assert cfg.min_ply == 10
         assert cfg.batch_size == 256
         assert cfg.lr == 3e-4

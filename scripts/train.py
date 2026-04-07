@@ -197,10 +197,21 @@ def run_pretrain(config: PretrainConfig) -> None:
     if config.d_ff is not None:
         model_cfg.d_ff = config.d_ff
 
+    # Sequence length
+    model_cfg.max_seq_len = config.max_seq_len
+    train_cfg.max_ply = config.max_seq_len
+
+    # Validation
+    train_cfg.val_games = config.val_games
+
     print(f"Model config: {model_cfg}")
     print(f"Training config: {train_cfg}")
 
-    trainer = CLMTrainer(train_cfg, model_cfg, hf_repo=config.hf_repo)
+    trainer = CLMTrainer(
+        train_cfg, model_cfg, hf_repo=config.hf_repo,
+        patience=config.patience,
+        legality_late_ply=config.legality_late_ply,
+    )
 
     if config.resume:
         trainer.load_checkpoint(config.resume)

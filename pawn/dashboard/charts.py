@@ -291,6 +291,7 @@ def val_accuracy_chart(records: list[dict], x_key: str, run_type: str):
             ("val/accuracy", "Top-1", COLORS["blue"]),
             ("val/top5_accuracy", "Top-5", COLORS["green"]),
             ("val/legal_move_rate", "Legal Rate", COLORS["orange"]),
+            ("val/late_legal_move_rate", "Late Legal", COLORS["purple"]),
         ]
     else:
         specs = [
@@ -302,9 +303,11 @@ def val_accuracy_chart(records: list[dict], x_key: str, run_type: str):
 
 def patience_chart(val_records: list[dict], x_key: str = "step",
                    patience_limit: int = 10) -> "go.Figure":
-    """Infer patience counter from val loss records and plot it.
+    """Plot patience counter from val records.
 
-    Patience resets to 0 when val loss improves, increments by 1 otherwise.
+    Uses the logged ``patience_counter`` field when present (compound early
+    stopping logs it directly).  Falls back to inferring patience from
+    val/loss for older runs.
     Shows a horizontal line at the patience limit.
     """
     import plotly.graph_objects as go
@@ -314,23 +317,35 @@ def patience_chart(val_records: list[dict], x_key: str = "step",
         fig.update_layout(**LAYOUT, title="Patience (early stopping)")
         return fig
 
+    # Check if any record has an explicit patience_counter (compound stopping)
+    has_explicit = any(r.get("patience_counter") is not None for r in val_records)
+
     best_loss = float("inf")
     steps = []
     counters = []
 
     counter = 0
     for r in val_records:
-        vl = r.get("val/loss")
         s = r.get(x_key)
-        if vl is None or s is None:
+        if s is None:
             continue
-        if vl < best_loss:
-            best_loss = vl
-            counter = 0
+        if has_explicit:
+            pc = r.get("patience_counter")
+            if pc is not None:
+                counter = pc
+            steps.append(s)
+            counters.append(counter)
         else:
-            counter += 1
-        steps.append(s)
-        counters.append(counter)
+            vl = r.get("val/loss")
+            if vl is None:
+                continue
+            if vl < best_loss:
+                best_loss = vl
+                counter = 0
+            else:
+                counter += 1
+            steps.append(s)
+            counters.append(counter)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(

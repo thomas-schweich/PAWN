@@ -128,6 +128,8 @@ def compute_legal_move_rate_from_preds(
     legal_grid: torch.Tensor,
     loss_mask: torch.Tensor,
     game_lengths: torch.Tensor,
+    min_ply: int = 0,
+    max_ply_limit: int | None = None,
 ) -> float:
     """Compute fraction of argmax predictions that are legal moves.
 
@@ -139,6 +141,8 @@ def compute_legal_move_rate_from_preds(
         legal_grid: (B, max_ply, 64) bit-packed legal moves from engine
         loss_mask: (B, T) bool
         game_lengths: (B,) int
+        min_ply: inclusive lower bound on the ply range (default 0)
+        max_ply_limit: exclusive upper bound on the ply range (default None = all)
     """
     B, T = preds.shape
     max_ply = legal_grid.shape[1]
@@ -155,13 +159,14 @@ def compute_legal_move_rate_from_preds(
         legal_flat = legal_dense.reshape(B, max_ply, 4096)  # (B, max_ply, 4096)
 
         n_plies = min(T, max_ply)
+        upper = min(n_plies, max_ply_limit) if max_ply_limit is not None else n_plies
         valid_count = 0
         legal_acc = torch.tensor(0, dtype=torch.long, device=preds.device)
 
         # Promo token -> grid index lookup (lazily built, cached)
         promo_grid_idx = _get_promo_grid_index(preds.device)  # (176,)
 
-        for p in range(n_plies):
+        for p in range(min_ply, upper):
             pos_mask = move_mask[:, p]  # (B,)
             if not pos_mask.any():
                 continue
@@ -207,6 +212,8 @@ class CLMTrainer:
         train_cfg: TrainingConfig,
         model_cfg: CLMConfig,
         hf_repo: str | None = None,
+        patience: int | None = None,
+        legality_late_ply: int | None = None,
     ):
         self.cfg = train_cfg
         self.model_cfg = model_cfg
@@ -214,6 +221,16 @@ class CLMTrainer:
         self.global_step = 0
         self.hf_repo = hf_repo
         self.hf_branch: str | None = None
+
+        # Compound early stopping state
+        self.patience = patience
+        self.legality_late_ply = (
+            legality_late_ply if legality_late_ply is not None
+            else model_cfg.max_seq_len // 2
+        )
+        self.best_val_loss: float = float("inf")
+        self.best_late_legality: float = 0.0
+        self.patience_counter: int = 0
 
         self.logger = MetricsLogger(
             train_cfg.log_dir, run_prefix="run", device=self.device,
@@ -430,6 +447,13 @@ class CLMTrainer:
                     )
                     metrics["legal_move_rate"] = legal_rate
 
+                    # Late-game legality: only plies >= legality_late_ply
+                    late_legal_rate = compute_legal_move_rate_from_preds(
+                        preds, legal_grid, loss_mask, game_lengths,
+                        min_ply=self.legality_late_ply,
+                    )
+                    metrics["late_legal_move_rate"] = late_legal_rate
+
             for k, v in metrics.items():
                 total_metrics[k] = total_metrics.get(k, 0.0) + v
             n_batches += 1
@@ -525,18 +549,54 @@ class CLMTrainer:
                     )
                     if "val/legal_move_rate" in val_metrics:
                         val_msg += f" | legal {val_metrics['val/legal_move_rate']:.3f}"
+                    if "val/late_legal_move_rate" in val_metrics:
+                        val_msg += f" | late_legal {val_metrics['val/late_legal_move_rate']:.3f}"
+
+                    # Compound early stopping
+                    extra_log: dict[str, object] = {}
+                    if self.patience is not None:
+                        val_loss = val_metrics["val/loss"]
+                        late_legality = val_metrics.get("val/late_legal_move_rate", 0.0)
+
+                        improved = False
+                        if val_loss < self.best_val_loss:
+                            self.best_val_loss = val_loss
+                            improved = True
+                        if late_legality > self.best_late_legality:
+                            self.best_late_legality = late_legality
+                            improved = True
+
+                        if improved:
+                            self.patience_counter = 0
+                        else:
+                            self.patience_counter += 1
+
+                        val_msg += f" | pat {self.patience_counter}/{self.patience}"
+                        extra_log = {
+                            "patience_counter": self.patience_counter,
+                            "best_val_loss": self.best_val_loss,
+                            "best_late_legality": self.best_late_legality,
+                        }
+
                     print(val_msg, flush=True)
 
-                    self.logger.log_val(step=self.global_step, **val_metrics)  # type: ignore[arg-type]
+                    self.logger.log_val(step=self.global_step, **val_metrics, **extra_log)  # type: ignore[arg-type]
 
                     if self.wandb_run:
-                        self.wandb_run.log(val_metrics, step=self.global_step)
+                        self.wandb_run.log({**val_metrics, **extra_log}, step=self.global_step)
 
                 if self.global_step % self.cfg.checkpoint_interval == 0:
                     self.save_checkpoint()
 
                 if self.global_step >= self.cfg.total_steps:
                     print(f"Training complete at step {self.global_step}")
+                    self.save_checkpoint()
+                    break
+
+                if (self.patience is not None
+                        and self.patience_counter >= self.patience):
+                    print(f"\nEarly stopping at step {self.global_step} "
+                          f"(no improvement for {self.patience} evals)")
                     self.save_checkpoint()
                     break
 
@@ -579,6 +639,11 @@ class CLMTrainer:
             self.global_step,
             self.model_cfg.__dict__,
             self.cfg.__dict__,
+            extra={
+                "best_val_loss": self.best_val_loss,
+                "best_late_legality": self.best_late_legality,
+                "patience_counter": self.patience_counter,
+            },
         )
         print(f"Checkpoint saved: {path}")
 
@@ -604,4 +669,10 @@ class CLMTrainer:
             device=self.device,
         )
         self.global_step = meta["global_step"]
+        if meta.get("best_val_loss") is not None:
+            self.best_val_loss = meta["best_val_loss"]
+        if meta.get("best_late_legality") is not None:
+            self.best_late_legality = meta["best_late_legality"]
+        if meta.get("patience_counter") is not None:
+            self.patience_counter = meta["patience_counter"]
         print(f"Resumed from step {self.global_step}")

@@ -61,6 +61,17 @@ You drive the loop manually. At each check-in:
 4. `lab_launch(config={"run_type": "adapter", "strategy": "lora", "lora_rank": 4, "lr": 3e-4, ...})` — launch with a full RunConfig dict
 5. `lab_kill` to terminate unpromising running trials if needed
 
+**Pretraining run:**
+- `lab_launch(config={"run_type": "pretrain", "variant": "base", "max_seq_len": 512, ...})`
+- Key tunable parameters:
+  - **Architecture:** `d_model`, `n_layers`, `n_heads`, `d_ff` (override variant defaults)
+  - **Sequence length:** `max_seq_len` (default 256; set to 512 for long-game training)
+  - **Data generation:** `mate_boost` (0.0-1.0), `discard_ply_limit` (bool), `no_outcome_token` (bool — strips outcome conditioning)
+  - **Training:** `lr`, `batch_size`, `accumulation_steps`, `warmup_frac`, `weight_decay`
+  - **Early stopping:** `patience` (evals without improvement), `legality_late_ply` (ply threshold for late-game legality, defaults to `max_seq_len // 2`)
+- **Compound early stopping:** Patience resets when *either* val_loss *or* late-game legality improves. This keeps training alive when loss plateaus but the model is still learning to play legal moves deeper into games. Check `lab_log` to see the patience counter (`pat N/M`).
+- **VRAM note:** 512-token sequences double attention memory. Start with smaller `batch_size` (128 or 64) and use `accumulation_steps` to maintain effective batch size.
+
 **Single training run:**
 - Call `lab_launch` with the strategy and exact params
 - Monitor via the cron check-in
