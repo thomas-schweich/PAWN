@@ -661,7 +661,8 @@ for _ in range(n_iter):
 
 peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
 
-json.dump({"times": times, "peak_memory_mb": peak_mb}, open(result_path, "w"))
+with open(result_path, "w") as f:
+    json.dump({"times": times, "peak_memory_mb": peak_mb}, f)
 '''
 
 
@@ -685,6 +686,7 @@ def bench_concurrency(
         variant: backbone model size (toy/small/base/large)
         adapter: adapter type to wrap the backbone (none/lora/film/bottleneck)
     """
+    import shutil
     import subprocess
     import tempfile
 
@@ -702,14 +704,12 @@ def bench_concurrency(
     print(f"  AMP: bf16  SDPA: {sdpa_name}")
 
     # Detect CUDA MPS (changes concurrency dynamics)
-    mps_active = False
     try:
-        import subprocess as _sp
-        _ps = _sp.run(["ps", "-eo", "comm"], capture_output=True, text=True, timeout=5)
-        if "nvidia-cuda-mps" in _ps.stdout:
-            mps_active = True
+        ps = subprocess.run(
+            ["ps", "-eo", "comm"], capture_output=True, text=True, timeout=5)
+        if "nvidia-cuda-mps" in ps.stdout:
             print("  NOTE: CUDA MPS is active — results reflect MPS scheduling")
-    except (FileNotFoundError, _sp.TimeoutExpired):
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
     # Pin all workers to GPU 0 so the sweep measures contention on a single
@@ -718,7 +718,9 @@ def bench_concurrency(
     worker_env["CUDA_VISIBLE_DEVICES"] = "0"
 
     # Write worker script to a temp file
-    worker_file = Path(tempfile.mktemp(suffix=".py", prefix="pawn_bench_worker_"))
+    fd, worker_path = tempfile.mkstemp(suffix=".py", prefix="pawn_bench_worker_")
+    os.close(fd)
+    worker_file = Path(worker_path)
     worker_file.write_text(_WORKER_SCRIPT)
 
     results: list[ConcurrencyResult] = []
@@ -730,10 +732,11 @@ def bench_concurrency(
             print(f"\n  N={n_procs} ...")
 
             # Create result files for each worker
-            result_files = [
-                Path(tempfile.mktemp(suffix=".json", prefix=f"pawn_bench_r{i}_"))
-                for i in range(n_procs)
-            ]
+            result_files = []
+            for i in range(n_procs):
+                fd, rpath = tempfile.mkstemp(suffix=".json", prefix=f"pawn_bench_r{i}_")
+                os.close(fd)
+                result_files.append(Path(rpath))
 
             # Timeout: for N=1, be generous (10 min for compilation).
             # For N>1, allow N * baseline * 3 — if it takes longer than that,
@@ -782,8 +785,6 @@ def bench_concurrency(
                         for line in stderr.strip().splitlines()[-3:]:
                             print(f"      {line}")
 
-            import shutil as _shutil
-
             if timed_out:
                 print(f"    Timeout ({timeout_secs:.0f}s) — GPU thrashing, stopping sweep")
                 for p in procs:
@@ -791,24 +792,24 @@ def bench_concurrency(
                     p.wait()
                 for rf in result_files:
                     rf.unlink(missing_ok=True)
-                _shutil.rmtree(barrier_dir, ignore_errors=True)
+                shutil.rmtree(barrier_dir, ignore_errors=True)
                 break
 
             if oom:
                 print(f"    OOM with N={n_procs} — stopping sweep")
                 for rf in result_files:
                     rf.unlink(missing_ok=True)
-                _shutil.rmtree(barrier_dir, ignore_errors=True)
+                shutil.rmtree(barrier_dir, ignore_errors=True)
                 break
 
             if failed:
                 for rf in result_files:
                     rf.unlink(missing_ok=True)
-                _shutil.rmtree(barrier_dir, ignore_errors=True)
+                shutil.rmtree(barrier_dir, ignore_errors=True)
                 break
 
             # Collect results and clean up
-            _shutil.rmtree(barrier_dir, ignore_errors=True)
+            shutil.rmtree(barrier_dir, ignore_errors=True)
             worker_results = []
             for rf in result_files:
                 try:
@@ -847,7 +848,7 @@ def bench_concurrency(
             cr = ConcurrencyResult(
                 n_models=n_procs,
                 step_ms=round(wall_ms, 1),
-                per_model_ms=round(wall_ms, 1),
+                per_model_ms=round(wall_ms / n_procs, 1),
                 total_throughput=round(total_throughput),
                 per_model_throughput=round(per_model_throughput),
                 total_vram_mb=round(total_vram_mb),
@@ -1386,6 +1387,8 @@ def main():
                         help="Batch size for GPU benchmarks (default: 256)")
     parser.add_argument("--no-backbone", action="store_true",
                         help="Skip backbone benchmarks")
+    parser.add_argument("--no-dataloader", action="store_true",
+                        help="Skip dataloader-inclusive benchmarks")
     parser.add_argument("--no-adapters", action="store_true",
                         help="Skip adapter benchmarks")
     parser.add_argument("--device", type=str, default="cuda")
@@ -1476,6 +1479,7 @@ def main():
             do_compile, do_eager, args.n_iter, args.n_warmup,
             sdpa_backend,
         )
+    if do_backbone and not args.no_dataloader:
         dataloader_results = bench_dataloader(
             args.batch_size, args.device, args.n_iter, args.n_warmup,
             sdpa_backend,
