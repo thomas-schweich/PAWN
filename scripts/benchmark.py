@@ -770,15 +770,35 @@ def main():
         cpu_name = platform.processor() or platform.machine() or "unknown"
     cpu_count = multiprocessing.cpu_count() or 0
 
+    # System RAM
+    try:
+        import psutil
+        ram_gb = psutil.virtual_memory().total / (1024**3)
+    except ImportError:
+        # psutil not available — fall back to /proc/meminfo on Linux
+        ram_gb = 0.0
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        ram_kb = int(line.split()[1])
+                        ram_gb = ram_kb / (1024**2)
+                        break
+        except OSError:
+            pass
+
     info: dict = {
         "python": sys.version.split()[0],
         "os": platform.system(),
         "arch": platform.machine(),
         "cpu": cpu_name,
         "cpu_count": cpu_count,
+        "ram_gb": round(ram_gb, 1),
     }
 
     print(f"CPU: {cpu_name} ({cpu_count} CPUs)")
+    if ram_gb:
+        print(f"RAM: {ram_gb:.1f} GB")
 
     # Detect GPU platform for SDPA backend selection
     sdpa_backend = None
@@ -797,6 +817,8 @@ def main():
                 sys.exit(1)
         else:
             info["gpu"] = torch.cuda.get_device_name(0)
+            vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            info["vram_gb"] = round(vram_gb, 1)
             from torch.nn.attention import SDPBackend
 
             if is_rocm():
@@ -810,7 +832,7 @@ def main():
                 # NVIDIA: default SDPA (flash attention)
                 sdpa_backend = None
 
-            print(f"GPU: {info['gpu']} ({info['platform']})")
+            print(f"GPU: {info['gpu']} ({info['platform']}, {vram_gb:.1f} GB)")
             print(f"PyTorch: {torch.__version__}")
             print(f"SDPA backend: {sdpa_backend.name if sdpa_backend else 'default (flash)'}")
             print(f"AMP dtype: bfloat16")
