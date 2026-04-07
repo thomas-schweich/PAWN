@@ -642,6 +642,22 @@ def bench_concurrency(
     print(f"  mode=compiled  {n_warmup} warmup + {n_iter} timed iterations per process")
     print(f"  AMP: bf16  SDPA: {sdpa_name}")
 
+    # Detect CUDA MPS (changes concurrency dynamics)
+    mps_active = False
+    try:
+        import subprocess as _sp
+        _ps = _sp.run(["ps", "-eo", "comm"], capture_output=True, text=True, timeout=5)
+        if "nvidia-cuda-mps" in _ps.stdout:
+            mps_active = True
+            print("  NOTE: CUDA MPS is active — results reflect MPS scheduling")
+    except (FileNotFoundError, _sp.TimeoutExpired):
+        pass
+
+    # Pin all workers to GPU 0 so the sweep measures contention on a single
+    # GPU, even on multi-GPU systems.
+    worker_env = os.environ.copy()
+    worker_env["CUDA_VISIBLE_DEVICES"] = "0"
+
     # Write worker script to a temp file
     worker_file = Path(tempfile.mktemp(suffix=".py", prefix="pawn_bench_worker_"))
     worker_file.write_text(_WORKER_SCRIPT)
@@ -659,7 +675,7 @@ def bench_concurrency(
                 for i in range(n_procs)
             ]
 
-            # Launch all workers
+            # Launch all workers, pinned to GPU 0
             procs: list[subprocess.Popen[str]] = []
             for rf in result_files:
                 p = subprocess.Popen(
@@ -667,6 +683,7 @@ def bench_concurrency(
                      str(batch_size), str(n_warmup), str(n_iter),
                      sdpa_name, variant, str(rf)],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    env=worker_env,
                 )
                 procs.append(p)
 
@@ -1128,12 +1145,15 @@ def _collect_gpu_info_nvidia_smi(info: dict) -> None:
 
 def _collect_gpu_info() -> dict:
     """Collect GPU info from torch and system tools. Best-effort."""
+    import subprocess
     import torch
 
+    n_gpus = torch.cuda.device_count()
     props = torch.cuda.get_device_properties(0)
     info: dict = {
         "torch": torch.__version__,
         "gpu": props.name,
+        "gpu_count": n_gpus,
         "vram_gb": round(props.total_memory / (1024**3), 1),
         "gpu_sm_count": props.multi_processor_count,
     }
@@ -1142,6 +1162,16 @@ def _collect_gpu_info() -> dict:
     l2 = getattr(props, "L2_cache_size", 0)
     if l2:
         info["gpu_l2_mb"] = round(l2 / (1024**2), 1)
+
+    # Detect CUDA MPS
+    try:
+        ps = subprocess.run(
+            ["ps", "-eo", "comm"], capture_output=True, text=True, timeout=5,
+        )
+        if "nvidia-cuda-mps" in ps.stdout:
+            info["cuda_mps"] = True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
 
     # Try platform-specific tools for clock speeds and VRAM details
     from pawn.gpu import is_rocm
@@ -1194,7 +1224,9 @@ def _print_system_info(info: dict) -> None:
 
 def _print_gpu_info(info: dict, sdpa_backend) -> None:
     """Print GPU info header."""
-    gpu_line = f"GPU: {info['gpu']} ({info['platform']}, {info['vram_gb']:.1f} GB"
+    n_gpus = info.get("gpu_count", 1)
+    gpu_count_str = f" x{n_gpus}" if n_gpus > 1 else ""
+    gpu_line = f"GPU: {info['gpu']}{gpu_count_str} ({info['platform']}, {info['vram_gb']:.1f} GB"
     vram_type = info.get("vram_type", "")
     if vram_type:
         gpu_line += f" {vram_type}"
@@ -1215,8 +1247,12 @@ def _print_gpu_info(info: dict, sdpa_backend) -> None:
         extras.append(f"{info['vram_bus_width']}-bit bus")
     if info.get("pcie"):
         extras.append(f"PCIe {info['pcie']}")
+    if info.get("cuda_mps"):
+        extras.append("MPS active")
     if extras:
         print(f"      {', '.join(extras)}")
+    if n_gpus > 1:
+        print(f"      Benchmarking GPU 0 only")
 
     import torch
     print(f"PyTorch: {torch.__version__}")
