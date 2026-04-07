@@ -30,7 +30,8 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push runtime
+      # ── CUDA images ──────────────────────────────────────────────────
+      - name: Build and push runtime (CUDA)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -43,10 +44,12 @@ jobs:
           build-args: |
             GIT_HASH=${{ github.sha }}
             GIT_TAG=${{ steps.meta.outputs.tag }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-builder
+            type=registry,ref=${{ env.IMAGE }}:buildcache-runtime
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-runtime,mode=max
 
-      - name: Build and push dev
+      - name: Build and push dev (CUDA)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -59,5 +62,46 @@ jobs:
           build-args: |
             GIT_HASH=${{ github.sha }}
             GIT_TAG=${{ steps.meta.outputs.tag }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-builder
+            type=registry,ref=${{ env.IMAGE }}:buildcache-runtime
+            type=registry,ref=${{ env.IMAGE }}:buildcache-dev
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-dev,mode=max
+
+      # ── ROCm images ─────────────────────────────────────────────────
+      - name: Build and push runtime (ROCm)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime-rocm
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:rocm
+            ${{ env.IMAGE }}:rocm-${{ github.sha }}
+          build-args: |
+            GIT_HASH=${{ github.sha }}
+            GIT_TAG=${{ steps.meta.outputs.tag }}
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-builder
+            type=registry,ref=${{ env.IMAGE }}:buildcache-runtime-rocm
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-runtime-rocm,mode=max
+
+      - name: Build and push dev (ROCm)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: dev-rocm
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:dev-rocm
+            ${{ env.IMAGE }}:dev-rocm-${{ github.sha }}
+          build-args: |
+            GIT_HASH=${{ github.sha }}
+            GIT_TAG=${{ steps.meta.outputs.tag }}
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-builder
+            type=registry,ref=${{ env.IMAGE }}:buildcache-runtime-rocm
+            type=registry,ref=${{ env.IMAGE }}:buildcache-dev-rocm
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-dev-rocm,mode=max

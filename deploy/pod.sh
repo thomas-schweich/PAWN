@@ -38,7 +38,7 @@ mkdir -p "$POD_DIR"
 DEFAULT_GPU="NVIDIA RTX A5000"
 DEFAULT_CONTAINER_DISK=20
 DEFAULT_VOLUME_DISK=75
-DEFAULT_IMAGE="runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404"
+DEFAULT_IMAGE="thomasschweich/pawn:latest"
 
 # --- Helpers ---
 
