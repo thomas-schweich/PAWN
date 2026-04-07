@@ -794,9 +794,88 @@ def _collect_system_info() -> dict:
     return info
 
 
+def _collect_gpu_info_amdsmi(info: dict) -> None:
+    """Collect AMD GPU clocks and VRAM bandwidth via the amdsmi Python library.
+
+    Available on ROCm 6+. Native Python API — no subprocess needed.
+    """
+    try:
+        import amdsmi  # type: ignore[import-untyped]
+        amdsmi.amdsmi_init()
+    except (ImportError, Exception):
+        return
+
+    try:
+        handles = amdsmi.amdsmi_get_processor_handles()
+        if not handles:
+            return
+        gpu = handles[0]
+
+        # Max clocks: SYS (graphics) and MEM
+        for clk_type, key in [
+            (amdsmi.AmdSmiClkType.SYS, "gpu_clock_mhz"),
+            (amdsmi.AmdSmiClkType.MEM, "gpu_mem_clock_mhz"),
+        ]:
+            try:
+                clk = amdsmi.amdsmi_get_clock_info(gpu, clk_type)
+                max_clk = clk.get("max_clk") or clk.get("max")
+                if max_clk:
+                    info[key] = int(max_clk)
+            except Exception:
+                pass
+
+        # VRAM info (type, bus width, bandwidth)
+        try:
+            vram = amdsmi.amdsmi_get_gpu_vram_info(gpu)
+            vram_type = vram.get("vram_type") or vram.get("type")
+            if vram_type:
+                info["vram_type"] = str(vram_type)
+            vram_width = vram.get("vram_bit_width") or vram.get("bit_width")
+            if vram_width:
+                info["vram_bus_width"] = int(vram_width)
+        except Exception:
+            pass
+
+        # PCIe info
+        try:
+            pcie = amdsmi.amdsmi_get_pcie_info(gpu)
+            pcie_info = pcie.get("pcie_static", pcie)
+            gen = pcie_info.get("max_pcie_speed") or pcie_info.get("pcie_generation")
+            width = pcie_info.get("max_pcie_width") or pcie_info.get("pcie_width")
+            if gen and width:
+                info["pcie"] = f"Gen{gen} x{width}"
+        except Exception:
+            pass
+    finally:
+        try:
+            amdsmi.amdsmi_shut_down()
+        except Exception:
+            pass
+
+
+def _collect_gpu_info_nvidia_smi(info: dict) -> None:
+    """Collect NVIDIA GPU clocks via nvidia-smi."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=clocks.max.graphics,clocks.max.mem,pcie.link.gen.max,pcie.link.width.max",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            parts = [p.strip() for p in out.stdout.strip().split(",")]
+            if len(parts) >= 2:
+                info["gpu_clock_mhz"] = int(parts[0])
+                info["gpu_mem_clock_mhz"] = int(parts[1])
+            if len(parts) >= 4:
+                info["pcie"] = f"Gen{parts[2]} x{parts[3]}"
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+
+
 def _collect_gpu_info() -> dict:
     """Collect GPU info from torch and system tools. Best-effort."""
-    import subprocess
     import torch
 
     props = torch.cuda.get_device_properties(0)
@@ -812,45 +891,12 @@ def _collect_gpu_info() -> dict:
     if l2:
         info["gpu_l2_mb"] = round(l2 / (1024**2), 1)
 
-    # Try nvidia-smi for clock speeds
-    try:
-        out = subprocess.run(
-            ["nvidia-smi",
-             "--query-gpu=clocks.max.graphics,clocks.max.mem",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if out.returncode == 0:
-            parts = out.stdout.strip().split(", ")
-            if len(parts) == 2:
-                info["gpu_clock_mhz"] = int(parts[0])
-                info["gpu_mem_clock_mhz"] = int(parts[1])
-    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
-        pass
-
-    # Try rocm-smi for clock speeds
-    if not info.get("gpu_clock_mhz"):
-        try:
-            out = subprocess.run(
-                ["rocm-smi", "--showclkfrq", "--json"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if out.returncode == 0:
-                import json as json_mod
-                data = json_mod.loads(out.stdout)
-                # rocm-smi JSON format varies; try common keys
-                for card_data in data.values():
-                    if isinstance(card_data, dict):
-                        for k, v in card_data.items():
-                            if "sclk" in k.lower() and "max" in k.lower():
-                                info["gpu_clock_mhz"] = int(
-                                    str(v).replace("Mhz", "").strip())
-                            elif "mclk" in k.lower() and "max" in k.lower():
-                                info["gpu_mem_clock_mhz"] = int(
-                                    str(v).replace("Mhz", "").strip())
-        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError,
-                KeyError):
-            pass
+    # Try platform-specific tools for clock speeds and VRAM details
+    from pawn.gpu import is_rocm
+    if is_rocm():
+        _collect_gpu_info_amdsmi(info)
+    else:
+        _collect_gpu_info_nvidia_smi(info)
 
     return info
 
@@ -896,7 +942,11 @@ def _print_system_info(info: dict) -> None:
 
 def _print_gpu_info(info: dict, sdpa_backend) -> None:
     """Print GPU info header."""
-    gpu_line = f"GPU: {info['gpu']} ({info['platform']}, {info['vram_gb']:.1f} GB VRAM"
+    gpu_line = f"GPU: {info['gpu']} ({info['platform']}, {info['vram_gb']:.1f} GB"
+    vram_type = info.get("vram_type", "")
+    if vram_type:
+        gpu_line += f" {vram_type}"
+    gpu_line += " VRAM"
     if info.get("gpu_clock_mhz"):
         gpu_line += f", {info['gpu_clock_mhz']} MHz"
     if info.get("gpu_mem_clock_mhz"):
@@ -909,6 +959,10 @@ def _print_gpu_info(info: dict, sdpa_backend) -> None:
         extras.append(f"{info['gpu_sm_count']} SMs")
     if info.get("gpu_l2_mb"):
         extras.append(f"L2: {info['gpu_l2_mb']} MB")
+    if info.get("vram_bus_width"):
+        extras.append(f"{info['vram_bus_width']}-bit bus")
+    if info.get("pcie"):
+        extras.append(f"PCIe {info['pcie']}")
     if extras:
         print(f"      {', '.join(extras)}")
 
