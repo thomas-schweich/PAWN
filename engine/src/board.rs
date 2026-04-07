@@ -709,12 +709,34 @@ mod tests {
 
     #[test]
     fn test_halfmove_clock_resets_on_capture() {
-        // e2e4, d7d5, e4d5 (pawn capture) -> clock=0
-        let state = replay_ucis(&["e2e4", "d7d5", "e4d5"]);
-        assert_eq!(state.halfmove_clock(), 0);
-        // Continue with knight moves to increment
-        let state = replay_ucis(&["e2e4", "d7d5", "e4d5", "g8f6"]);
-        assert_eq!(state.halfmove_clock(), 1);
+        // Build up a non-zero halfmove clock using knight moves, then capture to prove reset.
+        // 1. g1f3 (clock=1) 2. b8c6 (clock=2) 3. f3e5 (non-capture knight move, clock=3)
+        // Actually f3e5 is not a capture — e5 is empty. But we need clock > 0 before a capture.
+        // Sequence: 1. g1f3 b8c6 2. f3d4 (clock=3) d7d5 (pawn resets to 0)
+        // That uses a pawn move for the reset, not a capture. Let's use a pure capture:
+        // 1. g1f3 (clock=1) 2. b8c6 (clock=2) 3. e2e4 (pawn -> clock=0) — no, we want non-pawn
+        // moves to build clock, then a capture (non-pawn) to show reset.
+        //
+        // Sequence: 1.Nf3 Nc6 2.Nd4 (non-capture, clock=3) Nd4... no, Nxd4 requires a piece on d4
+        //
+        // Simpler: 1.e4 d5 -> exd5 is a capture, but clock is 0 since e4 is a pawn move.
+        // Best approach: use knight moves to build clock, then make a knight capture.
+        //
+        // 1.Nf3 Nc6 2.Ng5 (clock=3) Nd4 (clock=4)
+        // Then: 3.Nxf7 is a capture (knight takes f7 pawn).
+        let state = replay_ucis(&["g1f3", "b8c6", "f3g5", "c6d4"]);
+        assert!(state.halfmove_clock() > 0,
+            "Clock should be > 0 after four non-pawn non-capture moves, got {}",
+            state.halfmove_clock());
+        let before = state.halfmove_clock();
+        // Now play Nxf7 — knight captures the f7 pawn
+        let state = replay_ucis(&["g1f3", "b8c6", "f3g5", "c6d4", "g5f7"]);
+        assert_eq!(state.halfmove_clock(), 0,
+            "Halfmove clock should reset to 0 after capture (was {} before)", before);
+        // Verify clock increments again after non-pawn non-capture move
+        let state = replay_ucis(&["g1f3", "b8c6", "f3g5", "c6d4", "g5f7", "d4c6"]);
+        assert_eq!(state.halfmove_clock(), 1,
+            "Clock should increment after non-capture knight move");
     }
 
     #[test]

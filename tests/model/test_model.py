@@ -404,13 +404,33 @@ class TestCLMEmbedding:
 
     @pytest.mark.unit
     def test_decomp_table_outcome_entries_zero(self, toy_clm_config):
-        """Decomp table entries for outcome tokens should be (0,0,0)."""
+        """Decomp table entries for all outcome tokens in the table are (0,0,0).
+
+        Outcome tokens span OUTCOME_TOKEN_BASE .. OUTCOME_TOKEN_BASE+n_outcomes-1.
+        The decomp table may be smaller than vocab_size (higher outcomes are
+        clamped in forward()), so we check every outcome index the table covers.
+        """
+        from pawn.config import N_TOTAL_OUTCOMES
+
         emb = CLMEmbedding(toy_clm_config)
-        for tok in range(OUTCOME_TOKEN_BASE, 4278):
+        table_len = emb.decomp_table.shape[0]
+        outcome_end = OUTCOME_TOKEN_BASE + N_TOTAL_OUTCOMES  # 4284
+        check_end = min(outcome_end, table_len)
+        n_checked = check_end - OUTCOME_TOKEN_BASE
+        assert n_checked > 0, "no outcome tokens in decomp table"
+
+        for tok in range(OUTCOME_TOKEN_BASE, check_end):
             entry = emb.decomp_table[tok]
-            assert entry[0].item() == 0
-            assert entry[1].item() == 0
-            assert entry[2].item() == 0
+            assert entry[0].item() == 0, f"token {tok} src != 0"
+            assert entry[1].item() == 0, f"token {tok} dst != 0"
+            assert entry[2].item() == 0, f"token {tok} promo != 0"
+
+        # The last table entry is the clamp target for out-of-range outcomes;
+        # verify it is also (0,0,0) so higher outcome tokens are safe.
+        last_entry = emb.decomp_table[table_len - 1]
+        assert last_entry[0].item() == 0, "clamp-target src != 0"
+        assert last_entry[1].item() == 0, "clamp-target dst != 0"
+        assert last_entry[2].item() == 0, "clamp-target promo != 0"
 
     @pytest.mark.unit
     def test_decomp_table_shape(self, toy_clm_config):
@@ -524,14 +544,27 @@ class TestPAWNCLMForward:
 
     @pytest.mark.unit
     def test_param_init_not_zero(self, toy_clm_config):
+        """Verify initialization scheme: all 2D params nonzero, RMSNorm=1, pad=0."""
         model = PAWNCLM(toy_clm_config)
-        # Some 2D param should be nonzero
-        any_nonzero = False
-        for p in model.parameters():
-            if p.dim() > 1 and p.abs().sum() > 0:
-                any_nonzero = True
-                break
-        assert any_nonzero
+
+        # ALL 2D parameters should have non-zero std (properly initialized)
+        for name, p in model.named_parameters():
+            if p.dim() >= 2:
+                assert p.std().item() > 0, (
+                    f"{name}: 2D parameter has zero std (bad init)"
+                )
+
+        # RMSNorm weights should be initialized to 1.0
+        for name, p in model.named_parameters():
+            if "norm" in name.lower() and "weight" in name and p.dim() == 1:
+                assert torch.allclose(p, torch.ones_like(p)), (
+                    f"{name}: RMSNorm weight not initialized to 1.0"
+                )
+
+        # Pad embedding should be initialized to zero
+        assert torch.equal(
+            model.embed.pad_embed, torch.zeros(toy_clm_config.d_model)
+        ), "pad_embed should be initialized to zero"
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +626,7 @@ class TestForwardTrain:
 
     @pytest.mark.unit
     def test_accuracy_in_range(self, toy_model, small_clm_sequences):
+        """Accuracy must be in [0, 1] and an untrained model should not be perfect."""
         _, metrics = toy_model.forward_train(
             small_clm_sequences["input_ids"],
             small_clm_sequences["loss_mask"],
@@ -600,6 +634,21 @@ class TestForwardTrain:
         )
         acc = metrics["accuracy"].item()
         assert 0.0 <= acc <= 1.0
+
+        # An untrained toy model on random-ish data should not achieve perfect
+        # accuracy (vocab=4284, so chance ≈ 0.02%).  Strictly less than 1.0.
+        assert acc < 1.0, "untrained model should not predict perfectly"
+
+        # Cross-check: recompute accuracy from the logits and targets manually
+        ids = small_clm_sequences["input_ids"]
+        mask = small_clm_sequences["loss_mask"]
+        tgt = small_clm_sequences["targets"]
+        logits, _ = toy_model(ids, mask)
+        preds = logits[mask].argmax(dim=-1)
+        expected_acc = (preds == tgt[mask]).float().mean().item()
+        assert abs(acc - expected_acc) < 1e-5, (
+            f"forward_train accuracy {acc} != manual accuracy {expected_acc}"
+        )
 
     @pytest.mark.unit
     def test_seq_len_exceeds_max_raises(self, toy_model, toy_clm_config):

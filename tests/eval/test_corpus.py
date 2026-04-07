@@ -216,10 +216,69 @@ class TestAccumulator:
             "is_check": np.array([False, True, False]),
         })
         _accumulate(acc, df)
+
+        # Core counters
         assert acc["n"] == 3
         assert acc["sum_k"] == pytest.approx(30.0)
+        assert acc["sum_k_sq"] == pytest.approx(5**2 + 10**2 + 15**2)
         assert acc["k_min"] == 5
         assert acc["k_max"] == 15
+
+        # Inverse-k and log-k accumulators
+        assert acc["sum_inv_k"] == pytest.approx(1/5 + 1/10 + 1/15)
+        assert acc["sum_inv_k_sq"] == pytest.approx((1/5)**2 + (1/10)**2 + (1/15)**2)
+        import math
+        assert acc["sum_ln_k"] == pytest.approx(math.log(5) + math.log(10) + math.log(15))
+        assert acc["sum_ln_k_sq"] == pytest.approx(
+            math.log(5)**2 + math.log(10)**2 + math.log(15)**2
+        )
+
+        # Top-5 accumulators: min(5, k)/k for each k
+        t5_5 = min(5, 5) / 5  # 1.0
+        t5_10 = min(5, 10) / 10  # 0.5
+        t5_15 = min(5, 15) / 15  # 1/3
+        assert acc["sum_top5"] == pytest.approx(t5_5 + t5_10 + t5_15)
+        assert acc["sum_top5_sq"] == pytest.approx(t5_5**2 + t5_10**2 + t5_15**2)
+
+        # k_hist: bins at 5, 10, 15 should have count 1 each
+        assert acc["k_hist"][5] == 1
+        assert acc["k_hist"][10] == 1
+        assert acc["k_hist"][15] == 1
+        assert acc["k_hist"].sum() == 3
+
+        # Check-split: is_check=[F, T, F] -> chk has k=10, nochk has k=5,15
+        assert acc["chk_n"] == 1
+        assert acc["chk_sum_k"] == pytest.approx(10.0)
+        assert acc["chk_sum_inv_k"] == pytest.approx(1/10)
+        assert acc["nochk_n"] == 2
+        assert acc["nochk_sum_k"] == pytest.approx(20.0)
+        assert acc["nochk_sum_inv_k"] == pytest.approx(1/5 + 1/15)
+
+        # Phase-split: ply=1 -> ply_1_20, ply=30 -> ply_21_80, ply=100 -> ply_81_150
+        assert acc["ply_1_20_n"] == 1
+        assert acc["ply_1_20_sum_k"] == pytest.approx(5.0)
+        assert acc["ply_21_80_n"] == 1
+        assert acc["ply_21_80_sum_k"] == pytest.approx(10.0)
+        assert acc["ply_81_150_n"] == 1
+        assert acc["ply_81_150_sum_k"] == pytest.approx(15.0)
+        assert acc["ply_150_plus_n"] == 0
+
+        # Verify total key count matches expectations
+        expected_scalar_keys = {
+            "n", "sum_k", "sum_k_sq", "k_min", "k_max",
+            "sum_inv_k", "sum_inv_k_sq", "sum_ln_k", "sum_ln_k_sq",
+            "sum_top5", "sum_top5_sq",
+        }
+        expected_check_keys = {
+            f"{label}_{s}" for label in ("chk", "nochk")
+            for s in ("n", "sum_k", "sum_inv_k")
+        }
+        expected_phase_keys = {
+            f"{p}_{s}" for p, _, _ in _PHASES
+            for s in ("n", "sum_k", "sum_inv_k", "sum_ln_k")
+        }
+        expected_keys = expected_scalar_keys | expected_check_keys | expected_phase_keys | {"k_hist"}
+        assert set(acc.keys()) == expected_keys
 
     @pytest.mark.unit
     def test_accumulate_empty_dataframe_noop(self):

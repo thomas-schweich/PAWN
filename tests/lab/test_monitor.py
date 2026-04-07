@@ -270,7 +270,10 @@ class TestCheckHealth:
         t.current_step = 600  # > 500 threshold
         issue = check_health(t)
         assert issue is not None
-        assert "NaN" in issue or "Inf" in issue
+        # The message must mention NaN or Inf (the specific pathological value)
+        assert "NaN" in issue or "nan" in issue.lower(), (
+            f"Health issue for NaN loss should mention 'NaN', got: {issue!r}"
+        )
 
     def test_inf_loss_after_warmup_is_unhealthy(self):
         t = _make_trial()
@@ -279,6 +282,10 @@ class TestCheckHealth:
         t.current_step = 600
         issue = check_health(t)
         assert issue is not None
+        # The message must mention Inf (the specific pathological value)
+        assert "Inf" in issue or "inf" in issue.lower(), (
+            f"Health issue for Inf loss should mention 'Inf', got: {issue!r}"
+        )
 
     def test_nan_loss_during_warmup_is_tolerated(self):
         t = _make_trial()
@@ -295,7 +302,10 @@ class TestCheckHealth:
         t.current_step = 150  # below threshold
         assert check_health(t) is None
         t.current_step = 250  # above threshold
-        assert check_health(t) is not None
+        issue = check_health(t)
+        assert issue is not None
+        assert isinstance(issue, str) and len(issue) > 0
+        assert "NaN" in issue or "Inf" in issue
 
     def test_no_total_steps_uses_500_threshold(self):
         t = _make_trial()
@@ -304,4 +314,7 @@ class TestCheckHealth:
         t.current_step = 400
         assert check_health(t) is None
         t.current_step = 600
-        assert check_health(t) is not None
+        issue = check_health(t)
+        assert issue is not None
+        assert isinstance(issue, str) and len(issue) > 0
+        assert "NaN" in issue or "Inf" in issue

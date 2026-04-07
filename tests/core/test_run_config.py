@@ -237,12 +237,22 @@ class TestBaseRunConfig:
         assert cfg.wandb is False
         assert cfg.resume is None
 
-    def test_base_run_config_cannot_be_instantiated_as_discriminated(self):
-        """BaseRunConfig itself is an abstract parent — still instantiable."""
-        # BaseRunConfig has no `run_type` literal, so it's usable on its own
-        # but not part of the union. Verify it validates checkpoint mode.
+    def test_base_run_config_not_accepted_by_discriminated_union(self):
+        """BaseRunConfig is directly instantiable but NOT accepted by RunConfig union."""
+        # BaseRunConfig can be instantiated on its own
         cfg = BaseRunConfig(local_checkpoints=True)
         assert cfg.local_checkpoints is True
+
+        # But a BaseRunConfig dict (without run_type) must NOT validate as RunConfig
+        adapter = TypeAdapter(RunConfig)
+        with pytest.raises(ValidationError):
+            adapter.validate_python(cfg.model_dump())
+
+        # Even if we manually add a bogus run_type, it should be rejected
+        data = cfg.model_dump()
+        data["run_type"] = "base"
+        with pytest.raises(ValidationError):
+            adapter.validate_python(data)
 
 
 # ---------------------------------------------------------------------------

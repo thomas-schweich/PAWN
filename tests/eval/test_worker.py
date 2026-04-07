@@ -155,6 +155,15 @@ class TestRunProbes:
         assert mock.called
         called_fn = mock.call_args[0][0]
         assert called_fn is worker_mod._probes_worker
+        # Verify ALL positional args passed to run_in_worker
+        args = mock.call_args[0]
+        assert args[1] == "/path/to/ckpt"  # checkpoint_path (stringified)
+        assert args[2] == "cuda"            # device
+        assert args[3] == 100               # n_train
+        assert args[4] == 20                # n_val
+        assert args[5] == 3                 # n_epochs
+        assert args[6] == 1                 # seed_train
+        assert args[7] == 2                 # seed_val
 
     @pytest.mark.unit
     def test_stringifies_path(self):
@@ -171,9 +180,13 @@ class TestRunProbes:
             run_probes("/ckpt", "cuda")
         args = mock.call_args[0]
         # Positional args: (fn, ckpt, device, n_train, n_val, n_epochs, seed_train, seed_val)
+        assert args[1] == "/ckpt"
+        assert args[2] == "cuda"
         assert args[3] == 5_000  # default n_train
         assert args[4] == 1_000  # default n_val
         assert args[5] == 20     # default n_epochs
+        assert args[6] == 3000   # default seed_train
+        assert args[7] == 4000   # default seed_val
 
 
 class TestRunOutcomeSignalTest:
@@ -184,6 +197,12 @@ class TestRunOutcomeSignalTest:
         assert result == {"r": 1}
         called_fn = mock.call_args[0][0]
         assert called_fn is worker_mod._signal_test_worker
+        # Verify all positional args
+        args = mock.call_args[0]
+        assert args[1] == "/ckpt"            # checkpoint_path
+        assert args[2] == "cpu"              # device
+        assert args[3] == 50                 # n_per_outcome
+        assert args[4] == [False, True]      # default mask_conditions as list
 
     @pytest.mark.unit
     def test_mask_conditions_converted_to_list(self):
@@ -203,6 +222,15 @@ class TestRunPrefixContinuationTest:
                                          n_per_bucket=10)
         called_fn = mock.call_args[0][0]
         assert called_fn is worker_mod._prefix_continuation_worker
+        # Verify all positional args
+        args = mock.call_args[0]
+        assert args[1] == "/ckpt"            # checkpoint_path
+        assert args[2] == "/corpus"          # corpus_dir
+        assert args[3] == "cpu"              # device
+        assert args[4] == 10                 # n_per_bucket
+        # Default prefix_pcts and absolute_plies converted to lists
+        assert args[5] == [0.1, 0.5, 0.9]
+        assert args[6] == [10, 50, 100, 200]
 
     @pytest.mark.unit
     def test_converts_tuples_to_lists(self):
@@ -225,6 +253,13 @@ class TestRunPoisonedPrefixTest:
             run_poisoned_prefix_test("/ckpt", "/corpus", "cpu", n_per_pair=3)
         called_fn = mock.call_args[0][0]
         assert called_fn is worker_mod._poisoned_prefix_worker
+        # Verify all positional args
+        args = mock.call_args[0]
+        assert args[1] == "/ckpt"    # checkpoint_path
+        assert args[2] == "/corpus"  # corpus_dir
+        assert args[3] == "cpu"      # device
+        assert args[4] == 3          # n_per_pair
+        assert args[5] == 0.5        # default prefix_pct
 
     @pytest.mark.unit
     def test_passes_prefix_pct(self):
@@ -241,8 +276,12 @@ class TestRunImpossibleTaskTest:
             run_impossible_task_test("/ckpt", "/corpus", "cpu", n_per_scenario=7)
         called_fn = mock.call_args[0][0]
         assert called_fn is worker_mod._impossible_task_worker
+        # Verify all positional args
         args = mock.call_args[0]
-        assert args[-1] == 7
+        assert args[1] == "/ckpt"    # checkpoint_path
+        assert args[2] == "/corpus"  # corpus_dir
+        assert args[3] == "cpu"      # device
+        assert args[4] == 7          # n_per_scenario
 
 
 class TestRunImprobableTaskTest:
@@ -252,8 +291,12 @@ class TestRunImprobableTaskTest:
             run_improbable_task_test("/ckpt", "/corpus", "cpu", n_per_scenario=9)
         called_fn = mock.call_args[0][0]
         assert called_fn is worker_mod._improbable_task_worker
+        # Verify all positional args
         args = mock.call_args[0]
-        assert args[-1] == 9
+        assert args[1] == "/ckpt"    # checkpoint_path
+        assert args[2] == "/corpus"  # corpus_dir
+        assert args[3] == "cpu"      # device
+        assert args[4] == 9          # n_per_scenario
 
 
 class TestRunDiagnosticEval:

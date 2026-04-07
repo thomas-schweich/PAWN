@@ -173,21 +173,38 @@ mod tests {
 
     #[test]
     fn test_extract_ep_square_after_double_push() {
-        // After 1. e2e4 (double pawn push), the legal EP square should be e3 (idx 20).
+        // Set up a position where EP is actually legal:
+        // 1. e2e4  a7a6  2. e4e5  d7d5
+        // After move 3 (d7d5), white's e5-pawn is adjacent to d5, so EP on d6 is legal.
+        // Board state at ply 4 (before a hypothetical 5th move) should have ep_square = d6.
+        // d6 in our square mapping: rank=5, file=3 => 5*8+3 = 43.
+        //
+        // Note: legal_ep_square() only returns Some when an EP capture is actually legal,
+        // which requires the capturing pawn to be on the 5th rank (for white) or 4th rank
+        // (for black), adjacent to the double-pushed pawn.
         let max_ply = 8;
         let mut move_ids = vec![0i16; max_ply];
         move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
-        // Black also double-pushes to d5 so white has a legal EP
-        move_ids[1] = crate::vocab::base_grid_token(51, 35) as i16; // d7d5
-        let game_lengths = vec![2i16];
+        move_ids[1] = crate::vocab::base_grid_token(48, 40) as i16; // a7a6 (waiting move)
+        move_ids[2] = crate::vocab::base_grid_token(28, 36) as i16; // e4e5
+        move_ids[3] = crate::vocab::base_grid_token(51, 35) as i16; // d7d5
+        // 5th move: white captures en passant e5d6 (src=36, dst=43)
+        move_ids[4] = crate::vocab::base_grid_token(36, 43) as i16; // exd6 (EP capture)
+        let game_lengths = vec![5i16];
 
         let states = extract_board_states(&move_ids, &game_lengths, max_ply);
 
-        // Ply 0: no EP (start)
-        assert_eq!(states.ep_square[0], -1);
-        // Ply 1: after e2e4, there's no black pawn to capture en passant, so legal_ep_square is -1.
-        // But we did e2e4 then look at next ply. legal_ep_square only reports if a legal EP exists.
-        // Check for e6 after d7d5. We need to make another move to look at next state.
+        // Ply 0: no EP at start
+        assert_eq!(states.ep_square[0], -1, "no EP at startpos");
+        // Ply 1: after e2e4, no adjacent black pawn on 4th rank => legal_ep_square is None
+        assert_eq!(states.ep_square[1], -1, "no black pawn adjacent to e4");
+        // Ply 2: after a7a6, white's turn. a6 was not a double push => no EP.
+        assert_eq!(states.ep_square[2], -1, "a7a6 is single push, no EP");
+        // Ply 3: after e4e5, black's turn. e4e5 is a single-square push => no EP.
+        assert_eq!(states.ep_square[3], -1, "e4e5 is single push, no EP");
+        // Ply 4: after d7d5, white's e5-pawn is adjacent to d5. EP on d6 is legal.
+        // d6 = rank 5, file 3 => 5*8+3 = 43.
+        assert_eq!(states.ep_square[4], 43, "after d7d5, EP on d6 is legal for white's e5 pawn");
     }
 
     #[test]
@@ -314,21 +331,55 @@ mod tests {
 
     #[test]
     fn test_multiple_games_independent() {
-        // Different games should produce independent state arrays.
+        // Different games should produce independent state arrays:
+        // same start, but divergent board states after different opening moves.
         let max_ply = 16;
         let mut move_ids = vec![0i16; 2 * max_ply];
-        // Game 0: 1. e2e4 (so ply 1 has e4 with white pawn)
-        move_ids[0 * max_ply + 0] = crate::vocab::base_grid_token(12, 28) as i16;
-        // Game 1: 1. d2d4
-        move_ids[1 * max_ply + 0] = crate::vocab::base_grid_token(11, 27) as i16;
-        let game_lengths = vec![1i16, 1i16];
+        // Game 0: 1. e2e4 e7e5
+        move_ids[0 * max_ply + 0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
+        move_ids[0 * max_ply + 1] = crate::vocab::base_grid_token(52, 36) as i16; // e7e5
+        // Game 1: 1. d2d4 d7d5
+        move_ids[1 * max_ply + 0] = crate::vocab::base_grid_token(11, 27) as i16; // d2d4
+        move_ids[1 * max_ply + 1] = crate::vocab::base_grid_token(51, 35) as i16; // d7d5
+        let game_lengths = vec![2i16, 2i16];
 
         let states = extract_board_states(&move_ids, &game_lengths, max_ply);
 
-        // Both games should start identically
+        // Ply 0: both games start identically (initial position)
         assert_eq!(states.castling_rights[0], 0b1111);
         assert_eq!(states.castling_rights[max_ply], 0b1111);
         assert!(states.side_to_move[0]);
         assert!(states.side_to_move[max_ply]);
+        // Board at ply 0 should be identical between the two games
+        for i in 0..64 {
+            assert_eq!(
+                states.boards[0 * 64 + i],
+                states.boards[max_ply * 64 + i],
+                "ply 0 boards should be identical at square {}", i
+            );
+        }
+
+        // Ply 1: after different first moves, boards must diverge.
+        // Game 0 ply 1: after e2e4 => e2 empty, e4 has white pawn
+        // Game 1 ply 1: after d2d4 => d2 empty, d4 has white pawn
+        let g0_ply1_board_base = 1 * 64;           // game 0, ply 1
+        let g1_ply1_board_base = (max_ply + 1) * 64; // game 1, ply 1
+
+        // e2=12: game 0 has empty (0), game 1 still has pawn (1)
+        assert_eq!(states.boards[g0_ply1_board_base + 12], 0, "game 0: e2 empty after e2e4");
+        assert_eq!(states.boards[g1_ply1_board_base + 12], 1, "game 1: e2 still has pawn");
+        // d2=11: game 0 still has pawn (1), game 1 has empty (0)
+        assert_eq!(states.boards[g0_ply1_board_base + 11], 1, "game 0: d2 still has pawn");
+        assert_eq!(states.boards[g1_ply1_board_base + 11], 0, "game 1: d2 empty after d2d4");
+
+        // Confirm the two games' ply-1 boards are actually different
+        let mut any_differ = false;
+        for i in 0..64 {
+            if states.boards[g0_ply1_board_base + i] != states.boards[g1_ply1_board_base + i] {
+                any_differ = true;
+                break;
+            }
+        }
+        assert!(any_differ, "games with different moves must produce different board states at ply 1");
     }
 }

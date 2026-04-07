@@ -931,10 +931,11 @@ mod tests {
 
     #[test]
     fn test_enriched_tokens_match_legacy() {
-        // Enriched parsing should produce the same tokens as the legacy pipeline
+        // Enriched parsing should produce the same tokens as the legacy pipeline,
+        // AND the enriched data (clocks, evals) should actually be populated.
         let pgn = r#"[Event "Test"]
 
-1. e4 { [%clk 0:10:00] } 1... e5 { [%clk 0:09:58] } 2. Nf3 { [%clk 0:09:50] } 2... Nc6 { [%clk 0:09:45] } 1-0
+1. e4 { [%clk 0:10:00] [%eval 0.23] } 1... e5 { [%clk 0:09:58] [%eval 0.31] } 2. Nf3 { [%clk 0:09:50] } 2... Nc6 { [%clk 0:09:45] } 1-0
 "#;
         let enriched = parse_pgn_enriched(pgn, 256, 100, 2);
         let legacy = parse_pgn_to_san(pgn, 100);
@@ -948,6 +949,21 @@ mod tests {
 
         assert_eq!(enriched[0].tokens, legacy_tokens);
         assert_eq!(enriched[0].game_length, legacy_n);
+
+        // Verify enriched data is actually present (not just empty/default).
+        // Clocks: all 4 plies have clock annotations.
+        assert_eq!(enriched[0].clocks.len(), 4, "clocks should have one entry per ply");
+        assert!(
+            enriched[0].clocks.iter().any(|&c| c != CLOCK_NONE),
+            "enriched clocks should contain actual values, not all CLOCK_NONE"
+        );
+        assert_eq!(enriched[0].clocks[0], 600, "first ply clock should be 600s (0:10:00)");
+        assert_eq!(enriched[0].clocks[1], 598, "second ply clock should be 598s (0:09:58)");
+
+        // Evals: first two plies have eval annotations, last two do not.
+        assert_eq!(enriched[0].evals.len(), 4, "evals should have one entry per ply");
+        assert_eq!(enriched[0].evals[0], 23, "first ply eval should be 23cp");
+        assert_eq!(enriched[0].evals[1], 31, "second ply eval should be 31cp");
     }
 
     #[test]
@@ -976,6 +992,15 @@ mod tests {
 
     #[test]
     fn test_sampled_parsing() {
+        // Test parse_pgn_enriched_sampled with explicit offset semantics.
+        //
+        // Offset semantics: When parsing PGN in chunks, `game_offset` is the count
+        // of date-matching games seen in all *previous* chunks. Each date-matching
+        // game in the current chunk gets a global index = game_offset + local_index
+        // (where local_index starts at 0 for the first matching game in this chunk).
+        // The `indices` set contains the global indices to select.
+        //
+        // PGN contains 4 games; 3 match Dec 2023 (Games 1-3), 1 is out of range (Game 4).
         let pgn = r#"[Event "Game 1"]
 [UTCDate "2023.12.05"]
 
@@ -996,18 +1021,34 @@ mod tests {
 
 1. Nf3 d5 1-0
 "#;
-        // 3 games match Dec 2023 (indices 0, 1, 2 within the date range)
+        // 3 games match Dec 2023 (global indices 0, 1, 2 with offset=0)
         assert_eq!(count_games_in_date_range(pgn, "2023.12.01", "2023.12.31"), 3);
 
-        // Sample only index 1 (Game 2)
+        // --- offset=0: global index == local index ---
+
+        // Select global index 0 => Game 1 (1. e4 e5). Verify we get the right game.
+        let indices: HashSet<usize> = HashSet::from([0]);
+        let sampled = parse_pgn_enriched_sampled(
+            pgn, 256, 2, "2023.12.01", "2023.12.31", &indices, 0,
+        );
+        assert_eq!(sampled.len(), 1);
+        assert_eq!(sampled[0].headers.get("UTCDate").unwrap(), "2023.12.05");
+        // Game 1 starts with e4: verify first token matches e2e4
+        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        assert_eq!(sampled[0].tokens[0], e2e4, "Game 1 should start with e2e4");
+        assert_eq!(sampled[0].game_length, 2, "Game 1 has 2 plies (e4 e5)");
+
+        // Select global index 1 => Game 2 (1. d4 d5). Verify different first move.
         let indices: HashSet<usize> = HashSet::from([1]);
         let sampled = parse_pgn_enriched_sampled(
             pgn, 256, 2, "2023.12.01", "2023.12.31", &indices, 0,
         );
         assert_eq!(sampled.len(), 1);
         assert_eq!(sampled[0].headers.get("UTCDate").unwrap(), "2023.12.10");
+        let d2d4 = crate::vocab::base_grid_token(11, 27);
+        assert_eq!(sampled[0].tokens[0], d2d4, "Game 2 should start with d2d4");
 
-        // Sample indices 0 and 2 (Game 1 and Game 3)
+        // Select global indices 0 and 2 => Game 1 and Game 3
         let indices: HashSet<usize> = HashSet::from([0, 2]);
         let sampled = parse_pgn_enriched_sampled(
             pgn, 256, 2, "2023.12.01", "2023.12.31", &indices, 0,
@@ -1015,18 +1056,21 @@ mod tests {
         assert_eq!(sampled.len(), 2);
         assert_eq!(sampled[0].headers.get("UTCDate").unwrap(), "2023.12.05");
         assert_eq!(sampled[1].headers.get("UTCDate").unwrap(), "2023.12.20");
+        // Game 3 also starts with e4 but second move is c5 (Sicilian)
+        assert_eq!(sampled[1].tokens[0], e2e4, "Game 3 should also start with e2e4");
 
-        // Sample with offset: simulating a second chunk where previous chunk had 1 match.
-        // Global index 2 = offset 1 + local index 1 => selects Game 2 (local idx 1).
+        // --- offset=1: simulates a second chunk where 1 game matched in a prior chunk ---
+        // Global index = offset + local_index. So global 2 = offset 1 + local 1 => Game 2.
         let indices: HashSet<usize> = HashSet::from([2]);
         let sampled = parse_pgn_enriched_sampled(
             pgn, 256, 2, "2023.12.01", "2023.12.31", &indices, 1,
         );
         assert_eq!(sampled.len(), 1);
         assert_eq!(sampled[0].headers.get("UTCDate").unwrap(), "2023.12.10");
+        assert_eq!(sampled[0].tokens[0], d2d4, "offset=1, index=2 should get Game 2 (d4 d5)");
 
-        // Offset that skips all local games: offset=3 means local indices are 3,4,5
-        // but we only ask for global index 0, which isn't in this chunk.
+        // --- offset that skips all local games ---
+        // offset=3 means local games get global indices 3,4,5 — but we ask for 0.
         let indices: HashSet<usize> = HashSet::from([0]);
         let sampled = parse_pgn_enriched_sampled(
             pgn, 256, 2, "2023.12.01", "2023.12.31", &indices, 3,

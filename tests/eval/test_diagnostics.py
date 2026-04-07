@@ -284,18 +284,37 @@ class TestEvaluateDiagnosticPositions:
             assert "std_entropy" in metrics
 
     @pytest.mark.unit
-    def test_terminal_flag_for_checkmate_stalemate(self, tiny_diag_corpus, toy_model, cpu_device):
-        positions = extract_diagnostic_positions(tiny_diag_corpus, max_per_category=2)
+    def test_terminal_flag_for_checkmate_stalemate(self, toy_model, cpu_device):
+        # Generate a corpus with a high quota to guarantee checkmate positions
+        corpus = generate_diagnostic_corpus(
+            n_per_category=50, max_ply=64, seed=42, max_simulated_factor=200.0,
+        )
+        positions = extract_diagnostic_positions(corpus, max_per_category=8)
         results = evaluate_diagnostic_positions(
-            toy_model, positions, tiny_diag_corpus, cpu_device,
+            toy_model, positions, corpus, cpu_device,
             n_samples=8, batch_size=4,
         )
-        if "checkmate" in results:
-            assert results["checkmate"]["terminal"] is True
+        # Assert that "checkmate" IS present — if not, the test should fail
+        assert "checkmate" in results, (
+            "checkmate category missing from results; corpus did not yield "
+            "any checkmate positions"
+        )
+        assert results["checkmate"]["terminal"] is True
+
         if "stalemate" in results:
             assert results["stalemate"]["terminal"] is True
-        if "in_check" in results:
-            assert results["in_check"]["terminal"] is False
+
+        # At least one non-terminal category should also be present
+        non_terminal_found = False
+        for cat, metrics in results.items():
+            if cat not in ("checkmate", "stalemate"):
+                assert metrics["terminal"] is False, (
+                    f"{cat} should not be terminal"
+                )
+                non_terminal_found = True
+        assert non_terminal_found, (
+            "Expected at least one non-terminal category in results"
+        )
 
     @pytest.mark.unit
     def test_metrics_in_valid_range(self, tiny_diag_corpus, toy_model, cpu_device):

@@ -88,10 +88,12 @@ class TestRandomSlug:
         assert re.match(r"^[a-z]+-[a-z]+$", slug), f"Bad slug format: {slug}"
 
     def test_slug_components_in_wordlists(self):
-        slug = random_slug()
-        adj, animal = slug.split("-")
-        assert adj in _ADJECTIVES, f"{adj!r} not in adjectives"
-        assert animal in _ANIMALS, f"{animal!r} not in animals"
+        """Generate multiple slugs to catch edge cases a single draw might miss."""
+        for i in range(20):
+            slug = random_slug()
+            adj, animal = slug.split("-")
+            assert adj in _ADJECTIVES, f"slug #{i} adj {adj!r} not in adjectives"
+            assert animal in _ANIMALS, f"slug #{i} animal {animal!r} not in animals"
 
     def test_slug_is_randomish(self):
         """Generate many slugs; expect at least some variation."""
@@ -99,8 +101,13 @@ class TestRandomSlug:
         assert len(slugs) > 5, "random_slug should produce varied output"
 
     def test_wordlist_nonempty(self):
-        assert len(_ADJECTIVES) > 0
-        assert len(_ANIMALS) > 0
+        assert len(_ADJECTIVES) >= 10, "adjective list too small for sufficient variety"
+        assert len(_ANIMALS) >= 10, "animal list too small for sufficient variety"
+        # Verify the function actually draws from these lists
+        slug = random_slug()
+        adj, animal = slug.split("-")
+        assert adj in _ADJECTIVES, f"{adj!r} not drawn from _ADJECTIVES"
+        assert animal in _ANIMALS, f"{animal!r} not drawn from _ANIMALS"
 
 
 # ---------------------------------------------------------------------------

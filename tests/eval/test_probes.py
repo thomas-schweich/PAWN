@@ -593,10 +593,7 @@ class TestExtractHiddenStates:
 class TestExtractTargets:
     @pytest.mark.unit
     def test_piece_type_targets(self, probe_data):
-        _, mask = _extract_hidden_states(
-            None, probe_data, "cpu", layer_idx=0, max_batch=4,
-        ) if False else (None, None)
-        # Build mask directly
+        # Build valid_mask from game_lengths
         game_lengths = probe_data["game_lengths"]
         max_ply = probe_data["boards"].shape[1]
         ply_grid = torch.arange(max_ply).unsqueeze(0)
@@ -605,6 +602,34 @@ class TestExtractTargets:
         t = _extract_targets("piece_type", probe_data, valid_mask)
         assert t.shape[1] == 64
         assert t.shape[0] == int(valid_mask.sum())
+        # Piece type values must be in [0, 12]
+        assert int(t.min()) >= 0
+        assert int(t.max()) <= 12
+
+    @pytest.mark.unit
+    def test_is_check_targets(self, probe_data):
+        game_lengths = probe_data["game_lengths"]
+        max_ply = probe_data["boards"].shape[1]
+        ply_grid = torch.arange(max_ply).unsqueeze(0)
+        valid_mask = ply_grid < torch.from_numpy(game_lengths).long().unsqueeze(1)
+
+        t = _extract_targets("is_check", probe_data, valid_mask)
+        assert t.shape[0] == int(valid_mask.sum())
+        assert t.shape[1] == 1
+        # is_check must be binary {0.0, 1.0}
+        assert set(t.flatten().tolist()).issubset({0.0, 1.0})
+
+    @pytest.mark.unit
+    def test_side_to_move_targets(self, probe_data):
+        game_lengths = probe_data["game_lengths"]
+        max_ply = probe_data["boards"].shape[1]
+        ply_grid = torch.arange(max_ply).unsqueeze(0)
+        valid_mask = ply_grid < torch.from_numpy(game_lengths).long().unsqueeze(1)
+
+        t = _extract_targets("side_to_move", probe_data, valid_mask)
+        assert t.shape[0] == int(valid_mask.sum())
+        # side_to_move must be binary {0.0, 1.0}
+        assert set(t.flatten().tolist()).issubset({0.0, 1.0})
 
 
 # ---------------------------------------------------------------------------

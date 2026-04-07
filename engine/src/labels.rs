@@ -299,7 +299,8 @@ mod tests {
     #[test]
     fn test_sparse_padding_pad_token() {
         // Sparse mask must include a PAD token slot at position `length` so loss
-        // is finite for that target position.
+        // is finite for that target position. Only PAD should be legal there —
+        // no move tokens should appear after game end.
         let max_ply = 8;
         let seq_len = max_ply + 1;
         let vocab_size = crate::vocab::VOCAB_SIZE;
@@ -312,9 +313,28 @@ mod tests {
         );
 
         // At position length=1, PAD token should be present.
-        // PAD_TOKEN = 0, so index = length * vocab_size + 0 = vocab_size
+        // PAD_TOKEN = 0, so index = game_base + length * vocab_size + 0 = vocab_size
         let expected_pad_idx = (1 * vocab_size) as i64;
         assert!(sparse.contains(&expected_pad_idx), "sparse must include PAD token at position length");
+
+        // Verify PAD is the ONLY token at position `length` — no move tokens
+        // should be legal after game end.
+        let pos_start = (1 * vocab_size) as i64;
+        let pos_end = (2 * vocab_size) as i64;
+        let tokens_at_length: Vec<i64> = sparse.iter()
+            .copied()
+            .filter(|&idx| idx >= pos_start && idx < pos_end)
+            .collect();
+        assert_eq!(
+            tokens_at_length.len(), 1,
+            "exactly one token (PAD) should be legal at position length, found {}",
+            tokens_at_length.len()
+        );
+        assert_eq!(
+            tokens_at_length[0], expected_pad_idx,
+            "the only token at position length should be PAD (index {}), got {}",
+            expected_pad_idx, tokens_at_length[0]
+        );
     }
 
     #[test]
@@ -355,16 +375,30 @@ mod tests {
 
     #[test]
     fn test_grids_zero_past_game_length() {
-        // Positions beyond game_length should have all-zero grids.
+        // Positions beyond game_length should have all-zero grids, but the last
+        // valid ply (length-1) should have non-zero legal moves (boundary check).
         let max_ply = 64;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;
-        move_ids[1] = crate::vocab::base_grid_token(52, 36) as i16;
+        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
+        move_ids[1] = crate::vocab::base_grid_token(52, 36) as i16; // e7e5
         let game_lengths = vec![2i16];
 
         let (grids, _) = compute_legal_move_masks(&move_ids, &game_lengths, max_ply);
 
-        // beyond ply 2, all grid entries should be 0
+        // Verify the last valid ply (index length-1 = 1) has a non-zero grid.
+        // At ply 1 (after e2e4, black to move), black has 20 legal moves.
+        let last_valid_ply = 1;
+        let mut any_nonzero = false;
+        for src in 0..64 {
+            let off = (0 * max_ply + last_valid_ply) * 64 + src;
+            if grids[off] != 0 {
+                any_nonzero = true;
+                break;
+            }
+        }
+        assert!(any_nonzero, "grid at last valid ply (index {}) should NOT be all-zero", last_valid_ply);
+
+        // Beyond ply 2, all grid entries should be 0
         for t in 2..max_ply {
             for src in 0..64 {
                 let off = (0 * max_ply + t) * 64 + src;

@@ -824,8 +824,14 @@ mod tests {
         // white is to move with EP available.
         let bits_ply4 = per_ply[4];
         assert_ne!(bits_ply4 & EP_CAPTURE_AVAILABLE, 0, "EP should be available after d7d5");
-        // EP square is on file d (file index 3)
+        // EP square is on file d (file index 3), NOT file e
         assert_ne!(bits_ply4 & EP_FILE_D, 0, "EP square should be on file D");
+        assert_eq!(bits_ply4 & EP_FILE_E, 0, "EP square should NOT be on file E (wrong file)");
+        // Verify no other EP file bits are set
+        let all_ep_files = EP_FILE_A | EP_FILE_B | EP_FILE_C | EP_FILE_D
+            | EP_FILE_E | EP_FILE_F | EP_FILE_G | EP_FILE_H;
+        let ep_files_set = bits_ply4 & all_ep_files;
+        assert_eq!(ep_files_set, EP_FILE_D, "only EP_FILE_D should be set, got 0x{:x}", ep_files_set);
         // Should NOT be in check
         assert_eq!(bits_ply4 & IN_CHECK, 0, "White should not be in check");
         // Should NOT have promotion available
@@ -901,13 +907,15 @@ mod tests {
     #[test]
     fn test_stalemate_detected() {
         // Find a stalemate terminal position in random games.
-        let batch = generate_random_games(500, 256, 7, 0.0, false);
+        // Use 10000 games to make finding at least one stalemate virtually certain.
+        let n_games = 10000;
+        let batch = generate_random_games(n_games, 256, 7, 0.0, false);
         let (per_ply, _, _) = compute_edge_stats_per_ply(
             &batch.move_ids, &batch.game_lengths, 256,
         );
 
         let mut found_stalemate = false;
-        for b in 0..500usize {
+        for b in 0..n_games {
             let length = batch.game_lengths[b] as usize;
             if length >= 256 { continue; }
             let term_bits = per_ply[b * 256 + length];
@@ -919,10 +927,7 @@ mod tests {
                 break;
             }
         }
-        // May not find one in 500 random games, so don't hard-fail
-        if !found_stalemate {
-            eprintln!("no stalemate found in 500 random games (not a failure)");
-        }
+        assert!(found_stalemate, "Expected at least one stalemate in {} random games", n_games);
     }
 
     #[test]

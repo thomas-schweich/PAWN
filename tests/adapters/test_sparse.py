@@ -202,9 +202,12 @@ class TestSparseCLMInvariants:
 
 
 class TestSparseCLMDensity:
-    def test_density_approx(self, toy_backbone, toy_clm_config):
-        density = 0.1
-        model = SparseCLM(toy_backbone, density=density, seed=42)
+    @pytest.mark.parametrize("density", [0.1, 0.5])
+    def test_density_approx(self, toy_clm_config, density):
+        from pawn.model import PAWNCLM
+        torch.manual_seed(0)
+        backbone = PAWNCLM(toy_clm_config)
+        model = SparseCLM(backbone, density=density, seed=42)
         # Count active entries
         n_active = model.n_active_params()
         # 2 layers × 4 projs × d_model × d_model elements each
@@ -212,9 +215,11 @@ class TestSparseCLMDensity:
             toy_clm_config.n_layers * 4 * toy_clm_config.d_model * toy_clm_config.d_model
         )
         actual_density = n_active / total_possible
-        # Allow ~3% deviation given d_model=64 (64*64=4096 elements per mask)
-        assert abs(actual_density - density) < 0.03, (
-            f"expected density ~{density}, got {actual_density}"
+        # 15% relative tolerance — tight enough to catch bugs, loose enough
+        # for the stochastic mask (each mask has 64*64=4096 Bernoulli draws).
+        assert abs(actual_density - density) / density < 0.15, (
+            f"expected density ~{density}, got {actual_density} "
+            f"(relative error {abs(actual_density - density) / density:.2%})"
         )
 
     def test_density_deterministic_with_seed(self, toy_clm_config):

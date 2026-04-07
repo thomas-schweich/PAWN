@@ -735,11 +735,27 @@ mod tests {
         // Rollouts from startpos should produce 20 entries (one per legal move)
         let results = rollout_legal_moves(&[], 1, 50, 42);
         assert_eq!(results.len(), 20);
-        for (_tok, dist) in &results {
+
+        // Build the set of legal move tokens at the starting position
+        let startpos = GameState::new();
+        let legal_tokens: std::collections::HashSet<u16> = startpos.legal_move_tokens().into_iter().collect();
+        assert_eq!(legal_tokens.len(), 20, "Starting position has 20 legal moves");
+
+        for (tok, dist) in &results {
+            // Every returned move token must be a legal move from the starting position
+            assert!(
+                legal_tokens.contains(tok),
+                "Rollout returned token {} which is not a legal starting move", tok
+            );
             assert_eq!(dist.total, 1);
             let sum: u32 = dist.counts.iter().sum();
             assert_eq!(sum, 1);
         }
+
+        // Also verify all 20 legal moves appear exactly once
+        let result_tokens: std::collections::HashSet<u16> = results.iter().map(|(t, _)| *t).collect();
+        assert_eq!(result_tokens, legal_tokens,
+            "Rollout should return exactly the set of legal starting moves");
     }
 
     #[test]
@@ -801,14 +817,70 @@ mod tests {
         let (examples, total) = generate_checkmate_examples(42, 256, 5);
         assert_eq!(examples.len(), 5);
         assert!(total >= 5);
-        for ex in &examples {
+        for (ei, ex) in examples.iter().enumerate() {
             // Checkmate grid has at least one bit set (there's at least one mating move)
             let has_bits: bool = ex.checkmate_grid.iter().any(|&g| g != 0);
-            assert!(has_bits, "Checkmate game must have at least one mating move");
-            // Legal grid has more bits than checkmate grid (more legal moves than mating ones)
+            assert!(has_bits, "Example {}: checkmate game must have at least one mating move", ei);
+            // Legal grid has at least as many bits as checkmate grid
             let n_legal: u32 = ex.legal_grid.iter().map(|&g| g.count_ones()).sum();
             let n_mates: u32 = ex.checkmate_grid.iter().map(|&g| g.count_ones()).sum();
-            assert!(n_legal >= n_mates, "n_legal {} >= n_mates {}", n_legal, n_mates);
+            assert!(n_legal >= n_mates, "Example {}: n_legal {} >= n_mates {}", ei, n_legal, n_mates);
+
+            // Replay the game to the penultimate ply
+            assert!(ex.move_ids.len() >= 2,
+                "Example {}: checkmate game must have >= 2 plies", ei);
+            let penultimate_tokens = &ex.move_ids[..ex.move_ids.len() - 1];
+            let penultimate_state = GameState::from_move_tokens(penultimate_tokens)
+                .expect("replay to penultimate position should succeed");
+
+            let legal_tokens = penultimate_state.legal_move_tokens();
+
+            // Verify every bit set in checkmate_grid has at least one corresponding
+            // legal move that delivers checkmate. The grid uses (src, dst) from
+            // token_to_src_dst, which strips promotion info — so multiple promotion
+            // variants map to the same bit. We verify that at least one matching
+            // legal move delivers mate.
+            for src in 0..64u8 {
+                let bits = ex.checkmate_grid[src as usize];
+                if bits == 0 { continue; }
+                for dst in 0..64u8 {
+                    if (bits >> dst) & 1 == 0 { continue; }
+                    // Find all legal tokens that match this (src, dst) pair
+                    let matching: Vec<u16> = legal_tokens.iter()
+                        .filter(|&&tok| {
+                            let (s, d, _) = crate::vocab::decompose_token(tok).unwrap();
+                            s == src && d == dst
+                        })
+                        .copied()
+                        .collect();
+                    assert!(!matching.is_empty(),
+                        "Example {}: grid bit ({},{}) has no matching legal move", ei, src, dst);
+                    // At least one matching move must deliver checkmate
+                    let any_mate = matching.iter().any(|&tok| {
+                        let mut test_state = penultimate_state.clone();
+                        test_state.make_move(tok).unwrap();
+                        test_state.check_termination(256 + 10) == Some(Termination::Checkmate)
+                    });
+                    assert!(any_mate,
+                        "Example {}: grid bit ({},{}) set but no matching move delivers checkmate",
+                        ei, src, dst);
+                }
+            }
+
+            // Also verify NO legal move outside checkmate_grid delivers checkmate.
+            // Group legal moves by (src, dst) — if the grid bit is unset, none of
+            // the moves with that (src, dst) should deliver mate.
+            for &tok in &legal_tokens {
+                let (src, dst, _) = crate::vocab::decompose_token(tok).unwrap();
+                let is_marked = (ex.checkmate_grid[src as usize] >> dst) & 1 == 1;
+                if is_marked { continue; }
+                let mut test_state = penultimate_state.clone();
+                test_state.make_move(tok).unwrap();
+                let term = test_state.check_termination(256 + 10);
+                assert_ne!(term, Some(Termination::Checkmate),
+                    "Example {}: move ({},{}) token {} delivers checkmate but is NOT in checkmate_grid",
+                    ei, src, dst, tok);
+            }
         }
     }
 

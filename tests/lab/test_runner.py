@@ -386,11 +386,56 @@ class TestResults:
         runner.trials[1] = self._make_completed(1, {"param_count": 2000}, 1.8)
         # trial 2: 2000 params, val_loss 2.2 (dominated by 1)
         runner.trials[2] = self._make_completed(2, {"param_count": 2000}, 2.2)
+        # trial 3: 500 params, val_loss 3.0 (not dominated: fewest params)
+        runner.trials[3] = self._make_completed(3, {"param_count": 500}, 3.0)
+        # trial 4: 3000 params, val_loss 3.0 (dominated by 1: more params, worse loss)
+        runner.trials[4] = self._make_completed(4, {"param_count": 3000}, 3.0)
         r = runner.results()
-        pareto_ids = sorted(row["trial"] for row in r["pareto_front"])
+        all_completed = [row for row in r["trials"]
+                         if row["status"] == "completed"
+                         and row["val_loss"] is not None
+                         and row["params"] is not None]
+        pareto = r["pareto_front"]
+        pareto_ids = {row["trial"] for row in pareto}
+        non_pareto_ids = {row["trial"] for row in all_completed} - pareto_ids
+
+        # Verify non-domination: for every Pareto-optimal trial, no other
+        # completed trial dominates it (both strictly better on at least one axis)
+        for p_row in pareto:
+            for other in all_completed:
+                if other["trial"] == p_row["trial"]:
+                    continue
+                both_le = (other["params"] <= p_row["params"]
+                           and other["val_loss"] <= p_row["val_loss"])
+                one_strict = (other["params"] < p_row["params"]
+                              or other["val_loss"] < p_row["val_loss"])
+                assert not (both_le and one_strict), (
+                    f"Pareto trial {p_row['trial']} is dominated by trial {other['trial']}"
+                )
+
+        # Verify every non-Pareto trial IS dominated by at least one other trial
+        for np_id in non_pareto_ids:
+            np_row = next(r for r in all_completed if r["trial"] == np_id)
+            dominated = False
+            for other in all_completed:
+                if other["trial"] == np_id:
+                    continue
+                if (other["params"] <= np_row["params"]
+                        and other["val_loss"] <= np_row["val_loss"]
+                        and (other["params"] < np_row["params"]
+                             or other["val_loss"] < np_row["val_loss"])):
+                    dominated = True
+                    break
+            assert dominated, (
+                f"Non-Pareto trial {np_id} is not dominated by any other trial"
+            )
+
+        # Spot-check expected membership
         assert 0 in pareto_ids
         assert 1 in pareto_ids
+        assert 3 in pareto_ids
         assert 2 not in pareto_ids
+        assert 4 not in pareto_ids
 
 
 # =====================================================================

@@ -95,7 +95,7 @@ def _pack_grid(dense: torch.Tensor) -> torch.Tensor:
 
 class TestComputeLegalMoveRate:
     def test_all_legal_predictions_yields_one(self, cpu_device):
-        """If preds hit legal slots, rate == 1.0."""
+        """If preds hit legal slots at every position, rate == 1.0 exactly."""
         B, T, V = 2, 4, 4284
         max_ply = 4
         # Predict token 1 (grid index 0) at every position
@@ -111,7 +111,11 @@ class TestComputeLegalMoveRate:
         game_lengths = torch.full((B,), T - 1, dtype=torch.long)
 
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
+        # Exactly 1.0: all B*T = 8 positions predict token 1 (grid 0),
+        # and grid slot (0,0) is legal at every ply in every batch element.
         assert rate == pytest.approx(1.0)
+        # Verify the setup is non-trivial: we have positions that were counted
+        assert B * T > 0
 
     def test_all_illegal_predictions_yields_zero(self, cpu_device):
         """If preds miss, rate == 0.0."""
@@ -144,24 +148,27 @@ class TestComputeLegalMoveRate:
         assert rate == 0.0
 
     def test_partial_legal_rate(self, cpu_device):
-        """Mix of legal and illegal preds yields fractional rate."""
-        B, T, V = 2, 2, 4284
-        max_ply = 2
-        # preds[0,:] = token 1 (grid 0), preds[1,:] = token 1 (grid 0)
+        """Exactly K of N positions have legal argmax -> rate == K/N."""
+        B, T, V = 2, 3, 4284
+        max_ply = 3
+        # All positions predict token 1 (grid index 0)
         preds = torch.ones(B, T, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
         dense = torch.zeros(B, max_ply, 64, 64)
-        # Make slot (0,0) legal only for batch 0, all plies
-        dense[0, :, 0, 0] = 1.0
+        # Make slot (0,0) legal at exactly 3 of 6 positions:
+        # batch 0 ply 0, batch 0 ply 1, batch 1 ply 2
+        dense[0, 0, 0, 0] = 1.0
+        dense[0, 1, 0, 0] = 1.0
+        dense[1, 2, 0, 0] = 1.0
         legal_grid = _pack_grid(dense)
 
         loss_mask = torch.ones(B, T, dtype=torch.bool)
         game_lengths = torch.full((B,), T - 1, dtype=torch.long)
 
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
-        # 4 positions total, 2 legal (batch 0, both plies) -> 0.5
-        assert rate == pytest.approx(0.5)
+        # 6 positions total (2 batches x 3 plies), 3 legal -> 3/6 = 0.5
+        assert rate == pytest.approx(3.0 / 6.0)
 
     def test_pad_token_predictions_are_not_counted_legal(self, cpu_device):
         """PAD token (0) is outside grid and promo ranges — always illegal."""

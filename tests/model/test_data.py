@@ -280,11 +280,23 @@ class TestStripOutcomeToken:
 
     @pytest.mark.unit
     def test_loss_mask_one_fewer_true(self, packed):
-        """strip should decrement loss_mask count by 1."""
+        """strip should decrement loss_mask count by 1 via a left-shift."""
         orig_count = packed["loss_mask"].sum().item()
         stripped = strip_outcome_token(packed)
         strip_count = stripped["loss_mask"].sum().item()
         assert strip_count == orig_count - 1
+
+        # The remaining mask must be a left-shifted version of the original:
+        # stripped[:, i] == packed[:, i+1] for i in 0..T-2,
+        # and the last position is always False (padding).
+        T = stripped["loss_mask"].shape[1]
+        assert torch.equal(
+            stripped["loss_mask"][:, : T - 1],
+            packed["loss_mask"][:, 1:T],
+        ), "stripped loss_mask[:, :-1] is not a left-shift of original[:, 1:]"
+        assert not stripped["loss_mask"][:, -1].any(), (
+            "last position of stripped loss_mask should be False"
+        )
 
 
 # ---------------------------------------------------------------------------

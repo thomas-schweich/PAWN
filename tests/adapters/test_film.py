@@ -188,21 +188,44 @@ class TestFiLMCLMConfig:
             out = model(toy_input_ids, toy_attention_mask)
         torch.testing.assert_close(out, bare, atol=1e-5, rtol=1e-5)
 
-    def test_weight_report_init_values(self, toy_backbone):
+    def test_weight_report_init_values(self, toy_backbone, toy_clm_config):
         model = FiLMCLM(toy_backbone)
         rep = model.film_weight_report()
+        # Report must be non-empty — a vacuous loop would hide bugs.
+        assert len(rep) > 0, "weight report is empty"
+        # Expect gamma_dev and beta_norm for every hidden layer (output_film
+        # defaults to on, so include those too).
+        expected_keys = set()
+        for i in range(toy_clm_config.n_layers):
+            expected_keys.add(f"hidden_{i}/gamma_dev")
+            expected_keys.add(f"hidden_{i}/beta_norm")
+        if model.output_film is not None:
+            expected_keys.add("output/gamma_dev")
+            expected_keys.add("output/beta_norm")
+        assert set(rep.keys()) == expected_keys, (
+            f"unexpected report keys: {set(rep.keys())} != {expected_keys}"
+        )
         # At init: all gamma_dev and beta_norm values should be 0
         for k, v in rep.items():
             assert v == 0.0, f"{k} should be zero at init, got {v}"
 
-    def test_weight_report_after_perturb(self, toy_backbone):
+    def test_weight_report_after_perturb(self, toy_backbone, toy_clm_config):
+        import math
         model = FiLMCLM(toy_backbone)
         for film in model.hidden_films:
             film.gamma.data += 0.5
         rep = model.film_weight_report()
+        # gamma_dev = (gamma - 1.0).norm() = norm of a vector of 0.5s with
+        # d_model elements = sqrt(d_model * 0.25) = sqrt(d_model) / 2
+        expected_gamma_dev = math.sqrt(toy_clm_config.d_model) * 0.5
         for k, v in rep.items():
             if "gamma_dev" in k and "hidden" in k:
-                assert v > 0.0
+                assert v == pytest.approx(expected_gamma_dev, abs=1e-5), (
+                    f"{k}: expected {expected_gamma_dev}, got {v}"
+                )
+            elif "beta_norm" in k and "hidden" in k:
+                # beta was not perturbed — should still be 0.0
+                assert v == 0.0, f"{k} should be zero, got {v}"
 
     def test_cfg_property(self, toy_backbone, toy_clm_config):
         model = FiLMCLM(toy_backbone)

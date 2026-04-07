@@ -235,20 +235,29 @@ mod tests {
     fn test_quota_never_exceeded() {
         // Quota should be an upper bound: filled[i] <= quotas[i] for every bit.
         let mut quotas_white = [0i32; 64];
-        let quotas_black = [0i32; 64];
+        let mut quotas_black = [0i32; 64];
         quotas_white[0] = 5;   // IN_CHECK white
         quotas_white[5] = 3;   // PAWN_CAPTURE_AVAILABLE white
+        quotas_black[0] = 4;   // IN_CHECK black
+        quotas_black[5] = 2;   // PAWN_CAPTURE_AVAILABLE black
 
         let output = generate_diagnostic_sets(
-            &quotas_white, &quotas_black, 20, 256, 42, 50.0,
+            &quotas_white, &quotas_black, 30, 256, 42, 50.0,
         );
 
         for i in 0..64 {
             assert!(output.quotas_filled_white[i] <= quotas_white[i],
-                "white quota {} exceeded: filled={} quota={}", i, output.quotas_filled_white[i], quotas_white[i]);
+                "white quota bit {} exceeded: filled={} > requested={}",
+                i, output.quotas_filled_white[i], quotas_white[i]);
             assert!(output.quotas_filled_black[i] <= quotas_black[i],
-                "black quota {} exceeded", i);
+                "black quota bit {} exceeded: filled={} > requested={}",
+                i, output.quotas_filled_black[i], quotas_black[i]);
         }
+
+        // Verify the test is non-vacuous: at least some quotas were actually filled.
+        let total_filled: i32 = output.quotas_filled_white.iter().sum::<i32>()
+            + output.quotas_filled_black.iter().sum::<i32>();
+        assert!(total_filled > 0, "test is vacuous: no quotas were filled at all");
     }
 
     #[test]

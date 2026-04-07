@@ -512,8 +512,31 @@ mod tests {
     #[test]
     fn test_training_batch_termination_codes_in_range() {
         let batch = generate_training_batch(8, 256, 42);
-        for &code in &batch.termination_codes {
-            assert!(code <= 5, "Termination code {} out of range", code);
+        // All six Termination enum discriminants
+        let valid_discriminants: [u8; 6] = [
+            Termination::Checkmate.as_u8(),          // 0
+            Termination::Stalemate.as_u8(),          // 1
+            Termination::SeventyFiveMoveRule.as_u8(), // 2
+            Termination::FivefoldRepetition.as_u8(),  // 3
+            Termination::InsufficientMaterial.as_u8(), // 4
+            Termination::PlyLimit.as_u8(),            // 5
+        ];
+        for (b, &code) in batch.termination_codes.iter().enumerate() {
+            assert!(
+                valid_discriminants.contains(&code),
+                "Game {}: termination code {} is not a valid Termination discriminant (expected one of {:?})",
+                b, code, valid_discriminants
+            );
+            // Also verify the round-trip: code maps back to a known variant
+            let _variant = match code {
+                0 => Termination::Checkmate,
+                1 => Termination::Stalemate,
+                2 => Termination::SeventyFiveMoveRule,
+                3 => Termination::FivefoldRepetition,
+                4 => Termination::InsufficientMaterial,
+                5 => Termination::PlyLimit,
+                other => panic!("Game {}: unmapped termination code {}", b, other),
+            };
         }
     }
 
@@ -569,10 +592,45 @@ mod tests {
 
     #[test]
     fn test_random_games_termination_codes_match_games() {
+        use crate::board::GameState;
         let batch = generate_random_games(16, 256, 42, 0.0, false);
         for b in 0..16 {
             let code = batch.termination_codes[b];
-            assert!(code <= 5);
+            // Basic range check
+            assert!(code <= 5, "Termination code {} out of range", code);
+
+            // Replay the game and verify the termination code matches the actual terminal state
+            let gl = batch.game_lengths[b] as usize;
+            let move_tokens: Vec<u16> = (0..gl)
+                .map(|t| batch.move_ids[b * 256 + t] as u16)
+                .collect();
+            let state = GameState::from_move_tokens(&move_tokens)
+                .expect("replay should succeed");
+            let actual_term = state.check_termination(256)
+                .expect("replayed game should be terminal");
+            assert_eq!(
+                actual_term.as_u8(), code,
+                "Game {}: replayed termination {:?} (={}) != reported code {}",
+                b, actual_term, actual_term.as_u8(), code
+            );
+
+            // Additionally verify the termination semantics match the board state
+            match actual_term {
+                Termination::Checkmate => {
+                    assert!(state.is_check(), "Game {}: checkmate requires check", b);
+                    assert!(state.legal_move_tokens().is_empty(),
+                        "Game {}: checkmate requires no legal moves", b);
+                }
+                Termination::Stalemate => {
+                    assert!(!state.is_check(), "Game {}: stalemate must not be check", b);
+                    assert!(state.legal_move_tokens().is_empty(),
+                        "Game {}: stalemate requires no legal moves", b);
+                }
+                Termination::PlyLimit => {
+                    assert_eq!(gl, 256, "Game {}: PlyLimit should have gl=max_ply", b);
+                }
+                _ => {} // draw rules checked internally by check_termination
+            }
         }
     }
 

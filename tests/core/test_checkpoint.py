@@ -196,14 +196,24 @@ class TestCompleteSentinel:
         d = tmp_path / "ckpt"
         d.mkdir()
         (d / "a.txt").write_text("alpha")
+        (d / "b.bin").write_bytes(b"\x00\x01")
         (d / "subdir").mkdir()
         (d / "subdir" / "inner.txt").write_text("inner")
 
         _write_complete_sentinel(d)
         data = json.loads((d / ".complete").read_text())
-        assert "a.txt" in data["files"]
-        assert "subdir" not in data["files"]
-        assert "inner.txt" not in data["files"]
+
+        # Top-level files ARE recorded in the sentinel
+        assert "a.txt" in data["files"], "top-level file a.txt missing from sentinel"
+        assert "b.bin" in data["files"], "top-level file b.bin missing from sentinel"
+
+        # Subdirectory and its contents are NOT recorded
+        assert "subdir" not in data["files"], "subdir should not appear in sentinel"
+        assert "inner.txt" not in data["files"], "subdir file should not appear"
+        assert "subdir/inner.txt" not in data["files"], "subdir path should not appear"
+
+        # Sentinel is still verifiable (subdir doesn't interfere)
+        _verify_complete_sentinel(d)
 
 
 # ---------------------------------------------------------------------------

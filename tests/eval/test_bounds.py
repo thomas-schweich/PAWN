@@ -38,6 +38,14 @@ def bounds(corpus_dir: Path) -> dict:
 
 
 class TestComputeTheoreticalBounds:
+    @staticmethod
+    def _corpus_for_seed(seed: int):
+        """Generate a small corpus with a given seed, returning the directory."""
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        generate_corpus(output_dir=d, n_games=16, max_ply=32, seed=seed, batch_size=16)
+        return d
+
     @pytest.mark.unit
     def test_returns_expected_keys(self, bounds: dict):
         for key in ("n_positions", "top1_accuracy", "top5_accuracy",
@@ -68,6 +76,24 @@ class TestComputeTheoreticalBounds:
     def test_top5_dominates_top1(self, bounds: dict):
         # top-5 accuracy must be >= top-1 accuracy
         assert bounds["top5_accuracy"]["value"] >= bounds["top1_accuracy"]["value"]
+        # With real chess positions, there are always positions with >1 legal move,
+        # so top-5 should be strictly greater than top-1.
+        assert bounds["top5_accuracy"]["value"] > bounds["top1_accuracy"]["value"], (
+            "top-5 should strictly dominate top-1 when positions with >1 legal move exist"
+        )
+
+    @pytest.mark.unit
+    def test_top5_dominates_top1_across_seeds(self):
+        """Verify top5 >= top1 across multiple independently-seeded corpora."""
+        for seed in (1, 17, 99):
+            d = self._corpus_for_seed(seed)
+            corpus = load_corpus(d)
+            b = compute_theoretical_bounds(corpus)
+            assert b["top5_accuracy"]["value"] > b["top1_accuracy"]["value"], (
+                f"top5 should strictly dominate top1 for seed={seed}"
+            )
+            assert math.isfinite(b["top5_accuracy"]["value"])
+            assert math.isfinite(b["top1_accuracy"]["value"])
 
     @pytest.mark.unit
     def test_loss_nats_positive(self, bounds: dict):

@@ -281,10 +281,15 @@ class TestSparseForward:
 
 class TestEvaluate:
     def test_empty_dataloader_returns_zeros(self, cpu_device):
-        """Evaluate with an empty loader returns a zero-filled metrics dict."""
+        """Evaluate with an empty loader returns a zero-filled metrics dict.
+
+        This calls the real evaluate function (not mocked) with an empty
+        iterator, verifying the zero-position early-return path.
+        """
         from pawn.adapter_training import evaluate
 
-        model = _StubWrapper(4, 8, 2).to(cpu_device)
+        B, T, V, D = 1, 2, 8, 4
+        model = _StubWrapper(D, V, T).to(cpu_device)
         mask_builder = MagicMock()
 
         class _EmptyLoader:
@@ -292,11 +297,28 @@ class TestEvaluate:
                 return iter([])
 
         metrics = evaluate(model, _EmptyLoader(), mask_builder, cpu_device)
-        assert metrics == {
-            "loss": 0.0,
-            "top1_accuracy": 0.0,
-            "top5_accuracy": 0.0,
+        # With zero batches, all metrics should be exactly 0.0
+        assert metrics["loss"] == 0.0
+        assert metrics["top1_accuracy"] == 0.0
+        assert metrics["top5_accuracy"] == 0.0
+
+        # Contrast with a non-empty loader: verify the function returns
+        # non-trivial (non-zero) values when given real data.
+        legal_mask = torch.ones(B, T, V, dtype=torch.bool, device=cpu_device)
+        mask_builder.scatter.return_value = legal_mask
+        ids = torch.zeros(B, T, dtype=torch.long)
+        tgt = torch.zeros(B, T, dtype=torch.long)
+        msk = torch.ones(B, T, dtype=torch.bool)
+        batch = {
+            "input_ids": ids, "targets": tgt, "loss_mask": msk,
+            "legal_indices": torch.zeros(B, T, dtype=torch.long),
         }
+        metrics_nonempty = evaluate(model, [batch], mask_builder, cpu_device)
+        # Loss should be positive (cross-entropy of a random model)
+        assert metrics_nonempty["loss"] > 0.0
+        # Accuracy should be in [0, 1] and at least one key differs from 0
+        assert 0.0 <= metrics_nonempty["top1_accuracy"] <= 1.0
+        assert 0.0 <= metrics_nonempty["top5_accuracy"] <= 1.0
 
     def test_returns_required_keys(self, cpu_device):
         """With a synthetic 1-batch loader, evaluate returns loss/top1/top5."""

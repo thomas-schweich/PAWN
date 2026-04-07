@@ -649,6 +649,37 @@ mod tests {
         // Each sentinel should be a legal move token (not PAD)
         assert_ne!(sent[0], crate::vocab::PAD_TOKEN);
         assert_ne!(sent[1], crate::vocab::PAD_TOKEN);
+
+        // Verify each sentinel token is actually a legal move in the corresponding game
+        // by checking it appears in get_legal_token_masks_batch.
+        let vocab_size = crate::vocab::VOCAB_SIZE;
+        let masks = env.get_legal_token_masks_batch(&[0, 1], vocab_size);
+        for (bi, &tok) in sent.iter().enumerate() {
+            let idx = bi * vocab_size + tok as usize;
+            assert!(
+                masks[idx],
+                "sentinel token {} for game {} is not marked as legal in get_legal_token_masks_batch",
+                tok, bi
+            );
+        }
+
+        // Also test after making a move (different position), sentinels are still legal
+        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let _ = env.apply_moves(&[0], &[e2e4]);
+        let sent_after = env.get_sentinel_tokens(&[0, 1]);
+        let masks_after = env.get_legal_token_masks_batch(&[0, 1], vocab_size);
+        for (bi, &tok) in sent_after.iter().enumerate() {
+            let idx = bi * vocab_size + tok as usize;
+            assert!(
+                masks_after[idx],
+                "post-move sentinel token {} for game {} is not legal",
+                tok, bi
+            );
+        }
+        // Game 0 now has black to move — sentinel should differ from game 1 (still white to move)
+        // (different positions should generally yield different sentinels, though not guaranteed)
+        assert_ne!(sent_after[0], crate::vocab::PAD_TOKEN);
+        assert_ne!(sent_after[1], crate::vocab::PAD_TOKEN);
     }
 
     #[test]

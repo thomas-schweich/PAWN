@@ -304,9 +304,14 @@ class TestLoRAWeightReport:
         for val in rep.values():
             assert isinstance(val, float)
 
-    def test_report_B_zero_at_init(self, toy_backbone):
-        model = LoRACLM(toy_backbone, rank=4)
+    def test_report_B_zero_at_init(self, toy_backbone, toy_clm_config):
+        model = LoRACLM(toy_backbone, rank=4, attn_targets="qkvo")
         rep = model.lora_weight_report()
-        for k, v in rep.items():
-            if k.endswith(".B"):
-                assert v == 0.0
+        b_keys = [k for k in rep if k.endswith(".B")]
+        # 2 layers × 4 projections (Q, K, V, O) = 8 B entries
+        expected_count = toy_clm_config.n_layers * 4
+        assert len(b_keys) == expected_count, (
+            f"expected {expected_count} B keys, got {len(b_keys)}: {b_keys}"
+        )
+        for k in b_keys:
+            assert rep[k] == 0.0, f"{k} should be 0.0 at init, got {rep[k]}"
