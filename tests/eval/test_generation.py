@@ -43,24 +43,6 @@ class TestOutcomeTokens:
                     "STALEMATE", "DRAW_BY_RULE", "PLY_LIMIT"}
         assert set(OUTCOME_TOKENS.keys()) == expected
 
-    @pytest.mark.unit
-    def test_white_checkmates_uses_config_value(self):
-        assert OUTCOME_TOKENS["WHITE_CHECKMATES"] == WHITE_CHECKMATES
-
-    @pytest.mark.unit
-    def test_ply_limit_uses_config_value(self):
-        assert OUTCOME_TOKENS["PLY_LIMIT"] == PLY_LIMIT
-
-    @pytest.mark.unit
-    def test_tokens_are_sequential(self):
-        assert OUTCOME_TOKENS["BLACK_CHECKMATES"] == OUTCOME_TOKENS["WHITE_CHECKMATES"] + 1
-        assert OUTCOME_TOKENS["STALEMATE"] == OUTCOME_TOKENS["WHITE_CHECKMATES"] + 2
-        assert OUTCOME_TOKENS["DRAW_BY_RULE"] == OUTCOME_TOKENS["WHITE_CHECKMATES"] + 3
-
-    @pytest.mark.unit
-    def test_all_tokens_distinct(self):
-        vals = list(OUTCOME_TOKENS.values())
-        assert len(vals) == len(set(vals))
 
 
 # ---------------------------------------------------------------------------

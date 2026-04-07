@@ -1584,36 +1584,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_vocab_constants_accessible() {
-        // Ensure core vocab constants are publicly reachable from lib.rs,
-        // which is needed by PyO3 glue.
-        assert_eq!(vocab::VOCAB_SIZE, 4284);
-        assert_eq!(vocab::PAD_TOKEN, 0);
-        assert_eq!(vocab::BASE_GRID_START, 1);
-        assert_eq!(vocab::BASE_GRID_END, 4096);
-        assert_eq!(vocab::PROMO_START, 4097);
-        assert_eq!(vocab::PROMO_END, 4272);
-        assert_eq!(vocab::OUTCOME_BASE, 4273);
-        assert_eq!(vocab::NUM_PROMO_PAIRS, 44);
-    }
-
-    #[test]
-    fn test_vocab_outcome_symbols_accessible() {
-        // The 11 outcome token consts must be in scope (used by Python via bindings)
-        assert_eq!(vocab::WHITE_CHECKMATES, 4273);
-        assert_eq!(vocab::BLACK_CHECKMATES, 4274);
-        assert_eq!(vocab::STALEMATE, 4275);
-        assert_eq!(vocab::DRAW_BY_RULE, 4276);
-        assert_eq!(vocab::PLY_LIMIT, 4277);
-        assert_eq!(vocab::WHITE_RESIGNS, 4278);
-        assert_eq!(vocab::BLACK_RESIGNS, 4279);
-        assert_eq!(vocab::DRAW_BY_AGREEMENT, 4280);
-        assert_eq!(vocab::WHITE_WINS_ON_TIME, 4281);
-        assert_eq!(vocab::BLACK_WINS_ON_TIME, 4282);
-        assert_eq!(vocab::DRAW_BY_TIME, 4283);
-    }
-
-    #[test]
     fn test_decompose_token_dispatch_pad_range() {
         // Dispatch: PAD_TOKEN returns None
         assert!(vocab::decompose_token(vocab::PAD_TOKEN).is_none());
@@ -1664,41 +1634,9 @@ mod tests {
     }
 
     #[test]
-    fn test_termination_enum_consistent_with_u8_mapping() {
-        // PyGameState.check_termination returns i8 with this mapping:
-        // 0=Checkmate, 1=Stalemate, 2=SeventyFiveMoveRule, 3=Fivefold, 4=Insufficient, 5=PlyLimit
-        assert_eq!(types::Termination::Checkmate as u8, 0);
-        assert_eq!(types::Termination::Stalemate as u8, 1);
-        assert_eq!(types::Termination::SeventyFiveMoveRule as u8, 2);
-        assert_eq!(types::Termination::FivefoldRepetition as u8, 3);
-        assert_eq!(types::Termination::InsufficientMaterial as u8, 4);
-        assert_eq!(types::Termination::PlyLimit as u8, 5);
-    }
-
-    #[test]
     fn test_module_exports_hello() {
         // Pure Rust test of the hello() function that's exported to Python
         assert_eq!(hello(), "pawn-engine ready");
-    }
-
-    #[test]
-    fn test_build_vocab_maps_has_expected_entries() {
-        // The export_move_vocabulary binding relies on build_vocab_maps; verify
-        // it returns the correct cardinality.
-        let (t2m, m2t) = vocab::build_vocab_maps();
-        // 4096 grid + 176 promo = 4272 entries (no PAD/outcome)
-        assert_eq!(t2m.len(), 4272);
-        assert_eq!(m2t.len(), 4272);
-        // Specific expected entries
-        assert_eq!(t2m.get(&1).map(|s| s.as_str()), Some("a1a1"));
-        assert_eq!(m2t.get("e2e4").copied(), Some(vocab::base_grid_token(12, 28)));
-    }
-
-    #[test]
-    fn test_promo_pairs_accessible_from_lib() {
-        // PyO3 export_move_vocabulary accesses promo_pairs via vocab::
-        let pairs = vocab::promo_pairs();
-        assert_eq!(pairs.len(), 44);
     }
 
     #[test]

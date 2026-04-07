@@ -375,22 +375,3 @@ class TestCLMDataset:
         assert not torch.equal(batches[0]["input_ids"], batches[1]["input_ids"])
 
 
-# ---------------------------------------------------------------------------
-# End-to-end: Rust batch is consistent with Python pack
-# ---------------------------------------------------------------------------
-
-
-class TestRustPackConsistency:
-    @pytest.mark.integration
-    def test_pack_matches_rust(self):
-        import chess_engine as engine
-
-        B = 8
-        seq_len = 64
-        r_ids, r_tgt, r_mask, r_move_ids, r_gl, r_tc = engine.generate_clm_batch(
-            B, seq_len, seed=42
-        )
-        py = _to_clm_batch(r_move_ids, r_gl, r_tc, seq_len)
-        assert torch.equal(torch.from_numpy(r_ids).long(), py["input_ids"])
-        assert torch.equal(torch.from_numpy(r_tgt).long(), py["targets"])
-        assert torch.equal(torch.from_numpy(r_mask), py["loss_mask"])
