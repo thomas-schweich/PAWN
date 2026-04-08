@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 import chess_engine as engine
 
-from pawn.config import PAD_TOKEN, WHITE_CHECKMATES, PLY_LIMIT, CLMConfig
+from pawn.config import PAD_TOKEN, WHITE_CHECKMATES, PLY_LIMIT, CLMConfig, LegacyVocab
 from pawn.data import _map_termination_to_outcome
 
 
@@ -108,7 +108,7 @@ def _generate_batch(
     temperature: float,
 ) -> dict[str, np.ndarray]:
     """Generate a batch of games using batch Rust engine for state management."""
-    cfg_vocab_size = CLMConfig.vocab_size  # 4278
+    cfg_vocab_size = getattr(model, 'cfg', CLMConfig()).vocab_size
     max_move_positions = max_seq_len - 1  # position 0 is outcome token
 
     # Initialize sequences with outcome token
