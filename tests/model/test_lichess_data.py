@@ -270,7 +270,7 @@ class TestLegalMaskCollate:
         B = 2
         seq_len = 32
         move_ids, gl, _tc = engine.generate_random_games(B, seq_len - 1, seed=42)
-        collate = LegalMaskCollate(seq_len=seq_len, vocab_size=4278)
+        collate = LegalMaskCollate(seq_len=seq_len)
 
         items = [
             {

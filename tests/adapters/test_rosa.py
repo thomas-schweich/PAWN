@@ -254,8 +254,8 @@ class TestRoSACLM:
             masks[key] = torch.rand(d_model, d_model) > 0.99
         model.set_masks(masks)
 
-        input_ids = torch.randint(1, 4273, (2, 8))
-        targets = torch.randint(1, 4273, (2, 8))
+        input_ids = torch.randint(0, 1968, (2, 8))
+        targets = torch.randint(0, 1968, (2, 8))
         hidden = model.forward_hidden(input_ids)
         logits = model.project_head(hidden)
         loss = torch.nn.functional.cross_entropy(
@@ -324,8 +324,8 @@ class TestRetroBottleneckCLM:
         sparse_model = SparseCLM(toy_backbone, density=0.01)
         model = RetroBottleneckCLM(sparse_model.backbone, bottleneck_dim=4)
 
-        input_ids = torch.randint(1, 4273, (2, 8))
-        targets = torch.randint(1, 4273, (2, 8))
+        input_ids = torch.randint(0, 1968, (2, 8))
+        targets = torch.randint(0, 1968, (2, 8))
         hidden = model.forward_hidden(input_ids)
         logits = model.project_head(hidden)
         loss = torch.nn.functional.cross_entropy(
@@ -348,8 +348,8 @@ class TestGenerateGradientMasks:
         batches = []
         for _ in range(4):
             B, T = 4, 32
-            ids = torch.randint(1, 4273, (B, T))
-            tgt = torch.randint(1, 4273, (B, T))
+            ids = torch.randint(0, 1968, (B, T))
+            tgt = torch.randint(0, 1968, (B, T))
             msk = torch.ones(B, T, dtype=torch.bool)
             # Simple legal mask -- all True (no illegal moves)
             batches.append({
@@ -384,7 +384,7 @@ class TestGenerateGradientMasks:
         # Train LoRA for a few steps to build up signal
         optimizer = torch.optim.Adam(model.lora_parameters(), lr=1e-3)
         for _ in range(10):
-            ids = torch.randint(1, 4273, (4, 16))
+            ids = torch.randint(0, 1968, (4, 16))
             logits = model.forward(ids)
             loss = logits.sum()
             optimizer.zero_grad()
@@ -394,8 +394,8 @@ class TestGenerateGradientMasks:
         batches = []
         for _ in range(4):
             batches.append({
-                "input_ids": torch.randint(1, 4273, (4, 16)),
-                "targets": torch.randint(1, 4273, (4, 16)),
+                "input_ids": torch.randint(0, 1968, (4, 16)),
+                "targets": torch.randint(0, 1968, (4, 16)),
                 "loss_mask": torch.ones(4, 16, dtype=torch.bool),
             })
 
@@ -414,8 +414,8 @@ class TestGenerateGradientMasks:
         model = RoSACLM(toy_backbone, rank=4, attn_targets="qv")
 
         batches = [{
-            "input_ids": torch.randint(1, 4273, (2, 8)),
-            "targets": torch.randint(1, 4273, (2, 8)),
+            "input_ids": torch.randint(0, 1968, (2, 8)),
+            "targets": torch.randint(0, 1968, (2, 8)),
             "loss_mask": torch.ones(2, 8, dtype=torch.bool),
         }]
 

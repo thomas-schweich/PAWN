@@ -90,7 +90,8 @@ class SpecializedCLM(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
-        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN)
+        pad_idx = PAD_TOKEN if vocab_size > PAD_TOKEN else None
+        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
         self.layers = nn.ModuleList([
             _Block(d_model, n_heads, d_ff) for _ in range(n_layers)
         ])

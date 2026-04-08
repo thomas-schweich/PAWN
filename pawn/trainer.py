@@ -79,33 +79,42 @@ class CosineWithWarmup:
         self._apply_lr(self._step)
 
 
-def _build_promo_grid_index() -> list[int]:
-    """Build a mapping from promotion token to grid index (src*64 + dst).
+def _build_action_grid_index() -> list[int]:
+    """Build a mapping from action token to grid index (src*64 + dst).
 
-    Promotion tokens 4097..4272 encode 44 (src, dst) pairs x 4 piece types.
-    Token layout: PROMO_START + pair_idx * 4 + promo_type.
+    For the searchless_chess vocab, each action token 0..1967 maps to a
+    (src, dst) square pair via the engine's vocabulary export.  Multiple
+    actions can map to the same grid cell (e.g. promotions to different
+    piece types from the same square pair).
     """
     import chess_engine
     vocab = chess_engine.export_move_vocabulary()
-    promo_pairs = vocab["promo_pairs"]  # list of (src, dst) tuples, len=44
-    # For each of the 176 promo tokens, compute src*64+dst
+    token_to_move = vocab["token_to_move"]  # dict: int -> UCI string
+    square_names = vocab["square_names"]    # list of 64 square names
+    name_to_idx = {name: i for i, name in enumerate(square_names)}
+
+    from pawn.config import NUM_ACTIONS
     grid_indices = []
-    for src, dst in promo_pairs:
-        grid_idx = src * 64 + dst
-        grid_indices.extend([grid_idx] * 4)  # 4 piece types per pair
+    for action in range(NUM_ACTIONS):
+        uci = token_to_move[action]
+        src_name = uci[:2]
+        dst_name = uci[2:4]
+        src_sq = name_to_idx[src_name]
+        dst_sq = name_to_idx[dst_name]
+        grid_indices.append(src_sq * 64 + dst_sq)
     return grid_indices
 
 
 # Lazily initialized on first use
-_PROMO_GRID_INDEX: list[int] | None = None
+_ACTION_GRID_INDEX: list[int] | None = None
 
 
-def _get_promo_grid_index(device: str | torch.device) -> torch.Tensor:
-    """Get the promo-token-to-grid-index mapping as a tensor on the given device."""
-    global _PROMO_GRID_INDEX
-    if _PROMO_GRID_INDEX is None:
-        _PROMO_GRID_INDEX = _build_promo_grid_index()
-    return torch.tensor(_PROMO_GRID_INDEX, dtype=torch.long, device=device)
+def _get_action_grid_index(device: str | torch.device) -> torch.Tensor:
+    """Get the action-token-to-grid-index mapping as a tensor on the given device."""
+    global _ACTION_GRID_INDEX
+    if _ACTION_GRID_INDEX is None:
+        _ACTION_GRID_INDEX = _build_action_grid_index()
+    return torch.tensor(_ACTION_GRID_INDEX, dtype=torch.long, device=device)
 
 
 def compute_legal_move_rate(
@@ -133,23 +142,24 @@ def compute_legal_move_rate_from_preds(
 ) -> float:
     """Compute fraction of argmax predictions that are legal moves.
 
-    Evaluated at positions 0 through game_lengths (inclusive), matching the
-    loss_mask semantics (which includes the end-of-game PAD prediction).
+    Evaluated at positions where loss_mask is True, intersected with the
+    ply range [min_ply, max_ply_limit).
 
     Args:
-        preds: (B, T) argmax token predictions
+        preds: (B, T) argmax token predictions (action tokens 0..1967)
         legal_grid: (B, max_ply, 64) bit-packed legal moves from engine
         loss_mask: (B, T) bool
         game_lengths: (B,) int
         min_ply: inclusive lower bound on the ply range (default 0)
         max_ply_limit: exclusive upper bound on the ply range (default None = all)
     """
+    from pawn.config import NUM_ACTIONS
+
     B, T = preds.shape
     max_ply = legal_grid.shape[1]
 
     with torch.no_grad():
-        move_mask = torch.arange(T, device=preds.device).unsqueeze(0) <= game_lengths.unsqueeze(1)
-        move_mask = move_mask & loss_mask
+        move_mask = loss_mask.clone()
 
         if not move_mask.any():
             return 0.0
@@ -163,8 +173,8 @@ def compute_legal_move_rate_from_preds(
         valid_count = 0
         legal_acc = torch.tensor(0, dtype=torch.long, device=preds.device)
 
-        # Promo token -> grid index lookup (lazily built, cached)
-        promo_grid_idx = _get_promo_grid_index(preds.device)  # (176,)
+        # Action token -> grid index lookup (lazily built, cached)
+        action_grid_idx = _get_action_grid_index(preds.device)  # (NUM_ACTIONS,)
 
         for p in range(min_ply, upper):
             pos_mask = move_mask[:, p]  # (B,)
@@ -176,21 +186,14 @@ def compute_legal_move_rate_from_preds(
             n = len(batch_preds)
             arange_n = torch.arange(n, device=preds.device)
 
-            # Base grid tokens (1-4096): grid index = token - 1
-            is_base = (batch_preds >= 1) & (batch_preds <= 4096)
-            base_idx = (batch_preds - 1).clamp(0, 4095)
-            base_legal = batch_legal[arange_n, base_idx] > 0.5
-            legal_base = is_base & base_legal
-
-            # Promotion tokens (4097-4272): look up the (src, dst) grid index
-            is_promo = (batch_preds >= 4097) & (batch_preds <= 4272)
-            promo_offset = (batch_preds - 4097).clamp(0, 175)
-            promo_grid = promo_grid_idx[promo_offset]  # (N,) grid index per pred
-            promo_legal = batch_legal[arange_n, promo_grid] > 0.5
-            legal_promo = is_promo & promo_legal
+            # Action tokens (0..NUM_ACTIONS-1): look up grid index
+            is_action = batch_preds < NUM_ACTIONS
+            grid_idx = action_grid_idx[batch_preds.clamp(0, NUM_ACTIONS - 1)]
+            action_legal = batch_legal[arange_n, grid_idx] > 0.5
+            legal_action = is_action & action_legal
 
             valid_count += n
-            legal_acc += legal_base.sum() + legal_promo.sum()
+            legal_acc += legal_action.sum()
 
         if valid_count == 0:
             return 0.0

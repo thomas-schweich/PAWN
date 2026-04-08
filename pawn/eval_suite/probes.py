@@ -276,7 +276,7 @@ def _extract_hidden_states(
     device: str,
     layer_idx: int,
     max_batch: int = 64,
-    no_outcome_token: bool = False,
+    no_outcome_token: bool = True,
     use_amp: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract hidden states at one layer for all valid positions.
@@ -284,9 +284,9 @@ def _extract_hidden_states(
     Uses early-stop forward: only computes transformer layers up to
     layer_idx, avoiding wasted compute and GPU memory for later layers.
 
-    When no_outcome_token=True, strips the outcome token from position 0
-    before feeding to the model (which was trained without it) and adjusts
-    the position offset accordingly.
+    When no_outcome_token=True (default), moves start at position 0 and
+    ply_offset is 0. When False, position 0 is an outcome token and
+    moves start at position 1.
 
     Args:
         use_amp: use float16 autocast for the forward pass (GPU only).
@@ -302,9 +302,6 @@ def _extract_hidden_states(
     d_model = model.cfg.d_model
 
     if no_outcome_token:
-        # Strip outcome token at position 0; moves start at position 0 now
-        input_ids = input_ids[:, 1:]
-        loss_mask = loss_mask[:, 1:]
         ply_offset = 0  # moves are at positions 0..max_ply-1
     else:
         ply_offset = 1  # moves are at positions 1..max_ply (position 0 is outcome)
@@ -351,7 +348,7 @@ def _extract_all_hidden_states(
     data: dict,
     device: str,
     max_batch: int = 64,
-    no_outcome_token: bool = False,
+    no_outcome_token: bool = True,
     use_amp: bool = False,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
     """Extract hidden states at ALL layers via a single forward pass.
@@ -376,8 +373,6 @@ def _extract_all_hidden_states(
     n_out_layers = model.cfg.n_layers + 1
 
     if no_outcome_token:
-        input_ids = input_ids[:, 1:]
-        loss_mask = loss_mask[:, 1:]
         ply_offset = 0
     else:
         ply_offset = 1
@@ -624,7 +619,7 @@ def train_single_probe(
     lr: float = 1e-3,
     batch_size: int = 256,
     layer_idx: int = -1,
-    no_outcome_token: bool = False,
+    no_outcome_token: bool = True,
 ) -> dict:
     """Train a single probe (extracts hidden states internally).
 
@@ -882,7 +877,7 @@ def train_all_probes(
     lr: float = 1e-3,
     probe_names: list[str] | None = None,
     verbose: bool = True,
-    no_outcome_token: bool = False,
+    no_outcome_token: bool = True,
     use_amp: bool = False,
 ) -> dict:
     """Train all probes across all layers.

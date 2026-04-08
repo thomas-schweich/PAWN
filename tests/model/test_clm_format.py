@@ -3,6 +3,16 @@
 Migrated from tests/test_clm_format.py. Covers vocabulary consistency, Rust
 CLM batch invariants, Rust/Python parity, boundary cases, and strip_outcome_token
 applied to engine output.
+
+The engine's ``generate_clm_batch()`` supports two modes:
+
+- **Default** (``prepend_outcome=False``): sequences are pure moves
+  ``[m1, m2, ..., mN, PAD, ...]`` with ``max_ply = seq_len``.
+- **Outcome-prepended** (``prepend_outcome=True``): sequences are
+  ``[outcome, m1, ..., mN, PAD, ...]`` with ``max_ply = seq_len - 1``.
+
+``_to_clm_batch`` (from ``pawn.data``) always prepends outcome tokens, so
+consistency tests between Rust and Python use ``prepend_outcome=True``.
 """
 
 from __future__ import annotations
@@ -16,6 +26,7 @@ import chess_engine as engine
 from pawn.config import (
     BLACK_CHECKMATES,
     DRAW_BY_RULE,
+    NUM_ACTIONS,
     OUTCOME_TOKEN_BASE,
     PAD_TOKEN,
     PLY_LIMIT,
@@ -40,9 +51,10 @@ class TestVocabConsistency:
     def test_vocab_size(self):
         vocab = engine.export_move_vocabulary()
         n_moves = len(vocab["token_to_move"])
-        assert n_moves == 4272
+        assert n_moves == NUM_ACTIONS  # 1968 actions [0, 1967]
         from pawn.config import CLMConfig, N_TOTAL_OUTCOMES
-        assert CLMConfig().vocab_size == 1 + n_moves + N_TOTAL_OUTCOMES
+        # Layout: 1968 actions + 1 PAD + 11 outcomes = 1980
+        assert CLMConfig().vocab_size == n_moves + 1 + N_TOTAL_OUTCOMES
 
     @pytest.mark.unit
     def test_outcome_tokens_not_in_move_vocab(self):
@@ -57,9 +69,7 @@ class TestVocabConsistency:
             gl = int(game_lengths[b])
             for t in range(gl):
                 tok = int(move_ids[b, t])
-                assert 1 <= tok <= 4272
-            if gl < 255:
-                assert move_ids[b, gl] == PAD_TOKEN
+                assert 0 <= tok <= NUM_ACTIONS - 1
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +77,9 @@ class TestVocabConsistency:
 # ---------------------------------------------------------------------------
 
 
-class TestRustCLMBatch:
+class TestRustCLMBatchDefault:
+    """Test the default (no outcome prefix) format: [m1, ..., mN, PAD, ...]."""
+
     @pytest.fixture(scope="class")
     def clm_batch(self):
         return engine.generate_clm_batch(32, 256, seed=42)
@@ -78,7 +90,83 @@ class TestRustCLMBatch:
         assert input_ids.shape == (32, 256)
         assert targets.shape == (32, 256)
         assert loss_mask.shape == (32, 256)
-        assert move_ids.shape == (32, 255)
+        assert move_ids.shape == (32, 256)  # max_ply = seq_len (no outcome prefix)
+        assert game_lengths.shape == (32,)
+        assert term_codes.shape == (32,)
+
+    @pytest.mark.integration
+    def test_position_zero_is_move(self, clm_batch):
+        input_ids, *_ = clm_batch
+        for b in range(input_ids.shape[0]):
+            tok = int(input_ids[b, 0])
+            assert 0 <= tok <= NUM_ACTIONS - 1
+
+    @pytest.mark.integration
+    def test_moves_in_valid_range(self, clm_batch):
+        input_ids, _, _, _, game_lengths, _ = clm_batch
+        for b in range(input_ids.shape[0]):
+            gl = int(game_lengths[b])
+            for t in range(gl):
+                tok = int(input_ids[b, t])
+                assert 0 <= tok <= NUM_ACTIONS - 1
+
+    @pytest.mark.integration
+    def test_padding_is_pad_token(self, clm_batch):
+        input_ids, _, _, _, game_lengths, _ = clm_batch
+        for b in range(input_ids.shape[0]):
+            gl = int(game_lengths[b])
+            for t in range(gl, 256):
+                assert input_ids[b, t] == PAD_TOKEN
+
+    @pytest.mark.integration
+    def test_target_shift_correct(self, clm_batch):
+        input_ids, targets, *_ = clm_batch
+        B, T = input_ids.shape
+        assert np.array_equal(targets[:, :-1], input_ids[:, 1:])
+        assert (targets[:, T - 1] == PAD_TOKEN).all()
+
+    @pytest.mark.integration
+    def test_target_at_game_end_is_pad(self, clm_batch):
+        _, targets, _, _, game_lengths, _ = clm_batch
+        for b in range(targets.shape[0]):
+            gl = int(game_lengths[b])
+            if gl < 256:
+                assert targets[b, gl - 1] == PAD_TOKEN
+
+    @pytest.mark.integration
+    def test_loss_mask_boundary(self, clm_batch):
+        _, _, loss_mask, _, game_lengths, _ = clm_batch
+        for b in range(loss_mask.shape[0]):
+            gl = int(game_lengths[b])
+            # Loss mask is True for positions 0..gl-1 (the gl move positions)
+            for t in range(gl):
+                assert loss_mask[b, t]
+            for t in range(gl, 256):
+                assert not loss_mask[b, t]
+
+    @pytest.mark.integration
+    def test_raw_move_ids_replayable(self, clm_batch):
+        _, _, _, move_ids, game_lengths, _ = clm_batch
+        is_valid, _first_illegal = engine.validate_games(move_ids, game_lengths)
+        assert all(is_valid)
+        grid, _promo = engine.compute_legal_move_masks(move_ids, game_lengths)
+        assert grid.shape[0] == 32
+
+
+class TestRustCLMBatchWithOutcome:
+    """Test the outcome-prepended format: [outcome, m1, ..., mN, PAD, ...]."""
+
+    @pytest.fixture(scope="class")
+    def clm_batch(self):
+        return engine.generate_clm_batch(32, 256, seed=42, prepend_outcome=True)
+
+    @pytest.mark.integration
+    def test_shapes(self, clm_batch):
+        input_ids, targets, loss_mask, move_ids, game_lengths, term_codes = clm_batch
+        assert input_ids.shape == (32, 256)
+        assert targets.shape == (32, 256)
+        assert loss_mask.shape == (32, 256)
+        assert move_ids.shape == (32, 255)  # max_ply = seq_len - 1
         assert game_lengths.shape == (32,)
         assert term_codes.shape == (32,)
 
@@ -96,29 +184,29 @@ class TestRustCLMBatch:
             gl = int(game_lengths[b])
             for t in range(1, gl + 1):
                 tok = int(input_ids[b, t])
-                assert 1 <= tok <= 4272
+                assert 0 <= tok <= NUM_ACTIONS - 1
 
     @pytest.mark.integration
-    def test_padding_is_zero(self, clm_batch):
+    def test_padding_is_pad_token(self, clm_batch):
         input_ids, _, _, _, game_lengths, _ = clm_batch
         for b in range(input_ids.shape[0]):
             gl = int(game_lengths[b])
             for t in range(gl + 1, 256):
-                assert input_ids[b, t] == 0
+                assert input_ids[b, t] == PAD_TOKEN
 
     @pytest.mark.integration
     def test_target_shift_correct(self, clm_batch):
         input_ids, targets, *_ = clm_batch
         B, T = input_ids.shape
         assert np.array_equal(targets[:, :-1], input_ids[:, 1:])
-        assert (targets[:, T - 1] == 0).all()
+        assert (targets[:, T - 1] == PAD_TOKEN).all()
 
     @pytest.mark.integration
     def test_target_at_game_end_is_pad(self, clm_batch):
         _, targets, _, _, game_lengths, _ = clm_batch
         for b in range(targets.shape[0]):
             gl = int(game_lengths[b])
-            assert targets[b, gl] == 0
+            assert targets[b, gl] == PAD_TOKEN
 
     @pytest.mark.integration
     def test_loss_mask_boundary(self, clm_batch):
@@ -151,7 +239,7 @@ class TestRustPythonConsistency:
         seed = 42
         B = 16
         r_input_ids, r_targets, r_loss_mask, r_move_ids, r_gl, r_tc = \
-            engine.generate_clm_batch(B, seq_len, seed)
+            engine.generate_clm_batch(B, seq_len, seed, prepend_outcome=True)
         py_batch = _to_clm_batch(r_move_ids, r_gl, r_tc, seq_len)
         assert torch.equal(torch.from_numpy(r_input_ids).long(), py_batch["input_ids"])
         assert torch.equal(torch.from_numpy(r_targets).long(), py_batch["targets"])
@@ -165,23 +253,40 @@ class TestRustPythonConsistency:
 
 class TestBoundaryCases:
     @pytest.mark.integration
-    def test_boundary_max_length_game(self):
+    def test_boundary_max_length_game_with_outcome(self):
+        """Boundary test with outcome-prepended format."""
         input_ids, targets, loss_mask, _, game_lengths, _ = engine.generate_clm_batch(
-            256, 256, seed=123
+            256, 256, seed=123, prepend_outcome=True
         )
         for b in range(256):
             gl = int(game_lengths[b])
             assert OUTCOME_TOKEN_BASE <= input_ids[b, 0] <= PLY_LIMIT
             if gl + 1 < 256:
-                assert input_ids[b, gl + 1] == 0
+                assert input_ids[b, gl + 1] == PAD_TOKEN
             assert loss_mask[b, gl]
             if gl + 1 < 256:
                 assert not loss_mask[b, gl + 1]
 
     @pytest.mark.integration
+    def test_boundary_max_length_game_default(self):
+        """Boundary test with default (no outcome) format."""
+        input_ids, targets, loss_mask, _, game_lengths, _ = engine.generate_clm_batch(
+            256, 256, seed=123
+        )
+        for b in range(256):
+            gl = int(game_lengths[b])
+            assert 0 <= input_ids[b, 0] <= NUM_ACTIONS - 1
+            if gl < 256:
+                assert input_ids[b, gl] == PAD_TOKEN
+            if gl > 0:
+                assert loss_mask[b, gl - 1]
+            if gl < 256:
+                assert not loss_mask[b, gl]
+
+    @pytest.mark.integration
     def test_discard_ply_limit(self):
         input_ids, _, _, _, _, term_codes = engine.generate_clm_batch(
-            32, 256, seed=42, discard_ply_limit=True
+            32, 256, seed=42, discard_ply_limit=True, prepend_outcome=True
         )
         for b in range(32):
             assert term_codes[b] != 5
@@ -211,7 +316,7 @@ class TestStripOutcomeTokenEngineOutput:
     @pytest.fixture(scope="class")
     def original_and_stripped(self):
         input_ids, targets, loss_mask, move_ids, game_lengths, term_codes = \
-            engine.generate_clm_batch(32, 256, seed=42)
+            engine.generate_clm_batch(32, 256, seed=42, prepend_outcome=True)
         legal_grid, _ = engine.compute_legal_move_masks(move_ids, game_lengths)
         original = {
             "input_ids": torch.from_numpy(input_ids).long(),
@@ -228,7 +333,7 @@ class TestStripOutcomeTokenEngineOutput:
         _, stripped = original_and_stripped
         for b in range(stripped["input_ids"].shape[0]):
             tok = stripped["input_ids"][b, 0].item()
-            assert 1 <= tok <= 4272
+            assert 0 <= tok <= NUM_ACTIONS - 1
 
     @pytest.mark.integration
     def test_no_outcome_tokens_in_sequence(self, original_and_stripped):
@@ -239,7 +344,7 @@ class TestStripOutcomeTokenEngineOutput:
     def test_target_shift_correct(self, original_and_stripped):
         _, stripped = original_and_stripped
         assert torch.equal(stripped["targets"][:, :-1], stripped["input_ids"][:, 1:])
-        assert (stripped["targets"][:, -1] == 0).all()
+        assert (stripped["targets"][:, -1] == PAD_TOKEN).all()
 
     @pytest.mark.integration
     def test_loss_mask_count(self, original_and_stripped):

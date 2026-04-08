@@ -1359,7 +1359,7 @@ impl PyBatchRLEnv {
 
     /// Legal move token masks: numpy bool (B, vocab_size).
     /// Includes promotion tokens — correct for autoregressive generation.
-    #[pyo3(signature = (game_indices, vocab_size=4284))]
+    #[pyo3(signature = (game_indices, vocab_size=1980))]
     fn get_legal_token_masks_batch<'py>(
         &self,
         py: Python<'py>,

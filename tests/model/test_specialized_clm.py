@@ -88,7 +88,7 @@ class TestWeightTying:
     @pytest.mark.unit
     def test_padding_idx_respected(self):
         """PAD token embedding has padding_idx=PAD_TOKEN so gradient is zero there."""
-        model = _make_toy()
+        model = _make_toy(vocab_size=1980)
         assert model.embed.padding_idx == PAD_TOKEN
 
 
