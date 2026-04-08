@@ -10,7 +10,7 @@ pawn/
 ├── pawn/            # Core Python package
 │   ├── config.py    # CLMConfig (small/base/large), TrainingConfig
 │   ├── model.py     # PAWNCLM transformer (RMSNorm, SwiGLU, RoPE, factored embeddings)
-│   ├── data.py      # On-the-fly random game data pipeline
+│   ├── data.py      # On-the-fly random game data pipeline (prepend_outcome flag)
 │   ├── lichess_data.py  # Lichess PGN data pipeline + legal mask computation
 │   ├── trainer.py   # Pretraining loop
 │   ├── gpu.py       # GPU auto-detection (compile/AMP/SDPA backend)
@@ -55,14 +55,15 @@ The only extras are GPU backends (`rocm` or `cu128`). Everything else (pytest, s
 - Uses rayon for parallel game generation (~43K games/sec, 150M+/hr)
 - PyO3 bindings expose `chess_engine` module to Python
 - Key functions: `generate_random_games()`, `parse_pgn_file()`, `compute_legal_token_masks_sparse()`, `extract_board_states()`, `export_move_vocabulary()`, `compute_accuracy_ceiling()`
+- `export_move_vocabulary()` returns 1,968-entry maps (searchless_chess compatible). Conversion functions `pawn_to_searchless()` and `searchless_to_pawn()` bridge between legacy PAWN token IDs and searchless_chess action indices.
 
 ## Model
 
 ### Architecture
-- Decoder-only transformer, next-token prediction over 4,278 tokens
-- Token vocabulary: 1 PAD + 4,096 grid (64x64 src/dst) + 176 promotions + 5 outcomes
+- Decoder-only transformer, next-token prediction over 1,968 move tokens (1,980 total vocab)
+- Token vocabulary: 1,968 searchless_chess actions (0-1967) + 1 PAD (1968) + 11 outcomes (1969-1979) = 1,980 total
 - Factored embeddings: `src_embed[s] + dst_embed[d] + promo_embed[p]`
-- Sequence format: `[outcome] [ply_1] ... [ply_N] [PAD] ... [PAD]` (256 tokens)
+- Sequence format: `[ply_1] ... [ply_N] [PAD] ... [PAD]` (512 tokens) — outcome prefix is optional via `prepend_outcome` flag
 
 ### Variants
 - `CLMConfig.small()`: d=256, 8 layers, 4 heads, ~9.5M params
@@ -373,7 +374,7 @@ Supports all adapter types + architecture search. GPU affinity assigns `CUDA_VIS
 - **DataLoader workers must use `multiprocessing_context='spawn'`** — the Rust engine uses rayon, and fork after rayon init causes deadlocks.
 - **`SDPA_BACKEND` must be set before `torch.compile()`** — compiled code captures the backend at trace time. `apply_gpu_config()` handles this.
 - **ROCm works**: The only known ROCm issue is a stride mismatch in flash attention backward when combined with `torch.compile` + AMP. The workaround is `--sdpa-math` (use the MATH SDPA backend instead of flash), which `configure_gpu()` applies automatically on AMD GPUs. Everything else — training, eval, adapters, data loading — works identically on ROCm and CUDA. **Do not assume bugs are ROCm-specific.** Every other time something has failed on AMD it turned out to be a bug in our code (wrong torch version installed, stale lockfile, missing dependency, etc.), not a ROCm issue.
-- **Sparse logit projection**: `forward_hidden()` returns `(B,T,d_model)`, then only loss-masked positions project through `lm_head` — avoids full `(B,T,V)` materialization.
+- **Sparse logit projection**: `forward_hidden()` returns `(B,T,d_model)`, then only loss-masked positions project through `lm_head` — avoids full `(B,T,1980)` materialization.
 - **Legal mask via Rust**: `LegalMaskBuilder` replays games in Rust, returns sparse indices (~2 MB) scattered into a pre-allocated GPU buffer (vs ~70 MB dense).
 - **GPU auto-detection**: `pawn.gpu.configure_gpu()` selects compile/AMP/SDPA settings. `apply_gpu_config()` applies them. NVIDIA uses flash attention + compile; AMD uses MATH SDPA + compile. Both paths are tested and production-validated.
 - **Factored embeddings**: each move token decomposes into `src_embed[s] + dst_embed[d] + promo_embed[p]`, reducing embedding parameters by ~32x.
