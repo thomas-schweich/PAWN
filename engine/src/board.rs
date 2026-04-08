@@ -31,7 +31,7 @@ pub fn shakmaty_sq_to_ours(sq: Square) -> u8 {
     rank * 8 + file
 }
 
-/// Convert a shakmaty Move to our token index.
+/// Convert a shakmaty Move to our token index (searchless_chess action ID).
 pub fn move_to_token(m: &Move) -> u16 {
     let (src, dst) = match m {
         Move::Normal { from, to, .. } => (*from, *to),
@@ -55,20 +55,24 @@ pub fn move_to_token(m: &Move) -> u16 {
     let src_idx = shakmaty_sq_to_ours(src);
     let dst_idx = shakmaty_sq_to_ours(dst);
 
-    // Check if this is a promotion
+    // Build UCI string and look up action
+    let mut uci = String::with_capacity(5);
+    uci.push_str(vocab::SQUARE_NAMES[src_idx as usize]);
+    uci.push_str(vocab::SQUARE_NAMES[dst_idx as usize]);
+
     if let Move::Normal { promotion: Some(role), .. } = m {
-        let promo_type = match role {
-            Role::Queen => 0,
-            Role::Rook => 1,
-            Role::Bishop => 2,
-            Role::Knight => 3,
+        let promo_char = match role {
+            Role::Queen => "q",
+            Role::Rook => "r",
+            Role::Bishop => "b",
+            Role::Knight => "n",
             _ => panic!("Invalid promotion role: {:?}", role),
         };
-        vocab::promo_token(src_idx, dst_idx, promo_type)
-            .expect("Promotion move should have a valid promo pair")
-    } else {
-        vocab::base_grid_token(src_idx, dst_idx)
+        uci.push_str(promo_char);
     }
+
+    vocab::uci_to_action(&uci)
+        .unwrap_or_else(|| panic!("Move {} not found in searchless vocabulary", uci))
 }
 
 /// Convert our token index to a shakmaty Move, given the current position.
@@ -596,7 +600,7 @@ mod tests {
     fn test_make_move() {
         let mut state = GameState::new();
         // e2e4: src=e2=12, dst=e4=28
-        let token = vocab::base_grid_token(12, 28);
+        let token = vocab::uci_token("e2e4");
         state.make_move(token).unwrap();
         assert_eq!(state.ply(), 1);
         assert_eq!(state.turn(), Color::Black);
@@ -618,7 +622,7 @@ mod tests {
         let dst = shakmaty_sq_to_ours(Square::G1);
         assert_eq!(src, 4);  // e1
         assert_eq!(dst, 6);  // g1
-        let token = vocab::base_grid_token(src, dst);
+        let token = vocab::uci_token("e1g1");
         let uci = vocab::token_to_uci(token).unwrap();
         assert_eq!(uci, "e1g1");
     }
@@ -844,7 +848,7 @@ mod tests {
     fn test_make_move_illegal_token() {
         let mut state = GameState::new();
         // e1e2 (king stepping forward) is not legal at startpos (pawn in the way)
-        let token = vocab::base_grid_token(4, 12);
+        let token = vocab::uci_token("e1e2");
         let result = state.make_move(token);
         assert!(result.is_err());
         // State should not have advanced
@@ -1006,7 +1010,7 @@ mod tests {
     fn test_token_to_move_illegal_returns_none() {
         let state = GameState::new();
         // a1a8 is not a legal move at startpos (rook blocked)
-        let token = vocab::base_grid_token(0, 56);
+        let token = vocab::uci_token("a1a8");
         assert!(token_to_move(state.position(), token).is_none());
     }
 
@@ -1074,7 +1078,7 @@ mod tests {
     #[test]
     fn test_make_move_uci_returns_uci_string() {
         let mut state = GameState::new();
-        let tok = vocab::base_grid_token(12, 28); // e2e4
+        let tok = vocab::uci_token("e2e4"); // e2e4
         let uci = state.make_move_uci(tok).unwrap();
         assert_eq!(uci, "e2e4");
         assert_eq!(state.ply(), 1);

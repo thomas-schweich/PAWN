@@ -59,9 +59,9 @@ mod tests {
         let max_ply = 256;
         let mut move_ids = vec![0i16; max_ply];
         // e2e4 is legal
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16;
         // e2e4 again is illegal (pawn already moved)
-        move_ids[1] = crate::vocab::base_grid_token(12, 28) as i16;
+        move_ids[1] = crate::vocab::uci_token("e2e4") as i16;
         let game_lengths = vec![2i16];
 
         let (valid, first_ill) = validate_games(&move_ids, &game_lengths, max_ply);
@@ -75,7 +75,7 @@ mod tests {
         let max_ply = 16;
         let mut move_ids = vec![0i16; max_ply];
         // e2e5 — pawn can't jump three ranks
-        move_ids[0] = crate::vocab::base_grid_token(12, 36) as i16;
+        move_ids[0] = crate::vocab::uci_token("e2e5") as i16;
         let game_lengths = vec![1i16];
 
         let (valid, first_ill) = validate_games(&move_ids, &game_lengths, max_ply);
@@ -97,12 +97,12 @@ mod tests {
         let max_ply = 8;
         let mut move_ids = vec![0i16; 3 * max_ply];
         // Game 0: valid (e2e4, e7e5)
-        move_ids[0 * max_ply + 0] = crate::vocab::base_grid_token(12, 28) as i16;
-        move_ids[0 * max_ply + 1] = crate::vocab::base_grid_token(52, 36) as i16;
+        move_ids[0 * max_ply + 0] = crate::vocab::uci_token("e2e4") as i16;
+        move_ids[0 * max_ply + 1] = crate::vocab::uci_token("e7e5") as i16;
         // Game 1: invalid at ply 0 (e2e5)
-        move_ids[1 * max_ply + 0] = crate::vocab::base_grid_token(12, 36) as i16;
+        move_ids[1 * max_ply + 0] = crate::vocab::uci_token("e2e5") as i16;
         // Game 2: valid single move (d2d4)
-        move_ids[2 * max_ply + 0] = crate::vocab::base_grid_token(11, 27) as i16;
+        move_ids[2 * max_ply + 0] = crate::vocab::uci_token("d2d4") as i16;
         let game_lengths = vec![2i16, 1i16, 1i16];
 
         let (valid, first_ill) = validate_games(&move_ids, &game_lengths, max_ply);

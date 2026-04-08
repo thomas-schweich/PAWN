@@ -754,7 +754,7 @@ mod tests {
         let (tokens, n) = san_moves_to_tokens(&moves, 256);
         assert_eq!(n, 7);
         assert_eq!(tokens.len(), 7);
-        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let e2e4 = crate::vocab::uci_token("e2e4");
         assert_eq!(tokens[0], e2e4);
     }
 
@@ -1034,7 +1034,7 @@ mod tests {
         assert_eq!(sampled.len(), 1);
         assert_eq!(sampled[0].headers.get("UTCDate").unwrap(), "2023.12.05");
         // Game 1 starts with e4: verify first token matches e2e4
-        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let e2e4 = crate::vocab::uci_token("e2e4");
         assert_eq!(sampled[0].tokens[0], e2e4, "Game 1 should start with e2e4");
         assert_eq!(sampled[0].game_length, 2, "Game 1 has 2 plies (e4 e5)");
 
@@ -1045,7 +1045,7 @@ mod tests {
         );
         assert_eq!(sampled.len(), 1);
         assert_eq!(sampled[0].headers.get("UTCDate").unwrap(), "2023.12.10");
-        let d2d4 = crate::vocab::base_grid_token(11, 27);
+        let d2d4 = crate::vocab::uci_token("d2d4");
         assert_eq!(sampled[0].tokens[0], d2d4, "Game 2 should start with d2d4");
 
         // Select global indices 0 and 2 => Game 1 and Game 3
@@ -1379,11 +1379,12 @@ mod tests {
         ];
         let (tokens, n) = san_moves_to_tokens(&moves, 256);
         assert_eq!(n, 9, "all 9 moves should parse including promotion");
-        // The last move is a promotion; token should be in the promo range
+        // The last move is a promotion; token should decompose with promo_type >= 1
         let last_tok = tokens[8];
-        assert!(last_tok >= crate::vocab::PROMO_START && last_tok <= crate::vocab::PROMO_END,
-            "promotion token 0x{:x} should be in range [{}, {}]", last_tok,
-            crate::vocab::PROMO_START, crate::vocab::PROMO_END);
+        let (_, _, promo_type) = crate::vocab::decompose_token(last_tok as u16)
+            .expect("promotion token should decompose");
+        assert!(promo_type >= 1 && promo_type <= 4,
+            "promotion token {} should have promo_type 1-4, got {}", last_tok, promo_type);
     }
 
     #[test]
@@ -1500,7 +1501,7 @@ mod tests {
         let g = &games[0];
         // First token is outcome, second is e2e4
         assert_eq!(g.tokens[0], crate::vocab::WHITE_WINS_ON_TIME);
-        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let e2e4 = crate::vocab::uci_token("e2e4");
         assert_eq!(g.tokens[1], e2e4);
     }
 }

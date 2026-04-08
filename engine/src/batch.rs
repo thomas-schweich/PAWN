@@ -296,8 +296,9 @@ pub fn generate_clm_batch(
         generate_random_games(batch_size, max_ply, seed, mate_boost, discard_ply_limit)
     };
 
-    let mut input_ids = vec![0i16; batch_size * seq_len];
-    let mut targets = vec![0i16; batch_size * seq_len];
+    let pad = vocab::PAD_TOKEN as i16;
+    let mut input_ids = vec![pad; batch_size * seq_len];
+    let mut targets = vec![pad; batch_size * seq_len];
     let mut loss_mask = vec![false; batch_size * seq_len];
 
     for b in 0..batch_size {
@@ -321,13 +322,13 @@ pub fn generate_clm_batch(
         for t in 0..gl {
             input_ids[row + 1 + t] = game_batch.move_ids[b * max_ply + t];
         }
-        // Remaining positions are already 0 (PAD)
+        // Remaining positions are already PAD
 
         // Targets: input_ids shifted left by 1
         for t in 0..(seq_len - 1) {
             targets[row + t] = input_ids[row + t + 1];
         }
-        // targets[row + seq_len - 1] is already 0
+        // targets[row + seq_len - 1] is already PAD
 
         // Loss mask: positions 0..=gl are true
         for t in 0..=gl {
@@ -419,21 +420,23 @@ mod tests {
             let gl = batch.game_lengths[b] as usize;
             let row = b * seq_len;
 
-            // Position 0: outcome token (4273-4277)
+            let pad = vocab::PAD_TOKEN as i16;
+
+            // Position 0: outcome token
             let outcome = batch.input_ids[row];
             assert!(outcome >= vocab::OUTCOME_BASE as i16 && outcome <= vocab::PLY_LIMIT as i16,
                 "Position 0 should be outcome token, got {}", outcome);
 
-            // Positions 1..=gl: move tokens (1-4272)
+            // Positions 1..=gl: move tokens (action IDs 0..1967)
             for t in 1..=gl {
                 let tok = batch.input_ids[row + t];
-                assert!(tok >= 1 && tok <= 4272,
-                    "Position {} should be move token, got {}", t, tok);
+                assert!(tok >= 0 && tok < vocab::NUM_ACTIONS as i16,
+                    "Position {} should be move token (0-1967), got {}", t, tok);
             }
 
-            // Positions gl+1..seq_len: PAD (0)
+            // Positions gl+1..seq_len: PAD
             for t in (gl + 1)..seq_len {
-                assert_eq!(batch.input_ids[row + t], 0,
+                assert_eq!(batch.input_ids[row + t], pad,
                     "Position {} should be PAD, got {}", t, batch.input_ids[row + t]);
             }
 
@@ -442,10 +445,10 @@ mod tests {
                 assert_eq!(batch.targets[row + t], batch.input_ids[row + t + 1],
                     "targets[{}] should equal input_ids[{}]", t, t + 1);
             }
-            assert_eq!(batch.targets[row + seq_len - 1], 0, "Last target should be PAD");
+            assert_eq!(batch.targets[row + seq_len - 1], pad, "Last target should be PAD");
 
             // Target at position gl is PAD (end of game)
-            assert_eq!(batch.targets[row + gl], 0, "Target at game_length should be PAD");
+            assert_eq!(batch.targets[row + gl], pad, "Target at game_length should be PAD");
 
             // Loss mask: true for 0..=gl, false after
             for t in 0..=gl {
@@ -503,8 +506,8 @@ mod tests {
             let gl = batch.game_lengths[b] as usize;
             for t in 0..gl {
                 let tok = batch.move_ids[b * 64 + t];
-                // Tokens should be valid move tokens (1..=4272)
-                assert!(tok >= 1 && tok <= 4272,
+                // Tokens should be valid action IDs (0..1967)
+                assert!(tok >= 0 && tok < vocab::NUM_ACTIONS as i16,
                     "Invalid token at b={} t={}: {}", b, t, tok);
             }
         }

@@ -1,4 +1,5 @@
 pub mod types;
+pub mod searchless_vocab;
 pub mod vocab;
 pub mod board;
 pub mod random;
@@ -1590,32 +1591,25 @@ mod tests {
     }
 
     #[test]
-    fn test_decompose_token_dispatch_base_grid_range() {
-        // Dispatch: tokens in [1, 4096] go to base grid branch (promo=0)
-        let samples = [1u16, 2, 64, 128, 4095, 4096];
-        for &t in &samples {
-            let decomp = vocab::decompose_token(t);
-            assert!(decomp.is_some(), "token {} should decompose", t);
-            let (_, _, promo) = decomp.unwrap();
-            assert_eq!(promo, 0, "base grid token {} should have promo=0", t);
+    fn test_decompose_token_action_range() {
+        // All 1968 actions should decompose
+        for action in 0..vocab::NUM_ACTIONS as u16 {
+            assert!(vocab::decompose_token(action).is_some(),
+                "action {} should decompose", action);
         }
     }
 
     #[test]
-    fn test_decompose_token_dispatch_promo_range() {
-        // Dispatch: tokens in [4097, 4272] go to promo branch (promo >= 1)
-        let samples = [4097u16, 4098, 4099, 4100, 4200, 4272];
-        for &t in &samples {
-            let decomp = vocab::decompose_token(t);
-            assert!(decomp.is_some(), "token {} should decompose", t);
-            let (_, _, promo) = decomp.unwrap();
-            assert!(promo >= 1 && promo <= 4, "promo token {} should have 1<=promo<=4", t);
-        }
+    fn test_decompose_token_promo_actions() {
+        // Promotion actions should have promo >= 1
+        let a7a8q = vocab::uci_token("a7a8q");
+        let (_, _, promo) = vocab::decompose_token(a7a8q).unwrap();
+        assert!(promo >= 1 && promo <= 4, "promo action should have 1<=promo<=4");
     }
 
     #[test]
     fn test_decompose_token_dispatch_outcome_range() {
-        // Dispatch: tokens >= OUTCOME_BASE (4273) return None
+        // Outcome tokens return None
         for t in vocab::OUTCOME_BASE..=vocab::DRAW_BY_TIME {
             assert!(vocab::decompose_token(t).is_none(),
                 "outcome token {} should not decompose", t);
@@ -1624,13 +1618,13 @@ mod tests {
 
     #[test]
     fn test_decompose_token_boundary_values() {
-        // Boundaries between ranges
-        assert!(vocab::decompose_token(0).is_none()); // PAD
-        assert!(vocab::decompose_token(1).is_some()); // first grid
-        assert!(vocab::decompose_token(4096).is_some()); // last grid
-        assert!(vocab::decompose_token(4097).is_some()); // first promo
-        assert!(vocab::decompose_token(4272).is_some()); // last promo
-        assert!(vocab::decompose_token(4273).is_none()); // first outcome
+        // Boundaries: actions [0, 1967], PAD [1968], outcomes [1969, 1979]
+        assert!(vocab::decompose_token(0).is_some());    // first action
+        assert!(vocab::decompose_token(1967).is_some());  // last action
+        assert!(vocab::decompose_token(1968).is_none());  // PAD
+        assert!(vocab::decompose_token(1969).is_none());  // first outcome
+        assert!(vocab::decompose_token(1979).is_none());  // last outcome
+        assert!(vocab::decompose_token(1980).is_none());  // beyond vocab
     }
 
     #[test]

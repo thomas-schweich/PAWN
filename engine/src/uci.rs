@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(n, 4);
         assert_eq!(tokens.len(), 4);
         // e2e4: src=12 (e2), dst=28 (e4)
-        let e2e4 = vocab::base_grid_token(12, 28);
+        let e2e4 = vocab::uci_token("e2e4");
         assert_eq!(tokens[0], e2e4);
     }
 
@@ -312,10 +312,10 @@ mod tests {
             let (tokens, n) = uci_moves_to_tokens(&moves, 256);
             assert_eq!(n, 9, "promotion {} should be legal", target);
             let promo_tok = tokens[8];
-            assert!(
-                promo_tok >= crate::vocab::PROMO_START && promo_tok <= crate::vocab::PROMO_END,
-                "promotion token out of range: {}", promo_tok
-            );
+            let (_, _, promo_type) = crate::vocab::decompose_token(promo_tok as u16)
+                .expect("promotion token should decompose");
+            assert!(promo_type >= 1 && promo_type <= 4,
+                "promotion token {} should have promo_type 1-4, got {}", promo_tok, promo_type);
         }
     }
 

@@ -475,7 +475,7 @@ mod tests {
         let mut env = BatchRLEnv::new(2, 256, 42);
         env.reset();
         // e2e4 is legal for both games
-        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let e2e4 = crate::vocab::uci_token("e2e4");
         let (flags, codes) = env.apply_moves(&[0, 1], &[e2e4, e2e4]);
         assert_eq!(flags, vec![true, true]);
         assert_eq!(codes, vec![-1, -1]); // still going
@@ -514,7 +514,7 @@ mod tests {
     fn test_get_move_histories_after_move() {
         let mut env = BatchRLEnv::new(1, 256, 42);
         env.reset();
-        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let e2e4 = crate::vocab::uci_token("e2e4");
         let _ = env.apply_moves(&[0], &[e2e4]);
         let (flat, lengths) = env.get_move_histories(&[0]);
         assert_eq!(lengths, vec![1i32]);
@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(plies, vec![0u32, 0u32]);
 
         // Apply a move and check ply goes up
-        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let e2e4 = crate::vocab::uci_token("e2e4");
         let _ = env.apply_moves(&[0], &[e2e4]);
         let plies = env.get_plies(&[0, 1]);
         assert_eq!(plies, vec![1u32, 0u32]);
@@ -595,8 +595,8 @@ mod tests {
     fn test_load_prefixes_basic() {
         let mut env = BatchRLEnv::new(2, 256, 42);
         env.reset();
-        let e2e4 = crate::vocab::base_grid_token(12, 28);
-        let e7e5 = crate::vocab::base_grid_token(52, 36);
+        let e2e4 = crate::vocab::uci_token("e2e4");
+        let e7e5 = crate::vocab::uci_token("e7e5");
         let max_ply = 8;
         let move_ids = vec![e2e4, e7e5, 0, 0, 0, 0, 0, 0,  // game 0: 2 moves
                             e2e4, 0, 0, 0, 0, 0, 0, 0];   // game 1: 1 move
@@ -664,7 +664,7 @@ mod tests {
         }
 
         // Also test after making a move (different position), sentinels are still legal
-        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let e2e4 = crate::vocab::uci_token("e2e4");
         let _ = env.apply_moves(&[0], &[e2e4]);
         let sent_after = env.get_sentinel_tokens(&[0, 1]);
         let masks_after = env.get_legal_token_masks_batch(&[0, 1], vocab_size);
@@ -686,7 +686,7 @@ mod tests {
     fn test_reset_clears_state() {
         let mut env = BatchRLEnv::new(2, 256, 42);
         env.reset();
-        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let e2e4 = crate::vocab::uci_token("e2e4");
         let _ = env.apply_moves(&[0], &[e2e4]);
         let plies = env.get_plies(&[0]);
         assert_eq!(plies[0], 1);
@@ -710,7 +710,7 @@ mod tests {
         );
 
         // Apply e2e4 to game 0 only
-        let e2e4 = crate::vocab::base_grid_token(12, 28);
+        let e2e4 = crate::vocab::uci_token("e2e4");
         let _ = env.apply_moves(&[0], &[e2e4]);
         let masks_after = env.get_legal_token_masks_batch(&[0, 1], vocab_size);
         // Game 0 now has black to move (different masks), game 1 still startpos
