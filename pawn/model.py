@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
-from pawn.config import CLMConfig, OUTCOME_TOKEN_BASE
+from pawn.config import CLMConfig, LegacyVocab
 from chess_engine import export_move_vocabulary
 
 # ROCm flash attention backward has stride mismatches with torch.compile.
@@ -26,33 +26,54 @@ from chess_engine import export_move_vocabulary
 SDPA_BACKEND: SDPBackend | None = None
 
 
-def _build_decomposition_table() -> torch.Tensor:
+def _build_decomposition_table(n_actions: int) -> torch.Tensor:
     """Build static token -> (src, dst, promo_type) lookup table.
 
-    Returns int16[4278, 3]. PAD (0) and outcome tokens (4273-4277)
-    map to (0, 0, 0) — handled by standalone embeddings.
+    For new vocab (n_actions=1968): returns int16[1968, 3].
+    For legacy vocab (n_actions=4272): returns int16[4272, 3], using the
+    old formula (tokens 1-4096 = dense grid, 4097-4272 = promotions).
+
+    PAD and outcome tokens are above the table range and handled
+    by standalone embeddings.
     """
-    vocab = export_move_vocabulary()
-    table = torch.zeros(4278, 3, dtype=torch.int16)
+    from pawn.config import LegacyVocab, NUM_ACTIONS
 
-    for token_idx, uci_str in vocab["token_to_move"].items():
-        if token_idx >= OUTCOME_TOKEN_BASE:
-            continue  # Outcome tokens use standalone embeddings
-        src_name = uci_str[:2]
-        dst_name = uci_str[2:4]
-        promo_suffix = uci_str[4:] if len(uci_str) > 4 else ""
-
+    if n_actions == NUM_ACTIONS:
+        # New searchless vocab — read from engine
+        vocab = export_move_vocabulary()
+        table = torch.zeros(n_actions, 3, dtype=torch.int16)
         sq_names = vocab["square_names"]
-        src_sq = sq_names.index(src_name)
-        dst_sq = sq_names.index(dst_name)
+        promo_map = {"q": 1, "r": 2, "b": 3, "n": 4}
+        for token_idx, uci_str in vocab["token_to_move"].items():
+            src_sq = sq_names.index(uci_str[:2])
+            dst_sq = sq_names.index(uci_str[2:4])
+            promo_type = promo_map.get(uci_str[4:], 0)
+            table[token_idx] = torch.tensor([src_sq, dst_sq, promo_type], dtype=torch.int16)
+        return table
 
-        promo_type = 0
-        if promo_suffix:
-            promo_map = {"q": 1, "r": 2, "b": 3, "n": 4}
-            promo_type = promo_map[promo_suffix]
-
-        table[token_idx] = torch.tensor([src_sq, dst_sq, promo_type], dtype=torch.int16)
-
+    # Legacy PAWN vocab — reconstruct from formula
+    assert n_actions == LegacyVocab.NUM_ACTIONS, f"Unknown n_actions: {n_actions}"
+    table = torch.zeros(n_actions, 3, dtype=torch.int16)
+    # Tokens 1-4096: base grid (src * 64 + dst + 1)
+    for token in range(1, 4097):
+        t = token - 1
+        src = t // 64
+        dst = t % 64
+        table[token] = torch.tensor([src, dst, 0], dtype=torch.int16)
+    # Tokens 4097-4272: promotions
+    vocab = export_move_vocabulary()
+    from chess_engine import searchless_to_pawn
+    sq_names = vocab["square_names"]
+    promo_map = {"q": 1, "r": 2, "b": 3, "n": 4}
+    for action_idx, uci_str in vocab["token_to_move"].items():
+        if len(uci_str) != 5:
+            continue  # only promotions
+        pawn_token = searchless_to_pawn(action_idx)
+        if pawn_token < n_actions:
+            src_sq = sq_names.index(uci_str[:2])
+            dst_sq = sq_names.index(uci_str[2:4])
+            promo_type = promo_map[uci_str[4:]]
+            table[pawn_token] = torch.tensor([src_sq, dst_sq, promo_type], dtype=torch.int16)
     return table
 
 
@@ -239,6 +260,10 @@ class CLMEmbedding(nn.Module):
 
     Move tokens use factored embedding: src_embed[s] + dst_embed[d] + promo_embed[p].
     PAD and outcome tokens use standalone embeddings.
+
+    Supports both the new searchless_chess vocab (1980) and the legacy PAWN
+    vocab (4284) — the decomposition table and PAD/outcome detection are
+    derived from ``cfg.vocab_size``.
     """
 
     decomp_table: torch.Tensor
@@ -246,6 +271,17 @@ class CLMEmbedding(nn.Module):
     def __init__(self, cfg: CLMConfig):
         super().__init__()
         self.d_model = cfg.d_model
+
+        # Derive vocab-specific constants
+        if cfg.vocab_size == LegacyVocab.VOCAB_SIZE:
+            self.n_actions = LegacyVocab.NUM_ACTIONS
+            self.pad_token = LegacyVocab.PAD_TOKEN
+            self.outcome_base = LegacyVocab.OUTCOME_TOKEN_BASE
+        else:
+            from pawn.config import NUM_ACTIONS, PAD_TOKEN, OUTCOME_TOKEN_BASE
+            self.n_actions = NUM_ACTIONS
+            self.pad_token = PAD_TOKEN
+            self.outcome_base = OUTCOME_TOKEN_BASE
 
         # Factored move components
         self.src_embed = nn.Embedding(64, cfg.d_model)
@@ -257,16 +293,16 @@ class CLMEmbedding(nn.Module):
         self.outcome_embed = nn.Embedding(cfg.n_outcomes, cfg.d_model)
 
         # Static decomposition table: token_idx -> (src, dst, promo_type)
-        self.register_buffer("decomp_table", _build_decomposition_table(), persistent=False)
+        self.register_buffer("decomp_table", _build_decomposition_table(self.n_actions), persistent=False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
-        input_ids: (B, T) int tensor of token indices [0..4277]
+        input_ids: (B, T) int tensor of token indices
         Returns: (B, T, d_model)
         """
         # Decompose all tokens (PAD and outcomes get (0,0,0) from the table —
         # their factored embeddings are garbage but will be overridden below)
-        flat = input_ids.long().clamp(0, 4277)
+        flat = input_ids.long().clamp(0, self.n_actions - 1)
         decomp = self.decomp_table[flat]  # (B, T, 3)
         src_idx = decomp[..., 0].long()
         dst_idx = decomp[..., 1].long()
@@ -275,15 +311,13 @@ class CLMEmbedding(nn.Module):
         emb = self.src_embed(src_idx) + self.dst_embed(dst_idx) + self.promo_embed(promo_idx)
 
         # Override PAD positions (branchless for torch.compile)
-        pad_mask = (input_ids == 0).unsqueeze(-1)  # (B, T, 1)
+        pad_mask = (input_ids == self.pad_token).unsqueeze(-1)  # (B, T, 1)
         emb = torch.where(pad_mask, self.pad_embed, emb)
 
         # Override outcome token positions (branchless)
-        # Compute outcome embeddings for ALL positions (clamp makes non-outcome
-        # indices safe); torch.where selects only at actual outcome positions.
-        outcome_idx = (input_ids - OUTCOME_TOKEN_BASE).clamp(0, self.outcome_embed.num_embeddings - 1)
+        outcome_idx = (input_ids - self.outcome_base).clamp(0, self.outcome_embed.num_embeddings - 1)
         outcome_embs = self.outcome_embed(outcome_idx)
-        outcome_mask = (input_ids >= OUTCOME_TOKEN_BASE).unsqueeze(-1)  # (B, T, 1)
+        outcome_mask = (input_ids >= self.outcome_base).unsqueeze(-1)  # (B, T, 1)
         emb = torch.where(outcome_mask, outcome_embs, emb)
 
         return emb
