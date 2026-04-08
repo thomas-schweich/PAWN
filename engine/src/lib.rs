@@ -173,9 +173,13 @@ fn generate_random_games<'py>(
 ///
 /// Returns (input_ids, targets, loss_mask, move_ids, game_lengths, term_codes).
 /// input_ids = [outcome, ply_1, ..., ply_N, PAD, ...] (seq_len per row).
-/// move_ids are the raw moves (seq_len-1 per row) for replay operations.
+/// move_ids are the raw moves for replay operations.
+///
+/// When `prepend_outcome` is false (default), sequences are pure moves and
+/// `max_ply = seq_len`. When true, position 0 is the outcome token and
+/// `max_ply = seq_len - 1`.
 #[pyfunction]
-#[pyo3(signature = (batch_size, seq_len=256, seed=42, discard_ply_limit=false, mate_boost=0.0))]
+#[pyo3(signature = (batch_size, seq_len=256, seed=42, discard_ply_limit=false, mate_boost=0.0, prepend_outcome=false))]
 fn generate_clm_batch<'py>(
     py: Python<'py>,
     batch_size: usize,
@@ -183,19 +187,20 @@ fn generate_clm_batch<'py>(
     seed: u64,
     discard_ply_limit: bool,
     mate_boost: f64,
+    prepend_outcome: bool,
 ) -> PyResult<(
     Bound<'py, PyArray2<i16>>,   // input_ids (B, seq_len)
     Bound<'py, PyArray2<i16>>,   // targets (B, seq_len)
     Bound<'py, PyArray2<bool>>,  // loss_mask (B, seq_len)
-    Bound<'py, PyArray2<i16>>,   // move_ids (B, seq_len-1)
+    Bound<'py, PyArray2<i16>>,   // move_ids (B, max_ply)
     Bound<'py, PyArray1<i16>>,   // game_lengths (B,)
     Bound<'py, PyArray1<u8>>,    // termination_codes (B,)
 )> {
     let result = py.allow_threads(|| {
-        batch::generate_clm_batch(batch_size, seq_len, seed, discard_ply_limit, mate_boost)
+        batch::generate_clm_batch(batch_size, seq_len, seed, discard_ply_limit, mate_boost, prepend_outcome)
     });
 
-    let max_ply = seq_len - 1;
+    let max_ply = result.max_ply;
     let input_ids = numpy::PyArray::from_vec(py, result.input_ids)
         .reshape([batch_size, seq_len])?;
     let targets = numpy::PyArray::from_vec(py, result.targets)
@@ -1539,10 +1544,27 @@ fn compute_accuracy_ceiling_py(
     Ok(dict.into())
 }
 
+/// Convert a legacy PAWN token (1-4272) to a searchless action (0-1967).
+/// Returns -1 for impossible moves, legacy PAD (0), or out-of-range tokens.
+#[pyfunction]
+fn pawn_to_searchless(pawn_token: u16) -> i16 {
+    vocab::pawn_to_searchless(pawn_token)
+        .map(|a| a as i16)
+        .unwrap_or(-1)
+}
+
+/// Convert a searchless action (0-1967) to a legacy PAWN token (1-4272).
+#[pyfunction]
+fn searchless_to_pawn(action: u16) -> u16 {
+    vocab::searchless_to_pawn(action)
+}
+
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hello, m)?)?;
     m.add_function(wrap_pyfunction!(export_move_vocabulary, m)?)?;
+    m.add_function(wrap_pyfunction!(pawn_to_searchless, m)?)?;
+    m.add_function(wrap_pyfunction!(searchless_to_pawn, m)?)?;
     m.add_function(wrap_pyfunction!(generate_training_batch, m)?)?;
     m.add_function(wrap_pyfunction!(generate_random_games, m)?)?;
     m.add_function(wrap_pyfunction!(generate_clm_batch, m)?)?;

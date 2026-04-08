@@ -281,16 +281,20 @@ pub struct CLMBatch {
 
 /// Generate a CLM training batch: random games packed into model-ready format.
 ///
-/// `seq_len` is the total sequence length (256). Games are generated with up to
-/// `seq_len - 1` plies, leaving position 0 for the outcome token.
+/// When `prepend_outcome` is false (default), sequences are pure moves:
+///   `[move_1, move_2, ..., move_N, PAD, ...]` and `max_ply = seq_len`.
+///
+/// When `prepend_outcome` is true, position 0 is the outcome token:
+///   `[outcome, move_1, ..., move_N, PAD, ...]` and `max_ply = seq_len - 1`.
 pub fn generate_clm_batch(
     batch_size: usize,
     seq_len: usize,
     seed: u64,
     discard_ply_limit: bool,
     mate_boost: f64,
+    prepend_outcome: bool,
 ) -> CLMBatch {
-    let max_ply = seq_len - 1;
+    let max_ply = if prepend_outcome { seq_len - 1 } else { seq_len };
 
     let game_batch = {
         generate_random_games(batch_size, max_ply, seed, mate_boost, discard_ply_limit)
@@ -303,36 +307,44 @@ pub fn generate_clm_batch(
 
     for b in 0..batch_size {
         let gl = game_batch.game_lengths[b] as usize;
-        let term = match game_batch.termination_codes[b] {
-            0 => Termination::Checkmate,
-            1 => Termination::Stalemate,
-            2 => Termination::SeventyFiveMoveRule,
-            3 => Termination::FivefoldRepetition,
-            4 => Termination::InsufficientMaterial,
-            _ => Termination::PlyLimit,
-        };
-        let outcome = vocab::termination_to_outcome(term, game_batch.game_lengths[b] as u16);
-
         let row = b * seq_len;
 
-        // Position 0: outcome token
-        input_ids[row] = outcome as i16;
+        if prepend_outcome {
+            // Outcome-prefixed format: [outcome, m1, ..., mN, PAD, ...]
+            let term = match game_batch.termination_codes[b] {
+                0 => Termination::Checkmate,
+                1 => Termination::Stalemate,
+                2 => Termination::SeventyFiveMoveRule,
+                3 => Termination::FivefoldRepetition,
+                4 => Termination::InsufficientMaterial,
+                _ => Termination::PlyLimit,
+            };
+            let outcome = vocab::termination_to_outcome(term, game_batch.game_lengths[b] as u16);
+            input_ids[row] = outcome as i16;
 
-        // Positions 1..=gl: move tokens
-        for t in 0..gl {
-            input_ids[row + 1 + t] = game_batch.move_ids[b * max_ply + t];
+            for t in 0..gl {
+                input_ids[row + 1 + t] = game_batch.move_ids[b * max_ply + t];
+            }
+
+            // Loss mask: positions 0..=gl are true
+            for t in 0..=gl {
+                loss_mask[row + t] = true;
+            }
+        } else {
+            // Pure moves format: [m1, m2, ..., mN, PAD, ...]
+            for t in 0..gl {
+                input_ids[row + t] = game_batch.move_ids[b * max_ply + t];
+            }
+
+            // Loss mask: positions 0..gl-1 are true (gl positions predict gl targets)
+            for t in 0..gl {
+                loss_mask[row + t] = true;
+            }
         }
-        // Remaining positions are already PAD
 
         // Targets: input_ids shifted left by 1
         for t in 0..(seq_len - 1) {
             targets[row + t] = input_ids[row + t + 1];
-        }
-        // targets[row + seq_len - 1] is already PAD
-
-        // Loss mask: positions 0..=gl are true
-        for t in 0..=gl {
-            loss_mask[row + t] = true;
         }
     }
 
@@ -409,7 +421,7 @@ mod tests {
     #[test]
     fn test_clm_batch_format() {
         let seq_len = 256;
-        let batch = generate_clm_batch(8, seq_len, 42, false, 0.0);
+        let batch = generate_clm_batch(8, seq_len, 42, false, 0.0, true);
         assert_eq!(batch.input_ids.len(), 8 * seq_len);
         assert_eq!(batch.targets.len(), 8 * seq_len);
         assert_eq!(batch.loss_mask.len(), 8 * seq_len);
@@ -464,8 +476,8 @@ mod tests {
 
     #[test]
     fn test_clm_batch_deterministic() {
-        let b1 = generate_clm_batch(4, 256, 99, false, 0.0);
-        let b2 = generate_clm_batch(4, 256, 99, false, 0.0);
+        let b1 = generate_clm_batch(4, 256, 99, false, 0.0, true);
+        let b2 = generate_clm_batch(4, 256, 99, false, 0.0, true);
         assert_eq!(b1.input_ids, b2.input_ids);
         assert_eq!(b1.targets, b2.targets);
         assert_eq!(b1.loss_mask, b2.loss_mask);
@@ -474,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_clm_batch_outcome_correctness() {
-        let batch = generate_clm_batch(32, 256, 42, false, 0.0);
+        let batch = generate_clm_batch(32, 256, 42, false, 0.0, true);
         for b in 0..32 {
             let gl = batch.game_lengths[b] as usize;
             let tc = batch.termination_codes[b];
@@ -689,7 +701,7 @@ mod tests {
 
     #[test]
     fn test_clm_batch_seq_len_consistency() {
-        let batch = generate_clm_batch(4, 32, 42, false, 0.0);
+        let batch = generate_clm_batch(4, 32, 42, false, 0.0, true);
         assert_eq!(batch.seq_len, 32);
         assert_eq!(batch.max_ply, 31); // seq_len - 1
         assert_eq!(batch.input_ids.len(), 4 * 32);
@@ -699,7 +711,7 @@ mod tests {
     #[test]
     fn test_clm_batch_shift_by_one() {
         // Verify targets[t] == input_ids[t+1] for all t < seq_len-1
-        let batch = generate_clm_batch(4, 64, 42, false, 0.0);
+        let batch = generate_clm_batch(4, 64, 42, false, 0.0, true);
         for b in 0..4 {
             let row = b * 64;
             for t in 0..63 {
@@ -711,7 +723,7 @@ mod tests {
 
     #[test]
     fn test_clm_batch_loss_mask_covers_outcome_and_moves() {
-        let batch = generate_clm_batch(4, 64, 42, false, 0.0);
+        let batch = generate_clm_batch(4, 64, 42, false, 0.0, true);
         for b in 0..4 {
             let gl = batch.game_lengths[b] as usize;
             let row = b * 64;
@@ -729,7 +741,7 @@ mod tests {
     #[test]
     fn test_clm_batch_move_ids_copied_correctly() {
         // move_ids in CLMBatch is the raw game moves (seq_len-1 wide)
-        let batch = generate_clm_batch(2, 32, 42, false, 0.0);
+        let batch = generate_clm_batch(2, 32, 42, false, 0.0, true);
         for b in 0..2 {
             let gl = batch.game_lengths[b] as usize;
             let max_ply = 31;
@@ -797,8 +809,8 @@ mod tests {
 
     #[test]
     fn test_generate_clm_batch_mate_boost_deterministic() {
-        let b1 = generate_clm_batch(4, 64, 42, false, 0.5);
-        let b2 = generate_clm_batch(4, 64, 42, false, 0.5);
+        let b1 = generate_clm_batch(4, 64, 42, false, 0.5, true);
+        let b2 = generate_clm_batch(4, 64, 42, false, 0.5, true);
         assert_eq!(b1.input_ids, b2.input_ids);
         assert_eq!(b1.game_lengths, b2.game_lengths);
     }
@@ -806,7 +818,7 @@ mod tests {
     #[test]
     fn test_clm_batch_discard_no_ply_limit_outcomes() {
         // With discard_ply_limit=true, outcome token at pos 0 is never PLY_LIMIT (4277)
-        let batch = generate_clm_batch(8, 40, 42, true, 0.0);
+        let batch = generate_clm_batch(8, 40, 42, true, 0.0, true);
         for b in 0..8 {
             let outcome = batch.input_ids[b * 40] as u16;
             assert_ne!(outcome, vocab::PLY_LIMIT,

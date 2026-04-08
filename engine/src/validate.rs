@@ -116,9 +116,10 @@ mod tests {
 
     #[test]
     fn test_validate_pad_token_illegal() {
-        // PAD_TOKEN (0) is never a legal move; validator should reject immediately.
+        // PAD_TOKEN is never a legal move; validator should reject immediately.
         let max_ply = 4;
-        let move_ids = vec![0i16; max_ply]; // all zeros = PAD
+        let mut move_ids = vec![0i16; max_ply];
+        move_ids[0] = crate::vocab::PAD_TOKEN as i16; // PAD = 1968
         let game_lengths = vec![1i16];
 
         let (valid, first_ill) = validate_games(&move_ids, &game_lengths, max_ply);

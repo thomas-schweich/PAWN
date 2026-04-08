@@ -3,6 +3,7 @@
 use rayon::prelude::*;
 
 use crate::board::GameState;
+use crate::vocab;
 
 /// Replay games and compute legal move masks at each ply.
 /// The label at ply t is the legal moves BEFORE move t has been played —
@@ -139,7 +140,7 @@ pub fn compute_legal_token_masks_sparse(
             // Include PAD token in the legal mask so loss is finite.
             if length < seq_len {
                 let pad_base = game_base + (length * vocab_size) as i64;
-                indices.push(pad_base); // PAD_TOKEN = 0
+                indices.push(pad_base + vocab::PAD_TOKEN as i64);
             }
 
             indices
@@ -314,8 +315,7 @@ mod tests {
         );
 
         // At position length=1, PAD token should be present.
-        // PAD_TOKEN = 0, so index = game_base + length * vocab_size + 0 = vocab_size
-        let expected_pad_idx = (1 * vocab_size) as i64;
+        let expected_pad_idx = (1 * vocab_size + vocab::PAD_TOKEN as usize) as i64;
         assert!(sparse.contains(&expected_pad_idx), "sparse must include PAD token at position length");
 
         // Verify PAD is the ONLY token at position `length` — no move tokens
