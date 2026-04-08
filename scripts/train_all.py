@@ -303,6 +303,8 @@ def parse_args():
     p.add_argument("--patience", type=int, default=10,
                     help="Stop if no val loss improvement for N eval intervals (0=disabled)")
     p.add_argument("--wandb", action="store_true")
+    p.add_argument("--legacy-vocab", action="store_true",
+                    help="Use old 4284-token PAWN vocabulary (for reproducing old experiments)")
 
     ckpt_group = p.add_mutually_exclusive_group(required=True)
     ckpt_group.add_argument("--hf-repo", type=str, default=None,
@@ -454,8 +456,16 @@ def main():
     scaled_lr = base_lr * (args.batch_size / base_batch_size)
     print(f"LR: {scaled_lr:.2e} (scaled from {base_lr:.2e} for batch {args.batch_size})")
 
+    if args.legacy_vocab:
+        from pawn.config import LegacyVocab
+        print("Using legacy PAWN vocabulary (4284 tokens, 256 seq_len)")
+
     slots: list[ModelSlot] = []
     for name, model_cfg in variants.items():
+        if args.legacy_vocab:
+            model_cfg.vocab_size = LegacyVocab.VOCAB_SIZE
+            model_cfg.max_seq_len = 256
+
         train_cfg = TrainingConfig()
         train_cfg.lr = scaled_lr
         train_cfg.total_steps = args.total_steps
@@ -469,13 +479,14 @@ def main():
         train_cfg.discard_ply_limit = args.discard_ply_limit
         train_cfg.no_outcome_token = args.no_outcome_token
         train_cfg.use_wandb = args.wandb
+        train_cfg.max_ply = model_cfg.max_seq_len
 
         hf_repo = f"{args.hf_repo}-{name}" if args.hf_repo else None
         slots.append(ModelSlot(name, model_cfg, train_cfg, device, hf_repo,
                                shm_checkpoints=args.shm_checkpoints, slug=slug))
 
     # Shared dataset and validation set
-    max_ply = 256
+    max_ply = model_cfg.max_seq_len  # 512 (new default) or 256 (legacy)
     dataset = CLMDataset(
         args.batch_size, max_ply, base_seed=42,
         discard_ply_limit=args.discard_ply_limit,

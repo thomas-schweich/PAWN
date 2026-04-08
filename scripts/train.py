@@ -134,7 +134,7 @@ def run_pretrain(config: PretrainConfig) -> None:
     """Bridge ``PretrainConfig`` into ``CLMConfig`` + ``TrainingConfig``."""
     import torch
 
-    from pawn.config import CLMConfig, TrainingConfig
+    from pawn.config import CLMConfig, LegacyVocab, TrainingConfig
     from pawn.trainer import CLMTrainer
 
     variant_factory = {
@@ -147,6 +147,12 @@ def run_pretrain(config: PretrainConfig) -> None:
     train_cfg = (
         TrainingConfig.toy() if config.variant == "toy" else TrainingConfig()
     )
+
+    if config.legacy_vocab:
+        model_cfg.vocab_size = LegacyVocab.VOCAB_SIZE
+        model_cfg.max_seq_len = 256
+        train_cfg.max_ply = 256
+        print("Using legacy PAWN vocabulary (4284 tokens, 256 seq_len)")
 
     # Map RunConfig fields onto internal configs
     train_cfg.device = config.device
@@ -214,7 +220,14 @@ def run_pretrain(config: PretrainConfig) -> None:
     )
 
     if config.resume:
-        trainer.load_checkpoint(config.resume)
+        meta = trainer.load_checkpoint(config.resume)
+        loaded_vs = (meta or {}).get("model_config", {}).get("vocab_size")
+        if loaded_vs and loaded_vs != model_cfg.vocab_size:
+            _die(
+                f"Checkpoint vocab_size={loaded_vs} doesn't match "
+                f"model vocab_size={model_cfg.vocab_size}. "
+                f"Use --legacy-vocab to match old checkpoints."
+            )
 
     trainer.train()
 
