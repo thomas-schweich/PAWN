@@ -63,28 +63,36 @@ RUN maturin build --release
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# CUDA stages (--extra cu128)
+# Shared deps base — everything before the GPU-specific uv sync
 # ═══════════════════════════════════════════════════════════════════════
 
-# ── Deps (CUDA) ──────────────────────────────────────────────────────
-FROM python:3.12-slim AS deps
+FROM python:3.12-slim AS deps-common
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server tini \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 
-COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
-
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_CACHE_DIR=/tmp/uv-cache
 
-COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
-
 WORKDIR /opt/pawn
 COPY pyproject.toml uv.lock ./
 COPY --from=builder /build/engine/target/wheels/*.whl /tmp/
+
+# External binaries last — they don't depend on our layers, so placing
+# them here avoids invalidating the layers above on a caddy/uv release.
+COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
+COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CUDA stages (--extra cu128)
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── Deps (CUDA) ──────────────────────────────────────────────────────
+FROM deps-common AS deps
 RUN uv venv && \
     uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl ${UV_CACHE_DIR}
@@ -101,83 +109,10 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
     PYTHONPATH=/opt/pawn \
     PATH="/opt/pawn/.venv/bin:${PATH}"
 
+RUN chmod +x deploy/entrypoint.sh
 EXPOSE 8888
-COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
-RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["tini", "--"]
-CMD ["/opt/pawn/entrypoint.sh"]
-
-# ── Dev (CUDA) ───────────────────────────────────────────────────────
-# Built independently (not FROM runtime) so all /opt/pawn files are
-# owned by pawn from the start, avoiding a slow chown -R layer.
-FROM python:3.12-slim AS dev
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        openssh-server tini tmux ripgrep jq curl git \
-    && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /run/sshd
-
-COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
-
-ENV PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy \
-    UV_CACHE_DIR=/tmp/uv-cache
-
-# Developer-friendly tmux defaults
-RUN cat <<'TMUX' > /etc/tmux.conf
-set -g mouse on
-set -g history-limit 50000
-set -g default-terminal "tmux-256color"
-set -g base-index 1
-setw -g pane-base-index 1
-set -g renumber-windows on
-set -g set-clipboard on
-TMUX
-
-COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
-
-# Create non-root user, then copy installed deps with correct ownership
-RUN useradd -m -s /bin/bash pawn && \
-    mkdir -p /opt/pawn && chown pawn:pawn /opt/pawn
-COPY --from=deps --chown=pawn:pawn /opt/pawn /opt/pawn
-
-# Source code + entrypoint
-USER pawn
-WORKDIR /opt/pawn
-COPY --chown=pawn:pawn . .
-
-# Install Claude Code
-RUN curl -fsSL https://claude.ai/install.sh | bash
-
-ARG GIT_HASH=""
-ARG GIT_TAG=""
-ENV PAWN_GIT_HASH=${GIT_HASH} \
-    PAWN_GIT_TAG=${GIT_TAG} \
-    PYTHONPATH=/opt/pawn \
-    PATH="/home/pawn/.local/bin:/opt/pawn/.venv/bin:${PATH}"
-
-# Convenience script: drop into pawn user with claude in a tmux session.
-USER root
-COPY <<'CLAUDE_DEV' /usr/local/bin/claude-dev
-#!/usr/bin/env bash
-set -euo pipefail
-SESSION="claude"
-exec su - pawn -c "
-    if tmux has-session -t $SESSION 2>/dev/null; then
-        exec tmux attach -t $SESSION
-    fi
-    tmux new-session -d -s $SESSION -c /opt/pawn
-    tmux send-keys -t $SESSION 'cd /opt/pawn && claude --dangerously-skip-permissions' Enter
-    exec tmux attach -t $SESSION
-"
-CLAUDE_DEV
-RUN chmod +x /usr/local/bin/claude-dev
-
-EXPOSE 8888
-COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
-RUN chmod +x /opt/pawn/entrypoint.sh
-ENTRYPOINT ["tini", "--"]
-CMD ["/opt/pawn/entrypoint.sh"]
+CMD ["/opt/pawn/deploy/entrypoint.sh"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -187,24 +122,7 @@ CMD ["/opt/pawn/entrypoint.sh"]
 # ═══════════════════════════════════════════════════════════════════════
 
 # ── Deps (ROCm) ──────────────────────────────────────────────────────
-FROM python:3.12-slim AS deps-rocm
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        openssh-server tini \
-    && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /run/sshd
-
-COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
-
-ENV PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy \
-    UV_CACHE_DIR=/tmp/uv-cache
-
-COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
-
-WORKDIR /opt/pawn
-COPY pyproject.toml uv.lock ./
-COPY --from=builder /build/engine/target/wheels/*.whl /tmp/
+FROM deps-common AS deps-rocm
 RUN uv venv && \
     uv sync --extra rocm --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl ${UV_CACHE_DIR}
@@ -221,21 +139,22 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
     PYTHONPATH=/opt/pawn \
     PATH="/opt/pawn/.venv/bin:${PATH}"
 
+RUN chmod +x deploy/entrypoint.sh
 EXPOSE 8888
-COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
-RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["tini", "--"]
-CMD ["/opt/pawn/entrypoint.sh"]
+CMD ["/opt/pawn/deploy/entrypoint.sh"]
 
-# ── Dev (ROCm) ───────────────────────────────────────────────────────
-FROM python:3.12-slim AS dev-rocm
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# ═══════════════════════════════════════════════════════════════════════
+# Shared dev base — dev tools, non-root user, Claude Code, tmux
+# ═══════════════════════════════════════════════════════════════════════
+
+FROM python:3.12-slim AS dev-common
+
+RUN apt-get update && apt-get install -y build-essential \
         openssh-server tini tmux ripgrep jq curl git \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
-
-COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
 
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
@@ -252,30 +171,18 @@ set -g renumber-windows on
 set -g set-clipboard on
 TMUX
 
-COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
-
-# Create non-root user, then copy installed deps with correct ownership
+# Create non-root user
 RUN useradd -m -s /bin/bash pawn && \
     mkdir -p /opt/pawn && chown pawn:pawn /opt/pawn
-COPY --from=deps-rocm --chown=pawn:pawn /opt/pawn /opt/pawn
 
-# Source code + entrypoint
+# Install Claude Code and Rust toolchain (for building the chess engine)
 USER pawn
-WORKDIR /opt/pawn
-COPY --chown=pawn:pawn . .
-
-# Install Claude Code
 RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
-ARG GIT_HASH=""
-ARG GIT_TAG=""
-ENV PAWN_GIT_HASH=${GIT_HASH} \
-    PAWN_GIT_TAG=${GIT_TAG} \
-    PYTHONPATH=/opt/pawn \
-    PATH="/home/pawn/.local/bin:/opt/pawn/.venv/bin:${PATH}"
-
+# Convenience script: drop into pawn user with claude in a tmux session
 USER root
-COPY <<'CLAUDE_DEV' /usr/local/bin/claude-dev
+COPY --chmod=755 <<'CLAUDE_DEV' /usr/local/bin/claude-dev
 #!/usr/bin/env bash
 set -euo pipefail
 SESSION="claude"
@@ -288,10 +195,65 @@ exec su - pawn -c "
     exec tmux attach -t $SESSION
 "
 CLAUDE_DEV
-RUN chmod +x /usr/local/bin/claude-dev
 
+# External binaries last (same rationale as deps-common)
+COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
+COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Dev images — GPU deps + source code on top of dev-common
+# Built independently from runtime/deps so every file in /opt/pawn
+# enters via COPY --chown=pawn:pawn, avoiding a slow chown -R layer
+# that would duplicate the multi-GB venv.
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── Dev (CUDA) ───────────────────────────────────────────────────────
+FROM dev-common AS dev
+COPY --from=deps --chown=pawn:pawn /opt/pawn /opt/pawn
+
+USER pawn
+WORKDIR /opt/pawn
+COPY --chown=pawn:pawn . .
+
+# Build the engine so uv run doesn't trigger a rebuild on first use
+RUN PATH="/home/pawn/.cargo/bin:${PATH}" \
+    uv sync --extra cu128 --frozen
+
+ARG GIT_HASH=""
+ARG GIT_TAG=""
+ENV PAWN_GIT_HASH=${GIT_HASH} \
+    PAWN_GIT_TAG=${GIT_TAG} \
+    PYTHONPATH=/opt/pawn \
+    PATH="/home/pawn/.cargo/bin:/home/pawn/.local/bin:/opt/pawn/.venv/bin:${PATH}"
+
+USER root
+RUN chmod +x /opt/pawn/deploy/entrypoint-dev.sh /opt/pawn/deploy/entrypoint.sh
 EXPOSE 8888
-COPY deploy/entrypoint.sh /opt/pawn/entrypoint.sh
-RUN chmod +x /opt/pawn/entrypoint.sh
 ENTRYPOINT ["tini", "--"]
-CMD ["/opt/pawn/entrypoint.sh"]
+CMD ["/opt/pawn/deploy/entrypoint-dev.sh"]
+
+# ── Dev (ROCm) ───────────────────────────────────────────────────────
+FROM dev-common AS dev-rocm
+COPY --from=deps-rocm --chown=pawn:pawn /opt/pawn /opt/pawn
+
+USER pawn
+WORKDIR /opt/pawn
+COPY --chown=pawn:pawn . .
+
+# Build the engine so uv run doesn't trigger a rebuild on first use
+RUN PATH="/home/pawn/.cargo/bin:${PATH}" \
+    uv sync --extra rocm --frozen
+
+ARG GIT_HASH=""
+ARG GIT_TAG=""
+ENV PAWN_GIT_HASH=${GIT_HASH} \
+    PAWN_GIT_TAG=${GIT_TAG} \
+    PYTHONPATH=/opt/pawn \
+    PATH="/home/pawn/.cargo/bin:/home/pawn/.local/bin:/opt/pawn/.venv/bin:${PATH}"
+
+USER root
+RUN chmod +x /opt/pawn/deploy/entrypoint-dev.sh /opt/pawn/deploy/entrypoint.sh
+EXPOSE 8888
+ENTRYPOINT ["tini", "--"]
+CMD ["/opt/pawn/deploy/entrypoint-dev.sh"]
