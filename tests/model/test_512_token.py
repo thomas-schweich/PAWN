@@ -15,6 +15,7 @@ import chess_engine as engine
 
 from pawn.config import (
     CLMConfig,
+    NUM_ACTIONS,
     PAD_TOKEN,
     PLY_LIMIT,
     OUTCOME_TOKEN_BASE,
@@ -36,14 +37,19 @@ _PRETRAINING_OUTCOMES = {
 
 # ---------------------------------------------------------------------------
 # Engine generates correct shapes and content at seq_len=512
+# (default: prepend_outcome=False — pure move sequences)
 # ---------------------------------------------------------------------------
 
 
 class TestEngine512:
-    """Verify the Rust engine produces valid CLM batches at seq_len=512."""
+    """Verify the Rust engine produces valid CLM batches at seq_len=512.
+
+    Default mode: prepend_outcome=False, so sequences are pure moves
+    [m1, m2, ..., mN, PAD, ...] with max_ply=seq_len=512.
+    """
 
     SEQ_LEN = 512
-    MAX_PLY = 511  # seq_len - 1
+    MAX_PLY = 512  # prepend_outcome=False → max_ply = seq_len
     B = 64
 
     @pytest.fixture(scope="class")
@@ -61,44 +67,49 @@ class TestEngine512:
         assert term_codes.shape == (self.B,)
 
     @pytest.mark.integration
-    def test_position_zero_is_outcome(self, clm_batch):
-        input_ids, *_ = clm_batch
+    def test_position_zero_is_move(self, clm_batch):
+        """Without prepend_outcome, position 0 is the first move, not an outcome."""
+        input_ids, _, _, _, game_lengths, _ = clm_batch
         for b in range(input_ids.shape[0]):
-            assert int(input_ids[b, 0]) in _PRETRAINING_OUTCOMES
+            gl = int(game_lengths[b])
+            if gl > 0:
+                tok = int(input_ids[b, 0])
+                assert 0 <= tok < NUM_ACTIONS, f"batch {b}: token {tok} not a valid action"
 
     @pytest.mark.integration
     def test_moves_in_valid_range(self, clm_batch):
         input_ids, _, _, _, game_lengths, _ = clm_batch
         for b in range(input_ids.shape[0]):
             gl = int(game_lengths[b])
-            for t in range(1, min(gl + 1, self.SEQ_LEN)):
+            for t in range(min(gl, self.SEQ_LEN)):
                 tok = int(input_ids[b, t])
-                assert 1 <= tok <= 4272, f"batch {b} ply {t}: token {tok} out of range"
+                assert 0 <= tok < NUM_ACTIONS, f"batch {b} ply {t}: token {tok} out of range"
 
     @pytest.mark.integration
     def test_padding_beyond_game_length(self, clm_batch):
         input_ids, _, _, _, game_lengths, _ = clm_batch
         for b in range(input_ids.shape[0]):
             gl = int(game_lengths[b])
-            for t in range(gl + 1, self.SEQ_LEN):
+            for t in range(gl, self.SEQ_LEN):
                 assert input_ids[b, t] == PAD_TOKEN
 
     @pytest.mark.integration
     def test_target_shift(self, clm_batch):
         input_ids, targets, *_ = clm_batch
         assert np.array_equal(targets[:, :-1], input_ids[:, 1:])
-        assert (targets[:, -1] == 0).all()
+        assert (targets[:, -1] == PAD_TOKEN).all()
 
     @pytest.mark.integration
     def test_loss_mask_boundary(self, clm_batch):
+        """Without prepend_outcome, loss_mask has gl True positions (0..gl-1)."""
         _, _, loss_mask, _, game_lengths, _ = clm_batch
         for b in range(loss_mask.shape[0]):
             gl = int(game_lengths[b])
-            # Positions 0..gl should be True
-            for t in range(gl + 1):
+            # Positions 0..gl-1 should be True
+            for t in range(gl):
                 assert loss_mask[b, t], f"batch {b} pos {t} should be masked"
-            # Positions gl+1..seq_len should be False
-            for t in range(gl + 1, self.SEQ_LEN):
+            # Positions gl..seq_len-1 should be False
+            for t in range(gl, self.SEQ_LEN):
                 assert not loss_mask[b, t], f"batch {b} pos {t} should not be masked"
 
     @pytest.mark.integration
@@ -114,7 +125,10 @@ class TestEngine512:
 
 
 class TestLongGames:
-    """Verify that seq_len=512 actually produces games longer than 255 plies."""
+    """Verify that seq_len=512 actually produces games longer than 255 plies.
+
+    Uses default prepend_outcome=False, so max_ply=512.
+    """
 
     @pytest.mark.integration
     def test_some_games_exceed_255_plies(self):
@@ -130,26 +144,29 @@ class TestLongGames:
         found_late_move = False
         for b in range(256):
             gl = int(game_lengths[b])
-            if gl > 256:
-                # Position 257 in input_ids corresponds to ply 256 (0-indexed)
+            if gl > 257:
+                # Position 257 in input_ids (0-indexed) is ply 257
                 tok = int(input_ids[b, 257])
-                assert 1 <= tok <= 4272, f"Token at position 257 should be a move, got {tok}"
+                assert 0 <= tok < NUM_ACTIONS, f"Token at position 257 should be a move, got {tok}"
                 found_late_move = True
         assert found_late_move, "No game had moves at position 257"
 
     @pytest.mark.integration
-    def test_ply_limit_at_511(self):
-        """PlyLimit should appear for games that hit 511 plies, not 255."""
+    def test_ply_limit_at_512(self):
+        """PlyLimit should appear for games that hit 512 plies, not 255.
+
+        With prepend_outcome=False, max_ply=seq_len=512.
+        """
         _, _, _, _, game_lengths, term_codes = engine.generate_clm_batch(256, 512, seed=42)
         for b in range(256):
             gl = int(game_lengths[b])
             tc = int(term_codes[b])
             if tc == 5:  # PlyLimit
-                assert gl == 511, (
-                    f"PlyLimit game has gl={gl}, expected 511 (max_ply=511)"
+                assert gl == 512, (
+                    f"PlyLimit game has gl={gl}, expected 512 (max_ply=512)"
                 )
-            # Games should never have gl > 511
-            assert gl <= 511, f"Game length {gl} exceeds max_ply=511"
+            # Games should never have gl > 512
+            assert gl <= 512, f"Game length {gl} exceeds max_ply=512"
 
     @pytest.mark.integration
     def test_no_ply_limit_at_255(self):
@@ -168,13 +185,17 @@ class TestLongGames:
 
 
 class TestOutcomeTokens512:
-    """Verify outcome token correctness for 512-token batches."""
+    """Verify outcome token correctness for 512-token batches.
+
+    Uses prepend_outcome=True so outcome appears at input_ids[b, 0].
+    With prepend_outcome=True, max_ply=511.
+    """
 
     @pytest.mark.integration
     def test_checkmate_parity(self):
         """Checkmate winner determined by game length parity, even at long ply counts."""
         input_ids, _, _, _, game_lengths, term_codes = engine.generate_clm_batch(
-            256, 512, seed=42
+            256, 512, seed=42, prepend_outcome=True
         )
         for b in range(256):
             gl = int(game_lengths[b])
@@ -190,7 +211,7 @@ class TestOutcomeTokens512:
     def test_ply_limit_outcome_token(self):
         """Games hitting 511 plies should get PLY_LIMIT outcome token."""
         input_ids, _, _, _, game_lengths, term_codes = engine.generate_clm_batch(
-            256, 512, seed=42
+            256, 512, seed=42, prepend_outcome=True
         )
         for b in range(256):
             tc = int(term_codes[b])
@@ -202,7 +223,7 @@ class TestOutcomeTokens512:
     def test_draw_outcomes(self):
         """Stalemate and draw-by-rule outcomes remain correct at 512 tokens."""
         input_ids, _, _, _, _, term_codes = engine.generate_clm_batch(
-            256, 512, seed=42
+            256, 512, seed=42, prepend_outcome=True
         )
         for b in range(256):
             tc = int(term_codes[b])
@@ -221,11 +242,15 @@ class TestOutcomeTokens512:
 class TestRustPythonParity512:
     @pytest.mark.integration
     def test_rust_clm_matches_python_pack_at_512(self):
-        """Rust generate_clm_batch and Python _to_clm_batch agree at seq_len=512."""
+        """Rust generate_clm_batch (prepend_outcome=True) and Python _to_clm_batch agree at seq_len=512.
+
+        _to_clm_batch always prepends outcome tokens, so the Rust side must use
+        prepend_outcome=True for the outputs to match.
+        """
         seq_len = 512
         B = 16
         r_input_ids, r_targets, r_loss_mask, r_move_ids, r_gl, r_tc = (
-            engine.generate_clm_batch(B, seq_len, seed=42)
+            engine.generate_clm_batch(B, seq_len, seed=42, prepend_outcome=True)
         )
         py_batch = _to_clm_batch(r_move_ids, r_gl, r_tc, seq_len)
         assert torch.equal(torch.from_numpy(r_input_ids).long(), py_batch["input_ids"])
@@ -258,7 +283,7 @@ class TestModelForward512:
     def test_forward_full_512(self, model_512):
         """Model can process a full 512-token sequence."""
         B = 2
-        input_ids = torch.randint(0, 4272, (B, 512))
+        input_ids = torch.randint(0, NUM_ACTIONS, (B, 512))
         mask = torch.ones(B, 512, dtype=torch.bool)
         with torch.no_grad():
             logits, _ = model_512(input_ids, mask, hidden_only=True)
@@ -268,7 +293,7 @@ class TestModelForward512:
     def test_forward_shorter_than_max(self, model_512):
         """Model handles sequences shorter than max_seq_len."""
         B = 2
-        input_ids = torch.randint(0, 4272, (B, 128))
+        input_ids = torch.randint(0, NUM_ACTIONS, (B, 128))
         mask = torch.ones(B, 128, dtype=torch.bool)
         with torch.no_grad():
             logits, _ = model_512(input_ids, mask, hidden_only=True)
@@ -277,7 +302,7 @@ class TestModelForward512:
     @pytest.mark.unit
     def test_rejects_longer_than_max(self, model_512):
         """Model raises on sequences exceeding max_seq_len."""
-        input_ids = torch.randint(0, 4272, (1, 513))
+        input_ids = torch.randint(0, NUM_ACTIONS, (1, 513))
         mask = torch.ones(1, 513, dtype=torch.bool)
         with pytest.raises(ValueError, match="exceeds max"):
             model_512(input_ids, mask)
@@ -289,7 +314,12 @@ class TestModelForward512:
 
 
 class TestLegalGrid512:
-    """Verify legal move masks and legal move rate at 512-token sequences."""
+    """Verify legal move masks and legal move rate at 512-token sequences.
+
+    Uses default prepend_outcome=False, so max_ply=512 and sequences are
+    pure moves. The engine returns move_ids with shape (B, 512) and
+    legal_grid with shape (B, 512, 64).
+    """
 
     @pytest.fixture(scope="class")
     def val_data_512(self):
@@ -301,21 +331,23 @@ class TestLegalGrid512:
     def test_legal_grid_shape(self, val_data_512):
         """Legal grid has correct shape for 512-token sequences."""
         legal_grid = val_data_512["legal_grid"]
-        # max_ply for legal grid is 511 (seq_len-1 passed to engine)
+        # prepend_outcome=False → max_ply=512
         assert legal_grid.shape[0] == 64
-        assert legal_grid.shape[1] == 511
+        assert legal_grid.shape[1] == 512
         assert legal_grid.shape[2] == 64
 
     @pytest.mark.integration
     def test_game_lengths_match(self, val_data_512):
-        """game_lengths in val set should match loss_mask counts."""
+        """game_lengths in val set should match loss_mask counts.
+
+        With prepend_outcome=False, loss_mask has gl True positions (0..gl-1).
+        """
         loss_mask = val_data_512["loss_mask"]
         game_lengths = val_data_512["game_lengths"]
         for b in range(64):
             gl = int(game_lengths[b])
-            # loss_mask has gl+1 True positions (0..gl inclusive)
             mask_count = int(loss_mask[b].sum().item())
-            assert mask_count == gl + 1
+            assert mask_count == gl
 
     @pytest.mark.integration
     def test_legal_grid_nonempty_at_late_plies(self, val_data_512):
@@ -346,13 +378,13 @@ class TestPlyRangeFilter:
     def setup(self):
         """Generate val data with known legal grids at seq_len=64.
 
-        Uses ``targets`` as predictions — targets[p] = input_ids[p+1] which
-        is the actual move at ply p, aligning with legal_grid[p].  This gives
+        Uses ``input_ids`` as predictions — input_ids[p] is the actual move
+        at ply p (no outcome prefix), aligning with legal_grid[p].  This gives
         a legal rate of ~1.0 for move positions (the ground truth is always legal).
         """
         val = create_validation_set(n_games=16, max_ply=64, seed=42)
-        # targets[p] = the move actually played at ply p → always legal
-        val["preds"] = val["targets"].clone()
+        # input_ids[p] = the move actually played at ply p → always legal
+        val["preds"] = val["input_ids"].clone()
         return val
 
     @pytest.mark.integration
@@ -368,15 +400,15 @@ class TestPlyRangeFilter:
     def test_min_ply_excludes_early(self, setup):
         """Setting min_ply > 0 excludes early plies from the computation.
 
-        Uses ground-truth preds for the first 10 plies and zeros (illegal)
+        Uses ground-truth preds for the first 10 plies and PAD_TOKEN (illegal)
         for the rest.  Full-range rate should be moderate (mix of legal and
         illegal), but restricting to [0, 10) should be ~1.0 since those plies
-        have the real moves.  Restricting to [10, ∞) should be ~0.0 since
-        those plies have all-zero (PAD) predictions which are never legal.
+        have the real moves.  Restricting to [10, inf) should be ~0.0 since
+        those plies have PAD predictions which are never legal.
         """
         split = 10
-        # Build preds: ground-truth for plies < split, zeros elsewhere
-        preds = torch.zeros_like(setup["preds"])
+        # Build preds: ground-truth for plies < split, PAD elsewhere
+        preds = torch.full_like(setup["preds"], PAD_TOKEN)
         preds[:, :split] = setup["preds"][:, :split]
 
         rate_early = compute_legal_move_rate_from_preds(
@@ -470,7 +502,8 @@ class TestCLMDataset512:
         ds = CLMDataset(batch_size=128, max_ply=512, base_seed=42)
         ds.set_start_step(0)
         batch = next(iter(ds))
-        game_lengths = batch["loss_mask"].sum(dim=1) - 1  # subtract 1 for outcome position
+        # Without prepend_outcome, loss_mask count = game_length directly
+        game_lengths = batch["loss_mask"].sum(dim=1)
         long_games = (game_lengths > 255).sum().item()
         assert long_games > 0, "No games exceeded 255 plies in CLMDataset at max_ply=512"
 
@@ -484,7 +517,7 @@ class TestDiscardPlyLimit512:
     """Verify discard_ply_limit works correctly at seq_len=512."""
 
     @pytest.mark.integration
-    def test_discard_removes_511_ply_games(self):
+    def test_discard_removes_ply_limit_games(self):
         """With discard_ply_limit=True, no games should have term_code=PlyLimit."""
         _, _, _, _, _, term_codes = engine.generate_clm_batch(
             64, 512, seed=42, discard_ply_limit=True,

@@ -15,6 +15,7 @@ from hypothesis import strategies as st
 from pawn.config import (
     BLACK_CHECKMATES,
     DRAW_BY_RULE,
+    OUTCOME_TOKEN_BASE,
     PAD_TOKEN,
     PLY_LIMIT,
     STALEMATE,
@@ -131,8 +132,8 @@ class TestPackCLMSequences:
         gl = np.array([3], dtype=np.int16)
         outcomes = torch.tensor([WHITE_CHECKMATES], dtype=torch.long)
         batch = pack_clm_sequences(move_ids, gl, outcomes, seq_len=8)
-        # Positions 4..7 should be PAD (0)
-        assert (batch["input_ids"][0, 4:] == 0).all()
+        # Positions 4..7 should be PAD (1968)
+        assert (batch["input_ids"][0, 4:] == PAD_TOKEN).all()
 
     @pytest.mark.unit
     def test_targets_shift(self):
@@ -144,7 +145,7 @@ class TestPackCLMSequences:
         B, T = batch["targets"].shape
         for t in range(T - 1):
             assert batch["targets"][0, t] == batch["input_ids"][0, t + 1]
-        assert batch["targets"][0, T - 1] == 0
+        assert batch["targets"][0, T - 1] == PAD_TOKEN
 
     @pytest.mark.unit
     def test_loss_mask_boundary(self):
@@ -165,9 +166,9 @@ class TestPackCLMSequences:
         gl = np.array([3], dtype=np.int16)
         outcomes = torch.tensor([WHITE_CHECKMATES], dtype=torch.long)
         batch = pack_clm_sequences(move_ids, gl, outcomes, seq_len=8)
-        # Positions 4, 5 should be zeroed since gl=3
-        assert batch["input_ids"][0, 4].item() == 0
-        assert batch["input_ids"][0, 5].item() == 0
+        # Positions 4, 5 should be PAD since gl=3
+        assert batch["input_ids"][0, 4].item() == PAD_TOKEN
+        assert batch["input_ids"][0, 5].item() == PAD_TOKEN
 
     @pytest.mark.unit
     def test_output_dtypes(self):
@@ -187,15 +188,15 @@ class TestPackCLMSequences:
         gl = np.array([2, 3], dtype=np.int16)
         outcomes = torch.tensor([WHITE_CHECKMATES, BLACK_CHECKMATES], dtype=torch.long)
         batch = pack_clm_sequences(move_ids, gl, outcomes, seq_len=6)
-        # Game 0: [WHITE_CM, 1, 2, 0, 0, 0]
+        # Game 0: [WHITE_CM, 1, 2, PAD, PAD, PAD]
         assert batch["input_ids"][0, 0].item() == WHITE_CHECKMATES
         assert batch["input_ids"][0, 1].item() == 1
         assert batch["input_ids"][0, 2].item() == 2
-        assert batch["input_ids"][0, 3].item() == 0
-        # Game 1: [BLACK_CM, 10, 20, 30, 0, 0]
+        assert batch["input_ids"][0, 3].item() == PAD_TOKEN
+        # Game 1: [BLACK_CM, 10, 20, 30, PAD, PAD]
         assert batch["input_ids"][1, 0].item() == BLACK_CHECKMATES
         assert batch["input_ids"][1, 3].item() == 30
-        assert batch["input_ids"][1, 4].item() == 0
+        assert batch["input_ids"][1, 4].item() == PAD_TOKEN
 
     @pytest.mark.unit
     @given(n_moves=st.integers(min_value=1, max_value=20))
@@ -238,7 +239,7 @@ class TestStripOutcomeToken:
     @pytest.mark.unit
     def test_last_position_is_pad(self, packed):
         stripped = strip_outcome_token(packed)
-        assert stripped["input_ids"][0, -1].item() == 0
+        assert stripped["input_ids"][0, -1].item() == PAD_TOKEN
 
     @pytest.mark.unit
     def test_targets_match_new_shift(self, packed):
@@ -247,7 +248,7 @@ class TestStripOutcomeToken:
         assert torch.equal(
             stripped["targets"][:, :-1], stripped["input_ids"][:, 1:]
         )
-        assert (stripped["targets"][:, -1] == 0).all()
+        assert (stripped["targets"][:, -1] == PAD_TOKEN).all()
 
     @pytest.mark.unit
     def test_loss_mask_shifted_left(self, packed):
@@ -351,10 +352,10 @@ class TestCLMDataset:
     def test_no_outcome_mode(self):
         ds = CLMDataset(batch_size=4, max_ply=32, base_seed=42, no_outcome=True)
         batch = next(iter(ds))
-        # Position 0 should be a move token (not outcome >= 4273)
+        # Position 0 should be a move token (not outcome >= OUTCOME_TOKEN_BASE)
         # unless the game had 0 moves (should still yield a valid shape).
         # Just verify no outcome tokens appear.
-        assert (batch["input_ids"] < 4273).all()
+        assert (batch["input_ids"] < OUTCOME_TOKEN_BASE).all()
 
     @pytest.mark.unit
     def test_discard_ply_limit(self):
@@ -388,7 +389,7 @@ class TestRustPackConsistency:
         B = 8
         seq_len = 64
         r_ids, r_tgt, r_mask, r_move_ids, r_gl, r_tc = engine.generate_clm_batch(
-            B, seq_len, seed=42
+            B, seq_len, seed=42, prepend_outcome=True
         )
         py = _to_clm_batch(r_move_ids, r_gl, r_tc, seq_len)
         assert torch.equal(torch.from_numpy(r_ids).long(), py["input_ids"])

@@ -786,7 +786,7 @@ mod tests {
         // From the starting position: no check, no mate, no EP, no promo, no pins.
         let max_ply = 8;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16;
         let game_lengths = vec![1i16];
 
         let (per_ply, _, _) = compute_edge_stats_per_ply(&move_ids, &game_lengths, max_ply);
@@ -810,10 +810,10 @@ mod tests {
         // 1. e2e4 a7a6 2. e4e5 d7d5 — white can capture en passant (exd6).
         let max_ply = 16;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;  // e2e4
-        move_ids[1] = crate::vocab::base_grid_token(48, 40) as i16;  // a7a6
-        move_ids[2] = crate::vocab::base_grid_token(28, 36) as i16;  // e4e5
-        move_ids[3] = crate::vocab::base_grid_token(51, 35) as i16;  // d7d5
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16;  // e2e4
+        move_ids[1] = crate::vocab::uci_token("a7a6") as i16;  // a7a6
+        move_ids[2] = crate::vocab::uci_token("e4e5") as i16;  // e4e5
+        move_ids[3] = crate::vocab::uci_token("d7d5") as i16;  // d7d5
         let game_lengths = vec![4i16];
 
         let (per_ply, _, _) = compute_edge_stats_per_ply(&move_ids, &game_lengths, max_ply);
@@ -841,8 +841,8 @@ mod tests {
         // 1. e2e4 d7d5 — white can now play exd5 (pawn capture).
         let max_ply = 8;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;  // e2e4
-        move_ids[1] = crate::vocab::base_grid_token(51, 35) as i16;  // d7d5
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16;  // e2e4
+        move_ids[1] = crate::vocab::uci_token("d7d5") as i16;  // d7d5
         let game_lengths = vec![2i16];
 
         let (per_ply, _, _) = compute_edge_stats_per_ply(&move_ids, &game_lengths, max_ply);
@@ -946,12 +946,12 @@ mod tests {
         // Italian Game: 1. e4 e5 2. Nf3 Nc6 3. Bc4 Nf6 — now white can castle kingside.
         let max_ply = 16;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
-        move_ids[1] = crate::vocab::base_grid_token(52, 36) as i16; // e7e5
-        move_ids[2] = crate::vocab::base_grid_token(6, 21) as i16;  // g1f3
-        move_ids[3] = crate::vocab::base_grid_token(57, 42) as i16; // b8c6
-        move_ids[4] = crate::vocab::base_grid_token(5, 26) as i16;  // f1c4
-        move_ids[5] = crate::vocab::base_grid_token(62, 45) as i16; // g8f6
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16; // e2e4
+        move_ids[1] = crate::vocab::uci_token("e7e5") as i16; // e7e5
+        move_ids[2] = crate::vocab::uci_token("g1f3") as i16;  // g1f3
+        move_ids[3] = crate::vocab::uci_token("b8c6") as i16; // b8c6
+        move_ids[4] = crate::vocab::uci_token("f1c4") as i16;  // f1c4
+        move_ids[5] = crate::vocab::uci_token("g8f6") as i16; // g8f6
         let game_lengths = vec![6i16];
 
         let (per_ply, _, _) = compute_edge_stats_per_ply(&move_ids, &game_lengths, max_ply);

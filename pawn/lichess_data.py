@@ -65,7 +65,7 @@ def compute_legal_indices(
     move_ids: np.ndarray,
     game_lengths: np.ndarray,
     seq_len: int,
-    vocab_size: int = 4278,
+    vocab_size: int = 1968,
 ) -> np.ndarray:
     """Compute flat sparse indices for legal token masks (CPU only).
 
@@ -92,7 +92,7 @@ class LegalMaskBuilder:
       2. ``__call__(batch)`` — legacy path that computes indices inline.
     """
 
-    def __init__(self, batch_size: int, max_ply: int, vocab_size: int = 4278,
+    def __init__(self, batch_size: int, max_ply: int, vocab_size: int = 1968,
                  device: str = "cpu", max_index_buf: int = 4_000_000):
         self.vocab_size = vocab_size
         self.max_ply = max_ply
@@ -159,7 +159,7 @@ class LegalMaskCollate:
     GPU training critical path.
     """
 
-    def __init__(self, seq_len: int, vocab_size: int = 4278):
+    def __init__(self, seq_len: int, vocab_size: int = 1968):
         self.seq_len = seq_len
         self.vocab_size = vocab_size
 

@@ -3,6 +3,7 @@
 use rayon::prelude::*;
 
 use crate::board::GameState;
+use crate::vocab;
 
 /// Replay games and compute legal move masks at each ply.
 /// The label at ply t is the legal moves BEFORE move t has been played —
@@ -139,7 +140,7 @@ pub fn compute_legal_token_masks_sparse(
             // Include PAD token in the legal mask so loss is finite.
             if length < seq_len {
                 let pad_base = game_base + (length * vocab_size) as i64;
-                indices.push(pad_base); // PAD_TOKEN = 0
+                indices.push(pad_base + vocab::PAD_TOKEN as i64);
             }
 
             indices
@@ -232,7 +233,7 @@ mod tests {
         let max_ply = 8;
         let vocab_size = crate::vocab::VOCAB_SIZE;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16; // e2e4
         let game_lengths = vec![1i16];
 
         let masks = compute_legal_token_masks(&move_ids, &game_lengths, max_ply, vocab_size);
@@ -240,18 +241,18 @@ mod tests {
         assert_eq!(count, 20, "Starting position should have 20 legal moves");
 
         // e2e4 should be among them
-        let e2e4 = crate::vocab::base_grid_token(12, 28) as usize;
+        let e2e4 = crate::vocab::uci_token("e2e4") as usize;
         assert!(masks[e2e4]);
     }
 
     #[test]
     fn test_grid_matches_token_mask() {
-        // For non-promotion moves, token = base_grid_token(src, dst), and the
-        // per-src 64-bit dst grid should match the dense token mask.
+        // For non-promotion moves, the action maps to a unique (src, dst) pair,
+        // and the per-src 64-bit dst grid should match the dense token mask.
         let max_ply = 8;
         let vocab_size = crate::vocab::VOCAB_SIZE;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16; // e2e4
         let game_lengths = vec![1i16];
 
         let (grids, _promos) = compute_legal_move_masks(&move_ids, &game_lengths, max_ply);
@@ -277,8 +278,8 @@ mod tests {
         let max_ply = 8;
         let vocab_size = crate::vocab::VOCAB_SIZE;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
-        move_ids[1] = crate::vocab::base_grid_token(52, 36) as i16; // e7e5
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16; // e2e4
+        move_ids[1] = crate::vocab::uci_token("e7e5") as i16; // e7e5
         let game_lengths = vec![2i16];
 
         let masks = compute_legal_token_masks(&move_ids, &game_lengths, max_ply, vocab_size);
@@ -286,15 +287,15 @@ mod tests {
         // mask at ply=0: white's turn, e2e4 is a legal option (20 moves)
         let ply0_count: usize = (0..vocab_size).filter(|&v| masks[v]).count();
         assert_eq!(ply0_count, 20, "ply 0 = startpos, 20 legal moves");
-        assert!(masks[crate::vocab::base_grid_token(12, 28) as usize], "e2e4 legal at ply 0");
+        assert!(masks[crate::vocab::uci_token("e2e4") as usize], "e2e4 legal at ply 0");
 
         // mask at ply=1: after e2e4, black has 20 moves
         let ply1_off = vocab_size;
         let ply1_count: usize = (0..vocab_size).filter(|&v| masks[ply1_off + v]).count();
         assert_eq!(ply1_count, 20, "ply 1 = after e2e4, black has 20 legal moves");
-        assert!(masks[ply1_off + crate::vocab::base_grid_token(52, 36) as usize], "e7e5 legal at ply 1");
+        assert!(masks[ply1_off + crate::vocab::uci_token("e7e5") as usize], "e7e5 legal at ply 1");
         // e2e4 should NOT be legal at ply 1 (wrong side, pawn moved)
-        assert!(!masks[ply1_off + crate::vocab::base_grid_token(12, 28) as usize]);
+        assert!(!masks[ply1_off + crate::vocab::uci_token("e2e4") as usize]);
     }
 
     #[test]
@@ -306,7 +307,7 @@ mod tests {
         let seq_len = max_ply + 1;
         let vocab_size = crate::vocab::VOCAB_SIZE;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16;
         let game_lengths = vec![1i16];
 
         let sparse = compute_legal_token_masks_sparse(
@@ -314,8 +315,7 @@ mod tests {
         );
 
         // At position length=1, PAD token should be present.
-        // PAD_TOKEN = 0, so index = game_base + length * vocab_size + 0 = vocab_size
-        let expected_pad_idx = (1 * vocab_size) as i64;
+        let expected_pad_idx = (1 * vocab_size + vocab::PAD_TOKEN as usize) as i64;
         assert!(sparse.contains(&expected_pad_idx), "sparse must include PAD token at position length");
 
         // Verify PAD is the ONLY token at position `length` — no move tokens
@@ -380,8 +380,8 @@ mod tests {
         // valid ply (length-1) should have non-zero legal moves (boundary check).
         let max_ply = 64;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
-        move_ids[1] = crate::vocab::base_grid_token(52, 36) as i16; // e7e5
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16; // e2e4
+        move_ids[1] = crate::vocab::uci_token("e7e5") as i16; // e7e5
         let game_lengths = vec![2i16];
 
         let (grids, _) = compute_legal_move_masks(&move_ids, &game_lengths, max_ply);

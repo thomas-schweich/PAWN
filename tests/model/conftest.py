@@ -57,10 +57,10 @@ def small_clm_sequences():
     Deterministic, no engine dependency. 2 games, seq_len=8.
     Game 0: len=3 moves, Game 1: len=5 moves.
     """
-    from pawn.config import WHITE_CHECKMATES, BLACK_CHECKMATES
+    from pawn.config import WHITE_CHECKMATES, BLACK_CHECKMATES, PAD_TOKEN
 
     seq_len = 8
-    input_ids = torch.zeros(2, seq_len, dtype=torch.long)
+    input_ids = torch.full((2, seq_len), PAD_TOKEN, dtype=torch.long)
     # Game 0: [WHITE_CHECKMATES, m1, m2, m3, PAD, PAD, PAD, PAD]
     input_ids[0, 0] = WHITE_CHECKMATES
     input_ids[0, 1:4] = torch.tensor([10, 20, 30])
@@ -68,7 +68,7 @@ def small_clm_sequences():
     input_ids[1, 0] = BLACK_CHECKMATES
     input_ids[1, 1:6] = torch.tensor([11, 22, 33, 44, 55])
 
-    targets = torch.zeros(2, seq_len, dtype=torch.long)
+    targets = torch.full((2, seq_len), PAD_TOKEN, dtype=torch.long)
     targets[:, :-1] = input_ids[:, 1:]
 
     game_lengths = torch.tensor([3, 5], dtype=torch.long)

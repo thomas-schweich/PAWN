@@ -341,15 +341,15 @@ class TestCLMEmbedding:
     @pytest.mark.unit
     def test_output_shape(self, toy_clm_config):
         emb = CLMEmbedding(toy_clm_config)
-        input_ids = torch.randint(0, 4278, (2, 8))
+        input_ids = torch.randint(0, 1968, (2, 8))
         out = emb(input_ids)
         assert out.shape == (2, 8, toy_clm_config.d_model)
 
     @pytest.mark.unit
     def test_pad_gets_pad_embed(self, toy_clm_config):
-        """PAD token (0) → pad_embed parameter (zero by default)."""
+        """PAD token (1968) → pad_embed parameter (zero by default)."""
         emb = CLMEmbedding(toy_clm_config)
-        input_ids = torch.tensor([[0, 0, 0]])
+        input_ids = torch.tensor([[PAD_TOKEN, PAD_TOKEN, PAD_TOKEN]])
         out = emb(input_ids)
         # pad_embed is initialized to zeros
         expected = emb.pad_embed.expand(1, 3, -1)
@@ -403,39 +403,47 @@ class TestCLMEmbedding:
         assert torch.allclose(out, expected, atol=1e-6)
 
     @pytest.mark.unit
-    def test_decomp_table_outcome_entries_zero(self, toy_clm_config):
-        """Decomp table entries for all outcome tokens in the table are (0,0,0).
+    def test_outcome_tokens_use_outcome_embed_not_decomp(self, toy_clm_config):
+        """Outcome tokens are above the decomp table and overridden in forward().
 
-        Outcome tokens span OUTCOME_TOKEN_BASE .. OUTCOME_TOKEN_BASE+n_outcomes-1.
-        The decomp table may be smaller than vocab_size (higher outcomes are
-        clamped in forward()), so we check every outcome index the table covers.
+        The decomp table covers only action tokens [0, NUM_ACTIONS).
+        Outcome tokens (>= OUTCOME_TOKEN_BASE) and PAD (PAD_TOKEN) are
+        clamped to the last table entry during lookup, but then overridden
+        by outcome_embed and pad_embed respectively.  Verify the override
+        produces the correct embedding.
         """
-        from pawn.config import N_TOTAL_OUTCOMES
+        from pawn.config import NUM_ACTIONS
 
         emb = CLMEmbedding(toy_clm_config)
-        table_len = emb.decomp_table.shape[0]
-        outcome_end = OUTCOME_TOKEN_BASE + N_TOTAL_OUTCOMES  # 4284
-        check_end = min(outcome_end, table_len)
-        n_checked = check_end - OUTCOME_TOKEN_BASE
-        assert n_checked > 0, "no outcome tokens in decomp table"
+        # Decomp table covers only action tokens
+        assert emb.decomp_table.shape[0] == NUM_ACTIONS
 
-        for tok in range(OUTCOME_TOKEN_BASE, check_end):
-            entry = emb.decomp_table[tok]
-            assert entry[0].item() == 0, f"token {tok} src != 0"
-            assert entry[1].item() == 0, f"token {tok} dst != 0"
-            assert entry[2].item() == 0, f"token {tok} promo != 0"
+        # Outcome tokens are above the table range
+        assert OUTCOME_TOKEN_BASE >= NUM_ACTIONS
 
-        # The last table entry is the clamp target for out-of-range outcomes;
-        # verify it is also (0,0,0) so higher outcome tokens are safe.
-        last_entry = emb.decomp_table[table_len - 1]
-        assert last_entry[0].item() == 0, "clamp-target src != 0"
-        assert last_entry[1].item() == 0, "clamp-target dst != 0"
-        assert last_entry[2].item() == 0, "clamp-target promo != 0"
+        # Verify outcome tokens produce outcome_embed, not factored embeddings
+        with torch.no_grad():
+            emb.src_embed.weight.zero_()
+            emb.dst_embed.weight.zero_()
+            emb.promo_embed.weight.zero_()
+            emb.pad_embed.zero_()
+
+        input_ids = torch.tensor([[WHITE_CHECKMATES, BLACK_CHECKMATES, STALEMATE]])
+        out = emb(input_ids)
+        expected = torch.stack(
+            [
+                emb.outcome_embed.weight[0],
+                emb.outcome_embed.weight[1],
+                emb.outcome_embed.weight[2],
+            ]
+        ).unsqueeze(0)
+        assert torch.allclose(out, expected, atol=1e-6)
 
     @pytest.mark.unit
     def test_decomp_table_shape(self, toy_clm_config):
+        from pawn.config import NUM_ACTIONS
         emb = CLMEmbedding(toy_clm_config)
-        assert emb.decomp_table.shape == (4278, 3)
+        assert emb.decomp_table.shape == (NUM_ACTIONS, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -510,8 +518,8 @@ class TestPAWNCLMForward:
     @pytest.mark.unit
     def test_no_nan_with_padding(self, toy_model, toy_clm_config):
         B, T = 2, 16
-        ids = torch.randint(1, 4273, (B, T))
-        ids[:, 10:] = 0
+        ids = torch.randint(0, 1968, (B, T))
+        ids[:, 10:] = PAD_TOKEN
         mask = torch.zeros(B, T, dtype=torch.bool)
         mask[:, :11] = True
         logits, _ = toy_model(ids, mask)
@@ -522,12 +530,12 @@ class TestPAWNCLMForward:
         """Future tokens should not affect past logits (causal)."""
         B, T = 1, 8
         torch.manual_seed(0)
-        ids = torch.randint(1, 4273, (B, T))
+        ids = torch.randint(0, 1968, (B, T))
         mask = full_mask(B, T)
         logits1, _ = toy_model(ids, mask)
 
         ids2 = ids.clone()
-        ids2[0, T - 1] = (ids2[0, T - 1] + 100) % 4272 + 1
+        ids2[0, T - 1] = (ids2[0, T - 1] + 100) % 1968
         logits2, _ = toy_model(ids2, mask)
         # Logits at position 0 should be identical
         assert torch.allclose(logits1[0, 0], logits2[0, 0], atol=1e-5)
@@ -636,7 +644,7 @@ class TestForwardTrain:
         assert 0.0 <= acc <= 1.0
 
         # An untrained toy model on random-ish data should not achieve perfect
-        # accuracy (vocab=4284, so chance ≈ 0.02%).  Strictly less than 1.0.
+        # accuracy (vocab=1980, so chance ≈ 0.05%).  Strictly less than 1.0.
         assert acc < 1.0, "untrained model should not predict perfectly"
 
         # Cross-check: recompute accuracy from the logits and targets manually

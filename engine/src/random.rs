@@ -633,9 +633,9 @@ mod tests {
     fn test_generate_game_moves_match_length() {
         let (moves, length, _) = generate_one_game(7, 256, 0.0);
         assert_eq!(moves.len(), length as usize);
-        // Each move is a valid move token (1..=4272)
+        // Each move is a valid action ID (0..1967)
         for &tok in &moves {
-            assert!(tok >= 1 && tok <= 4272, "Invalid move token: {}", tok);
+            assert!((tok as usize) < crate::vocab::NUM_ACTIONS, "Invalid move token: {}", tok);
         }
     }
 

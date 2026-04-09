@@ -1,4 +1,5 @@
 pub mod types;
+pub mod searchless_vocab;
 pub mod vocab;
 pub mod board;
 pub mod random;
@@ -172,9 +173,13 @@ fn generate_random_games<'py>(
 ///
 /// Returns (input_ids, targets, loss_mask, move_ids, game_lengths, term_codes).
 /// input_ids = [outcome, ply_1, ..., ply_N, PAD, ...] (seq_len per row).
-/// move_ids are the raw moves (seq_len-1 per row) for replay operations.
+/// move_ids are the raw moves for replay operations.
+///
+/// When `prepend_outcome` is false (default), sequences are pure moves and
+/// `max_ply = seq_len`. When true, position 0 is the outcome token and
+/// `max_ply = seq_len - 1`.
 #[pyfunction]
-#[pyo3(signature = (batch_size, seq_len=256, seed=42, discard_ply_limit=false, mate_boost=0.0))]
+#[pyo3(signature = (batch_size, seq_len=256, seed=42, discard_ply_limit=false, mate_boost=0.0, prepend_outcome=false))]
 fn generate_clm_batch<'py>(
     py: Python<'py>,
     batch_size: usize,
@@ -182,19 +187,20 @@ fn generate_clm_batch<'py>(
     seed: u64,
     discard_ply_limit: bool,
     mate_boost: f64,
+    prepend_outcome: bool,
 ) -> PyResult<(
     Bound<'py, PyArray2<i16>>,   // input_ids (B, seq_len)
     Bound<'py, PyArray2<i16>>,   // targets (B, seq_len)
     Bound<'py, PyArray2<bool>>,  // loss_mask (B, seq_len)
-    Bound<'py, PyArray2<i16>>,   // move_ids (B, seq_len-1)
+    Bound<'py, PyArray2<i16>>,   // move_ids (B, max_ply)
     Bound<'py, PyArray1<i16>>,   // game_lengths (B,)
     Bound<'py, PyArray1<u8>>,    // termination_codes (B,)
 )> {
     let result = py.allow_threads(|| {
-        batch::generate_clm_batch(batch_size, seq_len, seed, discard_ply_limit, mate_boost)
+        batch::generate_clm_batch(batch_size, seq_len, seed, discard_ply_limit, mate_boost, prepend_outcome)
     });
 
-    let max_ply = seq_len - 1;
+    let max_ply = result.max_ply;
     let input_ids = numpy::PyArray::from_vec(py, result.input_ids)
         .reshape([batch_size, seq_len])?;
     let targets = numpy::PyArray::from_vec(py, result.targets)
@@ -1353,7 +1359,7 @@ impl PyBatchRLEnv {
 
     /// Legal move token masks: numpy bool (B, vocab_size).
     /// Includes promotion tokens — correct for autoregressive generation.
-    #[pyo3(signature = (game_indices, vocab_size=4284))]
+    #[pyo3(signature = (game_indices, vocab_size=1980))]
     fn get_legal_token_masks_batch<'py>(
         &self,
         py: Python<'py>,
@@ -1538,10 +1544,27 @@ fn compute_accuracy_ceiling_py(
     Ok(dict.into())
 }
 
+/// Convert a legacy PAWN token (1-4272) to a searchless action (0-1967).
+/// Returns -1 for impossible moves, legacy PAD (0), or out-of-range tokens.
+#[pyfunction]
+fn pawn_to_searchless(pawn_token: u16) -> i16 {
+    vocab::pawn_to_searchless(pawn_token)
+        .map(|a| a as i16)
+        .unwrap_or(-1)
+}
+
+/// Convert a searchless action (0-1967) to a legacy PAWN token (1-4272).
+#[pyfunction]
+fn searchless_to_pawn(action: u16) -> u16 {
+    vocab::searchless_to_pawn(action)
+}
+
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hello, m)?)?;
     m.add_function(wrap_pyfunction!(export_move_vocabulary, m)?)?;
+    m.add_function(wrap_pyfunction!(pawn_to_searchless, m)?)?;
+    m.add_function(wrap_pyfunction!(searchless_to_pawn, m)?)?;
     m.add_function(wrap_pyfunction!(generate_training_batch, m)?)?;
     m.add_function(wrap_pyfunction!(generate_random_games, m)?)?;
     m.add_function(wrap_pyfunction!(generate_clm_batch, m)?)?;
@@ -1590,32 +1613,25 @@ mod tests {
     }
 
     #[test]
-    fn test_decompose_token_dispatch_base_grid_range() {
-        // Dispatch: tokens in [1, 4096] go to base grid branch (promo=0)
-        let samples = [1u16, 2, 64, 128, 4095, 4096];
-        for &t in &samples {
-            let decomp = vocab::decompose_token(t);
-            assert!(decomp.is_some(), "token {} should decompose", t);
-            let (_, _, promo) = decomp.unwrap();
-            assert_eq!(promo, 0, "base grid token {} should have promo=0", t);
+    fn test_decompose_token_action_range() {
+        // All 1968 actions should decompose
+        for action in 0..vocab::NUM_ACTIONS as u16 {
+            assert!(vocab::decompose_token(action).is_some(),
+                "action {} should decompose", action);
         }
     }
 
     #[test]
-    fn test_decompose_token_dispatch_promo_range() {
-        // Dispatch: tokens in [4097, 4272] go to promo branch (promo >= 1)
-        let samples = [4097u16, 4098, 4099, 4100, 4200, 4272];
-        for &t in &samples {
-            let decomp = vocab::decompose_token(t);
-            assert!(decomp.is_some(), "token {} should decompose", t);
-            let (_, _, promo) = decomp.unwrap();
-            assert!(promo >= 1 && promo <= 4, "promo token {} should have 1<=promo<=4", t);
-        }
+    fn test_decompose_token_promo_actions() {
+        // Promotion actions should have promo >= 1
+        let a7a8q = vocab::uci_token("a7a8q");
+        let (_, _, promo) = vocab::decompose_token(a7a8q).unwrap();
+        assert!(promo >= 1 && promo <= 4, "promo action should have 1<=promo<=4");
     }
 
     #[test]
     fn test_decompose_token_dispatch_outcome_range() {
-        // Dispatch: tokens >= OUTCOME_BASE (4273) return None
+        // Outcome tokens return None
         for t in vocab::OUTCOME_BASE..=vocab::DRAW_BY_TIME {
             assert!(vocab::decompose_token(t).is_none(),
                 "outcome token {} should not decompose", t);
@@ -1624,13 +1640,13 @@ mod tests {
 
     #[test]
     fn test_decompose_token_boundary_values() {
-        // Boundaries between ranges
-        assert!(vocab::decompose_token(0).is_none()); // PAD
-        assert!(vocab::decompose_token(1).is_some()); // first grid
-        assert!(vocab::decompose_token(4096).is_some()); // last grid
-        assert!(vocab::decompose_token(4097).is_some()); // first promo
-        assert!(vocab::decompose_token(4272).is_some()); // last promo
-        assert!(vocab::decompose_token(4273).is_none()); // first outcome
+        // Boundaries: actions [0, 1967], PAD [1968], outcomes [1969, 1979]
+        assert!(vocab::decompose_token(0).is_some());    // first action
+        assert!(vocab::decompose_token(1967).is_some());  // last action
+        assert!(vocab::decompose_token(1968).is_none());  // PAD
+        assert!(vocab::decompose_token(1969).is_none());  // first outcome
+        assert!(vocab::decompose_token(1979).is_none());  // last outcome
+        assert!(vocab::decompose_token(1980).is_none());  // beyond vocab
     }
 
     #[test]

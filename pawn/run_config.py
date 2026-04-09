@@ -85,9 +85,10 @@ class PretrainConfig(BaseRunConfig):
     # Pretrain-specific
     accumulation_steps: int = 1
     checkpoint_interval: int = 5000
-    max_seq_len: int = 256
+    max_seq_len: int = 512
     legality_late_ply: int | None = None  # defaults to max_seq_len // 2 at runtime
     val_games: int = 512  # override BaseRunConfig's 50K — pretrain uses on-the-fly data
+    legacy_vocab: bool = False  # use old 4284-token PAWN vocab (for reproducing old experiments)
 
 
 class AdapterConfig(BaseRunConfig):

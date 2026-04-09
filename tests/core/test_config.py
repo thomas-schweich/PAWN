@@ -39,26 +39,26 @@ from pawn.config import (
 
 @pytest.mark.unit
 class TestConstants:
-    def test_pad_token_is_zero(self):
-        assert PAD_TOKEN == 0
+    def test_pad_token(self):
+        assert PAD_TOKEN == 1968
 
     def test_outcome_token_base(self):
-        assert OUTCOME_TOKEN_BASE == 4273
+        assert OUTCOME_TOKEN_BASE == 1969
 
     def test_pretraining_outcomes_sequence(self):
-        assert WHITE_CHECKMATES == 4273
-        assert BLACK_CHECKMATES == 4274
-        assert STALEMATE == 4275
-        assert DRAW_BY_RULE == 4276
-        assert PLY_LIMIT == 4277
+        assert WHITE_CHECKMATES == 1969
+        assert BLACK_CHECKMATES == 1970
+        assert STALEMATE == 1971
+        assert DRAW_BY_RULE == 1972
+        assert PLY_LIMIT == 1973
 
     def test_lichess_outcomes_sequence(self):
-        assert WHITE_RESIGNS == 4278
-        assert BLACK_RESIGNS == 4279
-        assert DRAW_BY_AGREEMENT == 4280
-        assert WHITE_WINS_ON_TIME == 4281
-        assert BLACK_WINS_ON_TIME == 4282
-        assert DRAW_BY_TIME == 4283
+        assert WHITE_RESIGNS == 1974
+        assert BLACK_RESIGNS == 1975
+        assert DRAW_BY_AGREEMENT == 1976
+        assert WHITE_WINS_ON_TIME == 1977
+        assert BLACK_WINS_ON_TIME == 1978
+        assert DRAW_BY_TIME == 1979
 
     def test_n_pretraining_outcomes(self):
         assert N_PRETRAINING_OUTCOMES == 5
@@ -76,7 +76,7 @@ class TestConstants:
         assert len(pretrain) + len(lichess) == N_TOTAL_OUTCOMES
 
     def test_outcome_tokens_contiguous(self):
-        """Outcome tokens are 4273..4283 with no gaps."""
+        """Outcome tokens are 1969..1979 with no gaps."""
         all_outcomes = [WHITE_CHECKMATES, BLACK_CHECKMATES, STALEMATE,
                         DRAW_BY_RULE, PLY_LIMIT, WHITE_RESIGNS, BLACK_RESIGNS,
                         DRAW_BY_AGREEMENT, WHITE_WINS_ON_TIME,
@@ -94,8 +94,8 @@ class TestConstants:
 class TestCLMConfigVariants:
     def test_default_fields(self):
         cfg = CLMConfig()
-        assert cfg.vocab_size == 4284
-        assert cfg.max_seq_len == 256
+        assert cfg.vocab_size == 1980
+        assert cfg.max_seq_len == 512
         assert cfg.n_outcomes == N_TOTAL_OUTCOMES
         assert cfg.d_model == 512
         assert cfg.n_layers == 8
@@ -105,9 +105,8 @@ class TestCLMConfigVariants:
         assert cfg.rope_base == 10000.0
 
     def test_vocab_size_is_sum_of_components(self):
-        """1 pad + 4096 grid + 176 promo + 11 outcome = 4284."""
-        # 4284 = 1 + 4096 + 176 + 11
-        assert CLMConfig().vocab_size == 1 + 4096 + 176 + 11
+        """1968 actions + 1 pad + 11 outcomes = 1980."""
+        assert CLMConfig().vocab_size == 1968 + 1 + 11
 
     def test_small_variant(self):
         cfg = CLMConfig.small()
@@ -240,7 +239,7 @@ class TestTrainingConfigDefaults:
         assert cfg.warmup_steps == 1000
         assert cfg.total_steps == 100_000
         assert cfg.batch_size == 256
-        assert cfg.max_ply == 256
+        assert cfg.max_ply == 512
         assert cfg.discard_ply_limit is False
         assert cfg.num_workers == 4
         assert cfg.use_amp is True

@@ -1,73 +1,69 @@
-"""Tests for pawn.trainer module: legal move rate, promo grid index, step helpers."""
+"""Tests for pawn.trainer module: legal move rate, action grid index, step helpers."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
+from pawn.config import NUM_ACTIONS, PAD_TOKEN, OUTCOME_TOKEN_BASE
 from pawn.trainer import (
-    _build_promo_grid_index,
-    _get_promo_grid_index,
+    _build_action_grid_index,
+    _get_action_grid_index,
     compute_legal_move_rate,
 )
 
 
 # ---------------------------------------------------------------------------
-# _build_promo_grid_index / _get_promo_grid_index
+# _build_action_grid_index / _get_action_grid_index
 # ---------------------------------------------------------------------------
 
 
-class TestBuildPromoGridIndex:
-    def test_length_is_176(self):
-        """44 pairs * 4 promo types = 176 entries."""
-        idx = _build_promo_grid_index()
-        assert len(idx) == 176
+class TestBuildActionGridIndex:
+    def test_length_is_num_actions(self):
+        """One grid index per action token."""
+        idx = _build_action_grid_index(NUM_ACTIONS)
+        assert len(idx) == NUM_ACTIONS
 
     def test_entries_are_valid_grid_indices(self):
         """Each entry must be in [0, 4095] (grid = 64x64 = 4096 slots)."""
-        idx = _build_promo_grid_index()
+        idx = _build_action_grid_index(NUM_ACTIONS)
         for v in idx:
             assert 0 <= v < 4096
 
-    def test_four_consecutive_entries_are_equal(self):
-        """Token layout: PROMO_START + pair_idx * 4 + promo_type.
-        So each pair_idx corresponds to 4 consecutive entries with the same grid index.
-        """
-        idx = _build_promo_grid_index()
-        for pair_idx in range(44):
-            base = idx[pair_idx * 4]
-            for promo_type in range(4):
-                assert idx[pair_idx * 4 + promo_type] == base
+    def test_first_action_is_a1b1(self):
+        """Action 0 = a1b1, grid index = 0*64 + 1 = 1."""
+        idx = _build_action_grid_index(NUM_ACTIONS)
+        assert idx[0] == 0 * 64 + 1  # a1=0, b1=1
 
 
-class TestGetPromoGridIndex:
+class TestGetActionGridIndex:
     def test_returns_long_tensor(self, cpu_device):
-        t = _get_promo_grid_index(cpu_device)
+        t = _get_action_grid_index(cpu_device)
         assert t.dtype == torch.long
-        assert t.shape == (176,)
+        assert t.shape == (NUM_ACTIONS,)
         assert str(t.device) == "cpu"
 
     def test_matches_builder(self, cpu_device):
-        ref = _build_promo_grid_index()
-        t = _get_promo_grid_index(cpu_device)
+        ref = _build_action_grid_index(NUM_ACTIONS)
+        t = _get_action_grid_index(cpu_device)
         assert t.tolist() == ref
 
     def test_all_values_in_grid_range(self, cpu_device):
-        t = _get_promo_grid_index(cpu_device)
+        t = _get_action_grid_index(cpu_device)
         assert (t >= 0).all().item()
         assert (t < 4096).all().item()
 
     def test_caches_across_calls(self, cpu_device):
-        """Module-level cache means second call is O(1) — verified by identity of list."""
+        """Module-level cache means second call is O(1) -- verified by identity check."""
         import pawn.trainer as tr
 
-        tr._PROMO_GRID_INDEX = None  # force rebuild
-        _get_promo_grid_index(cpu_device)
-        cached = tr._PROMO_GRID_INDEX
-        assert cached is not None
-        _get_promo_grid_index(cpu_device)
-        # Still the same cached list (identity check)
-        assert tr._PROMO_GRID_INDEX is cached
+        tr._ACTION_GRID_INDEX_CACHE.clear()
+        tr._ACTION_GRID_TENSOR_CACHE.clear()
+        t1 = _get_action_grid_index(cpu_device)
+        assert NUM_ACTIONS in tr._ACTION_GRID_INDEX_CACHE
+        t2 = _get_action_grid_index(cpu_device)
+        # Same tensor object (cached)
+        assert t1 is t2
 
 
 # ---------------------------------------------------------------------------
@@ -94,147 +90,161 @@ def _pack_grid(dense: torch.Tensor) -> torch.Tensor:
 
 
 class TestComputeLegalMoveRate:
+
+    @pytest.fixture(autouse=True)
+    def _grid_index(self):
+        """Cache the action-to-grid mapping for test helpers."""
+        self._idx = _build_action_grid_index(NUM_ACTIONS)
+
+    def _grid_for_action(self, action: int) -> tuple[int, int]:
+        """Return (src, dst) grid coords for an action token."""
+        grid = self._idx[action]
+        return grid // 64, grid % 64
+
     def test_all_legal_predictions_yields_one(self, cpu_device):
         """If preds hit legal slots at every position, rate == 1.0 exactly."""
-        B, T, V = 2, 4, 4284
+        V = 1980
+        B, T = 2, 4
         max_ply = 4
-        # Predict token 1 (grid index 0) at every position
-        preds = torch.ones(B, T, dtype=torch.long)
+        action = 0  # a1b1
+        src, dst = self._grid_for_action(action)
+        preds = torch.full((B, T), action, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
-        # Dense legal mask — set position (0,0) legal everywhere
         dense = torch.zeros(B, max_ply, 64, 64)
-        dense[..., 0, 0] = 1.0  # (src=0, dst=0) is legal
+        dense[..., src, dst] = 1.0
         legal_grid = _pack_grid(dense)
 
         loss_mask = torch.ones(B, T, dtype=torch.bool)
-        game_lengths = torch.full((B,), T - 1, dtype=torch.long)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
 
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
-        # Exactly 1.0: all B*T = 8 positions predict token 1 (grid 0),
-        # and grid slot (0,0) is legal at every ply in every batch element.
         assert rate == pytest.approx(1.0)
-        # Verify the setup is non-trivial: we have positions that were counted
         assert B * T > 0
 
     def test_all_illegal_predictions_yields_zero(self, cpu_device):
         """If preds miss, rate == 0.0."""
-        B, T, V = 2, 4, 4284
+        V = 1980
+        B, T = 2, 4
         max_ply = 4
-        # Predict token 1 (grid index 0) but only slot (1,1) is legal
-        preds = torch.ones(B, T, dtype=torch.long)
+        action = 0  # a1b1
+        preds = torch.full((B, T), action, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
+        # Make a different slot legal
         dense = torch.zeros(B, max_ply, 64, 64)
-        dense[..., 1, 1] = 1.0  # different slot
+        dense[..., 5, 5] = 1.0  # some other slot
         legal_grid = _pack_grid(dense)
 
         loss_mask = torch.ones(B, T, dtype=torch.bool)
-        game_lengths = torch.full((B,), T - 1, dtype=torch.long)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
 
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
         assert rate == pytest.approx(0.0)
 
     def test_empty_loss_mask_returns_zero(self, cpu_device):
         """No positions to evaluate -> 0.0 by convention."""
-        B, T, V = 2, 4, 4284
+        V = 1980
+        B, T = 2, 4
         max_ply = 4
         preds = torch.zeros(B, T, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
         legal_grid = torch.zeros(B, max_ply, 64, dtype=torch.long)
         loss_mask = torch.zeros(B, T, dtype=torch.bool)
-        game_lengths = torch.full((B,), T - 1, dtype=torch.long)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
         assert rate == 0.0
 
     def test_partial_legal_rate(self, cpu_device):
         """Exactly K of N positions have legal argmax -> rate == K/N."""
-        B, T, V = 2, 3, 4284
+        V = 1980
+        B, T = 2, 3
         max_ply = 3
-        # All positions predict token 1 (grid index 0)
-        preds = torch.ones(B, T, dtype=torch.long)
+        action = 0  # a1b1
+        src, dst = self._grid_for_action(action)
+        preds = torch.full((B, T), action, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
         dense = torch.zeros(B, max_ply, 64, 64)
-        # Make slot (0,0) legal at exactly 3 of 6 positions:
-        # batch 0 ply 0, batch 0 ply 1, batch 1 ply 2
-        dense[0, 0, 0, 0] = 1.0
-        dense[0, 1, 0, 0] = 1.0
-        dense[1, 2, 0, 0] = 1.0
+        # Make the action's slot legal at exactly 3 of 6 positions
+        dense[0, 0, src, dst] = 1.0
+        dense[0, 1, src, dst] = 1.0
+        dense[1, 2, src, dst] = 1.0
         legal_grid = _pack_grid(dense)
 
         loss_mask = torch.ones(B, T, dtype=torch.bool)
-        game_lengths = torch.full((B,), T - 1, dtype=torch.long)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
 
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
-        # 6 positions total (2 batches x 3 plies), 3 legal -> 3/6 = 0.5
         assert rate == pytest.approx(3.0 / 6.0)
 
     def test_pad_token_predictions_are_not_counted_legal(self, cpu_device):
-        """PAD token (0) is outside grid and promo ranges — always illegal."""
-        B, T, V = 1, 2, 4284
+        """PAD token is outside action range -- always illegal."""
+        V = 1980
+        B, T = 1, 2
         max_ply = 2
-        preds = torch.zeros(B, T, dtype=torch.long)  # PAD token
+        preds = torch.full((B, T), PAD_TOKEN, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
-        # Make everything legal — shouldn't matter, PAD is never counted
+        # Make everything legal -- shouldn't matter, PAD is never counted
         dense = torch.ones(B, max_ply, 64, 64)
         legal_grid = _pack_grid(dense)
 
         loss_mask = torch.ones(B, T, dtype=torch.bool)
-        game_lengths = torch.full((B,), T - 1, dtype=torch.long)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
 
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
         assert rate == pytest.approx(0.0)
 
     def test_outcome_token_predictions_are_not_counted_legal(self, cpu_device):
-        """Outcome tokens (4273+) are outside grid/promo ranges."""
-        B, T, V = 1, 1, 4284
+        """Outcome tokens are outside action range."""
+        V = 1980
+        B, T = 1, 1
         max_ply = 1
-        preds = torch.full((B, T), 4273, dtype=torch.long)  # outcome token
+        preds = torch.full((B, T), OUTCOME_TOKEN_BASE, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
         dense = torch.ones(B, max_ply, 64, 64)
         legal_grid = _pack_grid(dense)
 
         loss_mask = torch.ones(B, T, dtype=torch.bool)
-        game_lengths = torch.zeros(B, dtype=torch.long)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
 
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
         assert rate == pytest.approx(0.0)
 
     def test_game_length_clips_positions(self, cpu_device):
         """Positions beyond game_length are not counted."""
-        B, T, V = 1, 4, 4284
+        V = 1980
+        B, T = 1, 4
         max_ply = 4
-        # All preds legal
-        preds = torch.ones(B, T, dtype=torch.long)
+        action = 0
+        src, dst = self._grid_for_action(action)
+        preds = torch.full((B, T), action, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
         dense = torch.zeros(B, max_ply, 64, 64)
-        dense[..., 0, 0] = 1.0
+        dense[..., src, dst] = 1.0
         legal_grid = _pack_grid(dense)
 
-        loss_mask = torch.ones(B, T, dtype=torch.bool)
-        # game_length 0 -> only position 0 counts
-        game_lengths = torch.zeros(B, dtype=torch.long)
+        # loss_mask with only position 0 True (simulates game_length=1)
+        loss_mask = torch.zeros(B, T, dtype=torch.bool)
+        loss_mask[0, 0] = True
+        game_lengths = torch.ones(B, dtype=torch.long)
 
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
-        # Only 1 position (idx 0), which is legal -> 1.0
         assert rate == pytest.approx(1.0)
 
-    def test_promo_token_resolves_via_lookup(self, cpu_device):
-        """Promotion tokens (4097-4272) use the promo_grid_index lookup."""
-        B, T, V = 1, 1, 4284
+    def test_action_resolves_via_grid_lookup(self, cpu_device):
+        """Action tokens use the action_grid_index lookup to find their grid cell."""
+        V = 1980
+        B, T = 1, 1
         max_ply = 1
-        idx = _build_promo_grid_index()
-        # Pick the first promo token (4097) and look up its grid index
-        promo_token = 4097
-        grid_idx = idx[0]
-        src = grid_idx // 64
-        dst = grid_idx % 64
+        # Pick an arbitrary action and look up its grid index
+        action = 100
+        src, dst = self._grid_for_action(action)
 
-        preds = torch.full((B, T), promo_token, dtype=torch.long)
+        preds = torch.full((B, T), action, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
         dense = torch.zeros(B, max_ply, 64, 64)
@@ -242,73 +252,76 @@ class TestComputeLegalMoveRate:
         legal_grid = _pack_grid(dense)
 
         loss_mask = torch.ones(B, T, dtype=torch.bool)
-        game_lengths = torch.zeros(B, dtype=torch.long)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
 
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
         assert rate == pytest.approx(1.0)
 
-    def test_promo_token_illegal_when_grid_mismatches(self, cpu_device):
-        B, T, V = 1, 1, 4284
+    def test_action_illegal_when_grid_mismatches(self, cpu_device):
+        V = 1980
+        B, T = 1, 1
         max_ply = 1
-        promo_token = 4097  # some promo token
-        preds = torch.full((B, T), promo_token, dtype=torch.long)
+        action = 100
+        preds = torch.full((B, T), action, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
         # Empty legal mask
         legal_grid = torch.zeros(B, max_ply, 64, dtype=torch.long)
         loss_mask = torch.ones(B, T, dtype=torch.bool)
-        game_lengths = torch.zeros(B, dtype=torch.long)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
         assert rate == pytest.approx(0.0)
 
     def test_returns_python_float(self, cpu_device):
         """compute_legal_move_rate returns plain float, not a tensor."""
-        B, T, V = 1, 1, 4284
+        V = 1980
+        B, T = 1, 1
         max_ply = 1
-        preds = torch.zeros(B, T, dtype=torch.long)
+        preds = torch.full((B, T), PAD_TOKEN, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
         legal_grid = torch.zeros(B, max_ply, 64, dtype=torch.long)
         loss_mask = torch.ones(B, T, dtype=torch.bool)
-        game_lengths = torch.zeros(B, dtype=torch.long)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
         assert isinstance(rate, float)
 
-    def test_loss_mask_intersects_game_length(self, cpu_device):
-        """Only positions where BOTH loss_mask and <=game_length are counted."""
-        B, T, V = 1, 4, 4284
+    def test_loss_mask_restricts_evaluation(self, cpu_device):
+        """Only positions where loss_mask is True are counted."""
+        V = 1980
+        B, T = 1, 4
         max_ply = 4
-        preds = torch.ones(B, T, dtype=torch.long)  # legal at slot 0
+        action = 0
+        src, dst = self._grid_for_action(action)
+        preds = torch.full((B, T), action, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
         dense = torch.zeros(B, max_ply, 64, 64)
-        dense[..., 0, 0] = 1.0
+        dense[..., src, dst] = 1.0
         legal_grid = _pack_grid(dense)
 
         # Only position 2 has loss_mask True
         loss_mask = torch.zeros(B, T, dtype=torch.bool)
         loss_mask[0, 2] = True
-        game_lengths = torch.full((B,), T - 1, dtype=torch.long)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
-        # Only 1 position counted, legal -> 1.0
         assert rate == pytest.approx(1.0)
 
     def test_n_plies_clips_to_max_ply(self, cpu_device):
-        """When T > max_ply, only first max_ply positions are evaluated.
-
-        This exposes whether valid_count reflects only counted positions.
-        """
-        B, T, V = 1, 4, 4284
+        """When T > max_ply, only first max_ply positions are evaluated."""
+        V = 1980
+        B, T = 1, 4
         max_ply = 2
-        # Predict legal slot 1 (grid 0) at every T=4 positions
-        preds = torch.ones(B, T, dtype=torch.long)
+        action = 0
+        src, dst = self._grid_for_action(action)
+        preds = torch.full((B, T), action, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
         dense = torch.zeros(B, max_ply, 64, 64)
-        dense[..., 0, 0] = 1.0
+        dense[..., src, dst] = 1.0
         legal_grid = _pack_grid(dense)
 
         loss_mask = torch.ones(B, T, dtype=torch.bool)
-        game_lengths = torch.full((B,), T - 1, dtype=torch.long)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
 
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
         # Only 2 positions counted (max_ply=2), both legal -> 1.0
@@ -316,23 +329,26 @@ class TestComputeLegalMoveRate:
 
     def test_different_preds_per_batch_position(self, cpu_device):
         """Independently predict legal/illegal in different batch/position combos."""
-        B, T, V = 2, 2, 4284
+        V = 1980
+        B, T = 2, 2
         max_ply = 2
-        preds = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
-        # grid indices 0, 1, 2, 3
+        # Pick 4 different actions
+        actions = [0, 1, 2, 3]
+        grids = [self._grid_for_action(a) for a in actions]
+        preds = torch.tensor([[actions[0], actions[1]], [actions[2], actions[3]]], dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
         dense = torch.zeros(B, max_ply, 64, 64)
-        # Batch 0, ply 0: slot (0,0) legal -> pred 1 (grid 0) legal
-        dense[0, 0, 0, 0] = 1.0
-        # Batch 0, ply 1: no slots legal -> pred 2 (grid 1) illegal
-        # Batch 1, ply 0: slot (0,2) legal -> pred 3 (grid 2) legal
-        dense[1, 0, 0, 2] = 1.0
-        # Batch 1, ply 1: no slots legal -> pred 4 (grid 3) illegal
+        # Batch 0, ply 0: make action 0's slot legal
+        dense[0, 0, grids[0][0], grids[0][1]] = 1.0
+        # Batch 0, ply 1: no slots legal for action 1
+        # Batch 1, ply 0: make action 2's slot legal
+        dense[1, 0, grids[2][0], grids[2][1]] = 1.0
+        # Batch 1, ply 1: no slots legal for action 3
         legal_grid = _pack_grid(dense)
 
         loss_mask = torch.ones(B, T, dtype=torch.bool)
-        game_lengths = torch.full((B,), T - 1, dtype=torch.long)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
 
         rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
         # 2 of 4 legal

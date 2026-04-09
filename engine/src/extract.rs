@@ -152,8 +152,8 @@ mod tests {
         // At ply 1: AFTER e2e4 BEFORE e7e5, black to move, e2 empty, e4 has white pawn
         let max_ply = 8;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
-        move_ids[1] = crate::vocab::base_grid_token(52, 36) as i16; // e7e5
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16; // e2e4
+        move_ids[1] = crate::vocab::uci_token("e7e5") as i16; // e7e5
         let game_lengths = vec![2i16];
 
         let states = extract_board_states(&move_ids, &game_lengths, max_ply);
@@ -184,12 +184,12 @@ mod tests {
         // (for black), adjacent to the double-pushed pawn.
         let max_ply = 8;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
-        move_ids[1] = crate::vocab::base_grid_token(48, 40) as i16; // a7a6 (waiting move)
-        move_ids[2] = crate::vocab::base_grid_token(28, 36) as i16; // e4e5
-        move_ids[3] = crate::vocab::base_grid_token(51, 35) as i16; // d7d5
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16; // e2e4
+        move_ids[1] = crate::vocab::uci_token("a7a6") as i16; // a7a6 (waiting move)
+        move_ids[2] = crate::vocab::uci_token("e4e5") as i16; // e4e5
+        move_ids[3] = crate::vocab::uci_token("d7d5") as i16; // d7d5
         // 5th move: white captures en passant e5d6 (src=36, dst=43)
-        move_ids[4] = crate::vocab::base_grid_token(36, 43) as i16; // exd6 (EP capture)
+        move_ids[4] = crate::vocab::uci_token("e5d6") as i16; // exd6 (EP capture)
         let game_lengths = vec![5i16];
 
         let states = extract_board_states(&move_ids, &game_lengths, max_ply);
@@ -214,10 +214,10 @@ mod tests {
         // After e1 king moves, both white castling rights are lost (bits 0, 1 clear).
         let max_ply = 16;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
-        move_ids[1] = crate::vocab::base_grid_token(52, 36) as i16; // e7e5
-        move_ids[2] = crate::vocab::base_grid_token(4, 12) as i16;  // e1e2 (Ke2)
-        move_ids[3] = crate::vocab::base_grid_token(60, 52) as i16; // e8e7 (Ke7)
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16; // e2e4
+        move_ids[1] = crate::vocab::uci_token("e7e5") as i16; // e7e5
+        move_ids[2] = crate::vocab::uci_token("e1e2") as i16;  // e1e2 (Ke2)
+        move_ids[3] = crate::vocab::uci_token("e8e7") as i16; // e8e7 (Ke7)
         let game_lengths = vec![4i16];
 
         let states = extract_board_states(&move_ids, &game_lengths, max_ply);
@@ -234,7 +234,7 @@ mod tests {
     fn test_extract_not_check_at_startpos() {
         let max_ply = 8;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16;
         let game_lengths = vec![1i16];
         let states = extract_board_states(&move_ids, &game_lengths, max_ply);
         assert!(!states.is_check[0]);
@@ -245,7 +245,7 @@ mod tests {
         // Piece codes: 0=empty, 1-6=white P/N/B/R/Q/K, 7-12=black P/N/B/R/Q/K.
         let max_ply = 4;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16;
         let game_lengths = vec![1i16];
         let states = extract_board_states(&move_ids, &game_lengths, max_ply);
 
@@ -279,7 +279,7 @@ mod tests {
         // Positions beyond game_length should be default-initialized (zero/false/-1).
         let max_ply = 32;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(12, 28) as i16;
+        move_ids[0] = crate::vocab::uci_token("e2e4") as i16;
         let game_lengths = vec![1i16];
         let states = extract_board_states(&move_ids, &game_lengths, max_ply);
 
@@ -302,8 +302,8 @@ mod tests {
         // 2. Nf6 (knight move): halfmove clock becomes 2
         let max_ply = 8;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(6, 21) as i16;  // g1f3
-        move_ids[1] = crate::vocab::base_grid_token(62, 45) as i16; // g8f6
+        move_ids[0] = crate::vocab::uci_token("g1f3") as i16;  // g1f3
+        move_ids[1] = crate::vocab::uci_token("g8f6") as i16; // g8f6
         let game_lengths = vec![2i16];
         let states = extract_board_states(&move_ids, &game_lengths, max_ply);
 
@@ -317,9 +317,9 @@ mod tests {
         // 2. e5   (pawn): hmc should reset to 0
         let max_ply = 8;
         let mut move_ids = vec![0i16; max_ply];
-        move_ids[0] = crate::vocab::base_grid_token(6, 21) as i16;  // g1f3
-        move_ids[1] = crate::vocab::base_grid_token(52, 36) as i16; // e7e5 (pawn push)
-        move_ids[2] = crate::vocab::base_grid_token(1, 18) as i16;  // b1c3 knight
+        move_ids[0] = crate::vocab::uci_token("g1f3") as i16;  // g1f3
+        move_ids[1] = crate::vocab::uci_token("e7e5") as i16; // e7e5 (pawn push)
+        move_ids[2] = crate::vocab::uci_token("b1c3") as i16;  // b1c3 knight
         let game_lengths = vec![3i16];
         let states = extract_board_states(&move_ids, &game_lengths, max_ply);
 
@@ -336,11 +336,11 @@ mod tests {
         let max_ply = 16;
         let mut move_ids = vec![0i16; 2 * max_ply];
         // Game 0: 1. e2e4 e7e5
-        move_ids[0 * max_ply + 0] = crate::vocab::base_grid_token(12, 28) as i16; // e2e4
-        move_ids[0 * max_ply + 1] = crate::vocab::base_grid_token(52, 36) as i16; // e7e5
+        move_ids[0 * max_ply + 0] = crate::vocab::uci_token("e2e4") as i16; // e2e4
+        move_ids[0 * max_ply + 1] = crate::vocab::uci_token("e7e5") as i16; // e7e5
         // Game 1: 1. d2d4 d7d5
-        move_ids[1 * max_ply + 0] = crate::vocab::base_grid_token(11, 27) as i16; // d2d4
-        move_ids[1 * max_ply + 1] = crate::vocab::base_grid_token(51, 35) as i16; // d7d5
+        move_ids[1 * max_ply + 0] = crate::vocab::uci_token("d2d4") as i16; // d2d4
+        move_ids[1 * max_ply + 1] = crate::vocab::uci_token("d7d5") as i16; // d7d5
         let game_lengths = vec![2i16, 2i16];
 
         let states = extract_board_states(&move_ids, &game_lengths, max_ply);

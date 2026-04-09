@@ -3,36 +3,62 @@
 from dataclasses import dataclass
 
 
-# Outcome token IDs — must match engine/src/vocab.rs
-PAD_TOKEN = 0
-OUTCOME_TOKEN_BASE = 4273
+# ---- New vocabulary (searchless_chess) ----
+# Token layout: actions [0, 1967], PAD [1968], outcomes [1969, 1979]
+# Must match engine/src/vocab.rs
+
+PAD_TOKEN = 1968
+OUTCOME_TOKEN_BASE = 1969
+NUM_ACTIONS = 1968
 
 # Pretraining outcomes (random games — natural terminations)
-WHITE_CHECKMATES = 4273
-BLACK_CHECKMATES = 4274
-STALEMATE = 4275
-DRAW_BY_RULE = 4276       # 75-move, fivefold repetition, insufficient material
-PLY_LIMIT = 4277          # Hit 255 plies (also used for truncated Lichess games)
+WHITE_CHECKMATES = 1969
+BLACK_CHECKMATES = 1970
+STALEMATE = 1971
+DRAW_BY_RULE = 1972       # 75-move, fivefold repetition, insufficient material
+PLY_LIMIT = 1973          # Hit max plies (also used for truncated Lichess games)
 
 # Lichess-specific outcomes (finetuning data)
-WHITE_RESIGNS = 4278      # Normal termination, white wins, no checkmate
-BLACK_RESIGNS = 4279      # Normal termination, black wins, no checkmate
-DRAW_BY_AGREEMENT = 4280  # Normal termination, draw, not stalemate
-WHITE_WINS_ON_TIME = 4281 # Time forfeit, white wins
-BLACK_WINS_ON_TIME = 4282 # Time forfeit, black wins
-DRAW_BY_TIME = 4283       # Time forfeit, draw (insufficient mating material)
+WHITE_RESIGNS = 1974      # Normal termination, white wins, no checkmate
+BLACK_RESIGNS = 1975      # Normal termination, black wins, no checkmate
+DRAW_BY_AGREEMENT = 1976  # Normal termination, draw, not stalemate
+WHITE_WINS_ON_TIME = 1977 # Time forfeit, white wins
+BLACK_WINS_ON_TIME = 1978 # Time forfeit, black wins
+DRAW_BY_TIME = 1979       # Time forfeit, draw (insufficient mating material)
 
-N_PRETRAINING_OUTCOMES = 5  # Original vocab: tokens 4273-4277
-N_TOTAL_OUTCOMES = 11       # Full vocab: tokens 4273-4283
+N_PRETRAINING_OUTCOMES = 5  # Tokens 1969-1973
+N_TOTAL_OUTCOMES = 11       # Tokens 1969-1979
+
+
+class LegacyVocab:
+    """Constants for the original PAWN vocabulary (4,284 tokens).
+
+    Used when loading old checkpoints (vocab_size=4284).
+    """
+    PAD_TOKEN = 0
+    OUTCOME_TOKEN_BASE = 4273
+    NUM_ACTIONS = 4272  # 4096 grid + 176 promo
+    VOCAB_SIZE = 4284
+    WHITE_CHECKMATES = 4273
+    BLACK_CHECKMATES = 4274
+    STALEMATE = 4275
+    DRAW_BY_RULE = 4276
+    PLY_LIMIT = 4277
+    WHITE_RESIGNS = 4278
+    BLACK_RESIGNS = 4279
+    DRAW_BY_AGREEMENT = 4280
+    WHITE_WINS_ON_TIME = 4281
+    BLACK_WINS_ON_TIME = 4282
+    DRAW_BY_TIME = 4283
 
 
 @dataclass
 class CLMConfig:
     """Model architecture hyperparameters."""
 
-    # Vocabulary: 1 pad + 4096 grid + 176 promo + 11 outcome tokens
-    vocab_size: int = 4284
-    max_seq_len: int = 256  # 1 outcome + up to 255 move/padding tokens
+    # Vocabulary: 1968 actions + 1 PAD + 11 outcomes = 1980
+    vocab_size: int = 1980
+    max_seq_len: int = 512
     n_outcomes: int = N_TOTAL_OUTCOMES
 
     # Transformer
@@ -83,7 +109,7 @@ class TrainingConfig:
 
     # Batch
     batch_size: int = 256
-    max_ply: int = 256  # Rust engine max_ply (games up to 255 actual moves)
+    max_ply: int = 512  # Matches max_seq_len (no outcome prefix by default)
     discard_ply_limit: bool = False  # Only train on games that ended naturally
     num_workers: int = 4
 

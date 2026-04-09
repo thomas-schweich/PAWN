@@ -12,6 +12,7 @@ import torch.utils.data
 import chess_engine as engine
 
 from pawn.config import (
+    PAD_TOKEN,
     WHITE_CHECKMATES,
     BLACK_CHECKMATES,
     STALEMATE,
@@ -64,8 +65,8 @@ def pack_clm_sequences(
     Args:
         move_ids: (B, max_ply) raw move token IDs
         game_lengths: (B,) actual game lengths
-        outcome_tokens: (B,) pre-computed outcome token IDs (4273-4277)
-        seq_len: total CLM sequence length (256)
+        outcome_tokens: (B,) pre-computed outcome token IDs
+        seq_len: total CLM sequence length
     """
     B = len(game_lengths)
     n_move_slots = seq_len - 1  # 255 slots for moves (position 0 = outcome)
@@ -75,7 +76,7 @@ def pack_clm_sequences(
     move_ids_t = torch.from_numpy(move_ids).long()  # (B, max_ply)
 
     # Build input_ids: [outcome, move_0, ..., move_{N-1}, PAD, ...]
-    input_ids = torch.zeros(B, seq_len, dtype=torch.long)
+    input_ids = torch.full((B, seq_len), PAD_TOKEN, dtype=torch.long)
     input_ids[:, 0] = outcome_tokens
 
     # Mask out any non-move tokens from engine output
@@ -85,7 +86,7 @@ def pack_clm_sequences(
         engine_positions = torch.arange(max_ply).unsqueeze(0)
         _positions_cache[cache_key] = engine_positions
     move_mask = engine_positions < game_lengths_t.unsqueeze(1)
-    clean_moves = move_ids_t * move_mask
+    clean_moves = move_ids_t.where(move_mask, torch.tensor(PAD_TOKEN, dtype=torch.long))
 
     # Place moves at positions 1..n_move_slots
     n_to_copy = min(max_ply, n_move_slots)
@@ -96,7 +97,7 @@ def pack_clm_sequences(
     capped_lengths = game_lengths_t.clamp(max=n_move_slots)
 
     # Targets: input shifted left by 1
-    targets = torch.zeros(B, seq_len, dtype=torch.long)
+    targets = torch.full((B, seq_len), PAD_TOKEN, dtype=torch.long)
     targets[:, :-1] = input_ids[:, 1:]
 
     # Loss mask: True for positions 0 through capped_lengths[b]
@@ -143,11 +144,11 @@ def strip_outcome_token(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tenso
     loss_mask = batch["loss_mask"]
 
     # Shift input_ids left by 1 (drop outcome at position 0, pad end)
-    new_input_ids = torch.zeros_like(input_ids)
+    new_input_ids = torch.full_like(input_ids, PAD_TOKEN)
     new_input_ids[:, :-1] = input_ids[:, 1:]
 
     # Recompute targets from new input_ids (shifted left by 1)
-    new_targets = torch.zeros_like(new_input_ids)
+    new_targets = torch.full_like(new_input_ids, PAD_TOKEN)
     new_targets[:, :-1] = new_input_ids[:, 1:]
 
     # Shift loss_mask left by 1
@@ -184,7 +185,7 @@ class CLMDataset(torch.utils.data.IterableDataset):
 
     def __init__(self, batch_size: int, max_ply: int, base_seed: int,
                  discard_ply_limit: bool = False, no_outcome: bool = False,
-                 mate_boost: float = 0.0):
+                 mate_boost: float = 0.0, prepend_outcome: bool = False):
         super().__init__()
         self.batch_size = batch_size
         self.max_ply = max_ply
@@ -192,6 +193,7 @@ class CLMDataset(torch.utils.data.IterableDataset):
         self.discard_ply_limit = discard_ply_limit
         self.no_outcome = no_outcome
         self.mate_boost = mate_boost
+        self.prepend_outcome = prepend_outcome
         self._start_step = 0
         self._main_pid = os.getpid()
 
@@ -225,13 +227,14 @@ class CLMDataset(torch.utils.data.IterableDataset):
                     self.batch_size, self.max_ply, seed,
                     discard_ply_limit=self.discard_ply_limit,
                     mate_boost=self.mate_boost,
+                    prepend_outcome=self.prepend_outcome,
                 )
             batch = {
                 "input_ids": torch.from_numpy(input_ids).long(),
                 "targets": torch.from_numpy(targets).long(),
                 "loss_mask": torch.from_numpy(loss_mask),
             }
-            if self.no_outcome:
+            if self.no_outcome and self.prepend_outcome:
                 batch = strip_outcome_token(batch)
             yield batch
             step += 1
@@ -242,18 +245,20 @@ def create_validation_set(
     discard_ply_limit: bool = False,
     no_outcome: bool = False,
     mate_boost: float = 0.0,
+    prepend_outcome: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Generate a fixed validation set.
 
     Also computes legal move masks for legal move rate evaluation.
 
     Args:
-        max_ply: total CLM sequence length (256).
+        max_ply: total CLM sequence length (512).
     """
     input_ids, targets, loss_mask, move_ids, game_lengths, _tc = \
         engine.generate_clm_batch(
             n_games, max_ply, seed, discard_ply_limit=discard_ply_limit,
             mate_boost=mate_boost,
+            prepend_outcome=prepend_outcome,
         )
     batch = {
         "input_ids": torch.from_numpy(input_ids).long(),
@@ -266,7 +271,7 @@ def create_validation_set(
     batch["legal_grid"] = torch.from_numpy(legal_grid).long()
     batch["game_lengths"] = torch.from_numpy(game_lengths).long()
 
-    if no_outcome:
+    if no_outcome and prepend_outcome:
         batch = strip_outcome_token(batch)
 
     return batch
