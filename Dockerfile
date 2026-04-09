@@ -151,7 +151,7 @@ CMD ["/opt/pawn/deploy/entrypoint.sh"]
 
 FROM python:3.12-slim AS dev-common
 
-RUN apt-get update && apt-get install -y build-essential \
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
         openssh-server tini tmux ripgrep jq curl git \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
