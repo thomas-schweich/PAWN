@@ -14,6 +14,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import numpy as np
 import psutil
 import torch
 import torch.nn as nn
@@ -237,6 +238,69 @@ def compute_legal_move_rate_from_preds(
             return 0.0
         return legal_acc.item() / valid_count
 
+
+
+def compute_game_completion(
+    preds: torch.Tensor,
+    legal_mask: torch.Tensor,
+    loss_mask: torch.Tensor,
+    game_lengths: torch.Tensor,
+) -> dict[str, float]:
+    """Measure how often the model gets through a full game without illegal moves.
+
+    For each game, walks ply-by-ply checking whether the argmax prediction is
+    legal.  The first illegal move is a "forfeit".
+
+    Args:
+        preds: (B, T) argmax token predictions (aligned with targets)
+        legal_mask: (B, T, V) bool — legal token mask (shifted to align with targets)
+        loss_mask: (B, T) bool — which positions are valid
+        game_lengths: (B,) int — number of valid plies per game
+
+    Returns dict with:
+        game_completion_rate: fraction of games with zero illegal moves
+        avg_pct_completion: mean fraction of game completed before forfeit
+        avg_plies_to_forfeit: mean plies before first illegal move (inf-free)
+    """
+    B, T = preds.shape
+
+    with torch.no_grad():
+        n_complete = 0
+        pct_completions = []
+        plies_to_forfeit = []
+
+        for b in range(B):
+            gl = min(int(game_lengths[b].item()), T)
+            forfeit_ply = -1
+            n_checked = 0
+            for p in range(gl):
+                if not loss_mask[b, p]:
+                    continue
+                # Skip plies with no legal moves (end-of-game padding)
+                if not legal_mask[b, p].any():
+                    continue
+                n_checked += 1
+                token = int(preds[b, p].item())
+                if token < legal_mask.shape[2] and not legal_mask[b, p, token]:
+                    forfeit_ply = p
+                    break
+                elif token >= legal_mask.shape[2]:
+                    forfeit_ply = p
+                    break
+
+            if forfeit_ply < 0:
+                n_complete += 1
+                pct_completions.append(1.0)
+                plies_to_forfeit.append(float(gl))
+            else:
+                pct_completions.append(forfeit_ply / gl if gl > 0 else 0.0)
+                plies_to_forfeit.append(float(forfeit_ply))
+
+    return {
+        "game_completion_rate": n_complete / B if B > 0 else 0.0,
+        "avg_pct_completion": sum(pct_completions) / len(pct_completions) if pct_completions else 0.0,
+        "avg_plies_to_forfeit": sum(plies_to_forfeit) / len(plies_to_forfeit) if plies_to_forfeit else 0.0,
+    }
 
 
 def _get_grad_norm(model: nn.Module) -> float:
@@ -513,6 +577,42 @@ class CLMTrainer:
             torch.cuda.empty_cache()
         avg = {f"val/{k}": v / n_batches for k, v in total_metrics.items()}
         avg["val/perplexity"] = math.exp(min(avg["val/loss"], 20.0))
+
+        # Game completion eval: can the model get through entire games
+        # without picking an illegal move?  Uses a small subset to avoid
+        # materializing a large dense (B, T, vocab) token mask.
+        if "game_lengths" in self.val_data:
+            import chess_engine as engine_mod
+            gc_n = min(64, n)
+            gc_input = self.val_data["input_ids"][:gc_n].to(self.device)
+            gc_targets = self.val_data["targets"][:gc_n].to(self.device)
+            gc_loss_mask = self.val_data["loss_mask"][:gc_n].to(self.device)
+            gc_game_lengths = self.val_data["game_lengths"][:gc_n].to(self.device)
+            move_ids = self.val_data["input_ids"][:gc_n].numpy().astype(np.int16)
+            gl_np = self.val_data["game_lengths"][:gc_n].numpy().astype(np.int16)
+            vocab_size = self.model_cfg.vocab_size
+
+            with torch.no_grad():
+                with torch.amp.autocast(self.device, enabled=self.cfg.use_amp):
+                    hidden = model.forward_eval(gc_input, gc_loss_mask)
+                    gc_logits = model.lm_head(hidden)
+                gc_preds = gc_logits.argmax(dim=-1)
+
+            # Dense legal token mask, shifted to align with targets
+            legal_tokens = engine_mod.compute_legal_token_masks(move_ids, gl_np, vocab_size)
+            legal_tokens = np.roll(legal_tokens, -1, axis=1)
+            legal_tokens[:, -1, :] = False
+            legal_mask_t = torch.from_numpy(legal_tokens).to(self.device)
+
+            gc = compute_game_completion(gc_preds, legal_mask_t, gc_loss_mask, gc_game_lengths)
+            avg["val/game_completion_rate"] = gc["game_completion_rate"]
+            avg["val/avg_pct_completion"] = gc["avg_pct_completion"]
+            avg["val/avg_plies_to_forfeit"] = gc["avg_plies_to_forfeit"]
+
+            del legal_mask_t, gc_logits, gc_preds
+            if self.device != "cpu" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         return avg
 
     def train(self):
@@ -602,6 +702,11 @@ class CLMTrainer:
                         val_msg += f" | legal {val_metrics['val/legal_move_rate']:.3f}"
                     if "val/late_legal_move_rate" in val_metrics:
                         val_msg += f" | late_legal {val_metrics['val/late_legal_move_rate']:.3f}"
+                    if "val/game_completion_rate" in val_metrics:
+                        val_msg += (
+                            f" | complete {val_metrics['val/game_completion_rate']:.3f}"
+                            f" | avg_ply {val_metrics['val/avg_plies_to_forfeit']:.0f}"
+                        )
 
                     # Compound early stopping
                     extra_log: dict[str, object] = {}

@@ -1093,8 +1093,77 @@ def _collect_cpu_cache() -> dict[str, str]:
     return cache
 
 
+def _cgroup_cpu_count() -> int | None:
+    """Return container CPU limit from cgroups, or None if unconstrained."""
+    # cgroup v2: cpu.max contains "quota period" (e.g. "200000 100000" = 2 CPUs)
+    try:
+        text = Path("/sys/fs/cgroup/cpu.max").read_text().strip()
+        quota_s, period_s = text.split()
+        if quota_s != "max":
+            return max(1, int(int(quota_s) / int(period_s)))
+    except (OSError, ValueError):
+        pass
+
+    # cgroup v1: cpu.cfs_quota_us / cpu.cfs_period_us
+    try:
+        quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text().strip())
+        if quota > 0:
+            period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text().strip())
+            return max(1, int(quota / period))
+    except (OSError, ValueError):
+        pass
+
+    # cpuset: count the CPUs in the effective cpuset
+    for p in ("/sys/fs/cgroup/cpuset.cpus.effective",      # v2
+              "/sys/fs/cgroup/cpuset/cpuset.cpus"):         # v1
+        try:
+            text = Path(p).read_text().strip()
+            if text:
+                # Parse ranges like "0-3,8-11" → count individual CPUs
+                count = 0
+                for part in text.split(","):
+                    if "-" in part:
+                        lo, hi = part.split("-", 1)
+                        count += int(hi) - int(lo) + 1
+                    else:
+                        count += 1
+                return count
+        except (OSError, ValueError):
+            pass
+
+    return None
+
+
+def _cgroup_memory_bytes() -> int | None:
+    """Return container memory limit from cgroups, or None if unconstrained."""
+    # cgroup v2
+    try:
+        text = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        if text != "max":
+            return int(text)
+    except (OSError, ValueError):
+        pass
+
+    # cgroup v1
+    try:
+        limit = int(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+                     .read_text().strip())
+        # Kernel uses a huge sentinel (~2^63) when unconstrained
+        if limit < 2**62:
+            return limit
+    except (OSError, ValueError):
+        pass
+
+    return None
+
+
 def _collect_system_info() -> dict:
-    """Collect CPU, RAM, and cache info."""
+    """Collect CPU, RAM, and cache info.
+
+    In containers (RunPod, Docker), /proc/cpuinfo and /proc/meminfo report
+    host-level resources.  We check cgroup limits first and prefer those
+    when they indicate a constrained environment.
+    """
     import multiprocessing
 
     cpu_name = ""
@@ -1122,25 +1191,34 @@ def _collect_system_info() -> dict:
     except (OSError, ValueError):
         pass  # keep /proc/cpuinfo MHz if available
 
-    try:
-        cpu_count = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        cpu_count = multiprocessing.cpu_count() or 0
-
-    # System RAM
-    ram_gb = 0.0
-    try:
-        import psutil
-        ram_gb = psutil.virtual_memory().total / (1024**3)
-    except ImportError:
+    # CPU count: prefer cgroup limit over host-visible CPUs
+    cg_cpus = _cgroup_cpu_count()
+    if cg_cpus is not None:
+        cpu_count = cg_cpus
+    else:
         try:
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        ram_gb = int(line.split()[1]) / (1024**2)
-                        break
-        except OSError:
-            pass
+            cpu_count = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            cpu_count = multiprocessing.cpu_count() or 0
+
+    # System RAM: prefer cgroup limit over host total
+    cg_mem = _cgroup_memory_bytes()
+    if cg_mem is not None:
+        ram_gb = cg_mem / (1024**3)
+    else:
+        ram_gb = 0.0
+        try:
+            import psutil
+            ram_gb = psutil.virtual_memory().total / (1024**3)
+        except ImportError:
+            try:
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            ram_gb = int(line.split()[1]) / (1024**2)
+                            break
+            except OSError:
+                pass
 
     info: dict = {
         "python": sys.version.split()[0],
@@ -1411,8 +1489,10 @@ def main():
     # Iteration control
     parser.add_argument("--n-iter", type=int, default=10,
                         help="Timed iterations per benchmark (default: 10)")
-    parser.add_argument("--n-warmup", type=int, default=3,
-                        help="Warmup iterations per benchmark (default: 3)")
+    parser.add_argument("--n-warmup", type=int, default=10,
+                        help="Warmup iterations per benchmark (default: 10). "
+                             "torch.compile may need 5-10+ steps to fully optimize; "
+                             "too few warmup steps inflates timed results.")
 
     # Output
     parser.add_argument("--json", type=str, default=None,

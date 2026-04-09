@@ -266,8 +266,13 @@ def create_validation_set(
         "loss_mask": torch.from_numpy(loss_mask),
     }
 
-    # Compute legal move masks for evaluating legal move rate
+    # Compute legal move masks for evaluating legal move rate.
+    # legal_grid[ply] contains legal moves at the position *before* move_ids[ply],
+    # but targets[ply] is the *next* move (= move_ids[ply+1]).  Shift by one so
+    # legal_grid[ply] aligns with targets[ply].
     legal_grid, _legal_promo = engine.compute_legal_move_masks(move_ids, game_lengths)
+    legal_grid = np.roll(legal_grid, -1, axis=1)
+    legal_grid[:, -1, :] = 0  # last ply has no next move
     batch["legal_grid"] = torch.from_numpy(legal_grid).long()
     batch["game_lengths"] = torch.from_numpy(game_lengths).long()
 
