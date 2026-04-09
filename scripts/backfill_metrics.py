@@ -137,6 +137,7 @@ def evaluate_checkpoint(
             game_lengths = val_data["game_lengths"][start:end].to(device)
             metrics["legal_move_rate"] = compute_legal_move_rate(
                 logits, legal_grid, loss_mask, game_lengths,
+                n_actions=model.embed.n_actions,
             )
 
         for k, v in metrics.items():

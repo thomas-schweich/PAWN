@@ -152,6 +152,7 @@ def compute_legal_move_rate(
     legal_grid: torch.Tensor,
     loss_mask: torch.Tensor,
     game_lengths: torch.Tensor,
+    n_actions: int | None = None,
 ) -> float:
     """Compute fraction of argmax predictions that are legal moves.
 
@@ -159,7 +160,9 @@ def compute_legal_move_rate(
     Prefer compute_legal_move_rate_from_preds when hidden states are available.
     """
     preds = logits.argmax(dim=-1)
-    return compute_legal_move_rate_from_preds(preds, legal_grid, loss_mask, game_lengths)
+    return compute_legal_move_rate_from_preds(
+        preds, legal_grid, loss_mask, game_lengths, n_actions=n_actions,
+    )
 
 
 def compute_legal_move_rate_from_preds(

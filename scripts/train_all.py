@@ -265,6 +265,7 @@ class ModelSlot:
                 preds[loss_mask] = valid_logits.argmax(dim=-1)
                 metrics["legal_move_rate"] = compute_legal_move_rate_from_preds(
                     preds, legal_grid, loss_mask, game_lengths,
+                    n_actions=self.model.embed.n_actions,
                 )
 
             for k, v in metrics.items():
