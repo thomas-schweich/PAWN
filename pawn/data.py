@@ -66,7 +66,7 @@ def pack_clm_sequences(
         move_ids: (B, max_ply) raw move token IDs
         game_lengths: (B,) actual game lengths
         outcome_tokens: (B,) pre-computed outcome token IDs
-        seq_len: total CLM sequence length (256)
+        seq_len: total CLM sequence length
     """
     B = len(game_lengths)
     n_move_slots = seq_len - 1  # 255 slots for moves (position 0 = outcome)
