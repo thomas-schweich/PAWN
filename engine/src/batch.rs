@@ -700,12 +700,21 @@ mod tests {
     }
 
     #[test]
-    fn test_clm_batch_seq_len_consistency() {
+    fn test_clm_batch_seq_len_consistency_with_outcome() {
         let batch = generate_clm_batch(4, 32, 42, false, 0.0, true);
         assert_eq!(batch.seq_len, 32);
-        assert_eq!(batch.max_ply, 31); // seq_len - 1
+        assert_eq!(batch.max_ply, 31); // seq_len - 1 when outcome prepended
         assert_eq!(batch.input_ids.len(), 4 * 32);
         assert_eq!(batch.move_ids.len(), 4 * 31);
+    }
+
+    #[test]
+    fn test_clm_batch_seq_len_consistency_no_outcome() {
+        let batch = generate_clm_batch(4, 32, 42, false, 0.0, false);
+        assert_eq!(batch.seq_len, 32);
+        assert_eq!(batch.max_ply, 32); // max_ply == seq_len when no outcome
+        assert_eq!(batch.input_ids.len(), 4 * 32);
+        assert_eq!(batch.move_ids.len(), 4 * 32);
     }
 
     #[test]

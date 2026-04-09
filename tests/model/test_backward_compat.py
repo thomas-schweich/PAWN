@@ -42,8 +42,8 @@ def test_old_config_roundtrip():
     # lm_head projects to old vocab size
     assert model.lm_head.out_features == 4284
 
-    # Decomposition table has legacy n_actions rows
-    assert model.embed.decomp_table.shape == (4272, 3)
+    # Decomposition table has legacy n_actions+1 rows (indexed by token ID 0..4272)
+    assert model.embed.decomp_table.shape == (4273, 3)
 
 
 @pytest.mark.unit
@@ -82,7 +82,7 @@ def test_old_model_forward_pass():
     model = PAWNCLM(cfg)
     model.eval()
 
-    input_ids = torch.randint(1, 4272, (2, 16))
+    input_ids = torch.randint(1, 4273, (2, 16))  # inclusive of token 4272
     attention_mask = torch.ones(2, 16, dtype=torch.bool)
 
     with torch.no_grad():
@@ -145,6 +145,25 @@ def test_factored_embedding_equivalence():
     assert new_decomp.tolist() == [12, 28, 0], f"new decomp: {new_decomp.tolist()}"
     assert old_decomp.tolist() == [12, 28, 0], f"old decomp: {old_decomp.tolist()}"
     assert new_decomp.tolist() == old_decomp.tolist()
+
+
+@pytest.mark.unit
+def test_legacy_last_promo_token_decomposition():
+    """Token 4272 (last legacy promo: g2h1n) decomposes correctly."""
+    old_cfg = CLMConfig(
+        vocab_size=4284, max_seq_len=32, d_model=64, n_layers=2, n_heads=4, d_ff=128
+    )
+    torch.manual_seed(0)
+    model = PAWNCLM(old_cfg)
+
+    # Token 4272 is the last promo token — it must not be aliased to 4271
+    decomp_4272 = model.embed.decomp_table[4272].tolist()
+    decomp_4271 = model.embed.decomp_table[4271].tolist()
+    assert decomp_4272 != decomp_4271, (
+        f"Token 4272 should not alias to 4271: both got {decomp_4272}"
+    )
+    # Token 4272 should have promo_type >= 1
+    assert decomp_4272[2] >= 1, f"Token 4272 should be a promotion, got promo={decomp_4272[2]}"
 
 
 # ---------------------------------------------------------------------------

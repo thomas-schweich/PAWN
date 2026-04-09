@@ -21,18 +21,18 @@ from pawn.trainer import (
 class TestBuildActionGridIndex:
     def test_length_is_num_actions(self):
         """One grid index per action token."""
-        idx = _build_action_grid_index()
+        idx = _build_action_grid_index(NUM_ACTIONS)
         assert len(idx) == NUM_ACTIONS
 
     def test_entries_are_valid_grid_indices(self):
         """Each entry must be in [0, 4095] (grid = 64x64 = 4096 slots)."""
-        idx = _build_action_grid_index()
+        idx = _build_action_grid_index(NUM_ACTIONS)
         for v in idx:
             assert 0 <= v < 4096
 
     def test_first_action_is_a1b1(self):
         """Action 0 = a1b1, grid index = 0*64 + 1 = 1."""
-        idx = _build_action_grid_index()
+        idx = _build_action_grid_index(NUM_ACTIONS)
         assert idx[0] == 0 * 64 + 1  # a1=0, b1=1
 
 
@@ -44,7 +44,7 @@ class TestGetActionGridIndex:
         assert str(t.device) == "cpu"
 
     def test_matches_builder(self, cpu_device):
-        ref = _build_action_grid_index()
+        ref = _build_action_grid_index(NUM_ACTIONS)
         t = _get_action_grid_index(cpu_device)
         assert t.tolist() == ref
 
@@ -54,16 +54,16 @@ class TestGetActionGridIndex:
         assert (t < 4096).all().item()
 
     def test_caches_across_calls(self, cpu_device):
-        """Module-level cache means second call is O(1) -- verified by identity of list."""
+        """Module-level cache means second call is O(1) -- verified by identity check."""
         import pawn.trainer as tr
 
-        tr._ACTION_GRID_INDEX = None  # force rebuild
-        _get_action_grid_index(cpu_device)
-        cached = tr._ACTION_GRID_INDEX
-        assert cached is not None
-        _get_action_grid_index(cpu_device)
-        # Still the same cached list (identity check)
-        assert tr._ACTION_GRID_INDEX is cached
+        tr._ACTION_GRID_INDEX_CACHE.clear()
+        tr._ACTION_GRID_TENSOR_CACHE.clear()
+        t1 = _get_action_grid_index(cpu_device)
+        assert NUM_ACTIONS in tr._ACTION_GRID_INDEX_CACHE
+        t2 = _get_action_grid_index(cpu_device)
+        # Same tensor object (cached)
+        assert t1 is t2
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +94,7 @@ class TestComputeLegalMoveRate:
     @pytest.fixture(autouse=True)
     def _grid_index(self):
         """Cache the action-to-grid mapping for test helpers."""
-        self._idx = _build_action_grid_index()
+        self._idx = _build_action_grid_index(NUM_ACTIONS)
 
     def _grid_for_action(self, action: int) -> tuple[int, int]:
         """Return (src, dst) grid coords for an action token."""

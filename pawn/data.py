@@ -234,7 +234,7 @@ class CLMDataset(torch.utils.data.IterableDataset):
                 "targets": torch.from_numpy(targets).long(),
                 "loss_mask": torch.from_numpy(loss_mask),
             }
-            if self.no_outcome:
+            if self.no_outcome and self.prepend_outcome:
                 batch = strip_outcome_token(batch)
             yield batch
             step += 1
@@ -271,7 +271,7 @@ def create_validation_set(
     batch["legal_grid"] = torch.from_numpy(legal_grid).long()
     batch["game_lengths"] = torch.from_numpy(game_lengths).long()
 
-    if no_outcome:
+    if no_outcome and prepend_outcome:
         batch = strip_outcome_token(batch)
 
     return batch

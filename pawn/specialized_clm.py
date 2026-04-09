@@ -90,7 +90,13 @@ class SpecializedCLM(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
-        pad_idx = PAD_TOKEN if vocab_size > PAD_TOKEN else None
+        from pawn.config import LegacyVocab
+        if vocab_size == LegacyVocab.VOCAB_SIZE:
+            pad_idx = LegacyVocab.PAD_TOKEN
+        elif vocab_size > PAD_TOKEN:
+            pad_idx = PAD_TOKEN
+        else:
+            pad_idx = None
         self.embed = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
         self.layers = nn.ModuleList([
             _Block(d_model, n_heads, d_ff) for _ in range(n_layers)

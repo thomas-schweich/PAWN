@@ -51,9 +51,10 @@ def _build_decomposition_table(n_actions: int) -> torch.Tensor:
             table[token_idx] = torch.tensor([src_sq, dst_sq, promo_type], dtype=torch.int16)
         return table
 
-    # Legacy PAWN vocab — reconstruct from formula
+    # Legacy PAWN vocab — reconstruct from formula.
+    # Table is indexed by token ID (1..4272), so needs n_actions+1 rows.
     assert n_actions == LegacyVocab.NUM_ACTIONS, f"Unknown n_actions: {n_actions}"
-    table = torch.zeros(n_actions, 3, dtype=torch.int16)
+    table = torch.zeros(n_actions + 1, 3, dtype=torch.int16)
     # Tokens 1-4096: base grid (src * 64 + dst + 1)
     for token in range(1, 4097):
         t = token - 1
@@ -69,7 +70,7 @@ def _build_decomposition_table(n_actions: int) -> torch.Tensor:
         if len(uci_str) != 5:
             continue  # only promotions
         pawn_token = searchless_to_pawn(action_idx)
-        if pawn_token < n_actions:
+        if pawn_token <= n_actions:
             src_sq = sq_names.index(uci_str[:2])
             dst_sq = sq_names.index(uci_str[2:4])
             promo_type = promo_map[uci_str[4:]]
@@ -302,7 +303,7 @@ class CLMEmbedding(nn.Module):
         """
         # Decompose all tokens (PAD and outcomes get (0,0,0) from the table —
         # their factored embeddings are garbage but will be overridden below)
-        flat = input_ids.long().clamp(0, self.n_actions - 1)
+        flat = input_ids.long().clamp(0, self.decomp_table.shape[0] - 1)
         decomp = self.decomp_table[flat]  # (B, T, 3)
         src_idx = decomp[..., 0].long()
         dst_idx = decomp[..., 1].long()

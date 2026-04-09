@@ -55,23 +55,30 @@ pub fn move_to_token(m: &Move) -> u16 {
     let src_idx = shakmaty_sq_to_ours(src);
     let dst_idx = shakmaty_sq_to_ours(dst);
 
-    // Build UCI string and look up action
-    let mut uci = String::with_capacity(5);
-    uci.push_str(vocab::SQUARE_NAMES[src_idx as usize]);
-    uci.push_str(vocab::SQUARE_NAMES[dst_idx as usize]);
+    // Build UCI string on the stack (4-5 bytes, no heap allocation)
+    let mut buf = [0u8; 5];
+    let src_name = vocab::SQUARE_NAMES[src_idx as usize].as_bytes();
+    let dst_name = vocab::SQUARE_NAMES[dst_idx as usize].as_bytes();
+    buf[0] = src_name[0];
+    buf[1] = src_name[1];
+    buf[2] = dst_name[0];
+    buf[3] = dst_name[1];
 
-    if let Move::Normal { promotion: Some(role), .. } = m {
-        let promo_char = match role {
-            Role::Queen => "q",
-            Role::Rook => "r",
-            Role::Bishop => "b",
-            Role::Knight => "n",
+    let len = if let Move::Normal { promotion: Some(role), .. } = m {
+        buf[4] = match role {
+            Role::Queen => b'q',
+            Role::Rook => b'r',
+            Role::Bishop => b'b',
+            Role::Knight => b'n',
             _ => panic!("Invalid promotion role: {:?}", role),
         };
-        uci.push_str(promo_char);
-    }
+        5
+    } else {
+        4
+    };
 
-    vocab::uci_to_action(&uci)
+    let uci = std::str::from_utf8(&buf[..len]).unwrap();
+    vocab::uci_to_action(uci)
         .unwrap_or_else(|| panic!("Move {} not found in searchless vocabulary", uci))
 }
 

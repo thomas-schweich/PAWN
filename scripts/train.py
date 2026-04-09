@@ -150,8 +150,8 @@ def run_pretrain(config: PretrainConfig) -> None:
 
     if config.legacy_vocab:
         model_cfg.vocab_size = LegacyVocab.VOCAB_SIZE
-        model_cfg.max_seq_len = 256
-        train_cfg.max_ply = 256
+        # Override max_seq_len to legacy default unless user explicitly set it
+        config.max_seq_len = 256
         print("Using legacy PAWN vocabulary (4284 tokens, 256 seq_len)")
 
     # Map RunConfig fields onto internal configs
