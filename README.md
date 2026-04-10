@@ -17,7 +17,7 @@ Feel free to use PAWN in your own experiments. Note that PAWN was developed as a
 > - A new vocabulary borrowed from Google DeepMind's [searchless chess project (Amortized Planning with Large-Scale Transformers: A Case Study on Chess)](https://github.com/google-deepmind/searchless_chess) project, which doesn't include impossible moves.
 > - A wider 512-token context window.
 >
-> The information below applies to the existing models. The last commit from prior to these changes is tagged [pre-vocab-transition](https://github.com/thomas-schweich/PAWN/tree/pre-vocab-transition). View the repository at that commit to see the implementation of the previous architechture.
+> The information below applies to the existing models. The last commit from prior to these changes is tagged [pre-vocab-transition](https://github.com/thomas-schweich/PAWN/tree/pre-vocab-transition). View the repository at that commit to see the implementation of the previous architecture.
 
 
 
