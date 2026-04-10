@@ -378,13 +378,13 @@ class TestPlyRangeFilter:
     def setup(self):
         """Generate val data with known legal grids at seq_len=64.
 
-        Uses ``input_ids`` as predictions — input_ids[p] is the actual move
-        at ply p (no outcome prefix), aligning with legal_grid[p].  This gives
-        a legal rate of ~1.0 for move positions (the ground truth is always legal).
+        Uses ``targets`` as predictions — legal_grid is shifted by one ply
+        in create_validation_set to align with targets (target[p] is the move
+        at ply p+1).  This gives a legal rate of ~1.0 for move positions.
         """
         val = create_validation_set(n_games=16, max_ply=64, seed=42)
-        # input_ids[p] = the move actually played at ply p → always legal
-        val["preds"] = val["input_ids"].clone()
+        # targets[p] = the next move (ply p+1), aligned with legal_grid[p]
+        val["preds"] = val["targets"].clone()
         return val
 
     @pytest.mark.integration
