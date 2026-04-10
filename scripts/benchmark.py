@@ -1095,12 +1095,13 @@ def _collect_cpu_cache() -> dict[str, str]:
 
 def _cgroup_cpu_count() -> int | None:
     """Return container CPU limit from cgroups, or None if unconstrained."""
+    import math as _math
     # cgroup v2: cpu.max contains "quota period" (e.g. "200000 100000" = 2 CPUs)
     try:
         text = Path("/sys/fs/cgroup/cpu.max").read_text().strip()
         quota_s, period_s = text.split()
         if quota_s != "max":
-            return max(1, int(int(quota_s) / int(period_s)))
+            return max(1, _math.ceil(int(quota_s) / int(period_s)))
     except (OSError, ValueError):
         pass
 
@@ -1109,7 +1110,7 @@ def _cgroup_cpu_count() -> int | None:
         quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text().strip())
         if quota > 0:
             period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text().strip())
-            return max(1, int(quota / period))
+            return max(1, _math.ceil(quota / period))
     except (OSError, ValueError):
         pass
 

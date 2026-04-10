@@ -21,9 +21,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+import chess_engine as engine
 from pawn.config import CLMConfig, TrainingConfig
 from pawn.model import PAWNCLM
-from pawn.data import CLMDataset, create_validation_set
+from pawn.data import CLMDataset, create_validation_set, shift_legal_mask
 from pawn.logging import MetricsLogger
 
 from pawn.data_utils import unpack_grid
@@ -260,26 +261,25 @@ def compute_game_completion(
     Returns dict with:
         game_completion_rate: fraction of games with zero illegal moves
         avg_pct_completion: mean fraction of game completed before forfeit
-        avg_plies_to_forfeit: mean plies before first illegal move (inf-free)
+        avg_plies_completed: mean plies completed before first illegal move.
+            Games with no illegal moves contribute their full game_length.
     """
     B, T = preds.shape
 
     with torch.no_grad():
         n_complete = 0
         pct_completions = []
-        plies_to_forfeit = []
+        plies_completed = []
 
         for b in range(B):
             gl = min(int(game_lengths[b].item()), T)
             forfeit_ply = -1
-            n_checked = 0
             for p in range(gl):
                 if not loss_mask[b, p]:
                     continue
                 # Skip plies with no legal moves (end-of-game padding)
                 if not legal_mask[b, p].any():
                     continue
-                n_checked += 1
                 token = int(preds[b, p].item())
                 if token < legal_mask.shape[2] and not legal_mask[b, p, token]:
                     forfeit_ply = p
@@ -291,15 +291,15 @@ def compute_game_completion(
             if forfeit_ply < 0:
                 n_complete += 1
                 pct_completions.append(1.0)
-                plies_to_forfeit.append(float(gl))
+                plies_completed.append(float(gl))
             else:
                 pct_completions.append(forfeit_ply / gl if gl > 0 else 0.0)
-                plies_to_forfeit.append(float(forfeit_ply))
+                plies_completed.append(float(forfeit_ply))
 
     return {
         "game_completion_rate": n_complete / B if B > 0 else 0.0,
         "avg_pct_completion": sum(pct_completions) / len(pct_completions) if pct_completions else 0.0,
-        "avg_plies_to_forfeit": sum(plies_to_forfeit) / len(plies_to_forfeit) if plies_to_forfeit else 0.0,
+        "avg_plies_completed": sum(plies_completed) / len(plies_completed) if plies_completed else 0.0,
     }
 
 
@@ -582,10 +582,8 @@ class CLMTrainer:
         # without picking an illegal move?  Uses a small subset to avoid
         # materializing a large dense (B, T, vocab) token mask.
         if "game_lengths" in self.val_data:
-            import chess_engine as engine_mod
             gc_n = min(64, n)
             gc_input = self.val_data["input_ids"][:gc_n].to(self.device)
-            gc_targets = self.val_data["targets"][:gc_n].to(self.device)
             gc_loss_mask = self.val_data["loss_mask"][:gc_n].to(self.device)
             gc_game_lengths = self.val_data["game_lengths"][:gc_n].to(self.device)
             move_ids = self.val_data["input_ids"][:gc_n].numpy().astype(np.int16)
@@ -598,18 +596,17 @@ class CLMTrainer:
                     gc_logits = model.lm_head(hidden)
                 gc_preds = gc_logits.argmax(dim=-1)
 
-            # Dense legal token mask, shifted to align with targets
-            legal_tokens = engine_mod.compute_legal_token_masks(move_ids, gl_np, vocab_size)
-            legal_tokens = np.roll(legal_tokens, -1, axis=1)
-            legal_tokens[:, -1, :] = False
-            legal_mask_t = torch.from_numpy(legal_tokens).to(self.device)
+            legal_tokens = engine.compute_legal_token_masks(move_ids, gl_np, vocab_size)
+            legal_mask_t = torch.from_numpy(
+                shift_legal_mask(legal_tokens)
+            ).to(self.device)
 
             gc = compute_game_completion(gc_preds, legal_mask_t, gc_loss_mask, gc_game_lengths)
             avg["val/game_completion_rate"] = gc["game_completion_rate"]
             avg["val/avg_pct_completion"] = gc["avg_pct_completion"]
-            avg["val/avg_plies_to_forfeit"] = gc["avg_plies_to_forfeit"]
+            avg["val/avg_plies_completed"] = gc["avg_plies_completed"]
 
-            del legal_mask_t, gc_logits, gc_preds
+            del gc_input, gc_loss_mask, gc_game_lengths, legal_mask_t, gc_logits, gc_preds
             if self.device != "cpu" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -705,7 +702,7 @@ class CLMTrainer:
                     if "val/game_completion_rate" in val_metrics:
                         val_msg += (
                             f" | complete {val_metrics['val/game_completion_rate']:.3f}"
-                            f" | avg_ply {val_metrics['val/avg_plies_to_forfeit']:.0f}"
+                            f" | avg_ply {val_metrics['val/avg_plies_completed']:.0f}"
                         )
 
                     # Compound early stopping
