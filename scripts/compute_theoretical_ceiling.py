@@ -77,6 +77,8 @@ def main():
     parser.add_argument("--output", type=str, default="data/theoretical_ceiling.json")
     parser.add_argument("--model-accuracy", type=float, default=None,
                         help="Model top-1 accuracy to compute adjusted score")
+    parser.add_argument("--max-ply", type=int, default=255,
+                        help="Maximum game length in plies (default: 255)")
     parser.add_argument("--bootstrap", type=int, default=2000,
                         help="Number of bootstrap resamples for CIs (0 to skip)")
     args = parser.parse_args()
@@ -116,7 +118,7 @@ def main():
         bt = time.time()
         result = engine.compute_accuracy_ceiling(
             n_games=batch_n,
-            max_ply=255,
+            max_ply=args.max_ply,
             n_rollouts=args.rollouts,
             sample_rate=args.sample_rate,
             seed=batch_seed,

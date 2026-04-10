@@ -240,6 +240,22 @@ class CLMDataset(torch.utils.data.IterableDataset):
             step += 1
 
 
+def shift_legal_mask(mask: np.ndarray) -> np.ndarray:
+    """Shift a legal move mask forward by one ply to align with CLM targets.
+
+    The engine's legal masks are indexed by position *before* each move:
+    mask[ply] = legal moves at position ply.  But CLM targets[ply] is the
+    *next* move (= move_ids[ply+1]), so we need legal moves at position
+    ply+1.  This rolls the mask by -1 along the ply axis and zeros the
+    last entry (no next move at the final ply).
+
+    Works for any mask shape (B, T, ...).
+    """
+    shifted = np.roll(mask, -1, axis=1)
+    shifted[:, -1] = 0
+    return shifted
+
+
 def create_validation_set(
     n_games: int, max_ply: int, seed: int,
     discard_ply_limit: bool = False,
@@ -266,9 +282,11 @@ def create_validation_set(
         "loss_mask": torch.from_numpy(loss_mask),
     }
 
-    # Compute legal move masks for evaluating legal move rate
+    # Compute legal move masks for evaluating legal move rate.
+    # Shift by one ply so legal_grid[ply] aligns with targets[ply]
+    # (see shift_legal_mask docstring).
     legal_grid, _legal_promo = engine.compute_legal_move_masks(move_ids, game_lengths)
-    batch["legal_grid"] = torch.from_numpy(legal_grid).long()
+    batch["legal_grid"] = torch.from_numpy(shift_legal_mask(legal_grid)).long()
     batch["game_lengths"] = torch.from_numpy(game_lengths).long()
 
     if no_outcome and prepend_outcome:
