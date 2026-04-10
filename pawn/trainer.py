@@ -671,7 +671,8 @@ class CLMTrainer:
                 first_forfeit_all.append(first_forfeit.cpu())
                 gl_all.append(gl.cpu())
 
-                del gc_input, gc_loss_mask, gc_game_lengths, gc_logits, gc_preds, legal_mask_t
+                del gc_input, gc_loss_mask, gc_game_lengths, gc_logits, gc_preds
+                del legal_tokens, legal_mask_t
 
             gc = _aggregate_game_completion(
                 torch.cat(has_forfeit_all),
