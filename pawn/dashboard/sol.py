@@ -4,6 +4,8 @@ Standalone:  solara run pawn.dashboard.sol
 Jupyter:     from pawn.dashboard import Dashboard; Dashboard()
 """
 
+from __future__ import annotations
+
 import os
 import signal
 import subprocess
@@ -13,8 +15,8 @@ from pathlib import Path
 
 import solara
 
-from . import charts
-from .metrics import detect_run_type, get_run_hostname, get_run_meta, load_metrics, load_runs, sync_hf_metrics
+from . import charts, theme
+from .metrics import detect_run_type, get_run_meta, load_metrics, load_runs, sync_hf_metrics
 
 # ---------------------------------------------------------------------------
 # Global reactive state
@@ -45,14 +47,490 @@ TRAIN_SCRIPTS = {
     "tiny": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_tiny.py"},
 }
 
+
 # ---------------------------------------------------------------------------
-# Dashboard components
+# Global CSS — injected once per page render
+# ---------------------------------------------------------------------------
+
+GLOBAL_CSS = f"""
+:root {{
+  --pawn-bg: {theme.BG};
+  --pawn-surface: {theme.SURFACE};
+  --pawn-surface-2: {theme.SURFACE_ELEVATED};
+  --pawn-border: {theme.BORDER};
+  --pawn-border-strong: {theme.BORDER_STRONG};
+  --pawn-text: {theme.TEXT};
+  --pawn-text-muted: {theme.TEXT_MUTED};
+  --pawn-text-faint: {theme.TEXT_FAINT};
+  --pawn-primary: {theme.SKY};
+  --pawn-accent: {theme.ROSE};
+  --pawn-success: {theme.EMERALD};
+  --pawn-warning: {theme.AMBER};
+}}
+
+html, body,
+.v-application,
+.theme--dark.v-application,
+.v-application .v-application--wrap,
+.theme--dark.v-application .v-application--wrap,
+.theme--dark.v-sheet,
+.theme--dark.v-card,
+.theme--dark.v-main,
+.theme--dark .v-main__wrap {{
+  background: {theme.BG} !important;
+  background-color: {theme.BG} !important;
+  color: var(--pawn-text) !important;
+  font-family: {theme.FONT_FAMILY};
+  font-feature-settings: 'cv11', 'ss01', 'ss03';
+}}
+
+.pawn-shell {{
+  position: relative;
+  z-index: 1;
+  max-width: 1520px;
+  margin: 0 auto;
+  padding: 24px 32px 64px;
+}}
+
+.pawn-header {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 24px;
+  margin-bottom: 24px;
+  background: {theme.HEADER_BG};
+  border: 1px solid var(--pawn-border);
+  border-radius: 16px;
+}}
+.pawn-header .pawn-title {{
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--pawn-text);
+  line-height: 1.2;
+}}
+.pawn-header .pawn-title .pawn-brand {{
+  background: linear-gradient(135deg, {theme.SKY}, {theme.CYAN});
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}}
+.pawn-header .pawn-subtitle {{
+  font-size: 12px;
+  color: var(--pawn-text-muted);
+  margin-top: 2px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}}
+
+.pawn-pulse {{
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: color-mix(in srgb, var(--pawn-success) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--pawn-success) 25%, transparent);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--pawn-success);
+  font-weight: 500;
+}}
+.pawn-pulse.idle {{
+  background: color-mix(in srgb, var(--pawn-text-muted) 8%, transparent);
+  border-color: color-mix(in srgb, var(--pawn-text-muted) 22%, transparent);
+  color: var(--pawn-text-muted);
+}}
+.pawn-pulse .dot {{
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 0 0 currentColor;
+  animation: pawn-pulse 1.8s ease-out infinite;
+}}
+.pawn-pulse.idle .dot {{ animation: none; opacity: 0.5; }}
+@keyframes pawn-pulse {{
+  0%   {{ box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent); }}
+  70%  {{ box-shadow: 0 0 0 8px color-mix(in srgb, currentColor 0%, transparent); }}
+  100% {{ box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 0%, transparent); }}
+}}
+
+.pawn-card {{
+  background: var(--pawn-surface);
+  border: 1px solid var(--pawn-border);
+  border-radius: 14px;
+  padding: 16px 18px 14px;
+  transition: border-color 120ms ease, transform 120ms ease;
+}}
+.pawn-card:hover {{
+  border-color: var(--pawn-border-strong);
+}}
+
+.pawn-section-title {{
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--pawn-text-muted);
+  margin: 28px 4px 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}}
+.pawn-section-title::after {{
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, var(--pawn-border), transparent);
+}}
+
+.pawn-kpi {{
+  background: var(--pawn-surface);
+  border: 1px solid var(--pawn-border);
+  border-radius: 14px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+}}
+.pawn-kpi::before {{
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--pawn-kpi-accent, var(--pawn-primary));
+  opacity: 0.9;
+}}
+.pawn-kpi .label {{
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--pawn-text-muted);
+}}
+.pawn-kpi .value {{
+  font-family: {theme.FONT_MONO};
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--pawn-text);
+  font-feature-settings: 'tnum';
+  line-height: 1.15;
+}}
+.pawn-kpi .sub {{
+  font-size: 11px;
+  color: var(--pawn-text-faint);
+}}
+
+.pawn-chip {{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  margin: 3px 4px 3px 0;
+  border-radius: 999px;
+  background: rgba(148,163,184,0.07);
+  border: 1px solid var(--pawn-border);
+  font-family: {theme.FONT_MONO};
+  font-size: 11px;
+  color: var(--pawn-text-muted);
+}}
+.pawn-chip b {{ color: var(--pawn-text); font-weight: 500; }}
+
+.pawn-desc {{
+  color: var(--pawn-text-muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+  margin: 2px 2px 6px;
+}}
+
+.pawn-controls {{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  background: var(--pawn-surface);
+  border: 1px solid var(--pawn-border);
+  border-radius: 14px;
+  margin-bottom: 16px;
+}}
+
+.v-btn {{ text-transform: none !important; letter-spacing: 0 !important; }}
+.v-input__slot {{ background: var(--pawn-surface-2) !important; }}
+.v-label {{ color: var(--pawn-text-muted) !important; }}
+.v-select__selection, .v-select__selection--comma, input {{ color: var(--pawn-text) !important; }}
+
+.pawn-tabs {{
+  display: inline-flex;
+  background: var(--pawn-surface);
+  border: 1px solid var(--pawn-border);
+  border-radius: 12px;
+  padding: 4px;
+  gap: 2px;
+  margin-bottom: 20px;
+}}
+.pawn-tab-btn.v-btn {{
+  min-width: 0 !important;
+  padding: 0 18px !important;
+  height: 34px !important;
+  border-radius: 9px !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0 !important;
+  color: var(--pawn-text-muted) !important;
+  text-transform: none !important;
+  transition: all 120ms ease;
+}}
+.pawn-tab-btn.v-btn:hover {{
+  color: var(--pawn-text) !important;
+  background: rgba(148,163,184,0.06) !important;
+}}
+.pawn-tab-btn.v-btn.active {{
+  background: linear-gradient(135deg, {theme.SKY}26, {theme.ROSE}18) !important;
+  color: var(--pawn-text) !important;
+  box-shadow: 0 0 0 1px {theme.SKY}44 inset !important;
+}}
+
+.pawn-runner-output {{
+  background: #07090f;
+  border: 1px solid var(--pawn-border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-family: {theme.FONT_MONO};
+  font-size: 11.5px;
+  color: #cdd4e5;
+  max-height: 360px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  line-height: 1.55;
+}}
+.pawn-cmd-preview {{
+  background: #07090f;
+  border: 1px solid var(--pawn-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-family: {theme.FONT_MONO};
+  font-size: 11.5px;
+  color: {theme.SKY};
+  word-break: break-all;
+  line-height: 1.55;
+}}
+"""
+
+
+@solara.component
+def InjectStyle():
+    solara.Style(GLOBAL_CSS)
+
+
+# ---------------------------------------------------------------------------
+# Header
 # ---------------------------------------------------------------------------
 
 
 @solara.component
-def RunSelector(auto_refresh: bool = False, on_auto_refresh=None, interval: float = 10.0, on_interval=None):
-    """Run dropdown with refresh and optional live-update controls."""
+def Header(run_type: str, hostname: str, auto_refresh: bool):
+    status_class = "" if auto_refresh else "idle"
+    status_text = "LIVE" if auto_refresh else "PAUSED"
+    host_line = f"{run_type or 'unknown'} run"
+    if hostname:
+        host_line += f" · {hostname}"
+    solara.HTML(
+        tag="div",
+        unsafe_innerHTML=(
+            '<div class="pawn-header">'
+            '  <div>'
+            '    <div class="pawn-title"><span class="pawn-brand">PAWN</span> · Training Dashboard</div>'
+            f'    <div class="pawn-subtitle">{host_line}</div>'
+            '  </div>'
+            f'  <div class="pawn-pulse {status_class}"><span class="dot"></span>{status_text}</div>'
+            '</div>'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# KPI tiles
+# ---------------------------------------------------------------------------
+
+
+def _fmt_num(x, digits: int = 4) -> str:
+    if x is None:
+        return "—"
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    if v == 0:
+        return "0"
+    if abs(v) >= 1000:
+        return f"{v:,.0f}"
+    if abs(v) >= 10:
+        return f"{v:.{max(digits - 2, 1)}f}"
+    return f"{v:.{digits}f}"
+
+
+def _fmt_pct(x) -> str:
+    if x is None:
+        return "—"
+    try:
+        return f"{float(x) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _last(records: list[dict], key: str):
+    for r in reversed(records):
+        v = r.get(key)
+        if v is not None:
+            return v
+    return None
+
+
+def _best_min(records: list[dict], key: str):
+    best = None
+    for r in records:
+        v = r.get(key)
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if best is None or fv < best:
+            best = fv
+    return best
+
+
+def _best_max(records: list[dict], key: str):
+    best = None
+    for r in records:
+        v = r.get(key)
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if best is None or fv > best:
+            best = fv
+    return best
+
+
+def _kpi_html(label: str, value: str, sub: str = "", accent: str = theme.SKY) -> str:
+    sub_html = f'<div class="sub">{sub}</div>' if sub else ""
+    return (
+        f'<div class="pawn-kpi" style="--pawn-kpi-accent:{accent}">'
+        f'  <div class="label">{label}</div>'
+        f'  <div class="value">{value}</div>'
+        f'  {sub_html}'
+        f'</div>'
+    )
+
+
+@solara.component
+def KpiRow(run_type: str, train: list[dict], val: list[dict]):
+    tiles: list[tuple[str, str, str, str]] = []  # (label, value, sub, accent)
+
+    if run_type == "pawn":
+        step = _last(train, "step")
+        train_loss = _last(train, "train/loss")
+        val_loss = _last(val, "val/loss")
+        best_val = _best_min(val, "val/loss")
+        val_acc = _last(val, "val/accuracy")
+        best_acc = _best_max(val, "val/accuracy")
+        completion = _last(val, "val/game_completion_rate")
+        avg_ply = _last(val, "val/avg_plies_completed")
+        gpu = _last(train, "mem/gpu_peak_gb")
+        step_time = _last(train, "step_time")
+
+        tiles.append(("Step", _fmt_num(step, 0), "", theme.SKY))
+        tiles.append(("Train Loss", _fmt_num(train_loss), "", theme.SKY))
+        tiles.append((
+            "Val Loss",
+            _fmt_num(val_loss),
+            f"best · {_fmt_num(best_val)}" if best_val is not None else "",
+            theme.ROSE,
+        ))
+        tiles.append((
+            "Val Top-1",
+            _fmt_pct(val_acc),
+            f"best · {_fmt_pct(best_acc)}" if best_acc is not None else "",
+            theme.EMERALD,
+        ))
+        if completion is not None:
+            tiles.append((
+                "Game Completion",
+                _fmt_pct(completion),
+                f"avg ply · {_fmt_num(avg_ply, 0)}" if avg_ply is not None else "",
+                theme.AMBER,
+            ))
+        if gpu is not None:
+            tiles.append((
+                "GPU Peak",
+                f"{float(gpu):.1f} GB",
+                f"{float(step_time):.2f}s/step" if step_time is not None else "",
+                theme.CYAN,
+            ))
+    else:
+        epoch = _last(train, "epoch")
+        train_loss = _last(train, "train_loss")
+        val_loss = _last(val, "val_loss") or _last(train, "val_loss")
+        best_val = _best_min(train, "val_loss")
+        val_top1 = _last(val, "val_top1") or _last(train, "val_top1")
+        best_top1 = _best_max(train, "val_top1")
+        epoch_time = _last(train, "epoch_time_s") or _last(train, "epoch_time")
+        gpu = _last(train, "mem/gpu_peak_gb")
+
+        tiles.append(("Epoch", _fmt_num(epoch, 0), "", theme.SKY))
+        tiles.append(("Train Loss", _fmt_num(train_loss), "", theme.SKY))
+        tiles.append((
+            "Val Loss",
+            _fmt_num(val_loss),
+            f"best · {_fmt_num(best_val)}" if best_val is not None else "",
+            theme.ROSE,
+        ))
+        tiles.append((
+            "Val Top-1",
+            _fmt_pct(val_top1),
+            f"best · {_fmt_pct(best_top1)}" if best_top1 is not None else "",
+            theme.EMERALD,
+        ))
+        if gpu is not None:
+            tiles.append((
+                "GPU Peak",
+                f"{float(gpu):.1f} GB",
+                f"{float(epoch_time):.2f}s/ep" if epoch_time is not None else "",
+                theme.CYAN,
+            ))
+
+    if not tiles:
+        return
+
+    inner = "".join(_kpi_html(*t) for t in tiles)
+    n = len(tiles)
+    solara.HTML(
+        tag="div",
+        unsafe_innerHTML=(
+            '<div style="display:grid;'
+            f'grid-template-columns:repeat({n}, minmax(0, 1fr));'
+            'gap:12px;margin-bottom:18px;">'
+            f'{inner}</div>'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Run selector (compact control bar)
+# ---------------------------------------------------------------------------
+
+
+@solara.component
+def RunSelector(auto_refresh: bool = False, on_auto_refresh=None,
+                interval: float = 10.0, on_interval=None):
     show_all, set_show_all = solara.use_state(False)
 
     def _load():
@@ -79,7 +557,6 @@ def RunSelector(auto_refresh: bool = False, on_auto_refresh=None, interval: floa
         dependencies=[log_dir.value, metrics_tick.value, show_all],
     )
     name_to_label = {v: k for k, v in label_to_name.items()}
-
     current_label = name_to_label.get(selected_run.value, "")
 
     if labeled and (not current_label or current_label not in labeled):
@@ -88,24 +565,28 @@ def RunSelector(auto_refresh: bool = False, on_auto_refresh=None, interval: floa
     def on_select(label):
         selected_run.set(label_to_name.get(label, label))
 
-    with solara.Row(style={"align-items": "center", "gap": "8px", "flex-wrap": "wrap"}):
+    def _sync_hf():
+        synced = sync_hf_metrics(log_dir.value)
+        if synced:
+            print(f"Synced {len(synced)} runs from HF")
+        metrics_tick.set(metrics_tick.value + 1)
+
+    with solara.Div(classes=["pawn-controls"]):
         if labeled:
-            solara.Select(label="Run", value=current_label, values=labeled, on_value=on_select)
+            solara.Select(
+                label="Run", value=current_label, values=labeled, on_value=on_select,
+                style={"min-width": "360px", "flex": "1"},
+            )
         else:
-            solara.Info("No recent runs found (try Show All)" if not show_all else "No runs found in " + str(log_dir.value))
+            msg = "No recent runs (try 'All')" if not show_all else f"No runs in {log_dir.value}"
+            solara.Info(msg)
         solara.Button(
             "Refresh",
             on_click=lambda: metrics_tick.set(metrics_tick.value + 1),
             icon_name="mdi-refresh",
+            text=True,
         )
-
-        def _sync_hf():
-            synced = sync_hf_metrics(log_dir.value)
-            if synced:
-                print(f"Synced {len(synced)} runs from HF")
-            metrics_tick.set(metrics_tick.value + 1)
-
-        solara.Button("Sync HF", on_click=_sync_hf, icon_name="mdi-cloud-download")
+        solara.Button("Sync HF", on_click=_sync_hf, icon_name="mdi-cloud-download", text=True)
         solara.Switch(label="All", value=show_all, on_value=set_show_all)
         if on_auto_refresh is not None:
             solara.Switch(label="Live", value=auto_refresh, on_value=on_auto_refresh)
@@ -119,16 +600,35 @@ def RunSelector(auto_refresh: bool = False, on_auto_refresh=None, interval: floa
                 )
 
 
+# ---------------------------------------------------------------------------
+# Config summary (compact chips)
+# ---------------------------------------------------------------------------
+
+
+_CONFIG_SKIP = {"type", "timestamp", "compiled", "hostname", "slug", "git_hash", "git_tag"}
+_CONFIG_HIGHLIGHT_ORDER = (
+    "variant", "run_type", "formulation",
+    "model.d_model", "model.n_layers", "model.n_heads", "model.max_seq_len",
+    "training.batch_size", "training.lr", "training.weight_decay",
+    "training.warmup_steps", "training.total_steps", "training.patience",
+    "training.eval_interval", "training.checkpoint_interval",
+    "param_count",
+)
+
+
 def _flatten_config(config: dict) -> dict[str, str]:
-    """Flatten nested config dicts into dot-separated key-value pairs."""
+    """Flatten a nested config dict to ``dot.separated`` keys.
+
+    Prefixing with the parent key prevents silent collisions when two nested
+    sections share a field name (e.g. ``model.dropout`` vs ``training.dropout``).
+    """
     flat: dict[str, str] = {}
-    skip = {"type", "timestamp", "compiled"}
     for k, v in config.items():
-        if k in skip:
+        if k in _CONFIG_SKIP:
             continue
         if isinstance(v, dict):
             for k2, v2 in v.items():
-                if k2 in skip:
+                if k2 in _CONFIG_SKIP:
                     continue
                 flat[f"{k}.{k2}"] = str(v2)
         else:
@@ -137,110 +637,125 @@ def _flatten_config(config: dict) -> dict[str, str]:
 
 
 @solara.component
-def ConfigSummary():
-    """Config summary for the selected run."""
-    data = solara.use_memo(
-        lambda: load_metrics(log_dir.value, selected_run.value) if selected_run.value else {},
-        dependencies=[selected_run.value, metrics_tick.value],
-    )
+def ConfigSummary(data: dict | None = None):
     if not selected_run.value:
         return
+    if data is None:
+        data = {}
 
     configs = data.get("config", [])
     config = configs[-1] if configs else {}
-    run_type = detect_run_type(config)
     flat = _flatten_config(config)
+    if not flat:
+        return
 
-    hostname = config.get("hostname", "")
-    host_str = f" | **Host:** {hostname}" if hostname else ""
-    solara.Markdown(f"**Run:** `{selected_run.value}` | **Type:** {run_type}{host_str}")
+    # Order: highlight keys first, then everything else alphabetically.
+    ordered: list[tuple[str, str]] = []
+    seen = set()
+    for k in _CONFIG_HIGHLIGHT_ORDER:
+        if k in flat:
+            ordered.append((k, flat[k]))
+            seen.add(k)
+    for k in sorted(flat):
+        if k not in seen:
+            ordered.append((k, flat[k]))
 
-    if flat:
-        items = list(flat.items())
-        n_cols = 3
-        n_rows = (len(items) + n_cols - 1) // n_cols
-        cols = [items[i * n_rows:(i + 1) * n_rows] for i in range(n_cols)]
+    chips = "".join(
+        f'<span class="pawn-chip">{k}·<b>{v}</b></span>'
+        for k, v in ordered
+    )
+    solara.HTML(
+        tag="div",
+        unsafe_innerHTML=(
+            '<div class="pawn-card" style="margin-bottom:18px;">'
+            '<div class="pawn-desc" style="margin-bottom:8px;">Configuration</div>'
+            f'<div>{chips}</div>'
+            '</div>'
+        ),
+    )
 
-        header = "| Parameter | Value " * n_cols + "|"
-        sep = "| --- | --- " * n_cols + "|"
-        rows = []
-        for r in range(n_rows):
-            cells = ""
-            for c in range(n_cols):
-                if r < len(cols[c]):
-                    k, v = cols[c][r]
-                    cells += f"| `{k}` | `{v}` "
-                else:
-                    cells += "| | "
-            rows.append(cells + "|")
 
-        solara.Markdown("\n".join([header, sep, *rows]))
-
+# ---------------------------------------------------------------------------
+# Chart grid
+# ---------------------------------------------------------------------------
 
 _CHART_DESCRIPTIONS = {
     "film": {
-        "loss": "Cross-entropy loss on Lichess move prediction with illegal-move masking (train vs val)",
-        "accuracy": "Move prediction accuracy (train top-1, val top-1/top-5)",
-        "film_gamma": "Per-layer \u03b3 deviation from identity (||\u03b3-1||\u2082). Layers with large deviation contributed to adaptation",
-        "film_beta": "Per-layer \u03b2 norm (||\u03b2||\u2082). Hidden-layer \u03b2 shifts position-dependent features; output \u03b2 acts as a fixed move prior",
-        "lr": "Learning rate with linear warmup and cosine decay",
-        "time": "Wall-clock time per epoch",
+        "loss": "Cross-entropy loss on Lichess move prediction with illegal-move masking.",
+        "accuracy": "Top-1 move accuracy (train) and top-1/top-5 (val).",
+        "film_gamma": "Per-layer γ deviation from identity. Large values = this layer is adapting.",
+        "film_beta": "Per-layer β norm. Hidden β shifts features; output β acts as a fixed move prior.",
+        "lr": "Learning rate schedule — linear warmup then cosine decay.",
+        "time": "Wall-clock seconds per epoch.",
     },
     "pawn": {
-        "loss": "Cross-entropy loss on next-token prediction (lower = better at predicting which random move was played)",
-        "accuracy": "Fraction of positions where the model's top-1 prediction matches the actual next move",
-        "val_loss": "Validation loss and perplexity on held-out games",
-        "val_accuracy": "Validation top-1/top-5 accuracy and legal move rate (fraction of predictions that are legal chess moves)",
-        "lr": "Learning rate with linear warmup and cosine decay",
-        "grad_norm": "L2 norm of gradients before clipping",
-        "gpu": "GPU memory usage: peak, reserved, current",
-        "time": "Wall-clock time per training step",
+        "loss": "Cross-entropy on next-token prediction. Lower = better at predicting random moves.",
+        "accuracy": "Fraction of positions where the model's top-1 prediction matches the true next move.",
+        "val_loss": "Validation loss and perplexity on held-out games.",
+        "val_accuracy": "Validation top-1/top-5 on held-out games.",
+        "lr": "Learning rate schedule — linear warmup then cosine decay.",
+        "grad_norm": "L2 norm of gradients before clipping.",
+        "gpu": "GPU memory footprint (peak / reserved / current).",
+        "time": "Wall-clock seconds per training step.",
     },
     "lora": {
-        "loss": "Cross-entropy loss on Lichess move prediction with illegal-move masking",
-        "accuracy": "Move prediction accuracy (train top-1, val top-1/top-5)",
-        "lora_layer": "Mean LoRA B-norm per layer. Shows which layers are adapting most",
-        "lora_proj": "Mean LoRA B-norm per projection type. Shows Q vs K vs V vs O adaptation",
-        "time": "Wall-clock time per epoch",
+        "loss": "Cross-entropy loss on Lichess move prediction with illegal-move masking.",
+        "accuracy": "Top-1 / top-5 move accuracy.",
+        "lora_layer": "Mean ‖B‖₂ per layer — which depths are adapting most.",
+        "lora_proj": "Mean ‖B‖₂ per projection — Q vs K vs V vs O balance.",
+        "time": "Wall-clock seconds per epoch.",
     },
     "hybrid": {
-        "loss": "Cross-entropy loss on Lichess move prediction with illegal-move masking",
-        "accuracy": "Move prediction accuracy (train top-1, val top-1/top-5)",
-        "lora_layer": "Mean LoRA B-norm per layer",
-        "lora_proj": "Mean LoRA B-norm per projection type",
-        "film_gamma": "Per-layer FiLM \u03b3 deviation from identity",
-        "film_beta": "Per-layer FiLM \u03b2 norm",
-        "time": "Wall-clock time per epoch",
+        "loss": "Cross-entropy loss on Lichess move prediction with illegal-move masking.",
+        "accuracy": "Top-1 / top-5 move accuracy.",
+        "lora_layer": "Mean LoRA ‖B‖₂ per layer.",
+        "lora_proj": "Mean LoRA ‖B‖₂ per projection type.",
+        "film_gamma": "Per-layer FiLM γ deviation from identity.",
+        "film_beta": "Per-layer FiLM β norm.",
+        "time": "Wall-clock seconds per epoch.",
     },
 }
 
 _DEFAULT_DESCRIPTIONS = {
-    "lr": "Learning rate schedule",
-    "grad_norm": "Gradient norm before clipping",
-    "gpu": "GPU memory usage",
-    "time": "Time per step/epoch",
+    "lr": "Learning rate schedule.",
+    "grad_norm": "Gradient norm before clipping.",
+    "gpu": "GPU memory footprint.",
+    "time": "Wall-clock per step or epoch.",
+    "sparse_delta": "Per-layer sparse Δ norm.",
+    "adapter_up": "Bottleneck adapter up-projection norm.",
+    "patience": "Consecutive evals without improvement — stops when it hits the limit.",
 }
 
 
 @solara.component
-def ChartWithInfo(chart, description: str = ""):
-    """Chart with an info icon tooltip for the description."""
-    if description:
-        with solara.Row(style={"align-items": "center", "gap": "4px", "margin-bottom": "-8px"}):
-            with solara.Tooltip(tooltip=description):
-                solara.Text("\u2139", style="cursor: help; opacity: 0.5; font-size: 14px;")
-    solara.FigurePlotly(chart)
+def ChartCard(chart, description: str = ""):
+    """A card wrapper that shows the description above the chart."""
+    with solara.Div(classes=["pawn-card"]):
+        if description:
+            solara.HTML(tag="div", unsafe_innerHTML=f'<div class="pawn-desc">{description}</div>')
+        solara.FigurePlotly(chart)
 
 
 @solara.component
-def MetricsCharts():
-    """Chart grid for the selected run, adapted to run type."""
-    data = solara.use_memo(
-        lambda: load_metrics(log_dir.value, selected_run.value) if selected_run.value else {},
-        dependencies=[selected_run.value, metrics_tick.value],
-    )
+def Section(title: str):
+    solara.HTML(tag="div", unsafe_innerHTML=f'<div class="pawn-section-title">{title}</div>')
+
+
+def _row(items: list):
+    """Two-column row of chart cards, gracefully handling odd counts."""
+    ratio = [1] * max(len(items), 1)
+    with solara.Columns(ratio):
+        for item in items:
+            item()
+
+
+@solara.component
+def MetricsCharts(data: dict | None = None):
     if not selected_run.value:
         return
+    if data is None:
+        data = {}
+
     configs = data.get("config", [])
     config = configs[-1] if configs else {}
     run_type = detect_run_type(config)
@@ -254,107 +769,181 @@ def MetricsCharts():
     def desc(key: str) -> str:
         return descs.get(key, _DEFAULT_DESCRIPTIONS.get(key, ""))
 
+    def card(fig, description: str):
+        def _render():
+            ChartCard(fig, description)
+        return _render
+
     if run_type == "hybrid":
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.loss_chart(train, x_key, run_type), desc("loss"))
-            ChartWithInfo(charts.accuracy_chart(train, x_key, run_type), desc("accuracy"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.lora_layer_chart(train, x_key), desc("lora_layer"))
-            ChartWithInfo(charts.lora_proj_chart(train, x_key), desc("lora_proj"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.film_weight_chart(train, x_key), desc("film_gamma"))
-            ChartWithInfo(charts.film_beta_chart(train, x_key), desc("film_beta"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.lr_chart(train, batch, x_key), desc("lr"))
-            ChartWithInfo(charts.time_chart(train, x_key, run_type), desc("time"))
+        Section("Training")
+        _row([
+            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+        ])
+        Section("LoRA Adaptation")
+        _row([
+            card(charts.lora_layer_chart(train, x_key), desc("lora_layer")),
+            card(charts.lora_proj_chart(train, x_key), desc("lora_proj")),
+        ])
+        Section("FiLM Modulation")
+        _row([
+            card(charts.film_weight_chart(train, x_key), desc("film_gamma")),
+            card(charts.film_beta_chart(train, x_key), desc("film_beta")),
+        ])
+        Section("Optimizer & Runtime")
+        _row([
+            card(charts.lr_chart(train, batch, x_key), desc("lr")),
+            card(charts.time_chart(train, x_key, run_type), desc("time")),
+        ])
     elif run_type == "rosa":
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.loss_chart(train, x_key, run_type), desc("loss"))
-            ChartWithInfo(charts.accuracy_chart(train, x_key, run_type), desc("accuracy"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.sparse_delta_chart(train, x_key), desc("sparse_delta"))
-            ChartWithInfo(charts.bottleneck_up_chart(train, x_key), desc("adapter_up"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.lr_chart(train, batch, x_key), desc("lr"))
-            ChartWithInfo(charts.time_chart(train, x_key, run_type), desc("time"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.gpu_chart(train, x_key), desc("gpu"))
-            ChartWithInfo(charts.patience_chart(val, x_key), desc("patience"))
+        Section("Training")
+        _row([
+            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+        ])
+        Section("Adapter Diagnostics")
+        _row([
+            card(charts.sparse_delta_chart(train, x_key), desc("sparse_delta")),
+            card(charts.bottleneck_up_chart(train, x_key), desc("adapter_up")),
+        ])
+        Section("Optimizer & Runtime")
+        _row([
+            card(charts.lr_chart(train, batch, x_key), desc("lr")),
+            card(charts.time_chart(train, x_key, run_type), desc("time")),
+        ])
+        _row([
+            card(charts.gpu_chart(train, x_key), desc("gpu")),
+            card(charts.patience_chart(val, x_key), desc("patience")),
+        ])
     elif run_type == "sparse":
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.loss_chart(train, x_key, run_type), desc("loss"))
-            ChartWithInfo(charts.accuracy_chart(train, x_key, run_type), desc("accuracy"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.sparse_delta_chart(train, x_key), desc("sparse_delta"))
-            ChartWithInfo(charts.time_chart(train, x_key, run_type), desc("time"))
+        Section("Training")
+        _row([
+            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+        ])
+        Section("Adapter Diagnostics")
+        _row([
+            card(charts.sparse_delta_chart(train, x_key), desc("sparse_delta")),
+            card(charts.time_chart(train, x_key, run_type), desc("time")),
+        ])
     elif run_type == "bottleneck":
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.loss_chart(train, x_key, run_type), desc("loss"))
-            ChartWithInfo(charts.accuracy_chart(train, x_key, run_type), desc("accuracy"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.bottleneck_up_chart(train, x_key), desc("adapter_up"))
-            ChartWithInfo(charts.lr_chart(train, batch, x_key), desc("lr"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.gpu_chart(train, x_key), desc("gpu"))
-            ChartWithInfo(charts.time_chart(train, x_key, run_type), desc("time"))
+        Section("Training")
+        _row([
+            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+        ])
+        Section("Adapter Diagnostics")
+        _row([
+            card(charts.bottleneck_up_chart(train, x_key), desc("adapter_up")),
+            card(charts.lr_chart(train, batch, x_key), desc("lr")),
+        ])
+        Section("Runtime")
+        _row([
+            card(charts.gpu_chart(train, x_key), desc("gpu")),
+            card(charts.time_chart(train, x_key, run_type), desc("time")),
+        ])
     elif run_type == "tiny":
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.loss_chart(train, x_key, run_type), desc("loss"))
-            ChartWithInfo(charts.accuracy_chart(train, x_key, run_type), desc("accuracy"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.lr_chart(train, batch, x_key), desc("lr"))
-            ChartWithInfo(charts.gpu_chart(train, x_key), desc("gpu"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.time_chart(train, x_key, run_type), desc("time"))
+        Section("Training")
+        _row([
+            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+        ])
+        Section("Optimizer & Runtime")
+        _row([
+            card(charts.lr_chart(train, batch, x_key), desc("lr")),
+            card(charts.gpu_chart(train, x_key), desc("gpu")),
+        ])
+        _row([
+            card(charts.time_chart(train, x_key, run_type), desc("time")),
+        ])
     elif run_type == "lora":
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.loss_chart(train, x_key, run_type), desc("loss"))
-            ChartWithInfo(charts.accuracy_chart(train, x_key, run_type), desc("accuracy"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.lora_layer_chart(train, x_key), desc("lora_layer"))
-            ChartWithInfo(charts.lora_proj_chart(train, x_key), desc("lora_proj"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.lr_chart(train, batch, x_key), desc("lr"))
-            ChartWithInfo(charts.time_chart(train, x_key, run_type), desc("time"))
+        Section("Training")
+        _row([
+            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+        ])
+        Section("LoRA Adaptation")
+        _row([
+            card(charts.lora_layer_chart(train, x_key), desc("lora_layer")),
+            card(charts.lora_proj_chart(train, x_key), desc("lora_proj")),
+        ])
+        Section("Optimizer & Runtime")
+        _row([
+            card(charts.lr_chart(train, batch, x_key), desc("lr")),
+            card(charts.time_chart(train, x_key, run_type), desc("time")),
+        ])
     elif run_type == "film":
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.loss_chart(train, x_key, run_type), desc("loss"))
-            ChartWithInfo(charts.accuracy_chart(train, x_key, run_type), desc("accuracy"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.film_weight_chart(train, x_key), desc("film_gamma"))
-            ChartWithInfo(charts.film_beta_chart(train, x_key), desc("film_beta"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.lr_chart(train, batch, x_key), desc("lr"))
-            ChartWithInfo(charts.time_chart(train, x_key, run_type), desc("time"))
+        Section("Training")
+        _row([
+            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+        ])
+        Section("FiLM Modulation")
+        _row([
+            card(charts.film_weight_chart(train, x_key), desc("film_gamma")),
+            card(charts.film_beta_chart(train, x_key), desc("film_beta")),
+        ])
+        Section("Optimizer & Runtime")
+        _row([
+            card(charts.lr_chart(train, batch, x_key), desc("lr")),
+            card(charts.time_chart(train, x_key, run_type), desc("time")),
+        ])
     else:
-        # Default: pretraining or unknown
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.loss_chart(train, x_key, run_type), desc("loss"))
-            ChartWithInfo(charts.accuracy_chart(train, x_key, run_type), desc("accuracy"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.val_loss_chart(val, x_key, run_type), desc("val_loss"))
-            ChartWithInfo(charts.val_accuracy_chart(val, x_key, run_type), desc("val_accuracy"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.lr_chart(train, batch, x_key), desc("lr"))
-            ChartWithInfo(charts.grad_chart(train, x_key), desc("grad_norm"))
-        with solara.Columns([1, 1]):
-            ChartWithInfo(charts.gpu_chart(train, x_key), desc("gpu"))
-            ChartWithInfo(charts.time_chart(train, x_key, run_type), desc("time"))
-        if val:
-            patience = config.get("training", {}).get("patience", 10)
-            if isinstance(patience, str):
+        # Pretraining default
+        Section("Training")
+        _row([
+            card(
+                charts.loss_chart(train, x_key, run_type, val_records=val),
+                desc("loss") + " Val loss overlaid on train; log scale.",
+            ),
+            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+        ])
+        Section("Validation")
+        _row([
+            card(
+                charts.perplexity_chart(val, x_key),
+                "Validation perplexity on held-out games (log scale).",
+            ),
+            card(charts.val_accuracy_chart(val, x_key, run_type), desc("val_accuracy")),
+        ])
+        patience = config.get("training", {}).get("patience", 10)
+        if isinstance(patience, str):
+            try:
                 patience = int(patience)
-            with solara.Columns([1]):
-                ChartWithInfo(
-                    charts.patience_chart(val, x_key, patience_limit=patience),
-                    "Consecutive evals without val loss improvement. "
-                    "Training stops when this reaches the patience limit."
-                )
+            except ValueError:
+                patience = 10
+        if val:
+            Section("Game Integrity & Stopping")
+            error_desc = (
+                "Log-scale error rates — illegal (per-position), late illegal "
+                "(per-position, plies ≥ context/2), and forfeit (per-game, any illegal). "
+                "Dashed = log-linear fit on the last half of the series; slope → "
+                "half-life. Lower is better."
+            )
+            patience_desc = _DEFAULT_DESCRIPTIONS["patience"]
+            _row([
+                card(charts.error_rate_chart(val, x_key, fit=True), error_desc),
+                card(charts.patience_chart(val, x_key, patience_limit=patience), patience_desc),
+            ])
+        Section("Optimizer")
+        _row([
+            card(charts.lr_chart(train, batch, x_key), desc("lr")),
+            card(charts.grad_chart(train, x_key), desc("grad_norm")),
+        ])
+        Section("Runtime")
+        _row([
+            card(charts.gpu_chart(train, x_key), desc("gpu")),
+            card(charts.time_chart(train, x_key, run_type), desc("time")),
+        ])
+
+
+# ---------------------------------------------------------------------------
+# Auto-refresh
+# ---------------------------------------------------------------------------
 
 
 @solara.component
 def AutoRefresh(interval: float = 10.0):
-    """Invisible component that bumps metrics_tick every `interval` seconds."""
     def setup():
         stop = threading.Event()
 
@@ -367,6 +956,11 @@ def AutoRefresh(interval: float = 10.0):
         return lambda: stop.set()
 
     solara.use_effect(setup, [interval])
+
+
+# ---------------------------------------------------------------------------
+# Top-level Dashboard component
+# ---------------------------------------------------------------------------
 
 
 @solara.component
@@ -386,19 +980,32 @@ def Dashboard(log_dir_override: Path | None = None):
     if auto_refresh:
         AutoRefresh(interval=interval)
 
-    solara.Markdown("## Training Metrics")
+    data = solara.use_memo(
+        lambda: load_metrics(log_dir.value, selected_run.value) if selected_run.value else {},
+        dependencies=[selected_run.value, metrics_tick.value],
+    )
+    configs = data.get("config", []) if data else []
+    config = configs[-1] if configs else {}
+    run_type = detect_run_type(config) if config else ""
+    hostname = config.get("hostname", "") if config else ""
+    train = data.get("train", []) if data else []
+    val = data.get("val", []) if data else []
+
+    Header(run_type=run_type, hostname=hostname, auto_refresh=auto_refresh)
     RunSelector(
         auto_refresh=auto_refresh,
         on_auto_refresh=set_auto_refresh,
         interval=interval,
         on_interval=set_interval,
     )
-    ConfigSummary()
-    MetricsCharts()
+    if train or val:
+        KpiRow(run_type, train, val)
+    ConfigSummary(data=data)
+    MetricsCharts(data=data)
 
 
 # ---------------------------------------------------------------------------
-# Runner components
+# Runner
 # ---------------------------------------------------------------------------
 
 
@@ -418,7 +1025,6 @@ def Runner(project_root: Path | None = None):
     def build_command() -> list[str]:
         info = TRAIN_SCRIPTS[run_type]
         cmd = ["uv", "run", "python", info["script"]]
-
         if run_type == "pawn":
             if checkpoint:
                 cmd.extend(["--resume", checkpoint])
@@ -427,15 +1033,12 @@ def Runner(project_root: Path | None = None):
             if steps:
                 cmd.extend(["--total-steps", steps])
         else:
-            # Adapter training
             if checkpoint:
                 cmd.extend(["--checkpoint", checkpoint])
             if pgn_path:
                 cmd.extend(["--pgn", pgn_path])
             cmd.extend(["--lr", lr, "--batch-size", batch_size, "--epochs", steps])
-
         cmd.extend(["--log-dir", str(root / "logs")])
-
         if extra_args.strip():
             cmd.extend(extra_args.strip().split())
         return cmd
@@ -451,11 +1054,8 @@ def Runner(project_root: Path | None = None):
         def _stream():
             try:
                 proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    cwd=cwd,
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, cwd=cwd,
                 )
                 runner_pid.set(proc.pid)
                 buf: list[str] = []
@@ -469,9 +1069,7 @@ def Runner(project_root: Path | None = None):
                 if buf:
                     runner_output.set(runner_output.value + "".join(buf))
                 proc.wait()
-                runner_output.set(
-                    runner_output.value + f"\n[exited {proc.returncode}]\n"
-                )
+                runner_output.set(runner_output.value + f"\n[exited {proc.returncode}]\n")
             except Exception as exc:
                 runner_output.set(runner_output.value + f"\n[error: {exc}]\n")
             finally:
@@ -489,47 +1087,68 @@ def Runner(project_root: Path | None = None):
             runner_pid.set(0)
 
     cmd_preview = " ".join(build_command())
+    is_running = bool(runner_pid.value)
 
-    with solara.Card("Launch Training Run"):
+    with solara.Div(classes=["pawn-card"]):
+        solara.HTML(
+            tag="div",
+            unsafe_innerHTML=(
+                '<div class="pawn-desc" style="font-size:13px;color:var(--pawn-text);'
+                'font-weight:600;margin-bottom:12px;letter-spacing:0.02em;">Launch Training Run</div>'
+            ),
+        )
         with solara.Columns([1, 1]):
-            with solara.Column():
+            with solara.Column(gap="10px"):
                 solara.Select(
-                    label="Run Type",
-                    value=run_type,
-                    on_value=set_run_type,
+                    label="Run Type", value=run_type, on_value=set_run_type,
                     values=list(TRAIN_SCRIPTS.keys()),
                 )
-                solara.InputText(
-                    "Checkpoint", value=checkpoint, on_value=set_checkpoint,
-                )
+                solara.InputText("Checkpoint", value=checkpoint, on_value=set_checkpoint)
                 if run_type != "pawn":
-                    solara.InputText(
-                        "PGN File", value=pgn_path, on_value=set_pgn_path,
-                    )
+                    solara.InputText("PGN File", value=pgn_path, on_value=set_pgn_path)
                 solara.InputText("Learning Rate", value=lr, on_value=set_lr)
                 solara.InputText("Batch Size", value=batch_size, on_value=set_batch_size)
                 steps_label = "Total Steps" if run_type == "pawn" else "Epochs"
                 solara.InputText(steps_label, value=steps, on_value=set_steps)
                 solara.InputText("Extra Args", value=extra_args, on_value=set_extra_args)
 
-            with solara.Column():
-                solara.Markdown(f"**Command:**\n```\n{cmd_preview}\n```")
-                with solara.Row():
+            with solara.Column(gap="10px"):
+                solara.HTML(
+                    tag="div",
+                    unsafe_innerHTML=f'<div class="pawn-cmd-preview">{cmd_preview}</div>',
+                )
+                with solara.Row(gap="8px"):
                     solara.Button(
-                        "Launch",
-                        on_click=launch,
-                        disabled=bool(runner_pid.value),
-                        color="primary",
+                        "Launch", on_click=launch, disabled=is_running, color="primary",
+                        icon_name="mdi-play",
                     )
                     solara.Button(
-                        "Stop",
-                        on_click=stop,
-                        disabled=not runner_pid.value,
-                        color="error",
+                        "Stop", on_click=stop, disabled=not is_running, color="error",
+                        icon_name="mdi-stop",
+                    )
+                    status_class = "" if is_running else "idle"
+                    status_text = f"PID {runner_pid.value}" if is_running else "IDLE"
+                    solara.HTML(
+                        tag="div",
+                        unsafe_innerHTML=(
+                            f'<div class="pawn-pulse {status_class}" style="margin-left:8px;">'
+                            f'<span class="dot"></span>{status_text}</div>'
+                        ),
                     )
                 if runner_output.value:
-                    tail = runner_output.value.split("\n")[-100:]
-                    solara.Markdown(f"```\n{chr(10).join(tail)}\n```")
+                    tail = "\n".join(runner_output.value.split("\n")[-120:])
+                    solara.HTML(
+                        tag="div",
+                        unsafe_innerHTML=f'<div class="pawn-runner-output">{_escape(tail)}</div>',
+                    )
+
+
+def _escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -543,22 +1162,26 @@ def Page():
     solara.Title("PAWN Dashboard")
     solara.use_effect(lambda: setattr(solara.lab.theme, "dark", True), [])
 
+    InjectStyle()
+
     tab, set_tab = solara.use_state(0)
 
-    solara.Markdown("# PAWN Dashboard")
-    with solara.Row(style={"gap": "4px", "margin-bottom": "16px"}):
-        solara.Button(
-            "Training", on_click=lambda: set_tab(0),
-            color="primary" if tab == 0 else None,
-            text=tab != 0,
-        )
-        solara.Button(
-            "Runner", on_click=lambda: set_tab(1),
-            color="primary" if tab == 1 else None,
-            text=tab != 1,
-        )
+    with solara.Div(classes=["pawn-shell"]):
+        with solara.Div(classes=["pawn-tabs"]):
+            solara.Button(
+                "Training",
+                on_click=lambda: set_tab(0),
+                classes=["pawn-tab-btn", *(["active"] if tab == 0 else [])],
+                text=True,
+            )
+            solara.Button(
+                "Runner",
+                on_click=lambda: set_tab(1),
+                classes=["pawn-tab-btn", *(["active"] if tab == 1 else [])],
+                text=True,
+            )
 
-    if tab == 0:
-        Dashboard()
-    else:
-        Runner()
+        if tab == 0:
+            Dashboard()
+        else:
+            Runner()

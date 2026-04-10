@@ -241,6 +241,82 @@ def compute_legal_move_rate_from_preds(
 
 
 
+def _game_completion_chunk(
+    preds: torch.Tensor,
+    legal_mask: torch.Tensor,
+    loss_mask: torch.Tensor,
+    game_lengths: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Vectorized per-game forfeit lookup for a single chunk.
+
+    Returns (has_forfeit, first_forfeit, gl) each of shape (B,).
+    """
+    B, T = preds.shape
+    V = legal_mask.shape[2]
+
+    has_legal = legal_mask.any(dim=-1)                # (B, T)
+    checked = loss_mask.bool() & has_legal            # (B, T)
+
+    preds_clamped = preds.clamp(min=0, max=V - 1).long()
+    in_range = preds < V                              # (B, T)
+
+    legal_at_pred = legal_mask.gather(
+        dim=-1, index=preds_clamped.unsqueeze(-1)
+    ).squeeze(-1)                                      # (B, T)
+
+    illegal = checked & (~in_range | ~legal_at_pred)  # (B, T)
+
+    has_forfeit = illegal.any(dim=-1)                 # (B,)
+    first_forfeit = illegal.int().argmax(dim=-1)      # (B,)
+    gl = game_lengths.long().clamp(max=T)             # (B,)
+    return has_forfeit, first_forfeit, gl
+
+
+def _aggregate_game_completion(
+    has_forfeit: torch.Tensor,
+    first_forfeit: torch.Tensor,
+    gl: torch.Tensor,
+) -> dict[str, float]:
+    """Reduce per-game tensors to scalar summary statistics."""
+    n_games = int(has_forfeit.shape[0])
+    if n_games == 0:
+        return {
+            "game_completion_rate": 0.0,
+            "avg_pct_completion": 0.0,
+            "avg_plies_completed": 0.0,
+            "min_forfeit_ply": 0.0,
+            "max_forfeit_ply": 0.0,
+            "median_forfeit_ply": 0.0,
+        }
+
+    plies_completed = torch.where(has_forfeit, first_forfeit, gl).float()
+    pct = torch.where(
+        has_forfeit & (gl > 0),
+        first_forfeit.float() / gl.clamp(min=1).float(),
+        torch.ones_like(plies_completed),
+    )
+
+    n_complete = int((~has_forfeit).sum().item())
+    forfeit_only = first_forfeit[has_forfeit].float()
+    if forfeit_only.numel() > 0:
+        min_forfeit = float(forfeit_only.min().item())
+        max_forfeit = float(forfeit_only.max().item())
+        median_forfeit = float(forfeit_only.median().item())
+    else:
+        min_forfeit = 0.0
+        max_forfeit = 0.0
+        median_forfeit = 0.0
+
+    return {
+        "game_completion_rate": n_complete / n_games,
+        "avg_pct_completion": float(pct.mean().item()),
+        "avg_plies_completed": float(plies_completed.mean().item()),
+        "min_forfeit_ply": min_forfeit,
+        "max_forfeit_ply": max_forfeit,
+        "median_forfeit_ply": median_forfeit,
+    }
+
+
 def compute_game_completion(
     preds: torch.Tensor,
     legal_mask: torch.Tensor,
@@ -249,8 +325,9 @@ def compute_game_completion(
 ) -> dict[str, float]:
     """Measure how often the model gets through a full game without illegal moves.
 
-    For each game, walks ply-by-ply checking whether the argmax prediction is
-    legal.  The first illegal move is a "forfeit".
+    Vectorized: for each game, finds the first ply where the argmax prediction
+    is either out-of-range or marked illegal by the legal_mask.  Games with no
+    illegal prediction are "completed".
 
     Args:
         preds: (B, T) argmax token predictions (aligned with targets)
@@ -263,44 +340,14 @@ def compute_game_completion(
         avg_pct_completion: mean fraction of game completed before forfeit
         avg_plies_completed: mean plies completed before first illegal move.
             Games with no illegal moves contribute their full game_length.
+        min_forfeit_ply / max_forfeit_ply / median_forfeit_ply: forfeit ply
+            statistics across games that actually forfeited (0 if none).
     """
-    B, T = preds.shape
-
     with torch.no_grad():
-        n_complete = 0
-        pct_completions = []
-        plies_completed = []
-
-        for b in range(B):
-            gl = min(int(game_lengths[b].item()), T)
-            forfeit_ply = -1
-            for p in range(gl):
-                if not loss_mask[b, p]:
-                    continue
-                # Skip plies with no legal moves (end-of-game padding)
-                if not legal_mask[b, p].any():
-                    continue
-                token = int(preds[b, p].item())
-                if token < legal_mask.shape[2] and not legal_mask[b, p, token]:
-                    forfeit_ply = p
-                    break
-                elif token >= legal_mask.shape[2]:
-                    forfeit_ply = p
-                    break
-
-            if forfeit_ply < 0:
-                n_complete += 1
-                pct_completions.append(1.0)
-                plies_completed.append(float(gl))
-            else:
-                pct_completions.append(forfeit_ply / gl if gl > 0 else 0.0)
-                plies_completed.append(float(forfeit_ply))
-
-    return {
-        "game_completion_rate": n_complete / B if B > 0 else 0.0,
-        "avg_pct_completion": sum(pct_completions) / len(pct_completions) if pct_completions else 0.0,
-        "avg_plies_completed": sum(plies_completed) / len(plies_completed) if plies_completed else 0.0,
-    }
+        has_forfeit, first_forfeit, gl = _game_completion_chunk(
+            preds, legal_mask, loss_mask, game_lengths,
+        )
+    return _aggregate_game_completion(has_forfeit, first_forfeit, gl)
 
 
 def _get_grad_norm(model: nn.Module) -> float:
@@ -335,6 +382,8 @@ class CLMTrainer:
         )
         self.best_val_loss: float = float("inf")
         self.best_late_legality: float = 0.0
+        self.best_game_completion: float = 0.0
+        self.best_avg_plies_completed: float = 0.0
         self.patience_counter: int = 0
 
         self.logger = MetricsLogger(
@@ -415,16 +464,23 @@ class CLMTrainer:
         else:
             print("Skipping torch.compile on CPU")
 
+        # Patience and legality_late_ply aren't in TrainingConfig — pass them
+        # alongside so the dashboard and other consumers can see them.
+        training_log = {
+            **train_cfg.__dict__,
+            "patience": self.patience,
+            "legality_late_ply": self.legality_late_ply,
+        }
         self.logger.log_config(
             model=model_cfg.__dict__,
-            training=train_cfg.__dict__,
+            training=training_log,
             param_count=param_count,
             compiled=self._compiled,
             formulation="clm",
         )
         self.logger.write_config_json(
             model=model_cfg.__dict__,
-            training=train_cfg.__dict__,
+            training=training_log,
             param_count=param_count,
             compiled=self._compiled,
             formulation="clm",
@@ -579,34 +635,57 @@ class CLMTrainer:
         avg["val/perplexity"] = math.exp(min(avg["val/loss"], 20.0))
 
         # Game completion eval: can the model get through entire games
-        # without picking an illegal move?  Uses a small subset to avoid
-        # materializing a large dense (B, T, vocab) token mask.
+        # without picking an illegal move?  Fully vectorized, chunked to keep
+        # the dense (B, T, vocab) legal mask within VRAM limits.
         if "game_lengths" in self.val_data:
-            gc_n = min(64, n)
-            gc_input = self.val_data["input_ids"][:gc_n].to(self.device)
-            gc_loss_mask = self.val_data["loss_mask"][:gc_n].to(self.device)
-            gc_game_lengths = self.val_data["game_lengths"][:gc_n].to(self.device)
-            move_ids = self.val_data["input_ids"][:gc_n].numpy().astype(np.int16)
-            gl_np = self.val_data["game_lengths"][:gc_n].numpy().astype(np.int16)
+            gc_batch = max(1, self.cfg.batch_size)  # same chunk size as loss eval
             vocab_size = self.model_cfg.vocab_size
+            has_forfeit_all: list[torch.Tensor] = []
+            first_forfeit_all: list[torch.Tensor] = []
+            gl_all: list[torch.Tensor] = []
 
-            with torch.no_grad():
-                with torch.amp.autocast(self.device, enabled=self.cfg.use_amp):
-                    hidden = model.forward_eval(gc_input, gc_loss_mask)
-                    gc_logits = model.lm_head(hidden)
-                gc_preds = gc_logits.argmax(dim=-1)
+            for start in range(0, n, gc_batch):
+                end = min(start + gc_batch, n)
+                gc_input = self.val_data["input_ids"][start:end].to(self.device)
+                gc_loss_mask = self.val_data["loss_mask"][start:end].to(self.device)
+                gc_game_lengths = self.val_data["game_lengths"][start:end].to(self.device)
+                move_ids = self.val_data["input_ids"][start:end].numpy().astype(np.int16)
+                gl_np = self.val_data["game_lengths"][start:end].numpy().astype(np.int16)
 
-            legal_tokens = engine.compute_legal_token_masks(move_ids, gl_np, vocab_size)
-            legal_mask_t = torch.from_numpy(
-                shift_legal_mask(legal_tokens)
-            ).to(self.device)
+                with torch.no_grad():
+                    with torch.amp.autocast(self.device, enabled=self.cfg.use_amp):
+                        hidden = model.forward_eval(gc_input, gc_loss_mask)
+                        gc_logits = model.lm_head(hidden)
+                    gc_preds = gc_logits.argmax(dim=-1)
 
-            gc = compute_game_completion(gc_preds, legal_mask_t, gc_loss_mask, gc_game_lengths)
+                    legal_tokens = engine.compute_legal_token_masks(move_ids, gl_np, vocab_size)
+                    legal_mask_t = torch.from_numpy(
+                        shift_legal_mask(legal_tokens)
+                    ).to(self.device)
+
+                    has_forfeit, first_forfeit, gl = _game_completion_chunk(
+                        gc_preds, legal_mask_t, gc_loss_mask, gc_game_lengths,
+                    )
+
+                has_forfeit_all.append(has_forfeit.cpu())
+                first_forfeit_all.append(first_forfeit.cpu())
+                gl_all.append(gl.cpu())
+
+                del gc_input, gc_loss_mask, gc_game_lengths, gc_logits, gc_preds
+                del legal_tokens, legal_mask_t
+
+            gc = _aggregate_game_completion(
+                torch.cat(has_forfeit_all),
+                torch.cat(first_forfeit_all),
+                torch.cat(gl_all),
+            )
             avg["val/game_completion_rate"] = gc["game_completion_rate"]
             avg["val/avg_pct_completion"] = gc["avg_pct_completion"]
             avg["val/avg_plies_completed"] = gc["avg_plies_completed"]
+            avg["val/min_forfeit_ply"] = gc["min_forfeit_ply"]
+            avg["val/max_forfeit_ply"] = gc["max_forfeit_ply"]
+            avg["val/median_forfeit_ply"] = gc["median_forfeit_ply"]
 
-            del gc_input, gc_loss_mask, gc_game_lengths, legal_mask_t, gc_logits, gc_preds
             if self.device != "cpu" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -704,12 +783,20 @@ class CLMTrainer:
                             f" | complete {val_metrics['val/game_completion_rate']:.3f}"
                             f" | avg_ply {val_metrics['val/avg_plies_completed']:.0f}"
                         )
+                        if "val/min_forfeit_ply" in val_metrics:
+                            val_msg += (
+                                f" | forfeit [{val_metrics['val/min_forfeit_ply']:.0f}"
+                                f"-{val_metrics['val/max_forfeit_ply']:.0f}"
+                                f" med {val_metrics['val/median_forfeit_ply']:.0f}]"
+                            )
 
                     # Compound early stopping
                     extra_log: dict[str, object] = {}
                     if self.patience is not None:
                         val_loss = val_metrics["val/loss"]
                         late_legality = val_metrics.get("val/late_legal_move_rate", 0.0)
+                        game_completion = val_metrics.get("val/game_completion_rate", 0.0)
+                        avg_plies = val_metrics.get("val/avg_plies_completed", 0.0)
 
                         improved = False
                         if val_loss < self.best_val_loss:
@@ -717,6 +804,12 @@ class CLMTrainer:
                             improved = True
                         if late_legality > self.best_late_legality:
                             self.best_late_legality = late_legality
+                            improved = True
+                        if game_completion > self.best_game_completion:
+                            self.best_game_completion = game_completion
+                            improved = True
+                        if avg_plies > self.best_avg_plies_completed:
+                            self.best_avg_plies_completed = avg_plies
                             improved = True
 
                         if improved:
@@ -729,6 +822,8 @@ class CLMTrainer:
                             "patience_counter": self.patience_counter,
                             "best_val_loss": self.best_val_loss,
                             "best_late_legality": self.best_late_legality,
+                            "best_game_completion": self.best_game_completion,
+                            "best_avg_plies_completed": self.best_avg_plies_completed,
                         }
 
                     print(val_msg, flush=True)
@@ -795,6 +890,8 @@ class CLMTrainer:
             extra={
                 "best_val_loss": self.best_val_loss,
                 "best_late_legality": self.best_late_legality,
+                "best_game_completion": self.best_game_completion,
+                "best_avg_plies_completed": self.best_avg_plies_completed,
                 "patience_counter": self.patience_counter,
             },
         )
@@ -826,6 +923,10 @@ class CLMTrainer:
             self.best_val_loss = meta["best_val_loss"]
         if meta.get("best_late_legality") is not None:
             self.best_late_legality = meta["best_late_legality"]
+        if meta.get("best_game_completion") is not None:
+            self.best_game_completion = meta["best_game_completion"]
+        if meta.get("best_avg_plies_completed") is not None:
+            self.best_avg_plies_completed = meta["best_avg_plies_completed"]
         if meta.get("patience_counter") is not None:
             self.patience_counter = meta["patience_counter"]
         print(f"Resumed from step {self.global_step}")

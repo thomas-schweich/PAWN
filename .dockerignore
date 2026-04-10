@@ -1,5 +1,6 @@
 .git
 .claude
+!.claude/skills
 .venv
 .env
 __pycache__

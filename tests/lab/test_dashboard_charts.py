@@ -33,8 +33,9 @@ class TestModuleContents:
             assert isinstance(c, str)
             assert c.startswith("#")
 
-    def test_layer_color_helper_returns_hex(self, charts):
-        c = charts._layer_color(0)
+    def test_layer_color_helper_returns_hex(self):
+        from pawn.dashboard.theme import layer_color
+        c = layer_color(0)
         assert c.startswith("#")
         assert len(c) == 7
 
@@ -117,7 +118,8 @@ class TestLossChart:
     def test_pawn(self, charts):
         fig = charts.loss_chart(SAMPLE_PAWN_TRAIN, "step", "pawn")
         assert fig is not None
-        assert fig.to_dict()["layout"]["title"]["text"] == "Loss"
+        # Titles are wrapped in <b>...</b> for bold rendering.
+        assert "Loss" in fig.to_dict()["layout"]["title"]["text"]
 
     def test_adapter(self, charts):
         fig = charts.loss_chart(SAMPLE_ADAPTER_TRAIN, "step", "lora")

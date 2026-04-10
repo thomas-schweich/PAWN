@@ -32,8 +32,23 @@ First, read `runs/lab-notes.md` — this is your handwritten research log with w
 
 Also read `/workspace/pod_manager.md` (auto-maintained by the lab server) for the structured tables and recent events.
 
+### 3. Benchmark the Pod (skip if a benchmark for this pod already exists in lab-notes)
 
-### 3. Start Check-In Cron
+Before launching real trials, run `scripts/benchmark.py` to characterize the actual performance of *this specific pod*. GPU model name alone isn't enough — driver version, CUDA/ROCm version, host CPU, PCIe topology, and thermal headroom all affect throughput. The benchmark script gives you ground-truth numbers for:
+
+- **Step time per variant** (eager vs. compiled) → informs how long a target step count will actually take
+- **Compile speedup ratio** → confirms `torch.compile` is working and tells you if any models hit a known compile-bug regression
+- **Concurrency scaling** → how many models you can fit per GPU and the total throughput at each level (relevant for sweeps and `train_all.py`)
+- **Adapter step times** → cost estimate for adapter sweeps
+- **Engine throughput** → tells you if the data pipeline will keep the GPU fed
+
+```bash
+python3 scripts/benchmark.py --json /workspace/benchmark_<pod-name>.json 2>&1 | tee /workspace/benchmark_<pod-name>.txt
+```
+
+This takes ~5-10 minutes. Skim the output, capture the headline numbers (compiled step time for `base`, compile speedup, peak concurrency throughput) into `runs/lab-notes.md`, and use them to plan everything that follows. If a previous run already benchmarked this pod and the numbers are in lab-notes, you can skip this step.
+
+### 4. Start Check-In Cron
 
 Use CronCreate to schedule a recurring check-in. The interval depends on the workload — see [Check-In Intervals](#check-in-intervals) below.
 
@@ -46,7 +61,7 @@ The cron is your heartbeat — it's how you:
 - Make strategic decisions (what to try next, kill underperformers)
 - Warn about idle pods
 
-### 4. Act on the Objective
+### 5. Act on the Objective
 
 **Monitoring an existing run:**
 - Call `lab_status` to see what's running
@@ -65,12 +80,12 @@ You drive the loop manually. At each check-in:
 - `lab_launch(config={"run_type": "pretrain", "variant": "base", "max_seq_len": 512, ...})`
 - Key tunable parameters:
   - **Architecture:** `d_model`, `n_layers`, `n_heads`, `d_ff` (override variant defaults)
-  - **Sequence length:** `max_seq_len` (default 256; set to 512 for long-game training)
+  - **Sequence length:** `max_seq_len` (default 512 for long-game training)
   - **Data generation:** `mate_boost` (0.0-1.0), `discard_ply_limit` (bool), `no_outcome_token` (bool — strips outcome conditioning)
   - **Training:** `lr`, `batch_size`, `accumulation_steps`, `warmup_frac`, `weight_decay`
+  - **Validation:** `val_games` (default 512; bump to 2048+ for finer forfeit-rate detection)
   - **Early stopping:** `patience` (evals without improvement), `legality_late_ply` (ply threshold for late-game legality, defaults to `max_seq_len // 2`)
-- **Compound early stopping:** Patience resets when *either* val_loss *or* late-game legality improves. This keeps training alive when loss plateaus but the model is still learning to play legal moves deeper into games. Check `lab_log` to see the patience counter (`pat N/M`).
-- **VRAM note:** 512-token sequences double attention memory. Start with smaller `batch_size` (128 or 64) and use `accumulation_steps` to maintain effective batch size.
+- **Compound early stopping:** Patience resets when *any* of the following improve: `val_loss`, `late_legal_move_rate`, `game_completion_rate`, or `avg_plies_completed`. This keeps training alive when loss plateaus but the model is still learning to play longer stretches of legal moves — which has been the dominant late-phase signal. Check `lab_log` to see the patience counter (`pat N/M`) and the per-eval line: `complete X.XXX | avg_ply N | forfeit [min-max med N]`.
 
 **Single training run:**
 - Call `lab_launch` with the strategy and exact params
@@ -115,9 +130,9 @@ To switch intervals, delete the old cron with `CronDelete` and create a new one.
 | Tool | Purpose |
 |------|---------|
 | `lab_status` | GPUs, running trials with ETAs, cost. Best for first-contact orientation. Only updates val_loss/acc at eval intervals, so don't poll repeatedly for progress. |
-| `lab_results` | All trials with metrics + Pareto front + Optuna suggestions. Optionally pass `strategy` to filter. |
-| `lab_schema` | Returns JSON Schema for all RunConfig fields. Call before `lab_launch` to discover available parameters. |
-| `lab_events` | New events since sequence N. Types: trial_started, trial_completed, trial_failed, trial_killed, gpu_idle. Call at every check-in. |
+| `lab_results` | All trials with metrics + Pareto front + Optuna suggestions. Optionally filter by `strategy` and/or `tag`. |
+| `lab_schema` | Returns JSON Schema for `PretrainConfig` and `AdapterConfig`. Call before `lab_launch` to discover available parameters. |
+| `lab_events` | New events since sequence N (auto-tracked if omitted; pass `since=0` for full history). Types: trial_started, trial_completed, trial_failed, trial_killed, gpu_idle, health_warning. Call at every check-in. |
 
 ### Monitoring tools (call at check-ins)
 
@@ -130,8 +145,9 @@ To switch intervals, delete the old cron with `CronDelete` and create a new one.
 
 | Tool | Purpose |
 |------|---------|
-| `lab_launch` | Launch one trial from a RunConfig dict. Call `lab_schema` first to see all fields. |
-| `lab_kill` | Kill a trial by ID (SIGTERM) |
+| `lab_launch` | Launch one trial from a RunConfig dict. Call `lab_schema` first to see all fields. Optionally pass `tags` for grouping. |
+| `lab_resume` | Resume a completed/paused trial from its best checkpoint. Creates a new trial with the same config plus `--resume`. Can override `total_steps` or `pause_after_steps`. |
+| `lab_kill` | Kill a trial by ID (SIGTERM). The trainer handles SIGTERM gracefully and writes a final checkpoint before exiting, so resume/launch with `resume=<path>` picks up where it left off — no need to wait for a 5K-interval checkpoint. |
 | `lab_set_cost` | Set $/hr rate for cost tracking |
 
 ---
@@ -171,7 +187,7 @@ You are the decision-maker. Your job at each check-in is **expert judgment**:
    - What does it tell us about this strategy/param range?
 
 4. **Strategic decisions.** Based on accumulated results:
-   - What should the next trial be? Check `lab_results(suggest_strategy=...)` for an Optuna suggestion as a starting point.
+   - What should the next trial be? `lab_results` returns Optuna suggestions alongside the results table — use them as a starting point when they're in-range.
    - Should we change phase? (exploration → exploitation → validation)
    - Should we kill any running trials that look unpromising?
    - Are there obvious gaps in coverage?
@@ -185,14 +201,14 @@ You are the decision-maker. Your job at each check-in is **expert judgment**:
 
 ## Infrastructure Notes (PAWN-specific)
 
-- **`uv run` may be broken** on pods. Use `python3` directly if `uv` fails.
+- **`uv run`** works on the dev image (PR #53 registered the engine wheel in uv's workspace). Runtime images install the engine via `uv pip install` outside the workspace — use `python3` directly there if `uv run` complains about the workspace member.
 - **Persistent storage** is at `/workspace`. Code is at `/opt/pawn`. Always write results to `/workspace`.
 - **`--log-dir /workspace/logs`** — always pass this explicitly.
 - **`--local-checkpoints`** — use unless you have a specific HF repo.
-- **`--no-compile`** for trials under 20K steps. `torch.compile` overhead is 15-30 min.
+- **Always use `torch.compile`** (the default). Warmup is ~10-30 s on NVIDIA and ~1-2 min on AMD, then step time is steady. Even short exploration runs amortize the cost, and the compile speedup (1.5-2.2x) is too valuable to give up. Only pass `--no-compile` if compile is actively broken on the target hardware (e.g. has been an issue with adapters >20M params on MI300X in the past — verify with the benchmark step before assuming).
 - **`--num-workers`** — keep total across all processes under `nproc - 4`.
 - **AMP float16 can NaN** at high learning rates (>7e-4) after 25-40K steps. Use `--amp-dtype bfloat16` for long runs.
-- **SIGTERM for graceful shutdown** of training processes. They save a checkpoint before exiting.
+- **SIGTERM for graceful shutdown** of training processes. They save a final checkpoint at the current step (not the last 5K-interval) before exiting, so `lab_kill` + relaunch loses almost no work.
 - **HF backups**: Periodically `hf sync /workspace hf://buckets/<repo>` if a bucket is configured.
 
 ## Lab Notes
