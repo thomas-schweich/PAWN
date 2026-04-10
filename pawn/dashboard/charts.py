@@ -282,12 +282,15 @@ def bottleneck_up_chart(records: list[dict], x_key: str):
 
 
 def val_loss_chart(records: list[dict], x_key: str, run_type: str):
-    """For pawn runs this is now a standalone Perplexity chart (log-scaled)."""
-    if run_type == "pawn":
-        specs = [("val/perplexity", "Perplexity", COLORS["warning"])]
-        return make_chart(records, x_key, specs, title="Perplexity", y_title="perplexity", y_log=True)
+    """Validation loss (log-scaled). Adapter runs only — pawn uses ``perplexity_chart``."""
     specs = [("val_loss", "Val Loss", COLORS["accent"])]
     return make_chart(records, x_key, specs, title="Validation Loss", y_title="loss", y_log=True)
+
+
+def perplexity_chart(records: list[dict], x_key: str = "step"):
+    """Standalone log-scaled perplexity chart for pawn pretraining runs."""
+    specs = [("val/perplexity", "Perplexity", COLORS["warning"])]
+    return make_chart(records, x_key, specs, title="Perplexity", y_title="perplexity", y_log=True)
 
 
 def val_accuracy_chart(records: list[dict], x_key: str, run_type: str):

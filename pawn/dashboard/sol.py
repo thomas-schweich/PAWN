@@ -128,16 +128,16 @@ html, body,
   align-items: center;
   gap: 8px;
   padding: 6px 12px;
-  background: rgba(52,211,153,0.08);
-  border: 1px solid rgba(52,211,153,0.25);
+  background: color-mix(in srgb, var(--pawn-success) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--pawn-success) 25%, transparent);
   border-radius: 999px;
   font-size: 12px;
   color: var(--pawn-success);
   font-weight: 500;
 }}
 .pawn-pulse.idle {{
-  background: rgba(148,163,184,0.08);
-  border-color: rgba(148,163,184,0.22);
+  background: color-mix(in srgb, var(--pawn-text-muted) 8%, transparent);
+  border-color: color-mix(in srgb, var(--pawn-text-muted) 22%, transparent);
   color: var(--pawn-text-muted);
 }}
 .pawn-pulse .dot {{
@@ -150,9 +150,9 @@ html, body,
 }}
 .pawn-pulse.idle .dot {{ animation: none; opacity: 0.5; }}
 @keyframes pawn-pulse {{
-  0%   {{ box-shadow: 0 0 0 0 rgba(52,211,153,0.55); }}
-  70%  {{ box-shadow: 0 0 0 8px rgba(52,211,153,0); }}
-  100% {{ box-shadow: 0 0 0 0 rgba(52,211,153,0); }}
+  0%   {{ box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent); }}
+  70%  {{ box-shadow: 0 0 0 8px color-mix(in srgb, currentColor 0%, transparent); }}
+  100% {{ box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 0%, transparent); }}
 }}
 
 .pawn-card {{
@@ -443,7 +443,7 @@ def KpiRow(run_type: str, train: list[dict], val: list[dict]):
         val_acc = _last(val, "val/accuracy")
         best_acc = _best_max(val, "val/accuracy")
         completion = _last(val, "val/game_completion_rate")
-        avg_ply = _last(val, "val/avg_plies_to_forfeit")
+        avg_ply = _last(val, "val/avg_plies_completed")
         gpu = _last(train, "mem/gpu_peak_gb")
         step_time = _last(train, "step_time")
 
@@ -607,13 +607,21 @@ def RunSelector(auto_refresh: bool = False, on_auto_refresh=None,
 
 _CONFIG_SKIP = {"type", "timestamp", "compiled", "hostname", "slug", "git_hash", "git_tag"}
 _CONFIG_HIGHLIGHT_ORDER = (
-    "variant", "run_type", "d_model", "n_layers", "n_heads",
-    "max_seq_len", "batch_size", "lr", "weight_decay", "warmup_steps",
-    "total_steps", "patience", "eval_interval", "checkpoint_interval",
+    "variant", "run_type", "formulation",
+    "model.d_model", "model.n_layers", "model.n_heads", "model.max_seq_len",
+    "training.batch_size", "training.lr", "training.weight_decay",
+    "training.warmup_steps", "training.total_steps", "training.patience",
+    "training.eval_interval", "training.checkpoint_interval",
+    "param_count",
 )
 
 
 def _flatten_config(config: dict) -> dict[str, str]:
+    """Flatten a nested config dict to ``dot.separated`` keys.
+
+    Prefixing with the parent key prevents silent collisions when two nested
+    sections share a field name (e.g. ``model.dropout`` vs ``training.dropout``).
+    """
     flat: dict[str, str] = {}
     for k, v in config.items():
         if k in _CONFIG_SKIP:
@@ -622,20 +630,18 @@ def _flatten_config(config: dict) -> dict[str, str]:
             for k2, v2 in v.items():
                 if k2 in _CONFIG_SKIP:
                     continue
-                flat[k2] = str(v2)
+                flat[f"{k}.{k2}"] = str(v2)
         else:
             flat[k] = str(v)
     return flat
 
 
 @solara.component
-def ConfigSummary():
-    data = solara.use_memo(
-        lambda: load_metrics(log_dir.value, selected_run.value) if selected_run.value else {},
-        dependencies=[selected_run.value, metrics_tick.value],
-    )
+def ConfigSummary(data: dict | None = None):
     if not selected_run.value:
         return
+    if data is None:
+        data = {}
 
     configs = data.get("config", [])
     config = configs[-1] if configs else {}
@@ -744,13 +750,11 @@ def _row(items: list):
 
 
 @solara.component
-def MetricsCharts():
-    data = solara.use_memo(
-        lambda: load_metrics(log_dir.value, selected_run.value) if selected_run.value else {},
-        dependencies=[selected_run.value, metrics_tick.value],
-    )
+def MetricsCharts(data: dict | None = None):
     if not selected_run.value:
         return
+    if data is None:
+        data = {}
 
     configs = data.get("config", [])
     config = configs[-1] if configs else {}
@@ -897,7 +901,7 @@ def MetricsCharts():
         Section("Validation")
         _row([
             card(
-                charts.val_loss_chart(val, x_key, run_type),
+                charts.perplexity_chart(val, x_key),
                 "Validation perplexity on held-out games (log scale).",
             ),
             card(charts.val_accuracy_chart(val, x_key, run_type), desc("val_accuracy")),
@@ -908,18 +912,19 @@ def MetricsCharts():
                 patience = int(patience)
             except ValueError:
                 patience = 10
-        Section("Game Integrity & Stopping")
-        error_desc = (
-            "Log-scale error rates — illegal (per-position), late illegal "
-            "(second half of games), and forfeit (per-game). Dashed = log-linear "
-            "fit on the last half; slope → half-life. Lower is better."
-        )
-        patience_desc = _DEFAULT_DESCRIPTIONS["patience"]
-        _row([
-            card(charts.error_rate_chart(val, x_key, fit=True), error_desc),
-            card(charts.patience_chart(val, x_key, patience_limit=patience), patience_desc)
-            if val else (lambda: None),
-        ])
+        if val:
+            Section("Game Integrity & Stopping")
+            error_desc = (
+                "Log-scale error rates — illegal (per-position), late illegal "
+                "(per-position, plies ≥ context/2), and forfeit (per-game, any illegal). "
+                "Dashed = log-linear fit on the last half of the series; slope → "
+                "half-life. Lower is better."
+            )
+            patience_desc = _DEFAULT_DESCRIPTIONS["patience"]
+            _row([
+                card(charts.error_rate_chart(val, x_key, fit=True), error_desc),
+                card(charts.patience_chart(val, x_key, patience_limit=patience), patience_desc),
+            ])
         Section("Optimizer")
         _row([
             card(charts.lr_chart(train, batch, x_key), desc("lr")),
@@ -995,8 +1000,8 @@ def Dashboard(log_dir_override: Path | None = None):
     )
     if train or val:
         KpiRow(run_type, train, val)
-    ConfigSummary()
-    MetricsCharts()
+    ConfigSummary(data=data)
+    MetricsCharts(data=data)
 
 
 # ---------------------------------------------------------------------------
