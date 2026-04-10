@@ -10,6 +10,17 @@ Feel free to use PAWN in your own experiments. Note that PAWN was developed as a
 
 **PAWN is under active development and is not yet stable. All results are preliminary.**
 
+
+> [!important]
+> I am actively in process of re-training the model with:
+>
+> - A new vocabulary borrowed from Google DeepMind's [searchless chess project (Amortized Planning with Large-Scale Transformers: A Case Study on Chess)](https://github.com/google-deepmind/searchless_chess) project, which doesn't include impossible moves.
+> - A wider 512-token context window.
+>
+> The information below applies to the existing models. The last commit from prior to these changes is tagged [pre-vocab-transition](https://github.com/thomas-schweich/PAWN/tree/pre-vocab-transition). View the repository at that commit to see the implementation of the previous architechture.
+
+
+
 ## Model Variants
 
 Three sizes, trained for 100K steps on random games (~25.6M games each):
@@ -197,6 +208,7 @@ PAWN builds on ideas and tools from the following projects and publications:
 | Linear probes | [Alain & Bengio, "Understanding Intermediate Layers Using Linear Classifier Probes", ICLR Workshop 2017](https://arxiv.org/abs/1610.01644) |
 | MAIA | [McIlroy-Young et al., "Aligning Superhuman AI with Human Behavior: Chess as a Model System", KDD 2020](https://arxiv.org/abs/2006.01855) |
 | AlphaZero | [Silver et al., "A General Reinforcement Learning Algorithm that Masters Chess, Shogi, and Go through Self-Play", Science 2018](https://arxiv.org/abs/1712.01815) |
+| Searchless Chess | [Ruoss et al., Amortized Planning with Large-Scale Transformers: A Case Study on Chess](https://arxiv.org/abs/2402.04494) |
 | Leela Chess Zero | [github.com/LeelaChessZero/lc0](https://github.com/LeelaChessZero/lc0) |
 | shakmaty | [github.com/niklasf/shakmaty](https://github.com/niklasf/shakmaty) |
 | PyO3 | [github.com/PyO3/pyo3](https://github.com/PyO3/pyo3) |
