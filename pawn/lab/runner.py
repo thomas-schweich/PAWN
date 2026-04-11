@@ -17,7 +17,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pawn.lab.monitor import check_health, is_alive, read_metrics
+from pawn.lab.monitor import (
+    check_health,
+    is_alive,
+    read_metrics,
+    read_pretrain_val_summary,
+)
 from pawn.lab.state import Trial, _format_duration, _now_iso
 
 log = logging.getLogger("pawn.lab")
@@ -521,7 +526,7 @@ class TrialRunner:
         for t in self.trials.values():
             if t.status == "running":
                 cfg = t.config or t.params
-                running.append({
+                row: dict[str, Any] = {
                     "trial": t.trial_id, "strategy": t.strategy,
                     "step": t.current_step, "total": t.total_steps,
                     "sps": round(t.steps_per_sec, 2),
@@ -532,7 +537,14 @@ class TrialRunner:
                     "key_hp": {k: v for k, v in cfg.items()
                                if k in ("lr", "lora_rank", "bottleneck_dim",
                                         "density", "d_model", "n_layers", "batch_size")},
-                })
+                }
+                # For pretraining runs, surface game-completion metrics and
+                # the log-linear forfeit-rate fit (matches the dashboard chart).
+                if cfg.get("run_type") == "pretrain":
+                    pretrain = read_pretrain_val_summary(t)
+                    if pretrain:
+                        row["pretrain"] = pretrain
+                running.append(row)
         elapsed = time.time() - self.start_time
         cost = (self.cost_per_hour * elapsed / 3600) if self.cost_per_hour else None
         return {
