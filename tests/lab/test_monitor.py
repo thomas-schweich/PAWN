@@ -9,7 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from pawn.lab.monitor import check_health, is_alive, read_metrics
+from pawn.lab.monitor import (
+    check_health,
+    is_alive,
+    read_metrics,
+    read_pretrain_val_summary,
+)
 from pawn.lab.state import Trial
 
 
@@ -318,3 +323,176 @@ class TestCheckHealth:
         assert issue is not None
         assert isinstance(issue, str) and len(issue) > 0
         assert "NaN" in issue or "Inf" in issue
+
+
+# =====================================================================
+# read_pretrain_val_summary
+# =====================================================================
+
+
+def _val_record(step: int, gc: float, **kwargs) -> dict:
+    """Build a minimal val record with game_completion_rate."""
+    rec = {
+        "type": "val",
+        "step": step,
+        "val/loss": 3.0,
+        "val/game_completion_rate": gc,
+        "val/avg_plies_completed": 300.0,
+        "val/min_forfeit_ply": 10.0,
+        "val/max_forfeit_ply": 400.0,
+        "val/median_forfeit_ply": 100.0,
+        "val/legal_move_rate": 0.997,
+        "val/late_legal_move_rate": 0.993,
+    }
+    rec.update(kwargs)
+    return rec
+
+
+class TestReadPretrainValSummary:
+    def test_no_run_dir_returns_none(self):
+        trial = _make_trial()
+        assert read_pretrain_val_summary(trial) is None
+
+    def test_missing_metrics_file_returns_none(self, tmp_path):
+        trial = _make_trial()
+        trial.run_dir = str(tmp_path / "does_not_exist")
+        assert read_pretrain_val_summary(trial) is None
+
+    def test_no_val_records_returns_none(self, tmp_path):
+        run_dir = tmp_path / "run_x"
+        _write_metrics_file(run_dir / "metrics.jsonl", [
+            {"type": "train", "step": 10, "train/loss": 2.0},
+        ])
+        trial = _make_trial()
+        trial.run_dir = str(run_dir)
+        assert read_pretrain_val_summary(trial) is None
+
+    def test_val_records_without_game_completion_return_none(self, tmp_path):
+        """Adapter runs log val records but no game_completion_rate."""
+        run_dir = tmp_path / "run_x"
+        _write_metrics_file(run_dir / "metrics.jsonl", [
+            {"type": "val", "step": 100, "val/loss": 2.0, "val/accuracy": 0.5},
+            {"type": "val", "step": 200, "val/loss": 1.9, "val/accuracy": 0.55},
+        ])
+        trial = _make_trial()
+        trial.run_dir = str(run_dir)
+        assert read_pretrain_val_summary(trial) is None
+
+    def test_returns_latest_without_fit_when_too_few_records(self, tmp_path):
+        """Need n >= 4 val records to even attempt the fit."""
+        run_dir = tmp_path / "run_x"
+        _write_metrics_file(run_dir / "metrics.jsonl", [
+            _val_record(1000, 0.5),
+            _val_record(2000, 0.4),
+            _val_record(3000, 0.3),
+        ])
+        trial = _make_trial()
+        trial.run_dir = str(run_dir)
+        summary = read_pretrain_val_summary(trial)
+
+        assert summary is not None
+        assert "latest" in summary
+        assert summary["latest"]["step"] == 3000
+        assert summary["latest"]["game_completion_rate"] == pytest.approx(0.3)
+        assert "forfeit_fit" not in summary
+
+    def test_returns_fit_on_known_series(self, tmp_path):
+        """Construct a known exponential decay and verify OLS recovers it.
+
+        We pick forfeit_rate(step) = exp(-k * step + b) so log(forfeit) is
+        exactly linear in step with slope -k. The fit uses the second half
+        of the history.
+        """
+        run_dir = tmp_path / "run_x"
+        k = 1e-5  # half-life = ln(2)/k ~= 69314 steps
+        b = math.log(0.5)  # forfeit(0) = 0.5
+
+        records = []
+        n = 20
+        for i in range(n):
+            step = (i + 1) * 1000
+            forfeit = math.exp(-k * step + b)
+            gc = 1.0 - forfeit
+            records.append(_val_record(step, gc))
+
+        _write_metrics_file(run_dir / "metrics.jsonl", records)
+        trial = _make_trial()
+        trial.run_dir = str(run_dir)
+        summary = read_pretrain_val_summary(trial)
+
+        assert summary is not None
+        assert "forfeit_fit" in summary
+        fit = summary["forfeit_fit"]
+        assert fit["slope_per_step"] == pytest.approx(-k, rel=1e-6)
+        assert fit["half_life_steps"] == pytest.approx(math.log(2) / k, rel=1e-6)
+        # Second half of n=20 → 10 points
+        assert fit["n_points"] == 10
+        # current_forfeit is the last overall series value, not the fit window's
+        expected_current = math.exp(-k * (n * 1000) + b)
+        assert fit["current_forfeit"] == pytest.approx(expected_current)
+
+    def test_all_zero_forfeit_omits_fit(self, tmp_path):
+        """If every forfeit rate is exactly 0 (perfect completion), the OLS
+        window has no positive points to fit and forfeit_fit is omitted."""
+        run_dir = tmp_path / "run_x"
+        _write_metrics_file(run_dir / "metrics.jsonl", [
+            _val_record(1000, 1.0),
+            _val_record(2000, 1.0),
+            _val_record(3000, 1.0),
+            _val_record(4000, 1.0),
+            _val_record(5000, 1.0),
+        ])
+        trial = _make_trial()
+        trial.run_dir = str(run_dir)
+        summary = read_pretrain_val_summary(trial)
+
+        assert summary is not None
+        assert summary["latest"]["game_completion_rate"] == pytest.approx(1.0)
+        assert "forfeit_fit" not in summary
+
+    def test_latest_records_carries_all_fields(self, tmp_path):
+        """All documented latest fields are present when available."""
+        run_dir = tmp_path / "run_x"
+        _write_metrics_file(run_dir / "metrics.jsonl", [
+            _val_record(
+                5000, 0.9,
+                **{"val/avg_plies_completed": 321.5,
+                   "val/min_forfeit_ply": 25.0,
+                   "val/max_forfeit_ply": 300.0,
+                   "val/median_forfeit_ply": 120.0,
+                   "val/loss": 2.9,
+                   "val/legal_move_rate": 0.996,
+                   "val/late_legal_move_rate": 0.992}),
+        ])
+        trial = _make_trial()
+        trial.run_dir = str(run_dir)
+        summary = read_pretrain_val_summary(trial)
+
+        assert summary is not None
+        latest = summary["latest"]
+        assert latest["step"] == 5000
+        assert latest["val_loss"] == pytest.approx(2.9)
+        assert latest["game_completion_rate"] == pytest.approx(0.9)
+        assert latest["avg_plies_completed"] == pytest.approx(321.5)
+        assert latest["forfeit_ply_min"] == pytest.approx(25.0)
+        assert latest["forfeit_ply_max"] == pytest.approx(300.0)
+        assert latest["forfeit_ply_median"] == pytest.approx(120.0)
+        assert latest["legal_move_rate"] == pytest.approx(0.996)
+        assert latest["late_legal_move_rate"] == pytest.approx(0.992)
+
+    def test_current_forfeit_is_last_of_full_series(self, tmp_path):
+        """`current_forfeit` tracks the unfiltered last value, even when it's
+        zero and got dropped from the OLS window."""
+        run_dir = tmp_path / "run_x"
+        # 10 decaying records, then a final record at 100% completion (forfeit=0)
+        records = [_val_record(i * 1000, 1.0 - math.exp(-i * 0.2)) for i in range(1, 11)]
+        records.append(_val_record(11_000, 1.0))  # forfeit = 0.0
+        _write_metrics_file(run_dir / "metrics.jsonl", records)
+        trial = _make_trial()
+        trial.run_dir = str(run_dir)
+        summary = read_pretrain_val_summary(trial)
+
+        assert summary is not None
+        # If forfeit_fit was computed, current_forfeit should be the unfiltered last value
+        if "forfeit_fit" in summary:
+            assert summary["forfeit_fit"]["current_forfeit"] == pytest.approx(0.0)

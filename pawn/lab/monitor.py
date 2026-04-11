@@ -125,11 +125,17 @@ def read_pretrain_val_summary(trial: Trial) -> dict[str, Any] | None:
         latest: the latest val record's key fields (game_completion_rate,
             avg_plies_completed, forfeit min/max/median, legal, late_legal,
             val_loss, step)
-        forfeit_fit: {slope, half_life_steps, n_points} computed from the
-            most recent half of the (step, forfeit_rate) series — matches
-            the dashboard's log-linear fit. Omitted if fewer than 4 val
-            records have game_completion_rate (not a pretraining run or
-            too early).
+        forfeit_fit: {slope_per_step, half_life_steps, n_points,
+            current_forfeit} computed from the most recent half of the
+            (step, forfeit_rate) series — matches the dashboard's
+            log-linear fit. The OLS itself is restricted to strictly
+            positive forfeit rates (log(0) would blow up), but
+            `current_forfeit` is always the last observed forfeit rate
+            from the full series — including 0.0 if the most recent eval
+            had no forfeits. Omitted if fewer than 4 val records have
+            game_completion_rate (not a pretraining run or too early),
+            or if fewer than 3 positive-forfeit points land in the
+            half-window.
 
     Returns None if no val records are available.
     """
@@ -189,9 +195,8 @@ def read_pretrain_val_summary(trial: Trial) -> dict[str, Any] | None:
         # Only fit on strictly positive forfeit rates
         pos = [(x, y) for x, y in zip(xs, ys) if y > 0]
         if len(pos) >= 3:
-            import math as _math
             xs_f = [float(x) for x, _ in pos]
-            ys_log = [_math.log(y) for _, y in pos]
+            ys_log = [math.log(y) for _, y in pos]
             n_pts = len(xs_f)
             mean_x = sum(xs_f) / n_pts
             mean_y = sum(ys_log) / n_pts
@@ -199,7 +204,7 @@ def read_pretrain_val_summary(trial: Trial) -> dict[str, Any] | None:
             den = sum((x - mean_x) ** 2 for x in xs_f)
             if den > 0:
                 slope = num / den
-                half_life = _math.log(2) / abs(slope) if slope != 0 else None
+                half_life = math.log(2) / abs(slope) if slope != 0 else None
                 summary["forfeit_fit"] = {
                     "slope_per_step": slope,
                     "half_life_steps": half_life,

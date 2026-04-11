@@ -335,6 +335,64 @@ class TestStatus:
         assert s["estimated_cost"] is not None
         assert s["estimated_cost"] == pytest.approx(3.0, abs=0.1)
 
+    def test_status_attaches_pretrain_block_for_pretrain_runs(self, tmp_path):
+        """Running pretrain trials get a `pretrain` block with latest val
+        metrics and the log-linear forfeit fit."""
+        import json
+        import math
+        runner = TrialRunner(workspace=str(tmp_path))
+        run_dir = tmp_path / "run_x"
+        run_dir.mkdir()
+        # Enough val records with known exponential forfeit decay for a fit.
+        k = 1e-5
+        records = []
+        for i in range(1, 13):
+            step = i * 1000
+            forfeit = math.exp(-k * step + math.log(0.5))
+            records.append({
+                "type": "val", "step": step, "val/loss": 3.0,
+                "val/game_completion_rate": 1.0 - forfeit,
+                "val/avg_plies_completed": 300.0,
+                "val/min_forfeit_ply": 20.0, "val/max_forfeit_ply": 400.0,
+                "val/median_forfeit_ply": 100.0,
+                "val/legal_move_rate": 0.997,
+                "val/late_legal_move_rate": 0.993,
+            })
+        with open(run_dir / "metrics.jsonl", "w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+        runner.trials[0] = Trial(
+            trial_id=0, strategy="base", params={"run_type": "pretrain"},
+            cli_command=[], status="running", current_step=12_000,
+            total_steps=100_000, pid=1, gpu_id=0,
+            config={"run_type": "pretrain", "variant": "base"},
+            run_dir=str(run_dir),
+        )
+
+        s = runner.status()
+        assert len(s["running"]) == 1
+        row = s["running"][0]
+        assert "pretrain" in row
+        pretrain = row["pretrain"]
+        assert "latest" in pretrain
+        assert pretrain["latest"]["step"] == 12_000
+        assert "forfeit_fit" in pretrain
+        assert pretrain["forfeit_fit"]["slope_per_step"] == pytest.approx(-k, rel=1e-6)
+
+    def test_status_omits_pretrain_block_for_adapter_runs(self, tmp_path):
+        """Adapter runs don't get a pretrain block even if they log val records."""
+        runner = TrialRunner(workspace=str(tmp_path))
+        runner.trials[0] = Trial(
+            trial_id=0, strategy="lora", params={"run_type": "adapter"},
+            cli_command=[], status="running",
+            config={"run_type": "adapter", "strategy": "lora"},
+            pid=1, gpu_id=0,
+        )
+        s = runner.status()
+        assert len(s["running"]) == 1
+        assert "pretrain" not in s["running"][0]
+
 
 # =====================================================================
 # results()
