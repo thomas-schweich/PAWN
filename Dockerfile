@@ -185,8 +185,8 @@ WORKDIR /home/pawn
 RUN curl -fsSL https://claude.ai/install.sh | bash && \
     { test -x /home/pawn/.local/bin/claude \
       || test -x /home/pawn/.claude/local/claude \
-      || (echo "claude install failed — binary not found" >&2; \
-          find /home/pawn -name claude 2>/dev/null >&2; exit 1); }
+      || { echo "claude install failed — binary not found" >&2; \
+           find /home/pawn -name claude 2>/dev/null; exit 1; }; }
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 # Expose claude system-wide so both root and pawn find it on PATH without

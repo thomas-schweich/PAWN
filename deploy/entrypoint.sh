@@ -14,7 +14,7 @@ fi
 # ── HF token persistence ─────────────────────────────────────────────
 if [ -n "${HF_TOKEN:-}" ]; then
     mkdir -p ~/.cache/huggingface
-    echo -n "$HF_TOKEN" > ~/.cache/huggingface/token
+    printf '%s' "$HF_TOKEN" > ~/.cache/huggingface/token
 fi
 
 # ── SSH key injection (RunPod sets PUBLIC_KEY env var) ────────────────
