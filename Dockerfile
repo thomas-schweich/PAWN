@@ -175,13 +175,31 @@ TMUX
 RUN useradd -m -s /bin/bash pawn && \
     mkdir -p /opt/pawn && chown pawn:pawn /opt/pawn
 
-# Install Claude Code and Rust toolchain (for building the chess engine)
+# Install Claude Code and Rust toolchain (for building the chess engine).
+# Docker's USER instruction does NOT reset $HOME — without an explicit
+# ENV HOME=/home/pawn the claude installer (which writes to $HOME/.claude)
+# would land its downloads under /root where pawn can't touch them.
 USER pawn
-RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV HOME=/home/pawn
+WORKDIR /home/pawn
+RUN curl -fsSL https://claude.ai/install.sh | bash && \
+    { test -x /home/pawn/.local/bin/claude \
+      || test -x /home/pawn/.claude/local/claude \
+      || { echo "claude install failed — binary not found" >&2; \
+           find /home/pawn -name claude 2>/dev/null; exit 1; }; }
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
-# Convenience script: drop into pawn user with claude in a tmux session
+# Expose claude system-wide so both root and pawn find it on PATH without
+# relying on .bashrc aliases (which don't fire in non-interactive shells).
 USER root
+ENV HOME=/root
+RUN set -e; \
+    for p in /home/pawn/.local/bin/claude /home/pawn/.claude/local/claude; do \
+        if [ -x "$p" ]; then ln -sf "$p" /usr/local/bin/claude; break; fi; \
+    done; \
+    test -x /usr/local/bin/claude
+
+# Convenience script: drop into pawn user with claude in a tmux session
 COPY --chmod=755 <<'CLAUDE_DEV' /usr/local/bin/claude-dev
 #!/usr/bin/env bash
 set -euo pipefail
