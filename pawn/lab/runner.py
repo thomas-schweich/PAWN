@@ -35,14 +35,19 @@ def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
     """
     from pydantic import TypeAdapter
 
-    from pawn.run_config import AdapterConfig, PretrainConfig
+    from pawn.run_config import AdapterConfig, CotrainConfig, PretrainConfig
 
     run_type = config.get("run_type")
-    if run_type not in ("pretrain", "adapter"):
-        raise ValueError(f"run_type must be 'pretrain' or 'adapter', got {run_type!r}")
-    ta = TypeAdapter(
-        PretrainConfig if run_type == "pretrain" else AdapterConfig
-    )
+    config_cls = {
+        "pretrain": PretrainConfig,
+        "adapter": AdapterConfig,
+        "cotrain": CotrainConfig,
+    }.get(run_type)  # type: ignore[arg-type]
+    if config_cls is None:
+        raise ValueError(
+            f"run_type must be 'pretrain', 'adapter', or 'cotrain', got {run_type!r}"
+        )
+    ta = TypeAdapter(config_cls)
     return ta.validate_python(config).model_dump()
 
 
@@ -266,7 +271,11 @@ class TrialRunner:
         validated = _validate_config(config)
         cmd = self._build_command(validated, trial_id)
 
-        strategy_display = validated.get("strategy") or validated.get("variant", "pretrain")
+        if validated.get("run_type") == "cotrain":
+            variant_names = [v["name"] for v in validated.get("variants", [])]
+            strategy_display = "cotrain:" + "+".join(variant_names)
+        else:
+            strategy_display = validated.get("strategy") or validated.get("variant", "pretrain")
         trial = Trial(
             trial_id=trial_id,
             strategy=strategy_display,
@@ -296,34 +305,83 @@ class TrialRunner:
         total_steps: int | None = None,
         pause_after_steps: int | None = None,
     ) -> int:
-        """Resume a completed/failed trial from its best checkpoint."""
+        """Resume a completed/failed trial from its best checkpoint.
+
+        For cotrain trials, discovers per-variant checkpoints and sets
+        the resume path on each variant in the new config.
+        """
         old = self.trials.get(trial_id)
         if not old:
             raise RuntimeError(f"Trial {trial_id} not found")
         if not old.run_dir:
             raise RuntimeError(f"Trial {trial_id} has no run directory")
 
-        ckpt_base = Path(old.run_dir) / "checkpoints"
-        ckpt_dir = ckpt_base / "best"
-        if not ckpt_dir.exists():
-            ckpt_dir = ckpt_base / "final"
-        if not ckpt_dir.exists():
-            # Pretraining uses step_XXXXXXXX naming — pick the highest step
-            step_dirs = sorted(ckpt_base.glob("step_*"))
-            if step_dirs:
-                ckpt_dir = step_dirs[-1]
-        if not ckpt_dir.exists():
-            raise RuntimeError(f"No checkpoint found for trial {trial_id}")
-
         new_config = dict(old.config)
         new_config.pop("pause_after_steps", None)
-        new_config["resume"] = str(ckpt_dir)
+
+        if (old.config or {}).get("run_type") == "cotrain":
+            self._resolve_cotrain_resume(old, new_config)
+        else:
+            ckpt_dir = self._find_latest_checkpoint(Path(old.run_dir))
+            new_config["resume"] = str(ckpt_dir)
+
         if total_steps is not None:
             new_config["total_steps"] = total_steps
         if pause_after_steps is not None:
             new_config["pause_after_steps"] = pause_after_steps
 
         return await self.launch(new_config, tags=old.tags)
+
+    @staticmethod
+    def _find_latest_checkpoint(run_dir: Path) -> Path:
+        """Find the latest checkpoint under a run directory.
+
+        Checks for ``best/`` and ``final/`` symlinks first (adapter runs),
+        then falls back to the highest-numbered ``step_*`` directory
+        (pretrain/cotrain runs, which don't create best/final symlinks).
+        """
+        ckpt_base = run_dir / "checkpoints"
+        ckpt_dir = ckpt_base / "best"
+        if not ckpt_dir.exists():
+            ckpt_dir = ckpt_base / "final"
+        if not ckpt_dir.exists():
+            step_dirs = sorted(ckpt_base.glob("step_*"))
+            if step_dirs:
+                ckpt_dir = step_dirs[-1]
+        if not ckpt_dir.exists():
+            raise RuntimeError(f"No checkpoint found under {run_dir}")
+        return ckpt_dir
+
+    def _resolve_cotrain_resume(
+        self, old: "Trial", new_config: dict[str, Any],
+    ) -> None:
+        """Set per-variant resume paths for a cotrain trial."""
+        if not old.variants:
+            raise RuntimeError(
+                f"Trial {old.trial_id} is cotrain but has no variant state. "
+                "Cannot determine per-variant checkpoints."
+            )
+
+        # Deep-copy variants list so we can mutate
+        import copy
+        variants = copy.deepcopy(new_config.get("variants", []))
+
+        for v_cfg in variants:
+            name = v_cfg.get("name")
+            if name not in old.variants:
+                raise RuntimeError(
+                    f"Variant '{name}' not found in trial {old.trial_id} state"
+                )
+            vs = old.variants[name]
+            v_run_dir = vs.get("run_dir")
+            if not v_run_dir:
+                raise RuntimeError(
+                    f"Variant '{name}' in trial {old.trial_id} has no run directory"
+                )
+            ckpt_dir = self._find_latest_checkpoint(Path(v_run_dir))
+            v_cfg["resume"] = str(ckpt_dir)
+
+        new_config["variants"] = variants
 
     def _build_command(
         self, config: dict[str, Any], trial_id: int,

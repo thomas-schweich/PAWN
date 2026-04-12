@@ -142,7 +142,55 @@ class AdapterConfig(BaseRunConfig):
     val_every: int = 1
 
 
+class CotrainVariant(BaseModel):
+    """Per-variant spec within a co-training run.
+
+    Architecture fields override the preset selected by ``variant``.
+    ``resume`` is set automatically by ``lab_resume`` — not user-facing.
+    """
+
+    name: str
+    variant: Literal["toy", "small", "base", "large"] = "base"
+    d_model: int | None = None
+    n_layers: int | None = None
+    n_heads: int | None = None
+    d_ff: int | None = None
+    max_seq_len: int = 512
+    legacy_vocab: bool = False
+    resume: str | None = None
+
+
+class CotrainConfig(BaseRunConfig):
+    """Co-training multiple model variants on shared data batches."""
+
+    run_type: Literal["cotrain"] = "cotrain"
+    variants: list[CotrainVariant]
+    checkpoint_interval: int = 5000
+    shm_checkpoints: bool = False
+    val_games: int = 512  # override BaseRunConfig's 50K — pretrain uses on-the-fly data
+
+    @model_validator(mode="after")
+    def _check_cotrain(self) -> "CotrainConfig":
+        if not self.variants:
+            raise ValueError("variants must contain at least one entry")
+        names = [v.name for v in self.variants]
+        if len(names) != len(set(names)):
+            raise ValueError(f"variant names must be unique, got {names}")
+        if self.shm_checkpoints and not self.hf_repo:
+            raise ValueError(
+                "--shm-checkpoints requires --hf-repo "
+                "(HF is the only durable store)"
+            )
+        if self.resume is not None:
+            raise ValueError(
+                "CotrainConfig does not use the top-level 'resume' field. "
+                "Set 'resume' on each variant in the 'variants' list instead."
+            )
+        return self
+
+
 RunConfig = Annotated[
-    Union[PretrainConfig, AdapterConfig], Field(discriminator="run_type")
+    Union[PretrainConfig, AdapterConfig, CotrainConfig],
+    Field(discriminator="run_type"),
 ]
 """Discriminated union of all run config types."""

@@ -215,23 +215,18 @@ class MetricsLogger:
     def log_train(
         self,
         step: int,
-        epoch: int | None = None,
         **metrics: object,
     ) -> None:
         """Log a training metrics record.
 
         Standard fields (pass as kwargs):
-            lr, grad_norm, loss, accuracy, step_time, games_per_sec,
+            epoch, lr, grad_norm, loss, accuracy, step_time, games_per_sec,
             train_loss, train_top1, etc.
 
         Adapter-specific fields are passed through as-is:
             film/gamma_norm_L0, lora/B_norm_q, adapter/up_norm, etc.
         """
         record: dict[str, object] = {"type": "train", "step": step}
-        if epoch is not None:
-            record["epoch"] = epoch
-
-        # Normalize common field names: accept both flat and prefixed
         for k, v in metrics.items():
             record[k] = v
 
@@ -245,19 +240,15 @@ class MetricsLogger:
     def log_val(
         self,
         step: int,
-        epoch: int | None = None,
         **metrics: object,
     ) -> None:
         """Log a validation metrics record.
 
         Standard fields (pass as kwargs):
-            loss (or val/loss), accuracy, top5_accuracy,
+            epoch, loss (or val/loss), accuracy, top5_accuracy,
             patience, best_val_loss, best_val_step, etc.
         """
         record: dict[str, object] = {"type": "val", "step": step}
-        if epoch is not None:
-            record["epoch"] = epoch
-
         for k, v in metrics.items():
             record[k] = v
 

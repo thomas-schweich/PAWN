@@ -41,9 +41,31 @@ def is_alive(pid: int) -> tuple[bool, int | None]:
 def read_metrics(
     trial: Trial,
     log_dir: Path,
-    offsets: dict[int, int],
+    offsets: dict,
 ) -> None:
-    """Read new lines from the trial's metrics.jsonl, updating trial in-place."""
+    """Read new lines from the trial's metrics.jsonl, updating trial in-place.
+
+    For cotrain trials, discovers multiple per-variant metrics files and
+    aggregates them to the trial level while tracking per-variant state in
+    ``trial.variants``.
+
+    ``offsets`` keys are ``int`` (trial_id) for single-variant trials, or
+    ``(trial_id, variant_name)`` for cotrain per-variant files.
+    """
+    is_cotrain = (trial.config or {}).get("run_type") == "cotrain"
+
+    if is_cotrain:
+        _read_cotrain_metrics(trial, log_dir, offsets)
+    else:
+        _read_single_metrics(trial, log_dir, offsets)
+
+
+def _read_single_metrics(
+    trial: Trial,
+    log_dir: Path,
+    offsets: dict,
+) -> None:
+    """Read metrics for a single-variant (pretrain/adapter) trial."""
     # Find run dir if not yet discovered — pick the most recent
     if trial.run_dir is None:
         trial_log_dir = log_dir / f"trial_{trial.trial_id:04d}"
@@ -114,6 +136,166 @@ def read_metrics(
                    or rec.get("accuracy"))
             if acc is not None:
                 trial.best_accuracy = acc
+
+
+def _read_cotrain_metrics(
+    trial: Trial,
+    log_dir: Path,
+    offsets: dict,
+) -> None:
+    """Read metrics for a cotrain trial (multiple per-variant JSONL files)."""
+    trial_log_dir = log_dir / f"trial_{trial.trial_id:04d}"
+
+    # Discover all per-variant metrics files under the trial dir.
+    # Each variant's MetricsLogger creates a run dir with suffix=variant_name,
+    # e.g. run_20260410_151230_zesty-osprey_small/metrics.jsonl
+    metrics_files = list(trial_log_dir.glob("*/metrics.jsonl"))
+    if not metrics_files:
+        return
+
+    # Set trial.run_dir to the parent trial dir (not a specific variant)
+    if trial.run_dir is None:
+        trial.run_dir = str(trial_log_dir)
+
+    # Initialize variants dict if needed
+    if trial.variants is None:
+        trial.variants = {}
+
+    # Extract variant name from the run dir suffix: run_..._<name>/metrics.jsonl
+    # The MetricsLogger uses suffix=name, producing dirs like
+    # run_YYYYMMDD_HHMMSS_slug_variantname/
+    for mf in metrics_files:
+        variant_name = _extract_variant_name(mf.parent.name)
+        if variant_name is None:
+            continue
+
+        # Initialize this variant's state dict
+        if variant_name not in trial.variants:
+            trial.variants[variant_name] = {
+                "name": variant_name,
+                "run_dir": str(mf.parent),
+                "current_step": 0,
+                "last_train_loss": None,
+                "last_train_acc": None,
+                "best_val_loss": None,
+                "best_val_step": 0,
+                "best_accuracy": None,
+                "actual_param_count": None,
+                "stopped": False,
+                "steps_per_sec": 0.0,
+            }
+
+        vs = trial.variants[variant_name]
+        offset_key = (trial.trial_id, variant_name)
+        offset = offsets.get(offset_key, 0)
+
+        try:
+            with open(mf) as f:
+                f.seek(offset)
+                new_lines = f.readlines()
+                offsets[offset_key] = f.tell()
+        except OSError:
+            continue
+
+        for line in new_lines:
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            rtype = rec.get("type")
+            if rtype == "config":
+                ts = rec.get("total_steps") or (rec.get("training") or {}).get("total_steps")
+                if ts:
+                    trial.total_steps = ts
+                pc = rec.get("param_count")
+                if pc is not None:
+                    vs["actual_param_count"] = pc
+
+            elif rtype == "train":
+                vs["current_step"] = rec.get("step", vs["current_step"])
+                loss = rec.get("train/loss") or rec.get("train_loss")
+                if loss is not None:
+                    vs["last_train_loss"] = loss
+                train_acc = rec.get("train/accuracy") or rec.get("train_top1")
+                if train_acc is not None:
+                    vs["last_train_acc"] = train_acc
+                st = rec.get("step_time")
+                if st and st > 0:
+                    vs["steps_per_sec"] = 1.0 / st
+                elif rec.get("elapsed") and vs["current_step"] > 0:
+                    vs["steps_per_sec"] = vs["current_step"] / rec["elapsed"]
+
+            elif rtype == "val":
+                vl = rec.get("val/loss") or rec.get("val_loss") or rec.get("loss")
+                if vl is not None and (vs["best_val_loss"] is None or vl < vs["best_val_loss"]):
+                    vs["best_val_loss"] = vl
+                    vs["best_val_step"] = rec.get("step", vs.get("best_val_step", 0))
+                acc = (rec.get("val/accuracy") or rec.get("val_top1")
+                       or rec.get("accuracy"))
+                if acc is not None:
+                    vs["best_accuracy"] = acc
+
+    # Aggregate to trial level
+    _aggregate_cotrain_metrics(trial)
+
+
+def _extract_variant_name(run_dir_name: str) -> str | None:
+    """Extract variant name from a run directory name.
+
+    The MetricsLogger creates dirs like ``run_YYYYMMDD_HHMMSS_variantname_slug``.
+    The layout is: ``run`` _ ``date`` _ ``time`` _ ``variant`` _ ``slug``.
+    The variant name may itself contain underscores, but the slug (final segment)
+    never does (it's two hyphenated words like ``calm-crane``).  So we rejoin
+    everything between parts[3] and parts[-1].
+    """
+    # Expected: run_YYYYMMDD_HHMMSS_variant_slug (at least 5 parts)
+    parts = run_dir_name.split("_")
+    if len(parts) < 5 or parts[0] != "run":
+        return None
+    # parts[1]=date, parts[2]=time, parts[-1]=slug, parts[3:-1]=variant
+    return "_".join(parts[3:-1])
+
+
+def _aggregate_cotrain_metrics(trial: Trial) -> None:
+    """Aggregate per-variant metrics to the trial level."""
+    if not trial.variants:
+        return
+
+    variants = list(trial.variants.values())
+
+    # current_step = min across variants (honest ETA — slowest determines progress)
+    steps = [v["current_step"] for v in variants if v["current_step"] > 0]
+    if steps:
+        trial.current_step = min(steps)
+
+    # best_val_loss = min across variants
+    val_losses = [v["best_val_loss"] for v in variants if v["best_val_loss"] is not None]
+    if val_losses:
+        trial.best_val_loss = min(val_losses)
+
+    # best_accuracy = max across variants
+    accs = [v["best_accuracy"] for v in variants if v["best_accuracy"] is not None]
+    if accs:
+        trial.best_accuracy = max(accs)
+
+    # last_train_loss = mean across active variants
+    losses = [v["last_train_loss"] for v in variants
+              if v["last_train_loss"] is not None and not v.get("stopped")]
+    if losses:
+        trial.last_train_loss = sum(losses) / len(losses)
+
+    # last_train_acc = mean across active variants
+    accs_train = [v["last_train_acc"] for v in variants
+                  if v.get("last_train_acc") is not None and not v.get("stopped")]
+    if accs_train:
+        trial.last_train_acc = sum(accs_train) / len(accs_train)
+
+    # steps_per_sec from any variant (they share the same step timing)
+    for v in variants:
+        if v.get("steps_per_sec", 0) > 0:
+            trial.steps_per_sec = v["steps_per_sec"]
+            break
 
 
 def read_pretrain_val_summary(trial: Trial) -> dict[str, Any] | None:

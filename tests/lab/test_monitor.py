@@ -251,6 +251,156 @@ class TestReadMetrics:
 
 
 # =====================================================================
+# read_metrics — cotrain
+# =====================================================================
+
+
+class TestReadMetricsCotrain:
+    def _make_cotrain_trial(self, trial_id: int = 0) -> Trial:
+        return Trial(
+            trial_id=trial_id,
+            strategy="cotrain:small+base",
+            params={},
+            cli_command=[],
+            config={"run_type": "cotrain"},
+        )
+
+    def test_discovers_multiple_variant_dirs(self, tmp_path):
+        """Cotrain read_metrics discovers per-variant JSONL files."""
+        log_dir = tmp_path / "logs"
+        trial_dir = log_dir / "trial_0000"
+
+        # Create two variant run dirs with metrics
+        for name in ("small", "base"):
+            metrics_path = trial_dir / f"run_20260410_120000_{name}_calm-crane" / "metrics.jsonl"
+            _write_metrics_file(metrics_path, [
+                {"type": "config", "total_steps": 100, "param_count": 1000},
+                {"type": "train", "step": 10, "train/loss": 2.5, "step_time": 0.1},
+                {"type": "val", "step": 10, "val/loss": 2.0, "val/accuracy": 0.4},
+            ])
+
+        trial = self._make_cotrain_trial(0)
+        offsets: dict = {}
+        read_metrics(trial, log_dir, offsets)
+
+        assert trial.run_dir == str(trial_dir)
+        assert trial.variants is not None
+        assert "small" in trial.variants
+        assert "base" in trial.variants
+        assert trial.variants["small"]["current_step"] == 10
+        assert trial.variants["base"]["current_step"] == 10
+
+    def test_aggregates_current_step_as_min(self, tmp_path):
+        """Trial.current_step is min across variants."""
+        log_dir = tmp_path / "logs"
+        trial_dir = log_dir / "trial_0000"
+
+        small_path = trial_dir / "run_20260410_120000_small_calm-crane" / "metrics.jsonl"
+        _write_metrics_file(small_path, [
+            {"type": "train", "step": 50, "train/loss": 2.0, "step_time": 0.1},
+        ])
+        base_path = trial_dir / "run_20260410_120000_base_calm-crane" / "metrics.jsonl"
+        _write_metrics_file(base_path, [
+            {"type": "train", "step": 30, "train/loss": 2.5, "step_time": 0.1},
+        ])
+
+        trial = self._make_cotrain_trial(0)
+        offsets: dict = {}
+        read_metrics(trial, log_dir, offsets)
+
+        assert trial.current_step == 30  # min of 50, 30
+
+    def test_aggregates_best_val_loss_as_min(self, tmp_path):
+        """Trial.best_val_loss is min across variants."""
+        log_dir = tmp_path / "logs"
+        trial_dir = log_dir / "trial_0000"
+
+        small_path = trial_dir / "run_20260410_120000_small_calm-crane" / "metrics.jsonl"
+        _write_metrics_file(small_path, [
+            {"type": "val", "step": 10, "val/loss": 3.0},
+        ])
+        base_path = trial_dir / "run_20260410_120000_base_calm-crane" / "metrics.jsonl"
+        _write_metrics_file(base_path, [
+            {"type": "val", "step": 10, "val/loss": 2.0},
+        ])
+
+        trial = self._make_cotrain_trial(0)
+        offsets: dict = {}
+        read_metrics(trial, log_dir, offsets)
+
+        assert trial.best_val_loss == pytest.approx(2.0)
+
+    def test_per_variant_offsets_incremental(self, tmp_path):
+        """Cotrain uses (trial_id, variant_name) offset keys for incremental reads."""
+        log_dir = tmp_path / "logs"
+        trial_dir = log_dir / "trial_0000"
+
+        small_path = trial_dir / "run_20260410_120000_small_calm-crane" / "metrics.jsonl"
+        _write_metrics_file(small_path, [
+            {"type": "train", "step": 10, "train/loss": 2.5, "step_time": 0.1},
+        ])
+
+        trial = self._make_cotrain_trial(0)
+        offsets: dict = {}
+        read_metrics(trial, log_dir, offsets)
+
+        assert trial.variants["small"]["current_step"] == 10
+
+        # Append more data
+        with open(small_path, "a") as f:
+            f.write(json.dumps({"type": "train", "step": 20, "train/loss": 2.0, "step_time": 0.1}) + "\n")
+
+        read_metrics(trial, log_dir, offsets)
+        assert trial.variants["small"]["current_step"] == 20
+
+    def test_underscore_in_variant_name(self, tmp_path):
+        """Variant names containing underscores are parsed correctly."""
+        log_dir = tmp_path / "logs"
+        trial_dir = log_dir / "trial_0000"
+
+        metrics_path = trial_dir / "run_20260410_120000_my_model_calm-crane" / "metrics.jsonl"
+        _write_metrics_file(metrics_path, [
+            {"type": "train", "step": 5, "train/loss": 3.0, "step_time": 0.2},
+        ])
+
+        trial = self._make_cotrain_trial(0)
+        offsets: dict = {}
+        read_metrics(trial, log_dir, offsets)
+
+        assert trial.variants is not None
+        assert "my_model" in trial.variants
+        assert trial.variants["my_model"]["current_step"] == 5
+
+    def test_empty_trial_dir_noops(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        (log_dir / "trial_0000").mkdir(parents=True)
+
+        trial = self._make_cotrain_trial(0)
+        offsets: dict = {}
+        read_metrics(trial, log_dir, offsets)
+
+        assert trial.variants is None
+        assert trial.run_dir is None
+
+    def test_variant_run_dir_tracked(self, tmp_path):
+        """Each variant's run_dir is stored independently."""
+        log_dir = tmp_path / "logs"
+        trial_dir = log_dir / "trial_0000"
+
+        small_dir = trial_dir / "run_20260410_120000_small_calm-crane"
+        metrics_path = small_dir / "metrics.jsonl"
+        _write_metrics_file(metrics_path, [
+            {"type": "train", "step": 5, "train/loss": 3.0, "step_time": 0.2},
+        ])
+
+        trial = self._make_cotrain_trial(0)
+        offsets: dict = {}
+        read_metrics(trial, log_dir, offsets)
+
+        assert trial.variants["small"]["run_dir"] == str(small_dir)
+
+
+# =====================================================================
 # check_health
 # =====================================================================
 

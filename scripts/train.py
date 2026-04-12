@@ -30,7 +30,7 @@ from typing import Any
 import torch.multiprocessing as mp
 from pydantic import TypeAdapter
 
-from pawn.run_config import AdapterConfig, PretrainConfig
+from pawn.run_config import AdapterConfig, CotrainConfig, PretrainConfig
 
 
 # -----------------------------------------------------------------------
@@ -490,21 +490,27 @@ def main() -> None:
     raw = _parse_cli()
 
     run_type = raw.get("run_type")
-    if run_type not in ("pretrain", "adapter"):
+    if run_type not in ("pretrain", "adapter", "cotrain"):
         _die(
-            f"run_type must be 'pretrain' or 'adapter', got {run_type!r}. "
+            f"run_type must be 'pretrain', 'adapter', or 'cotrain', got {run_type!r}. "
             "Specify via --run-type or in the JSON config."
         )
 
-    ta = TypeAdapter(
-        PretrainConfig if run_type == "pretrain" else AdapterConfig
-    )
+    config_cls = {
+        "pretrain": PretrainConfig,
+        "adapter": AdapterConfig,
+        "cotrain": CotrainConfig,
+    }[run_type]  # type: ignore[index]  # narrowed by `not in` check above
+    ta = TypeAdapter(config_cls)
     config = ta.validate_python(raw)
 
     if isinstance(config, PretrainConfig):
         run_pretrain(config)
     elif isinstance(config, AdapterConfig):
         run_adapter(config)
+    elif isinstance(config, CotrainConfig):
+        from pawn.cotrain import run_cotrain
+        run_cotrain(config)
     else:
         _die(f"Unknown run_type: {run_type}")
 
