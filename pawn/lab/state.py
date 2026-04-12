@@ -52,6 +52,8 @@ class Trial:
     # Agent annotations
     notes: str = ""
     tags: list[str] = field(default_factory=list)
+    # Co-training: per-variant state (None for non-cotrain trials)
+    variants: dict[str, dict[str, Any]] | None = None
 
     def eta_seconds(self) -> float | None:
         if self.steps_per_sec > 0 and self.total_steps > self.current_step:

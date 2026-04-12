@@ -44,7 +44,7 @@ async def lab_status(ctx: Context) -> dict[str, Any]:
 
 @mcp.tool
 async def lab_launch(config: dict[str, Any], ctx: Context, tags: list[str] | None = None) -> dict[str, Any]:
-    """Launch a trial from a RunConfig dict. Use lab_schema to discover all fields. The config must include run_type ('pretrain' or 'adapter'). Optionally pass tags for grouping (e.g. ["phase1", "mate-boost"])."""
+    """Launch a trial from a RunConfig dict. Use lab_schema to discover all fields. The config must include run_type ('pretrain', 'adapter', or 'cotrain'). Optionally pass tags for grouping (e.g. ["phase1", "mate-boost"])."""
     try:
         tid = await _runner(ctx).launch(config, tags=tags)
         return _runner(ctx).trials[tid].to_dict()
@@ -105,10 +105,11 @@ async def lab_set_cost(cost_per_hour: float, ctx: Context) -> dict[str, Any]:
 
 @mcp.tool
 async def lab_schema(ctx: Context) -> dict[str, Any]:
-    """Return the JSON Schema for RunConfig (PretrainConfig and AdapterConfig). Use this to discover all available parameters before calling lab_launch."""
-    from pawn.run_config import AdapterConfig, PretrainConfig
+    """Return the JSON Schema for RunConfig (PretrainConfig, AdapterConfig, CotrainConfig). Use this to discover all available parameters before calling lab_launch."""
+    from pawn.run_config import AdapterConfig, CotrainConfig, PretrainConfig
 
     return {
         "pretrain": PretrainConfig.model_json_schema(),
         "adapter": AdapterConfig.model_json_schema(),
+        "cotrain": CotrainConfig.model_json_schema(),
     }

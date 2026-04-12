@@ -13,6 +13,8 @@ from pydantic import TypeAdapter, ValidationError
 from pawn.run_config import (
     AdapterConfig,
     BaseRunConfig,
+    CotrainConfig,
+    CotrainVariant,
     PretrainConfig,
     RunConfig,
 )
@@ -206,6 +208,146 @@ class TestAdapterConfig:
 
 
 # ---------------------------------------------------------------------------
+# CotrainConfig
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCotrainConfig:
+    def test_valid_three_variants(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            variants=[
+                CotrainVariant(name="small", variant="small"),
+                CotrainVariant(name="base", variant="base"),
+                CotrainVariant(name="large", variant="large"),
+            ],
+        )
+        assert cfg.run_type == "cotrain"
+        assert len(cfg.variants) == 3
+
+    def test_single_variant(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            variants=[CotrainVariant(name="only", variant="toy")],
+        )
+        assert len(cfg.variants) == 1
+
+    def test_custom_architecture_overrides(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            variants=[
+                CotrainVariant(
+                    name="custom", variant="base",
+                    d_model=384, n_layers=6, n_heads=6, d_ff=1536,
+                ),
+            ],
+        )
+        v = cfg.variants[0]
+        assert v.d_model == 384
+        assert v.n_layers == 6
+
+    def test_empty_variants_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            CotrainConfig(local_checkpoints=True, variants=[])
+        assert "at least one" in str(exc_info.value).lower()
+
+    def test_duplicate_names_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            CotrainConfig(
+                local_checkpoints=True,
+                variants=[
+                    CotrainVariant(name="dup", variant="small"),
+                    CotrainVariant(name="dup", variant="base"),
+                ],
+            )
+        assert "unique" in str(exc_info.value).lower()
+
+    def test_shm_without_hf_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            CotrainConfig(
+                local_checkpoints=True,
+                shm_checkpoints=True,
+                variants=[CotrainVariant(name="x", variant="toy")],
+            )
+        assert "hf-repo" in str(exc_info.value).lower() or "hf_repo" in str(exc_info.value).lower()
+
+    def test_shm_with_hf_accepted(self):
+        cfg = CotrainConfig(
+            hf_repo="user/repo",
+            shm_checkpoints=True,
+            variants=[CotrainVariant(name="x", variant="toy")],
+        )
+        assert cfg.shm_checkpoints is True
+
+    def test_default_val_games(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            variants=[CotrainVariant(name="x", variant="toy")],
+        )
+        assert cfg.val_games == 512
+
+    def test_default_checkpoint_interval(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            variants=[CotrainVariant(name="x", variant="toy")],
+        )
+        assert cfg.checkpoint_interval == 5000
+
+    def test_variant_resume_path(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            variants=[
+                CotrainVariant(name="a", variant="toy", resume="/tmp/ckpt_a"),
+                CotrainVariant(name="b", variant="toy", resume="/tmp/ckpt_b"),
+            ],
+        )
+        assert cfg.variants[0].resume == "/tmp/ckpt_a"
+        assert cfg.variants[1].resume == "/tmp/ckpt_b"
+
+    def test_serialization_roundtrip(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            total_steps=1000,
+            batch_size=64,
+            variants=[
+                CotrainVariant(name="small", variant="small"),
+                CotrainVariant(name="base", variant="base", d_model=384),
+            ],
+        )
+        data = cfg.model_dump()
+        cfg2 = CotrainConfig(**data)
+        assert cfg == cfg2
+
+    def test_json_schema_generates(self):
+        schema = CotrainConfig.model_json_schema()
+        assert isinstance(schema, dict)
+        assert "properties" in schema
+        assert "variants" in schema["properties"]
+        assert "run_type" in schema["properties"]
+
+
+@pytest.mark.unit
+class TestCotrainVariant:
+    def test_defaults(self):
+        v = CotrainVariant(name="test")
+        assert v.variant == "base"
+        assert v.d_model is None
+        assert v.max_seq_len == 512
+        assert v.legacy_vocab is False
+        assert v.resume is None
+
+    def test_all_variant_presets(self):
+        for preset in ["toy", "small", "base", "large"]:
+            v = CotrainVariant(name=preset, variant=preset)
+            assert v.variant == preset
+
+    def test_invalid_variant_rejected(self):
+        with pytest.raises(ValidationError):
+            CotrainVariant(name="x", variant="enormous")
+
+
+# ---------------------------------------------------------------------------
 # Base fields shared across configs
 # ---------------------------------------------------------------------------
 
@@ -282,6 +424,17 @@ class TestDiscriminatedUnion:
         assert cfg.run_type == "adapter"
         assert cfg.strategy == "lora"
 
+    def test_union_dispatches_cotrain(self):
+        adapter = TypeAdapter(RunConfig)
+        cfg = adapter.validate_python({
+            "run_type": "cotrain",
+            "local_checkpoints": True,
+            "variants": [{"name": "s", "variant": "small"}],
+        })
+        assert isinstance(cfg, CotrainConfig)
+        assert cfg.run_type == "cotrain"
+        assert len(cfg.variants) == 1
+
     def test_union_missing_run_type(self):
         adapter = TypeAdapter(RunConfig)
         with pytest.raises(ValidationError):
@@ -330,6 +483,29 @@ class TestSerialization:
         s = cfg.model_dump_json()
         d = json.loads(s)
         cfg2 = PretrainConfig(**d)
+        assert cfg == cfg2
+
+    def test_cotrain_json_roundtrip(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            total_steps=500,
+            variants=[
+                CotrainVariant(name="a", variant="toy"),
+                CotrainVariant(name="b", variant="small", d_model=128),
+            ],
+        )
+        data = cfg.model_dump()
+        cfg2 = CotrainConfig(**data)
+        assert cfg == cfg2
+
+    def test_cotrain_json_string_roundtrip(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            variants=[CotrainVariant(name="x", variant="toy")],
+        )
+        s = cfg.model_dump_json()
+        d = json.loads(s)
+        cfg2 = CotrainConfig(**d)
         assert cfg == cfg2
 
     def test_pretrain_json_schema_generates(self):
