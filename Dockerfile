@@ -176,11 +176,13 @@ RUN useradd -m -s /bin/bash pawn && \
     mkdir -p /opt/pawn && chown pawn:pawn /opt/pawn
 
 # Install Claude Code and Rust toolchain (for building the chess engine).
-# Docker's USER instruction does NOT reset $HOME — without an explicit
-# ENV HOME=/home/pawn the claude installer (which writes to $HOME/.claude)
-# would land its downloads under /root where pawn can't touch them.
+# BuildKit auto-updates $HOME based on the current USER's passwd entry at
+# each RUN, so USER pawn gives HOME=/home/pawn without an explicit ENV.
+# Do NOT set `ENV HOME=...` here: an explicit value becomes sticky and
+# would propagate into child stages (dev, dev-rocm), breaking their
+# USER pawn / uv sync step with "cannot create /root/.rustup: permission
+# denied".
 USER pawn
-ENV HOME=/home/pawn
 WORKDIR /home/pawn
 RUN curl -fsSL https://claude.ai/install.sh | bash && \
     { test -x /home/pawn/.local/bin/claude \
@@ -192,7 +194,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 # Expose claude system-wide so both root and pawn find it on PATH without
 # relying on .bashrc aliases (which don't fire in non-interactive shells).
 USER root
-ENV HOME=/root
 RUN set -e; \
     for p in /home/pawn/.local/bin/claude /home/pawn/.claude/local/claude; do \
         if [ -x "$p" ]; then ln -sf "$p" /usr/local/bin/claude; break; fi; \
