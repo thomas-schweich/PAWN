@@ -157,18 +157,18 @@ class ModelSlot:
         self.scheduler.step()
         return grad_norm
 
-    def _unwrapped_model(self):
+    def _unwrapped_model(self) -> PAWNCLM:
         """Return the unwrapped model (strips torch.compile wrapper)."""
-        m = self.model
+        m: Any = self.model
         while hasattr(m, '_orig_mod'):
             m = m._orig_mod
-        return m
+        return m  # type: ignore[return-value]
 
     def save_checkpoint(self):
         path = os.path.join(self.checkpoint_dir, f"step_{self.global_step:08d}")
         save_pretrain_checkpoint(
             path, self._unwrapped_model(), self.optimizer, self.scheduler, self.scaler,
-            self.global_step, self.model_cfg.__dict__, self.train_cfg.__dict__,
+            self.global_step, self.model_cfg.__dict__, self.train_cfg.__dict__,  # type: ignore[arg-type]
         )
         print(f"  [{self.name}] Checkpoint saved: {path}")
 
@@ -181,13 +181,16 @@ class ModelSlot:
         if self._hf_push_future is not None:
             self._hf_push_future.result()  # raises if previous push failed
 
+        assert self.hf_repo is not None and self.hf_branch is not None
+        hf_repo, hf_branch = self.hf_repo, self.hf_branch
+
         def _push():
             try:
                 push_checkpoint_to_hf(
-                    ckpt_path, self.hf_repo, self.hf_branch,
+                    ckpt_path, hf_repo, hf_branch,
                     metrics_path=self.jsonl_path, step=step,
                 )
-                print(f"  [{self.name}] Pushed to HF: {self.hf_repo}@{self.hf_branch}")
+                print(f"  [{self.name}] Pushed to HF: {hf_repo}@{hf_branch}")
 
                 # On /dev/shm, clean up old checkpoints after successful push.
                 # Keep the latest (just saved) and the best (for post-training evals).
@@ -206,18 +209,20 @@ class ModelSlot:
         if not self.hf_repo or not self.hf_branch:
             return
 
+        hf_repo, hf_branch = self.hf_repo, self.hf_branch
+
         def _push_metrics():
             try:
                 from huggingface_hub import HfApi
                 api = HfApi()
-                api.create_branch(self.hf_repo, repo_type="model",
-                                  branch=self.hf_branch, exist_ok=True)
+                api.create_branch(hf_repo, repo_type="model",
+                                  branch=hf_branch, exist_ok=True)
                 api.upload_file(
                     path_or_fileobj=self.jsonl_path,
                     path_in_repo="metrics.jsonl",
-                    repo_id=self.hf_repo,
+                    repo_id=hf_repo,
                     repo_type="model",
-                    revision=self.hf_branch,
+                    revision=hf_branch,
                     commit_message=f"Metrics through step {self.global_step}",
                 )
             except Exception as e:
@@ -445,7 +450,7 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     if device != "cpu" and not config.no_compile:
         for slot in slots:
             try:
-                slot.model = torch.compile(slot.model, mode="default")
+                slot.model = torch.compile(slot.model, mode="default")  # type: ignore[assignment]
                 print(f"  [{slot.name}] torch.compile enabled")
             except Exception:
                 print(f"  [{slot.name}] torch.compile not available")
