@@ -4,6 +4,7 @@ Includes the 5 original probes from grid-PAWN plus 5 new probes:
 material_count, legal_move_count, halfmove_clock, game_phase, is_square_attacked.
 """
 
+import contextlib
 import gc
 import math
 
@@ -89,29 +90,42 @@ def extract_probe_data(
     max_ply: int,
     seed: int,
     include_legal_counts: bool = True,
+    prepend_outcome: bool = False,
 ) -> dict:
     """Generate games and extract all probe data.
 
     Board states at ply t correspond to CLM position t+1.
 
+    Args:
+        max_ply: total CLM sequence length passed to ``generate_clm_batch``.
+            When ``prepend_outcome=True``, actual move plies in the returned
+            arrays are ``max_ply - 1`` (position 0 is the outcome token).
+        prepend_outcome: match the training-time outcome-prefix format. Set
+            this to ``True`` for checkpoints trained with
+            ``no_outcome_token=False``.
+
     Returns dict with all arrays needed for all probes.
     """
     input_ids, targets, loss_mask, move_ids_np, game_lengths_np, _tc = \
-        engine.generate_clm_batch(n_games, max_ply, seed)
+        engine.generate_clm_batch(
+            n_games, max_ply, seed, prepend_outcome=prepend_outcome,
+        )
 
     boards_np, side_np, castling_np, ep_np, check_np, halfmove_np = (
         engine.extract_board_states(move_ids_np, game_lengths_np)
     )
 
+    # Store probe-data arrays in compact dtypes and promote at use sites
+    # (see ``get_probe_targets``). This keeps the cached datasets small.
     result = {
         "input_ids": torch.from_numpy(input_ids).long(),
         "loss_mask": torch.from_numpy(loss_mask),
-        "boards": torch.from_numpy(boards_np.copy()).long(),
-        "side_to_move": torch.from_numpy(side_np.copy()).float(),
-        "castling_rights": torch.from_numpy(castling_np.copy()),
-        "ep_square": torch.from_numpy(ep_np.copy()).long(),
-        "is_check": torch.from_numpy(check_np.copy()).float(),
-        "halfmove_clock": torch.from_numpy(halfmove_np.copy()).float(),
+        "boards": torch.from_numpy(boards_np.copy()),          # int8  (engine dtype)
+        "side_to_move": torch.from_numpy(side_np.copy()),      # bool  (engine dtype)
+        "castling_rights": torch.from_numpy(castling_np.copy()),  # uint8
+        "ep_square": torch.from_numpy(ep_np.copy()),           # int8
+        "is_check": torch.from_numpy(check_np.copy()),         # bool
+        "halfmove_clock": torch.from_numpy(halfmove_np.copy()),  # uint8
         "game_lengths": game_lengths_np,
     }
     del boards_np, side_np, castling_np, ep_np, check_np, halfmove_np
@@ -126,7 +140,7 @@ def extract_probe_data(
             parts.append(_count_legal_moves(move_ids_np[s:e], game_lengths_np[s:e]))
         legal_counts = np.concatenate(parts, axis=0)
         del parts
-        result["legal_move_counts"] = torch.from_numpy(legal_counts).float()
+        result["legal_move_counts"] = torch.from_numpy(legal_counts)  # uint16
         del legal_counts
 
     return result
@@ -148,14 +162,15 @@ def get_probe_targets(
     B_idx = game_indices if game_indices is not None else torch.arange(len(ply_indices))
 
     if probe_name == "piece_type":
-        boards = data["boards"][B_idx, ply_indices]  # (N, 8, 8)
-        return boards.reshape(-1, 64)
+        boards = data["boards"][B_idx, ply_indices]  # (N, 8, 8), int8
+        # cross_entropy targets must be int64
+        return boards.reshape(-1, 64).long()
 
     elif probe_name == "side_to_move":
-        return data["side_to_move"][B_idx, ply_indices].unsqueeze(-1)
+        return data["side_to_move"][B_idx, ply_indices].float().unsqueeze(-1)
 
     elif probe_name == "is_check":
-        return data["is_check"][B_idx, ply_indices].unsqueeze(-1)
+        return data["is_check"][B_idx, ply_indices].float().unsqueeze(-1)
 
     elif probe_name == "castling_rights":
         raw = data["castling_rights"][B_idx, ply_indices].long()
@@ -167,7 +182,7 @@ def get_probe_targets(
         return torch.where(ep < 0, 64, ep)
 
     elif probe_name == "material_count":
-        boards = data["boards"][B_idx, ply_indices]  # (N, 8, 8)
+        boards = data["boards"][B_idx, ply_indices]  # (N, 8, 8), int8
         flat = boards.reshape(-1, 64)
         # Vectorized: broadcast compare all 10 piece types at once
         piece_ids = torch.tensor(
@@ -177,10 +192,10 @@ def get_probe_targets(
         return (flat.unsqueeze(-1) == piece_ids.view(1, 1, -1)).float().sum(dim=1)
 
     elif probe_name == "legal_move_count":
-        return data["legal_move_counts"][B_idx, ply_indices].unsqueeze(-1)
+        return data["legal_move_counts"][B_idx, ply_indices].float().unsqueeze(-1)
 
     elif probe_name == "halfmove_clock":
-        return data["halfmove_clock"][B_idx, ply_indices].unsqueeze(-1)
+        return data["halfmove_clock"][B_idx, ply_indices].float().unsqueeze(-1)
 
     elif probe_name == "game_phase":
         boards = data["boards"][B_idx, ply_indices]  # (N, 8, 8)
@@ -867,6 +882,198 @@ def _train_probe_all_layers(
     return results
 
 
+@torch.no_grad()
+def _forward_batch_positions(
+    model: PAWNCLM,
+    data: dict,
+    game_indices: torch.Tensor,
+    device: str,
+    layer_indices: list[int],
+    no_outcome_token: bool,
+    use_amp: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run a single forward pass on a batch of games and return stacked hidden
+    states at every valid move position, plus the game/ply indices needed to
+    look up per-position targets via ``get_probe_targets``.
+
+    Returns:
+        stacked: ``(n_sel, n_valid_in_batch, d_model)`` fp32 GPU tensor
+        global_g_idx: ``(n_valid_in_batch,)`` CPU long tensor — the original
+            game indices (into ``data``) for each valid position
+        ply_idx: ``(n_valid_in_batch,)`` CPU long tensor — ply index within
+            each game
+    """
+    input_ids = data["input_ids"][game_indices].to(device)
+    loss_mask = data["loss_mask"][game_indices].to(device)
+
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.float16)
+        if use_amp and device != "cpu"
+        else contextlib.nullcontext()
+    )
+    with amp_ctx:
+        layer_outs = _forward_all_layers(model, input_ids, loss_mask)
+
+    B = input_ids.shape[0]
+    max_ply = data["boards"].shape[1]
+    d_model = model.cfg.d_model
+    ply_offset = 0 if no_outcome_token else 1
+
+    # Slice selected layers to move positions and flatten
+    sel_flat = [
+        layer_outs[i][:, ply_offset:ply_offset + max_ply, :].reshape(
+            B * max_ply, d_model
+        )
+        for i in layer_indices
+    ]
+    stacked = torch.stack(sel_flat).float()  # (n_sel, B*max_ply, d_model)
+    del layer_outs, sel_flat
+
+    # Build valid mask for this batch
+    gl_np = data["game_lengths"][game_indices.cpu().numpy()]
+    gl = torch.from_numpy(gl_np).long()
+    ply_grid = torch.arange(max_ply)
+    valid_mask = ply_grid.unsqueeze(0) < gl.unsqueeze(1)  # (B, max_ply) CPU
+    v_flat = valid_mask.reshape(B * max_ply)
+
+    # Gather valid positions on GPU
+    v_flat_gpu = v_flat.to(device)
+    stacked = stacked[:, v_flat_gpu, :]  # (n_sel, n_valid, d_model)
+
+    # Game/ply index pairs for target lookup (CPU)
+    bg_idx, bp_idx = valid_mask.nonzero(as_tuple=True)
+    global_g_idx = game_indices.cpu()[bg_idx]
+
+    return stacked, global_g_idx, bp_idx
+
+
+def _compute_val_target_means(
+    val_data: dict, probe_names: list[str], device: str,
+) -> dict[str, torch.Tensor]:
+    """Precompute target means for MSE probes (needed for global R² during
+    streamed validation).
+
+    Returns ``{probe_name: (1, n_outputs) tensor on device}`` for MSE probes
+    only.
+    """
+    mse_probes = [p for p in probe_names if PROBES[p][1] == "mse"]
+    if not mse_probes:
+        return {}
+
+    gl = val_data["game_lengths"]
+    max_ply = val_data["boards"].shape[1]
+    ply_grid = torch.arange(max_ply).unsqueeze(0)
+    valid_mask = ply_grid < torch.from_numpy(gl).long().unsqueeze(1)
+    g_idx, p_idx = valid_mask.nonzero(as_tuple=True)
+
+    means: dict[str, torch.Tensor] = {}
+    for pname in mse_probes:
+        t = get_probe_targets(pname, val_data, p_idx, g_idx).float()
+        means[pname] = t.mean(dim=0, keepdim=True).to(device)
+        del t
+    return means
+
+
+@torch.no_grad()
+def _eval_streaming(
+    model: PAWNCLM,
+    val_data: dict,
+    probes_dict: dict[str, "BatchedLinearProbe"],
+    device: str,
+    layer_indices: list[int],
+    no_outcome_token: bool,
+    use_amp: bool,
+    probe_names: list[str],
+    val_target_means: dict[str, torch.Tensor],
+    game_batch_size: int,
+) -> dict:
+    """Stream-evaluate every probe over the full validation set in a single
+    sweep. Accumulates accuracy/loss/MAE/SS_res/SS_tot per layer so no hidden-
+    state corpus is retained across batches.
+    """
+    for p in probes_dict.values():
+        p.eval()
+
+    n_sel = len(layer_indices)
+    n_games = val_data["input_ids"].shape[0]
+
+    acc: dict[str, dict[str, torch.Tensor]] = {}
+    for pname in probe_names:
+        loss_type = PROBES[pname][1]
+        acc[pname] = {
+            "loss_sum": torch.zeros(n_sel, device=device),
+        }
+        if loss_type == "mse":
+            acc[pname]["ss_res"] = torch.zeros(n_sel, device=device)
+            acc[pname]["ss_tot"] = torch.zeros(n_sel, device=device)
+            acc[pname]["ae_sum"] = torch.zeros(n_sel, device=device)
+        else:
+            acc[pname]["correct_sum"] = torch.zeros(n_sel, device=device)
+
+    total_positions = 0
+    for gs in range(0, n_games, game_batch_size):
+        ge = min(gs + game_batch_size, n_games)
+        game_indices = torch.arange(gs, ge)
+
+        stacked, g_idx, p_idx = _forward_batch_positions(
+            model, val_data, game_indices, device,
+            layer_indices, no_outcome_token, use_amp,
+        )
+        n_valid_batch = stacked.shape[1]
+        if n_valid_batch == 0:
+            del stacked
+            continue
+
+        total_positions += n_valid_batch
+
+        for pname in probe_names:
+            n_out, loss_type, _ = PROBES[pname]
+            targets = get_probe_targets(pname, val_data, p_idx, g_idx).to(device)
+
+            logits = probes_dict[pname](stacked)  # (L, n_valid, n_out)
+
+            loss_per = _compute_batched_loss_per_layer(
+                logits, targets, loss_type, n_out,
+            )
+            acc[pname]["loss_sum"] += loss_per * n_valid_batch
+
+            if loss_type == "mse":
+                exp_t = targets.unsqueeze(0).expand_as(logits)
+                diff = logits - exp_t
+                acc[pname]["ss_res"] += (diff ** 2).sum(dim=(1, 2))
+                mean = val_target_means[pname]  # (1, n_out)
+                centered = exp_t - mean.unsqueeze(0)
+                acc[pname]["ss_tot"] += (centered ** 2).sum(dim=(1, 2))
+                acc[pname]["ae_sum"] += diff.abs().sum(dim=(1, 2))
+            else:
+                accs = _compute_batched_accuracy(
+                    logits, targets, loss_type, n_out,
+                )
+                acc[pname]["correct_sum"] += accs * n_valid_batch
+
+            del logits, targets
+
+        del stacked
+
+    # Finalize
+    out: dict = {"_n_val_positions": total_positions}
+    denom = max(total_positions, 1)
+    for pname in probe_names:
+        loss_type = PROBES[pname][1]
+        entry: dict[str, torch.Tensor] = {
+            "loss": (acc[pname]["loss_sum"] / denom).cpu(),
+        }
+        if loss_type == "mse":
+            ss_res = acc[pname]["ss_res"]
+            ss_tot = acc[pname]["ss_tot"]
+            entry["accuracy"] = (1.0 - ss_res / (ss_tot + 1e-8)).cpu()
+            entry["mae"] = (acc[pname]["ae_sum"] / denom).cpu()
+        else:
+            entry["accuracy"] = (acc[pname]["correct_sum"] / denom).cpu()
+        out[pname] = entry
+    return out
+
+
 def train_all_probes(
     model: PAWNCLM,
     train_data: dict,
@@ -879,115 +1086,163 @@ def train_all_probes(
     verbose: bool = True,
     no_outcome_token: bool = True,
     use_amp: bool = False,
+    game_batch_size: int = 64,
+    inner_batch_size: int = 256,
 ) -> dict:
-    """Train all probes across all layers.
+    """Train all probes across all layers via streaming forward passes.
 
-    Two key optimizations over the naive layer-first approach:
-
-    1. **Single-pass extraction**: Hidden states for *all* layers are extracted
-       via one forward pass through the model (eliminates the O(n_layers²)
-       redundancy of per-layer ``_forward_to_layer``).
-
-    2. **Batched probe training**: For each probe, all layers are trained
-       simultaneously via ``BatchedLinearProbe`` (``torch.bmm`` on stacked
-       ``(L, B, d_model)`` mini-batches), similar to how ``train_all.py``
-       trains three model variants on shared data.
+    Hidden states are *never* materialized for the full train/val corpus.
+    Each epoch runs the model forward per game batch, trains every probe on
+    the batch's valid positions using a per-position mini-batch SGD sweep,
+    and discards activations before moving to the next batch. Validation
+    follows the same streaming structure and accumulates per-layer metrics
+    across the full val set in a single sweep.
 
     Args:
         use_amp: use float16 autocast for the forward pass (CUDA only).
+        game_batch_size: number of games per model forward pass.
+        inner_batch_size: probe SGD mini-batch size (in valid positions).
+            Chosen to match the original dense-memory trainer's 256-position
+            step, so SGD dynamics are preserved.
 
-    Returns nested dict: ``results[probe_name][layer_name] = metrics``
+    Returns nested dict: ``results[probe_name][layer_name] = metrics``.
     """
     if probe_names is None:
         probe_names = list(PROBES.keys())
+    probe_names = [p for p in probe_names if p in PROBES]
 
     n_layers = model.cfg.n_layers
+    d_model = model.cfg.d_model
     layer_indices = list(range(n_layers + 1)) if per_layer else [n_layers]
     layer_names = (
         ["embed"] + [f"layer_{i}" for i in range(n_layers)]
     ) if per_layer else [f"layer_{n_layers - 1}"]
+    n_sel = len(layer_indices)
 
     model.eval()
-    results = {pname: {} for pname in probe_names if pname in PROBES}
 
-    # ------------------------------------------------------------------
-    # Phase 1: extract hidden states for all layers in a single pass
-    # ------------------------------------------------------------------
+    # One BatchedLinearProbe per probe type, shared across all epochs/batches.
+    probes_dict: dict[str, BatchedLinearProbe] = {}
+    opts: dict[str, torch.optim.Optimizer] = {}
+    for pname in probe_names:
+        n_out, _lt, _ = PROBES[pname]
+        probes_dict[pname] = BatchedLinearProbe(n_sel, d_model, n_out).to(device)
+        opts[pname] = torch.optim.AdamW(probes_dict[pname].parameters(), lr=lr)
+
+    n_train_games = train_data["input_ids"].shape[0]
+    n_val_games = val_data["input_ids"].shape[0]
+    n_train_positions = int(train_data["game_lengths"].sum())
+
+    # Target means for exact R² during streaming val.
+    val_target_means = _compute_val_target_means(val_data, probe_names, device)
+
+    best_val_acc = {p: torch.full((n_sel,), -float("inf")) for p in probe_names}
+
+    if verbose:
+        print(
+            f"Streaming probe training: {len(probe_names)} probes × {n_sel} "
+            f"layers × {n_epochs} epochs ({n_train_games} train games, "
+            f"{n_train_positions:,} positions / {n_val_games} val games)"
+        )
+
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    if per_layer:
-        if verbose:
-            print(f"Extracting hidden states for {len(layer_indices)} layers "
-                  f"(single forward pass)...")
-        all_train_h, train_valid = _extract_all_hidden_states(
-            model, train_data, device,
-            no_outcome_token=no_outcome_token, use_amp=use_amp,
-        )
-        all_val_h, val_valid = _extract_all_hidden_states(
-            model, val_data, device,
-            no_outcome_token=no_outcome_token, use_amp=use_amp,
-        )
-        # Select only requested layers
-        sel_train_h = [all_train_h[i] for i in layer_indices]
-        sel_val_h = [all_val_h[i] for i in layer_indices]
-        del all_train_h, all_val_h
-    else:
-        # Single layer — use the early-stop extractor to avoid allocating
-        # CPU tensors for all n_layers+1 layers just to discard them.
-        li = layer_indices[0]
-        if verbose:
-            print(f"Extracting hidden states for layer {layer_names[0]}...")
-        train_h, train_valid = _extract_hidden_states(
-            model, train_data, device, li,
-            no_outcome_token=no_outcome_token, use_amp=use_amp,
-        )
-        val_h, val_valid = _extract_hidden_states(
-            model, val_data, device, li,
-            no_outcome_token=no_outcome_token, use_amp=use_amp,
-        )
-        sel_train_h = [train_h]
-        sel_val_h = [val_h]
-        del train_h, val_h
+    for _epoch in range(n_epochs):
+        game_perm = torch.randperm(n_train_games)
+        for p in probes_dict.values():
+            p.train()
 
-    if verbose:
-        print(f"  {len(sel_train_h[0]):,} train positions, "
-              f"{len(sel_val_h[0]):,} val positions")
+        for gs in range(0, n_train_games, game_batch_size):
+            game_indices = game_perm[gs:gs + game_batch_size]
+            stacked, g_idx, p_idx = _forward_batch_positions(
+                model, train_data, game_indices, device,
+                layer_indices, no_outcome_token, use_amp,
+            )
+            n_valid_batch = stacked.shape[1]
+            if n_valid_batch == 0:
+                del stacked
+                continue
 
-    # ------------------------------------------------------------------
-    # Phase 2: train each probe across all layers simultaneously
-    # ------------------------------------------------------------------
+            # Precompute targets for every probe once per batch
+            batch_targets: dict[str, torch.Tensor] = {}
+            for pname in probe_names:
+                batch_targets[pname] = (
+                    get_probe_targets(pname, train_data, p_idx, g_idx)
+                    .to(device)
+                )
+
+            # One position-shuffled sweep per batch, matching the dense
+            # trainer's per-epoch 256-position SGD step count.
+            pos_perm = torch.randperm(n_valid_batch, device=device)
+            for start in range(0, n_valid_batch, inner_batch_size):
+                end = min(start + inner_batch_size, n_valid_batch)
+                inner_idx = pos_perm[start:end]
+                h_inner = stacked[:, inner_idx, :]  # (L, bs, d_model)
+                for pname in probe_names:
+                    n_out, loss_type, _ = PROBES[pname]
+                    t_inner = batch_targets[pname][inner_idx]
+                    logits = probes_dict[pname](h_inner)
+                    loss = _compute_batched_loss_per_layer(
+                        logits, t_inner, loss_type, n_out,
+                    ).sum()
+                    opts[pname].zero_grad(set_to_none=True)
+                    loss.backward()
+                    opts[pname].step()
+
+            del stacked, batch_targets
+
+        # Per-epoch validation for best_accuracy tracking
+        epoch_val = _eval_streaming(
+            model, val_data, probes_dict, device, layer_indices,
+            no_outcome_token, use_amp, probe_names, val_target_means,
+            game_batch_size,
+        )
+        for pname in probe_names:
+            best_val_acc[pname] = torch.maximum(
+                best_val_acc[pname], epoch_val[pname]["accuracy"],
+            )
+
+    # Final evaluation for returned loss/accuracy/mae
+    final_val = _eval_streaming(
+        model, val_data, probes_dict, device, layer_indices,
+        no_outcome_token, use_amp, probe_names, val_target_means,
+        game_batch_size,
+    )
+    n_val_positions = final_val["_n_val_positions"]
+
+    # Build results dict matching the legacy nested layout
+    results: dict = {}
     for pname in probe_names:
-        if pname not in PROBES:
-            continue
-
-        train_t = _extract_targets(pname, train_data, train_valid)
-        val_t = _extract_targets(pname, val_data, val_valid)
-
-        layer_results = _train_probe_all_layers(
-            pname, sel_train_h, sel_val_h, train_t, val_t,
-            model.cfg.d_model, device, n_epochs, lr,
-        )
-
-        for lname, metrics in zip(layer_names, layer_results):
-            results[pname][lname] = metrics
+        loss_type = PROBES[pname][1]
+        results[pname] = {}
+        for li, lname in enumerate(layer_names):
+            entry = {
+                "accuracy": final_val[pname]["accuracy"][li].item(),
+                "loss": final_val[pname]["loss"][li].item(),
+                "best_accuracy": best_val_acc[pname][li].item(),
+                "n_train": n_train_positions,
+                "n_val": n_val_positions,
+            }
+            if loss_type == "mse":
+                entry["mae"] = final_val[pname]["mae"][li].item()
+            results[pname][lname] = entry
 
         if verbose:
-            loss_type = PROBES[pname][1]
-            # Print per-layer metrics
-            accs = [r["best_accuracy"] for r in layer_results]
+            accs = [results[pname][n]["best_accuracy"] for n in layer_names]
             best_idx = max(range(len(accs)), key=lambda i: accs[i])
-            if loss_type == "mse":
-                vals = [f"{a:.3f}" for a in accs]
-                print(f"  {pname:>20s}: R² {' → '.join(vals)}  "
-                      f"(best={accs[best_idx]:.4f} @ {layer_names[best_idx]})")
-            else:
-                vals = [f"{a:.3f}" for a in accs]
-                print(f"  {pname:>20s}: {' → '.join(vals)}  "
-                      f"(best={accs[best_idx]:.4f} @ {layer_names[best_idx]})")
+            prefix = "R² " if loss_type == "mse" else ""
+            vals = [f"{a:.3f}" for a in accs]
+            print(
+                f"  {pname:>20s}: {prefix}{' → '.join(vals)}  "
+                f"(best={accs[best_idx]:.4f} @ {layer_names[best_idx]})"
+            )
 
-        del train_t, val_t
+    # Free probe/optimizer state
+    del probes_dict, opts
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    del sel_train_h, sel_val_h
     return results

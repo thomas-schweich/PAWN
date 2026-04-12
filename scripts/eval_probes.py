@@ -2,6 +2,7 @@
 """Run linear probes on all trained checkpoints and write results to JSON."""
 
 import argparse
+import gc
 import json
 import sys
 from pathlib import Path
@@ -15,7 +16,11 @@ from pawn.eval_suite.probes import extract_probe_data, train_all_probes
 
 def load_model_from_checkpoint(checkpoint_path: str, device: str) -> PAWNCLM:
     from pawn.checkpoint import load_backbone_weights
-    state_dict, model_config = load_backbone_weights(checkpoint_path, device)
+    # Load weights on CPU first, load them into a CPU-instantiated model,
+    # then move the final model to the target device. This avoids the
+    # transient 2x-on-device peak that happens when both the state_dict
+    # and the model parameters are briefly resident on the GPU during load.
+    state_dict, model_config = load_backbone_weights(checkpoint_path, "cpu")
     if model_config:
         cfg = CLMConfig(**model_config)
     else:
@@ -30,8 +35,10 @@ def load_model_from_checkpoint(checkpoint_path: str, device: str) -> PAWNCLM:
             cfg = CLMConfig.large()
         else:
             cfg = CLMConfig(d_model=d_model, n_layers=n_layers)
-    model = PAWNCLM(cfg).to(device)
+    model = PAWNCLM(cfg)
     model.load_state_dict(state_dict)
+    del state_dict
+    model.to(device)
     model.eval()
     return model
 
@@ -50,6 +57,8 @@ def main():
                         help="Strip outcome token from sequences (auto-detected from checkpoint config)")
     parser.add_argument("--top-layer-only", action="store_true",
                         help="Only probe the top layer (skip per-layer sweep)")
+    parser.add_argument("--max-ply", type=int, default=None,
+                        help="Override probe sequence length (defaults to model's max_seq_len)")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -66,12 +75,22 @@ def main():
     if args.checkpoint:
         # Direct checkpoint path — build a minimal run entry
         ckpt_path = Path(args.checkpoint)
-        # Try to load config from checkpoint dir
-        cfg = {}
-        cfg_file = ckpt_path / "config.json"
-        if cfg_file.exists():
-            with open(cfg_file) as f:
+        # Prefer the run's top-level config.json (keys: model/training); fall
+        # back to the per-checkpoint config (keys: model_config/training_config).
+        cfg: dict = {}
+        run_cfg_file = ckpt_path.parent.parent / "config.json"
+        ckpt_cfg_file = ckpt_path / "config.json"
+        if run_cfg_file.exists():
+            with open(run_cfg_file) as f:
                 cfg = json.load(f)
+        elif ckpt_cfg_file.exists():
+            with open(ckpt_cfg_file) as f:
+                raw = json.load(f)
+            # Normalize to the run-level schema
+            cfg = {
+                "model": raw.get("model_config") or raw.get("model") or {},
+                "training": raw.get("training_config") or raw.get("training") or {},
+            }
         run_dir = log_dir
         run_dir.mkdir(parents=True, exist_ok=True)
         runs.append((run_dir, ckpt_path, cfg))
@@ -98,12 +117,33 @@ def main():
 
     print(f"Found {len(runs)} runs to evaluate")
 
-    # Generate probe data once (shared across all models with same max_ply)
-    max_ply = 256
-    print(f"\nGenerating probe data: {args.n_games} train + {args.n_val_games} val games...")
-    train_data = extract_probe_data(args.n_games, max_ply, seed=12345)
-    val_data = extract_probe_data(args.n_val_games, max_ply, seed=54321)
-    print("Done.")
+    # Size-1 LRU probe-data cache keyed by (max_ply, prepend_outcome). If the
+    # script sweeps runs with differing seq lengths or outcome-prefix settings
+    # this keeps exactly one dataset resident — regenerating is much cheaper
+    # than carrying multiple multi-GiB caches.
+    _probe_cache: dict = {"key": None, "data": None}
+
+    def get_probe_data(max_ply: int, prepend_outcome: bool) -> tuple[dict, dict]:
+        key = (max_ply, prepend_outcome)
+        if _probe_cache["key"] != key:
+            # Drop the previous entry before generating the new one.
+            _probe_cache["data"] = None
+            _probe_cache["key"] = None
+            gc.collect()
+            print(
+                f"\nGenerating probe data: {args.n_games} train + {args.n_val_games} val games "
+                f"(max_ply={max_ply}, prepend_outcome={prepend_outcome})..."
+            )
+            train_data = extract_probe_data(
+                args.n_games, max_ply, seed=12345, prepend_outcome=prepend_outcome,
+            )
+            val_data = extract_probe_data(
+                args.n_val_games, max_ply, seed=54321, prepend_outcome=prepend_outcome,
+            )
+            print("Done.")
+            _probe_cache["key"] = key
+            _probe_cache["data"] = (train_data, val_data)
+        return _probe_cache["data"]
 
     for run_dir, ckpt_path, run_cfg in runs:
         model_cfg = run_cfg.get("model", {})
@@ -121,8 +161,14 @@ def main():
 
         # Auto-detect no_outcome_token from checkpoint config
         no_outcome = args.no_outcome_token or train_cfg.get("no_outcome_token", False)
-        if no_outcome:
-            print(f"  [no_outcome_token=True] Stripping outcome token from probe inputs")
+        prepend_outcome = not no_outcome
+        max_ply = args.max_ply or model_cfg.get("max_seq_len") or 256
+        print(
+            f"  max_ply={max_ply}, no_outcome_token={no_outcome}, "
+            f"prepend_outcome={prepend_outcome}"
+        )
+
+        train_data, val_data = get_probe_data(max_ply, prepend_outcome)
 
         results = train_all_probes(
             model, train_data, val_data, device,
