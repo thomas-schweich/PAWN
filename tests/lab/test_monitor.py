@@ -272,7 +272,7 @@ class TestReadMetricsCotrain:
 
         # Create two variant run dirs with metrics
         for name in ("small", "base"):
-            metrics_path = trial_dir / f"run_20260410_120000_slug_{name}" / "metrics.jsonl"
+            metrics_path = trial_dir / f"run_20260410_120000_{name}_calm-crane" / "metrics.jsonl"
             _write_metrics_file(metrics_path, [
                 {"type": "config", "total_steps": 100, "param_count": 1000},
                 {"type": "train", "step": 10, "train/loss": 2.5, "step_time": 0.1},
@@ -295,11 +295,11 @@ class TestReadMetricsCotrain:
         log_dir = tmp_path / "logs"
         trial_dir = log_dir / "trial_0000"
 
-        small_path = trial_dir / "run_20260410_120000_slug_small" / "metrics.jsonl"
+        small_path = trial_dir / "run_20260410_120000_small_calm-crane" / "metrics.jsonl"
         _write_metrics_file(small_path, [
             {"type": "train", "step": 50, "train/loss": 2.0, "step_time": 0.1},
         ])
-        base_path = trial_dir / "run_20260410_120000_slug_base" / "metrics.jsonl"
+        base_path = trial_dir / "run_20260410_120000_base_calm-crane" / "metrics.jsonl"
         _write_metrics_file(base_path, [
             {"type": "train", "step": 30, "train/loss": 2.5, "step_time": 0.1},
         ])
@@ -315,11 +315,11 @@ class TestReadMetricsCotrain:
         log_dir = tmp_path / "logs"
         trial_dir = log_dir / "trial_0000"
 
-        small_path = trial_dir / "run_20260410_120000_slug_small" / "metrics.jsonl"
+        small_path = trial_dir / "run_20260410_120000_small_calm-crane" / "metrics.jsonl"
         _write_metrics_file(small_path, [
             {"type": "val", "step": 10, "val/loss": 3.0},
         ])
-        base_path = trial_dir / "run_20260410_120000_slug_base" / "metrics.jsonl"
+        base_path = trial_dir / "run_20260410_120000_base_calm-crane" / "metrics.jsonl"
         _write_metrics_file(base_path, [
             {"type": "val", "step": 10, "val/loss": 2.0},
         ])
@@ -335,7 +335,7 @@ class TestReadMetricsCotrain:
         log_dir = tmp_path / "logs"
         trial_dir = log_dir / "trial_0000"
 
-        small_path = trial_dir / "run_20260410_120000_slug_small" / "metrics.jsonl"
+        small_path = trial_dir / "run_20260410_120000_small_calm-crane" / "metrics.jsonl"
         _write_metrics_file(small_path, [
             {"type": "train", "step": 10, "train/loss": 2.5, "step_time": 0.1},
         ])
@@ -353,6 +353,24 @@ class TestReadMetricsCotrain:
         read_metrics(trial, log_dir, offsets)
         assert trial.variants["small"]["current_step"] == 20
 
+    def test_underscore_in_variant_name(self, tmp_path):
+        """Variant names containing underscores are parsed correctly."""
+        log_dir = tmp_path / "logs"
+        trial_dir = log_dir / "trial_0000"
+
+        metrics_path = trial_dir / "run_20260410_120000_my_model_calm-crane" / "metrics.jsonl"
+        _write_metrics_file(metrics_path, [
+            {"type": "train", "step": 5, "train/loss": 3.0, "step_time": 0.2},
+        ])
+
+        trial = self._make_cotrain_trial(0)
+        offsets: dict = {}
+        read_metrics(trial, log_dir, offsets)
+
+        assert trial.variants is not None
+        assert "my_model" in trial.variants
+        assert trial.variants["my_model"]["current_step"] == 5
+
     def test_empty_trial_dir_noops(self, tmp_path):
         log_dir = tmp_path / "logs"
         (log_dir / "trial_0000").mkdir(parents=True)
@@ -369,7 +387,7 @@ class TestReadMetricsCotrain:
         log_dir = tmp_path / "logs"
         trial_dir = log_dir / "trial_0000"
 
-        small_dir = trial_dir / "run_20260410_120000_slug_small"
+        small_dir = trial_dir / "run_20260410_120000_small_calm-crane"
         metrics_path = small_dir / "metrics.jsonl"
         _write_metrics_file(metrics_path, [
             {"type": "train", "step": 5, "train/loss": 3.0, "step_time": 0.2},

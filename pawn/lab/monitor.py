@@ -176,6 +176,7 @@ def _read_cotrain_metrics(
                 "run_dir": str(mf.parent),
                 "current_step": 0,
                 "last_train_loss": None,
+                "last_train_acc": None,
                 "best_val_loss": None,
                 "best_val_step": 0,
                 "best_accuracy": None,
@@ -216,6 +217,9 @@ def _read_cotrain_metrics(
                 loss = rec.get("train/loss") or rec.get("train_loss")
                 if loss is not None:
                     vs["last_train_loss"] = loss
+                train_acc = rec.get("train/accuracy") or rec.get("train_top1")
+                if train_acc is not None:
+                    vs["last_train_acc"] = train_acc
                 st = rec.get("step_time")
                 if st and st > 0:
                     vs["steps_per_sec"] = 1.0 / st
@@ -239,16 +243,18 @@ def _read_cotrain_metrics(
 def _extract_variant_name(run_dir_name: str) -> str | None:
     """Extract variant name from a run directory name.
 
-    The MetricsLogger creates dirs like ``run_YYYYMMDD_HHMMSS_slug_variantname``.
-    The variant name is the final underscore-delimited segment after the slug.
-    We look for the expected pattern: ``run_<date>_<time>_<slug>_<variant>``.
+    The MetricsLogger creates dirs like ``run_YYYYMMDD_HHMMSS_variantname_slug``.
+    The layout is: ``run`` _ ``date`` _ ``time`` _ ``variant`` _ ``slug``.
+    The variant name may itself contain underscores, but the slug (final segment)
+    never does (it's two hyphenated words like ``calm-crane``).  So we rejoin
+    everything between parts[3] and parts[-1].
     """
-    # Expected: run_YYYYMMDD_HHMMSS_slug_variant (at least 5 parts)
+    # Expected: run_YYYYMMDD_HHMMSS_variant_slug (at least 5 parts)
     parts = run_dir_name.split("_")
     if len(parts) < 5 or parts[0] != "run":
         return None
-    # The variant is the last part (slug is second-to-last)
-    return parts[-1]
+    # parts[1]=date, parts[2]=time, parts[-1]=slug, parts[3:-1]=variant
+    return "_".join(parts[3:-1])
 
 
 def _aggregate_cotrain_metrics(trial: Trial) -> None:
@@ -278,6 +284,12 @@ def _aggregate_cotrain_metrics(trial: Trial) -> None:
               if v["last_train_loss"] is not None and not v.get("stopped")]
     if losses:
         trial.last_train_loss = sum(losses) / len(losses)
+
+    # last_train_acc = mean across active variants
+    accs_train = [v["last_train_acc"] for v in variants
+                  if v.get("last_train_acc") is not None and not v.get("stopped")]
+    if accs_train:
+        trial.last_train_acc = sum(accs_train) / len(accs_train)
 
     # steps_per_sec from any variant (they share the same step timing)
     for v in variants:

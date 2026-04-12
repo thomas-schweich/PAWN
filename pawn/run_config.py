@@ -181,6 +181,11 @@ class CotrainConfig(BaseRunConfig):
                 "--shm-checkpoints requires --hf-repo "
                 "(HF is the only durable store)"
             )
+        if self.resume is not None:
+            raise ValueError(
+                "CotrainConfig does not use the top-level 'resume' field. "
+                "Set 'resume' on each variant in the 'variants' list instead."
+            )
         return self
 
 

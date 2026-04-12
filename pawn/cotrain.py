@@ -179,7 +179,7 @@ class ModelSlot:
         """Push checkpoint to HuggingFace in a background thread."""
         # Wait for any previous push to finish before starting a new one
         if self._hf_push_future is not None:
-            self._hf_push_future.result()  # raises if previous push failed
+            self._hf_push_future.result()  # blocks until previous push completes
 
         assert self.hf_repo is not None and self.hf_branch is not None
         hf_repo, hf_branch = self.hf_repo, self.hf_branch
@@ -376,7 +376,12 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
         if not torch.cuda.is_available():
             print("ERROR: CUDA not available", file=sys.stderr)
             sys.exit(1)
-        gpu_cfg = configure_gpu()
+        gpu_cfg = configure_gpu(
+            device,
+            no_compile=config.no_compile,
+            no_amp=(config.amp_dtype == "none"),
+            sdpa_math=config.sdpa_math,
+        )
         import pawn.model as model_module
         if gpu_cfg.get("sdpa_backend"):
             model_module.SDPA_BACKEND = gpu_cfg["sdpa_backend"]
@@ -462,6 +467,7 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
         pin_memory=(device != "cpu"),
         persistent_workers=(config.num_workers > 0),
         prefetch_factor=2 if config.num_workers > 0 else None,
+        multiprocessing_context="spawn" if config.num_workers > 0 else None,
     )
 
     # Signal handling

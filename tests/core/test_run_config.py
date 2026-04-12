@@ -280,6 +280,15 @@ class TestCotrainConfig:
         )
         assert cfg.shm_checkpoints is True
 
+    def test_top_level_resume_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            CotrainConfig(
+                local_checkpoints=True,
+                resume="/some/path",
+                variants=[CotrainVariant(name="x", variant="toy")],
+            )
+        assert "per" in str(exc_info.value).lower() or "variant" in str(exc_info.value).lower()
+
     def test_default_val_games(self):
         cfg = CotrainConfig(
             local_checkpoints=True,

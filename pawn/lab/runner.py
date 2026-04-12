@@ -322,7 +322,7 @@ class TrialRunner:
         if (old.config or {}).get("run_type") == "cotrain":
             self._resolve_cotrain_resume(old, new_config)
         else:
-            ckpt_dir = self._find_best_checkpoint(Path(old.run_dir))
+            ckpt_dir = self._find_latest_checkpoint(Path(old.run_dir))
             new_config["resume"] = str(ckpt_dir)
 
         if total_steps is not None:
@@ -333,8 +333,13 @@ class TrialRunner:
         return await self.launch(new_config, tags=old.tags)
 
     @staticmethod
-    def _find_best_checkpoint(run_dir: Path) -> Path:
-        """Find the best checkpoint under a run directory."""
+    def _find_latest_checkpoint(run_dir: Path) -> Path:
+        """Find the latest checkpoint under a run directory.
+
+        Checks for ``best/`` and ``final/`` symlinks first (adapter runs),
+        then falls back to the highest-numbered ``step_*`` directory
+        (pretrain/cotrain runs, which don't create best/final symlinks).
+        """
         ckpt_base = run_dir / "checkpoints"
         ckpt_dir = ckpt_base / "best"
         if not ckpt_dir.exists():
@@ -373,7 +378,7 @@ class TrialRunner:
                 raise RuntimeError(
                     f"Variant '{name}' in trial {old.trial_id} has no run directory"
                 )
-            ckpt_dir = self._find_best_checkpoint(Path(v_run_dir))
+            ckpt_dir = self._find_latest_checkpoint(Path(v_run_dir))
             v_cfg["resume"] = str(ckpt_dir)
 
         new_config["variants"] = variants
