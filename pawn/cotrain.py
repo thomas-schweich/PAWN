@@ -409,7 +409,6 @@ def _build_variant_configs(
     variant_spec: CotrainVariant,
     shared: CotrainConfig,
     device: str,
-    scaled_lr: float,
 ) -> tuple[CLMConfig, TrainingConfig]:
     """Build internal CLMConfig + TrainingConfig for one variant."""
     variant_factory = {
@@ -448,7 +447,7 @@ def _build_variant_configs(
         model_cfg.max_seq_len = 256
 
     train_cfg = TrainingConfig()
-    train_cfg.lr = scaled_lr
+    train_cfg.lr = shared.lr
     train_cfg.total_steps = shared.total_steps or train_cfg.total_steps
     train_cfg.batch_size = shared.batch_size
     train_cfg.num_workers = shared.num_workers
@@ -502,11 +501,6 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
 
     total_steps = config.total_steps or 100_000
 
-    # Linear LR scaling: lr = base_lr * (batch_size / base_batch_size)
-    base_batch_size = 256
-    base_lr = config.lr
-    scaled_lr = base_lr * (config.batch_size / base_batch_size)
-
     slug = random_slug()
     variant_names = [v.name for v in config.variants]
 
@@ -527,7 +521,7 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
         )
     if config.prepend_outcome:
         print("Outcome token: PREPENDED at position 0 (outcome-conditioned training)")
-    print(f"LR: {scaled_lr:.2e} (scaled from {base_lr:.2e} for batch {config.batch_size})")
+    print(f"LR: {config.lr:.2e}")
     print()
 
     # Correct config.prepend_outcome BEFORE constructing slots. Each
@@ -542,7 +536,7 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     slots: list[ModelSlot] = []
     for variant_spec in config.variants:
         model_cfg, train_cfg = _build_variant_configs(
-            variant_spec, config, device, scaled_lr,
+            variant_spec, config, device,
         )
         hf_repo = f"{config.hf_repo}-{variant_spec.name}" if config.hf_repo else None
         slots.append(ModelSlot(
