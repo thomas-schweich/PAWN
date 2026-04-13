@@ -272,6 +272,13 @@ class CotrainConfig(BaseRunConfig):
                 "publish_results requires hf_repo — there's no branch to "
                 "push eval_results.json to without one"
             )
+        if self.publish_results and not self.run_evals:
+            raise ValueError(
+                "publish_results requires run_evals=True — "
+                "run_post_training_evals is the only thing that writes "
+                "the eval_results.json file, so there's nothing to "
+                "publish without it"
+            )
         if self.lichess_pgn and not self.run_evals:
             raise ValueError(
                 "lichess_pgn is only meaningful when run_evals=True"

@@ -1,4 +1,5 @@
 {
+  "_comment": "Canonical 3-variant cotrain config. Pick exactly one of --local-checkpoints or --hf-repo REPO_ID on the CLI; the JSON intentionally omits both so either can be supplied without tripping BaseRunConfig's mutual-exclusion check.",
   "run_type": "cotrain",
   "variants": [
     {"name": "small", "variant": "small"},
@@ -12,6 +13,5 @@
   "log_interval": 10,
   "eval_interval": 500,
   "checkpoint_interval": 5000,
-  "patience": 10,
-  "local_checkpoints": true
+  "patience": 10
 }
