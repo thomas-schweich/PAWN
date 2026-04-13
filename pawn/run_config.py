@@ -109,6 +109,24 @@ class PretrainConfig(BaseRunConfig):
                 raise ValueError(
                     f"variant='custom' requires {', '.join(missing)} to be set explicitly"
                 )
+            # Narrowed by the missing-fields check above, but pyright
+            # can't follow that across the `if`.
+            assert self.d_model is not None
+            assert self.n_heads is not None
+            assert self.n_layers is not None
+            assert self.d_ff is not None
+            if self.d_model <= 0 or self.n_heads <= 0 or self.n_layers <= 0 or self.d_ff <= 0:
+                raise ValueError(
+                    f"variant='custom' requires positive d_model/n_heads/n_layers/d_ff, "
+                    f"got d_model={self.d_model}, n_heads={self.n_heads}, "
+                    f"n_layers={self.n_layers}, d_ff={self.d_ff}"
+                )
+            if self.d_model % self.n_heads != 0:
+                raise ValueError(
+                    f"variant='custom' requires d_model ({self.d_model}) to be "
+                    f"divisible by n_heads ({self.n_heads}); otherwise attention "
+                    f"head_dim is non-integer and the model crashes at first forward"
+                )
         return self
 
 
@@ -198,6 +216,24 @@ class CotrainVariant(BaseModel):
                 raise ValueError(
                     f"variant='custom' requires {', '.join(missing)} to be "
                     f"set explicitly on variant '{self.name}'"
+                )
+            assert self.d_model is not None
+            assert self.n_heads is not None
+            assert self.n_layers is not None
+            assert self.d_ff is not None
+            if self.d_model <= 0 or self.n_heads <= 0 or self.n_layers <= 0 or self.d_ff <= 0:
+                raise ValueError(
+                    f"variant='custom' on '{self.name}' requires positive "
+                    f"d_model/n_heads/n_layers/d_ff, got d_model={self.d_model}, "
+                    f"n_heads={self.n_heads}, n_layers={self.n_layers}, "
+                    f"d_ff={self.d_ff}"
+                )
+            if self.d_model % self.n_heads != 0:
+                raise ValueError(
+                    f"variant='custom' on '{self.name}' requires d_model "
+                    f"({self.d_model}) to be divisible by n_heads "
+                    f"({self.n_heads}); otherwise attention head_dim is "
+                    f"non-integer and the model crashes at first forward"
                 )
         return self
 

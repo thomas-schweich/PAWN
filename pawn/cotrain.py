@@ -339,6 +339,7 @@ def _resolve_cotrain_resume_prepend_outcome(config: CotrainConfig) -> None:
     from pawn.checkpoint import infer_prepend_outcome, read_checkpoint_metadata
 
     resume_modes: dict[str, bool] = {}
+    ambiguous_variants: list[tuple[str, str]] = []
     for variant_spec in config.variants:
         if not variant_spec.resume:
             continue
@@ -351,10 +352,37 @@ def _resolve_cotrain_resume_prepend_outcome(config: CotrainConfig) -> None:
         saved_prepend, reason = infer_prepend_outcome(
             saved.get("training_config"), saved.get("model_config"),
         )
+        if saved_prepend is None:
+            ambiguous_variants.append((variant_spec.name, reason))
+            print(f"  [{variant_spec.name}] resume: ambiguous ({reason})")
+            continue
         resume_modes[variant_spec.name] = saved_prepend
         print(f"  [{variant_spec.name}] resume: "
               f"{'outcome-prefixed' if saved_prepend else 'pure-moves'} "
               f"({reason})")
+
+    if ambiguous_variants:
+        if "prepend_outcome" in config.model_fields_set:
+            print(
+                f"WARNING: {len(ambiguous_variants)} resumed variant(s) "
+                f"have ambiguous sequence format — trusting explicit "
+                f"prepend_outcome={config.prepend_outcome} from the run "
+                "config. Verify this matches what the checkpoints were "
+                "trained with."
+            )
+            # Treat the user's explicit value as the ground-truth for
+            # those variants so the mismatch-detection below still works.
+            for name, _ in ambiguous_variants:
+                resume_modes[name] = config.prepend_outcome
+        else:
+            names = ", ".join(n for n, _ in ambiguous_variants)
+            print(
+                f"ERROR: resumed variant(s) {names} have ambiguous sequence "
+                "format. Pass `prepend_outcome: true` or "
+                "`prepend_outcome: false` in the run config explicitly.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     if not resume_modes:
         return

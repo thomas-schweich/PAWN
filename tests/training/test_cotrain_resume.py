@@ -166,3 +166,49 @@ class TestResolveCotrainResumePrependOutcome:
         # up the corrected flag.
         assert before is False
         assert after is True
+
+    def test_ambiguous_resume_without_explicit_flag_errors(self, tmp_path):
+        """Pre-flag 1980-vocab / 512-ctx checkpoint → helper can't
+        guess. Without an explicit prepend_outcome in the run config,
+        fail closed instead of silently defaulting."""
+        ckpt = tmp_path / "step_1"
+        _write_checkpoint(
+            ckpt, prepend_outcome=None, vocab_size=1980, max_seq_len=512,
+        )
+        # Note: passing prepend_outcome at all marks the field as "set"
+        # on the Pydantic model, so we use model_construct to simulate a
+        # user who accepted the default.
+        cfg = CotrainConfig.model_construct(
+            local_checkpoints=True,
+            variants=[
+                CotrainVariant(name="a", variant="toy", resume=str(ckpt)),
+            ],
+        )
+        cfg.prepend_outcome = False  # default value
+        # Clear model_fields_set so the helper sees "not explicit".
+        cfg.__pydantic_fields_set__.discard("prepend_outcome")
+        with pytest.raises(SystemExit) as exc_info:
+            _resolve_cotrain_resume_prepend_outcome(cfg)
+        assert exc_info.value.code == 1
+
+    def test_ambiguous_resume_with_explicit_flag_trusts_user(
+        self, tmp_path, capsys,
+    ):
+        """If the user explicitly passed prepend_outcome, the helper
+        trusts their value for ambiguous variants (still warns)."""
+        ckpt = tmp_path / "step_1"
+        _write_checkpoint(
+            ckpt, prepend_outcome=None, vocab_size=1980, max_seq_len=512,
+        )
+        cfg = _make_config(
+            [CotrainVariant(name="a", variant="toy", resume=str(ckpt))],
+            prepend_outcome=True,  # explicit
+        )
+        # _make_config passes prepend_outcome to CotrainConfig, so it
+        # ends up in model_fields_set automatically.
+        assert "prepend_outcome" in cfg.model_fields_set
+        _resolve_cotrain_resume_prepend_outcome(cfg)
+        assert cfg.prepend_outcome is True
+        out = capsys.readouterr().out
+        assert "ambiguous" in out
+        assert "WARNING" in out

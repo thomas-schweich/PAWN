@@ -153,7 +153,23 @@ def run_pretrain(config: PretrainConfig) -> None:
             saved_prepend, reason = infer_prepend_outcome(
                 saved.get("training_config"), saved.get("model_config"),
             )
-            if saved_prepend != config.prepend_outcome:
+            if saved_prepend is None:
+                # Ambiguous pre-flag checkpoint. Honor the user's
+                # explicit value if they passed one, otherwise fail loud
+                # rather than silently guessing.
+                if "prepend_outcome" in config.model_fields_set:
+                    print(
+                        f"WARNING: {reason}. Trusting explicit "
+                        f"prepend_outcome={config.prepend_outcome} from the run "
+                        "config — verify this matches what the checkpoint was "
+                        "trained with."
+                    )
+                else:
+                    _die(
+                        f"Resume: {reason}. Pass `prepend_outcome: true` or "
+                        "`prepend_outcome: false` in the run config explicitly."
+                    )
+            elif saved_prepend != config.prepend_outcome:
                 print(
                     f"Resume: saved checkpoint is "
                     f"{'outcome-prefixed' if saved_prepend else 'pure-moves'} "

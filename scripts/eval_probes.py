@@ -54,7 +54,11 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Evaluate a single checkpoint path directly (skips log-dir scan)")
     parser.add_argument("--no-outcome-token", action="store_true",
-                        help="Strip outcome token from sequences (auto-detected from checkpoint config)")
+                        help="Force pure-moves probe data (overrides checkpoint auto-detection)")
+    parser.add_argument("--prepend-outcome", action="store_true",
+                        help="Force outcome-prefixed probe data (overrides auto-detection). "
+                             "Required for ambiguous pre-flag checkpoints (1980-vocab/512-ctx "
+                             "without training.prepend_outcome in config.json).")
     parser.add_argument("--top-layer-only", action="store_true",
                         help="Only probe the top layer (skip per-layer sweep)")
     parser.add_argument("--max-ply", type=int, default=None,
@@ -164,10 +168,23 @@ def main():
         # (which were always outcome-prefixed pre-2026-04-08) are handled
         # correctly; modern checkpoints use the exact persisted flag.
         from pawn.checkpoint import infer_prepend_outcome
-        prepend_outcome, reason = infer_prepend_outcome(train_cfg, model_cfg)
-        if args.no_outcome_token:
+        inferred, reason = infer_prepend_outcome(train_cfg, model_cfg)
+        if args.prepend_outcome:
+            prepend_outcome = True
+            reason = "forced by --prepend-outcome CLI override"
+        elif args.no_outcome_token:
             prepend_outcome = False
             reason = "forced by --no-outcome-token CLI override"
+        elif inferred is None:
+            # Ambiguous pre-flag checkpoint — probes would silently
+            # measure out-of-distribution hidden states if we guessed.
+            raise SystemExit(
+                f"ERROR: {run_dir.name}: {reason}. Re-run with "
+                "--prepend-outcome or --no-outcome-token to force the "
+                "correct layout."
+            )
+        else:
+            prepend_outcome = inferred
         no_outcome = not prepend_outcome
         max_ply = args.max_ply or model_cfg.get("max_seq_len") or 256
         print(

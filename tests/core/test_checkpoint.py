@@ -975,14 +975,20 @@ class TestInferPrependOutcome:
         assert result is True
         assert "256" in reason
 
-    def test_modern_default_is_pure_moves(self):
+    def test_ambiguous_modern_returns_none(self):
+        """1980-vocab / 512-ctx with no prepend_outcome field could be
+        either pre-flip (outcome-prefixed) or post-flip (pure-moves).
+        The helper must return None so callers fail closed or demand an
+        explicit override — silently guessing either way is unsafe."""
         result, reason = infer_prepend_outcome(
             {}, {"vocab_size": 1980, "max_seq_len": 512},
         )
-        assert result is False
-        assert "modern" in reason
+        assert result is None
+        assert "ambiguous" in reason
 
-    def test_none_inputs(self):
+    def test_none_inputs_are_ambiguous(self):
+        """Missing configs entirely are treated the same as ambiguous —
+        callers must not silently default."""
         result, reason = infer_prepend_outcome(None, None)
-        assert result is False
-        assert "modern" in reason
+        assert result is None
+        assert "ambiguous" in reason

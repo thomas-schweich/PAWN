@@ -313,23 +313,30 @@ def read_checkpoint_metadata(path: str | Path) -> dict:
 def infer_prepend_outcome(
     training_config: dict | None,
     model_config: dict | None,
-) -> tuple[bool, str]:
+) -> tuple[bool | None, str]:
     """Infer ``prepend_outcome`` for a resumed/evaluated checkpoint.
 
-    Returns ``(prepend_outcome, reason)``:
+    Returns ``(prepend_outcome, reason)`` where ``prepend_outcome`` is
+    ``True`` / ``False`` / ``None``. ``None`` means the helper cannot
+    confidently decide — callers must fail closed or require an
+    explicit user override, not silently pick a default.
 
       1. If ``training_config["prepend_outcome"]`` is present, return it
-         exactly — this is the post-2026-04 PAWN default where the field
-         is persisted to config.json.
+         exactly — this is the post-PR PAWN default where the field is
+         persisted to config.json.
       2. Otherwise, fall back to heuristics for pre-flag checkpoints:
-         - Legacy vocab (``vocab_size == LegacyVocab.VOCAB_SIZE``) → True.
-           The legacy 4284-token runs are all pre-2026-04-08 and used the
-           outcome prefix as the implicit Rust default.
-         - 256-token context (``max_seq_len <= 256``) → True. The 256-ctx
-           convention predates the flip and was outcome-prefixed.
-         - Otherwise → False. Modern 1980-vocab / 512-ctx checkpoints
-           saved before the flag landed are ambiguous, but by far the
-           most common post-flip case is pure-moves.
+         - Legacy vocab (``vocab_size == LegacyVocab.VOCAB_SIZE``) →
+           ``(True, ...)``. The legacy 4284-token runs are all pre-
+           2026-04-08 and used the outcome prefix as the implicit Rust
+           default.
+         - 256-token context (``max_seq_len <= 256``) → ``(True, ...)``.
+           The 256-ctx convention predates the flip and was
+           outcome-prefixed.
+         - Otherwise → ``(None, ...)``. A 1980-vocab / 512-ctx
+           checkpoint without the field could be either pre-flip
+           (outcome-prefixed) or post-flip (pure-moves), so guessing
+           either way risks silently corrupting resume/eval. Callers
+           must use an explicit override in this case.
 
     Callers should print the reason when they override a user-supplied
     flag so the behaviour is explicit and auditable.
@@ -349,7 +356,11 @@ def infer_prepend_outcome(
     if isinstance(max_seq_len, int) and max_seq_len <= 256:
         return True, f"legacy 256-ctx (max_seq_len={max_seq_len})"
 
-    return False, "modern pure-moves default (no legacy indicators)"
+    return None, (
+        "ambiguous pre-flag checkpoint (no training.prepend_outcome, "
+        "modern vocab/context): could be pre-2026-04-08 outcome-prefixed "
+        "or post-flip pure-moves; pass prepend_outcome explicitly"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -632,6 +632,52 @@ class TestCustomVariant:
             PretrainConfig(local_checkpoints=True, variant=preset)
             CotrainVariant(name=preset, variant=preset)
 
+    def test_pretrain_custom_rejects_incompatible_head_dim(self):
+        """d_model must be divisible by n_heads; otherwise attention
+        crashes at first forward. Validator catches it upfront."""
+        with pytest.raises(ValidationError) as exc_info:
+            PretrainConfig(
+                local_checkpoints=True, variant="custom",
+                d_model=96, n_layers=4, n_heads=5, d_ff=384,  # 96 % 5 = 1
+            )
+        msg = str(exc_info.value)
+        assert "divisible" in msg
+        assert "n_heads" in msg
+        assert "d_model" in msg
+
+    def test_pretrain_custom_accepts_compatible_head_dim(self):
+        cfg = PretrainConfig(
+            local_checkpoints=True, variant="custom",
+            d_model=96, n_layers=4, n_heads=4, d_ff=384,  # 96 % 4 = 0
+        )
+        assert cfg.d_model == 96
+        assert cfg.n_heads == 4
+
+    def test_pretrain_custom_rejects_nonpositive(self):
+        with pytest.raises(ValidationError) as exc_info:
+            PretrainConfig(
+                local_checkpoints=True, variant="custom",
+                d_model=0, n_layers=4, n_heads=4, d_ff=512,
+            )
+        assert "positive" in str(exc_info.value)
+
+    def test_cotrain_variant_custom_rejects_incompatible_head_dim(self):
+        with pytest.raises(ValidationError) as exc_info:
+            CotrainVariant(
+                name="weird", variant="custom",
+                d_model=96, n_layers=4, n_heads=5, d_ff=384,
+            )
+        msg = str(exc_info.value)
+        assert "divisible" in msg
+        assert "weird" in msg  # names the offending variant
+
+    def test_cotrain_variant_custom_accepts_compatible_head_dim(self):
+        v = CotrainVariant(
+            name="ok", variant="custom",
+            d_model=128, n_layers=4, n_heads=4, d_ff=512,  # 128 % 4 = 0
+        )
+        assert v.d_model == 128
+
     def test_extra_fields_behavior(self):
         """Pydantic by default ignores extra fields unless model_config forbids."""
         # Should not raise (extra fields silently ignored by default)
