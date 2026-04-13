@@ -324,7 +324,10 @@ class ModelSlot:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_cotrain_resume_prepend_outcome(config: CotrainConfig) -> None:
+def _resolve_cotrain_resume_prepend_outcome(
+    config: CotrainConfig,
+    metadata_cache: dict[str, dict] | None = None,
+) -> None:
     """Peek at each variant's resume checkpoint and align config.prepend_outcome
     with what the checkpoints were actually trained on.
 
@@ -333,6 +336,14 @@ def _resolve_cotrain_resume_prepend_outcome(config: CotrainConfig) -> None:
     loud error. Called BEFORE slot construction so each ModelSlot's
     write_config_json sees the corrected format; otherwise the new run
     directory would advertise a format inconsistent with its batches.
+
+    If ``metadata_cache`` is provided, each successfully-read variant's
+    metadata dict is stored under its name so downstream helpers (e.g.
+    ``_warn_cotrain_resume_lr_mismatch``) can skip the extra filesystem
+    or pickle load. Legacy ``.pt`` checkpoints in particular trigger a
+    full ``torch.load`` pickle deserialization via
+    ``read_checkpoint_metadata``, so sharing one read per variant
+    avoids multiplying that cost.
 
     No-op when no variant is resuming.
     """
@@ -349,6 +360,8 @@ def _resolve_cotrain_resume_prepend_outcome(config: CotrainConfig) -> None:
             print(f"WARNING: couldn't peek at {variant_spec.name} resume "
                   f"checkpoint ({e}); assuming current prepend_outcome")
             continue
+        if metadata_cache is not None:
+            metadata_cache[variant_spec.name] = saved
         saved_prepend, reason = infer_prepend_outcome(
             saved.get("training_config"), saved.get("model_config"),
         )
@@ -405,11 +418,68 @@ def _resolve_cotrain_resume_prepend_outcome(config: CotrainConfig) -> None:
         config.prepend_outcome = resumed_prepend
 
 
+def _warn_cotrain_resume_lr_mismatch(
+    config: CotrainConfig,
+    metadata_cache: dict[str, dict] | None = None,
+) -> None:
+    """Warn if any resuming variant's saved ``training.lr`` differs from
+    the new ``config.lr``.
+
+    Cotrain used to silently scale the user-supplied LR by
+    ``batch_size / 256``, which meant an old checkpoint launched at
+    e.g. ``lr=3e-4, batch_size=512`` actually saved ``training.lr=6e-4``
+    in its config.json (the scaled value). This PR removed that
+    scaling, so resuming such a checkpoint with the original CLI args
+    (``lr=3e-4``) would silently halve the effective LR mid-training —
+    ``CosineWithWarmup`` captures ``base_lrs`` from the newly
+    constructed optimizer (at the new ``config.lr``) and overrides the
+    loaded per-group lr on its first ``step()``.
+
+    This helper just warns and tells the user how to pin the old LR.
+    No override — the whole point of this PR is that cotrain should
+    never silently rewrite the user's LR.
+
+    If ``metadata_cache`` is provided, reuses already-read metadata
+    instead of touching the filesystem again. Legacy ``.pt`` resumes
+    would otherwise trigger a second full pickle deserialization here.
+    """
+    from pawn.checkpoint import read_checkpoint_metadata
+    for variant_spec in config.variants:
+        if not variant_spec.resume:
+            continue
+        saved: dict | None = None
+        if metadata_cache is not None and variant_spec.name in metadata_cache:
+            saved = metadata_cache[variant_spec.name]
+        else:
+            try:
+                saved = read_checkpoint_metadata(variant_spec.resume)
+            except (FileNotFoundError, OSError):
+                continue
+        training_cfg = saved.get("training_config") or {}
+        saved_lr = training_cfg.get("lr")
+        if saved_lr is None:
+            continue
+        try:
+            saved_lr_f = float(saved_lr)
+        except (TypeError, ValueError):
+            continue
+        if abs(saved_lr_f - config.lr) > 1e-12:
+            print(
+                f"  [{variant_spec.name}] WARNING: resuming checkpoint "
+                f"trained with lr={saved_lr_f:.2e}, but run config "
+                f"lr={config.lr:.2e}. Training will continue at "
+                f"{config.lr:.2e} from here — CosineWithWarmup's base_lrs "
+                f"are captured from the fresh optimizer. If this is a "
+                f"pre-scaling-removal cotrain checkpoint, pass "
+                f"lr={saved_lr_f:.2e} explicitly in the run config to "
+                f"preserve the effective LR."
+            )
+
+
 def _build_variant_configs(
     variant_spec: CotrainVariant,
     shared: CotrainConfig,
     device: str,
-    scaled_lr: float,
 ) -> tuple[CLMConfig, TrainingConfig]:
     """Build internal CLMConfig + TrainingConfig for one variant."""
     variant_factory = {
@@ -448,7 +518,7 @@ def _build_variant_configs(
         model_cfg.max_seq_len = 256
 
     train_cfg = TrainingConfig()
-    train_cfg.lr = scaled_lr
+    train_cfg.lr = shared.lr
     train_cfg.total_steps = shared.total_steps or train_cfg.total_steps
     train_cfg.batch_size = shared.batch_size
     train_cfg.num_workers = shared.num_workers
@@ -502,11 +572,6 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
 
     total_steps = config.total_steps or 100_000
 
-    # Linear LR scaling: lr = base_lr * (batch_size / base_batch_size)
-    base_batch_size = 256
-    base_lr = config.lr
-    scaled_lr = base_lr * (config.batch_size / base_batch_size)
-
     slug = random_slug()
     variant_names = [v.name for v in config.variants]
 
@@ -527,14 +592,25 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
         )
     if config.prepend_outcome:
         print("Outcome token: PREPENDED at position 0 (outcome-conditioned training)")
-    print(f"LR: {scaled_lr:.2e} (scaled from {base_lr:.2e} for batch {config.batch_size})")
+    print(f"LR: {config.lr:.2e}")
     print()
 
     # Correct config.prepend_outcome BEFORE constructing slots. Each
     # ModelSlot writes its own config.json during __init__, so a
     # post-construction override would leave the new run directory
     # advertising a format inconsistent with what it actually trained on.
-    _resolve_cotrain_resume_prepend_outcome(config)
+    # Share a metadata cache with the LR-mismatch check below so a
+    # legacy .pt resume triggers at most one full pickle load here,
+    # not two.
+    resume_metadata: dict[str, dict] = {}
+    _resolve_cotrain_resume_prepend_outcome(config, metadata_cache=resume_metadata)
+
+    # Warn if resuming a pre-scaling-removal checkpoint whose saved LR
+    # differs from the new run config's LR. We don't override anything —
+    # this PR's whole point is that cotrain shouldn't silently rewrite
+    # user LRs — but the mismatch is subtle enough that a loud warning
+    # is warranted.
+    _warn_cotrain_resume_lr_mismatch(config, metadata_cache=resume_metadata)
 
     # Build slots (now uses the corrected config.prepend_outcome, so each
     # slot's TrainingConfig and config.json reflect the actual sequence
@@ -542,7 +618,7 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     slots: list[ModelSlot] = []
     for variant_spec in config.variants:
         model_cfg, train_cfg = _build_variant_configs(
-            variant_spec, config, device, scaled_lr,
+            variant_spec, config, device,
         )
         hf_repo = f"{config.hf_repo}-{variant_spec.name}" if config.hf_repo else None
         slots.append(ModelSlot(
