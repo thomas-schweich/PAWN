@@ -41,7 +41,9 @@ def parse_args():
     p.add_argument("--checkpoint-interval", type=int, default=5000)
     p.add_argument("--discard-ply-limit", action="store_true")
     p.add_argument("--no-outcome-token", action="store_true",
-                    help="Strip outcome token from sequences (ablation experiment)")
+                    help="Deprecated no-op (sequences are pure moves by default)")
+    p.add_argument("--prepend-outcome", action="store_true",
+                    help="Prepend outcome token at position 0 for outcome-conditioned training")
     p.add_argument("--patience", type=int, default=10,
                     help="Stop if no val loss improvement for N eval intervals (0=disabled)")
     p.add_argument("--wandb", action="store_true")
@@ -86,6 +88,7 @@ def _args_to_cotrain_config(args) -> CotrainConfig:
         checkpoint_interval=args.checkpoint_interval,
         discard_ply_limit=args.discard_ply_limit,
         no_outcome_token=args.no_outcome_token,
+        prepend_outcome=args.prepend_outcome,
         patience=args.patience,
         wandb=args.wandb,
         hf_repo=args.hf_repo,

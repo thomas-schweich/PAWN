@@ -346,6 +346,7 @@ def _build_variant_configs(
     train_cfg.checkpoint_interval = shared.checkpoint_interval
     train_cfg.discard_ply_limit = shared.discard_ply_limit
     train_cfg.no_outcome_token = shared.no_outcome_token
+    train_cfg.prepend_outcome = shared.prepend_outcome
     train_cfg.mate_boost = shared.mate_boost
     train_cfg.use_wandb = shared.wandb
     train_cfg.use_amp = shared.amp_dtype != "none"
@@ -403,8 +404,8 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     print(f"Variants: {', '.join(variant_names)}")
     if config.shm_checkpoints:
         print("Checkpoints: /dev/shm (volatile, HF push is durable store)")
-    if config.no_outcome_token:
-        print("Outcome token: DISABLED (ablation experiment)")
+    if config.prepend_outcome:
+        print("Outcome token: PREPENDED at position 0 (outcome-conditioned training)")
     print(f"LR: {scaled_lr:.2e} (scaled from {base_lr:.2e} for batch {config.batch_size})")
     print()
 
@@ -441,14 +442,16 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     dataset = CLMDataset(
         config.batch_size, max_ply, base_seed=42,
         discard_ply_limit=config.discard_ply_limit,
-        no_outcome=config.no_outcome_token,
+        mate_boost=config.mate_boost,
+        prepend_outcome=config.prepend_outcome,
     )
 
     print("\nGenerating shared validation set...")
     val_data = create_validation_set(
         config.val_games, max_ply, seed=(2**63) - 1,
         discard_ply_limit=config.discard_ply_limit,
-        no_outcome=config.no_outcome_token,
+        mate_boost=config.mate_boost,
+        prepend_outcome=config.prepend_outcome,
     )
 
     # Compile models
