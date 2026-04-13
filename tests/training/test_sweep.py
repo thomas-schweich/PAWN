@@ -10,8 +10,8 @@ import pytest
 import optuna
 
 from pawn.sweep import (
-    ADAPTER_SCRIPTS,
     SUGGEST_FNS,
+    TRAIN_SCRIPT,
     create_study,
     suggest_architecture,
     suggest_bottleneck,
@@ -167,25 +167,24 @@ class TestSuggestSparse:
 
 
 class TestSuggestHybrid:
-    def test_has_lora_and_film_lrs(self):
+    def test_has_required_hybrid_fields(self):
         params = {
+            "lr": 1e-3,
             "batch_size": 64,
             "weight_decay": 0.01,
             "warmup_frac": 0.05,
             "patience": 10,
-            "lora_lr": 1e-3,
-            "film_lr": 1e-4,
             "lora_rank": 4,
             "lora_targets": "qkvo",
-            "no_film": False,
+            "use_output_film": False,
         }
         trial = optuna.trial.FixedTrial(params)
         out = suggest_hybrid(trial)
-        assert "lora_lr" in out
-        assert "film_lr" in out
+        assert "lr" in out
         assert "lora_rank" in out
-        assert out["lora_lr"] == pytest.approx(1e-3)
-        assert out["film_lr"] == pytest.approx(1e-4)
+        assert "use_output_film" in out
+        assert out["lr"] == pytest.approx(1e-3)
+        assert out["use_output_film"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +197,7 @@ _ROSA_PARAMS = {
     "density": 0.01,
     "lora_rank": 4,
     "lora_targets": "qkvo",
-    "warmup_steps": 64,
+    "rosa_warmup_steps": 64,
     "mask_samples": 32,
     "grad_alpha": 2,
 }
@@ -208,7 +207,7 @@ class TestSuggestRosa:
     def test_has_mode_rosa(self):
         trial = optuna.trial.FixedTrial(_ROSA_PARAMS)
         out = suggest_rosa(trial)
-        assert out["mode"] == "rosa"
+        assert out["rosa_mode"] == "rosa"
 
     def test_has_required_rosa_fields(self):
         trial = optuna.trial.FixedTrial(_ROSA_PARAMS)
@@ -216,7 +215,7 @@ class TestSuggestRosa:
         assert "density" in out
         assert "lora_rank" in out
         assert "lora_targets" in out
-        assert "warmup_steps" in out
+        assert "rosa_warmup_steps" in out
         assert "mask_samples" in out
         assert "grad_alpha" in out
 
@@ -225,7 +224,7 @@ class TestSuggestRetroSparse:
     def test_has_mode_retro_sparse(self):
         trial = optuna.trial.FixedTrial(_ROSA_PARAMS)
         out = suggest_retro_sparse(trial)
-        assert out["mode"] == "retro-sparse"
+        assert out["rosa_mode"] == "retro-sparse"
 
 
 class TestSuggestRetroBottleneck:
@@ -233,7 +232,7 @@ class TestSuggestRetroBottleneck:
         params = {**_ROSA_PARAMS, "bottleneck_dim": 8}
         trial = optuna.trial.FixedTrial(params)
         out = suggest_retro_bottleneck(trial)
-        assert out["mode"] == "retro-bottleneck"
+        assert out["rosa_mode"] == "retro-bottleneck"
         assert out["bottleneck_dim"] == 8
 
 
@@ -351,10 +350,10 @@ class TestAdapterScriptsRegistry:
         ["lora", "bottleneck", "film", "sparse", "hybrid", "rosa", "tiny", "pretrain"],
     )
     def test_key_present(self, name):
-        assert name in ADAPTER_SCRIPTS
+        assert name in SUGGEST_FNS
 
-    def test_pretrain_points_to_train(self):
-        assert ADAPTER_SCRIPTS["pretrain"] == "scripts/train.py"
+    def test_unified_entry_point(self):
+        assert TRAIN_SCRIPT == "scripts/train.py"
 
 
 # ---------------------------------------------------------------------------

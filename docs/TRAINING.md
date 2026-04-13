@@ -105,7 +105,7 @@ uv run python scripts/train.py --run-type adapter --strategy bottleneck \
 
 ### Adapter training defaults
 
-- **Epochs**: 50 (with early stopping, patience=10)
+- **Epochs**: 50 (early stopping is opt-in via `--patience N`; default is no early stopping)
 - **Batch size**: 64
 - **Optimizer**: AdamW (lr=3e-4)
 - **LR schedule**: cosine with 5% warmup

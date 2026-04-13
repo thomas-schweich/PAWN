@@ -20,6 +20,8 @@ import json
 import shutil
 from pathlib import Path
 
+from pawn.checkpoint import _write_complete_sentinel
+
 
 def find_best_step(metrics_path: Path) -> int | None:
     """Find the step with lowest val loss from metrics.jsonl."""
@@ -51,7 +53,14 @@ def truncate_metrics(metrics_path: Path, up_to_step: int) -> list[str]:
 
 
 def copy_checkpoint(src: Path, dst: Path) -> None:
-    """Copy a directory-format checkpoint into the HF export layout."""
+    """Copy a directory-format checkpoint into the HF export layout.
+
+    The source's ``.complete`` sentinel is dropped during copy (its
+    hashes are keyed to the source directory's file order) and a fresh
+    sentinel is written for ``dst`` so the exported checkpoint is
+    loadable via every ``pawn.checkpoint`` load path, including
+    ``load_pretrain_checkpoint`` which insists on a valid sentinel.
+    """
     dst.mkdir(parents=True, exist_ok=True)
     for item in src.iterdir():
         if item.name == ".complete":
@@ -61,11 +70,7 @@ def copy_checkpoint(src: Path, dst: Path) -> None:
             shutil.copytree(item, target, dirs_exist_ok=True)
         else:
             shutil.copy2(item, target)
-
-
-def read_checkpoint_config(ckpt_dir: Path) -> dict:
-    with open(ckpt_dir / "config.json") as f:
-        return json.load(f)
+    _write_complete_sentinel(dst)
 
 
 def generate_readme(
@@ -75,9 +80,9 @@ def generate_readme(
 ) -> str:
     """Generate a HuggingFace model card README.
 
-    All architecture fields come from the checkpoint's saved model_config so
-    the card stays correct whether the checkpoint is old-vocab (4284 / 256)
-    or new-vocab (1980 / 512).
+    All architecture fields come from the checkpoint's saved
+    ``model_config``, so the card stays correct regardless of whether
+    the checkpoint was trained with a named preset or custom arch.
     """
     d_model = model_config.get("d_model", "?")
     n_layers = model_config.get("n_layers", "?")
@@ -86,13 +91,9 @@ def generate_readme(
     vocab_size = model_config.get("vocab_size", "?")
     max_seq_len = model_config.get("max_seq_len", "?")
 
-    variant = "custom"
-    if d_model == 256:
-        variant = "small"
-    elif d_model == 512:
-        variant = "base"
-    elif d_model == 640:
-        variant = "large"
+    # `CLMConfig(**model_config)` reconstructs the exact trained
+    # architecture from the saved dict regardless of whether it matches
+    # a named preset, so the usage snippet below is always correct.
 
     return f"""---
 license: apache-2.0
@@ -140,11 +141,16 @@ A causal transformer trained on random chess games, designed as a testbed for fi
 ## Usage
 
 ```python
+import json
 from safetensors.torch import load_file
 from pawn.config import CLMConfig
 from pawn.model import PAWNCLM
 
-cfg = CLMConfig.{variant}() if "{variant}" != "custom" else CLMConfig()
+# Reconstruct the exact architecture this checkpoint was trained with
+with open("config.json") as f:
+    model_config = json.load(f)["model_config"]
+cfg = CLMConfig(**model_config)
+
 model = PAWNCLM(cfg)
 model.load_state_dict(load_file("model.safetensors"))
 model.eval()
@@ -206,7 +212,8 @@ def main():
     )
     print(f"Best checkpoint: {best_ckpt}")
 
-    config = read_checkpoint_config(best_ckpt)
+    with open(best_ckpt / "config.json") as f:
+        config = json.load(f)
     model_config = config.get("model_config", {})
     training_config = config.get("training_config", {})
 

@@ -285,6 +285,42 @@ def read_checkpoint_metadata(path: str | Path) -> dict:
     }
 
 
+class IncompatibleCheckpointError(Exception):
+    """Raised when a checkpoint's saved model_config is incompatible with
+    the current codebase (e.g. pre-migration vocab/context)."""
+    pass
+
+
+def _check_checkpoint_compatible(model_config: dict | None, path_hint: str | Path) -> None:
+    """Fail loud when loading a checkpoint whose vocab layout doesn't
+    match the current ``CLMConfig`` defaults.
+
+    The repo migrated to a new 1,980-token vocabulary (searchless_chess)
+    and a 512-token context window. Pre-migration checkpoints (4,284
+    vocab / 256 ctx) would silently load with mismatched embeddings — the
+    shapes happen to match for the factored-embedding layers, but the
+    decomposition table is different and every token would be embedded
+    as the wrong move.
+
+    Refuse to load those checkpoints and point the user at the
+    ``pre-vocab-transition`` git tag, which preserves the code the old
+    checkpoints were trained with.
+    """
+    if not model_config:
+        return
+    from pawn.config import CLMConfig
+    expected_vocab = CLMConfig().vocab_size
+    vocab = model_config.get("vocab_size")
+    if vocab is not None and vocab != expected_vocab:
+        raise IncompatibleCheckpointError(
+            f"Checkpoint {path_hint} has vocab_size={vocab}, but this "
+            f"codebase only supports vocab_size={expected_vocab}. "
+            "Pre-migration checkpoints (4284-token vocab / 256-ctx) are "
+            "no longer loadable on `main`; check out the "
+            "`pre-vocab-transition` git tag to work with them."
+        )
+
+
 def get_prepend_outcome(training_config: dict | None) -> bool:
     """Return the saved ``prepend_outcome`` flag for a checkpoint.
 
@@ -379,11 +415,17 @@ def load_pretrain_checkpoint(
 ) -> dict:
     """Load a pretraining checkpoint with integrity verification.
 
-    Verifies the .complete sentinel and SHA-256 hashes before loading.
+    Verifies the .complete sentinel and SHA-256 hashes before loading
+    and refuses to load pre-migration checkpoints whose vocab_size
+    doesn't match the current codebase.
     """
     path = Path(path)
 
     _verify_complete_sentinel(path)
+
+    with open(path / "config.json") as f:
+        saved_config = json.load(f)
+    _check_checkpoint_compatible(saved_config.get("model_config"), path)
 
     weights = load_file(path / "model.safetensors", device=device)
     model.load_state_dict(weights)
@@ -560,22 +602,24 @@ def load_backbone_weights(
         # Verify integrity if .complete exists (new format checkpoints)
         if (path / ".complete").exists():
             _verify_complete_sentinel(path)
-        weights = load_file(sf_path, device=device)
         config = None
         config_path = path / "config.json"
         if config_path.exists():
             with open(config_path) as f:
                 config = json.load(f).get("model_config")
+        _check_checkpoint_compatible(config, path)
+        weights = load_file(sf_path, device=device)
         return weights, config
 
     # Bare safetensors file
     if path.suffix == ".safetensors":
-        weights = load_file(path, device=device)
         config = None
         config_path = path.parent / "config.json"
         if config_path.exists():
             with open(config_path) as f:
                 config = json.load(f).get("model_config")
+        _check_checkpoint_compatible(config, path)
+        weights = load_file(path, device=device)
         return weights, config
 
     raise ValueError(f"Unrecognized checkpoint format: {path}")
@@ -590,7 +634,6 @@ def _load_from_hf_repo(
 
     print(f"Downloading weights from HuggingFace: {repo_id}")
     sf_path = hf_hub_download(repo_id, "model.safetensors")
-    weights = load_file(sf_path, device=device)
 
     config = None
     try:
@@ -599,7 +642,9 @@ def _load_from_hf_repo(
             config = json.load(f).get("model_config")
     except Exception:
         pass
+    _check_checkpoint_compatible(config, repo_id)
 
+    weights = load_file(sf_path, device=device)
     return weights, config
 
 

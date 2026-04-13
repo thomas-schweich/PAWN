@@ -7,13 +7,13 @@ en passant, etc.) rather than relying on random sampling.
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 import chess_engine as engine
 
 from pawn.config import PAD_TOKEN
 from pawn.data import _map_termination_to_outcome
+from pawn.model import PAWNCLM
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +210,7 @@ def _term_code_to_outcome_name(tc: int, gl: int) -> str:
 
 @torch.no_grad()
 def evaluate_diagnostic_positions(
-    model: nn.Module,
+    model: PAWNCLM,
     positions: dict,
     corpus: dict,
     device: str,
@@ -220,11 +220,14 @@ def evaluate_diagnostic_positions(
     """Evaluate model behavior at diagnostic positions.
 
     For each position, collect the full softmax distribution and sample
-    N moves. Check legality via the engine.
+    N moves. Check legality via the engine. Sequences are capped at
+    ``model.cfg.max_seq_len`` so the same routine works for 256-ctx and
+    512-ctx checkpoints.
 
     Returns dict[category] -> metrics dict.
     """
     model.eval()
+    model_max_seq_len = model.cfg.max_seq_len
     move_ids = corpus["move_ids"]
     game_lengths = corpus["game_lengths"]
     term_codes = corpus["termination_codes"]
@@ -248,7 +251,7 @@ def evaluate_diagnostic_positions(
             # To predict move at ply t, input is [outcome, m_0, ..., m_{t-1}]
             # (t+1 tokens total). The model at position t predicts ply t's move.
             max_seq = max(p["ply"] + 1 for p in batch_pos)  # outcome + t moves
-            seq_len = min(max_seq, 512)
+            seq_len = min(max_seq, model_max_seq_len)
 
             input_seqs = np.full((B, seq_len), PAD_TOKEN, dtype=np.int64)
             pred_positions = []
@@ -298,7 +301,7 @@ def evaluate_diagnostic_positions(
                 sampled = sampled.squeeze(-1).cpu().numpy()
 
                 # Replay game to this position and check legality
-                gs = engine.PyGameState(max_ply=512)
+                gs = engine.PyGameState(max_ply=model_max_seq_len)
                 g = pos["game_idx"]
                 for mv_idx in range(pos["ply"]):
                     gs.make_move(int(move_ids[g, mv_idx]))

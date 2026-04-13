@@ -5,12 +5,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 import chess_engine as engine
 
 from pawn.config import PAD_TOKEN, WHITE_CHECKMATES, PLY_LIMIT
 from pawn.data import pack_clm_sequences, _map_termination_to_outcome
+from pawn.model import PAWNCLM
 
 
 # ---------------------------------------------------------------------------
@@ -121,17 +121,24 @@ def _extract_elos_from_pgn(pgn_path: Path, max_games: int) -> list[tuple[int, in
 
 @torch.no_grad()
 def evaluate_on_lichess(
-    model: nn.Module,
+    model: PAWNCLM,
     lichess_data: dict,
     device: str,
-    max_seq_len: int = 512,
+    max_seq_len: int | None = None,
     eval_batch_size: int = 32,
 ) -> dict:
     """Run next-token prediction metrics on Lichess games.
 
+    ``max_seq_len`` defaults to the loaded model's configured context
+    length (``model.cfg.max_seq_len``) so the same eval function works
+    for both 256-ctx and 512-ctx checkpoints without callers having to
+    thread the value through manually.
+
     For each Elo band, computes loss, perplexity, top-1 accuracy, top-5
     accuracy, and legal move rate.
     """
+    if max_seq_len is None:
+        max_seq_len = model.cfg.max_seq_len
     model.eval()
     results = {}
 

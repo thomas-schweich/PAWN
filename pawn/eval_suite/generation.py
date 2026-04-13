@@ -19,6 +19,8 @@ from pawn.data import _map_termination_to_outcome
 class GenerativeModel(Protocol):
     """Structural type for models usable in autoregressive generation."""
 
+    cfg: CLMConfig
+
     def eval(self) -> nn.Module: ...
 
     def __call__(
@@ -48,11 +50,15 @@ def autoregressive_generate(
     mask_illegal: bool = False,
     prefix_moves: np.ndarray | None = None,
     prefix_lengths: np.ndarray | None = None,
-    max_seq_len: int = 512,
+    max_seq_len: int | None = None,
     temperature: float = 1.0,
     batch_size: int = 64,
 ) -> dict[str, np.ndarray]:
     """Generate games autoregressively from a trained PAWN.
+
+    ``max_seq_len`` defaults to the model's configured context length so
+    the same generator works for 256-ctx and 512-ctx checkpoints without
+    callers threading the value through.
 
     Args:
         model: Trained PAWN model.
@@ -62,7 +68,7 @@ def autoregressive_generate(
         mask_illegal: If True, set illegal move logits to -inf during game phase.
         prefix_moves: Optional (n_games, prefix_len) int16 array of prefix moves.
         prefix_lengths: Optional (n_games,) int array of prefix lengths.
-        max_seq_len: Total sequence length.
+        max_seq_len: Total sequence length (default: model.cfg.max_seq_len).
         temperature: Sampling temperature.
         batch_size: Number of games to generate in parallel.
 
@@ -73,6 +79,8 @@ def autoregressive_generate(
         - forfeit_ply: (n_games,) int — ply of first illegal move (-1 if none)
         - terminated_at: (n_games,) int — ply of termination
     """
+    if max_seq_len is None:
+        max_seq_len = model.cfg.max_seq_len
     model.eval()
     all_results = []
 

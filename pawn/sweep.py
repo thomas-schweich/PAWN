@@ -86,18 +86,17 @@ def suggest_sparse(trial: "optuna.trial.BaseTrial") -> dict:
 
 
 def suggest_hybrid(trial: "optuna.trial.BaseTrial") -> dict:
-    """Hybrid (LoRA + FiLM) hyperparameters."""
-    params = {
-        "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128, 256]),
-        "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
-        "warmup_frac": trial.suggest_float("warmup_frac", 0.0, 0.15),
-        "patience": trial.suggest_int("patience", 5, 20),
-        "lora_lr": trial.suggest_float("lora_lr", 1e-5, 1e-2, log=True),
-        "film_lr": trial.suggest_float("film_lr", 1e-5, 1e-2, log=True),
-        "lora_rank": trial.suggest_categorical("lora_rank", [2, 4, 8, 16]),
-        "lora_targets": trial.suggest_categorical("lora_targets", ["qkvo", "qv", "qkv"]),
-        "no_film": trial.suggest_categorical("no_film", [True, False]),
-    }
+    """Hybrid (LoRA + FiLM) hyperparameters.
+
+    The unified adapter CLI uses a single ``lr`` for all trainable
+    parameters and builds ``HybridCLM`` with FiLM always enabled on
+    hidden layers. The only FiLM-related toggle exposed to the sweep
+    is whether the output logits get a FiLM layer.
+    """
+    params = suggest_common(trial)
+    params["lora_rank"] = trial.suggest_categorical("lora_rank", [2, 4, 8, 16])
+    params["lora_targets"] = trial.suggest_categorical("lora_targets", ["qkvo", "qv", "qkv"])
+    params["use_output_film"] = trial.suggest_categorical("use_output_film", [True, False])
     return params
 
 
@@ -150,7 +149,7 @@ def _suggest_rosa_common(trial: "optuna.trial.BaseTrial") -> dict:
     params["density"] = trial.suggest_float("density", 0.001, 0.1, log=True)
     params["lora_rank"] = trial.suggest_categorical("lora_rank", [2, 4, 8, 16])
     params["lora_targets"] = trial.suggest_categorical("lora_targets", ["qkvo", "qv", "qkv"])
-    params["warmup_steps"] = trial.suggest_int("warmup_steps", 32, 256, step=32)
+    params["rosa_warmup_steps"] = trial.suggest_int("rosa_warmup_steps", 32, 256, step=32)
     params["mask_samples"] = trial.suggest_categorical("mask_samples", [16, 32, 64])
     params["grad_alpha"] = trial.suggest_categorical("grad_alpha", [1, 2])
     return params
@@ -159,21 +158,21 @@ def _suggest_rosa_common(trial: "optuna.trial.BaseTrial") -> dict:
 def suggest_rosa(trial: "optuna.trial.BaseTrial") -> dict:
     """Standard RoSA: joint LoRA + gradient-informed sparse."""
     params = _suggest_rosa_common(trial)
-    params["mode"] = "rosa"
+    params["rosa_mode"] = "rosa"
     return params
 
 
 def suggest_retro_sparse(trial: "optuna.trial.BaseTrial") -> dict:
     """Retrospective sparse-only with gradient-informed masks."""
     params = _suggest_rosa_common(trial)
-    params["mode"] = "retro-sparse"
+    params["rosa_mode"] = "retro-sparse"
     return params
 
 
 def suggest_retro_bottleneck(trial: "optuna.trial.BaseTrial") -> dict:
     """Retrospective sparse + bottleneck adapters."""
     params = _suggest_rosa_common(trial)
-    params["mode"] = "retro-bottleneck"
+    params["rosa_mode"] = "retro-bottleneck"
     params["bottleneck_dim"] = trial.suggest_categorical("bottleneck_dim", [4, 8, 16])
     return params
 
@@ -214,7 +213,7 @@ def suggest_rosa_ratio(trial: "optuna.trial.BaseTrial") -> dict:
     trial.set_user_attr("actual_total_params", actual_bn + actual_sp)
 
     return {
-        "mode": "retro-bottleneck",
+        "rosa_mode": "retro-bottleneck",
         "bottleneck_dim": bottleneck_dim,
         "density": density,
         "lr": trial.suggest_float("lr", 1e-4, 3e-3, log=True),
@@ -224,7 +223,7 @@ def suggest_rosa_ratio(trial: "optuna.trial.BaseTrial") -> dict:
         "patience": 10,
         "lora_rank": 4,
         "lora_targets": "qkvo",
-        "warmup_steps": trial.suggest_int("warmup_steps", 64, 128, step=64),
+        "rosa_warmup_steps": trial.suggest_int("rosa_warmup_steps", 64, 128, step=64),
         "mask_samples": 32,
         "grad_alpha": 2,
     }
@@ -245,20 +244,8 @@ SUGGEST_FNS = {
     "pretrain": suggest_pretrain,
 }
 
-ADAPTER_SCRIPTS = {
-    "lora": "scripts/train.py",
-    "bottleneck": "scripts/train.py",
-    "film": "scripts/train.py",
-    "sparse": "scripts/train.py",
-    "hybrid": "scripts/train.py",
-    "rosa": "scripts/train.py",
-    "retro-sparse": "scripts/train.py",
-    "retro-bottleneck": "scripts/train.py",
-    "rosa-ratio": "scripts/train.py",
-    "tiny": "scripts/train.py",
-    "pretrain": "scripts/train.py",
-    "architecture": "scripts/train.py",
-}
+# All sweep targets dispatch through the unified training entry point.
+TRAIN_SCRIPT = "scripts/train.py"
 
 _ADAPTER_STRATEGY = {
     "lora": "lora",
@@ -353,7 +340,12 @@ class AdapterObjective:
         self.epochs = epochs
         self.n_gpus = n_gpus
         self.extra_args = extra_args or []
-        self.script = ADAPTER_SCRIPTS[adapter_type]
+        if adapter_type not in SUGGEST_FNS:
+            raise ValueError(
+                f"Unknown adapter_type {adapter_type!r}; "
+                f"expected one of {sorted(SUGGEST_FNS)}"
+            )
+        self.script = TRAIN_SCRIPT
 
     def __call__(self, trial: "optuna.trial.BaseTrial") -> float:
         suggest_fn = SUGGEST_FNS[self.adapter_type]

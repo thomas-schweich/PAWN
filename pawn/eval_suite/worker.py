@@ -92,8 +92,9 @@ def _probes_worker(checkpoint_path: str, device: str, n_train: int, n_val: int,
                    n_epochs: int, seed_train: int, seed_val: int) -> dict:
     from pawn.eval_suite.probes import extract_probe_data, train_all_probes
     model = _load_model(checkpoint_path, device)
-    train_data = extract_probe_data(n_train, max_ply=512, seed=seed_train)
-    val_data = extract_probe_data(n_val, max_ply=512, seed=seed_val)
+    max_ply = model.cfg.max_seq_len
+    train_data = extract_probe_data(n_train, max_ply=max_ply, seed=seed_train)
+    val_data = extract_probe_data(n_val, max_ply=max_ply, seed=seed_val)
     return train_all_probes(model, train_data, val_data, device,
                             per_layer=True, n_epochs=n_epochs, verbose=True)
 

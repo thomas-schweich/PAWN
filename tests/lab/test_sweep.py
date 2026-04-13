@@ -27,9 +27,9 @@ class TestBuiltinDistributions:
         assert "density" in dists
         assert "sparse_targets" in dists
 
-    def test_hybrid_has_film_lr(self):
+    def test_hybrid_has_use_output_film(self):
         dists = builtin_distributions("hybrid")
-        assert "film_lr" in dists
+        assert "use_output_film" in dists
         assert "lora_rank" in dists
 
     def test_rosa_has_rosa_warmup_steps(self):

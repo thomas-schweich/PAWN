@@ -61,7 +61,7 @@ logits_adapted = gamma * logits + beta  (output, dim = vocab_size)
 Identity-initialized: gamma=1, beta=0.
 
 **Key parameters:**
-- `use_output_film` -- apply FiLM to output logits as well (default: True)
+- `use_output_film` -- apply FiLM to output logits as well (default: False)
 
 **Param count:** `n_layers * 2 * d_model + 2 * vocab_size` = ~17K. The lightest adapter by far -- only diagonal (per-channel) modulation with no cross-channel mixing.
 
