@@ -72,7 +72,7 @@ def suggest_bottleneck(trial: "optuna.trial.BaseTrial") -> dict:
 def suggest_film(trial: "optuna.trial.BaseTrial") -> dict:
     """FiLM hyperparameters."""
     params = suggest_common(trial)
-    params["no_output_film"] = trial.suggest_categorical("no_output_film", [True, False])
+    params["use_output_film"] = trial.suggest_categorical("use_output_film", [True, False])
     return params
 
 

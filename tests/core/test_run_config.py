@@ -811,10 +811,17 @@ class TestCustomVariant:
         )
         assert v.d_model == 128
 
-    def test_extra_fields_behavior(self):
-        """Pydantic by default ignores extra fields unless model_config forbids."""
-        # Should not raise (extra fields silently ignored by default)
-        cfg = PretrainConfig.model_validate(
-            {"local_checkpoints": True, "bogus_field": "value"}
-        )
-        assert not hasattr(cfg, "bogus_field")
+    def test_extra_fields_forbidden(self):
+        """Unknown fields are rejected so stale CLI flags (e.g. legacy
+        `--legacy-vocab`) don't silently run with wrong architecture."""
+        with pytest.raises(ValidationError, match="bogus_field"):
+            PretrainConfig.model_validate(
+                {"local_checkpoints": True, "bogus_field": "value"}
+            )
+
+    def test_stale_legacy_vocab_rejected(self):
+        """Regression guard: legacy_vocab was removed — passing it must fail."""
+        with pytest.raises(ValidationError, match="legacy_vocab"):
+            PretrainConfig.model_validate(
+                {"local_checkpoints": True, "legacy_vocab": True}
+            )

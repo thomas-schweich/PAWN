@@ -122,12 +122,12 @@ class TestSuggestBottleneck:
 
 
 class TestSuggestFilm:
-    def test_has_no_output_film_key(self):
-        params = {**_COMMON_PARAMS, "no_output_film": True}
+    def test_has_use_output_film_key(self):
+        params = {**_COMMON_PARAMS, "use_output_film": True}
         trial = optuna.trial.FixedTrial(params)
         out = suggest_film(trial)
-        assert "no_output_film" in out
-        assert out["no_output_film"] is True
+        assert "use_output_film" in out
+        assert out["use_output_film"] is True
 
 
 # ---------------------------------------------------------------------------

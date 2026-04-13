@@ -77,7 +77,7 @@ def _detect_adapter_type(config: dict) -> str:
         return "lora"
     if "density" in config:
         return "sparse"
-    if "no_output_film" in config:
+    if "use_output_film" in config:
         return "film"
 
     raise ValueError("Cannot detect adapter type from config keys: "
@@ -118,7 +118,7 @@ def load_model(checkpoint_path: str, adapter_path: str, device: str):
 
     elif adapter_type == "film":
         from pawn.adapters.film import FiLMCLM
-        has_output = not adapter_config.get("no_output_film", False)
+        has_output = adapter_config.get("use_output_film", False)
         if any(k.startswith("output_film.") for k in adapter_weights):
             has_output = True
         model = FiLMCLM(backbone, use_output_film=has_output).to(device)
@@ -136,7 +136,7 @@ def load_model(checkpoint_path: str, adapter_path: str, device: str):
             adapt_ffn=adapter_config.get("lora_ffn", False),
             lora_layers=tuple(int(x) for x in lora_layers.split(",")) if lora_layers else None,
             use_film=adapter_config.get("use_film", True),
-            use_output_film=adapter_config.get("output_film", False),
+            use_output_film=adapter_config.get("use_output_film", False),
             film_layers=tuple(int(x) for x in film_layers.split(",")) if film_layers else None,
         ).to(device)
         model.load_adapter_state_dict(adapter_weights)

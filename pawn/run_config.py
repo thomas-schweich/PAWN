@@ -11,11 +11,18 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class BaseRunConfig(BaseModel):
     """Fields shared by pretraining and adapter runs."""
+
+    # Fail fast when callers pass stale CLI/JSON fields (e.g. the old
+    # ``legacy_vocab`` flag, or misspelled/removed hybrid args). Pydantic
+    # defaults to silently ignoring unknown fields, which makes it easy
+    # to burn a whole training run on a config that doesn't mean what
+    # the user thinks it means.
+    model_config = ConfigDict(extra="forbid")
 
     # Data ----------------------------------------------------------------
     elo_min: int | None = None
