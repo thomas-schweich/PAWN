@@ -437,16 +437,38 @@ class TestLegalGridOutcomePrepended:
 
     @pytest.mark.integration
     def test_preds_aligned_with_legal_grid(self, val):
-        """Using targets as ground-truth preds should yield near-perfect legal rate."""
+        """Using targets as ground-truth preds yields rate 1.0.
+
+        ``compute_legal_move_rate_from_preds`` now skips positions where
+        ``legal_grid`` is empty (end-of-game PAD prediction slots), so
+        every scored position has a legal ground-truth move.
+        """
         from pawn.trainer import compute_legal_move_rate_from_preds
         rate = compute_legal_move_rate_from_preds(
             val["targets"], val["legal_grid"], val["loss_mask"],
             val["game_lengths"],
         )
-        # targets[t] is the actual played move and must be legal; anything
-        # short of ~1.0 means we got the alignment wrong. A little slack for
-        # the zero-padded last row.
-        assert rate > 0.98, f"legal rate {rate} — alignment broken?"
+        assert rate == pytest.approx(1.0), (
+            f"legal rate {rate} — alignment broken or terminal-PAD filter regressed"
+        )
+
+    @pytest.mark.integration
+    def test_pure_moves_targets_also_yield_perfect_rate(self):
+        """Pure-moves mode has the same "skip end-of-game" semantics.
+
+        Historically this test would have measured ~0.995 because the
+        pre-PR code counted the terminal PAD-prediction slot as illegal;
+        the ``has_legal_row`` filter makes both modes consistent.
+        """
+        from pawn.trainer import compute_legal_move_rate_from_preds
+        val = create_validation_set(n_games=32, max_ply=128, seed=42)
+        rate = compute_legal_move_rate_from_preds(
+            val["targets"], val["legal_grid"], val["loss_mask"],
+            val["game_lengths"],
+        )
+        assert rate == pytest.approx(1.0), (
+            f"pure-moves legal rate {rate} — terminal-PAD filter regressed"
+        )
 
 
 # ---------------------------------------------------------------------------

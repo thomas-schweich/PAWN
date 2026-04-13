@@ -156,12 +156,19 @@ class TestComputeLegalMoveRate:
         assert rate == 0.0
 
     def test_partial_legal_rate(self, cpu_device):
-        """Exactly K of N positions have legal argmax -> rate == K/N."""
+        """Exactly K of N positions have legal argmax -> rate == K/N.
+
+        Every position has ≥1 legal move — the 3 "illegal" ones get a
+        different legal move so the row isn't empty (otherwise the
+        has_legal_row filter would skip them as end-of-game slots).
+        """
         V = 1980
         B, T = 2, 3
         max_ply = 3
         action = 0  # a1b1
         src, dst = self._grid_for_action(action)
+        # A different slot that's always non-empty in the "illegal" rows.
+        other_src, other_dst = 7, 8
         preds = torch.full((B, T), action, dtype=torch.long)
         logits = _make_logits(B, T, V, preds)
 
@@ -170,6 +177,12 @@ class TestComputeLegalMoveRate:
         dense[0, 0, src, dst] = 1.0
         dense[0, 1, src, dst] = 1.0
         dense[1, 2, src, dst] = 1.0
+        # Populate the other 3 positions with a different legal move so
+        # the row isn't empty (wouldn't be skipped) but the argmax is
+        # still illegal there.
+        dense[0, 2, other_src, other_dst] = 1.0
+        dense[1, 0, other_src, other_dst] = 1.0
+        dense[1, 1, other_src, other_dst] = 1.0
         legal_grid = _pack_grid(dense)
 
         loss_mask = torch.ones(B, T, dtype=torch.bool)
@@ -327,6 +340,48 @@ class TestComputeLegalMoveRate:
         # Only 2 positions counted (max_ply=2), both legal -> 1.0
         assert rate == pytest.approx(1.0)
 
+    def test_empty_legal_row_skipped(self, cpu_device):
+        """A row of all-zero legal moves (engine never filled beyond
+        game_length) must be skipped, not counted as illegal. Without
+        this filter the terminal PAD-prediction slot in every game
+        depressed legal_move_rate by ~1/gl."""
+        V = 1980
+        B, T = 1, 3
+        max_ply = 3
+        action = 0
+        src, dst = self._grid_for_action(action)
+        preds = torch.full((B, T), action, dtype=torch.long)
+        logits = _make_logits(B, T, V, preds)
+
+        dense = torch.zeros(B, max_ply, 64, 64)
+        # Positions 0 and 1 have action 0 as a legal move; position 2
+        # is all-zeros (simulating a past-end-of-game slot).
+        dense[0, 0, src, dst] = 1.0
+        dense[0, 1, src, dst] = 1.0
+        legal_grid = _pack_grid(dense)
+
+        loss_mask = torch.ones(B, T, dtype=torch.bool)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
+
+        rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
+        # 2 scored positions (both legal), 1 skipped (no legal row) → 1.0
+        assert rate == pytest.approx(1.0)
+
+    def test_all_empty_legal_rows_returns_zero(self, cpu_device):
+        """If every position has an all-zero legal row, nothing is
+        scored — returns 0.0 instead of crashing on /0."""
+        V = 1980
+        B, T = 2, 2
+        max_ply = 2
+        preds = torch.zeros((B, T), dtype=torch.long)
+        logits = _make_logits(B, T, V, preds)
+        dense = torch.zeros(B, max_ply, 64, 64)
+        legal_grid = _pack_grid(dense)
+        loss_mask = torch.ones(B, T, dtype=torch.bool)
+        game_lengths = torch.full((B,), T, dtype=torch.long)
+        rate = compute_legal_move_rate(logits, legal_grid, loss_mask, game_lengths)
+        assert rate == 0.0
+
     def test_different_preds_per_batch_position(self, cpu_device):
         """Independently predict legal/illegal in different batch/position combos."""
         V = 1980
@@ -339,12 +394,18 @@ class TestComputeLegalMoveRate:
         logits = _make_logits(B, T, V, preds)
 
         dense = torch.zeros(B, max_ply, 64, 64)
-        # Batch 0, ply 0: make action 0's slot legal
+        # Each ply has ≥1 legal move so has_legal_row passes for all
+        # positions; the question is whether the predicted action matches.
+        # Use a filler slot that's never the predicted action.
+        filler_src, filler_dst = 20, 21
+        # Batch 0, ply 0: make action 0's slot legal (pred is action 0 → legal)
         dense[0, 0, grids[0][0], grids[0][1]] = 1.0
-        # Batch 0, ply 1: no slots legal for action 1
-        # Batch 1, ply 0: make action 2's slot legal
+        # Batch 0, ply 1: only the filler slot is legal (pred is action 1 → illegal)
+        dense[0, 1, filler_src, filler_dst] = 1.0
+        # Batch 1, ply 0: make action 2's slot legal (pred is action 2 → legal)
         dense[1, 0, grids[2][0], grids[2][1]] = 1.0
-        # Batch 1, ply 1: no slots legal for action 3
+        # Batch 1, ply 1: only the filler slot is legal (pred is action 3 → illegal)
+        dense[1, 1, filler_src, filler_dst] = 1.0
         legal_grid = _pack_grid(dense)
 
         loss_mask = torch.ones(B, T, dtype=torch.bool)

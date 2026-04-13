@@ -183,7 +183,14 @@ def compute_legal_move_rate_from_preds(
     """Compute fraction of argmax predictions that are legal moves.
 
     Evaluated at positions where loss_mask is True, intersected with the
-    ply range [min_ply, max_ply_limit).
+    ply range [min_ply, max_ply_limit), and further restricted to
+    positions where the legal mask is non-empty. The engine leaves
+    ``legal_grid[p]`` zero for ``p >= game_length`` (it only fills the
+    replay prefix), so a row of all-zero legal moves uniquely identifies
+    a terminal PAD-prediction slot beyond the game's end and should not
+    count toward legality — otherwise every game contributes a
+    guaranteed false negative at its terminal position regardless of
+    whether the model correctly predicted PAD.
 
     Args:
         preds: (B, T) argmax token predictions
@@ -226,17 +233,26 @@ def compute_legal_move_rate_from_preds(
 
             batch_preds = preds[pos_mask, p]  # (N,)
             batch_legal = legal_flat[pos_mask, p]  # (N, 4096)
-            n = len(batch_preds)
-            arange_n = torch.arange(n, device=preds.device)
+
+            # Skip "past end of game" positions where the engine never
+            # filled a legal mask. Those are terminal PAD-prediction
+            # slots, not real move predictions — counting them would
+            # systematically depress the rate.
+            has_legal_row = batch_legal.any(dim=-1)  # (N,)
+            n_valid = int(has_legal_row.sum().item())
+            if n_valid == 0:
+                continue
+
+            arange_n = torch.arange(len(batch_preds), device=preds.device)
 
             # Action tokens: look up grid index
             max_idx = len(action_grid_idx) - 1
             is_action = batch_preds <= max_idx
             grid_idx = action_grid_idx[batch_preds.clamp(0, max_idx)]
             action_legal = batch_legal[arange_n, grid_idx] > 0.5
-            legal_action = is_action & action_legal
+            legal_action = is_action & action_legal & has_legal_row
 
-            valid_count += n
+            valid_count += n_valid
             legal_acc += legal_action.sum()
 
         if valid_count == 0:
