@@ -81,26 +81,33 @@ All training scripts require one of `--hf-repo REPO_ID` or `--local-checkpoints`
 # Single model
 uv run python scripts/train.py --variant base --local-checkpoints
 
-# All three variants simultaneously (shared data batches, sequential GPU)
-uv run python scripts/train_all.py --local-checkpoints
+# All three variants simultaneously (shared data batches, sequential GPU).
+# Cotrain always takes a JSON config because the `variants` list is
+# shaped like [{"name": ..., "variant": ..., ...}, ...] and isn't
+# expressible on a flat CLI. A default 3-variant config ships at
+# configs/cotrain_three_variants.json.
+uv run python scripts/train.py --config configs/cotrain_three_variants.json
 
 # Resume from checkpoint
 uv run python scripts/train.py --variant base --resume checkpoints/step_00050000 --local-checkpoints
 ```
 
-**`scripts/train.py`** key args:
-- `--variant {small|base|large|toy}` — model size (default: base)
+**`scripts/train.py`** key args (all run types):
+- `--config PATH` — load a JSON run config (required for cotrain)
+- `--run-type {pretrain|adapter|cotrain}` — dispatch target
+- `--variant {small|base|large|toy|custom}` — pretrain model size (default: base)
 - `--resume PATH` — resume from checkpoint directory
 - `--total-steps N` — training steps (default: 100,000)
 - `--batch-size N` — batch size (default: 256)
 - `--discard-ply-limit` — only train on naturally-ended games (no ply-limit truncation)
 - Architecture overrides: `--d-model`, `--n-layers`, `--n-heads`, `--d-ff`, `--lr`, `--weight-decay`, `--warmup-steps`
 
-**`scripts/train_all.py`** additional args:
-- `--shm-checkpoints` — write checkpoints to `/dev/shm` (requires `--hf-repo`, volatile)
-- `--run-evals` — auto-run probes + diagnostics after training completes
-- `--publish-results` — push eval results to HF
-- `--patience N` — per-model early stopping patience (eval intervals without improvement)
+**Cotrain-specific config fields** (in the JSON):
+- `shm_checkpoints: true` — write checkpoints to `/dev/shm` (requires `hf_repo`, volatile)
+- `run_evals: true` — run per-slot probes + diagnostics after training completes
+- `lichess_pgn: "..."` — Lichess PGN path for Maia-style accuracy eval (requires `run_evals`)
+- `publish_results: true` — push `eval_results.json` to HF (requires `hf_repo`)
+- `patience: N` — per-variant early stopping patience (eval intervals without improvement)
 
 ### Adapter Training
 
@@ -262,7 +269,7 @@ bash deploy/pod.sh create myexp --gpu h100
 bash deploy/pod.sh ssh myexp
 
 # Launch training
-bash deploy/pod.sh launch myexp scripts/train_all.py --hf-repo thomas-schweich/pawn-{variant}
+bash deploy/pod.sh launch myexp scripts/train.py --config configs/cotrain_three_variants.json --hf-repo thomas-schweich/pawn-{variant}
 
 # Stop (preserves volume, stops billing)
 bash deploy/pod.sh stop myexp
@@ -275,7 +282,7 @@ GPU shortcuts: `a5000`, `a40`, `a6000`, `4090`, `5090`, `l40s`, `h100`. Pod conf
 
 ### GPU Selection
 
-Benchmarks from pretraining 3 models concurrently (`train_all.py`, batch=256):
+Benchmarks from pretraining 3 models concurrently (cotrain, batch=256):
 
 | GPU | VRAM | $/hr | Step time | 100K cost | Notes |
 |-----|------|------|-----------|-----------|-------|

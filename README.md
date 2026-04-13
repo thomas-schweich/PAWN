@@ -77,7 +77,7 @@ Random games are generated on-the-fly; no dataset required:
 uv run python scripts/train.py --variant base --local-checkpoints
 
 # Or train all three variants simultaneously on shared data
-uv run python scripts/train_all.py --local-checkpoints
+uv run python scripts/train.py --config configs/cotrain_three_variants.json
 ```
 
 ### Run probes and diagnostics

@@ -54,7 +54,6 @@ ARGPARSE_SCRIPTS = [
     "run_evals_toplayer.py",
     "split_dataset.py",
     "train_adapter.py",
-    "train_all.py",
 ]
 
 

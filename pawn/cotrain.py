@@ -1,7 +1,10 @@
 """Co-training: train multiple model variants on shared data batches.
 
-Extracted from ``scripts/train_all.py`` so the lab MCP server and the CLI
-script share the same implementation.
+Invoked by ``scripts/train.py --run-type cotrain`` and by the
+``pawn-lab`` MCP server via ``lab_launch``. The shared data pipeline
+means every variant sees the same batches in the same order, so any
+val-loss differences are attributable to architecture rather than
+stochastic data variation.
 """
 
 from __future__ import annotations
@@ -817,4 +820,162 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
         slot.close()
 
     print("\nAll done.")
+
+    if config.run_evals:
+        print("\n" + "=" * 60)
+        print("POST-TRAINING EVALUATION")
+        print("=" * 60)
+        run_post_training_evals(
+            slots,
+            device=device,
+            lichess_pgn=config.lichess_pgn,
+            publish_results=config.publish_results,
+        )
+
     return slots
+
+
+# ---------------------------------------------------------------------------
+# Post-training evaluation
+# ---------------------------------------------------------------------------
+
+
+def run_post_training_evals(
+    slots: list[ModelSlot],
+    device: str,
+    lichess_pgn: str | None = None,
+    publish_results: bool = False,
+) -> None:
+    """Run probes + diagnostics + (optional) Lichess eval on each slot's
+    best checkpoint and write ``eval_results.json`` to its run directory.
+
+    Runs after a cotrain job completes (typically via
+    ``CotrainConfig.run_evals=True``). Loads each slot's best checkpoint
+    (tracked by ``best_val_step``; falls back to the latest if the best
+    step has already been cleaned out of ``/dev/shm``), re-hydrates the
+    model, and evaluates it with the same probe / diagnostic suite that
+    the standalone ``scripts/eval_probes.py`` uses.
+
+    Args:
+        slots: list of finished ``ModelSlot``s returned by
+            ``run_cotrain``.
+        device: torch device string the evaluation runs on.
+        lichess_pgn: optional path or HF repo id for a Lichess PGN
+            corpus. If set, runs Maia-style accuracy on the Lichess
+            holdout after the probe/diagnostic pass.
+        publish_results: if True, push each slot's ``eval_results.json``
+            to its HF checkpoint branch. Requires the slot to have
+            ``hf_repo``/``hf_branch`` configured.
+    """
+    from pawn.checkpoint import load_backbone_weights
+    from pawn.eval_suite.diagnostics import (
+        evaluate_diagnostic_positions,
+        extract_diagnostic_positions,
+        generate_diagnostic_corpus,
+    )
+    from pawn.eval_suite.probes import extract_probe_data, train_all_probes
+
+    for slot in slots:
+        print(f"\n--- Evaluating {slot.name} ---")
+
+        best_step = slot.best_val_step
+        best_loss = slot.best_val_loss
+
+        best_ckpt = os.path.join(
+            slot.checkpoint_dir, f"step_{best_step:08d}"
+        )
+        ckpt_path: str | None
+        if os.path.isdir(best_ckpt):
+            ckpt_path = best_ckpt
+        else:
+            # Fall back to the latest on-disk checkpoint — shm_checkpoints
+            # runs may have already cleaned out older ones.
+            ckpts = sorted(Path(slot.checkpoint_dir).glob("step_*"))
+            ckpt_path = str(ckpts[-1]) if ckpts else None
+
+        if ckpt_path is None:
+            print("  No checkpoint found, skipping")
+            continue
+
+        print(f"  Best checkpoint: {ckpt_path} (val_loss={best_loss:.4f})")
+
+        state_dict, _ = load_backbone_weights(ckpt_path)
+        model = PAWNCLM(slot.model_cfg).to(device)
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        results: dict[str, Any] = {}
+
+        # 1. Probes — match the checkpoint's training-time sequence
+        # format, not the extract_probe_data defaults. Without this,
+        # probe data for a prepend_outcome=True run would be generated
+        # as pure moves while hidden states were extracted at
+        # ply_offset=0, measuring off-by-one shifted representations.
+        prepend_outcome = slot.train_cfg.prepend_outcome
+        no_outcome_token = not prepend_outcome
+        print(f"  Running probes (prepend_outcome={prepend_outcome})...")
+        train_data = extract_probe_data(
+            2048, 256, seed=12345, prepend_outcome=prepend_outcome,
+        )
+        val_data = extract_probe_data(
+            512, 256, seed=54321, prepend_outcome=prepend_outcome,
+        )
+        probe_results = train_all_probes(
+            model, train_data, val_data, device=device,
+            per_layer=True, n_epochs=20, verbose=True,
+            no_outcome_token=no_outcome_token,
+        )
+        results["probes"] = probe_results
+        del train_data, val_data
+
+        # 2. Diagnostics
+        print("  Running diagnostics...")
+        corpus = generate_diagnostic_corpus(n_per_category=10_000)
+        positions = extract_diagnostic_positions(corpus, max_per_category=10_000)
+        diag_results = evaluate_diagnostic_positions(
+            model, positions, corpus, device=device,
+        )
+        results["diagnostics"] = diag_results
+        del corpus, positions
+
+        # 3. Lichess eval (if PGN provided)
+        if lichess_pgn:
+            print("  Running Lichess eval...")
+            from pawn.eval_suite.lichess import (
+                evaluate_on_lichess,
+                prepare_lichess_corpus,
+            )
+            lichess_data = prepare_lichess_corpus(
+                lichess_pgn, max_games_per_band=1000,
+            )
+            lichess_results = evaluate_on_lichess(
+                model, lichess_data, device=device,
+            )
+            results["lichess"] = lichess_results
+
+        # Save results
+        results_path = os.path.join(slot.run_dir, "eval_results.json")
+        with open(results_path, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"  Results saved: {results_path}")
+
+        # Publish to HF
+        if publish_results and slot.hf_repo and slot.hf_branch:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            try:
+                api.upload_file(
+                    path_or_fileobj=results_path,
+                    path_in_repo="eval_results.json",
+                    repo_id=slot.hf_repo,
+                    repo_type="model",
+                    revision=slot.hf_branch,
+                    commit_message=f"Eval results (best step {best_step})",
+                )
+                print(f"  Published to {slot.hf_repo}@{slot.hf_branch}")
+            except Exception as e:
+                print(f"  WARNING: HF publish failed: {e}")
+
+        del model, state_dict
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

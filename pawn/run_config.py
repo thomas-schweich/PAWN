@@ -247,6 +247,14 @@ class CotrainConfig(BaseRunConfig):
     shm_checkpoints: bool = False
     val_games: int = 512  # override BaseRunConfig's 50K — pretrain uses on-the-fly data
 
+    # Post-training evaluation — runs per-slot probes, diagnostics, and
+    # (optional) Lichess eval on each variant's best checkpoint after
+    # training completes. Writes eval_results.json to each variant's
+    # run directory.
+    run_evals: bool = False
+    lichess_pgn: str | None = None
+    publish_results: bool = False
+
     @model_validator(mode="after")
     def _check_cotrain(self) -> "CotrainConfig":
         if not self.variants:
@@ -258,6 +266,22 @@ class CotrainConfig(BaseRunConfig):
             raise ValueError(
                 "--shm-checkpoints requires --hf-repo "
                 "(HF is the only durable store)"
+            )
+        if self.publish_results and not self.hf_repo:
+            raise ValueError(
+                "publish_results requires hf_repo — there's no branch to "
+                "push eval_results.json to without one"
+            )
+        if self.publish_results and not self.run_evals:
+            raise ValueError(
+                "publish_results requires run_evals=True — "
+                "run_post_training_evals is the only thing that writes "
+                "the eval_results.json file, so there's nothing to "
+                "publish without it"
+            )
+        if self.lichess_pgn and not self.run_evals:
+            raise ValueError(
+                "lichess_pgn is only meaningful when run_evals=True"
             )
         if self.resume is not None:
             raise ValueError(

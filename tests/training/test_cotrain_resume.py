@@ -17,7 +17,10 @@ from typing import Any
 
 import pytest
 
-from pawn.cotrain import _resolve_cotrain_resume_prepend_outcome
+from pawn.cotrain import (
+    _resolve_cotrain_resume_prepend_outcome,
+    run_post_training_evals,
+)
 from pawn.run_config import CotrainConfig, CotrainVariant
 
 
@@ -190,6 +193,21 @@ class TestResolveCotrainResumePrependOutcome:
         with pytest.raises(SystemExit) as exc_info:
             _resolve_cotrain_resume_prepend_outcome(cfg)
         assert exc_info.value.code == 1
+
+    def test_run_post_training_evals_signature(self):
+        """Public API lock: run_post_training_evals takes the four
+        kwargs the cotrain dispatch relies on. This catches accidental
+        signature drift — the deleted scripts/train_all.py used to
+        forward --run-evals / --lichess-pgn / --publish-results to this
+        function, and the canonical entry point is now the cotrain
+        config in scripts/train.py."""
+        import inspect
+        sig = inspect.signature(run_post_training_evals)
+        params = set(sig.parameters)
+        assert "slots" in params
+        assert "device" in params
+        assert "lichess_pgn" in params
+        assert "publish_results" in params
 
     def test_metadata_cache_is_populated(self, tmp_path):
         """Codex round-2 regression: the helper should populate the

@@ -1,7 +1,7 @@
 ---
 name: manage-pod
 description: Lab manager for a machine with one or more GPUs. Uses the pawn-lab MCP server to launch/monitor/sweep trials, with check-ins for progress notes and strategic decisions.
-argument-hint: '[objective description, e.g. "pareto sweep across adapter strategies" or "monitor train_all.py"]'
+argument-hint: '[objective description, e.g. "pareto sweep across adapter strategies" or "monitor cotrain run"]'
 disable-model-invocation: true
 ---
 
@@ -38,7 +38,7 @@ Before launching real trials, run `scripts/benchmark.py` to characterize the act
 
 - **Step time per variant** (eager vs. compiled) → informs how long a target step count will actually take
 - **Compile speedup ratio** → confirms `torch.compile` is working and tells you if any models hit a known compile-bug regression
-- **Concurrency scaling** → how many models you can fit per GPU and the total throughput at each level (relevant for sweeps and `train_all.py`)
+- **Concurrency scaling** → how many models you can fit per GPU and the total throughput at each level (relevant for sweeps and cotrain)
 - **Adapter step times** → cost estimate for adapter sweeps
 - **Engine throughput** → tells you if the data pipeline will keep the GPU fed
 

@@ -335,6 +335,122 @@ class TestCotrainConfig:
         assert "variants" in schema["properties"]
         assert "run_type" in schema["properties"]
 
+    def test_run_evals_defaults_off(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            variants=[CotrainVariant(name="x", variant="toy")],
+        )
+        assert cfg.run_evals is False
+        assert cfg.lichess_pgn is None
+        assert cfg.publish_results is False
+
+    def test_run_evals_enabled(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            run_evals=True,
+            variants=[CotrainVariant(name="x", variant="toy")],
+        )
+        assert cfg.run_evals is True
+
+    def test_lichess_pgn_without_run_evals_rejected(self):
+        """lichess_pgn only does anything inside run_post_training_evals,
+        so setting it without run_evals is a user error — fail loudly."""
+        with pytest.raises(ValidationError) as exc_info:
+            CotrainConfig(
+                local_checkpoints=True,
+                lichess_pgn="/tmp/games.pgn",
+                variants=[CotrainVariant(name="x", variant="toy")],
+            )
+        msg = str(exc_info.value).lower()
+        assert "lichess_pgn" in msg and "run_evals" in msg
+
+    def test_lichess_pgn_with_run_evals_accepted(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            run_evals=True,
+            lichess_pgn="/tmp/games.pgn",
+            variants=[CotrainVariant(name="x", variant="toy")],
+        )
+        assert cfg.lichess_pgn == "/tmp/games.pgn"
+
+    def test_publish_results_without_hf_rejected(self):
+        """publish_results uploads to an HF branch — it's meaningless
+        without hf_repo."""
+        with pytest.raises(ValidationError) as exc_info:
+            CotrainConfig(
+                local_checkpoints=True,
+                run_evals=True,
+                publish_results=True,
+                variants=[CotrainVariant(name="x", variant="toy")],
+            )
+        assert "publish_results" in str(exc_info.value)
+
+    def test_publish_results_without_run_evals_rejected(self):
+        """publish_results is a no-op unless run_evals=True, because
+        nothing writes eval_results.json without the post-training
+        eval pass. Fail loudly on the silent-no-op config."""
+        with pytest.raises(ValidationError) as exc_info:
+            CotrainConfig(
+                hf_repo="user/repo",
+                publish_results=True,
+                # run_evals intentionally omitted (default False)
+                variants=[CotrainVariant(name="x", variant="toy")],
+            )
+        msg = str(exc_info.value)
+        assert "publish_results" in msg
+        assert "run_evals" in msg
+
+    def test_publish_results_with_hf_and_run_evals_accepted(self):
+        cfg = CotrainConfig(
+            hf_repo="user/repo",
+            run_evals=True,
+            publish_results=True,
+            variants=[CotrainVariant(name="x", variant="toy")],
+        )
+        assert cfg.publish_results is True
+
+    def test_canonical_three_variants_config_validates(self):
+        """The configs/cotrain_three_variants.json file ships in the
+        repo as the canonical replacement for the deleted train_all.py.
+        Lock it in against accidental schema drift.
+
+        The JSON intentionally omits both local_checkpoints and
+        hf_repo — BaseRunConfig requires exactly one, and omitting
+        both lets the CLI caller pick either without colliding with a
+        value baked into the JSON (scripts/train.py's _parse_cli
+        merges JSON then CLI, so JSON values survive unless the CLI
+        explicitly overrides them). Simulate the CLI merge here by
+        supplying local_checkpoints on top of the loaded JSON."""
+        import pathlib
+        path = pathlib.Path(__file__).resolve().parents[2] / "configs" / "cotrain_three_variants.json"
+        data = json.loads(path.read_text())
+        # Drop the _comment field — it's documentation, not config.
+        data.pop("_comment", None)
+        # Ensure the JSON DOESN'T pin a checkpoint mode, so either side
+        # of the mutual-exclusion can be chosen at launch time.
+        assert "local_checkpoints" not in data, (
+            "cotrain_three_variants.json must not pin local_checkpoints; "
+            "it would collide with --hf-repo on the CLI"
+        )
+        assert "hf_repo" not in data, (
+            "cotrain_three_variants.json must not pin hf_repo; "
+            "it would collide with --local-checkpoints on the CLI"
+        )
+        # Simulate a local-checkpoints run.
+        cfg_local = TypeAdapter(RunConfig).validate_python(
+            {**data, "local_checkpoints": True},
+        )
+        assert isinstance(cfg_local, CotrainConfig)
+        assert [v.name for v in cfg_local.variants] == ["small", "base", "large"]
+        assert [v.variant for v in cfg_local.variants] == ["small", "base", "large"]
+        # And simulate an hf-repo run — proves the same JSON can be
+        # used with the CLAUDE.md-documented pod workflow.
+        cfg_hf = TypeAdapter(RunConfig).validate_python(
+            {**data, "hf_repo": "user/pawn-cotrain"},
+        )
+        assert isinstance(cfg_hf, CotrainConfig)
+        assert cfg_hf.hf_repo == "user/pawn-cotrain"
+
 
 @pytest.mark.unit
 class TestCotrainVariant:

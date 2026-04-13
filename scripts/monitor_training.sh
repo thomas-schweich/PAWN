@@ -40,7 +40,8 @@ fi
 
 if [ -n "$SSH" ]; then
     echo "=== Process Status ==="
-    $SSH "pgrep -f train_all > /dev/null && echo RUNNING || echo STOPPED" 2>/dev/null || echo "  (SSH failed)"
+    # Match any scripts/train.py process (pretrain, adapter, or cotrain).
+    $SSH "pgrep -f 'scripts/train\.py' > /dev/null && echo RUNNING || echo STOPPED" 2>/dev/null || echo "  (SSH failed)"
 
     echo ""
     echo "=== Metrics Sync ==="
