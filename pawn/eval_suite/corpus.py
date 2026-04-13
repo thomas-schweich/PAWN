@@ -206,6 +206,20 @@ def load_corpus(corpus_dir: str | Path) -> dict:
     """
     d = Path(corpus_dir)
 
+    # Pre-parquet corpora (only .npy files, no games.parquet) used to be
+    # auto-migrated. That migration was removed with the legacy cleanup,
+    # so detect the old layout and fail loudly with a clear message
+    # instead of crashing deep inside a Polars scan.
+    if not (d / "games.parquet").exists():
+        if (d / "legal_move_counts.npy").exists():
+            raise FileNotFoundError(
+                f"{d} is a pre-parquet corpus (.npy-only layout). The "
+                "auto-migration was removed with the legacy cleanup; "
+                "regenerate the corpus with `generate_corpus` or check "
+                "out the `pre-vocab-transition` git tag to load it."
+            )
+        raise FileNotFoundError(f"No games.parquet found in {d}")
+
     corpus = {
         "move_ids": np.load(d / "move_ids.npy", mmap_mode="r"),
         "game_lengths": np.load(d / "game_lengths.npy"),
