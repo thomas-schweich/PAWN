@@ -249,6 +249,7 @@ class TestTrainingConfigDefaults:
         assert cfg.checkpoint_interval == 5000
         assert cfg.pause_after_steps is None
         assert cfg.no_outcome_token is False
+        assert cfg.prepend_outcome is False
         assert cfg.mate_boost == 0.0
         assert cfg.base_seed == 42
         assert cfg.val_seed == (2**63) - 1

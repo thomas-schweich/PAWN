@@ -366,6 +366,47 @@ class TestLegalGrid512:
         assert found_late, "No games long enough to test late-ply legal grid"
 
 
+class TestLegalGridOutcomePrepended:
+    """Verify validation set layout when prepend_outcome=True."""
+
+    @pytest.fixture(scope="class")
+    def val(self):
+        return create_validation_set(
+            n_games=32, max_ply=128, seed=42, prepend_outcome=True,
+        )
+
+    @pytest.mark.integration
+    def test_legal_grid_shape_matches_seq_len(self, val):
+        """align_legal_to_preds pads the grid so it's indexable against preds."""
+        legal_grid = val["legal_grid"]
+        input_ids = val["input_ids"]
+        assert legal_grid.shape[1] == input_ids.shape[1] == 128
+
+    @pytest.mark.integration
+    def test_move_ids_stored_separately(self, val):
+        """move_ids is the raw (B, max_ply) array, without the outcome prefix."""
+        move_ids = val["move_ids"]
+        # max_ply = seq_len - 1 when prepend_outcome=True.
+        assert move_ids.shape[1] == 127
+
+    @pytest.mark.integration
+    def test_prepend_outcome_flag_stored(self, val):
+        assert bool(val["prepend_outcome"].item()) is True
+
+    @pytest.mark.integration
+    def test_preds_aligned_with_legal_grid(self, val):
+        """Using targets as ground-truth preds should yield near-perfect legal rate."""
+        from pawn.trainer import compute_legal_move_rate_from_preds
+        rate = compute_legal_move_rate_from_preds(
+            val["targets"], val["legal_grid"], val["loss_mask"],
+            val["game_lengths"],
+        )
+        # targets[t] is the actual played move and must be legal; anything
+        # short of ~1.0 means we got the alignment wrong. A little slack for
+        # the zero-padded last row.
+        assert rate > 0.98, f"legal rate {rate} — alignment broken?"
+
+
 # ---------------------------------------------------------------------------
 # Ply-range filter for compute_legal_move_rate_from_preds
 # ---------------------------------------------------------------------------

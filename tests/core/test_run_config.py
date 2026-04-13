@@ -380,6 +380,7 @@ class TestBaseRunConfig:
         assert cfg.log_interval == 100
         assert cfg.mate_boost == 0.0
         assert cfg.no_outcome_token is False
+        assert cfg.prepend_outcome is False
         assert cfg.discard_ply_limit is False
         assert cfg.no_compile is False
         assert cfg.sdpa_math is False
@@ -561,6 +562,21 @@ class TestTypeValidation:
         # Pydantic v2 is lenient with bool coercion; we just test explicit bad values
         cfg = PretrainConfig(local_checkpoints=True, no_outcome_token=True)
         assert cfg.no_outcome_token is True
+
+    def test_prepend_outcome_flag(self):
+        cfg = PretrainConfig(local_checkpoints=True, prepend_outcome=True)
+        assert cfg.prepend_outcome is True
+        # Default is off so existing runs keep pure-move sequences.
+        default_cfg = PretrainConfig(local_checkpoints=True)
+        assert default_cfg.prepend_outcome is False
+
+    def test_prepend_outcome_propagates_to_cotrain(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            prepend_outcome=True,
+            variants=[CotrainVariant(name="base", variant="base")],
+        )
+        assert cfg.prepend_outcome is True
 
     def test_extra_fields_behavior(self):
         """Pydantic by default ignores extra fields unless model_config forbids."""
