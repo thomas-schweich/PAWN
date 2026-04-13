@@ -134,8 +134,49 @@ def run_pretrain(config: PretrainConfig) -> None:
     """Bridge ``PretrainConfig`` into ``CLMConfig`` + ``TrainingConfig``."""
     import torch
 
+    from pawn.checkpoint import infer_prepend_outcome, read_checkpoint_metadata
     from pawn.config import CLMConfig, LegacyVocab, TrainingConfig
     from pawn.trainer import CLMTrainer
+
+    # If we're resuming, peek at the saved config BEFORE constructing the
+    # trainer so the CLMDataset / validation set are built with the same
+    # sequence format the checkpoint was trained on. Without this, a
+    # pre-2026-04-08 outcome-prefixed run resumed after the default flip
+    # would silently switch to pure-moves and corrupt training.
+    if config.resume:
+        try:
+            saved = read_checkpoint_metadata(config.resume)
+        except (FileNotFoundError, OSError) as e:
+            print(f"WARNING: couldn't peek at resume checkpoint ({e}); "
+                  "proceeding with user-supplied prepend_outcome")
+        else:
+            saved_prepend, reason = infer_prepend_outcome(
+                saved.get("training_config"), saved.get("model_config"),
+            )
+            if saved_prepend is None:
+                # Ambiguous pre-flag checkpoint. Honor the user's
+                # explicit value if they passed one, otherwise fail loud
+                # rather than silently guessing.
+                if "prepend_outcome" in config.model_fields_set:
+                    print(
+                        f"WARNING: {reason}. Trusting explicit "
+                        f"prepend_outcome={config.prepend_outcome} from the run "
+                        "config — verify this matches what the checkpoint was "
+                        "trained with."
+                    )
+                else:
+                    _die(
+                        f"Resume: {reason}. Pass `prepend_outcome: true` or "
+                        "`prepend_outcome: false` in the run config explicitly."
+                    )
+            elif saved_prepend != config.prepend_outcome:
+                print(
+                    f"Resume: saved checkpoint is "
+                    f"{'outcome-prefixed' if saved_prepend else 'pure-moves'} "
+                    f"({reason}); overriding prepend_outcome={config.prepend_outcome} "
+                    f"→ {saved_prepend} to match."
+                )
+                config.prepend_outcome = saved_prepend
 
     variant_factory = {
         "small": CLMConfig.small,
@@ -143,7 +184,20 @@ def run_pretrain(config: PretrainConfig) -> None:
         "large": CLMConfig.large,
         "toy": CLMConfig.toy,
     }
-    model_cfg = variant_factory[config.variant]()
+    if config.variant == "custom":
+        # Validator ensures all four arch fields are set.
+        assert config.d_model is not None
+        assert config.n_layers is not None
+        assert config.n_heads is not None
+        assert config.d_ff is not None
+        model_cfg = CLMConfig(
+            d_model=config.d_model,
+            n_layers=config.n_layers,
+            n_heads=config.n_heads,
+            d_ff=config.d_ff,
+        )
+    else:
+        model_cfg = variant_factory[config.variant]()
     train_cfg = (
         TrainingConfig.toy() if config.variant == "toy" else TrainingConfig()
     )
@@ -172,6 +226,7 @@ def run_pretrain(config: PretrainConfig) -> None:
     train_cfg.max_grad_norm = config.max_grad_norm
     train_cfg.discard_ply_limit = config.discard_ply_limit
     train_cfg.no_outcome_token = config.no_outcome_token
+    train_cfg.prepend_outcome = config.prepend_outcome
     train_cfg.mate_boost = config.mate_boost
     train_cfg.log_interval = config.log_interval
     if config.eval_interval is not None:

@@ -12,6 +12,7 @@ import pytest
 from pawn.lab.monitor import (
     check_health,
     is_alive,
+    read_cotrain_val_summary,
     read_metrics,
     read_pretrain_val_summary,
 )
@@ -646,3 +647,73 @@ class TestReadPretrainValSummary:
         # If forfeit_fit was computed, current_forfeit should be the unfiltered last value
         if "forfeit_fit" in summary:
             assert summary["forfeit_fit"]["current_forfeit"] == pytest.approx(0.0)
+
+
+# =====================================================================
+# read_cotrain_val_summary
+# =====================================================================
+
+
+class TestReadCotrainValSummary:
+    def test_no_variants_returns_none(self):
+        trial = _make_trial()
+        assert read_cotrain_val_summary(trial) is None
+
+    def test_variants_without_game_completion_returns_none(self, tmp_path):
+        """Cotrain variants that only have loss/accuracy records but no
+        game_completion_rate yet — the helper skips them and returns None."""
+        trial = _make_trial()
+        run_dir = tmp_path / "run_base"
+        _write_metrics_file(run_dir / "metrics.jsonl", [
+            {"type": "val", "step": 100, "val/loss": 2.0, "val/accuracy": 0.5},
+        ])
+        trial.variants = {"base": {"run_dir": str(run_dir), "current_step": 100}}
+        assert read_cotrain_val_summary(trial) is None
+
+    def test_per_variant_summary_structure(self, tmp_path):
+        """Each variant's metrics.jsonl yields an independent forfeit summary."""
+        trial = _make_trial()
+        trial.variants = {}
+        k = {"small": 5e-6, "base": 1e-5, "large": 2e-5}
+        for name, rate in k.items():
+            run_dir = tmp_path / f"run_{name}"
+            records = []
+            for i in range(1, 21):
+                step = i * 1000
+                forfeit = math.exp(-rate * step + math.log(0.5))
+                records.append(_val_record(step, 1.0 - forfeit))
+            _write_metrics_file(run_dir / "metrics.jsonl", records)
+            trial.variants[name] = {
+                "run_dir": str(run_dir),
+                "current_step": 20_000,
+            }
+
+        summary = read_cotrain_val_summary(trial)
+        assert summary is not None
+        assert set(summary["variants"].keys()) == {"small", "base", "large"}
+        for name, want_slope in k.items():
+            v = summary["variants"][name]
+            assert "latest" in v
+            assert "forfeit_fit" in v
+            assert v["forfeit_fit"]["slope_per_step"] == pytest.approx(-want_slope, rel=1e-6)
+            assert v["forfeit_fit"]["n_points"] == 10
+
+    def test_partial_variants_surface_what_is_ready(self, tmp_path):
+        """A variant with records is surfaced even when a sibling has none."""
+        trial = _make_trial()
+        run_small = tmp_path / "run_small"
+        _write_metrics_file(run_small / "metrics.jsonl", [
+            _val_record(1000, 0.5),
+        ])
+        run_base = tmp_path / "run_base"
+        _write_metrics_file(run_base / "metrics.jsonl", [
+            {"type": "train", "step": 1000, "train/loss": 2.0},
+        ])
+        trial.variants = {
+            "small": {"run_dir": str(run_small), "current_step": 1000},
+            "base": {"run_dir": str(run_base), "current_step": 1000},
+        }
+        summary = read_cotrain_val_summary(trial)
+        assert summary is not None
+        # Only `small` had game_completion records.
+        assert list(summary["variants"].keys()) == ["small"]

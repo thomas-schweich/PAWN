@@ -35,10 +35,12 @@ from pawn.checkpoint import (
     _unflatten_optimizer_state,
     _verify_complete_sentinel,
     _write_complete_sentinel,
+    infer_prepend_outcome,
     is_legacy_checkpoint,
     load_adapter_checkpoint,
     load_backbone_weights,
     load_pretrain_checkpoint,
+    read_checkpoint_metadata,
     save_adapter_checkpoint,
     save_pretrain_checkpoint,
 )
@@ -884,3 +886,163 @@ class TestHfPushMocked:
             ckpt_path, repo_id="user/repo", branch="run/test", step=1,
         )
         fake_api.upload_file.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# read_checkpoint_metadata + infer_prepend_outcome
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestReadCheckpointMetadata:
+    def _save_skeleton(
+        self, tmp_path: Path, model_cfg: dict, training_cfg: dict,
+    ) -> Path:
+        model, _ = _make_toy_model()
+        opt = _make_optimizer(model)
+        ckpt = tmp_path / "step_00000001"
+        save_pretrain_checkpoint(
+            ckpt, model, opt, FakeScheduler(), FakeScaler(),
+            global_step=1, model_config=model_cfg, training_config=training_cfg,
+        )
+        return ckpt
+
+    def test_reads_directory_checkpoint(self, tmp_path):
+        model_cfg = {"vocab_size": 1980, "max_seq_len": 512, "d_model": 64}
+        training_cfg = {"prepend_outcome": True, "lr": 3e-4}
+        ckpt = self._save_skeleton(tmp_path, model_cfg, training_cfg)
+        meta = read_checkpoint_metadata(ckpt)
+        assert meta["model_config"] == model_cfg
+        assert meta["training_config"] == training_cfg
+
+    def test_missing_config_raises(self, tmp_path):
+        ckpt = tmp_path / "fake_ckpt"
+        ckpt.mkdir()
+        with pytest.raises(FileNotFoundError):
+            read_checkpoint_metadata(ckpt)
+
+    def test_legacy_pt_file(self, tmp_path):
+        ckpt = tmp_path / "legacy.pt"
+        torch.save({
+            "model_state_dict": {},
+            "model_config": {"vocab_size": 4284, "max_seq_len": 256},
+            "training_config": {},  # no prepend_outcome field
+        }, ckpt)
+        meta = read_checkpoint_metadata(ckpt)
+        assert meta["model_config"]["vocab_size"] == 4284
+        assert meta["model_config"]["max_seq_len"] == 256
+
+
+@pytest.mark.unit
+class TestInferPrependOutcome:
+    def test_exact_from_saved_true(self):
+        result, reason = infer_prepend_outcome(
+            {"prepend_outcome": True}, {"vocab_size": 1980, "max_seq_len": 512},
+        )
+        assert result is True
+        assert "saved" in reason
+
+    def test_exact_from_saved_false(self):
+        result, reason = infer_prepend_outcome(
+            {"prepend_outcome": False}, {"vocab_size": 1980, "max_seq_len": 512},
+        )
+        assert result is False
+        assert "saved" in reason
+
+    def test_saved_value_takes_precedence_over_heuristics(self):
+        """A modern training_cfg with prepend_outcome=False must NOT be
+        overridden by the legacy-vocab heuristic (edge case: user retrains
+        with new vocab + pure moves starting from a legacy-vocab arch)."""
+        result, _ = infer_prepend_outcome(
+            {"prepend_outcome": False},
+            {"vocab_size": 4284, "max_seq_len": 256},
+        )
+        assert result is False
+
+    def test_legacy_vocab_heuristic(self):
+        from pawn.config import LegacyVocab
+        result, reason = infer_prepend_outcome(
+            {},  # no prepend_outcome field
+            {"vocab_size": LegacyVocab.VOCAB_SIZE, "max_seq_len": 256},
+        )
+        assert result is True
+        assert "legacy vocab" in reason
+
+    def test_256_ctx_heuristic(self):
+        result, reason = infer_prepend_outcome(
+            {}, {"vocab_size": 1980, "max_seq_len": 256},
+        )
+        assert result is True
+        assert "256" in reason
+
+    def test_ambiguous_modern_returns_none(self):
+        """1980-vocab / 512-ctx with no prepend_outcome field could be
+        either pre-flip (outcome-prefixed) or post-flip (pure-moves).
+        The helper must return None so callers fail closed or demand an
+        explicit override — silently guessing either way is unsafe."""
+        result, reason = infer_prepend_outcome(
+            {}, {"vocab_size": 1980, "max_seq_len": 512},
+        )
+        assert result is None
+        assert "ambiguous" in reason
+
+    def test_none_inputs_are_ambiguous(self):
+        """Missing configs entirely are treated the same as ambiguous —
+        callers must not silently default."""
+        result, reason = infer_prepend_outcome(None, None)
+        assert result is None
+        assert "ambiguous" in reason
+
+    def test_legacy_no_outcome_token_true_overrides_vocab_heuristic(self):
+        """Codex round 6: a pre-flag legacy-vocab checkpoint with the
+        pure-moves ablation flag set must be detected as pure-moves,
+        not silently reclassified as outcome-prefixed via the
+        legacy-vocab heuristic."""
+        from pawn.config import LegacyVocab
+        result, reason = infer_prepend_outcome(
+            {"no_outcome_token": True},
+            {"vocab_size": LegacyVocab.VOCAB_SIZE, "max_seq_len": 256},
+        )
+        assert result is False
+        assert "no_outcome_token" in reason
+
+    def test_legacy_no_outcome_token_true_overrides_256_ctx_heuristic(self):
+        """Same precedence check for 256-ctx 1980-vocab checkpoints."""
+        result, reason = infer_prepend_outcome(
+            {"no_outcome_token": True},
+            {"vocab_size": 1980, "max_seq_len": 256},
+        )
+        assert result is False
+        assert "no_outcome_token" in reason
+
+    def test_no_outcome_token_true_on_modern_checkpoint(self):
+        """A modern checkpoint with no_outcome_token=True (user still
+        passed the deprecated flag) is pure-moves — step 2 short-
+        circuits before the ambiguous fallback."""
+        result, reason = infer_prepend_outcome(
+            {"no_outcome_token": True},
+            {"vocab_size": 1980, "max_seq_len": 512},
+        )
+        assert result is False
+        assert "no_outcome_token" in reason
+
+    def test_no_outcome_token_false_is_not_disambiguating(self):
+        """A modern 512-ctx checkpoint with no_outcome_token=False must
+        still be treated as ambiguous — False is the default for every
+        run regardless of the actual sequence format."""
+        result, reason = infer_prepend_outcome(
+            {"no_outcome_token": False},
+            {"vocab_size": 1980, "max_seq_len": 512},
+        )
+        assert result is None
+        assert "ambiguous" in reason
+
+    def test_prepend_outcome_takes_precedence_over_no_outcome_token(self):
+        """Contradictory flags: saved prepend_outcome wins (exact), even
+        if the deprecated no_outcome_token is also set."""
+        result, reason = infer_prepend_outcome(
+            {"prepend_outcome": True, "no_outcome_token": True},
+            {"vocab_size": 1980, "max_seq_len": 512},
+        )
+        assert result is True
+        assert "saved" in reason

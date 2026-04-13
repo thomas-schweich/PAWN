@@ -278,6 +278,109 @@ def _load_legacy_pt(path: str | Path, device: str = "cpu") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Peek at checkpoint metadata without loading weights
+# ---------------------------------------------------------------------------
+
+def read_checkpoint_metadata(path: str | Path) -> dict:
+    """Return ``{"model_config": ..., "training_config": ...}`` from a
+    checkpoint without touching model weights or verifying the hash
+    sentinel. Used by resume/eval paths that need to peek at the saved
+    sequence format before building data pipelines.
+
+    Raises ``FileNotFoundError`` if the path or its ``config.json`` is
+    missing. For legacy .pt files, loads the pickled dict in CPU mode
+    and pulls ``model_config`` / ``training_config`` from it.
+    """
+    p = Path(path)
+    if is_legacy_checkpoint(p):
+        ckpt = _load_legacy_pt(p, device="cpu")
+        return {
+            "model_config": ckpt.get("model_config"),
+            "training_config": ckpt.get("training_config"),
+        }
+
+    cfg_path = p / "config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"No config.json at {cfg_path}")
+    with open(cfg_path) as f:
+        config = json.load(f)
+    return {
+        "model_config": config.get("model_config"),
+        "training_config": config.get("training_config"),
+    }
+
+
+def infer_prepend_outcome(
+    training_config: dict | None,
+    model_config: dict | None,
+) -> tuple[bool | None, str]:
+    """Infer ``prepend_outcome`` for a resumed/evaluated checkpoint.
+
+    Returns ``(prepend_outcome, reason)`` where ``prepend_outcome`` is
+    ``True`` / ``False`` / ``None``. ``None`` means the helper cannot
+    confidently decide — callers must fail closed or require an
+    explicit user override, not silently pick a default.
+
+    Precedence (most to least authoritative):
+
+      1. ``training_config["prepend_outcome"]`` — exact, this is the
+         post-PR PAWN default where the field is persisted to
+         config.json.
+      2. ``training_config["no_outcome_token"] == True`` — authoritative
+         ⇒ ``(False, ...)``. Pre-flag ablation runs used this flag to
+         strip the outcome via ``strip_outcome_token`` (sequences are
+         pure moves). Post-deprecation the flag is a no-op but was
+         always combined with the now-default pure-moves layout, so
+         either way ``True`` ⇒ pure moves. Note that the **False** case
+         (``no_outcome_token=False``) is NOT disambiguating: it's the
+         default and modern runs set it to False regardless of the
+         actual sequence format.
+      3. Legacy vocab (``vocab_size == LegacyVocab.VOCAB_SIZE``) →
+         ``(True, ...)``. The legacy 4284-token runs are all pre-
+         2026-04-08 and used the outcome prefix as the implicit Rust
+         default (unless overridden by ``no_outcome_token=True``, which
+         step 2 handles first).
+      4. 256-token context (``max_seq_len <= 256``) → ``(True, ...)``.
+         The 256-ctx convention predates the flip and was
+         outcome-prefixed.
+      5. Otherwise → ``(None, ...)``. A 1980-vocab / 512-ctx checkpoint
+         without the field could be either pre-flip (outcome-prefixed)
+         or post-flip (pure-moves); guessing either way risks silently
+         corrupting resume/eval. Callers must use an explicit override.
+
+    Callers should print the reason when they override a user-supplied
+    flag so the behaviour is explicit and auditable.
+    """
+    from pawn.config import LegacyVocab
+    training = training_config or {}
+    model = model_config or {}
+
+    if "prepend_outcome" in training:
+        return bool(training["prepend_outcome"]), "saved training.prepend_outcome"
+
+    # Pre-flag ablation runs used `no_outcome_token=True` to force pure-
+    # moves via strip_outcome_token. The `=False` case is non-signal
+    # because modern runs default the field to False while still being
+    # pure-moves (Rust default flipped in commit a6651a8).
+    if training.get("no_outcome_token") is True:
+        return False, "saved training.no_outcome_token=True (pure-moves ablation)"
+
+    vocab_size = model.get("vocab_size")
+    if vocab_size == LegacyVocab.VOCAB_SIZE:
+        return True, f"legacy vocab (vocab_size={LegacyVocab.VOCAB_SIZE})"
+
+    max_seq_len = model.get("max_seq_len")
+    if isinstance(max_seq_len, int) and max_seq_len <= 256:
+        return True, f"legacy 256-ctx (max_seq_len={max_seq_len})"
+
+    return None, (
+        "ambiguous pre-flag checkpoint (no training.prepend_outcome, "
+        "modern vocab/context): could be pre-2026-04-08 outcome-prefixed "
+        "or post-flip pure-moves; pass prepend_outcome explicitly"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pretrain checkpoint save/load
 # ---------------------------------------------------------------------------
 

@@ -366,6 +366,111 @@ class TestLegalGrid512:
         assert found_late, "No games long enough to test late-ply legal grid"
 
 
+class TestStripOutcomeMetadata:
+    """strip_outcome_token must produce a batch that downstream eval can
+    consume without shape mismatches. Regression for the `no_outcome=True`
+    + `prepend_outcome=True` combo where stale move_ids + prepend_outcome
+    flags survived the strip and broke the game-completion eval path."""
+
+    @pytest.mark.integration
+    def test_strip_overwrites_outcome_metadata(self):
+        val = create_validation_set(
+            n_games=8, max_ply=64, seed=42,
+            prepend_outcome=True, no_outcome=True,
+        )
+        # After stripping, the batch must look pure-moves to downstream:
+        assert bool(val["prepend_outcome"].item()) is False
+        # move_ids should match the new pure-moves input_ids shape, not
+        # the original (B, max_ply-1) raw shape.
+        assert val["move_ids"].shape == val["input_ids"].shape
+
+    @pytest.mark.integration
+    def test_strip_batch_runs_through_game_completion(self):
+        """End-to-end: the stripped batch must feed cleanly into
+        eval_game_completion_metrics without raising."""
+        from pawn.config import CLMConfig
+        from pawn.model import PAWNCLM
+        from pawn.trainer import eval_game_completion_metrics
+
+        val = create_validation_set(
+            n_games=4, max_ply=32, seed=42,
+            prepend_outcome=True, no_outcome=True,
+        )
+        cfg = CLMConfig.toy()
+        cfg.max_seq_len = 32
+        torch.manual_seed(0)
+        model = PAWNCLM(cfg).to("cpu").eval()
+        out = eval_game_completion_metrics(
+            model, val,
+            batch_size=2, vocab_size=cfg.vocab_size,
+            device="cpu", use_amp=False,
+        )
+        assert "val/game_completion_rate" in out
+
+
+class TestLegalGridOutcomePrepended:
+    """Verify validation set layout when prepend_outcome=True."""
+
+    @pytest.fixture(scope="class")
+    def val(self):
+        return create_validation_set(
+            n_games=32, max_ply=128, seed=42, prepend_outcome=True,
+        )
+
+    @pytest.mark.integration
+    def test_legal_grid_shape_matches_seq_len(self, val):
+        """align_legal_to_preds pads the grid so it's indexable against preds."""
+        legal_grid = val["legal_grid"]
+        input_ids = val["input_ids"]
+        assert legal_grid.shape[1] == input_ids.shape[1] == 128
+
+    @pytest.mark.integration
+    def test_move_ids_stored_separately(self, val):
+        """move_ids is the raw (B, max_ply) array, without the outcome prefix."""
+        move_ids = val["move_ids"]
+        # max_ply = seq_len - 1 when prepend_outcome=True.
+        assert move_ids.shape[1] == 127
+
+    @pytest.mark.integration
+    def test_prepend_outcome_flag_stored(self, val):
+        assert bool(val["prepend_outcome"].item()) is True
+
+    @pytest.mark.integration
+    def test_preds_aligned_with_legal_grid(self, val):
+        """Using targets as ground-truth preds yields rate 1.0.
+
+        ``compute_legal_move_rate_from_preds`` now skips positions where
+        ``legal_grid`` is empty (end-of-game PAD prediction slots), so
+        every scored position has a legal ground-truth move.
+        """
+        from pawn.trainer import compute_legal_move_rate_from_preds
+        rate = compute_legal_move_rate_from_preds(
+            val["targets"], val["legal_grid"], val["loss_mask"],
+            val["game_lengths"],
+        )
+        assert rate == pytest.approx(1.0), (
+            f"legal rate {rate} — alignment broken or terminal-PAD filter regressed"
+        )
+
+    @pytest.mark.integration
+    def test_pure_moves_targets_also_yield_perfect_rate(self):
+        """Pure-moves mode has the same "skip end-of-game" semantics.
+
+        Historically this test would have measured ~0.995 because the
+        pre-PR code counted the terminal PAD-prediction slot as illegal;
+        the ``has_legal_row`` filter makes both modes consistent.
+        """
+        from pawn.trainer import compute_legal_move_rate_from_preds
+        val = create_validation_set(n_games=32, max_ply=128, seed=42)
+        rate = compute_legal_move_rate_from_preds(
+            val["targets"], val["legal_grid"], val["loss_mask"],
+            val["game_lengths"],
+        )
+        assert rate == pytest.approx(1.0), (
+            f"pure-moves legal rate {rate} — terminal-PAD filter regressed"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Ply-range filter for compute_legal_move_rate_from_preds
 # ---------------------------------------------------------------------------

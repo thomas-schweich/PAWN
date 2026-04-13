@@ -27,6 +27,11 @@ from pawn.gpu import configure_gpu
 from pawn.logging import MetricsLogger, random_slug
 from pawn.model import PAWNCLM
 from pawn.run_config import CotrainConfig, CotrainVariant
+from pawn.trainer import (
+    CosineWithWarmup,
+    compute_legal_move_rate_from_preds,
+    eval_game_completion_metrics,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +71,6 @@ class ModelSlot:
             weight_decay=train_cfg.weight_decay,
         )
 
-        from pawn.trainer import CosineWithWarmup
         self.scheduler = CosineWithWarmup(
             self.optimizer,
             warmup_steps=train_cfg.warmup_steps,
@@ -239,14 +243,14 @@ class ModelSlot:
 
     @torch.no_grad()
     def evaluate(self, val_data: dict[str, torch.Tensor]) -> dict[str, float]:
-        from pawn.trainer import compute_legal_move_rate_from_preds
-
         self.model.eval()
         n = val_data["input_ids"].shape[0]
         batch_size = self.train_cfg.batch_size
         total_metrics: dict[str, float] = {}
         n_batches = 0
         has_legal = "legal_grid" in val_data
+        legality_late_ply = self.model_cfg.max_seq_len // 2
+        n_actions = self.model.embed.n_actions
 
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
@@ -273,7 +277,7 @@ class ModelSlot:
                 (top5 == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
             )
 
-            # Legal move rate: reuse already-computed valid_logits argmax
+            # Legal move rate (full + late): reuse valid_logits argmax.
             if has_legal:
                 legal_grid = val_data["legal_grid"][start:end].to(self.device, non_blocking=True)
                 game_lengths = val_data["game_lengths"][start:end].to(self.device, non_blocking=True)
@@ -281,7 +285,12 @@ class ModelSlot:
                 preds[loss_mask] = valid_logits.argmax(dim=-1)
                 metrics["legal_move_rate"] = compute_legal_move_rate_from_preds(
                     preds, legal_grid, loss_mask, game_lengths,
-                    n_actions=self.model.embed.n_actions,
+                    n_actions=n_actions,
+                )
+                metrics["late_legal_move_rate"] = compute_legal_move_rate_from_preds(
+                    preds, legal_grid, loss_mask, game_lengths,
+                    min_ply=legality_late_ply,
+                    n_actions=n_actions,
                 )
 
             for k, v in metrics.items():
@@ -290,6 +299,18 @@ class ModelSlot:
 
         avg = {f"val/{k}": v / n_batches for k, v in total_metrics.items()}
         avg["val/perplexity"] = math.exp(min(avg["val/loss"], 20.0))
+
+        # Forfeit-ply / game-completion stats — same surface as pretraining
+        # so the lab MCP server can fit a log-linear trend from each variant's
+        # metrics.jsonl.
+        avg.update(eval_game_completion_metrics(
+            self.model, val_data,
+            batch_size=self.train_cfg.batch_size,
+            vocab_size=self.model_cfg.vocab_size,
+            device=self.device,
+            use_amp=self.train_cfg.use_amp,
+        ))
+
         return avg
 
     def close(self):
@@ -301,6 +322,87 @@ class ModelSlot:
 # ---------------------------------------------------------------------------
 # Variant config builder
 # ---------------------------------------------------------------------------
+
+
+def _resolve_cotrain_resume_prepend_outcome(config: CotrainConfig) -> None:
+    """Peek at each variant's resume checkpoint and align config.prepend_outcome
+    with what the checkpoints were actually trained on.
+
+    Cotrain shares one data pipeline across variants, so a mismatch (some
+    outcome-prefixed, some pure-moves) is unresolvable — exits with a
+    loud error. Called BEFORE slot construction so each ModelSlot's
+    write_config_json sees the corrected format; otherwise the new run
+    directory would advertise a format inconsistent with its batches.
+
+    No-op when no variant is resuming.
+    """
+    from pawn.checkpoint import infer_prepend_outcome, read_checkpoint_metadata
+
+    resume_modes: dict[str, bool] = {}
+    ambiguous_variants: list[tuple[str, str]] = []
+    for variant_spec in config.variants:
+        if not variant_spec.resume:
+            continue
+        try:
+            saved = read_checkpoint_metadata(variant_spec.resume)
+        except (FileNotFoundError, OSError) as e:
+            print(f"WARNING: couldn't peek at {variant_spec.name} resume "
+                  f"checkpoint ({e}); assuming current prepend_outcome")
+            continue
+        saved_prepend, reason = infer_prepend_outcome(
+            saved.get("training_config"), saved.get("model_config"),
+        )
+        if saved_prepend is None:
+            ambiguous_variants.append((variant_spec.name, reason))
+            print(f"  [{variant_spec.name}] resume: ambiguous ({reason})")
+            continue
+        resume_modes[variant_spec.name] = saved_prepend
+        print(f"  [{variant_spec.name}] resume: "
+              f"{'outcome-prefixed' if saved_prepend else 'pure-moves'} "
+              f"({reason})")
+
+    if ambiguous_variants:
+        if "prepend_outcome" in config.model_fields_set:
+            print(
+                f"WARNING: {len(ambiguous_variants)} resumed variant(s) "
+                f"have ambiguous sequence format — trusting explicit "
+                f"prepend_outcome={config.prepend_outcome} from the run "
+                "config. Verify this matches what the checkpoints were "
+                "trained with."
+            )
+            # Treat the user's explicit value as the ground-truth for
+            # those variants so the mismatch-detection below still works.
+            for name, _ in ambiguous_variants:
+                resume_modes[name] = config.prepend_outcome
+        else:
+            names = ", ".join(n for n, _ in ambiguous_variants)
+            print(
+                f"ERROR: resumed variant(s) {names} have ambiguous sequence "
+                "format. Pass `prepend_outcome: true` or "
+                "`prepend_outcome: false` in the run config explicitly.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if not resume_modes:
+        return
+
+    unique = set(resume_modes.values())
+    if len(unique) > 1:
+        print(
+            "ERROR: resumed variants use incompatible sequence formats; "
+            "cotrain shares one data pipeline, so all variants must "
+            f"agree on prepend_outcome. Got: {resume_modes}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    resumed_prepend = next(iter(unique))
+    if resumed_prepend != config.prepend_outcome:
+        print(f"Resume: overriding prepend_outcome="
+              f"{config.prepend_outcome} → {resumed_prepend} to match "
+              f"resumed checkpoints.")
+        config.prepend_outcome = resumed_prepend
 
 
 def _build_variant_configs(
@@ -316,17 +418,29 @@ def _build_variant_configs(
         "large": CLMConfig.large,
         "toy": CLMConfig.toy,
     }
-    model_cfg = variant_factory[variant_spec.variant]()
-
-    # Architecture overrides from the variant spec
-    if variant_spec.d_model is not None:
-        model_cfg.d_model = variant_spec.d_model
-    if variant_spec.n_layers is not None:
-        model_cfg.n_layers = variant_spec.n_layers
-    if variant_spec.n_heads is not None:
-        model_cfg.n_heads = variant_spec.n_heads
-    if variant_spec.d_ff is not None:
-        model_cfg.d_ff = variant_spec.d_ff
+    if variant_spec.variant == "custom":
+        # CotrainVariant._check_custom_arch ensures all four are set.
+        assert variant_spec.d_model is not None
+        assert variant_spec.n_layers is not None
+        assert variant_spec.n_heads is not None
+        assert variant_spec.d_ff is not None
+        model_cfg = CLMConfig(
+            d_model=variant_spec.d_model,
+            n_layers=variant_spec.n_layers,
+            n_heads=variant_spec.n_heads,
+            d_ff=variant_spec.d_ff,
+        )
+    else:
+        model_cfg = variant_factory[variant_spec.variant]()
+        # Architecture overrides on top of the preset
+        if variant_spec.d_model is not None:
+            model_cfg.d_model = variant_spec.d_model
+        if variant_spec.n_layers is not None:
+            model_cfg.n_layers = variant_spec.n_layers
+        if variant_spec.n_heads is not None:
+            model_cfg.n_heads = variant_spec.n_heads
+        if variant_spec.d_ff is not None:
+            model_cfg.d_ff = variant_spec.d_ff
     model_cfg.max_seq_len = variant_spec.max_seq_len
 
     if variant_spec.legacy_vocab:
@@ -345,7 +459,7 @@ def _build_variant_configs(
         train_cfg.eval_interval = shared.eval_interval
     train_cfg.checkpoint_interval = shared.checkpoint_interval
     train_cfg.discard_ply_limit = shared.discard_ply_limit
-    train_cfg.no_outcome_token = shared.no_outcome_token
+    train_cfg.prepend_outcome = shared.prepend_outcome
     train_cfg.mate_boost = shared.mate_boost
     train_cfg.use_wandb = shared.wandb
     train_cfg.use_amp = shared.amp_dtype != "none"
@@ -404,11 +518,27 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     if config.shm_checkpoints:
         print("Checkpoints: /dev/shm (volatile, HF push is durable store)")
     if config.no_outcome_token:
-        print("Outcome token: DISABLED (ablation experiment)")
+        import warnings
+        warnings.warn(
+            "no_outcome_token is deprecated and has no effect in cotraining. "
+            "Sequences are pure moves by default; use prepend_outcome=True for "
+            "outcome-conditioned training.",
+            DeprecationWarning, stacklevel=2,
+        )
+    if config.prepend_outcome:
+        print("Outcome token: PREPENDED at position 0 (outcome-conditioned training)")
     print(f"LR: {scaled_lr:.2e} (scaled from {base_lr:.2e} for batch {config.batch_size})")
     print()
 
-    # Build slots
+    # Correct config.prepend_outcome BEFORE constructing slots. Each
+    # ModelSlot writes its own config.json during __init__, so a
+    # post-construction override would leave the new run directory
+    # advertising a format inconsistent with what it actually trained on.
+    _resolve_cotrain_resume_prepend_outcome(config)
+
+    # Build slots (now uses the corrected config.prepend_outcome, so each
+    # slot's TrainingConfig and config.json reflect the actual sequence
+    # format).
     slots: list[ModelSlot] = []
     for variant_spec in config.variants:
         model_cfg, train_cfg = _build_variant_configs(
@@ -441,14 +571,16 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     dataset = CLMDataset(
         config.batch_size, max_ply, base_seed=42,
         discard_ply_limit=config.discard_ply_limit,
-        no_outcome=config.no_outcome_token,
+        mate_boost=config.mate_boost,
+        prepend_outcome=config.prepend_outcome,
     )
 
     print("\nGenerating shared validation set...")
     val_data = create_validation_set(
         config.val_games, max_ply, seed=(2**63) - 1,
         discard_ply_limit=config.discard_ply_limit,
-        no_outcome=config.no_outcome_token,
+        mate_boost=config.mate_boost,
+        prepend_outcome=config.prepend_outcome,
     )
 
     # Compile models

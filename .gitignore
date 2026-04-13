@@ -73,3 +73,6 @@ checkpoints/
 
 # pawn-lab run directory (state, events, logs, lab notes)
 runs/
+
+# Codex review scratch file (ephemeral, sometimes left behind by `codex review`)
+.codex

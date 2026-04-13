@@ -168,6 +168,16 @@ def strip_outcome_token(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tenso
         new_legal[:, :-1] = legal_grid[:, 1:]
         result["legal_grid"] = new_legal
 
+    # Post-strip the batch represents pure-move sequences — overwrite the
+    # outcome-aware metadata so eval consumers (eval_game_completion_metrics,
+    # probes, etc.) apply the pure-moves alignment. Without this, the raw
+    # ``move_ids`` tensor's shape (B, seq_len-1) would no longer align with
+    # the now-pure ``input_ids`` (B, seq_len) and would crash downstream.
+    result["prepend_outcome"] = torch.tensor(False, dtype=torch.bool)
+    # For pure-move sequences, the padded ``input_ids`` can stand in for
+    # ``move_ids`` (they encode the same ply positions up to game_length).
+    result["move_ids"] = new_input_ids
+
     # Pass through other keys unchanged
     for k, v in batch.items():
         if k not in result:
@@ -256,6 +266,32 @@ def shift_legal_mask(mask: np.ndarray) -> np.ndarray:
     return shifted
 
 
+def align_legal_to_preds(
+    raw: np.ndarray, prepend_outcome: bool
+) -> np.ndarray:
+    """Align a raw per-game-ply legal mask with CLM predictions.
+
+    The engine returns masks indexed by game-ply: ``raw[p]`` = legal moves
+    at game-ply ``p`` (i.e. after ``p`` moves have been played).  CLM
+    predictions are indexed by token position in the packed sequence:
+
+      * ``prepend_outcome=False`` — ``preds[t]`` predicts ``targets[t]``
+        = ``input_ids[t+1]``, which is game-ply ``t+1``.  Shift the raw
+        mask by -1 so ``out[t] = raw[t+1]``.
+      * ``prepend_outcome=True`` — position 0 is the outcome token, so
+        ``preds[t]`` predicts game-ply ``t``.  We want ``out[t] = raw[t]``,
+        plus one zero row appended at the end to keep the sequence length
+        consistent with the token tensors.
+
+    In both cases the returned tensor has shape ``(B, seq_len, ...)`` so
+    it can be indexed in lockstep with ``preds`` / ``loss_mask``.
+    """
+    if prepend_outcome:
+        pad = np.zeros_like(raw[:, :1])
+        return np.concatenate([raw, pad], axis=1)
+    return shift_legal_mask(raw)
+
+
 def create_validation_set(
     n_games: int, max_ply: int, seed: int,
     discard_ply_limit: bool = False,
@@ -282,11 +318,21 @@ def create_validation_set(
         "loss_mask": torch.from_numpy(loss_mask),
     }
 
+    # Raw per-game-ply move ids (without the outcome prefix) — eval uses
+    # these to recompute full-vocab legal token masks for game-completion
+    # scoring, where ``input_ids`` can't be reused directly because it may
+    # start with the outcome token.
+    batch["move_ids"] = torch.from_numpy(move_ids).long()
+    batch["prepend_outcome"] = torch.tensor(prepend_outcome, dtype=torch.bool)
+
     # Compute legal move masks for evaluating legal move rate.
-    # Shift by one ply so legal_grid[ply] aligns with targets[ply]
-    # (see shift_legal_mask docstring).
+    # ``align_legal_to_preds`` handles both modes: shift-by-one for pure
+    # sequences (preds[t] predicts game-ply t+1), or append a zero row for
+    # outcome-prefixed sequences (preds[t] predicts game-ply t).
     legal_grid, _legal_promo = engine.compute_legal_move_masks(move_ids, game_lengths)
-    batch["legal_grid"] = torch.from_numpy(shift_legal_mask(legal_grid)).long()
+    batch["legal_grid"] = torch.from_numpy(
+        align_legal_to_preds(legal_grid, prepend_outcome)
+    ).long()
     batch["game_lengths"] = torch.from_numpy(game_lengths).long()
 
     if no_outcome and prepend_outcome:

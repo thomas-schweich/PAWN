@@ -20,6 +20,7 @@ from typing import Any
 from pawn.lab.monitor import (
     check_health,
     is_alive,
+    read_cotrain_val_summary,
     read_metrics,
     read_pretrain_val_summary,
 )
@@ -602,6 +603,11 @@ class TrialRunner:
                     pretrain = read_pretrain_val_summary(t)
                     if pretrain:
                         row["pretrain"] = pretrain
+                # Same surface for cotrain, per variant.
+                elif cfg.get("run_type") == "cotrain":
+                    cotrain = read_cotrain_val_summary(t)
+                    if cotrain:
+                        row["cotrain"] = cotrain
                 running.append(row)
         elapsed = time.time() - self.start_time
         cost = (self.cost_per_hour * elapsed / 3600) if self.cost_per_hour else None
