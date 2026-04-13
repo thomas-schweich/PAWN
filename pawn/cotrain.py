@@ -405,6 +405,53 @@ def _resolve_cotrain_resume_prepend_outcome(config: CotrainConfig) -> None:
         config.prepend_outcome = resumed_prepend
 
 
+def _warn_cotrain_resume_lr_mismatch(config: CotrainConfig) -> None:
+    """Warn if any resuming variant's saved ``training.lr`` differs from
+    the new ``config.lr``.
+
+    Cotrain used to silently scale the user-supplied LR by
+    ``batch_size / 256``, which meant an old checkpoint launched at
+    e.g. ``lr=3e-4, batch_size=512`` actually saved ``training.lr=6e-4``
+    in its config.json (the scaled value). This PR removed that
+    scaling, so resuming such a checkpoint with the original CLI args
+    (``lr=3e-4``) would silently halve the effective LR mid-training —
+    ``CosineWithWarmup`` captures ``base_lrs`` from the newly
+    constructed optimizer (at the new ``config.lr``) and overrides the
+    loaded per-group lr on its first ``step()``.
+
+    This helper just warns and tells the user how to pin the old LR.
+    No override — the whole point of this PR is that cotrain should
+    never silently rewrite the user's LR.
+    """
+    from pawn.checkpoint import read_checkpoint_metadata
+    for variant_spec in config.variants:
+        if not variant_spec.resume:
+            continue
+        try:
+            saved = read_checkpoint_metadata(variant_spec.resume)
+        except (FileNotFoundError, OSError):
+            continue
+        training_cfg = saved.get("training_config") or {}
+        saved_lr = training_cfg.get("lr")
+        if saved_lr is None:
+            continue
+        try:
+            saved_lr_f = float(saved_lr)
+        except (TypeError, ValueError):
+            continue
+        if abs(saved_lr_f - config.lr) > 1e-12:
+            print(
+                f"  [{variant_spec.name}] WARNING: resuming checkpoint "
+                f"trained with lr={saved_lr_f:.2e}, but run config "
+                f"lr={config.lr:.2e}. Training will continue at "
+                f"{config.lr:.2e} from here — CosineWithWarmup's base_lrs "
+                f"are captured from the fresh optimizer. If this is a "
+                f"pre-scaling-removal cotrain checkpoint, pass "
+                f"lr={saved_lr_f:.2e} explicitly in the run config to "
+                f"preserve the effective LR."
+            )
+
+
 def _build_variant_configs(
     variant_spec: CotrainVariant,
     shared: CotrainConfig,
@@ -529,6 +576,13 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     # post-construction override would leave the new run directory
     # advertising a format inconsistent with what it actually trained on.
     _resolve_cotrain_resume_prepend_outcome(config)
+
+    # Warn if resuming a pre-scaling-removal checkpoint whose saved LR
+    # differs from the new run config's LR. We don't override anything —
+    # this PR's whole point is that cotrain shouldn't silently rewrite
+    # user LRs — but the mismatch is subtle enough that a loud warning
+    # is warranted.
+    _warn_cotrain_resume_lr_mismatch(config)
 
     # Build slots (now uses the corrected config.prepend_outcome, so each
     # slot's TrainingConfig and config.json reflect the actual sequence
