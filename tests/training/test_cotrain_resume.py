@@ -191,6 +191,22 @@ class TestResolveCotrainResumePrependOutcome:
             _resolve_cotrain_resume_prepend_outcome(cfg)
         assert exc_info.value.code == 1
 
+    def test_metadata_cache_is_populated(self, tmp_path):
+        """Codex round-2 regression: the helper should populate the
+        passed-in metadata cache so downstream helpers can reuse it
+        instead of triggering a second (expensive for legacy .pt)
+        checkpoint load."""
+        ckpt = tmp_path / "step_1"
+        _write_checkpoint(ckpt, prepend_outcome=True)
+        cfg = _make_config(
+            [CotrainVariant(name="a", variant="toy", resume=str(ckpt))],
+            prepend_outcome=True,
+        )
+        cache: dict = {}
+        _resolve_cotrain_resume_prepend_outcome(cfg, metadata_cache=cache)
+        assert "a" in cache
+        assert cache["a"]["training_config"]["prepend_outcome"] is True
+
     def test_ambiguous_resume_with_explicit_flag_trusts_user(
         self, tmp_path, capsys,
     ):

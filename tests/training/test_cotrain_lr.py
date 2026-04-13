@@ -172,3 +172,47 @@ class TestCotrainResumeLrMismatchWarning:
         _warn_cotrain_resume_lr_mismatch(cfg)
         out = capsys.readouterr().out
         assert "WARNING" not in out
+
+    def test_metadata_cache_avoids_second_read(self, tmp_path, mocker):
+        """Codex round-2 regression: legacy .pt resumes trigger a full
+        pickle deserialization inside read_checkpoint_metadata. The
+        warn helper must reuse the cache populated by the prepend-peek
+        helper instead of re-reading."""
+        ckpt = tmp_path / "a"
+        _write_ckpt(ckpt, saved_lr=6e-4)
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            lr=3e-4,
+            variants=[CotrainVariant(name="a", variant="toy", resume=str(ckpt))],
+        )
+        # Pre-populate the cache (simulating the first peek helper's
+        # behaviour) and then patch read_checkpoint_metadata to blow up
+        # if it's called again.
+        cache = {
+            "a": {
+                "training_config": {"lr": 6e-4},
+                "model_config": {"vocab_size": 1980, "max_seq_len": 512},
+            },
+        }
+        spy = mocker.patch(
+            "pawn.checkpoint.read_checkpoint_metadata",
+            side_effect=AssertionError("should not reload from disk"),
+        )
+        _warn_cotrain_resume_lr_mismatch(cfg, metadata_cache=cache)
+        spy.assert_not_called()
+
+    def test_cache_miss_falls_back_to_filesystem(self, tmp_path, capsys):
+        """If a variant is absent from the cache (e.g. the first peek
+        failed to read it), the warn helper still does its own read.
+        Keeps the helper robust for standalone/test use."""
+        ckpt = tmp_path / "a"
+        _write_ckpt(ckpt, saved_lr=6e-4)
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            lr=3e-4,
+            variants=[CotrainVariant(name="a", variant="toy", resume=str(ckpt))],
+        )
+        _warn_cotrain_resume_lr_mismatch(cfg, metadata_cache={})  # empty cache
+        out = capsys.readouterr().out
+        assert "WARNING" in out
+        assert "6.00e-04" in out
