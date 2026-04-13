@@ -239,7 +239,10 @@ class ModelSlot:
 
     @torch.no_grad()
     def evaluate(self, val_data: dict[str, torch.Tensor]) -> dict[str, float]:
-        from pawn.trainer import compute_legal_move_rate_from_preds
+        from pawn.trainer import (
+            compute_legal_move_rate_from_preds,
+            eval_game_completion_metrics,
+        )
 
         self.model.eval()
         n = val_data["input_ids"].shape[0]
@@ -247,6 +250,8 @@ class ModelSlot:
         total_metrics: dict[str, float] = {}
         n_batches = 0
         has_legal = "legal_grid" in val_data
+        legality_late_ply = self.model_cfg.max_seq_len // 2
+        n_actions = self.model.embed.n_actions
 
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
@@ -273,7 +278,7 @@ class ModelSlot:
                 (top5 == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
             )
 
-            # Legal move rate: reuse already-computed valid_logits argmax
+            # Legal move rate (full + late): reuse valid_logits argmax.
             if has_legal:
                 legal_grid = val_data["legal_grid"][start:end].to(self.device, non_blocking=True)
                 game_lengths = val_data["game_lengths"][start:end].to(self.device, non_blocking=True)
@@ -281,7 +286,12 @@ class ModelSlot:
                 preds[loss_mask] = valid_logits.argmax(dim=-1)
                 metrics["legal_move_rate"] = compute_legal_move_rate_from_preds(
                     preds, legal_grid, loss_mask, game_lengths,
-                    n_actions=self.model.embed.n_actions,
+                    n_actions=n_actions,
+                )
+                metrics["late_legal_move_rate"] = compute_legal_move_rate_from_preds(
+                    preds, legal_grid, loss_mask, game_lengths,
+                    min_ply=legality_late_ply,
+                    n_actions=n_actions,
                 )
 
             for k, v in metrics.items():
@@ -290,6 +300,18 @@ class ModelSlot:
 
         avg = {f"val/{k}": v / n_batches for k, v in total_metrics.items()}
         avg["val/perplexity"] = math.exp(min(avg["val/loss"], 20.0))
+
+        # Forfeit-ply / game-completion stats — same surface as pretraining
+        # so the lab MCP server can fit a log-linear trend from each variant's
+        # metrics.jsonl.
+        avg.update(eval_game_completion_metrics(
+            self.model, val_data,
+            batch_size=self.train_cfg.batch_size,
+            vocab_size=self.model_cfg.vocab_size,
+            device=self.device,
+            use_amp=self.train_cfg.use_amp,
+        ))
+
         return avg
 
     def close(self):

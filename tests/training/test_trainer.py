@@ -426,3 +426,76 @@ class TestValStepSmoke:
         assert logits.shape[0] == B
         assert logits.shape[1] == T
         assert logits.shape[2] == toy_model.cfg.vocab_size
+
+
+@pytest.mark.integration
+class TestEvalGameCompletionMetrics:
+    """Shared helper for pretrain + cotrain forfeit/game-completion stats."""
+
+    def _toy_model(self, max_seq_len: int, cpu_device: str):
+        from pawn.config import CLMConfig
+        from pawn.model import PAWNCLM
+        cfg = CLMConfig.toy()
+        cfg.max_seq_len = max_seq_len
+        torch.manual_seed(0)
+        model = PAWNCLM(cfg).to(cpu_device).eval()
+        return model, cfg
+
+    def test_pure_moves_returns_expected_keys(self, cpu_device):
+        from pawn.data import create_validation_set
+        from pawn.trainer import eval_game_completion_metrics
+
+        model, cfg = self._toy_model(max_seq_len=64, cpu_device=cpu_device)
+        val_data = create_validation_set(n_games=8, max_ply=64, seed=42)
+
+        out = eval_game_completion_metrics(
+            model, val_data,
+            batch_size=4, vocab_size=cfg.vocab_size,
+            device=cpu_device, use_amp=False,
+        )
+
+        expected = {
+            "val/game_completion_rate",
+            "val/avg_pct_completion",
+            "val/avg_plies_completed",
+            "val/min_forfeit_ply",
+            "val/max_forfeit_ply",
+            "val/median_forfeit_ply",
+        }
+        assert expected <= out.keys()
+        assert 0.0 <= out["val/game_completion_rate"] <= 1.0
+
+    def test_prepend_outcome_runs_without_shape_errors(self, cpu_device):
+        """Regression: outcome token at position 0 breaks the old code path
+        that reused input_ids as move_ids; the new helper must use val_data
+        move_ids and align_legal_to_preds instead."""
+        from pawn.data import create_validation_set
+        from pawn.trainer import eval_game_completion_metrics
+
+        model, cfg = self._toy_model(max_seq_len=64, cpu_device=cpu_device)
+        val_data = create_validation_set(
+            n_games=8, max_ply=64, seed=42, prepend_outcome=True,
+        )
+
+        out = eval_game_completion_metrics(
+            model, val_data,
+            batch_size=4, vocab_size=cfg.vocab_size,
+            device=cpu_device, use_amp=False,
+        )
+        assert "val/game_completion_rate" in out
+        assert 0.0 <= out["val/game_completion_rate"] <= 1.0
+
+    def test_missing_move_ids_returns_empty(self, cpu_device):
+        from pawn.trainer import eval_game_completion_metrics
+        model, cfg = self._toy_model(max_seq_len=32, cpu_device=cpu_device)
+        # val_data without move_ids / game_lengths -> helper is a no-op.
+        val_data = {
+            "input_ids": torch.zeros(2, 32, dtype=torch.long),
+            "loss_mask": torch.ones(2, 32, dtype=torch.bool),
+        }
+        out = eval_game_completion_metrics(
+            model, val_data,
+            batch_size=2, vocab_size=cfg.vocab_size,
+            device=cpu_device, use_amp=False,
+        )
+        assert out == {}
