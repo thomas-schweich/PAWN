@@ -298,32 +298,17 @@ def _aggregate_cotrain_metrics(trial: Trial) -> None:
             break
 
 
-def read_pretrain_val_summary(trial: Trial) -> dict[str, Any] | None:
-    """Scan the trial's metrics.jsonl for the latest pretraining val record
-    and compute a log-linear fit on forfeit rate over the most recent half
-    of the history.
+def _read_val_forfeit_summary(metrics_path: Path) -> dict[str, Any] | None:
+    """Scan a single metrics.jsonl for forfeit / game-completion stats.
 
-    Returns a dict with:
-        latest: the latest val record's key fields (game_completion_rate,
-            avg_plies_completed, forfeit min/max/median, legal, late_legal,
-            val_loss, step)
-        forfeit_fit: {slope_per_step, half_life_steps, n_points,
-            current_forfeit} computed from the most recent half of the
-            (step, forfeit_rate) series — matches the dashboard's
-            log-linear fit. The OLS itself is restricted to strictly
-            positive forfeit rates (log(0) would blow up), but
-            `current_forfeit` is always the last observed forfeit rate
-            from the full series — including 0.0 if the most recent eval
-            had no forfeits. Omitted if fewer than 4 val records have
-            game_completion_rate (not a pretraining run or too early),
-            or if fewer than 3 positive-forfeit points land in the
-            half-window.
+    Returns ``{"latest": {...}, "forfeit_fit": {...}}`` or ``None`` if the
+    file has no val records with ``val/game_completion_rate``. The fit
+    block is omitted when there are fewer than 4 val records total or
+    fewer than 3 strictly positive forfeit points in the half-window.
 
-    Returns None if no val records are available.
+    Shared by :func:`read_pretrain_val_summary` (single metrics.jsonl) and
+    :func:`read_cotrain_val_summary` (one call per variant).
     """
-    if trial.run_dir is None:
-        return None
-    metrics_path = Path(trial.run_dir) / "metrics.jsonl"
     if not metrics_path.exists():
         return None
 
@@ -395,6 +380,62 @@ def read_pretrain_val_summary(trial: Trial) -> dict[str, Any] | None:
                 }
 
     return summary
+
+
+def read_pretrain_val_summary(trial: Trial) -> dict[str, Any] | None:
+    """Scan the trial's metrics.jsonl for the latest pretraining val record
+    and compute a log-linear fit on forfeit rate over the most recent half
+    of the history.
+
+    Returns a dict with:
+        latest: the latest val record's key fields (game_completion_rate,
+            avg_plies_completed, forfeit min/max/median, legal, late_legal,
+            val_loss, step)
+        forfeit_fit: {slope_per_step, half_life_steps, n_points,
+            current_forfeit} computed from the most recent half of the
+            (step, forfeit_rate) series — matches the dashboard's
+            log-linear fit. The OLS itself is restricted to strictly
+            positive forfeit rates (log(0) would blow up), but
+            `current_forfeit` is always the last observed forfeit rate
+            from the full series — including 0.0 if the most recent eval
+            had no forfeits. Omitted if fewer than 4 val records have
+            game_completion_rate (not a pretraining run or too early),
+            or if fewer than 3 positive-forfeit points land in the
+            half-window.
+
+    Returns None if no val records are available.
+    """
+    if trial.run_dir is None:
+        return None
+    return _read_val_forfeit_summary(Path(trial.run_dir) / "metrics.jsonl")
+
+
+def read_cotrain_val_summary(trial: Trial) -> dict[str, Any] | None:
+    """Per-variant forfeit / log-linear summary for a cotrain trial.
+
+    Returns ``{"variants": {name: summary, ...}}`` where each variant
+    summary matches the shape of :func:`read_pretrain_val_summary` —
+    ``{"latest": {...}, "forfeit_fit": {...}}`` keyed by variant name
+    (e.g. ``small`` / ``base`` / ``large``). Variants with no
+    game-completion records yet are omitted. Returns ``None`` if the
+    trial has no variants registered or none of them have any
+    forfeit-rate data yet.
+    """
+    if not trial.variants:
+        return None
+
+    variants_out: dict[str, dict[str, Any]] = {}
+    for name, vs in trial.variants.items():
+        run_dir = vs.get("run_dir")
+        if not run_dir:
+            continue
+        summary = _read_val_forfeit_summary(Path(run_dir) / "metrics.jsonl")
+        if summary is not None:
+            variants_out[name] = summary
+
+    if not variants_out:
+        return None
+    return {"variants": variants_out}
 
 
 def check_health(trial: Trial) -> str | None:
