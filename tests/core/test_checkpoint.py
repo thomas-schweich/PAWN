@@ -992,3 +992,57 @@ class TestInferPrependOutcome:
         result, reason = infer_prepend_outcome(None, None)
         assert result is None
         assert "ambiguous" in reason
+
+    def test_legacy_no_outcome_token_true_overrides_vocab_heuristic(self):
+        """Codex round 6: a pre-flag legacy-vocab checkpoint with the
+        pure-moves ablation flag set must be detected as pure-moves,
+        not silently reclassified as outcome-prefixed via the
+        legacy-vocab heuristic."""
+        from pawn.config import LegacyVocab
+        result, reason = infer_prepend_outcome(
+            {"no_outcome_token": True},
+            {"vocab_size": LegacyVocab.VOCAB_SIZE, "max_seq_len": 256},
+        )
+        assert result is False
+        assert "no_outcome_token" in reason
+
+    def test_legacy_no_outcome_token_true_overrides_256_ctx_heuristic(self):
+        """Same precedence check for 256-ctx 1980-vocab checkpoints."""
+        result, reason = infer_prepend_outcome(
+            {"no_outcome_token": True},
+            {"vocab_size": 1980, "max_seq_len": 256},
+        )
+        assert result is False
+        assert "no_outcome_token" in reason
+
+    def test_no_outcome_token_true_on_modern_checkpoint(self):
+        """A modern checkpoint with no_outcome_token=True (user still
+        passed the deprecated flag) is pure-moves — step 2 short-
+        circuits before the ambiguous fallback."""
+        result, reason = infer_prepend_outcome(
+            {"no_outcome_token": True},
+            {"vocab_size": 1980, "max_seq_len": 512},
+        )
+        assert result is False
+        assert "no_outcome_token" in reason
+
+    def test_no_outcome_token_false_is_not_disambiguating(self):
+        """A modern 512-ctx checkpoint with no_outcome_token=False must
+        still be treated as ambiguous — False is the default for every
+        run regardless of the actual sequence format."""
+        result, reason = infer_prepend_outcome(
+            {"no_outcome_token": False},
+            {"vocab_size": 1980, "max_seq_len": 512},
+        )
+        assert result is None
+        assert "ambiguous" in reason
+
+    def test_prepend_outcome_takes_precedence_over_no_outcome_token(self):
+        """Contradictory flags: saved prepend_outcome wins (exact), even
+        if the deprecated no_outcome_token is also set."""
+        result, reason = infer_prepend_outcome(
+            {"prepend_outcome": True, "no_outcome_token": True},
+            {"vocab_size": 1980, "max_seq_len": 512},
+        )
+        assert result is True
+        assert "saved" in reason

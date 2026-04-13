@@ -321,22 +321,32 @@ def infer_prepend_outcome(
     confidently decide — callers must fail closed or require an
     explicit user override, not silently pick a default.
 
-      1. If ``training_config["prepend_outcome"]`` is present, return it
-         exactly — this is the post-PR PAWN default where the field is
-         persisted to config.json.
-      2. Otherwise, fall back to heuristics for pre-flag checkpoints:
-         - Legacy vocab (``vocab_size == LegacyVocab.VOCAB_SIZE``) →
-           ``(True, ...)``. The legacy 4284-token runs are all pre-
-           2026-04-08 and used the outcome prefix as the implicit Rust
-           default.
-         - 256-token context (``max_seq_len <= 256``) → ``(True, ...)``.
-           The 256-ctx convention predates the flip and was
-           outcome-prefixed.
-         - Otherwise → ``(None, ...)``. A 1980-vocab / 512-ctx
-           checkpoint without the field could be either pre-flip
-           (outcome-prefixed) or post-flip (pure-moves), so guessing
-           either way risks silently corrupting resume/eval. Callers
-           must use an explicit override in this case.
+    Precedence (most to least authoritative):
+
+      1. ``training_config["prepend_outcome"]`` — exact, this is the
+         post-PR PAWN default where the field is persisted to
+         config.json.
+      2. ``training_config["no_outcome_token"] == True`` — authoritative
+         ⇒ ``(False, ...)``. Pre-flag ablation runs used this flag to
+         strip the outcome via ``strip_outcome_token`` (sequences are
+         pure moves). Post-deprecation the flag is a no-op but was
+         always combined with the now-default pure-moves layout, so
+         either way ``True`` ⇒ pure moves. Note that the **False** case
+         (``no_outcome_token=False``) is NOT disambiguating: it's the
+         default and modern runs set it to False regardless of the
+         actual sequence format.
+      3. Legacy vocab (``vocab_size == LegacyVocab.VOCAB_SIZE``) →
+         ``(True, ...)``. The legacy 4284-token runs are all pre-
+         2026-04-08 and used the outcome prefix as the implicit Rust
+         default (unless overridden by ``no_outcome_token=True``, which
+         step 2 handles first).
+      4. 256-token context (``max_seq_len <= 256``) → ``(True, ...)``.
+         The 256-ctx convention predates the flip and was
+         outcome-prefixed.
+      5. Otherwise → ``(None, ...)``. A 1980-vocab / 512-ctx checkpoint
+         without the field could be either pre-flip (outcome-prefixed)
+         or post-flip (pure-moves); guessing either way risks silently
+         corrupting resume/eval. Callers must use an explicit override.
 
     Callers should print the reason when they override a user-supplied
     flag so the behaviour is explicit and auditable.
@@ -347,6 +357,13 @@ def infer_prepend_outcome(
 
     if "prepend_outcome" in training:
         return bool(training["prepend_outcome"]), "saved training.prepend_outcome"
+
+    # Pre-flag ablation runs used `no_outcome_token=True` to force pure-
+    # moves via strip_outcome_token. The `=False` case is non-signal
+    # because modern runs default the field to False while still being
+    # pure-moves (Rust default flipped in commit a6651a8).
+    if training.get("no_outcome_token") is True:
+        return False, "saved training.no_outcome_token=True (pure-moves ablation)"
 
     vocab_size = model.get("vocab_size")
     if vocab_size == LegacyVocab.VOCAB_SIZE:
