@@ -135,13 +135,24 @@ def _run_post_training_evals(slots: list[ModelSlot], args):
 
         results = {}
 
-        # 1. Probes
-        print("  Running probes...")
-        train_data = extract_probe_data(2048, 256, seed=12345)
-        val_data = extract_probe_data(512, 256, seed=54321)
+        # 1. Probes — match the checkpoint's training-time sequence
+        # format, not the extract_probe_data / train_all_probes defaults.
+        # Without this, probe data for a --prepend-outcome run would be
+        # generated as pure moves while hidden states were extracted at
+        # ply_offset=0, measuring off-by-one shifted representations.
+        prepend_outcome = slot.train_cfg.prepend_outcome
+        no_outcome_token = not prepend_outcome
+        print(f"  Running probes (prepend_outcome={prepend_outcome})...")
+        train_data = extract_probe_data(
+            2048, 256, seed=12345, prepend_outcome=prepend_outcome,
+        )
+        val_data = extract_probe_data(
+            512, 256, seed=54321, prepend_outcome=prepend_outcome,
+        )
         probe_results = train_all_probes(
             model, train_data, val_data, device=device,
             per_layer=True, n_epochs=20, verbose=True,
+            no_outcome_token=no_outcome_token,
         )
         results["probes"] = probe_results
         del train_data, val_data
