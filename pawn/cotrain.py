@@ -881,17 +881,19 @@ def run_post_training_evals(
         best_step = slot.best_val_step
         best_loss = slot.best_val_loss
 
-        ckpt_path: str | None = os.path.join(
+        best_ckpt = os.path.join(
             slot.checkpoint_dir, f"step_{best_step:08d}"
         )
-        assert ckpt_path is not None
-        if not os.path.isdir(ckpt_path):
+        ckpt_path: str | None
+        if os.path.isdir(best_ckpt):
+            ckpt_path = best_ckpt
+        else:
             # Fall back to the latest on-disk checkpoint — shm_checkpoints
             # runs may have already cleaned out older ones.
             ckpts = sorted(Path(slot.checkpoint_dir).glob("step_*"))
             ckpt_path = str(ckpts[-1]) if ckpts else None
 
-        if not ckpt_path:
+        if ckpt_path is None:
             print("  No checkpoint found, skipping")
             continue
 
