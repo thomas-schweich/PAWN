@@ -34,6 +34,10 @@ def parse_args():
     p.add_argument("--device", type=str, default=None, help="Device (cuda/cpu)")
     p.add_argument("--total-steps", type=int, default=100_000, help="Total training steps")
     p.add_argument("--batch-size", type=int, default=256, help="Batch size (shared across models)")
+    p.add_argument("--lr", type=float, default=None,
+                    help="Learning rate (shared across models). Defaults to CotrainConfig.lr "
+                         "(3e-4). Cotrain no longer scales this by batch_size/256 — pass the "
+                         "target rate explicitly.")
     p.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     p.add_argument("--log-dir", type=str, default="logs", help="Log directory")
     p.add_argument("--log-interval", type=int, default=10)
@@ -76,7 +80,7 @@ def _args_to_cotrain_config(args) -> CotrainConfig:
         CotrainVariant(name="large", variant="large", legacy_vocab=args.legacy_vocab),
     ]
 
-    return CotrainConfig(
+    kwargs: dict = dict(
         variants=variants,
         device=args.device or ("cuda" if torch.cuda.is_available() else "cpu"),
         total_steps=args.total_steps,
@@ -95,6 +99,14 @@ def _args_to_cotrain_config(args) -> CotrainConfig:
         local_checkpoints=args.local_checkpoints,
         shm_checkpoints=args.shm_checkpoints,
     )
+    # Only forward --lr if the user explicitly passed it, so the
+    # CotrainConfig default stays the authoritative fallback and
+    # model_fields_set correctly reflects what the user supplied
+    # (matters for downstream ambiguous-resume detection, which
+    # trusts the user's explicit flag over the default).
+    if args.lr is not None:
+        kwargs["lr"] = args.lr
+    return CotrainConfig(**kwargs)
 
 
 def _run_post_training_evals(slots: list[ModelSlot], args):
