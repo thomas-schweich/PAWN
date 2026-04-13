@@ -175,6 +175,29 @@ TMUX
 RUN useradd -m -s /bin/bash pawn && \
     mkdir -p /opt/pawn && chown pawn:pawn /opt/pawn
 
+# Normalize $HOME against /etc/passwd at login-shell start. Some container
+# runtimes (vast.ai) bake HOME=/root into /etc/environment based on the
+# container process env, which then leaks into every session via PAM's
+# common-session + pam_env.so — clobbering the HOME that `su -` just reset
+# for the target user. That breaks ~-relative paths for the pawn user and
+# makes our pre-seeded HF token / claude config invisible. /etc/profile.d
+# runs as part of /etc/profile, before bash looks for ~/.bash_profile, so
+# this fix is picked up in time to repoint the dotfile search at the right
+# home directory. No-op on hosts where $HOME is already correct.
+COPY --chmod=755 <<'FIX_HOME' /etc/profile.d/10-fix-home.sh
+#!/bin/sh
+_u=$(id -un 2>/dev/null) || _u=""
+if [ -n "$_u" ]; then
+    _h=$(getent passwd "$_u" 2>/dev/null | cut -d: -f6)
+    if [ -n "$_h" ] && [ "$HOME" != "$_h" ]; then
+        HOME="$_h"
+        export HOME
+        cd "$HOME" 2>/dev/null || true
+    fi
+fi
+unset _u _h
+FIX_HOME
+
 # Install Claude Code and Rust toolchain (for building the chess engine).
 # BuildKit auto-updates $HOME based on the current USER's passwd entry at
 # each RUN, so USER pawn gives HOME=/home/pawn without an explicit ENV.
