@@ -159,13 +159,23 @@ def main():
 
         model = load_model_from_checkpoint(str(ckpt_path), device)
 
-        # Auto-detect no_outcome_token from checkpoint config
-        no_outcome = args.no_outcome_token or train_cfg.get("no_outcome_token", False)
-        prepend_outcome = not no_outcome
+        # Auto-detect prepend_outcome from checkpoint config. Training now
+        # persists ``training.prepend_outcome`` directly; prefer that over
+        # the legacy ``not no_outcome_token`` heuristic (which has always
+        # been wrong for the default pure-moves path).
+        if "prepend_outcome" in train_cfg:
+            prepend_outcome = bool(train_cfg["prepend_outcome"])
+        else:
+            # Pre-prepend_outcome checkpoints were all trained on pure moves
+            # regardless of no_outcome_token (which was a no-op at that time).
+            prepend_outcome = False
+        no_outcome = not prepend_outcome
+        if args.no_outcome_token:
+            no_outcome = True
+            prepend_outcome = False
         max_ply = args.max_ply or model_cfg.get("max_seq_len") or 256
         print(
-            f"  max_ply={max_ply}, no_outcome_token={no_outcome}, "
-            f"prepend_outcome={prepend_outcome}"
+            f"  max_ply={max_ply}, prepend_outcome={prepend_outcome}"
         )
 
         train_data, val_data = get_probe_data(max_ply, prepend_outcome)
