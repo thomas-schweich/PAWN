@@ -324,6 +324,59 @@ class ModelSlot:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_cotrain_resume_prepend_outcome(config: CotrainConfig) -> None:
+    """Peek at each variant's resume checkpoint and align config.prepend_outcome
+    with what the checkpoints were actually trained on.
+
+    Cotrain shares one data pipeline across variants, so a mismatch (some
+    outcome-prefixed, some pure-moves) is unresolvable — exits with a
+    loud error. Called BEFORE slot construction so each ModelSlot's
+    write_config_json sees the corrected format; otherwise the new run
+    directory would advertise a format inconsistent with its batches.
+
+    No-op when no variant is resuming.
+    """
+    from pawn.checkpoint import infer_prepend_outcome, read_checkpoint_metadata
+
+    resume_modes: dict[str, bool] = {}
+    for variant_spec in config.variants:
+        if not variant_spec.resume:
+            continue
+        try:
+            saved = read_checkpoint_metadata(variant_spec.resume)
+        except (FileNotFoundError, OSError) as e:
+            print(f"WARNING: couldn't peek at {variant_spec.name} resume "
+                  f"checkpoint ({e}); assuming current prepend_outcome")
+            continue
+        saved_prepend, reason = infer_prepend_outcome(
+            saved.get("training_config"), saved.get("model_config"),
+        )
+        resume_modes[variant_spec.name] = saved_prepend
+        print(f"  [{variant_spec.name}] resume: "
+              f"{'outcome-prefixed' if saved_prepend else 'pure-moves'} "
+              f"({reason})")
+
+    if not resume_modes:
+        return
+
+    unique = set(resume_modes.values())
+    if len(unique) > 1:
+        print(
+            "ERROR: resumed variants use incompatible sequence formats; "
+            "cotrain shares one data pipeline, so all variants must "
+            f"agree on prepend_outcome. Got: {resume_modes}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    resumed_prepend = next(iter(unique))
+    if resumed_prepend != config.prepend_outcome:
+        print(f"Resume: overriding prepend_outcome="
+              f"{config.prepend_outcome} → {resumed_prepend} to match "
+              f"resumed checkpoints.")
+        config.prepend_outcome = resumed_prepend
+
+
 def _build_variant_configs(
     variant_spec: CotrainVariant,
     shared: CotrainConfig,
@@ -449,7 +502,15 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     print(f"LR: {scaled_lr:.2e} (scaled from {base_lr:.2e} for batch {config.batch_size})")
     print()
 
-    # Build slots
+    # Correct config.prepend_outcome BEFORE constructing slots. Each
+    # ModelSlot writes its own config.json during __init__, so a
+    # post-construction override would leave the new run directory
+    # advertising a format inconsistent with what it actually trained on.
+    _resolve_cotrain_resume_prepend_outcome(config)
+
+    # Build slots (now uses the corrected config.prepend_outcome, so each
+    # slot's TrainingConfig and config.json reflect the actual sequence
+    # format).
     slots: list[ModelSlot] = []
     for variant_spec in config.variants:
         model_cfg, train_cfg = _build_variant_configs(
@@ -470,47 +531,6 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
               file=sys.stderr)
         sys.exit(1)
     start_step = max(resumed_steps) if resumed_steps else 0
-
-    # If any variants are resuming, peek at their saved configs and pick
-    # the sequence format that matches. Cotrain shares one data pipeline
-    # across variants, so a mismatch (e.g. some outcome-prefixed, some
-    # pure-moves) is unresolvable — fail loudly.
-    from pawn.checkpoint import infer_prepend_outcome, read_checkpoint_metadata
-    resume_modes: dict[str, bool] = {}
-    for variant_spec in config.variants:
-        if not variant_spec.resume:
-            continue
-        try:
-            saved = read_checkpoint_metadata(variant_spec.resume)
-        except (FileNotFoundError, OSError) as e:
-            print(f"WARNING: couldn't peek at {variant_spec.name} resume "
-                  f"checkpoint ({e}); assuming current prepend_outcome")
-            continue
-        saved_prepend, reason = infer_prepend_outcome(
-            saved.get("training_config"), saved.get("model_config"),
-        )
-        resume_modes[variant_spec.name] = saved_prepend
-        print(f"  [{variant_spec.name}] resume: "
-              f"{'outcome-prefixed' if saved_prepend else 'pure-moves'} "
-              f"({reason})")
-    if resume_modes:
-        unique = set(resume_modes.values())
-        if len(unique) > 1:
-            print(
-                "ERROR: resumed variants use incompatible sequence formats; "
-                "cotrain shares one data pipeline, so all variants must "
-                f"agree on prepend_outcome. Got: {resume_modes}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        resumed_prepend = next(iter(unique))
-        if resumed_prepend != config.prepend_outcome:
-            print(f"Resume: overriding prepend_outcome="
-                  f"{config.prepend_outcome} → {resumed_prepend} to match "
-                  f"resumed checkpoints.")
-            config.prepend_outcome = resumed_prepend
-            for slot in slots:
-                slot.train_cfg.prepend_outcome = resumed_prepend
 
     # Shared dataset and validation set — use the max_seq_len from the first variant
     # All variants must produce compatible sequence lengths for the shared DataLoader.
