@@ -27,6 +27,11 @@ from pawn.gpu import configure_gpu
 from pawn.logging import MetricsLogger, random_slug
 from pawn.model import PAWNCLM
 from pawn.run_config import CotrainConfig, CotrainVariant
+from pawn.trainer import (
+    CosineWithWarmup,
+    compute_legal_move_rate_from_preds,
+    eval_game_completion_metrics,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +71,6 @@ class ModelSlot:
             weight_decay=train_cfg.weight_decay,
         )
 
-        from pawn.trainer import CosineWithWarmup
         self.scheduler = CosineWithWarmup(
             self.optimizer,
             warmup_steps=train_cfg.warmup_steps,
@@ -239,11 +243,6 @@ class ModelSlot:
 
     @torch.no_grad()
     def evaluate(self, val_data: dict[str, torch.Tensor]) -> dict[str, float]:
-        from pawn.trainer import (
-            compute_legal_move_rate_from_preds,
-            eval_game_completion_metrics,
-        )
-
         self.model.eval()
         n = val_data["input_ids"].shape[0]
         batch_size = self.train_cfg.batch_size
@@ -367,7 +366,6 @@ def _build_variant_configs(
         train_cfg.eval_interval = shared.eval_interval
     train_cfg.checkpoint_interval = shared.checkpoint_interval
     train_cfg.discard_ply_limit = shared.discard_ply_limit
-    train_cfg.no_outcome_token = shared.no_outcome_token
     train_cfg.prepend_outcome = shared.prepend_outcome
     train_cfg.mate_boost = shared.mate_boost
     train_cfg.use_wandb = shared.wandb
@@ -426,6 +424,14 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     print(f"Variants: {', '.join(variant_names)}")
     if config.shm_checkpoints:
         print("Checkpoints: /dev/shm (volatile, HF push is durable store)")
+    if config.no_outcome_token:
+        import warnings
+        warnings.warn(
+            "no_outcome_token is deprecated and has no effect in cotraining. "
+            "Sequences are pure moves by default; use prepend_outcome=True for "
+            "outcome-conditioned training.",
+            DeprecationWarning, stacklevel=2,
+        )
     if config.prepend_outcome:
         print("Outcome token: PREPENDED at position 0 (outcome-conditioned training)")
     print(f"LR: {scaled_lr:.2e} (scaled from {base_lr:.2e} for batch {config.batch_size})")

@@ -347,8 +347,10 @@ def eval_game_completion_metrics(
 
     n = val_data["input_ids"].shape[0]
     gc_batch = max(1, batch_size)
-    prepend_outcome = bool(
-        val_data.get("prepend_outcome", torch.tensor(False)).item()
+    prepend_outcome = (
+        bool(val_data["prepend_outcome"].item())
+        if "prepend_outcome" in val_data
+        else False
     )
 
     has_forfeit_all: list[torch.Tensor] = []

@@ -168,6 +168,16 @@ def strip_outcome_token(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tenso
         new_legal[:, :-1] = legal_grid[:, 1:]
         result["legal_grid"] = new_legal
 
+    # Post-strip the batch represents pure-move sequences — overwrite the
+    # outcome-aware metadata so eval consumers (eval_game_completion_metrics,
+    # probes, etc.) apply the pure-moves alignment. Without this, the raw
+    # ``move_ids`` tensor's shape (B, seq_len-1) would no longer align with
+    # the now-pure ``input_ids`` (B, seq_len) and would crash downstream.
+    result["prepend_outcome"] = torch.tensor(False, dtype=torch.bool)
+    # For pure-move sequences, the padded ``input_ids`` can stand in for
+    # ``move_ids`` (they encode the same ply positions up to game_length).
+    result["move_ids"] = new_input_ids
+
     # Pass through other keys unchanged
     for k, v in batch.items():
         if k not in result:
