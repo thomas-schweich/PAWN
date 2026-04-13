@@ -75,9 +75,11 @@ class PretrainConfig(BaseRunConfig):
     """Pretraining from scratch on random games."""
 
     run_type: Literal["pretrain"] = "pretrain"
-    variant: Literal["toy", "small", "base", "large"] = "base"
+    variant: Literal["toy", "small", "base", "large", "custom"] = "base"
 
-    # Architecture overrides (optional — override variant defaults)
+    # Architecture overrides. With one of the named presets, these override
+    # preset defaults on a per-field basis. With variant="custom" all four
+    # must be set explicitly — there is no underlying preset to fall back on.
     d_model: int | None = None
     n_layers: int | None = None
     n_heads: int | None = None
@@ -90,6 +92,24 @@ class PretrainConfig(BaseRunConfig):
     legality_late_ply: int | None = None  # defaults to max_seq_len // 2 at runtime
     val_games: int = 512  # override BaseRunConfig's 50K — pretrain uses on-the-fly data
     legacy_vocab: bool = False  # use old 4284-token PAWN vocab (for reproducing old experiments)
+
+    @model_validator(mode="after")
+    def _check_custom_arch(self) -> "PretrainConfig":
+        if self.variant == "custom":
+            missing = [
+                n for n, v in (
+                    ("d_model", self.d_model),
+                    ("n_layers", self.n_layers),
+                    ("n_heads", self.n_heads),
+                    ("d_ff", self.d_ff),
+                )
+                if v is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"variant='custom' requires {', '.join(missing)} to be set explicitly"
+                )
+        return self
 
 
 class AdapterConfig(BaseRunConfig):
@@ -146,12 +166,14 @@ class AdapterConfig(BaseRunConfig):
 class CotrainVariant(BaseModel):
     """Per-variant spec within a co-training run.
 
-    Architecture fields override the preset selected by ``variant``.
+    Architecture fields override the preset selected by ``variant``. With
+    ``variant="custom"`` there is no preset — ``d_model``, ``n_layers``,
+    ``n_heads``, and ``d_ff`` must all be set explicitly.
     ``resume`` is set automatically by ``lab_resume`` — not user-facing.
     """
 
     name: str
-    variant: Literal["toy", "small", "base", "large"] = "base"
+    variant: Literal["toy", "small", "base", "large", "custom"] = "base"
     d_model: int | None = None
     n_layers: int | None = None
     n_heads: int | None = None
@@ -159,6 +181,25 @@ class CotrainVariant(BaseModel):
     max_seq_len: int = 512
     legacy_vocab: bool = False
     resume: str | None = None
+
+    @model_validator(mode="after")
+    def _check_custom_arch(self) -> "CotrainVariant":
+        if self.variant == "custom":
+            missing = [
+                n for n, v in (
+                    ("d_model", self.d_model),
+                    ("n_layers", self.n_layers),
+                    ("n_heads", self.n_heads),
+                    ("d_ff", self.d_ff),
+                )
+                if v is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"variant='custom' requires {', '.join(missing)} to be "
+                    f"set explicitly on variant '{self.name}'"
+                )
+        return self
 
 
 class CotrainConfig(BaseRunConfig):

@@ -578,6 +578,60 @@ class TestTypeValidation:
         )
         assert cfg.prepend_outcome is True
 
+
+@pytest.mark.unit
+class TestCustomVariant:
+    """variant='custom' forces explicit architecture — no fallback to a preset."""
+
+    def test_pretrain_custom_requires_all_arch_fields(self):
+        with pytest.raises(ValidationError) as exc_info:
+            PretrainConfig(local_checkpoints=True, variant="custom")
+        msg = str(exc_info.value)
+        assert "d_model" in msg
+        assert "n_layers" in msg
+        assert "n_heads" in msg
+        assert "d_ff" in msg
+
+    def test_pretrain_custom_with_partial_fields_errors(self):
+        with pytest.raises(ValidationError) as exc_info:
+            PretrainConfig(
+                local_checkpoints=True, variant="custom",
+                d_model=128, n_layers=4,  # missing n_heads, d_ff
+            )
+        msg = str(exc_info.value)
+        assert "n_heads" in msg
+        assert "d_ff" in msg
+        assert "d_model" not in msg  # already provided
+
+    def test_pretrain_custom_accepts_complete_arch(self):
+        cfg = PretrainConfig(
+            local_checkpoints=True, variant="custom",
+            d_model=128, n_layers=4, n_heads=4, d_ff=512,
+        )
+        assert cfg.variant == "custom"
+        assert cfg.d_model == 128
+
+    def test_cotrain_variant_custom_requires_all_arch_fields(self):
+        with pytest.raises(ValidationError) as exc_info:
+            CotrainVariant(name="tiny", variant="custom")
+        msg = str(exc_info.value)
+        for field in ("d_model", "n_layers", "n_heads", "d_ff"):
+            assert field in msg
+        assert "tiny" in msg  # mentions the offending variant name
+
+    def test_cotrain_variant_custom_accepts_complete_arch(self):
+        v = CotrainVariant(
+            name="tiny", variant="custom",
+            d_model=96, n_layers=3, n_heads=4, d_ff=384,
+        )
+        assert v.variant == "custom"
+
+    def test_preset_variants_do_not_require_arch_fields(self):
+        """Sanity: custom's validator must not apply to the named presets."""
+        for preset in ("toy", "small", "base", "large"):
+            PretrainConfig(local_checkpoints=True, variant=preset)
+            CotrainVariant(name=preset, variant=preset)
+
     def test_extra_fields_behavior(self):
         """Pydantic by default ignores extra fields unless model_config forbids."""
         # Should not raise (extra fields silently ignored by default)

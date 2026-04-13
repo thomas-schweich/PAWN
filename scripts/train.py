@@ -143,7 +143,20 @@ def run_pretrain(config: PretrainConfig) -> None:
         "large": CLMConfig.large,
         "toy": CLMConfig.toy,
     }
-    model_cfg = variant_factory[config.variant]()
+    if config.variant == "custom":
+        # Validator ensures all four arch fields are set.
+        assert config.d_model is not None
+        assert config.n_layers is not None
+        assert config.n_heads is not None
+        assert config.d_ff is not None
+        model_cfg = CLMConfig(
+            d_model=config.d_model,
+            n_layers=config.n_layers,
+            n_heads=config.n_heads,
+            d_ff=config.d_ff,
+        )
+    else:
+        model_cfg = variant_factory[config.variant]()
     train_cfg = (
         TrainingConfig.toy() if config.variant == "toy" else TrainingConfig()
     )

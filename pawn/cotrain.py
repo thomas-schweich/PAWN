@@ -337,17 +337,29 @@ def _build_variant_configs(
         "large": CLMConfig.large,
         "toy": CLMConfig.toy,
     }
-    model_cfg = variant_factory[variant_spec.variant]()
-
-    # Architecture overrides from the variant spec
-    if variant_spec.d_model is not None:
-        model_cfg.d_model = variant_spec.d_model
-    if variant_spec.n_layers is not None:
-        model_cfg.n_layers = variant_spec.n_layers
-    if variant_spec.n_heads is not None:
-        model_cfg.n_heads = variant_spec.n_heads
-    if variant_spec.d_ff is not None:
-        model_cfg.d_ff = variant_spec.d_ff
+    if variant_spec.variant == "custom":
+        # CotrainVariant._check_custom_arch ensures all four are set.
+        assert variant_spec.d_model is not None
+        assert variant_spec.n_layers is not None
+        assert variant_spec.n_heads is not None
+        assert variant_spec.d_ff is not None
+        model_cfg = CLMConfig(
+            d_model=variant_spec.d_model,
+            n_layers=variant_spec.n_layers,
+            n_heads=variant_spec.n_heads,
+            d_ff=variant_spec.d_ff,
+        )
+    else:
+        model_cfg = variant_factory[variant_spec.variant]()
+        # Architecture overrides on top of the preset
+        if variant_spec.d_model is not None:
+            model_cfg.d_model = variant_spec.d_model
+        if variant_spec.n_layers is not None:
+            model_cfg.n_layers = variant_spec.n_layers
+        if variant_spec.n_heads is not None:
+            model_cfg.n_heads = variant_spec.n_heads
+        if variant_spec.d_ff is not None:
+            model_cfg.d_ff = variant_spec.d_ff
     model_cfg.max_seq_len = variant_spec.max_seq_len
 
     if variant_spec.legacy_vocab:
