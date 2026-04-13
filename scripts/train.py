@@ -172,6 +172,7 @@ def run_pretrain(config: PretrainConfig) -> None:
     train_cfg.max_grad_norm = config.max_grad_norm
     train_cfg.discard_ply_limit = config.discard_ply_limit
     train_cfg.no_outcome_token = config.no_outcome_token
+    train_cfg.prepend_outcome = config.prepend_outcome
     train_cfg.mate_boost = config.mate_boost
     train_cfg.log_interval = config.log_interval
     if config.eval_interval is not None:

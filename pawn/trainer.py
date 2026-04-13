@@ -24,7 +24,11 @@ from torch.utils.data import DataLoader
 import chess_engine as engine
 from pawn.config import CLMConfig, TrainingConfig
 from pawn.model import PAWNCLM
-from pawn.data import CLMDataset, create_validation_set, shift_legal_mask
+from pawn.data import (
+    CLMDataset,
+    align_legal_to_preds,
+    create_validation_set,
+)
 from pawn.logging import MetricsLogger
 
 from pawn.data_utils import unpack_grid
@@ -428,12 +432,14 @@ class CLMTrainer:
             train_cfg.batch_size, train_cfg.max_ply, train_cfg.base_seed,
             discard_ply_limit=train_cfg.discard_ply_limit,
             mate_boost=train_cfg.mate_boost,
+            prepend_outcome=train_cfg.prepend_outcome,
         )
         print("Generating validation set...")
         self.val_data = create_validation_set(
             train_cfg.val_games, train_cfg.max_ply, train_cfg.val_seed,
             discard_ply_limit=train_cfg.discard_ply_limit,
             mate_boost=train_cfg.mate_boost,
+            prepend_outcome=train_cfg.prepend_outcome,
         )
 
         # W&B
@@ -644,12 +650,20 @@ class CLMTrainer:
             first_forfeit_all: list[torch.Tensor] = []
             gl_all: list[torch.Tensor] = []
 
+            prepend_outcome = bool(
+                self.val_data.get(
+                    "prepend_outcome", torch.tensor(False)
+                ).item()
+            )
+
             for start in range(0, n, gc_batch):
                 end = min(start + gc_batch, n)
                 gc_input = self.val_data["input_ids"][start:end].to(self.device)
                 gc_loss_mask = self.val_data["loss_mask"][start:end].to(self.device)
                 gc_game_lengths = self.val_data["game_lengths"][start:end].to(self.device)
-                move_ids = self.val_data["input_ids"][start:end].numpy().astype(np.int16)
+                raw_move_ids = (
+                    self.val_data["move_ids"][start:end].numpy().astype(np.int16)
+                )
                 gl_np = self.val_data["game_lengths"][start:end].numpy().astype(np.int16)
 
                 with torch.no_grad():
@@ -658,9 +672,11 @@ class CLMTrainer:
                         gc_logits = model.lm_head(hidden)
                     gc_preds = gc_logits.argmax(dim=-1)
 
-                    legal_tokens = engine.compute_legal_token_masks(move_ids, gl_np, vocab_size)
+                    legal_tokens = engine.compute_legal_token_masks(
+                        raw_move_ids, gl_np, vocab_size,
+                    )
                     legal_mask_t = torch.from_numpy(
-                        shift_legal_mask(legal_tokens)
+                        align_legal_to_preds(legal_tokens, prepend_outcome)
                     ).to(self.device)
 
                     has_forfeit, first_forfeit, gl = _game_completion_chunk(
