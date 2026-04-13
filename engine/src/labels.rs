@@ -178,7 +178,7 @@ mod tests {
         // Verify compute_legal_token_masks matches direct replay with legal_move_tokens()
         let batch_size = 8;
         let max_ply = 256;
-        let vocab_size = 4278;
+        let vocab_size = crate::vocab::VOCAB_SIZE;
         let batch = generate_training_batch(batch_size, max_ply, 99);
 
         let token_masks = compute_legal_token_masks(
@@ -413,7 +413,7 @@ mod tests {
         let batch_size = 8;
         let max_ply = 256;
         let seq_len = max_ply + 1;
-        let vocab_size = 4278;
+        let vocab_size = crate::vocab::VOCAB_SIZE;
         let batch = generate_training_batch(batch_size, max_ply, 77);
 
         let dense = compute_legal_token_masks(

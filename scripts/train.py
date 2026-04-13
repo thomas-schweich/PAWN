@@ -134,15 +134,13 @@ def run_pretrain(config: PretrainConfig) -> None:
     """Bridge ``PretrainConfig`` into ``CLMConfig`` + ``TrainingConfig``."""
     import torch
 
-    from pawn.checkpoint import infer_prepend_outcome, read_checkpoint_metadata
-    from pawn.config import CLMConfig, LegacyVocab, TrainingConfig
+    from pawn.checkpoint import get_prepend_outcome, read_checkpoint_metadata
+    from pawn.config import CLMConfig, TrainingConfig
     from pawn.trainer import CLMTrainer
 
     # If we're resuming, peek at the saved config BEFORE constructing the
     # trainer so the CLMDataset / validation set are built with the same
-    # sequence format the checkpoint was trained on. Without this, a
-    # pre-2026-04-08 outcome-prefixed run resumed after the default flip
-    # would silently switch to pure-moves and corrupt training.
+    # sequence format the checkpoint was trained on.
     if config.resume:
         try:
             saved = read_checkpoint_metadata(config.resume)
@@ -150,33 +148,30 @@ def run_pretrain(config: PretrainConfig) -> None:
             print(f"WARNING: couldn't peek at resume checkpoint ({e}); "
                   "proceeding with user-supplied prepend_outcome")
         else:
-            saved_prepend, reason = infer_prepend_outcome(
-                saved.get("training_config"), saved.get("model_config"),
-            )
-            if saved_prepend is None:
-                # Ambiguous pre-flag checkpoint. Honor the user's
-                # explicit value if they passed one, otherwise fail loud
-                # rather than silently guessing.
+            try:
+                saved_prepend = get_prepend_outcome(saved.get("training_config"))
+            except ValueError as err:
                 if "prepend_outcome" in config.model_fields_set:
                     print(
-                        f"WARNING: {reason}. Trusting explicit "
+                        f"WARNING: {err}. Trusting explicit "
                         f"prepend_outcome={config.prepend_outcome} from the run "
                         "config — verify this matches what the checkpoint was "
                         "trained with."
                     )
                 else:
                     _die(
-                        f"Resume: {reason}. Pass `prepend_outcome: true` or "
+                        f"Resume: {err}. Pass `prepend_outcome: true` or "
                         "`prepend_outcome: false` in the run config explicitly."
                     )
-            elif saved_prepend != config.prepend_outcome:
-                print(
-                    f"Resume: saved checkpoint is "
-                    f"{'outcome-prefixed' if saved_prepend else 'pure-moves'} "
-                    f"({reason}); overriding prepend_outcome={config.prepend_outcome} "
-                    f"→ {saved_prepend} to match."
-                )
-                config.prepend_outcome = saved_prepend
+            else:
+                if saved_prepend != config.prepend_outcome:
+                    print(
+                        f"Resume: saved checkpoint is "
+                        f"{'outcome-prefixed' if saved_prepend else 'pure-moves'}; "
+                        f"overriding prepend_outcome={config.prepend_outcome} "
+                        f"→ {saved_prepend} to match."
+                    )
+                    config.prepend_outcome = saved_prepend
 
     variant_factory = {
         "small": CLMConfig.small,
@@ -201,12 +196,6 @@ def run_pretrain(config: PretrainConfig) -> None:
     train_cfg = (
         TrainingConfig.toy() if config.variant == "toy" else TrainingConfig()
     )
-
-    if config.legacy_vocab:
-        model_cfg.vocab_size = LegacyVocab.VOCAB_SIZE
-        # Force legacy sequence length (overrides --max-seq-len if provided)
-        config.max_seq_len = 256
-        print("Using legacy PAWN vocabulary (4284 tokens, 256 seq_len)")
 
     # Map RunConfig fields onto internal configs
     train_cfg.device = config.device
@@ -280,8 +269,7 @@ def run_pretrain(config: PretrainConfig) -> None:
         if loaded_vs and loaded_vs != model_cfg.vocab_size:
             _die(
                 f"Checkpoint vocab_size={loaded_vs} doesn't match "
-                f"model vocab_size={model_cfg.vocab_size}. "
-                f"Use --legacy-vocab to match old checkpoints."
+                f"model vocab_size={model_cfg.vocab_size}."
             )
 
     trainer.train()

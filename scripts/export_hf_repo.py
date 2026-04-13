@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export a training run to HuggingFace repo format.
 
-Converts .pt checkpoints to safetensors and structures files for HF upload:
+Finds the best checkpoint by val loss and packages files for HF upload:
   - Root: best checkpoint (model.safetensors, config.json, metrics.jsonl, README.md)
   - checkpoints/step_NNNN/: other checkpoints with truncated metrics
 
@@ -19,9 +19,6 @@ import argparse
 import json
 import shutil
 from pathlib import Path
-
-import torch
-from safetensors.torch import save_file
 
 
 def find_best_step(metrics_path: Path) -> int | None:
@@ -53,49 +50,22 @@ def truncate_metrics(metrics_path: Path, up_to_step: int) -> list[str]:
     return lines
 
 
-def convert_pt_to_safetensors(pt_path: Path, output_dir: Path):
-    """Convert a .pt checkpoint to safetensors + JSON directory format."""
-    output_dir.mkdir(parents=True, exist_ok=True)
+def copy_checkpoint(src: Path, dst: Path) -> None:
+    """Copy a directory-format checkpoint into the HF export layout."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        if item.name == ".complete":
+            continue
+        target = dst / item.name
+        if item.is_dir():
+            shutil.copytree(item, target, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, target)
 
-    ckpt = torch.load(str(pt_path), map_location="cpu", weights_only=False)
 
-    # Model weights -> safetensors
-    state_dict = ckpt["model_state_dict"]
-    tensors = {k: v.cpu().contiguous() for k, v in state_dict.items()}
-    save_file(tensors, output_dir / "model.safetensors")
-
-    # Config
-    config = {
-        "format_version": 1,
-        "checkpoint_type": "pretrain",
-        "model_config": ckpt.get("model_config", {}),
-        "training_config": ckpt.get("training_config", {}),
-    }
-    with open(output_dir / "config.json", "w") as f:
-        json.dump(config, f, indent=2, default=str)
-
-    # Optimizer -> safetensors (if present)
-    if "optimizer_state_dict" in ckpt:
-        from pawn.checkpoint import _flatten_optimizer_state, _rng_to_json, _json_default
-        opt_tensors, opt_meta = _flatten_optimizer_state(ckpt["optimizer_state_dict"])
-        if opt_tensors:
-            save_file(opt_tensors, output_dir / "optimizer.safetensors")
-
-        # Training state
-        training_state = {
-            "format_version": 1,
-            "global_step": ckpt.get("global_step", 0),
-            "scheduler_state_dict": ckpt.get("scheduler_state_dict"),
-            "scaler_state_dict": ckpt.get("scaler_state_dict"),
-            "optimizer_meta": opt_meta,
-        }
-        rng_state = {}
-        if ckpt.get("torch_rng_state") is not None:
-            rng_state.update(_rng_to_json(ckpt["torch_rng_state"], ckpt.get("cuda_rng_state")))
-        training_state.update(rng_state)
-
-        with open(output_dir / "training_state.json", "w") as f:
-            json.dump(training_state, f, indent=2, default=_json_default)
+def read_checkpoint_config(ckpt_dir: Path) -> dict:
+    with open(ckpt_dir / "config.json") as f:
+        return json.load(f)
 
 
 def generate_readme(
@@ -103,20 +73,26 @@ def generate_readme(
     best_step: int, val_loss: float, val_acc: float,
     github_url: str, extra_desc: str = "",
 ) -> str:
-    """Generate a HuggingFace model card README."""
+    """Generate a HuggingFace model card README.
+
+    All architecture fields come from the checkpoint's saved model_config so
+    the card stays correct whether the checkpoint is old-vocab (4284 / 256)
+    or new-vocab (1980 / 512).
+    """
     d_model = model_config.get("d_model", "?")
     n_layers = model_config.get("n_layers", "?")
     n_heads = model_config.get("n_heads", "?")
-    discard = training_config.get("discard_ply_limit", False)
+    d_ff = model_config.get("d_ff", "?")
+    vocab_size = model_config.get("vocab_size", "?")
+    max_seq_len = model_config.get("max_seq_len", "?")
 
-    # Infer variant name
-    variant = "base"
+    variant = "custom"
     if d_model == 256:
         variant = "small"
+    elif d_model == 512:
+        variant = "base"
     elif d_model == 640:
         variant = "large"
-
-    params = {"small": "9.5M", "base": "35.8M", "large": "68.4M"}.get(variant, "?")
 
     return f"""---
 license: apache-2.0
@@ -151,25 +127,24 @@ A causal transformer trained on random chess games, designed as a testbed for fi
 
 | | |
 |---|---|
-| **Parameters** | {params} |
 | **Architecture** | Decoder-only transformer (RMSNorm, SwiGLU, RoPE) |
 | **d_model** | {d_model} |
 | **Layers** | {n_layers} |
 | **Heads** | {n_heads} |
-| **Vocabulary** | 4,278 tokens (4,096 grid + 176 promotions + 5 outcomes + 1 PAD) |
-| **Sequence length** | 256 |
+| **d_ff** | {d_ff} |
+| **Vocabulary size** | {vocab_size} |
+| **Sequence length** | {max_seq_len} |
 | **Best val loss** | {val_loss:.4f} (step {best_step:,}) |
 | **Best val accuracy** | {val_acc:.1%} |
 
 ## Usage
 
 ```python
-import torch
 from safetensors.torch import load_file
 from pawn.config import CLMConfig
 from pawn.model import PAWNCLM
 
-cfg = CLMConfig.{variant}()
+cfg = CLMConfig.{variant}() if "{variant}" != "custom" else CLMConfig()
 model = PAWNCLM(cfg)
 model.load_state_dict(load_file("model.safetensors"))
 model.eval()
@@ -204,14 +179,12 @@ def main():
         print(f"ERROR: {metrics_path} not found")
         return
 
-    # Find best step
     best_step = find_best_step(metrics_path)
     if best_step is None:
         print("ERROR: No val records found in metrics.jsonl")
         return
     print(f"Best val step: {best_step}")
 
-    # Find best val metrics
     best_val_loss, best_val_acc = float("inf"), 0.0
     with open(metrics_path) as f:
         for line in f:
@@ -221,34 +194,28 @@ def main():
                 best_val_acc = r.get("val/accuracy", 0.0)
                 break
 
-    # Find all .pt checkpoints
     ckpt_dir = run_dir / "checkpoints"
-    checkpoints = sorted(ckpt_dir.glob("step_*.pt")) if ckpt_dir.exists() else []
+    checkpoints = sorted(d for d in ckpt_dir.glob("step_*") if d.is_dir()) if ckpt_dir.exists() else []
     if not checkpoints:
         print("ERROR: No checkpoints found")
         return
 
-    # Find nearest checkpoint to best step
-    best_ckpt = min(checkpoints, key=lambda p: abs(
-        int(p.stem.replace("step_", "")) - best_step
-    ))
+    best_ckpt = min(
+        checkpoints,
+        key=lambda p: abs(int(p.name.replace("step_", "")) - best_step),
+    )
     print(f"Best checkpoint: {best_ckpt}")
 
-    # Read config from checkpoint
-    ckpt_data = torch.load(str(best_ckpt), map_location="cpu", weights_only=False)
-    model_config = ckpt_data.get("model_config", {})
-    training_config = ckpt_data.get("training_config", {})
-    del ckpt_data
+    config = read_checkpoint_config(best_ckpt)
+    model_config = config.get("model_config", {})
+    training_config = config.get("training_config", {})
 
-    # Export best checkpoint to root
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nExporting best checkpoint to {output_dir}/")
-    convert_pt_to_safetensors(best_ckpt, output_dir)
+    copy_checkpoint(best_ckpt, output_dir)
 
-    # Copy full metrics.jsonl
     shutil.copy2(metrics_path, output_dir / "metrics.jsonl")
 
-    # Generate README
     readme = generate_readme(
         args.repo_name, model_config, training_config,
         best_step, best_val_loss, best_val_acc,
@@ -257,24 +224,22 @@ def main():
     with open(output_dir / "README.md", "w") as f:
         f.write(readme)
 
-    # Export other checkpoints
     if not args.best_only:
         for ckpt in checkpoints:
             if ckpt == best_ckpt:
                 continue
-            step_name = ckpt.stem  # e.g. "step_00005000"
+            step_name = ckpt.name  # e.g. "step_00005000"
             step_num = int(step_name.replace("step_", ""))
             step_dir = output_dir / "checkpoints" / step_name
             print(f"  Exporting {step_name}...")
-            convert_pt_to_safetensors(ckpt, step_dir)
+            copy_checkpoint(ckpt, step_dir)
 
-            # Truncated metrics
             truncated = truncate_metrics(metrics_path, step_num)
             with open(step_dir / "metrics.jsonl", "w") as f:
                 f.writelines(truncated)
 
     print(f"\nExport complete: {output_dir}")
-    print(f"  Best: model.safetensors, config.json, metrics.jsonl, README.md")
+    print("  Best: model.safetensors, config.json, metrics.jsonl, README.md")
     if not args.best_only:
         print(f"  Checkpoints: {len(checkpoints) - 1} in checkpoints/")
 

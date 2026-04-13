@@ -124,7 +124,7 @@ def evaluate_on_lichess(
     model: nn.Module,
     lichess_data: dict,
     device: str,
-    max_seq_len: int = 256,
+    max_seq_len: int = 512,
     eval_batch_size: int = 32,
 ) -> dict:
     """Run next-token prediction metrics on Lichess games.

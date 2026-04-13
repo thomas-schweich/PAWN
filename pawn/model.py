@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
-from pawn.config import CLMConfig, LegacyVocab
+from pawn.config import CLMConfig, NUM_ACTIONS, OUTCOME_TOKEN_BASE, PAD_TOKEN
 from chess_engine import export_move_vocabulary
 
 # ROCm flash attention backward has stride mismatches with torch.compile.
@@ -26,55 +26,22 @@ from chess_engine import export_move_vocabulary
 SDPA_BACKEND: SDPBackend | None = None
 
 
-def _build_decomposition_table(n_actions: int) -> torch.Tensor:
+def _build_decomposition_table() -> torch.Tensor:
     """Build static token -> (src, dst, promo_type) lookup table.
 
-    For new vocab (n_actions=1968): returns int16[1968, 3].
-    For legacy vocab (n_actions=4272): returns int16[4272, 3], using the
-    old formula (tokens 1-4096 = dense grid, 4097-4272 = promotions).
-
-    PAD and outcome tokens are above the table range and handled
-    by standalone embeddings.
+    Reads the searchless vocabulary from the Rust engine and returns
+    int16[NUM_ACTIONS, 3]. PAD and outcome tokens are above the table
+    range and handled by standalone embeddings.
     """
-    from pawn.config import LegacyVocab, NUM_ACTIONS
-
-    if n_actions == NUM_ACTIONS:
-        # New searchless vocab — read from engine
-        vocab = export_move_vocabulary()
-        table = torch.zeros(n_actions, 3, dtype=torch.int16)
-        sq_names = vocab["square_names"]
-        promo_map = {"q": 1, "r": 2, "b": 3, "n": 4}
-        for token_idx, uci_str in vocab["token_to_move"].items():
-            src_sq = sq_names.index(uci_str[:2])
-            dst_sq = sq_names.index(uci_str[2:4])
-            promo_type = promo_map.get(uci_str[4:], 0)
-            table[token_idx] = torch.tensor([src_sq, dst_sq, promo_type], dtype=torch.int16)
-        return table
-
-    # Legacy PAWN vocab — reconstruct from formula.
-    # Table is indexed by token ID (1..4272), so needs n_actions+1 rows.
-    assert n_actions == LegacyVocab.NUM_ACTIONS, f"Unknown n_actions: {n_actions}"
-    table = torch.zeros(n_actions + 1, 3, dtype=torch.int16)
-    # Tokens 1-4096: base grid (src * 64 + dst + 1)
-    for token in range(1, 4097):
-        t = token - 1
-        src = t // 64
-        dst = t % 64
-        table[token] = torch.tensor([src, dst, 0], dtype=torch.int16)
-    # Tokens 4097-4272: promotions
     vocab = export_move_vocabulary()
-    from chess_engine import searchless_to_pawn
+    table = torch.zeros(NUM_ACTIONS, 3, dtype=torch.int16)
     sq_names = vocab["square_names"]
     promo_map = {"q": 1, "r": 2, "b": 3, "n": 4}
-    for action_idx, uci_str in vocab["token_to_move"].items():
-        if len(uci_str) != 5:
-            continue  # only promotions
-        pawn_token = searchless_to_pawn(action_idx)
-        if pawn_token <= n_actions:
-            src_sq = sq_names.index(uci_str[:2])
-            dst_sq = sq_names.index(uci_str[2:4])
-            promo_type = promo_map[uci_str[4:]]
-            table[pawn_token] = torch.tensor([src_sq, dst_sq, promo_type], dtype=torch.int16)
+    for token_idx, uci_str in vocab["token_to_move"].items():
+        src_sq = sq_names.index(uci_str[:2])
+        dst_sq = sq_names.index(uci_str[2:4])
+        promo_type = promo_map.get(uci_str[4:], 0)
+        table[token_idx] = torch.tensor([src_sq, dst_sq, promo_type], dtype=torch.int16)
     return table
 
 
@@ -261,10 +228,6 @@ class CLMEmbedding(nn.Module):
 
     Move tokens use factored embedding: src_embed[s] + dst_embed[d] + promo_embed[p].
     PAD and outcome tokens use standalone embeddings.
-
-    Supports both the new searchless_chess vocab (1980) and the legacy PAWN
-    vocab (4284) — the decomposition table and PAD/outcome detection are
-    derived from ``cfg.vocab_size``.
     """
 
     decomp_table: torch.Tensor
@@ -272,17 +235,9 @@ class CLMEmbedding(nn.Module):
     def __init__(self, cfg: CLMConfig):
         super().__init__()
         self.d_model = cfg.d_model
-
-        # Derive vocab-specific constants
-        if cfg.vocab_size == LegacyVocab.VOCAB_SIZE:
-            self.n_actions = LegacyVocab.NUM_ACTIONS
-            self.pad_token = LegacyVocab.PAD_TOKEN
-            self.outcome_base = LegacyVocab.OUTCOME_TOKEN_BASE
-        else:
-            from pawn.config import NUM_ACTIONS, PAD_TOKEN, OUTCOME_TOKEN_BASE
-            self.n_actions = NUM_ACTIONS
-            self.pad_token = PAD_TOKEN
-            self.outcome_base = OUTCOME_TOKEN_BASE
+        self.n_actions = NUM_ACTIONS
+        self.pad_token = PAD_TOKEN
+        self.outcome_base = OUTCOME_TOKEN_BASE
 
         # Factored move components
         self.src_embed = nn.Embedding(64, cfg.d_model)
@@ -294,7 +249,7 @@ class CLMEmbedding(nn.Module):
         self.outcome_embed = nn.Embedding(cfg.n_outcomes, cfg.d_model)
 
         # Static decomposition table: token_idx -> (src, dst, promo_type)
-        self.register_buffer("decomp_table", _build_decomposition_table(self.n_actions), persistent=False)
+        self.register_buffer("decomp_table", _build_decomposition_table(), persistent=False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -566,7 +521,7 @@ def clm_loss(
     """Compute CLM cross-entropy loss on non-padding positions.
 
     Uses ignore_index on a flat view to avoid materializing a copy of
-    all valid-position logits (which would be ~50K × 4278 floats).
+    all valid-position logits.
 
     Args:
         logits: (B, T, vocab_size)

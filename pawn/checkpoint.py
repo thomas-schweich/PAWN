@@ -1,6 +1,6 @@
 """Checkpoint save/load using safetensors + JSON.
 
-Replaces monolithic torch.save() .pt files with directory-based checkpoints:
+Directory-based checkpoints:
   - model.safetensors / adapter.safetensors — tensor data
   - optimizer.safetensors — flattened optimizer state tensors
   - training_state.json — scalars, scheduler, scaler, RNG, optimizer metadata
@@ -9,8 +9,6 @@ Replaces monolithic torch.save() .pt files with directory-based checkpoints:
 
 Writes are atomic: files are written to a .tmp directory, then renamed.
 Loads always verify the .complete sentinel and SHA-256 hashes.
-
-Backward compatible: all load functions transparently handle legacy .pt files.
 """
 
 from __future__ import annotations
@@ -27,7 +25,6 @@ import torch.nn as nn
 from safetensors.torch import save_file, load_file
 
 CHECKPOINT_FORMAT_VERSION = 1
-LEGACY_EXTENSIONS = {".pt", ".pth"}
 
 
 # ---------------------------------------------------------------------------
@@ -264,20 +261,6 @@ def _unflatten_optimizer_state(
 
 
 # ---------------------------------------------------------------------------
-# Legacy checkpoint detection
-# ---------------------------------------------------------------------------
-
-def is_legacy_checkpoint(path: str | Path) -> bool:
-    """True if path is a single .pt/.pth file (legacy format)."""
-    p = Path(path)
-    return p.is_file() and p.suffix in LEGACY_EXTENSIONS
-
-
-def _load_legacy_pt(path: str | Path, device: str = "cpu") -> dict:
-    return torch.load(str(path), map_location=device, weights_only=False)
-
-
-# ---------------------------------------------------------------------------
 # Peek at checkpoint metadata without loading weights
 # ---------------------------------------------------------------------------
 
@@ -288,17 +271,9 @@ def read_checkpoint_metadata(path: str | Path) -> dict:
     sequence format before building data pipelines.
 
     Raises ``FileNotFoundError`` if the path or its ``config.json`` is
-    missing. For legacy .pt files, loads the pickled dict in CPU mode
-    and pulls ``model_config`` / ``training_config`` from it.
+    missing.
     """
     p = Path(path)
-    if is_legacy_checkpoint(p):
-        ckpt = _load_legacy_pt(p, device="cpu")
-        return {
-            "model_config": ckpt.get("model_config"),
-            "training_config": ckpt.get("training_config"),
-        }
-
     cfg_path = p / "config.json"
     if not cfg_path.exists():
         raise FileNotFoundError(f"No config.json at {cfg_path}")
@@ -310,74 +285,24 @@ def read_checkpoint_metadata(path: str | Path) -> dict:
     }
 
 
-def infer_prepend_outcome(
-    training_config: dict | None,
-    model_config: dict | None,
-) -> tuple[bool | None, str]:
-    """Infer ``prepend_outcome`` for a resumed/evaluated checkpoint.
+def get_prepend_outcome(training_config: dict | None) -> bool:
+    """Return the saved ``prepend_outcome`` flag for a checkpoint.
 
-    Returns ``(prepend_outcome, reason)`` where ``prepend_outcome`` is
-    ``True`` / ``False`` / ``None``. ``None`` means the helper cannot
-    confidently decide — callers must fail closed or require an
-    explicit user override, not silently pick a default.
-
-    Precedence (most to least authoritative):
-
-      1. ``training_config["prepend_outcome"]`` — exact, this is the
-         post-PR PAWN default where the field is persisted to
-         config.json.
-      2. ``training_config["no_outcome_token"] == True`` — authoritative
-         ⇒ ``(False, ...)``. Pre-flag ablation runs used this flag to
-         strip the outcome via ``strip_outcome_token`` (sequences are
-         pure moves). Post-deprecation the flag is a no-op but was
-         always combined with the now-default pure-moves layout, so
-         either way ``True`` ⇒ pure moves. Note that the **False** case
-         (``no_outcome_token=False``) is NOT disambiguating: it's the
-         default and modern runs set it to False regardless of the
-         actual sequence format.
-      3. Legacy vocab (``vocab_size == LegacyVocab.VOCAB_SIZE``) →
-         ``(True, ...)``. The legacy 4284-token runs are all pre-
-         2026-04-08 and used the outcome prefix as the implicit Rust
-         default (unless overridden by ``no_outcome_token=True``, which
-         step 2 handles first).
-      4. 256-token context (``max_seq_len <= 256``) → ``(True, ...)``.
-         The 256-ctx convention predates the flip and was
-         outcome-prefixed.
-      5. Otherwise → ``(None, ...)``. A 1980-vocab / 512-ctx checkpoint
-         without the field could be either pre-flip (outcome-prefixed)
-         or post-flip (pure-moves); guessing either way risks silently
-         corrupting resume/eval. Callers must use an explicit override.
-
-    Callers should print the reason when they override a user-supplied
-    flag so the behaviour is explicit and auditable.
+    Reads ``training_config["prepend_outcome"]`` and returns it as a
+    bool. Raises ``ValueError`` when the field is absent — every current
+    checkpoint writes the full ``TrainingConfig.__dict__``, so a missing
+    field means either a partially-written checkpoint or hand-edited
+    config.json; callers must fail closed rather than guess the
+    sequence format.
     """
-    from pawn.config import LegacyVocab
     training = training_config or {}
-    model = model_config or {}
-
-    if "prepend_outcome" in training:
-        return bool(training["prepend_outcome"]), "saved training.prepend_outcome"
-
-    # Pre-flag ablation runs used `no_outcome_token=True` to force pure-
-    # moves via strip_outcome_token. The `=False` case is non-signal
-    # because modern runs default the field to False while still being
-    # pure-moves (Rust default flipped in commit a6651a8).
-    if training.get("no_outcome_token") is True:
-        return False, "saved training.no_outcome_token=True (pure-moves ablation)"
-
-    vocab_size = model.get("vocab_size")
-    if vocab_size == LegacyVocab.VOCAB_SIZE:
-        return True, f"legacy vocab (vocab_size={LegacyVocab.VOCAB_SIZE})"
-
-    max_seq_len = model.get("max_seq_len")
-    if isinstance(max_seq_len, int) and max_seq_len <= 256:
-        return True, f"legacy 256-ctx (max_seq_len={max_seq_len})"
-
-    return None, (
-        "ambiguous pre-flag checkpoint (no training.prepend_outcome, "
-        "modern vocab/context): could be pre-2026-04-08 outcome-prefixed "
-        "or post-flip pure-moves; pass prepend_outcome explicitly"
-    )
+    if "prepend_outcome" not in training:
+        raise ValueError(
+            "training_config has no 'prepend_outcome' field — cannot "
+            "determine sequence format. Pass prepend_outcome explicitly "
+            "in the run config."
+        )
+    return bool(training["prepend_outcome"])
 
 
 # ---------------------------------------------------------------------------
@@ -454,34 +379,10 @@ def load_pretrain_checkpoint(
 ) -> dict:
     """Load a pretraining checkpoint with integrity verification.
 
-    Handles both legacy .pt files and new directory format.
-    New format: verifies .complete sentinel and SHA-256 hashes.
+    Verifies the .complete sentinel and SHA-256 hashes before loading.
     """
     path = Path(path)
 
-    if is_legacy_checkpoint(path):
-        ckpt = _load_legacy_pt(path, device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        if optimizer and "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if scheduler and "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if scaler and "scaler_state_dict" in ckpt:
-            scaler.load_state_dict(ckpt["scaler_state_dict"])
-        if ckpt.get("torch_rng_state") is not None:
-            torch.set_rng_state(ckpt["torch_rng_state"].cpu().byte())
-        if ckpt.get("cuda_rng_state") is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state(ckpt["cuda_rng_state"].cpu().byte())
-        return {
-            "global_step": ckpt.get("global_step", 0),
-            "model_config": ckpt.get("model_config"),
-            "training_config": ckpt.get("training_config"),
-            "best_val_loss": None,
-            "best_late_legality": None,
-            "patience_counter": None,
-        }
-
-    # New directory format — verify integrity first
     _verify_complete_sentinel(path)
 
     weights = load_file(path / "model.safetensors", device=device)
@@ -587,31 +488,6 @@ def load_adapter_checkpoint(
     """Load an adapter checkpoint with integrity verification."""
     path = Path(path)
 
-    if is_legacy_checkpoint(path):
-        ckpt = _load_legacy_pt(path, device)
-        adapter_key = None
-        for key in ("lora_state_dict", "bottleneck_state_dict", "film_state_dict",
-                     "sparse_state_dict", "adapter_state_dict", "model_state_dict"):
-            if key in ckpt:
-                adapter_key = key
-                break
-        return {
-            "adapter_state_dict": ckpt.get(adapter_key, {}),
-            "config": ckpt.get("config", {}),
-            "epoch": ckpt.get("epoch", 0),
-            "step": ckpt.get("step", 0),
-            "val_metrics": {
-                "loss": ckpt.get("val_loss"),
-                "top1_accuracy": ckpt.get("val_top1"),
-            },
-            "optimizer_state_dict": ckpt.get("optimizer_state_dict"),
-            "scheduler_state_dict": ckpt.get("scheduler_state_dict"),
-            "scaler_state_dict": ckpt.get("scaler_state_dict"),
-            "best_val_loss": ckpt.get("best_val_loss"),
-            "patience_counter": ckpt.get("patience_counter"),
-        }
-
-    # New directory format — verify integrity first
     _verify_complete_sentinel(path)
 
     adapter_weights = load_file(path / "adapter.safetensors", device=device)
@@ -663,8 +539,7 @@ def load_backbone_weights(
     Works with:
     - HuggingFace repo IDs (e.g. "thomas-schweich/pawn-small") — downloads
       model.safetensors + config.json via huggingface_hub
-    - Legacy .pt files (extracts model_state_dict + model_config)
-    - New checkpoint directories (reads model.safetensors + config.json, verifies .complete)
+    - Checkpoint directories (reads model.safetensors + config.json, verifies .complete)
     - Bare model.safetensors files (no .complete check — used for HF downloads)
 
     Returns (state_dict, model_config_dict_or_None).
@@ -676,10 +551,6 @@ def load_backbone_weights(
         return _load_from_hf_repo(path_str, device)
 
     path = Path(path)
-
-    if is_legacy_checkpoint(path):
-        ckpt = _load_legacy_pt(path, device)
-        return ckpt["model_state_dict"], ckpt.get("model_config")
 
     # Directory with model.safetensors
     if path.is_dir():

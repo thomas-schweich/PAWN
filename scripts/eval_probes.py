@@ -103,10 +103,8 @@ def main():
             run_dir = config_path.parent
             if args.run and run_dir.name != args.run:
                 continue
-            # Find checkpoints: directory-based (safetensors) or legacy .pt
             checkpoints = sorted(
-                [d for d in run_dir.glob("checkpoints/step_*") if d.is_dir()]
-                or list(run_dir.glob("checkpoints/step_*.pt"))
+                d for d in run_dir.glob("checkpoints/step_*") if d.is_dir()
             )
             if not checkpoints:
                 continue
@@ -164,29 +162,25 @@ def main():
         model = load_model_from_checkpoint(str(ckpt_path), device)
 
         # Auto-detect prepend_outcome from the checkpoint's saved config.
-        # Uses infer_prepend_outcome so legacy-vocab / 256-ctx checkpoints
-        # (which were always outcome-prefixed pre-2026-04-08) are handled
-        # correctly; modern checkpoints use the exact persisted flag.
-        from pawn.checkpoint import infer_prepend_outcome
-        inferred, reason = infer_prepend_outcome(train_cfg, model_cfg)
+        from pawn.checkpoint import get_prepend_outcome
         if args.prepend_outcome:
             prepend_outcome = True
             reason = "forced by --prepend-outcome CLI override"
         elif args.no_outcome_token:
             prepend_outcome = False
             reason = "forced by --no-outcome-token CLI override"
-        elif inferred is None:
-            # Ambiguous pre-flag checkpoint — probes would silently
-            # measure out-of-distribution hidden states if we guessed.
-            raise SystemExit(
-                f"ERROR: {run_dir.name}: {reason}. Re-run with "
-                "--prepend-outcome or --no-outcome-token to force the "
-                "correct layout."
-            )
         else:
-            prepend_outcome = inferred
+            try:
+                prepend_outcome = get_prepend_outcome(train_cfg)
+                reason = "saved training.prepend_outcome"
+            except ValueError as err:
+                raise SystemExit(
+                    f"ERROR: {run_dir.name}: {err} Re-run with "
+                    "--prepend-outcome or --no-outcome-token to force the "
+                    "correct layout."
+                )
         no_outcome = not prepend_outcome
-        max_ply = args.max_ply or model_cfg.get("max_seq_len") or 256
+        max_ply = args.max_ply or model_cfg.get("max_seq_len") or 512
         print(
             f"  max_ply={max_ply}, prepend_outcome={prepend_outcome} ({reason})"
         )

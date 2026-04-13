@@ -81,7 +81,7 @@ Unlike the random masks used by the Sparse adapter, RoSA selects its sparse mask
 2. **Mask generation** -- accumulate squared gradient magnitudes over a small data subset, select top-k positions per weight matrix at the target density (Algorithm 1 from the paper)
 3. **Joint training** -- train both LoRA and sparse adapters simultaneously
 
-The training script (`scripts/train_rosa.py`) also supports two **retrospective ablation** modes via `--mode`:
+The `rosa` strategy (via `scripts/train.py --run-type adapter --strategy rosa`) also supports two **retrospective ablation** modes via `--rosa-mode`:
 
 - **`retro-sparse`** -- use LoRA purely as a probe for mask selection, then discard it and train sparse-only on a fresh backbone with the found masks
 - **`retro-bottleneck`** -- same as retro-sparse, but adds bottleneck adapters (`RetroBottleneckCLM`) after each sublayer for nonlinearity that sparse-only cannot express
@@ -145,7 +145,7 @@ All adapters initialize to the identity function. Bottleneck and LoRA zero-initi
 
 ### Sparse logit projection
 
-All adapter wrappers expose `forward_hidden()` (returns `(B, T, d_model)`) and `project_head()` (applies `lm_head`) as separate methods. Training scripts use this split to avoid materializing the full `(B, T, V)` logit tensor: only positions included in the loss mask are projected through `lm_head`. This reduces peak memory significantly since `V=4278` and most positions in a batch are padding.
+All adapter wrappers expose `forward_hidden()` (returns `(B, T, d_model)`) and `project_head()` (applies `lm_head`) as separate methods. Training scripts use this split to avoid materializing the full `(B, T, V)` logit tensor: only positions included in the loss mask are projected through `lm_head`. This reduces peak memory significantly since `V=1980` and most positions in a batch are padding.
 
 ### Legal masking via Rust engine
 
@@ -207,47 +207,45 @@ Below ~1M params, bottleneck is more parameter-efficient. Above ~1M, sparse catc
 
 ## Quick Start
 
-All commands assume you are in the `pawn/` directory. `--checkpoint` points to a pretrained PAWN backbone and `--pgn` to a Lichess PGN file.
+All commands assume you are in the repo root. `--checkpoint` points to a pretrained PAWN backbone and `--pgn` to a Lichess PGN file. Every strategy dispatches through `scripts/train.py --run-type adapter --strategy <name>`.
 
 ```bash
 # Bottleneck (recommended default)
-uv run python scripts/train_bottleneck.py \
+uv run python scripts/train.py --run-type adapter --strategy bottleneck \
     --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
-    --bottleneck-dim 32 --max-games 100000 --lr 3e-4
+    --bottleneck-dim 32 --max-games 100000 --lr 3e-4 --local-checkpoints
 
 # LoRA
-uv run python scripts/train_lora.py \
+uv run python scripts/train.py --run-type adapter --strategy lora \
     --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
-    --lora-rank 8 --lora-targets qkvo --lr 3e-4
+    --lora-rank 8 --lora-targets qkvo --lr 3e-4 --local-checkpoints
 
 # FiLM
-uv run python scripts/train_film.py \
+uv run python scripts/train.py --run-type adapter --strategy film \
     --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
-    --lr 1e-3
+    --lr 1e-3 --local-checkpoints
 
 # Sparse
-uv run python scripts/train_sparse.py \
+uv run python scripts/train.py --run-type adapter --strategy sparse \
     --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
-    --density 0.015 --sparse-ffn --lr 3e-4
+    --density 0.015 --sparse-ffn --lr 3e-4 --local-checkpoints
 
 # Hybrid (LoRA + FiLM)
-uv run python scripts/train_hybrid.py \
+uv run python scripts/train.py --run-type adapter --strategy hybrid \
     --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
-    --lora-rank 4 --lora-lr 3e-4 --film-lr 1e-3
+    --lora-rank 4 --lr 3e-4 --local-checkpoints
 
 # RoSA (standard: joint LoRA + gradient-informed sparse)
-uv run python scripts/train_rosa.py \
+uv run python scripts/train.py --run-type adapter --strategy rosa \
     --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
-    --mode rosa --density 0.01 --lora-rank 4 --warmup-steps 128 --lr 3e-4 \
-    --local-checkpoints
+    --rosa-mode rosa --density 0.01 --lora-rank 4 --rosa-warmup-steps 128 \
+    --lr 3e-4 --local-checkpoints
 
 # RoSA (retrospective sparse + bottleneck)
-uv run python scripts/train_rosa.py \
+uv run python scripts/train.py --run-type adapter --strategy rosa \
     --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
-    --mode retro-bottleneck --density 0.01 --bottleneck-dim 8 --lr 3e-4 \
+    --rosa-mode retro-bottleneck --density 0.01 --bottleneck-dim 8 --lr 3e-4 \
     --local-checkpoints
 ```
 
-All scripts share common flags: `--epochs`, `--batch-size`, `--patience` (early stopping), `--no-compile` (required on ROCm), `--device`, `--num-workers`, `--resume` (checkpoint path for resuming).
-
-Run `--help` on any script for the full argument list.
+Common flags across all strategies: `--epochs`, `--batch-size`, `--patience` (early stopping), `--no-compile` (required on ROCm), `--device`, `--num-workers`, `--resume` (checkpoint path for resuming).

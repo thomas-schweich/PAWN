@@ -218,6 +218,8 @@ def build_context(variant_key: str, variant: dict) -> dict:
     ctx["n_layers"] = mc["n_layers"]
     ctx["n_heads"] = mc["n_heads"]
     ctx["d_ff"] = mc["d_ff"]
+    ctx["vocab_size"] = mc["vocab_size"]
+    ctx["max_seq_len"] = mc["max_seq_len"]
     ctx["head_dim"] = ctx["d_model"] // ctx["n_heads"]
     ctx["params_num"] = count_params_from_weights(repo)
     ctx["params"] = params_str(ctx["params_num"])

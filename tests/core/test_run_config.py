@@ -76,13 +76,17 @@ class TestPretrainConfig:
         assert cfg.variant == "base"
 
     def test_variants_accepted(self):
-        for v in ["toy", "small", "base", "large"]:
-            cfg = PretrainConfig(local_checkpoints=True, variant=v)
+        for v in ("toy", "small", "base", "large"):
+            cfg = PretrainConfig.model_validate(
+                {"local_checkpoints": True, "variant": v}
+            )
             assert cfg.variant == v
 
     def test_invalid_variant_rejected(self):
         with pytest.raises(ValidationError):
-            PretrainConfig(local_checkpoints=True, variant="enormous")
+            PretrainConfig.model_validate(
+                {"local_checkpoints": True, "variant": "enormous"}
+            )
 
     def test_architecture_overrides_default_none(self):
         cfg = PretrainConfig(local_checkpoints=True)
@@ -119,7 +123,7 @@ class TestPretrainConfig:
 class TestAdapterConfig:
     def test_strategy_required(self):
         with pytest.raises(ValidationError):
-            AdapterConfig(local_checkpoints=True)
+            AdapterConfig.model_validate({"local_checkpoints": True})
 
     @pytest.mark.parametrize("strat", [
         "bottleneck", "lora", "film", "sparse",
@@ -131,7 +135,9 @@ class TestAdapterConfig:
 
     def test_invalid_strategy_rejected(self):
         with pytest.raises(ValidationError):
-            AdapterConfig(local_checkpoints=True, strategy="nonexistent")
+            AdapterConfig.model_validate(
+                {"local_checkpoints": True, "strategy": "nonexistent"}
+            )
 
     def test_default_checkpoint_and_pgn(self):
         cfg = AdapterConfig(local_checkpoints=True, strategy="lora")
@@ -139,57 +145,65 @@ class TestAdapterConfig:
         assert cfg.pgn == "thomas-schweich/pawn-lichess-full"
 
     def test_lora_targets_valid(self):
-        for tgt in ["qkvo", "qv", "qkv"]:
-            cfg = AdapterConfig(
-                local_checkpoints=True, strategy="lora", lora_targets=tgt,
-            )
+        for tgt in ("qkvo", "qv", "qkv"):
+            cfg = AdapterConfig.model_validate({
+                "local_checkpoints": True, "strategy": "lora",
+                "lora_targets": tgt,
+            })
             assert cfg.lora_targets == tgt
 
     def test_lora_targets_invalid(self):
         with pytest.raises(ValidationError):
-            AdapterConfig(
-                local_checkpoints=True, strategy="lora", lora_targets="zzz",
-            )
+            AdapterConfig.model_validate({
+                "local_checkpoints": True, "strategy": "lora",
+                "lora_targets": "zzz",
+            })
 
     def test_sparse_targets_valid(self):
-        for tgt in ["qkvo", "qv", "qkv"]:
-            cfg = AdapterConfig(
-                local_checkpoints=True, strategy="sparse", sparse_targets=tgt,
-            )
+        for tgt in ("qkvo", "qv", "qkv"):
+            cfg = AdapterConfig.model_validate({
+                "local_checkpoints": True, "strategy": "sparse",
+                "sparse_targets": tgt,
+            })
             assert cfg.sparse_targets == tgt
 
     def test_rosa_mode_valid(self):
-        for m in ["rosa", "retro-sparse", "retro-bottleneck"]:
-            cfg = AdapterConfig(
-                local_checkpoints=True, strategy="rosa", rosa_mode=m,
-            )
+        for m in ("rosa", "retro-sparse", "retro-bottleneck"):
+            cfg = AdapterConfig.model_validate({
+                "local_checkpoints": True, "strategy": "rosa",
+                "rosa_mode": m,
+            })
             assert cfg.rosa_mode == m
 
     def test_amp_dtype_valid(self):
-        for d in ["float16", "bfloat16", "none"]:
-            cfg = AdapterConfig(
-                local_checkpoints=True, strategy="lora", amp_dtype=d,
-            )
+        for d in ("float16", "bfloat16", "none"):
+            cfg = AdapterConfig.model_validate({
+                "local_checkpoints": True, "strategy": "lora",
+                "amp_dtype": d,
+            })
             assert cfg.amp_dtype == d
 
     def test_amp_dtype_invalid(self):
         with pytest.raises(ValidationError):
-            AdapterConfig(
-                local_checkpoints=True, strategy="lora", amp_dtype="fp32",
-            )
+            AdapterConfig.model_validate({
+                "local_checkpoints": True, "strategy": "lora",
+                "amp_dtype": "fp32",
+            })
 
     def test_grad_alpha_valid(self):
-        for a in [1, 2]:
-            cfg = AdapterConfig(
-                local_checkpoints=True, strategy="rosa", grad_alpha=a,
-            )
+        for a in (1, 2):
+            cfg = AdapterConfig.model_validate({
+                "local_checkpoints": True, "strategy": "rosa",
+                "grad_alpha": a,
+            })
             assert cfg.grad_alpha == a
 
     def test_grad_alpha_invalid(self):
         with pytest.raises(ValidationError):
-            AdapterConfig(
-                local_checkpoints=True, strategy="rosa", grad_alpha=3,
-            )
+            AdapterConfig.model_validate({
+                "local_checkpoints": True, "strategy": "rosa",
+                "grad_alpha": 3,
+            })
 
     def test_defaults(self):
         cfg = AdapterConfig(local_checkpoints=True, strategy="bottleneck")
@@ -459,17 +473,16 @@ class TestCotrainVariant:
         assert v.variant == "base"
         assert v.d_model is None
         assert v.max_seq_len == 512
-        assert v.legacy_vocab is False
         assert v.resume is None
 
     def test_all_variant_presets(self):
-        for preset in ["toy", "small", "base", "large"]:
-            v = CotrainVariant(name=preset, variant=preset)
+        for preset in ("toy", "small", "base", "large"):
+            v = CotrainVariant.model_validate({"name": preset, "variant": preset})
             assert v.variant == preset
 
     def test_invalid_variant_rejected(self):
         with pytest.raises(ValidationError):
-            CotrainVariant(name="x", variant="enormous")
+            CotrainVariant.model_validate({"name": "x", "variant": "enormous"})
 
 
 # ---------------------------------------------------------------------------
@@ -668,11 +681,15 @@ class TestSerialization:
 class TestTypeValidation:
     def test_batch_size_must_be_int(self):
         with pytest.raises(ValidationError):
-            PretrainConfig(local_checkpoints=True, batch_size="many")
+            PretrainConfig.model_validate(
+                {"local_checkpoints": True, "batch_size": "many"}
+            )
 
     def test_lr_must_be_float(self):
         with pytest.raises(ValidationError):
-            PretrainConfig(local_checkpoints=True, lr="fast")
+            PretrainConfig.model_validate(
+                {"local_checkpoints": True, "lr": "fast"}
+            )
 
     def test_no_outcome_token_must_be_bool_like(self):
         # Pydantic v2 is lenient with bool coercion; we just test explicit bad values
@@ -797,5 +814,7 @@ class TestCustomVariant:
     def test_extra_fields_behavior(self):
         """Pydantic by default ignores extra fields unless model_config forbids."""
         # Should not raise (extra fields silently ignored by default)
-        cfg = PretrainConfig(local_checkpoints=True, bogus_field="value")
+        cfg = PretrainConfig.model_validate(
+            {"local_checkpoints": True, "bogus_field": "value"}
+        )
         assert not hasattr(cfg, "bogus_field")

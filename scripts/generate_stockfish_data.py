@@ -81,6 +81,9 @@ class StockfishEngine:
             text=True,
             bufsize=1,
         )
+        assert self.proc.stdin is not None and self.proc.stdout is not None
+        self._stdin = self.proc.stdin
+        self._stdout = self.proc.stdout
         self._send("uci")
         self._wait_for("uciok")
         self._send(f"setoption name Hash value {hash_mb}")
@@ -91,13 +94,13 @@ class StockfishEngine:
         self._wait_for("readyok")
 
     def _send(self, cmd: str):
-        self.proc.stdin.write(cmd + "\n")
-        self.proc.stdin.flush()
+        self._stdin.write(cmd + "\n")
+        self._stdin.flush()
 
     def _wait_for(self, token: str) -> list[str]:
         lines = []
         while True:
-            line = self.proc.stdout.readline().strip()
+            line = self._stdout.readline().strip()
             lines.append(line)
             if line.startswith(token):
                 return lines

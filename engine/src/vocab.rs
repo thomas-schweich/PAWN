@@ -173,23 +173,6 @@ pub fn lichess_outcome_token(
     }
 }
 
-// --- Legacy PAWN vocabulary conversion ---
-
-/// Convert a legacy PAWN token (1..=4272) to a searchless action index (0..=1967).
-/// Returns None for legacy PAD (0), outcome tokens (≥4273), and impossible moves.
-pub fn pawn_to_searchless(pawn_token: u16) -> Option<u16> {
-    if (pawn_token as usize) >= searchless_vocab::PAWN_TO_SEARCHLESS.len() {
-        return None;
-    }
-    let action = searchless_vocab::PAWN_TO_SEARCHLESS[pawn_token as usize];
-    if action < 0 { None } else { Some(action as u16) }
-}
-
-/// Convert a searchless action index (0..=1967) to a legacy PAWN token (1..=4272).
-pub fn searchless_to_pawn(action: u16) -> u16 {
-    searchless_vocab::SEARCHLESS_TO_PAWN[action as usize]
-}
-
 /// Convenience: look up a UCI string and panic if not found.
 /// Useful in tests and static initialization.
 pub fn uci_token(uci: &str) -> u16 {
@@ -427,51 +410,6 @@ mod tests {
         assert!(lichess_outcome_token("Rules infraction", "0-1", false, false, false).is_none());
         assert!(lichess_outcome_token("Unterminated", "*", false, false, false).is_none());
         assert!(lichess_outcome_token("Normal", "*", false, false, false).is_none());
-    }
-
-    // --- Legacy conversion tests ---
-
-    #[test]
-    fn test_pawn_to_searchless_known_moves() {
-        // e2e4: legacy token = 12*64+28+1 = 797, action = 317
-        assert_eq!(pawn_to_searchless(797), Some(317));
-        // a7a8q: legacy token = 4097, action = 1880
-        assert_eq!(pawn_to_searchless(4097), Some(1880));
-    }
-
-    #[test]
-    fn test_searchless_to_pawn_known_moves() {
-        assert_eq!(searchless_to_pawn(317), 797); // e2e4
-        assert_eq!(searchless_to_pawn(1880), 4097); // a7a8q
-    }
-
-    #[test]
-    fn test_conversion_roundtrip_all_actions() {
-        for action in 0..NUM_ACTIONS as u16 {
-            let pawn_token = searchless_to_pawn(action);
-            assert_eq!(pawn_to_searchless(pawn_token), Some(action),
-                "roundtrip failed for action {}: pawn_token={}", action, pawn_token);
-        }
-    }
-
-    #[test]
-    fn test_pawn_to_searchless_impossible_moves() {
-        // Legacy PAD
-        assert_eq!(pawn_to_searchless(0), None);
-        // a1a1 = legacy token 1 (self-move, impossible)
-        assert_eq!(pawn_to_searchless(1), None);
-        // a1b4 = not reachable by any piece
-        // src=0 (a1), dst=9 (b2)... actually b4=1+3*8=25, so legacy = 0*64+25+1 = 26
-        // Let's just check a known impossible move
-        assert_eq!(pawn_to_searchless(1), None); // a1a1
-    }
-
-    #[test]
-    fn test_pawn_to_searchless_out_of_range() {
-        // Beyond legacy vocab range
-        assert_eq!(pawn_to_searchless(4273), None);
-        assert_eq!(pawn_to_searchless(5000), None);
-        assert_eq!(pawn_to_searchless(u16::MAX), None);
     }
 
     // --- Promo pairs (kept for grid-based representations) ---

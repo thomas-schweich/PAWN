@@ -134,9 +134,10 @@ class TestFiLMCLMInvariants:
                                    toy_input_ids, toy_attention_mask):
         model = FiLMCLM(toy_backbone)
         # Perturb
-        for film in model.hidden_films:
-            film.gamma.data = film.gamma.data + torch.randn_like(film.gamma) * 0.01
-            film.beta.data = film.beta.data + torch.randn_like(film.beta) * 0.01
+        for mod in model.hidden_films:
+            assert isinstance(mod, FiLMLayer)
+            mod.gamma.data = mod.gamma.data + torch.randn_like(mod.gamma) * 0.01
+            mod.beta.data = mod.beta.data + torch.randn_like(mod.beta) * 0.01
         if model.output_film is not None:
             model.output_film.gamma.data += torch.randn_like(model.output_film.gamma) * 0.01
             model.output_film.beta.data += torch.randn_like(model.output_film.beta) * 0.01
@@ -212,8 +213,9 @@ class TestFiLMCLMConfig:
     def test_weight_report_after_perturb(self, toy_backbone, toy_clm_config):
         import math
         model = FiLMCLM(toy_backbone)
-        for film in model.hidden_films:
-            film.gamma.data += 0.5
+        for mod in model.hidden_films:
+            assert isinstance(mod, FiLMLayer)
+            mod.gamma.data += 0.5
         rep = model.film_weight_report()
         # gamma_dev = (gamma - 1.0).norm() = norm of a vector of 0.5s with
         # d_model elements = sqrt(d_model * 0.25) = sqrt(d_model) / 2

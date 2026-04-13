@@ -345,6 +345,7 @@ class TestReadMetricsCotrain:
         offsets: dict = {}
         read_metrics(trial, log_dir, offsets)
 
+        assert trial.variants is not None
         assert trial.variants["small"]["current_step"] == 10
 
         # Append more data
@@ -398,6 +399,7 @@ class TestReadMetricsCotrain:
         offsets: dict = {}
         read_metrics(trial, log_dir, offsets)
 
+        assert trial.variants is not None
         assert trial.variants["small"]["run_dir"] == str(small_dir)
 
 

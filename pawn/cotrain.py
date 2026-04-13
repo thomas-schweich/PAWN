@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from pawn.checkpoint import load_pretrain_checkpoint, save_pretrain_checkpoint, push_checkpoint_to_hf
-from pawn.config import CLMConfig, LegacyVocab, TrainingConfig
+from pawn.config import CLMConfig, TrainingConfig
 from pawn.data import CLMDataset, create_validation_set
 from pawn.gpu import configure_gpu
 from pawn.logging import MetricsLogger, random_slug
@@ -343,14 +343,11 @@ def _resolve_cotrain_resume_prepend_outcome(
     If ``metadata_cache`` is provided, each successfully-read variant's
     metadata dict is stored under its name so downstream helpers (e.g.
     ``_warn_cotrain_resume_lr_mismatch``) can skip the extra filesystem
-    or pickle load. Legacy ``.pt`` checkpoints in particular trigger a
-    full ``torch.load`` pickle deserialization via
-    ``read_checkpoint_metadata``, so sharing one read per variant
-    avoids multiplying that cost.
+    read.
 
     No-op when no variant is resuming.
     """
-    from pawn.checkpoint import infer_prepend_outcome, read_checkpoint_metadata
+    from pawn.checkpoint import get_prepend_outcome, read_checkpoint_metadata
 
     resume_modes: dict[str, bool] = {}
     ambiguous_variants: list[tuple[str, str]] = []
@@ -365,17 +362,16 @@ def _resolve_cotrain_resume_prepend_outcome(
             continue
         if metadata_cache is not None:
             metadata_cache[variant_spec.name] = saved
-        saved_prepend, reason = infer_prepend_outcome(
-            saved.get("training_config"), saved.get("model_config"),
-        )
-        if saved_prepend is None:
-            ambiguous_variants.append((variant_spec.name, reason))
-            print(f"  [{variant_spec.name}] resume: ambiguous ({reason})")
+        try:
+            saved_prepend = get_prepend_outcome(saved.get("training_config"))
+        except ValueError as err:
+            ambiguous_variants.append((variant_spec.name, str(err)))
+            print(f"  [{variant_spec.name}] resume: ambiguous ({err})")
             continue
         resume_modes[variant_spec.name] = saved_prepend
         print(f"  [{variant_spec.name}] resume: "
               f"{'outcome-prefixed' if saved_prepend else 'pure-moves'} "
-              f"({reason})")
+              f"(saved training.prepend_outcome)")
 
     if ambiguous_variants:
         if "prepend_outcome" in config.model_fields_set:
@@ -516,10 +512,6 @@ def _build_variant_configs(
             model_cfg.d_ff = variant_spec.d_ff
     model_cfg.max_seq_len = variant_spec.max_seq_len
 
-    if variant_spec.legacy_vocab:
-        model_cfg.vocab_size = LegacyVocab.VOCAB_SIZE
-        model_cfg.max_seq_len = 256
-
     train_cfg = TrainingConfig()
     train_cfg.lr = shared.lr
     train_cfg.total_steps = shared.total_steps or train_cfg.total_steps
@@ -643,9 +635,6 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     # All variants must produce compatible sequence lengths for the shared DataLoader.
     # Use the maximum max_seq_len across all variants so shorter models can mask off.
     max_ply = max(v.max_seq_len for v in config.variants)
-    any_legacy = any(v.legacy_vocab for v in config.variants)
-    if any_legacy:
-        max_ply = 256
 
     dataset = CLMDataset(
         config.batch_size, max_ply, base_seed=42,

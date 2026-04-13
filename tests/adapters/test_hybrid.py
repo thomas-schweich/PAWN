@@ -165,6 +165,7 @@ class TestHybridCLMConfig:
 
     def test_film_layers_subset(self, toy_backbone):
         model = HybridCLM(toy_backbone, lora_rank=4, film_layers=(1,))
+        assert model.hidden_films is not None
         assert not isinstance(model.hidden_films[0], FiLMLayer)
         assert isinstance(model.hidden_films[1], FiLMLayer)
         # Only 1 FiLM layer → 2 params

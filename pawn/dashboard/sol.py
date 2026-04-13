@@ -37,14 +37,16 @@ runner_pid = solara.reactive(0)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-TRAIN_SCRIPTS = {
-    "pawn": {"project": PROJECT_ROOT, "script": "scripts/train.py"},
-    "film": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_film.py"},
-    "lora": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_lora.py"},
-    "hybrid": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_hybrid.py"},
-    "sparse": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_sparse.py"},
-    "bottleneck": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_bottleneck.py"},
-    "tiny": {"project": PROJECT_ROOT, "script": "scripts/legacy/train_tiny.py"},
+# All runs dispatch through scripts/train.py. `pawn` runs pretrain;
+# adapter entries map to `--run-type adapter --strategy <strategy>`.
+TRAIN_SCRIPTS: dict[str, dict[str, str | Path]] = {
+    "pawn":       {"project": PROJECT_ROOT, "script": "scripts/train.py", "run_type": "pretrain"},
+    "film":       {"project": PROJECT_ROOT, "script": "scripts/train.py", "run_type": "adapter", "strategy": "film"},
+    "lora":       {"project": PROJECT_ROOT, "script": "scripts/train.py", "run_type": "adapter", "strategy": "lora"},
+    "hybrid":     {"project": PROJECT_ROOT, "script": "scripts/train.py", "run_type": "adapter", "strategy": "hybrid"},
+    "sparse":     {"project": PROJECT_ROOT, "script": "scripts/train.py", "run_type": "adapter", "strategy": "sparse"},
+    "bottleneck": {"project": PROJECT_ROOT, "script": "scripts/train.py", "run_type": "adapter", "strategy": "bottleneck"},
+    "tiny":       {"project": PROJECT_ROOT, "script": "scripts/train.py", "run_type": "adapter", "strategy": "specialized_clm"},
 }
 
 
@@ -1024,8 +1026,9 @@ def Runner(project_root: Path | None = None):
 
     def build_command() -> list[str]:
         info = TRAIN_SCRIPTS[run_type]
-        cmd = ["uv", "run", "python", info["script"]]
-        if run_type == "pawn":
+        cmd = ["uv", "run", "python", str(info["script"])]
+        cmd.extend(["--run-type", str(info["run_type"])])
+        if info["run_type"] == "pretrain":
             if checkpoint:
                 cmd.extend(["--resume", checkpoint])
             if batch_size:
@@ -1033,12 +1036,13 @@ def Runner(project_root: Path | None = None):
             if steps:
                 cmd.extend(["--total-steps", steps])
         else:
+            cmd.extend(["--strategy", str(info["strategy"])])
             if checkpoint:
                 cmd.extend(["--checkpoint", checkpoint])
             if pgn_path:
                 cmd.extend(["--pgn", pgn_path])
             cmd.extend(["--lr", lr, "--batch-size", batch_size, "--epochs", steps])
-        cmd.extend(["--log-dir", str(root / "logs")])
+        cmd.extend(["--log-dir", str(root / "logs"), "--local-checkpoints"])
         if extra_args.strip():
             cmd.extend(extra_args.strip().split())
         return cmd

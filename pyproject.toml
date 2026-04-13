@@ -17,6 +17,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "polars>=1.39.0",
     "pyarrow>=23.0.1",
+    "zstandard>=0.22.0",  # Lichess PGN extraction
     # Dashboard
     "solara>=1.0.0",
     "plotly>=5.18.0",

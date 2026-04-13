@@ -12,9 +12,9 @@ and optionally per-ply accuracy.
 
 Usage:
     uv run python scripts/eval_accuracy.py \
-        --checkpoint /path/to/checkpoint.pt \
-        --adapter-checkpoint lora_runs/best.pt \
-        --pgn /path/to/lichess_1200_1400.pgn \
+        --checkpoint thomas-schweich/pawn-base \
+        --adapter-checkpoint logs/run_*/checkpoints/best \
+        --pgn thomas-schweich/pawn-lichess-full \
         --min-eval-ply 10
 """
 
@@ -66,11 +66,7 @@ def parse_args():
 
 
 def _detect_adapter_type(config: dict) -> str:
-    """Auto-detect adapter type from config dict.
-
-    The config dict comes from load_adapter_checkpoint()["config"], which
-    contains training args for both legacy .pt files and new-format directories.
-    """
+    """Auto-detect adapter type from config dict."""
     if "checkpoint_type" in config:
         return config["checkpoint_type"]
     if "bottleneck_dim" in config:
@@ -204,9 +200,9 @@ def evaluate_maia(
     total_top5 = 0.0
     total_positions = 0
 
-    # Per-ply stats (optional)
-    ply_top1 = {} if per_ply else None
-    ply_count = {} if per_ply else None
+    # Per-ply stats (only populated when per_ply=True)
+    ply_top1: dict[int, float] = {}
+    ply_count: dict[int, int] = {}
 
     for batch in dataloader:
         ids = batch["input_ids"].to(device)

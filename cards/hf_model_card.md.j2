@@ -25,8 +25,8 @@ d_model: {{ d_model }}
 n_layers: {{ n_layers }}
 n_heads: {{ n_heads }}
 d_ff: {{ d_ff }}
-context_length: 256
-vocab_size: 4284
+context_length: {{ max_seq_len }}
+vocab_size: {{ vocab_size }}
 datasets:
   - random-chess-games
 language:
@@ -130,8 +130,8 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 | Head dimension | {{ head_dim }} |
 | d_ff | {{ d_ff }} |
 | Parameters | {{ params }} |
-| Vocabulary | 4,284 tokens |
-| Context length | 256 tokens |
+| Vocabulary | {{ vocab_size }} tokens |
+| Context length | {{ max_seq_len }} tokens |
 | Normalization | Pre-norm RMSNorm |
 | FFN | SwiGLU (4x expansion) |
 | Positional encoding | Rotary (RoPE, base 10000) |
@@ -184,7 +184,7 @@ model.load_state_dict(weights)
 ### Finetuning with an adapter
 
 ```bash
-uv run python scripts/train_bottleneck.py \
+uv run python scripts/train.py --run-type adapter --strategy bottleneck \
     --checkpoint thomas-schweich/pawn-{{ variant_key }} \
     --pgn thomas-schweich/pawn-lichess-full \
     --bottleneck-dim 32 --lr 1e-4 --local-checkpoints

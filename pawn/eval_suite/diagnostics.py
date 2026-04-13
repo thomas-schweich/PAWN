@@ -248,7 +248,7 @@ def evaluate_diagnostic_positions(
             # To predict move at ply t, input is [outcome, m_0, ..., m_{t-1}]
             # (t+1 tokens total). The model at position t predicts ply t's move.
             max_seq = max(p["ply"] + 1 for p in batch_pos)  # outcome + t moves
-            seq_len = min(max_seq, 256)
+            seq_len = min(max_seq, 512)
 
             input_seqs = np.full((B, seq_len), PAD_TOKEN, dtype=np.int64)
             pred_positions = []
@@ -298,7 +298,7 @@ def evaluate_diagnostic_positions(
                 sampled = sampled.squeeze(-1).cpu().numpy()
 
                 # Replay game to this position and check legality
-                gs = engine.PyGameState(max_ply=256)
+                gs = engine.PyGameState(max_ply=512)
                 g = pos["game_idx"]
                 for mv_idx in range(pos["ply"]):
                     gs.make_move(int(move_ids[g, mv_idx]))

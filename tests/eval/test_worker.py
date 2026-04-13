@@ -59,7 +59,7 @@ class TestWorkerEntry:
 # ---------------------------------------------------------------------------
 
 
-def _mk_pool_mock(return_value=None, raise_exc: Exception | None = None):
+def _mk_pool_mock(return_value=None, raise_exc: BaseException | None = None):
     """Build a Pool context-manager mock that returns value or raises."""
     pool = MagicMock()
     async_result = MagicMock()

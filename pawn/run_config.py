@@ -91,7 +91,6 @@ class PretrainConfig(BaseRunConfig):
     max_seq_len: int = 512
     legality_late_ply: int | None = None  # defaults to max_seq_len // 2 at runtime
     val_games: int = 512  # override BaseRunConfig's 50K — pretrain uses on-the-fly data
-    legacy_vocab: bool = False  # use old 4284-token PAWN vocab (for reproducing old experiments)
 
     @model_validator(mode="after")
     def _check_custom_arch(self) -> "PretrainConfig":
@@ -197,7 +196,6 @@ class CotrainVariant(BaseModel):
     n_heads: int | None = None
     d_ff: int | None = None
     max_seq_len: int = 512
-    legacy_vocab: bool = False
     resume: str | None = None
 
     @model_validator(mode="after")

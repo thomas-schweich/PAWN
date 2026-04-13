@@ -99,7 +99,7 @@ class TestComputeLegalIndices:
         """Each index must be in [0, B * seq_len * vocab_size)."""
         B = 4
         seq_len = 64
-        vocab_size = 4278
+        vocab_size = 1980
         move_ids, gl, _tc = engine.generate_random_games(B, seq_len - 1, seed=42)
         indices = compute_legal_indices(move_ids, gl, seq_len=seq_len, vocab_size=vocab_size)
         max_idx = B * seq_len * vocab_size
@@ -133,7 +133,7 @@ class TestLegalMaskBuilder:
     def test_scatter_output_shape(self):
         B = 4
         max_ply = 32
-        vocab = 4278
+        vocab = 1980
         builder = LegalMaskBuilder(
             batch_size=B, max_ply=max_ply, vocab_size=vocab, device="cpu"
         )
@@ -210,11 +210,11 @@ class TestLegalMaskBuilder:
         max_ply = 63  # seq_len 64
         move_ids, gl, _tc = engine.generate_random_games(B, max_ply, seed=42)
         builder = LegalMaskBuilder(
-            batch_size=B, max_ply=max_ply, vocab_size=4278, device="cpu"
+            batch_size=B, max_ply=max_ply, vocab_size=1980, device="cpu"
         )
         batch = {"move_ids": move_ids, "game_length": gl}
         mask = builder(batch)
-        assert mask.shape == (B, max_ply + 1, 4278)
+        assert mask.shape == (B, max_ply + 1, 1980)
         # Position 0 is outcome, position 1 is first move: each row should
         # have at least some legal moves.
         per_position_count = mask.sum(dim=-1)
@@ -228,14 +228,14 @@ class TestLegalMaskBuilder:
         max_ply = 15
         move_ids, gl, _tc = engine.generate_random_games(B, max_ply, seed=42)
         builder = LegalMaskBuilder(
-            batch_size=B, max_ply=max_ply, vocab_size=4278, device="cpu"
+            batch_size=B, max_ply=max_ply, vocab_size=1980, device="cpu"
         )
         batch = {
             "move_ids": torch.from_numpy(move_ids),
             "game_length": torch.from_numpy(gl),
         }
         mask = builder(batch)
-        assert mask.shape == (B, max_ply + 1, 4278)
+        assert mask.shape == (B, max_ply + 1, 1980)
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +246,7 @@ class TestLegalMaskBuilder:
 class TestLegalMaskCollate:
     @pytest.mark.integration
     def test_adds_legal_indices(self):
-        collate = LegalMaskCollate(seq_len=32, vocab_size=4278)
+        collate = LegalMaskCollate(seq_len=32, vocab_size=1980)
         # Fake items
         move_ids, gl, _tc = engine.generate_random_games(3, 31, seed=42)
         items = [

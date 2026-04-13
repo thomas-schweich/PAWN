@@ -40,7 +40,7 @@ except ImportError:
 # Search spaces per adapter type
 # ---------------------------------------------------------------------------
 
-def suggest_common(trial: "optuna.Trial") -> dict:
+def suggest_common(trial: "optuna.trial.BaseTrial") -> dict:
     """Hyperparameters shared across all adapter types."""
     return {
         "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
@@ -51,7 +51,7 @@ def suggest_common(trial: "optuna.Trial") -> dict:
     }
 
 
-def suggest_lora(trial: "optuna.Trial") -> dict:
+def suggest_lora(trial: "optuna.trial.BaseTrial") -> dict:
     """LoRA-specific hyperparameters."""
     params = suggest_common(trial)
     params["lora_rank"] = trial.suggest_categorical("lora_rank", [2, 4, 8, 16, 32])
@@ -60,7 +60,7 @@ def suggest_lora(trial: "optuna.Trial") -> dict:
     return params
 
 
-def suggest_bottleneck(trial: "optuna.Trial") -> dict:
+def suggest_bottleneck(trial: "optuna.trial.BaseTrial") -> dict:
     """Bottleneck adapter hyperparameters."""
     params = suggest_common(trial)
     params["bottleneck_dim"] = trial.suggest_categorical("bottleneck_dim", [4, 8, 16, 32, 64, 128])
@@ -69,14 +69,14 @@ def suggest_bottleneck(trial: "optuna.Trial") -> dict:
     return params
 
 
-def suggest_film(trial: "optuna.Trial") -> dict:
+def suggest_film(trial: "optuna.trial.BaseTrial") -> dict:
     """FiLM hyperparameters."""
     params = suggest_common(trial)
     params["no_output_film"] = trial.suggest_categorical("no_output_film", [True, False])
     return params
 
 
-def suggest_sparse(trial: "optuna.Trial") -> dict:
+def suggest_sparse(trial: "optuna.trial.BaseTrial") -> dict:
     """Sparse adapter hyperparameters."""
     params = suggest_common(trial)
     params["density"] = trial.suggest_float("density", 0.001, 0.1, log=True)
@@ -85,7 +85,7 @@ def suggest_sparse(trial: "optuna.Trial") -> dict:
     return params
 
 
-def suggest_hybrid(trial: "optuna.Trial") -> dict:
+def suggest_hybrid(trial: "optuna.trial.BaseTrial") -> dict:
     """Hybrid (LoRA + FiLM) hyperparameters."""
     params = {
         "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128, 256]),
@@ -101,7 +101,7 @@ def suggest_hybrid(trial: "optuna.Trial") -> dict:
     return params
 
 
-def suggest_tiny(trial: "optuna.Trial") -> dict:
+def suggest_tiny(trial: "optuna.trial.BaseTrial") -> dict:
     """Tiny standalone model hyperparameters."""
     params = suggest_common(trial)
     params["d_model"] = trial.suggest_categorical("d_model", [32, 64, 84, 128])
@@ -110,7 +110,7 @@ def suggest_tiny(trial: "optuna.Trial") -> dict:
     return params
 
 
-def suggest_pretrain(trial: "optuna.Trial") -> dict:
+def suggest_pretrain(trial: "optuna.trial.BaseTrial") -> dict:
     """Pretraining hyperparameters (fixed architecture, tune training)."""
     return {
         "lr": trial.suggest_float("lr", 1e-5, 1e-3, log=True),
@@ -121,7 +121,7 @@ def suggest_pretrain(trial: "optuna.Trial") -> dict:
     }
 
 
-def suggest_architecture(trial: "optuna.Trial") -> dict:
+def suggest_architecture(trial: "optuna.trial.BaseTrial") -> dict:
     """Architecture search space for pretraining.
 
     Explores model size, depth/width tradeoff, and training hyperparameters.
@@ -144,7 +144,7 @@ def suggest_architecture(trial: "optuna.Trial") -> dict:
     }
 
 
-def _suggest_rosa_common(trial: "optuna.Trial") -> dict:
+def _suggest_rosa_common(trial: "optuna.trial.BaseTrial") -> dict:
     """Shared search space for all RoSA modes."""
     params = suggest_common(trial)
     params["density"] = trial.suggest_float("density", 0.001, 0.1, log=True)
@@ -156,21 +156,21 @@ def _suggest_rosa_common(trial: "optuna.Trial") -> dict:
     return params
 
 
-def suggest_rosa(trial: "optuna.Trial") -> dict:
+def suggest_rosa(trial: "optuna.trial.BaseTrial") -> dict:
     """Standard RoSA: joint LoRA + gradient-informed sparse."""
     params = _suggest_rosa_common(trial)
     params["mode"] = "rosa"
     return params
 
 
-def suggest_retro_sparse(trial: "optuna.Trial") -> dict:
+def suggest_retro_sparse(trial: "optuna.trial.BaseTrial") -> dict:
     """Retrospective sparse-only with gradient-informed masks."""
     params = _suggest_rosa_common(trial)
     params["mode"] = "retro-sparse"
     return params
 
 
-def suggest_retro_bottleneck(trial: "optuna.Trial") -> dict:
+def suggest_retro_bottleneck(trial: "optuna.trial.BaseTrial") -> dict:
     """Retrospective sparse + bottleneck adapters."""
     params = _suggest_rosa_common(trial)
     params["mode"] = "retro-bottleneck"
@@ -189,7 +189,7 @@ _BASE_BOTTLENECK_PARAMS_PER_DIM = 4 * 8 * 512  # 16_384
 _BASE_SPARSE_MASKABLE_PARAMS = 4 * 8 * 512 * 512  # 8_388_608
 
 
-def suggest_rosa_ratio(trial: "optuna.Trial") -> dict:
+def suggest_rosa_ratio(trial: "optuna.trial.BaseTrial") -> dict:
     """Retro-bottleneck ratio sweep: vary bottleneck vs sparse param allocation.
 
     For a fixed total parameter budget, sweeps the fraction allocated to
@@ -246,18 +246,31 @@ SUGGEST_FNS = {
 }
 
 ADAPTER_SCRIPTS = {
-    "lora": "scripts/legacy/train_lora.py",
-    "bottleneck": "scripts/legacy/train_bottleneck.py",
-    "film": "scripts/legacy/train_film.py",
-    "sparse": "scripts/legacy/train_sparse.py",
-    "hybrid": "scripts/legacy/train_hybrid.py",
-    "rosa": "scripts/legacy/train_rosa.py",
-    "retro-sparse": "scripts/legacy/train_rosa.py",
-    "retro-bottleneck": "scripts/legacy/train_rosa.py",
-    "rosa-ratio": "scripts/legacy/train_rosa.py",
-    "tiny": "scripts/legacy/train_tiny.py",
+    "lora": "scripts/train.py",
+    "bottleneck": "scripts/train.py",
+    "film": "scripts/train.py",
+    "sparse": "scripts/train.py",
+    "hybrid": "scripts/train.py",
+    "rosa": "scripts/train.py",
+    "retro-sparse": "scripts/train.py",
+    "retro-bottleneck": "scripts/train.py",
+    "rosa-ratio": "scripts/train.py",
+    "tiny": "scripts/train.py",
     "pretrain": "scripts/train.py",
     "architecture": "scripts/train.py",
+}
+
+_ADAPTER_STRATEGY = {
+    "lora": "lora",
+    "bottleneck": "bottleneck",
+    "film": "film",
+    "sparse": "sparse",
+    "hybrid": "hybrid",
+    "rosa": "rosa",
+    "retro-sparse": "rosa",
+    "retro-bottleneck": "rosa",
+    "rosa-ratio": "rosa",
+    "tiny": "specialized_clm",
 }
 
 
@@ -342,7 +355,7 @@ class AdapterObjective:
         self.extra_args = extra_args or []
         self.script = ADAPTER_SCRIPTS[adapter_type]
 
-    def __call__(self, trial: "optuna.Trial") -> float:
+    def __call__(self, trial: "optuna.trial.BaseTrial") -> float:
         suggest_fn = SUGGEST_FNS[self.adapter_type]
         params = suggest_fn(trial)
 
@@ -351,21 +364,21 @@ class AdapterObjective:
         # Build command
         cmd = [sys.executable, self.script]
 
-        # Fixed args — architecture and pretrain sweeps use train.py directly
-        if self.adapter_type not in ("pretrain", "architecture"):
-            cmd.extend(["--checkpoint", self.checkpoint])
-            cmd.extend(["--pgn", self.pgn])
-        cmd.extend(["--device", self.device])
-
-        # output-dir for adapters, log-dir for pretraining
+        # All sweep targets dispatch through scripts/train.py via --run-type.
         if self.adapter_type in ("pretrain", "architecture"):
+            cmd.extend(["--run-type", "pretrain"])
             cmd.extend(["--log-dir", str(trial_dir)])
             cmd.extend(["--local-checkpoints"])
         else:
-            cmd.extend(["--output-dir", str(trial_dir)])
-            # Only pass --epochs for adapter scripts (train.py uses --total-steps)
+            cmd.extend(["--run-type", "adapter"])
+            cmd.extend(["--strategy", _ADAPTER_STRATEGY[self.adapter_type]])
+            cmd.extend(["--checkpoint", self.checkpoint])
+            cmd.extend(["--pgn", self.pgn])
+            cmd.extend(["--log-dir", str(trial_dir)])
+            cmd.extend(["--local-checkpoints"])
             if "epochs" not in params:
                 cmd.extend(["--epochs", str(self.epochs)])
+        cmd.extend(["--device", self.device])
 
         # Suggested hyperparameters
         cmd.extend(_params_to_cli_args(params))
@@ -519,7 +532,7 @@ class InProcessRoSAObjective:
         model.eval()
         return model
 
-    def __call__(self, trial: "optuna.Trial") -> float:
+    def __call__(self, trial: "optuna.trial.BaseTrial") -> float:
         import gc
         import math
         import torch

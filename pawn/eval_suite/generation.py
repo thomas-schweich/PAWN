@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 import chess_engine as engine
 
-from pawn.config import PAD_TOKEN, WHITE_CHECKMATES, PLY_LIMIT, CLMConfig, LegacyVocab
+from pawn.config import PAD_TOKEN, WHITE_CHECKMATES, PLY_LIMIT, CLMConfig
 from pawn.data import _map_termination_to_outcome
 
 
@@ -48,7 +48,7 @@ def autoregressive_generate(
     mask_illegal: bool = False,
     prefix_moves: np.ndarray | None = None,
     prefix_lengths: np.ndarray | None = None,
-    max_seq_len: int = 256,
+    max_seq_len: int = 512,
     temperature: float = 1.0,
     batch_size: int = 64,
 ) -> dict[str, np.ndarray]:
@@ -62,7 +62,7 @@ def autoregressive_generate(
         mask_illegal: If True, set illegal move logits to -inf during game phase.
         prefix_moves: Optional (n_games, prefix_len) int16 array of prefix moves.
         prefix_lengths: Optional (n_games,) int array of prefix lengths.
-        max_seq_len: Total sequence length (256).
+        max_seq_len: Total sequence length.
         temperature: Sampling temperature.
         batch_size: Number of games to generate in parallel.
 
