@@ -335,6 +335,78 @@ class TestCotrainConfig:
         assert "variants" in schema["properties"]
         assert "run_type" in schema["properties"]
 
+    def test_run_evals_defaults_off(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            variants=[CotrainVariant(name="x", variant="toy")],
+        )
+        assert cfg.run_evals is False
+        assert cfg.lichess_pgn is None
+        assert cfg.publish_results is False
+
+    def test_run_evals_enabled(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            run_evals=True,
+            variants=[CotrainVariant(name="x", variant="toy")],
+        )
+        assert cfg.run_evals is True
+
+    def test_lichess_pgn_without_run_evals_rejected(self):
+        """lichess_pgn only does anything inside run_post_training_evals,
+        so setting it without run_evals is a user error — fail loudly."""
+        with pytest.raises(ValidationError) as exc_info:
+            CotrainConfig(
+                local_checkpoints=True,
+                lichess_pgn="/tmp/games.pgn",
+                variants=[CotrainVariant(name="x", variant="toy")],
+            )
+        msg = str(exc_info.value).lower()
+        assert "lichess_pgn" in msg and "run_evals" in msg
+
+    def test_lichess_pgn_with_run_evals_accepted(self):
+        cfg = CotrainConfig(
+            local_checkpoints=True,
+            run_evals=True,
+            lichess_pgn="/tmp/games.pgn",
+            variants=[CotrainVariant(name="x", variant="toy")],
+        )
+        assert cfg.lichess_pgn == "/tmp/games.pgn"
+
+    def test_publish_results_without_hf_rejected(self):
+        """publish_results uploads to an HF branch — it's meaningless
+        without hf_repo."""
+        with pytest.raises(ValidationError) as exc_info:
+            CotrainConfig(
+                local_checkpoints=True,
+                run_evals=True,
+                publish_results=True,
+                variants=[CotrainVariant(name="x", variant="toy")],
+            )
+        assert "publish_results" in str(exc_info.value)
+
+    def test_publish_results_with_hf_accepted(self):
+        cfg = CotrainConfig(
+            hf_repo="user/repo",
+            run_evals=True,
+            publish_results=True,
+            variants=[CotrainVariant(name="x", variant="toy")],
+        )
+        assert cfg.publish_results is True
+
+    def test_canonical_three_variants_config_validates(self):
+        """The configs/cotrain_three_variants.json file ships in the
+        repo as the canonical replacement for the deleted train_all.py.
+        Lock it in against accidental schema drift."""
+        import pathlib
+        path = pathlib.Path(__file__).resolve().parents[2] / "configs" / "cotrain_three_variants.json"
+        data = json.loads(path.read_text())
+        cfg = TypeAdapter(RunConfig).validate_python(data)
+        assert isinstance(cfg, CotrainConfig)
+        assert [v.name for v in cfg.variants] == ["small", "base", "large"]
+        assert [v.variant for v in cfg.variants] == ["small", "base", "large"]
+        assert cfg.local_checkpoints is True
+
 
 @pytest.mark.unit
 class TestCotrainVariant:

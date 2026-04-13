@@ -1,0 +1,17 @@
+{
+  "run_type": "cotrain",
+  "variants": [
+    {"name": "small", "variant": "small"},
+    {"name": "base", "variant": "base"},
+    {"name": "large", "variant": "large"}
+  ],
+  "total_steps": 100000,
+  "batch_size": 256,
+  "num_workers": 4,
+  "log_dir": "logs",
+  "log_interval": 10,
+  "eval_interval": 500,
+  "checkpoint_interval": 5000,
+  "patience": 10,
+  "local_checkpoints": true
+}

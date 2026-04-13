@@ -54,8 +54,8 @@ class BatchedLinearProbe(nn.Module):
     """L independent linear probes packed into a single batched matmul.
 
     Trains all layers for one probe simultaneously via ``torch.bmm``,
-    analogous to how ``train_all.py`` trains multiple model variants
-    on shared data batches.
+    analogous to how cotraining trains multiple model variants on
+    shared data batches (see ``pawn.cotrain``).
     """
 
     def __init__(self, n_probes: int, d_model: int, n_outputs: int):
@@ -810,7 +810,8 @@ def _train_probe_all_layers(
 
     Hidden states from every layer are stacked into ``(L, B, d_model)``
     mini-batches and processed via a single ``torch.bmm`` call, analogous to
-    how ``train_all.py`` trains three model variants on shared data batches.
+    how cotraining trains multiple model variants on shared data batches
+    (see ``pawn.cotrain``).
 
     Returns list of per-layer result dicts (same format as ``_train_probe_on_hidden``).
     """
