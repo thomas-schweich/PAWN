@@ -278,6 +278,81 @@ def _load_legacy_pt(path: str | Path, device: str = "cpu") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Peek at checkpoint metadata without loading weights
+# ---------------------------------------------------------------------------
+
+def read_checkpoint_metadata(path: str | Path) -> dict:
+    """Return ``{"model_config": ..., "training_config": ...}`` from a
+    checkpoint without touching model weights or verifying the hash
+    sentinel. Used by resume/eval paths that need to peek at the saved
+    sequence format before building data pipelines.
+
+    Raises ``FileNotFoundError`` if the path or its ``config.json`` is
+    missing. For legacy .pt files, loads the pickled dict in CPU mode
+    and pulls ``model_config`` / ``training_config`` from it.
+    """
+    p = Path(path)
+    if is_legacy_checkpoint(p):
+        ckpt = _load_legacy_pt(p, device="cpu")
+        return {
+            "model_config": ckpt.get("model_config"),
+            "training_config": ckpt.get("training_config"),
+        }
+
+    cfg_path = p / "config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"No config.json at {cfg_path}")
+    with open(cfg_path) as f:
+        config = json.load(f)
+    return {
+        "model_config": config.get("model_config"),
+        "training_config": config.get("training_config"),
+    }
+
+
+def infer_prepend_outcome(
+    training_config: dict | None,
+    model_config: dict | None,
+) -> tuple[bool, str]:
+    """Infer ``prepend_outcome`` for a resumed/evaluated checkpoint.
+
+    Returns ``(prepend_outcome, reason)``:
+
+      1. If ``training_config["prepend_outcome"]`` is present, return it
+         exactly — this is the post-2026-04 PAWN default where the field
+         is persisted to config.json.
+      2. Otherwise, fall back to heuristics for pre-flag checkpoints:
+         - Legacy vocab (``vocab_size == LegacyVocab.VOCAB_SIZE``) → True.
+           The legacy 4284-token runs are all pre-2026-04-08 and used the
+           outcome prefix as the implicit Rust default.
+         - 256-token context (``max_seq_len <= 256``) → True. The 256-ctx
+           convention predates the flip and was outcome-prefixed.
+         - Otherwise → False. Modern 1980-vocab / 512-ctx checkpoints
+           saved before the flag landed are ambiguous, but by far the
+           most common post-flip case is pure-moves.
+
+    Callers should print the reason when they override a user-supplied
+    flag so the behaviour is explicit and auditable.
+    """
+    from pawn.config import LegacyVocab
+    training = training_config or {}
+    model = model_config or {}
+
+    if "prepend_outcome" in training:
+        return bool(training["prepend_outcome"]), "saved training.prepend_outcome"
+
+    vocab_size = model.get("vocab_size")
+    if vocab_size == LegacyVocab.VOCAB_SIZE:
+        return True, f"legacy vocab (vocab_size={LegacyVocab.VOCAB_SIZE})"
+
+    max_seq_len = model.get("max_seq_len")
+    if isinstance(max_seq_len, int) and max_seq_len <= 256:
+        return True, f"legacy 256-ctx (max_seq_len={max_seq_len})"
+
+    return False, "modern pure-moves default (no legacy indicators)"
+
+
+# ---------------------------------------------------------------------------
 # Pretrain checkpoint save/load
 # ---------------------------------------------------------------------------
 

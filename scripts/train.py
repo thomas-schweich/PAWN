@@ -134,8 +134,33 @@ def run_pretrain(config: PretrainConfig) -> None:
     """Bridge ``PretrainConfig`` into ``CLMConfig`` + ``TrainingConfig``."""
     import torch
 
+    from pawn.checkpoint import infer_prepend_outcome, read_checkpoint_metadata
     from pawn.config import CLMConfig, LegacyVocab, TrainingConfig
     from pawn.trainer import CLMTrainer
+
+    # If we're resuming, peek at the saved config BEFORE constructing the
+    # trainer so the CLMDataset / validation set are built with the same
+    # sequence format the checkpoint was trained on. Without this, a
+    # pre-2026-04-08 outcome-prefixed run resumed after the default flip
+    # would silently switch to pure-moves and corrupt training.
+    if config.resume:
+        try:
+            saved = read_checkpoint_metadata(config.resume)
+        except (FileNotFoundError, OSError) as e:
+            print(f"WARNING: couldn't peek at resume checkpoint ({e}); "
+                  "proceeding with user-supplied prepend_outcome")
+        else:
+            saved_prepend, reason = infer_prepend_outcome(
+                saved.get("training_config"), saved.get("model_config"),
+            )
+            if saved_prepend != config.prepend_outcome:
+                print(
+                    f"Resume: saved checkpoint is "
+                    f"{'outcome-prefixed' if saved_prepend else 'pure-moves'} "
+                    f"({reason}); overriding prepend_outcome={config.prepend_outcome} "
+                    f"→ {saved_prepend} to match."
+                )
+                config.prepend_outcome = saved_prepend
 
     variant_factory = {
         "small": CLMConfig.small,

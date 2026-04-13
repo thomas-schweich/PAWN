@@ -471,6 +471,47 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
         sys.exit(1)
     start_step = max(resumed_steps) if resumed_steps else 0
 
+    # If any variants are resuming, peek at their saved configs and pick
+    # the sequence format that matches. Cotrain shares one data pipeline
+    # across variants, so a mismatch (e.g. some outcome-prefixed, some
+    # pure-moves) is unresolvable — fail loudly.
+    from pawn.checkpoint import infer_prepend_outcome, read_checkpoint_metadata
+    resume_modes: dict[str, bool] = {}
+    for variant_spec in config.variants:
+        if not variant_spec.resume:
+            continue
+        try:
+            saved = read_checkpoint_metadata(variant_spec.resume)
+        except (FileNotFoundError, OSError) as e:
+            print(f"WARNING: couldn't peek at {variant_spec.name} resume "
+                  f"checkpoint ({e}); assuming current prepend_outcome")
+            continue
+        saved_prepend, reason = infer_prepend_outcome(
+            saved.get("training_config"), saved.get("model_config"),
+        )
+        resume_modes[variant_spec.name] = saved_prepend
+        print(f"  [{variant_spec.name}] resume: "
+              f"{'outcome-prefixed' if saved_prepend else 'pure-moves'} "
+              f"({reason})")
+    if resume_modes:
+        unique = set(resume_modes.values())
+        if len(unique) > 1:
+            print(
+                "ERROR: resumed variants use incompatible sequence formats; "
+                "cotrain shares one data pipeline, so all variants must "
+                f"agree on prepend_outcome. Got: {resume_modes}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        resumed_prepend = next(iter(unique))
+        if resumed_prepend != config.prepend_outcome:
+            print(f"Resume: overriding prepend_outcome="
+                  f"{config.prepend_outcome} → {resumed_prepend} to match "
+                  f"resumed checkpoints.")
+            config.prepend_outcome = resumed_prepend
+            for slot in slots:
+                slot.train_cfg.prepend_outcome = resumed_prepend
+
     # Shared dataset and validation set — use the max_seq_len from the first variant
     # All variants must produce compatible sequence lengths for the shared DataLoader.
     # Use the maximum max_seq_len across all variants so shorter models can mask off.
