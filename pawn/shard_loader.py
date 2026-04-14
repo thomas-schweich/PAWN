@@ -132,27 +132,45 @@ def _hf_storage_options() -> dict[str, str]:
 
 def _process_shard_tokens(
     token_lists: list[list[int]],
+    game_lengths_col: list[int] | np.ndarray,
+    outcome_tokens_col: list[int] | np.ndarray,
     max_ply: int,
-    seq_len: int,
 ) -> dict[str, torch.Tensor | np.ndarray]:
-    """Convert a list of token sequences into training tensors.
+    """Convert parquet shard rows into outcome-prefixed training tensors.
 
-    Handles v2 format (outcome token prepended). Returns a dict with
-    input_ids, targets, loss_mask, move_ids, game_lengths for one shard.
+    Expects the pure-moves parquet layout written by the current
+    ``extract_lichess_parquet.py``: ``token_lists[i]`` contains only the
+    move tokens for game ``i``, and ``game_lengths_col[i]`` /
+    ``outcome_tokens_col[i]`` come directly from the parquet columns of
+    the same name.
+
+    Produces outcome-prefixed ``input_ids`` of shape ``(N, max_ply + 1)``
+    matching ``_prepare_v2_tokens`` / ``pack_clm_sequences`` — position 0
+    holds the outcome token from the parquet column and positions
+    ``1..game_length`` hold the move tokens. The Lichess training path
+    consumes this layout verbatim.
     """
     N = len(token_lists)
-    input_ids = torch.zeros(N, seq_len, dtype=torch.long)
-    game_lengths = np.zeros(N, dtype=np.int16)
+    seq_len = max_ply + 1
+    game_lengths = np.asarray(game_lengths_col, dtype=np.int16)
+    np.minimum(game_lengths, max_ply, out=game_lengths)  # cap in place
+    outcomes = np.asarray(outcome_tokens_col, dtype=np.int64)
     move_ids = np.zeros((N, max_ply), dtype=np.int16)
 
+    # Bulk numpy construction: outcome at [0], moves at [1..gl+1], PAD after.
+    ids_np = np.zeros((N, seq_len), dtype=np.int64)
+    ids_np[:, 0] = outcomes
     for i, toks in enumerate(token_lists):
-        n_moves = min(len(toks) - 1, max_ply)
-        game_lengths[i] = n_moves
-        length = min(len(toks), seq_len)
-        input_ids[i, :length] = torch.tensor(toks[:length], dtype=torch.long)
-        move_ids[i, :n_moves] = toks[1:n_moves + 1]
+        n_moves = int(game_lengths[i])
+        if n_moves > 0:
+            # `toks` may be longer than game_length if max_ply is smaller
+            # than the stored game; clamp to n_moves.
+            move_slice = toks[:n_moves]
+            ids_np[i, 1 : 1 + n_moves] = move_slice
+            move_ids[i, :n_moves] = move_slice
+    input_ids = torch.from_numpy(ids_np)
 
-    capped_lengths = torch.from_numpy(game_lengths).long().clamp(max=max_ply)
+    capped_lengths = torch.from_numpy(game_lengths).long()
     targets = torch.zeros(N, seq_len, dtype=torch.long)
     targets[:, :-1] = input_ids[:, 1:]
     positions = torch.arange(seq_len).unsqueeze(0)
@@ -342,7 +360,9 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
                 )
                 if filt is not None:
                     lf = lf.filter(filt)
-                df = lf.select(["tokens", "game_length"]).collect()
+                df = lf.select(
+                    ["tokens", "game_length", "outcome_token"],
+                ).collect()
             except Exception as e:
                 print(f"  Warning: failed to load shard {shard_file}: {e}")
                 continue
@@ -352,7 +372,10 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
 
             token_lists = df["tokens"].to_list()
             batch = _process_shard_tokens(
-                token_lists, self.max_ply, self.seq_len,
+                token_lists,
+                df["game_length"].to_list(),
+                df["outcome_token"].to_list(),
+                self.max_ply,
             )
 
             n = len(token_lists)
@@ -410,9 +433,10 @@ def load_val_shards(
         raise FileNotFoundError(f"No validation shards found in {hf_repo}")
 
     storage_opts = None if local else _hf_storage_options()
-    seq_len = max_ply + 1
 
     all_tokens: list[list[int]] = []
+    all_game_lengths: list[int] = []
+    all_outcome_tokens: list[int] = []
     for shard_file in shard_files:
         if len(all_tokens) >= max_games:
             break
@@ -439,11 +463,17 @@ def load_val_shards(
             lf = lf.filter(pl.all_horizontal(filters))
 
         remaining = max_games - len(all_tokens)
-        df = lf.select(["tokens", "game_length"]).head(remaining).collect()
+        df = lf.select(
+            ["tokens", "game_length", "outcome_token"],
+        ).head(remaining).collect()
         all_tokens.extend(df["tokens"].to_list())
+        all_game_lengths.extend(df["game_length"].to_list())
+        all_outcome_tokens.extend(df["outcome_token"].to_list())
 
     print(f"  Validation: {len(all_tokens):,} games from {len(shard_files)} shards")
 
-    result: dict = _process_shard_tokens(all_tokens, max_ply, seq_len)
+    result: dict = _process_shard_tokens(
+        all_tokens, all_game_lengths, all_outcome_tokens, max_ply,
+    )
     result["n_games"] = len(all_tokens)
     return result

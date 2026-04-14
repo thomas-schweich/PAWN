@@ -138,8 +138,14 @@ def open_hf_stream(year_month: str) -> Any:
     return fs.open(hf_path, "rb")
 
 
-def stream_pgn_games(fileobj: Any, batch_size: int) -> Iterator[tuple[str, int]]:
-    """Yield (pgn_text, game_count) batches from a zstd-compressed stream."""
+def stream_pgn_games(fileobj: Any, batch_size: int) -> Iterator[str]:
+    """Yield batched PGN text chunks from a zstd-compressed stream.
+
+    Each yielded chunk contains at most ``batch_size`` complete games.
+    The final chunk may contain fewer, and a trailing partial game
+    (stream truncated mid-movetext) is passed through for the Rust
+    parser to filter as a malformed game.
+    """
     import zstandard as zstd
 
     dctx = zstd.ZstdDecompressor()
@@ -159,7 +165,7 @@ def stream_pgn_games(fileobj: Any, batch_size: int) -> Iterator[tuple[str, int]]
                 in_movetext = False
                 buf.append(line)
                 if game_count >= batch_size:
-                    yield "".join(buf), game_count
+                    yield "".join(buf)
                     buf.clear()
                     game_count = 0
                 continue
@@ -173,7 +179,7 @@ def stream_pgn_games(fileobj: Any, batch_size: int) -> Iterator[tuple[str, int]]
         buf.append(line)
 
     if buf:
-        yield "".join(buf), game_count
+        yield "".join(buf)
 
 
 # ---------------------------------------------------------------------------
@@ -198,19 +204,6 @@ def batch_to_dataframe(parsed: dict[str, Any]) -> pl.DataFrame:
     san_rows: list[list[str]] = parsed["san"]
     uci_rows: list[list[str]] = parsed["uci"]
 
-    datetimes: list[datetime | None] = []
-    for dt_str in parsed["date_time"]:
-        parsed_dt: datetime | None = None
-        if dt_str and len(dt_str) >= 10:
-            try:
-                parsed_dt = datetime.strptime(dt_str, "%Y.%m.%d %H:%M:%S")
-            except ValueError:
-                try:
-                    parsed_dt = datetime.strptime(dt_str[:10], "%Y.%m.%d")
-                except ValueError:
-                    parsed_dt = None
-        datetimes.append(parsed_dt)
-
     df = pl.DataFrame({
         "tokens": pl.Series("tokens", token_rows, dtype=pl.List(pl.Int16)),
         "san": pl.Series("san", san_rows, dtype=pl.List(pl.Utf8)),
@@ -233,9 +226,23 @@ def batch_to_dataframe(parsed: dict[str, Any]) -> pl.DataFrame:
         "opening": pl.Series("opening", parsed["opening"], dtype=pl.Utf8),
         "time_control": pl.Series("time_control", parsed["time_control"], dtype=pl.Utf8),
         "termination": pl.Series("termination", parsed["termination"], dtype=pl.Utf8),
-        "date": pl.Series("date", datetimes, dtype=pl.Datetime("ms")),
+        "_date_str": pl.Series("_date_str", parsed["date_time"], dtype=pl.Utf8),
         "site": pl.Series("site", parsed["site"], dtype=pl.Utf8),
     })
+
+    # Vectorized datetime parsing via Polars. Lichess stamps look like
+    # "2025.01.10 10:00:00"; if the time component is missing, fall back
+    # to a date-only parse. Anything that fails both becomes null.
+    df = df.with_columns(
+        pl.coalesce(
+            pl.col("_date_str").str.strptime(
+                pl.Datetime("ms"), "%Y.%m.%d %H:%M:%S", strict=False,
+            ),
+            pl.col("_date_str").str.strptime(
+                pl.Datetime("ms"), "%Y.%m.%d", strict=False,
+            ),
+        ).alias("date"),
+    ).drop("_date_str")
 
     df = df.with_columns(
         pl.col("white_player").hash().alias("white_player"),
@@ -253,6 +260,13 @@ class StreamingShardUploader:
 
     Shard names include the source month so parallel/resumed runs never
     collide: `<split>-<YYYY-MM>-<NNNN>.parquet`.
+
+    Uploads run on a dedicated single-worker `ThreadPoolExecutor` so
+    parsing the next batch overlaps with the HF network round-trip for
+    the previous shard. The executor is capped at one in-flight upload
+    per uploader, which keeps RAM bounded (worst case: one shard in the
+    uploader's buffer + one shard in flight). `finalize()` blocks on any
+    pending uploads and re-raises their exceptions in the caller.
     """
 
     def __init__(
@@ -279,6 +293,10 @@ class StreamingShardUploader:
         self.total_games = 0
         self.shard_idx = 0
         self.uploaded: list[str] = []
+        self._upload_pool = cf.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"upload-{split}-{month_tag}",
+        )
+        self._in_flight: cf.Future[None] | None = None
         scratch_dir.mkdir(parents=True, exist_ok=True)
 
     def add(self, df: pl.DataFrame) -> None:
@@ -307,6 +325,12 @@ class StreamingShardUploader:
                 self._flush(combined)
         self.frames = []
         self.buffered = 0
+        # Wait for any in-flight upload so its exception (if any) propagates
+        # and so a crash after finalize() can't leak a background thread.
+        if self._in_flight is not None:
+            self._in_flight.result()
+            self._in_flight = None
+        self._upload_pool.shutdown(wait=True)
 
     def _flush(self, df: pl.DataFrame) -> None:
         name = f"{self.split}-{self.month_tag}-{self.shard_idx:04d}.parquet"
@@ -315,10 +339,26 @@ class StreamingShardUploader:
         size_mb = local.stat().st_size / 1024 / 1024
         log(
             f"[{self.split}] shard {self.shard_idx}: {len(df):,} games, "
-            f"{size_mb:.1f} MB — uploading",
+            f"{size_mb:.1f} MB — queued for upload",
             self.log_prefix,
         )
 
+        # Before queueing the next upload, wait for the previous one so we
+        # never have more than one shard in flight per uploader (bounds RAM
+        # and keeps shard ordering stable).
+        if self._in_flight is not None:
+            self._in_flight.result()
+
+        shard_idx = self.shard_idx
+        self._in_flight = self._upload_pool.submit(
+            self._upload_and_unlink, local, name, size_mb, shard_idx,
+        )
+        self.uploaded.append(name)
+        self.shard_idx += 1
+
+    def _upload_and_unlink(
+        self, local: Path, name: str, size_mb: float, shard_idx: int,
+    ) -> None:
         t0 = time.monotonic()
         self.api.upload_file(
             path_or_fileobj=str(local),
@@ -331,14 +371,11 @@ class StreamingShardUploader:
         dt = time.monotonic() - t0
         rate = size_mb / dt if dt > 0 else 0.0
         log(
-            f"[{self.split}] shard {self.shard_idx} uploaded in {dt:.1f}s "
+            f"[{self.split}] shard {shard_idx} uploaded in {dt:.1f}s "
             f"({rate:.1f} MB/s)",
             self.log_prefix,
         )
-
         local.unlink(missing_ok=True)
-        self.uploaded.append(name)
-        self.shard_idx += 1
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +392,7 @@ def process_train_month(
 
     total = 0
     with open_hf_stream(year_month) as stream:
-        for pgn_text, _ in stream_pgn_games(stream, cfg.batch_size):
+        for pgn_text in stream_pgn_games(stream, cfg.batch_size):
             if not pgn_text.strip():
                 continue
 
@@ -394,6 +431,16 @@ def process_holdout_month(
     cfg: RunConfig,
     log_prefix: str,
 ) -> tuple[int, int]:
+    """Parse a month and route games into val/test buckets by date.
+
+    This relies on Lichess's monthly dumps being sorted chronologically
+    by UTCDate/UTCTime — the early-exit below breaks out of the stream
+    once the batch's max date passes ``test_end``. If you point this at
+    a non-Lichess source that isn't date-sorted, either the early-exit
+    must be removed or the stream must be sorted first, otherwise the
+    val/test splits will be truncated. ``val_days`` must also precede
+    ``test_days`` for the early-exit to cover both splits correctly.
+    """
     log("Streaming from HuggingFace", log_prefix)
 
     year, mon = year_month.split("-")
@@ -401,9 +448,14 @@ def process_holdout_month(
     val_end = datetime(int(year), int(mon), cfg.val_days[1] + 1)
     test_start = datetime(int(year), int(mon), cfg.test_days[0])
     test_end = datetime(int(year), int(mon), cfg.test_days[1] + 1)
+    if val_end > test_start:
+        raise ValueError(
+            f"val_days {cfg.val_days} must end before test_days {cfg.test_days} "
+            "(process_holdout_month's early-exit assumes chronological order).",
+        )
 
     with open_hf_stream(year_month) as stream:
-        for pgn_text, _ in stream_pgn_games(stream, cfg.batch_size):
+        for pgn_text in stream_pgn_games(stream, cfg.batch_size):
             if not pgn_text.strip():
                 continue
 

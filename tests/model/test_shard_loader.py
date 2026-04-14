@@ -88,13 +88,19 @@ class TestHfStorageOptions:
 
 
 class TestProcessShardTokens:
+    """The loader consumes the pure-moves parquet layout written by
+    extract_lichess_parquet.py: tokens are moves only, and the outcome
+    token + game length come from their own columns. The loader emits
+    outcome-prefixed tensors to match what the trainer expects."""
+
     @pytest.mark.unit
     def test_basic_shapes(self):
-        token_lists = [
-            [WHITE_CHECKMATES, 10, 20, 30],  # outcome + 3 moves
-            [WHITE_CHECKMATES + 1, 11, 22],  # outcome + 2 moves
-        ]
-        out = _process_shard_tokens(token_lists, max_ply=8, seq_len=9)
+        token_lists = [[10, 20, 30], [11, 22]]
+        game_lengths = [3, 2]
+        outcome_tokens = [WHITE_CHECKMATES, WHITE_CHECKMATES + 1]
+        out = _process_shard_tokens(
+            token_lists, game_lengths, outcome_tokens, max_ply=8,
+        )
         assert out["input_ids"].shape == (2, 9)
         assert out["targets"].shape == (2, 9)
         assert out["loss_mask"].shape == (2, 9)
@@ -102,9 +108,10 @@ class TestProcessShardTokens:
         assert out["game_lengths"].shape == (2,)
 
     @pytest.mark.unit
-    def test_outcome_at_position_zero(self):
-        token_lists = [[WHITE_CHECKMATES, 10, 20]]
-        out = _process_shard_tokens(token_lists, max_ply=8, seq_len=9)
+    def test_outcome_prepended_at_position_zero(self):
+        out = _process_shard_tokens(
+            [[10, 20]], [2], [WHITE_CHECKMATES], max_ply=8,
+        )
         assert out["input_ids"][0, 0].item() == WHITE_CHECKMATES
         assert out["input_ids"][0, 1].item() == 10
         assert out["input_ids"][0, 2].item() == 20
@@ -112,27 +119,31 @@ class TestProcessShardTokens:
 
     @pytest.mark.unit
     def test_targets_shift_left(self):
-        token_lists = [[WHITE_CHECKMATES, 10, 20, 30]]
-        out = _process_shard_tokens(token_lists, max_ply=8, seq_len=9)
+        out = _process_shard_tokens(
+            [[10, 20, 30]], [3], [WHITE_CHECKMATES], max_ply=8,
+        )
         T = out["targets"].shape[1]
         for t in range(T - 1):
             assert out["targets"][0, t] == out["input_ids"][0, t + 1]
         assert out["targets"][0, T - 1] == 0
 
     @pytest.mark.unit
-    def test_game_lengths_correct(self):
-        token_lists = [
-            [WHITE_CHECKMATES, 10, 20, 30],  # 3 moves
-            [WHITE_CHECKMATES, 1, 2, 3, 4, 5],  # 5 moves
-        ]
-        out = _process_shard_tokens(token_lists, max_ply=8, seq_len=9)
+    def test_game_lengths_from_column(self):
+        """game_length comes from the parquet column, not len(tokens)."""
+        out = _process_shard_tokens(
+            [[10, 20, 30], [1, 2, 3, 4, 5]],
+            [3, 5],
+            [WHITE_CHECKMATES, WHITE_CHECKMATES],
+            max_ply=8,
+        )
         assert out["game_lengths"][0] == 3
         assert out["game_lengths"][1] == 5
 
     @pytest.mark.unit
     def test_move_ids_excludes_outcome(self):
-        token_lists = [[WHITE_CHECKMATES, 10, 20, 30]]
-        out = _process_shard_tokens(token_lists, max_ply=8, seq_len=9)
+        out = _process_shard_tokens(
+            [[10, 20, 30]], [3], [WHITE_CHECKMATES], max_ply=8,
+        )
         # move_ids[0] should start with [10, 20, 30, 0, 0, ...]
         assert out["move_ids"][0, 0] == 10
         assert out["move_ids"][0, 1] == 20
@@ -141,21 +152,24 @@ class TestProcessShardTokens:
 
     @pytest.mark.unit
     def test_loss_mask_boundary(self):
-        token_lists = [[WHITE_CHECKMATES, 10, 20, 30]]  # 3 moves → game_length=3
-        out = _process_shard_tokens(token_lists, max_ply=8, seq_len=9)
-        # loss_mask: positions 0..3 True (outcome + 3 moves)
+        out = _process_shard_tokens(
+            [[10, 20, 30]], [3], [WHITE_CHECKMATES], max_ply=8,
+        )
+        # loss_mask: positions 0..3 True (outcome slot + 3 move slots)
         assert out["loss_mask"][0, :4].all()
         assert not out["loss_mask"][0, 4:].any()
 
     @pytest.mark.unit
     def test_max_ply_clipping(self):
-        """Tokens beyond max_ply are clipped."""
-        # 10 moves, but max_ply=4
-        toks = [WHITE_CHECKMATES] + [i + 1 for i in range(10)]
-        out = _process_shard_tokens([toks], max_ply=4, seq_len=5)
-        # n_moves = min(10, 4) = 4
+        """Games longer than max_ply get capped to max_ply moves."""
+        toks = [i + 1 for i in range(10)]  # 10 moves
+        out = _process_shard_tokens(
+            [toks], [10], [WHITE_CHECKMATES], max_ply=4,
+        )
+        # capped to max_ply = 4
         assert out["game_lengths"][0] == 4
-        # input_ids has seq_len=5 slots: [outcome, m1, m2, m3, m4]
+        # seq_len = max_ply + 1 = 5: [outcome, m1, m2, m3, m4]
+        assert out["input_ids"].shape == (1, 5)
         assert out["input_ids"][0, 0].item() == WHITE_CHECKMATES
         assert out["input_ids"][0, 1].item() == 1
         assert out["input_ids"][0, 4].item() == 4
@@ -205,15 +219,18 @@ class TestListShards:
 
 def _write_test_shard(path: Path, n_games: int, game_length: int = 10,
                      white_elo: int = 1800, black_elo: int = 1800) -> None:
-    """Create a test parquet shard with v2-format tokens (outcome + moves)."""
-    token_lists = []
-    for i in range(n_games):
-        # outcome + game_length moves
-        tokens = [WHITE_CHECKMATES + (i % 2)] + [1 + ((i + j) % 100) for j in range(game_length)]
-        token_lists.append(tokens)
+    """Create a test parquet shard in the pure-moves layout the current
+    extract_lichess_parquet.py emits: `tokens` is moves only and the
+    outcome is in its own column."""
+    token_lists = [
+        [1 + ((i + j) % 100) for j in range(game_length)]
+        for i in range(n_games)
+    ]
+    outcome_tokens = [WHITE_CHECKMATES + (i % 2) for i in range(n_games)]
     df = pl.DataFrame({
         "tokens": token_lists,
         "game_length": [game_length] * n_games,
+        "outcome_token": outcome_tokens,
         "white_elo": [white_elo] * n_games,
         "black_elo": [black_elo] * n_games,
         "result": ["1-0"] * n_games,

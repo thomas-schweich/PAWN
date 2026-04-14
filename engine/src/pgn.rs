@@ -157,8 +157,9 @@ pub fn parse_pgn_lichess(
             let tokens = result.tokens;
 
             // SAN strings are what the PGN actually wrote (e.g. "Nbd2"),
-            // trimmed to the number of moves that tokenized successfully.
-            let san_moves: Vec<String> = san_moves.into_iter().take(result.n_tokenized).collect();
+            // trimmed in-place to the number of moves that tokenized successfully.
+            let mut san_moves = san_moves;
+            san_moves.truncate(result.n_tokenized);
 
             // UCI strings are derived from tokens via O(1) vocab lookup
             // (no second board replay). Unwrap is safe because every token
