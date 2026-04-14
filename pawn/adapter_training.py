@@ -21,7 +21,7 @@ import gc
 import math
 import signal
 import time
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import torch
@@ -103,7 +103,7 @@ def sparse_forward(
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
-    dataloader: DataLoader[Any],
+    dataloader: Iterable[dict[str, Any]],
     mask_builder: LegalMaskBuilder,
     device: str,
     amp_dtype: torch.dtype | None = None,

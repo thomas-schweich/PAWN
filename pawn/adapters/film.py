@@ -11,7 +11,7 @@ and on the output logits:
     logits_adapted = γ_out ⊙ logits + β_out  (output)
 
 Identity-initialized (γ=1, β=0) so the wrapped model starts identical to
-the frozen backbone. Total trainable params: 8×2×512 + 2×4278 = 16,748.
+the frozen backbone.
 """
 
 import torch
@@ -22,6 +22,9 @@ from pawn.model import PAWNCLM
 
 class FiLMLayer(nn.Module):
     """Feature-wise Linear Modulation: y = γ * x + β."""
+
+    gamma: nn.Parameter
+    beta: nn.Parameter
 
     def __init__(self, dim: int):
         super().__init__()

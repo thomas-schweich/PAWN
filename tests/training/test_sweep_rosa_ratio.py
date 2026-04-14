@@ -9,7 +9,7 @@ from pawn.sweep import (
     _BASE_BOTTLENECK_PARAMS_PER_DIM,
     _BASE_SPARSE_MASKABLE_PARAMS,
     SUGGEST_FNS,
-    ADAPTER_SCRIPTS,
+    TRAIN_SCRIPT,
 )
 
 
@@ -23,9 +23,9 @@ def _make_fixed_trial(params: dict) -> optuna.trial.FixedTrial:
 # ---------------------------------------------------------------------------
 
 _REQUIRED_KEYS = {
-    "mode", "density", "bottleneck_dim", "lr", "batch_size",
+    "rosa_mode", "density", "bottleneck_dim", "lr", "batch_size",
     "weight_decay", "warmup_frac", "patience",
-    "lora_rank", "lora_targets", "warmup_steps",
+    "lora_rank", "lora_targets", "rosa_warmup_steps",
     "mask_samples", "grad_alpha",
 }
 
@@ -37,7 +37,7 @@ def test_suggest_keys():
         "bottleneck_ratio": 0.5,
         "lr": 1e-3,
         "batch_size": 64,
-        "warmup_steps": 64,
+        "rosa_warmup_steps": 64,
     })
     params = suggest_rosa_ratio(trial)
     assert _REQUIRED_KEYS.issubset(params.keys()), (
@@ -51,10 +51,10 @@ def test_mode_is_retro_bottleneck():
         "bottleneck_ratio": 0.5,
         "lr": 1e-3,
         "batch_size": 64,
-        "warmup_steps": 64,
+        "rosa_warmup_steps": 64,
     })
     params = suggest_rosa_ratio(trial)
-    assert params["mode"] == "retro-bottleneck"
+    assert params["rosa_mode"] == "retro-bottleneck"
 
 
 def test_fixed_targets():
@@ -63,7 +63,7 @@ def test_fixed_targets():
         "bottleneck_ratio": 0.5,
         "lr": 1e-3,
         "batch_size": 64,
-        "warmup_steps": 64,
+        "rosa_warmup_steps": 64,
     })
     params = suggest_rosa_ratio(trial)
     assert params["lora_targets"] == "qkvo"
@@ -76,7 +76,7 @@ def test_budget_derivation_half_split():
         "bottleneck_ratio": 0.5,
         "lr": 1e-3,
         "batch_size": 64,
-        "warmup_steps": 64,
+        "rosa_warmup_steps": 64,
     })
     params = suggest_rosa_ratio(trial)
 
@@ -94,7 +94,7 @@ def test_budget_derivation_500k():
         "bottleneck_ratio": 0.3,
         "lr": 1e-3,
         "batch_size": 64,
-        "warmup_steps": 64,
+        "rosa_warmup_steps": 64,
     })
     params = suggest_rosa_ratio(trial)
 
@@ -112,7 +112,7 @@ def test_edge_low_ratio_clamps_bottleneck_dim():
         "bottleneck_ratio": 0.05,
         "lr": 1e-3,
         "batch_size": 64,
-        "warmup_steps": 64,
+        "rosa_warmup_steps": 64,
     })
     params = suggest_rosa_ratio(trial)
     # 5K / 16384 = 0.305 -> round to 0 -> clamp to 1
@@ -127,7 +127,7 @@ def test_edge_high_ratio_positive_density():
         "bottleneck_ratio": 0.95,
         "lr": 1e-3,
         "batch_size": 64,
-        "warmup_steps": 64,
+        "rosa_warmup_steps": 64,
     })
     params = suggest_rosa_ratio(trial)
     assert params["density"] > 0
@@ -141,7 +141,7 @@ def test_user_attrs_logged():
         "bottleneck_ratio": 0.5,
         "lr": 1e-3,
         "batch_size": 64,
-        "warmup_steps": 64,
+        "rosa_warmup_steps": 64,
     })
     suggest_rosa_ratio(trial)
 
@@ -160,6 +160,6 @@ def test_registered_in_suggest_fns():
     assert SUGGEST_FNS["rosa-ratio"] is suggest_rosa_ratio
 
 
-def test_registered_in_adapter_scripts():
-    assert "rosa-ratio" in ADAPTER_SCRIPTS
-    assert ADAPTER_SCRIPTS["rosa-ratio"] == "scripts/legacy/train_rosa.py"
+def test_train_script_is_unified_entry_point():
+    """Every sweep runs through scripts/train.py post-legacy removal."""
+    assert TRAIN_SCRIPT == "scripts/train.py"

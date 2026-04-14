@@ -12,9 +12,9 @@ and optionally per-ply accuracy.
 
 Usage:
     uv run python scripts/eval_accuracy.py \
-        --checkpoint /path/to/checkpoint.pt \
-        --adapter-checkpoint lora_runs/best.pt \
-        --pgn /path/to/lichess_1200_1400.pgn \
+        --checkpoint thomas-schweich/pawn-base \
+        --adapter-checkpoint logs/run_*/checkpoints/best \
+        --pgn thomas-schweich/pawn-lichess-full \
         --min-eval-ply 10
 """
 
@@ -66,11 +66,7 @@ def parse_args():
 
 
 def _detect_adapter_type(config: dict) -> str:
-    """Auto-detect adapter type from config dict.
-
-    The config dict comes from load_adapter_checkpoint()["config"], which
-    contains training args for both legacy .pt files and new-format directories.
-    """
+    """Auto-detect adapter type from config dict."""
     if "checkpoint_type" in config:
         return config["checkpoint_type"]
     if "bottleneck_dim" in config:
@@ -81,7 +77,7 @@ def _detect_adapter_type(config: dict) -> str:
         return "lora"
     if "density" in config:
         return "sparse"
-    if "no_output_film" in config:
+    if "use_output_film" in config:
         return "film"
 
     raise ValueError("Cannot detect adapter type from config keys: "
@@ -122,7 +118,7 @@ def load_model(checkpoint_path: str, adapter_path: str, device: str):
 
     elif adapter_type == "film":
         from pawn.adapters.film import FiLMCLM
-        has_output = not adapter_config.get("no_output_film", False)
+        has_output = adapter_config.get("use_output_film", False)
         if any(k.startswith("output_film.") for k in adapter_weights):
             has_output = True
         model = FiLMCLM(backbone, use_output_film=has_output).to(device)
@@ -140,7 +136,7 @@ def load_model(checkpoint_path: str, adapter_path: str, device: str):
             adapt_ffn=adapter_config.get("lora_ffn", False),
             lora_layers=tuple(int(x) for x in lora_layers.split(",")) if lora_layers else None,
             use_film=adapter_config.get("use_film", True),
-            use_output_film=adapter_config.get("output_film", False),
+            use_output_film=adapter_config.get("use_output_film", False),
             film_layers=tuple(int(x) for x in film_layers.split(",")) if film_layers else None,
         ).to(device)
         model.load_adapter_state_dict(adapter_weights)
@@ -204,9 +200,9 @@ def evaluate_maia(
     total_top5 = 0.0
     total_positions = 0
 
-    # Per-ply stats (optional)
-    ply_top1 = {} if per_ply else None
-    ply_count = {} if per_ply else None
+    # Per-ply stats (only populated when per_ply=True)
+    ply_top1: dict[int, float] = {}
+    ply_count: dict[int, int] = {}
 
     for batch in dataloader:
         ids = batch["input_ids"].to(device)

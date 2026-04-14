@@ -1,16 +1,30 @@
 """Tests for enriched PGN parsing and dataset extraction pipeline."""
 
+import importlib.util
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 import pytest
-import sys
-from pathlib import Path
 
 import chess_engine
 
-# Import extraction helpers
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from extract_lichess_parquet import batch_to_dataframe
+
+def _load_extract_module():
+    """Load scripts/extract_lichess_parquet.py as a standalone module.
+
+    The scripts/ directory isn't a package, so we use importlib.util to
+    load the file directly by path.
+    """
+    path = Path(__file__).resolve().parent.parent / "scripts" / "extract_lichess_parquet.py"
+    spec = importlib.util.spec_from_file_location("extract_lichess_parquet", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+batch_to_dataframe = _load_extract_module().batch_to_dataframe
 
 # batch_to_dataframe expects parse_pgn_lichess output; use this for tests
 def parse_and_build_df(pgn: str):

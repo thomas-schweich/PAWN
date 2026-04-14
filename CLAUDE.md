@@ -55,7 +55,7 @@ The only extras are GPU backends (`rocm` or `cu128`). Everything else (pytest, s
 - Uses rayon for parallel game generation (~43K games/sec, 150M+/hr)
 - PyO3 bindings expose `chess_engine` module to Python
 - Key functions: `generate_random_games()`, `parse_pgn_file()`, `compute_legal_token_masks_sparse()`, `extract_board_states()`, `export_move_vocabulary()`, `compute_accuracy_ceiling()`
-- `export_move_vocabulary()` returns 1,968-entry maps (searchless_chess compatible). Conversion functions `pawn_to_searchless()` and `searchless_to_pawn()` bridge between legacy PAWN token IDs and searchless_chess action indices.
+- `export_move_vocabulary()` returns the 1,968-entry searchless_chess action table used by the factored embeddings.
 
 ## Model
 
@@ -111,24 +111,26 @@ uv run python scripts/train.py --variant base --resume checkpoints/step_00050000
 
 ### Adapter Training
 
-All adapter scripts require `--checkpoint PATH` (pretrained weights) and `--pgn PATH` (Lichess PGN file). They freeze the backbone and train only adapter parameters.
+All adapter strategies dispatch through the unified `scripts/train.py` with `--run-type adapter --strategy STRATEGY`. They freeze the backbone and train only adapter parameters. Both `--checkpoint PATH` and `--pgn PATH` are required.
 
 ```bash
 # Example: train a LoRA adapter on Lichess 1800-1900 games
-uv run python scripts/train_lora.py \
+uv run python scripts/train.py --run-type adapter --strategy lora \
     --checkpoint thomas-schweich/pawn-base \
     --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
     --lora-rank 4 --lr 3e-4 --local-checkpoints
 ```
 
-| Script | Adapter | Key args | Typical params |
-|--------|---------|----------|----------------|
-| `train_bottleneck.py` | Houlsby MLP | `--bottleneck-dim 8` | ~131K |
-| `train_lora.py` | Low-rank attention | `--lora-rank 4 --lora-targets qkvo` | ~65K |
-| `train_film.py` | Channel-wise affine | `--no-output-film` | ~17K |
-| `train_sparse.py` | Binary mask | `--density 0.01 --sparse-targets qkvo` | ~503K-2.7M |
-| `train_hybrid.py` | LoRA + FiLM | `--lora-rank 4 --film-lr 1e-3` | ~65K |
-| `train_tiny.py` | None (from scratch) | `--d-model 84 --n-layers 2` | ~524K |
+| `--strategy` value  | Adapter | Key args | Typical params |
+|---------------------|---------|----------|----------------|
+| `bottleneck`        | Houlsby MLP | `--bottleneck-dim 8` | ~131K |
+| `lora`              | Low-rank attention | `--lora-rank 4 --lora-targets qkvo` | ~65K |
+| `film`              | Channel-wise affine | `--no-output-film` | ~17K |
+| `sparse`            | Binary mask | `--density 0.01 --sparse-targets qkvo` | ~503K-2.7M |
+| `hybrid`            | LoRA + FiLM | `--lora-rank 4` | ~65K |
+| `rosa`              | Gradient-informed sparse + LoRA (3-phase) | `--rosa-mode rosa` | varies |
+| `specialized_clm`   | From-scratch standalone transformer (no backbone) | `--d-model 84 --n-layers 2` | ~524K |
+| `unfreeze`          | Fine-tune top N backbone layers | `--unfreeze-layers 6,7` | varies |
 
 Common adapter args: `--epochs 50`, `--batch-size 64`, `--lr 3e-4`, `--patience 10`, `--val-every 1`, `--max-games 12000`, `--min-ply 10`
 
@@ -200,7 +202,6 @@ step_00065000/
 ```
 
 Central module: `pawn/checkpoint.py`. All save/load goes through this module.
-Legacy `.pt` files are still loadable (backward compatible).
 
 ### Checkpoint Storage Modes
 

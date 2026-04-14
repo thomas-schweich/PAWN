@@ -6,51 +6,50 @@ This document describes the model architecture in detail.
 
 ## Input Format
 
-Each training example is a fixed-length sequence of 256 tokens:
+Each training example is a fixed-length sequence of 512 tokens:
 
 ```
-[outcome, move_1, move_2, ..., move_N, PAD, PAD, ..., PAD]
- pos 0    pos 1   pos 2        pos N   pos N+1         pos 255
+[move_1, move_2, ..., move_N, PAD, PAD, ..., PAD]
+ pos 0   pos 1        pos N-1 pos N           pos 511
 ```
 
-Position 0 holds an **outcome token** that tells the model how the game ends. The remaining 255 positions hold the game's moves in order, right-padded with PAD tokens. This outcome-first format gives the model access to the game result at every position via the causal attention mask, which is useful for downstream tasks that condition on game outcome.
+Sequences are pure moves by default. Position 0 holds the first ply; the rest are the game's moves in order, right-padded with PAD tokens. The model is trained with standard next-token prediction: given positions 0 through t, predict the token at position t+1.
 
-The model is trained with standard next-token prediction: given positions 0 through t, predict the token at position t+1.
+An optional outcome-conditioning mode — enabled via the `prepend_outcome` training config — prepends a single outcome token at position 0 and shifts all moves right by one. This is useful for downstream tasks that condition on game outcome, at the cost of one ply of context.
 
 ## Token Vocabulary
 
-The vocabulary contains 4278 tokens:
+The vocabulary contains 1,980 tokens, borrowed from Google DeepMind's [searchless_chess](https://github.com/google-deepmind/searchless_chess) project:
 
 | Range | Count | Description |
 |-------|-------|-------------|
-| 0 | 1 | PAD token |
-| 1--4096 | 4096 | Grid moves (64 source squares x 64 destination squares) |
-| 4097--4272 | 176 | Promotion moves (44 promotion src/dst pairs x 4 piece types) |
-| 4273--4283 | 11 | Outcome tokens |
+| 0--1967 | 1,968 | Move actions (one entry per legally-reachable (src, dst[, promotion]) tuple) |
+| 1968 | 1 | PAD token |
+| 1969--1979 | 11 | Outcome tokens |
 
 The outcome tokens are:
 
 | Token ID | Meaning | Source |
 |----------|---------|--------|
-| 4273 | White delivers checkmate | Pretraining + Lichess |
-| 4274 | Black delivers checkmate | Pretraining + Lichess |
-| 4275 | Stalemate | Pretraining + Lichess |
-| 4276 | Draw by rule (75-move, fivefold rep, insufficient material) | Pretraining + Lichess |
-| 4277 | Ply limit reached (255 plies) | Pretraining + Lichess (truncated) |
-| 4278 | White wins by resignation | Lichess only |
-| 4279 | Black wins by resignation | Lichess only |
-| 4280 | Draw by agreement | Lichess only |
-| 4281 | White wins on time | Lichess only |
-| 4282 | Black wins on time | Lichess only |
-| 4283 | Draw on time (insufficient material) | Lichess only |
+| 1969 | White delivers checkmate | Pretraining + Lichess |
+| 1970 | Black delivers checkmate | Pretraining + Lichess |
+| 1971 | Stalemate | Pretraining + Lichess |
+| 1972 | Draw by rule (75-move, fivefold rep, insufficient material) | Pretraining + Lichess |
+| 1973 | Ply limit reached | Pretraining + Lichess (truncated) |
+| 1974 | White wins by resignation | Lichess only |
+| 1975 | Black wins by resignation | Lichess only |
+| 1976 | Draw by agreement | Lichess only |
+| 1977 | White wins on time | Lichess only |
+| 1978 | Black wins on time | Lichess only |
+| 1979 | Draw on time (insufficient material) | Lichess only |
 
-Tokens 4273-4277 are used during pretraining on random games. Tokens 4278-4283 appear only in Lichess finetuning data. The pretrained model has no trained embeddings for tokens 4278-4283; these are initialized during adapter training.
+Tokens 1969-1973 are used during pretraining on random games. Tokens 1974-1979 appear only in Lichess finetuning data. The pretrained model has no trained embeddings for tokens 1974-1979; these are initialized during adapter training.
 
 Move tokenization is handled entirely by the Rust chess engine, which maps UCI move strings (e.g., `e2e4`, `a7a8q`) to token indices.
 
 ## Factored Input Embeddings
 
-Instead of a single embedding table of size 4278, PAWN uses **factored embeddings** that decompose each move token into its structural components. This exploits the fact that chess moves have compositional structure: a source square, a destination square, and an optional promotion piece.
+Instead of a single embedding table of size 1,980, PAWN uses **factored embeddings** that decompose each move token into its structural components. This exploits the fact that chess moves have compositional structure: a source square, a destination square, and an optional promotion piece.
 
 For each move token, a static decomposition table maps it to a (source, destination, promotion) triple. The embedding is computed as:
 
@@ -64,7 +63,7 @@ The embedding tables are:
 - `dst_embed`: 64 entries (one per square), each of dimension d_model
 - `promo_embed`: 5 entries (none, queen, rook, bishop, knight), each of dimension d_model
 
-This reduces the embedding parameter count from 4284 x d_model to 133 x d_model -- a roughly 32x reduction. It also provides structural inductive bias: moves that share a source or destination square share embedding components.
+This reduces the embedding parameter count from 1,980 x d_model to 133 x d_model -- a roughly 15x reduction. It also provides structural inductive bias: moves that share a source or destination square share embedding components.
 
 PAD and outcome tokens are not decomposed. PAD uses a standalone learned parameter vector. The 11 outcome tokens use a separate small embedding table.
 
@@ -93,7 +92,7 @@ FFN(x) = W_down(SiLU(W_gate(x)) * W_up(x))
 
 This uses three weight matrices per block instead of the standard two, with no bias terms. The intermediate dimension d_ff is 4x the model dimension.
 
-**Output head.** A single linear projection from d_model to vocab_size (4278), producing logits over the full token vocabulary. No weight tying with the input embeddings.
+**Output head.** A single linear projection from d_model to vocab_size (1,980), producing logits over the full token vocabulary. No weight tying with the input embeddings.
 
 **Weight initialization.** All parameters with more than one dimension are initialized from N(0, 0.02).
 
@@ -105,7 +104,7 @@ This uses three weight matrices per block instead of the standard two, with no b
 | Base    | 512     | 8      | 8     | 64       | 2048 | ~35.8M     |
 | Large   | 640     | 10     | 8     | 80       | 2560 | ~68.4M     |
 
-All variants use the same vocabulary, sequence length (256), and architectural choices. They differ only in width, depth, and head count. A `toy` variant (d=64, 2 layers, 4 heads) exists for testing.
+All variants use the same vocabulary, sequence length (512), and architectural choices. They differ only in width, depth, and head count. A `toy` variant (d=64, 2 layers, 4 heads) exists for testing.
 
 ## Forward Pass Variants
 
@@ -113,7 +112,7 @@ The model provides three forward pass modes:
 
 **`forward()`** -- Standard inference. Processes a full sequence and returns logits at every position along with intermediate hidden states from each layer. The hidden states are useful for linear probing experiments.
 
-**`forward_train()`** -- Memory-optimized training. Runs the transformer backbone identically, but projects only non-padding positions through the output head. This avoids materializing the full (B, T, 4278) logit tensor, saving roughly 25% memory during training.
+**`forward_train()`** -- Memory-optimized training. Runs the transformer backbone identically, but projects only non-padding positions through the output head. This avoids materializing the full (B, T, 1980) logit tensor, saving memory during training.
 
 **`forward_generate()`** -- Autoregressive generation with KV-cache. On the first call (prefill), processes the full input sequence and builds the key-value cache. On subsequent calls (decode), processes a single new token and extends the cache. Returns logits only for the last position.
 

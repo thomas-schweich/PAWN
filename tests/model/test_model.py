@@ -391,7 +391,9 @@ class TestCLMEmbedding:
         # Pick a non-promo move: token 1 (first move in vocab)
         token_id = 1
         decomp = emb.decomp_table[token_id]
-        s, d, p = decomp[0].item(), decomp[1].item(), decomp[2].item()
+        s = int(decomp[0].item())
+        d = int(decomp[1].item())
+        p = int(decomp[2].item())
 
         input_ids = torch.tensor([[token_id]])
         out = emb(input_ids)[0, 0]

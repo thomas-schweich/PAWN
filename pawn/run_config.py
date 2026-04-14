@@ -11,11 +11,18 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class BaseRunConfig(BaseModel):
     """Fields shared by pretraining and adapter runs."""
+
+    # Fail fast when callers pass stale CLI/JSON fields (e.g. the old
+    # ``legacy_vocab`` flag, or misspelled/removed hybrid args). Pydantic
+    # defaults to silently ignoring unknown fields, which makes it easy
+    # to burn a whole training run on a config that doesn't mean what
+    # the user thinks it means.
+    model_config = ConfigDict(extra="forbid")
 
     # Data ----------------------------------------------------------------
     elo_min: int | None = None
@@ -91,7 +98,6 @@ class PretrainConfig(BaseRunConfig):
     max_seq_len: int = 512
     legality_late_ply: int | None = None  # defaults to max_seq_len // 2 at runtime
     val_games: int = 512  # override BaseRunConfig's 50K — pretrain uses on-the-fly data
-    legacy_vocab: bool = False  # use old 4284-token PAWN vocab (for reproducing old experiments)
 
     @model_validator(mode="after")
     def _check_custom_arch(self) -> "PretrainConfig":
@@ -197,7 +203,6 @@ class CotrainVariant(BaseModel):
     n_heads: int | None = None
     d_ff: int | None = None
     max_seq_len: int = 512
-    legacy_vocab: bool = False
     resume: str | None = None
 
     @model_validator(mode="after")

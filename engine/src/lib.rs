@@ -1544,27 +1544,10 @@ fn compute_accuracy_ceiling_py(
     Ok(dict.into())
 }
 
-/// Convert a legacy PAWN token (1-4272) to a searchless action (0-1967).
-/// Returns -1 for impossible moves, legacy PAD (0), or out-of-range tokens.
-#[pyfunction]
-fn pawn_to_searchless(pawn_token: u16) -> i16 {
-    vocab::pawn_to_searchless(pawn_token)
-        .map(|a| a as i16)
-        .unwrap_or(-1)
-}
-
-/// Convert a searchless action (0-1967) to a legacy PAWN token (1-4272).
-#[pyfunction]
-fn searchless_to_pawn(action: u16) -> u16 {
-    vocab::searchless_to_pawn(action)
-}
-
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hello, m)?)?;
     m.add_function(wrap_pyfunction!(export_move_vocabulary, m)?)?;
-    m.add_function(wrap_pyfunction!(pawn_to_searchless, m)?)?;
-    m.add_function(wrap_pyfunction!(searchless_to_pawn, m)?)?;
     m.add_function(wrap_pyfunction!(generate_training_batch, m)?)?;
     m.add_function(wrap_pyfunction!(generate_random_games, m)?)?;
     m.add_function(wrap_pyfunction!(generate_clm_batch, m)?)?;

@@ -36,7 +36,7 @@ def _write_checkpoint(
     what ``save_pretrain_checkpoint`` writes.
 
     When ``prepend_outcome`` is None, the field is omitted — exercises the
-    legacy-fallback branch of ``infer_prepend_outcome``.
+    fail-closed branch of ``get_prepend_outcome``.
     """
     path.mkdir(parents=True, exist_ok=True)
     training: dict[str, Any] = {}
@@ -103,20 +103,6 @@ class TestResolveCotrainResumePrependOutcome:
         out = capsys.readouterr().out
         assert "overriding prepend_outcome" in out
 
-    def test_legacy_vocab_fallback(self, tmp_path):
-        """Pre-flag legacy-vocab checkpoint with no prepend_outcome field
-        → infer True."""
-        ckpt = tmp_path / "step_1"
-        _write_checkpoint(
-            ckpt, prepend_outcome=None, vocab_size=4284, max_seq_len=256,
-        )
-        cfg = _make_config(
-            [CotrainVariant(name="a", variant="toy", resume=str(ckpt))],
-            prepend_outcome=False,
-        )
-        _resolve_cotrain_resume_prepend_outcome(cfg)
-        assert cfg.prepend_outcome is True
-
     def test_mixed_format_errors(self, tmp_path):
         """Two variants, one outcome-prefixed and one pure-moves: cotrain
         can't share one pipeline for both, so helper must exit loudly."""
@@ -171,12 +157,13 @@ class TestResolveCotrainResumePrependOutcome:
         assert after is True
 
     def test_ambiguous_resume_without_explicit_flag_errors(self, tmp_path):
-        """Pre-flag 1980-vocab / 512-ctx checkpoint → helper can't
-        guess. Without an explicit prepend_outcome in the run config,
-        fail closed instead of silently defaulting."""
+        """Checkpoint without saved prepend_outcome field → helper can't
+        determine the sequence format. Without an explicit
+        prepend_outcome in the run config, fail closed instead of
+        silently defaulting."""
         ckpt = tmp_path / "step_1"
         _write_checkpoint(
-            ckpt, prepend_outcome=None, vocab_size=1980, max_seq_len=512,
+            ckpt, prepend_outcome=None,
         )
         # Note: passing prepend_outcome at all marks the field as "set"
         # on the Pydantic model, so we use model_construct to simulate a
@@ -210,9 +197,8 @@ class TestResolveCotrainResumePrependOutcome:
         assert "publish_results" in params
 
     def test_metadata_cache_is_populated(self, tmp_path):
-        """Codex round-2 regression: the helper should populate the
-        passed-in metadata cache so downstream helpers can reuse it
-        instead of triggering a second (expensive for legacy .pt)
+        """The helper should populate the passed-in metadata cache so
+        downstream helpers can reuse it instead of triggering a second
         checkpoint load."""
         ckpt = tmp_path / "step_1"
         _write_checkpoint(ckpt, prepend_outcome=True)

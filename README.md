@@ -12,12 +12,12 @@ Feel free to use PAWN in your own experiments. Note that PAWN was developed as a
 
 
 > [!important]
-> I am actively in process of re-training the model with:
+> The `main` branch trains a new architecture with:
 >
-> - A new vocabulary borrowed from Google DeepMind's [searchless_chess project (Amortized Planning with Large-Scale Transformers: A Case Study on Chess)](https://github.com/google-deepmind/searchless_chess), which doesn't include impossible moves.
+> - A vocabulary borrowed from Google DeepMind's [searchless_chess project (Amortized Planning with Large-Scale Transformers: A Case Study on Chess)](https://github.com/google-deepmind/searchless_chess), which doesn't include impossible moves (1,980 tokens total).
 > - A wider 512-token context window.
 >
-> The information below applies to the existing models, which use the previous architecture. The last commit from prior to these changes is tagged [pre-vocab-transition](https://github.com/thomas-schweich/PAWN/tree/pre-vocab-transition). View the repository at that commit to see the implementation of the previous architecture.
+> Retraining of the published HuggingFace checkpoints is still in progress, so the model table below reflects the *currently-published* weights (old 4,278-token vocab, 256-token context). The `pre-vocab-transition` git tag preserves the exact code those checkpoints were trained with; once new weights are uploaded, this table will be refreshed in a separate PR.
 
 
 ## Model Variants
@@ -30,12 +30,11 @@ Three sizes, trained for 100K steps on random games (~25.6M games each):
 | **PAWN (Base)** | 512 | 8 | 8 | ~35.8M | 7.02% | 99.87% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
 | **PAWN-Large** | 640 | 10 | 8 | ~68.4M | 6.95% | 99.89% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
 
-All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), factored move embeddings, and a 4278-token vocabulary covering:
+All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), factored move embeddings, and a vocabulary covering:
 
-- all possible (src, dst) pairs for an 8x8 grid (the chess board),
-- promotion moves: 4 piece types (queen, bishop, rook, knight) x 44 eligible (source square, destination square) pairs for pawns reaching the 1st & 8th ranks,
-- a token for each game outcome (`WHITE_CHECKMATES`, `BLACK_CHECKMATES`, `STALEMATE`, `DRAW_BY_RULE`, `PLY_LIMIT`),
-- and a padding token.
+- 1,968 move actions (the searchless_chess vocabulary, one entry per legally-reachable (src, dst[, promotion]) tuple),
+- 11 game-outcome tokens (pretraining outcomes: `WHITE_CHECKMATES`, `BLACK_CHECKMATES`, `STALEMATE`, `DRAW_BY_RULE`, `PLY_LIMIT`; Lichess-specific outcomes: `WHITE_RESIGNS`, `BLACK_RESIGNS`, `DRAW_BY_AGREEMENT`, `WHITE_WINS_ON_TIME`, `BLACK_WINS_ON_TIME`, `DRAW_BY_TIME`),
+- and a padding token — 1,980 tokens total on `main`. (Published checkpoints predate this change; see the note above.)
 
 PAWN learns to avoid impossible moves like `a1a1` and `b1a5` since they don't appear in its training examples.
 
@@ -63,7 +62,7 @@ uv sync --extra cu128   # NVIDIA GPU (or --extra rocm for AMD)
 Weights and data can be loaded directly from HuggingFace:
 
 ```bash
-uv run python scripts/train_bottleneck.py \
+uv run python scripts/train.py --run-type adapter --strategy bottleneck \
     --checkpoint thomas-schweich/pawn-base \
     --pgn thomas-schweich/pawn-lichess-full \
     --bottleneck-dim 32 --lr 1e-4 --local-checkpoints
@@ -107,10 +106,12 @@ Datasets load directly from HuggingFace via Polars lazy scan -- predicate pushdo
 PAWN is a standard decoder-only [transformer](https://arxiv.org/abs/1706.03762) trained with next-token prediction on chess move sequences. Each training example is:
 
 ```
-[outcome] [ply_1] [ply_2] ... [ply_N] [PAD] ... [PAD]
+[ply_1] [ply_2] ... [ply_N] [PAD] ... [PAD]
 ```
 
-Ply tokens use a factored embedding: each move is decomposed into source square + destination square + promotion piece, with embeddings summed. This gives the model explicit spatial structure while keeping the vocabulary compact. The context window of all variants is 256 tokens.
+(An optional outcome-conditioning prefix can be enabled via the `prepend_outcome` training config; pure moves is the default.)
+
+Ply tokens use a factored embedding: each move is decomposed into source square + destination square + promotion piece, with embeddings summed. This gives the model explicit spatial structure while keeping the vocabulary compact. On `main`, the context window is 512 tokens (the currently-published checkpoints use 256).
 
 The model's predictions are not masked to legal moves during training; it has to determine what moves are currently legal based on the sequence of moves so far.
 

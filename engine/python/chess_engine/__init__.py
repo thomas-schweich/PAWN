@@ -38,8 +38,6 @@ from chess_engine._engine import (
     generate_engine_games_py as generate_engine_games,
     # Vocabulary
     export_move_vocabulary,
-    pawn_to_searchless,
-    searchless_to_pawn,
     # Interactive game state (for RL)
     PyGameState,
     PyBatchRLEnv,
@@ -75,8 +73,6 @@ __all__ = [
     "pgn_to_uci",
     "generate_engine_games",
     "export_move_vocabulary",
-    "pawn_to_searchless",
-    "searchless_to_pawn",
     "PyGameState",
     "PyBatchRLEnv",
     "compute_accuracy_ceiling",

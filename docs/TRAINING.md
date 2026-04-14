@@ -80,29 +80,32 @@ Download standard rated game archives from the [Lichess open database](https://d
 
 ### Available adapters
 
-| Adapter      | Script                      | Key flag             |
-|--------------|-----------------------------|----------------------|
-| Bottleneck   | `scripts/train_bottleneck.py` | `--bottleneck-dim 8` |
-| FiLM         | `scripts/train_film.py`     |                      |
-| LoRA         | `scripts/train_lora.py`     |                      |
-| Sparse       | `scripts/train_sparse.py`   |                      |
-| Hybrid       | `scripts/train_hybrid.py`   |                      |
+All adapter strategies dispatch through the unified `scripts/train.py` via `--run-type adapter --strategy STRATEGY`:
 
-There is also `scripts/train_tiny.py` for a standalone small transformer baseline (no frozen backbone).
+| Strategy          | `--strategy` value | Key flag             |
+|-------------------|--------------------|----------------------|
+| Bottleneck        | `bottleneck`       | `--bottleneck-dim 8` |
+| FiLM              | `film`             | `--no-output-film`   |
+| LoRA              | `lora`             | `--lora-rank 4`      |
+| Sparse            | `sparse`           | `--density 0.01`     |
+| Hybrid (LoRA+FiLM)| `hybrid`           | `--lora-rank 4`      |
+| RoSA              | `rosa`             | `--rosa-mode rosa`   |
+| From-scratch      | `specialized_clm`  | `--d-model 84`       |
+| Unfreeze top-N    | `unfreeze`         | `--unfreeze-layers 6,7` |
 
 ### Example: bottleneck adapter
 
 ```bash
-uv run python scripts/train_bottleneck.py \
+uv run python scripts/train.py --run-type adapter --strategy bottleneck \
     --checkpoint thomas-schweich/pawn-base \
     --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
     --bottleneck-dim 32 \
-    --lr 1e-4
+    --lr 1e-4 --local-checkpoints
 ```
 
 ### Adapter training defaults
 
-- **Epochs**: 50 (with early stopping, patience=10)
+- **Epochs**: 50 (early stopping is opt-in via `--patience N`; default is no early stopping)
 - **Batch size**: 64
 - **Optimizer**: AdamW (lr=3e-4)
 - **LR schedule**: cosine with 5% warmup
@@ -113,10 +116,10 @@ uv run python scripts/train_bottleneck.py \
 ### Resuming adapter training
 
 ```bash
-uv run python scripts/train_bottleneck.py \
+uv run python scripts/train.py --run-type adapter --strategy bottleneck \
     --checkpoint thomas-schweich/pawn-base \
     --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
-    --resume logs/bottleneck_20260315_120000/checkpoints/best.pt
+    --resume logs/bottleneck_20260315_120000/checkpoints/best --local-checkpoints
 ```
 
 ### Selective layer placement
@@ -125,13 +128,11 @@ Adapters can target specific layers or sublayer positions:
 
 ```bash
 # Only FFN adapters on layers 4-7
-uv run python scripts/train_bottleneck.py \
+uv run python scripts/train.py --run-type adapter --strategy bottleneck \
     --checkpoint thomas-schweich/pawn-base \
     --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
-    --no-adapt-attn --adapter-layers 4,5,6,7
+    --no-adapt-attn --adapter-layers 4,5,6,7 --local-checkpoints
 ```
-
-Use `--attn-layers` / `--ffn-layers` for independent control of which layers get attention vs FFN adapters.
 
 ## Cloud Deployment (Runpod)
 

@@ -30,28 +30,6 @@ N_PRETRAINING_OUTCOMES = 5  # Tokens 1969-1973
 N_TOTAL_OUTCOMES = 11       # Tokens 1969-1979
 
 
-class LegacyVocab:
-    """Constants for the original PAWN vocabulary (4,284 tokens).
-
-    Used when loading old checkpoints (vocab_size=4284).
-    """
-    PAD_TOKEN = 0
-    OUTCOME_TOKEN_BASE = 4273
-    NUM_ACTIONS = 4272  # 4096 grid + 176 promo
-    VOCAB_SIZE = 4284
-    WHITE_CHECKMATES = 4273
-    BLACK_CHECKMATES = 4274
-    STALEMATE = 4275
-    DRAW_BY_RULE = 4276
-    PLY_LIMIT = 4277
-    WHITE_RESIGNS = 4278
-    BLACK_RESIGNS = 4279
-    DRAW_BY_AGREEMENT = 4280
-    WHITE_WINS_ON_TIME = 4281
-    BLACK_WINS_ON_TIME = 4282
-    DRAW_BY_TIME = 4283
-
-
 @dataclass
 class CLMConfig:
     """Model architecture hyperparameters."""

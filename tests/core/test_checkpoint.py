@@ -1,7 +1,6 @@
 """Tests for pawn.checkpoint: atomic save/load with SHA-256 integrity.
 
-Covers the new safetensors directory format AND legacy .pt backward compat.
-Extends the original tests/test_checkpoint.py with coverage of:
+Covers the safetensors directory format:
 - atomic rollback on failure
 - SHA-256 round-trip against known files
 - optimizer flatten/unflatten on synthetic states
@@ -35,8 +34,7 @@ from pawn.checkpoint import (
     _unflatten_optimizer_state,
     _verify_complete_sentinel,
     _write_complete_sentinel,
-    infer_prepend_outcome,
-    is_legacy_checkpoint,
+    get_prepend_outcome,
     load_adapter_checkpoint,
     load_backbone_weights,
     load_pretrain_checkpoint,
@@ -521,6 +519,7 @@ class TestRngRoundtrip:
         assert "cuda_rng_state" not in data
         restored_torch, restored_cuda = _json_to_rng(data)
         assert restored_cuda is None
+        assert restored_torch is not None
         assert torch.equal(torch_rng, restored_torch)
 
     def test_cuda_rng_roundtrip(self):
@@ -530,6 +529,7 @@ class TestRngRoundtrip:
         assert "torch_rng_state" not in data
         assert "cuda_rng_state" in data
         _, restored_cuda = _json_to_rng(data)
+        assert restored_cuda is not None
         assert torch.equal(fake_cuda, restored_cuda)
 
     def test_both_rng_roundtrip(self):
@@ -537,6 +537,8 @@ class TestRngRoundtrip:
         c = torch.randint(0, 256, (32,), dtype=torch.uint8)
         data = _rng_to_json(t, c)
         rt, rc = _json_to_rng(data)
+        assert rt is not None
+        assert rc is not None
         assert torch.equal(t, rt)
         assert torch.equal(c, rc)
 
@@ -555,6 +557,7 @@ class TestRngRoundtrip:
         tensor = torch.randint(0, 256, (n,), dtype=torch.uint8)
         data = _rng_to_json(tensor, None)
         restored, _ = _json_to_rng(data)
+        assert restored is not None
         assert torch.equal(tensor, restored)
 
     def test_reproducibility_via_roundtrip(self, freeze_rng):
@@ -568,6 +571,7 @@ class TestRngRoundtrip:
 
         # Restore and regenerate
         restored, _ = _json_to_rng(data)
+        assert restored is not None
         torch.set_rng_state(restored.cpu().byte())
         samples2 = torch.randn(10)
 
@@ -665,19 +669,7 @@ class TestLoadBackboneWeights:
             global_step=1, model_config=cfg.__dict__, training_config={},
         )
         state_dict, model_config = load_backbone_weights(ckpt_path)
-        assert model_config["d_model"] == cfg.d_model
-        for k in model1.state_dict():
-            torch.testing.assert_close(model1.state_dict()[k], state_dict[k])
-
-    def test_legacy_pt_file(self, tmp_path):
-        model1, cfg = _make_toy_model()
-        pt_path = tmp_path / "model.pt"
-        torch.save({
-            "model_state_dict": model1.state_dict(),
-            "model_config": cfg.__dict__,
-        }, pt_path)
-
-        state_dict, model_config = load_backbone_weights(pt_path)
+        assert model_config is not None
         assert model_config["d_model"] == cfg.d_model
         for k in model1.state_dict():
             torch.testing.assert_close(model1.state_dict()[k], state_dict[k])
@@ -694,6 +686,7 @@ class TestLoadBackboneWeights:
             {"model_config": cfg.__dict__}
         ))
         state_dict, model_config = load_backbone_weights(sf_path)
+        assert model_config is not None
         assert model_config["d_model"] == cfg.d_model
         for k in model1.state_dict():
             torch.testing.assert_close(model1.state_dict()[k], state_dict[k])
@@ -731,85 +724,6 @@ class TestLoadBackboneWeights:
         (ckpt_path / "model.safetensors").write_bytes(b"CORRUPTED")
         with pytest.raises(CheckpointIntegrityError):
             load_backbone_weights(ckpt_path)
-
-
-# ---------------------------------------------------------------------------
-# Legacy detection + load
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestLegacyCheckpoint:
-    def test_detects_pt(self, tmp_path):
-        pt = tmp_path / "step.pt"
-        pt.touch()
-        assert is_legacy_checkpoint(pt)
-
-    def test_detects_pth(self, tmp_path):
-        pth = tmp_path / "step.pth"
-        pth.touch()
-        assert is_legacy_checkpoint(pth)
-
-    def test_does_not_detect_directory(self, tmp_path):
-        d = tmp_path / "step_00001"
-        d.mkdir()
-        assert not is_legacy_checkpoint(d)
-
-    def test_does_not_detect_safetensors(self, tmp_path):
-        p = tmp_path / "model.safetensors"
-        p.touch()
-        assert not is_legacy_checkpoint(p)
-
-    def test_does_not_detect_missing_file(self, tmp_path):
-        assert not is_legacy_checkpoint(tmp_path / "nonexistent.pt")
-
-    def test_accepts_str_or_path(self, tmp_path):
-        pt = tmp_path / "x.pt"
-        pt.touch()
-        assert is_legacy_checkpoint(str(pt))
-        assert is_legacy_checkpoint(pt)
-
-    def test_legacy_load_pretrain(self, tmp_path):
-        """load_pretrain_checkpoint handles .pt format."""
-        model1, cfg = _make_toy_model()
-        opt1 = _make_optimizer(model1)
-        _run_step(model1, cfg, opt1)
-        pt_path = tmp_path / "ckpt.pt"
-        torch.save({
-            "model_state_dict": model1.state_dict(),
-            "optimizer_state_dict": opt1.state_dict(),
-            "global_step": 5,
-            "model_config": cfg.__dict__,
-            "training_config": {"lr": 1e-3},
-        }, pt_path)
-
-        model2, _ = _make_toy_model()
-        meta = load_pretrain_checkpoint(pt_path, model2)
-        assert meta["global_step"] == 5
-        assert meta["model_config"]["d_model"] == cfg.d_model
-        for k in model1.state_dict():
-            torch.testing.assert_close(
-                model1.state_dict()[k], model2.state_dict()[k],
-            )
-
-    def test_legacy_load_adapter(self, tmp_path):
-        """load_adapter_checkpoint handles .pt format with lora_state_dict key."""
-        pt_path = tmp_path / "adapter.pt"
-        torch.save({
-            "lora_state_dict": {"A.weight": torch.randn(4, 8)},
-            "config": {"lora_rank": 4},
-            "epoch": 3,
-            "step": 300,
-            "val_loss": 2.5,
-            "val_top1": 0.1,
-        }, pt_path)
-
-        loaded = load_adapter_checkpoint(pt_path)
-        assert loaded["epoch"] == 3
-        assert loaded["step"] == 300
-        assert "A.weight" in loaded["adapter_state_dict"]
-        assert loaded["val_metrics"]["loss"] == 2.5
-        assert loaded["val_metrics"]["top1_accuracy"] == 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -889,7 +803,7 @@ class TestHfPushMocked:
 
 
 # ---------------------------------------------------------------------------
-# read_checkpoint_metadata + infer_prepend_outcome
+# read_checkpoint_metadata + get_prepend_outcome
 # ---------------------------------------------------------------------------
 
 
@@ -921,128 +835,19 @@ class TestReadCheckpointMetadata:
         with pytest.raises(FileNotFoundError):
             read_checkpoint_metadata(ckpt)
 
-    def test_legacy_pt_file(self, tmp_path):
-        ckpt = tmp_path / "legacy.pt"
-        torch.save({
-            "model_state_dict": {},
-            "model_config": {"vocab_size": 4284, "max_seq_len": 256},
-            "training_config": {},  # no prepend_outcome field
-        }, ckpt)
-        meta = read_checkpoint_metadata(ckpt)
-        assert meta["model_config"]["vocab_size"] == 4284
-        assert meta["model_config"]["max_seq_len"] == 256
-
 
 @pytest.mark.unit
-class TestInferPrependOutcome:
-    def test_exact_from_saved_true(self):
-        result, reason = infer_prepend_outcome(
-            {"prepend_outcome": True}, {"vocab_size": 1980, "max_seq_len": 512},
-        )
-        assert result is True
-        assert "saved" in reason
+class TestGetPrependOutcome:
+    def test_reads_saved_true(self):
+        assert get_prepend_outcome({"prepend_outcome": True}) is True
 
-    def test_exact_from_saved_false(self):
-        result, reason = infer_prepend_outcome(
-            {"prepend_outcome": False}, {"vocab_size": 1980, "max_seq_len": 512},
-        )
-        assert result is False
-        assert "saved" in reason
+    def test_reads_saved_false(self):
+        assert get_prepend_outcome({"prepend_outcome": False}) is False
 
-    def test_saved_value_takes_precedence_over_heuristics(self):
-        """A modern training_cfg with prepend_outcome=False must NOT be
-        overridden by the legacy-vocab heuristic (edge case: user retrains
-        with new vocab + pure moves starting from a legacy-vocab arch)."""
-        result, _ = infer_prepend_outcome(
-            {"prepend_outcome": False},
-            {"vocab_size": 4284, "max_seq_len": 256},
-        )
-        assert result is False
+    def test_raises_on_missing_field(self):
+        with pytest.raises(ValueError, match="prepend_outcome"):
+            get_prepend_outcome({"lr": 3e-4})
 
-    def test_legacy_vocab_heuristic(self):
-        from pawn.config import LegacyVocab
-        result, reason = infer_prepend_outcome(
-            {},  # no prepend_outcome field
-            {"vocab_size": LegacyVocab.VOCAB_SIZE, "max_seq_len": 256},
-        )
-        assert result is True
-        assert "legacy vocab" in reason
-
-    def test_256_ctx_heuristic(self):
-        result, reason = infer_prepend_outcome(
-            {}, {"vocab_size": 1980, "max_seq_len": 256},
-        )
-        assert result is True
-        assert "256" in reason
-
-    def test_ambiguous_modern_returns_none(self):
-        """1980-vocab / 512-ctx with no prepend_outcome field could be
-        either pre-flip (outcome-prefixed) or post-flip (pure-moves).
-        The helper must return None so callers fail closed or demand an
-        explicit override — silently guessing either way is unsafe."""
-        result, reason = infer_prepend_outcome(
-            {}, {"vocab_size": 1980, "max_seq_len": 512},
-        )
-        assert result is None
-        assert "ambiguous" in reason
-
-    def test_none_inputs_are_ambiguous(self):
-        """Missing configs entirely are treated the same as ambiguous —
-        callers must not silently default."""
-        result, reason = infer_prepend_outcome(None, None)
-        assert result is None
-        assert "ambiguous" in reason
-
-    def test_legacy_no_outcome_token_true_overrides_vocab_heuristic(self):
-        """Codex round 6: a pre-flag legacy-vocab checkpoint with the
-        pure-moves ablation flag set must be detected as pure-moves,
-        not silently reclassified as outcome-prefixed via the
-        legacy-vocab heuristic."""
-        from pawn.config import LegacyVocab
-        result, reason = infer_prepend_outcome(
-            {"no_outcome_token": True},
-            {"vocab_size": LegacyVocab.VOCAB_SIZE, "max_seq_len": 256},
-        )
-        assert result is False
-        assert "no_outcome_token" in reason
-
-    def test_legacy_no_outcome_token_true_overrides_256_ctx_heuristic(self):
-        """Same precedence check for 256-ctx 1980-vocab checkpoints."""
-        result, reason = infer_prepend_outcome(
-            {"no_outcome_token": True},
-            {"vocab_size": 1980, "max_seq_len": 256},
-        )
-        assert result is False
-        assert "no_outcome_token" in reason
-
-    def test_no_outcome_token_true_on_modern_checkpoint(self):
-        """A modern checkpoint with no_outcome_token=True (user still
-        passed the deprecated flag) is pure-moves — step 2 short-
-        circuits before the ambiguous fallback."""
-        result, reason = infer_prepend_outcome(
-            {"no_outcome_token": True},
-            {"vocab_size": 1980, "max_seq_len": 512},
-        )
-        assert result is False
-        assert "no_outcome_token" in reason
-
-    def test_no_outcome_token_false_is_not_disambiguating(self):
-        """A modern 512-ctx checkpoint with no_outcome_token=False must
-        still be treated as ambiguous — False is the default for every
-        run regardless of the actual sequence format."""
-        result, reason = infer_prepend_outcome(
-            {"no_outcome_token": False},
-            {"vocab_size": 1980, "max_seq_len": 512},
-        )
-        assert result is None
-        assert "ambiguous" in reason
-
-    def test_prepend_outcome_takes_precedence_over_no_outcome_token(self):
-        """Contradictory flags: saved prepend_outcome wins (exact), even
-        if the deprecated no_outcome_token is also set."""
-        result, reason = infer_prepend_outcome(
-            {"prepend_outcome": True, "no_outcome_token": True},
-            {"vocab_size": 1980, "max_seq_len": 512},
-        )
-        assert result is True
-        assert "saved" in reason
+    def test_raises_on_none(self):
+        with pytest.raises(ValueError, match="prepend_outcome"):
+            get_prepend_outcome(None)

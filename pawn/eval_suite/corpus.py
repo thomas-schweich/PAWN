@@ -12,6 +12,7 @@ import json
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -188,68 +189,12 @@ def generate_corpus(
 
 
 # ---------------------------------------------------------------------------
-# Migration from .npy to parquet (one-time)
-# ---------------------------------------------------------------------------
-
-
-def _migrate_npy_to_parquet(corpus_dir: Path):
-    """Convert legacy .npy corpus to parquet format in-place."""
-    d = corpus_dir
-    print("Migrating .npy corpus to parquet format...")
-    gl = np.load(d / "game_lengths.npy")
-    tc = np.load(d / "termination_codes.npy")
-    lmc = np.load(d / "legal_move_counts.npy", mmap_mode="r")
-    ic = np.load(d / "is_check.npy", mmap_mode="r")
-    n = len(gl)
-
-    # games.parquet
-    outcomes = [_term_to_outcome(int(tc[i]), int(gl[i])) for i in range(n)]
-    pl.DataFrame({
-        "game_idx": np.arange(n, dtype=np.uint32),
-        "game_length": gl.astype(np.uint16),
-        "term_code": tc.astype(np.uint8),
-        "outcome": outcomes,
-    }).write_parquet(d / "games.parquet")
-    del outcomes
-
-    # positions/*.parquet
-    pos_dir = d / "positions"
-    pos_dir.mkdir(exist_ok=True)
-    for start in range(0, n, _POS_BATCH):
-        end = min(start + _POS_BATCH, n)
-        chunk_gl = gl[start:end].astype(np.int32)
-        sub_n = end - start
-        max_len = int(chunk_gl.max())
-
-        ply_grid = np.arange(max_len, dtype=np.uint16)[None, :]
-        valid = ply_grid < chunk_gl[:, None]
-
-        gidx = np.broadcast_to(
-            np.arange(start, end, dtype=np.uint32)[:, None],
-            (sub_n, max_len),
-        )[valid]
-
-        df = pl.DataFrame({
-            "game_idx": gidx,
-            "ply": np.broadcast_to(ply_grid, (sub_n, max_len))[valid],
-            "k": np.asarray(lmc[start:end, :max_len])[valid].astype(np.uint16),
-            "is_check": np.asarray(ic[start:end, :max_len])[valid],
-        })
-        part_idx = start // _POS_BATCH
-        df.write_parquet(pos_dir / f"part_{part_idx:04d}.parquet")
-        del df, gidx
-        print(f"  {end}/{n}", end="\r", flush=True)
-
-    print(f"  Migration complete: {n} games → games.parquet + {n // _POS_BATCH + 1} position parts")
-
-
-# ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
 
 
 def load_corpus(corpus_dir: str | Path) -> dict:
-    """Load corpus. Auto-migrates legacy .npy format to parquet on first load.
+    """Load corpus from parquet format.
 
     Returns dict with:
         move_ids:           np.ndarray (mmap)
@@ -261,9 +206,19 @@ def load_corpus(corpus_dir: str | Path) -> dict:
     """
     d = Path(corpus_dir)
 
-    # Auto-migrate if needed
-    if not (d / "games.parquet").exists() and (d / "legal_move_counts.npy").exists():
-        _migrate_npy_to_parquet(d)
+    # Pre-parquet corpora (only .npy files, no games.parquet) used to be
+    # auto-migrated. That migration was removed with the legacy cleanup,
+    # so detect the old layout and fail loudly with a clear message
+    # instead of crashing deep inside a Polars scan.
+    if not (d / "games.parquet").exists():
+        if (d / "legal_move_counts.npy").exists():
+            raise FileNotFoundError(
+                f"{d} is a pre-parquet corpus (.npy-only layout). The "
+                "auto-migration was removed with the legacy cleanup; "
+                "regenerate the corpus with `generate_corpus` or check "
+                "out the `pre-vocab-transition` git tag to load it."
+            )
+        raise FileNotFoundError(f"No games.parquet found in {d}")
 
     corpus = {
         "move_ids": np.load(d / "move_ids.npy", mmap_mode="r"),
@@ -396,7 +351,7 @@ def _iter_position_parts(corpus: dict) -> Iterator[pl.DataFrame]:
         yield pl.read_parquet(f)
 
 
-def _new_accumulator() -> dict[str, int | float | np.ndarray]:
+def _new_accumulator() -> dict[str, Any]:
     return {
         "n": 0, "sum_k": 0.0, "sum_k_sq": 0.0, "k_min": 999, "k_max": 0,
         "sum_inv_k": 0.0, "sum_inv_k_sq": 0.0,

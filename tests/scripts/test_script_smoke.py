@@ -53,7 +53,6 @@ ARGPARSE_SCRIPTS = [
     "run_evals_local.py",
     "run_evals_toplayer.py",
     "split_dataset.py",
-    "train_adapter.py",
 ]
 
 
@@ -83,8 +82,9 @@ class TestTrainPyImports:
         spec = importlib.util.spec_from_file_location(
             "scripts_train", str(SCRIPTS / "train.py"),
         )
-        mod = importlib.util.module_from_spec(spec)
+        assert spec is not None
         assert spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         # Verify key functions exist
         assert hasattr(mod, "_parse_cli")

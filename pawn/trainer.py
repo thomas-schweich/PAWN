@@ -88,46 +88,24 @@ class CosineWithWarmup:
 def _build_action_grid_index(n_actions: int) -> list[int]:
     """Build a mapping from action token to grid index (src*64 + dst).
 
-    For the searchless_chess vocab (n_actions=1968), each action maps to a
-    (src, dst) pair via the engine's vocabulary export.
-
-    For the legacy PAWN vocab (n_actions=4272), tokens 1-4096 use the formula
-    src*64+dst+1, and tokens 4097-4272 are promotions looked up via engine.
-    Token 0 (legacy PAD) maps to grid index 0.
+    Each action in the searchless_chess vocab maps to a (src, dst) pair
+    via the engine's vocabulary export.
     """
     import chess_engine
-    from pawn.config import NUM_ACTIONS, LegacyVocab
+    from pawn.config import NUM_ACTIONS
 
+    assert n_actions == NUM_ACTIONS, f"Unknown n_actions: {n_actions}"
     vocab = chess_engine.export_move_vocabulary()
     token_to_move = vocab["token_to_move"]
     square_names = vocab["square_names"]
     name_to_idx = {name: i for i, name in enumerate(square_names)}
 
-    if n_actions == NUM_ACTIONS:
-        grid_indices = []
-        for action in range(n_actions):
-            uci = token_to_move[action]
-            src_sq = name_to_idx[uci[:2]]
-            dst_sq = name_to_idx[uci[2:4]]
-            grid_indices.append(src_sq * 64 + dst_sq)
-        return grid_indices
-
-    # Legacy vocab: token 0 = PAD (map to 0), tokens 1-4096 = grid, 4097-4272 = promos
-    assert n_actions == LegacyVocab.NUM_ACTIONS
-    grid_indices = [0]  # token 0 (PAD)
-    for token in range(1, 4097):
-        t = token - 1
-        grid_indices.append((t // 64) * 64 + (t % 64))
-    # Promotions: look up via searchless_to_pawn
-    for token in range(4097, n_actions + 1):
-        action = chess_engine.pawn_to_searchless(token)
-        if action >= 0:
-            uci = token_to_move[action]
-            src_sq = name_to_idx[uci[:2]]
-            dst_sq = name_to_idx[uci[2:4]]
-            grid_indices.append(src_sq * 64 + dst_sq)
-        else:
-            grid_indices.append(0)
+    grid_indices = []
+    for action in range(n_actions):
+        uci = token_to_move[action]
+        src_sq = name_to_idx[uci[:2]]
+        dst_sq = name_to_idx[uci[2:4]]
+        grid_indices.append(src_sq * 64 + dst_sq)
     return grid_indices
 
 

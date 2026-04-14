@@ -339,7 +339,7 @@ def process_holdout_month(
 
             # Stop early once past test range
             max_date = df["date"].max()
-            if max_date and max_date >= test_end:
+            if isinstance(max_date, datetime) and max_date >= test_end:
                 log("Past test date range — stopping early", prefix)
                 break
 
@@ -351,7 +351,7 @@ def process_holdout_month(
     val_paths = val_buf.rename_shards() if val_buf.shard_paths else []
     test_paths = test_buf.rename_shards() if test_buf.shard_paths else []
 
-    return [str(p) for p in val_paths], [str(p) for p in test_paths]
+    return [Path(p) for p in val_paths], [Path(p) for p in test_paths]
 
 
 # ---------------------------------------------------------------------------
