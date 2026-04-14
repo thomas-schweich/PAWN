@@ -1024,6 +1024,26 @@ fn parse_pgn_lichess<'py>(
             }
         }
 
+        // UCI strings are derived from tokens via O(1) vocab lookup.
+        // The invariant is that every token produced by `san_moves_to_tokens_full`
+        // is a legal action in [0, NUM_ACTIONS), so `token_to_uci` always
+        // returns Some — but we surface a missing-token case as a
+        // `PyValueError` rather than a `PanicException` so a future invariant
+        // violation produces a clean Python exception.
+        let uci_moves: Vec<String> = g
+            .tokens
+            .iter()
+            .map(|&t| {
+                vocab::token_to_uci(t).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "tokenized move {} has no UCI representation \
+                         (vocab invariant violated)",
+                        t,
+                    ))
+                })
+            })
+            .collect::<PyResult<_>>()?;
+
         // clocks parallel to moves only
         let clk_offset = gi * max_ply;
         for (t, &clk) in g.clocks.iter().enumerate() {
@@ -1036,7 +1056,7 @@ fn parse_pgn_lichess<'py>(
         orig_lengths_out.push(g.original_length as u32);
         outcome_tokens_out.push(g.outcome_token);
         san_out.push(g.san_moves);
-        uci_out.push(g.uci_moves);
+        uci_out.push(uci_moves);
 
         let h = &g.headers;
         white_elo_out.push(h.get("WhiteElo").and_then(|s| s.parse::<u16>().ok()).unwrap_or(0));

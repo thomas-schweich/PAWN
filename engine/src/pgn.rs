@@ -83,15 +83,14 @@ pub fn parse_pgn_enriched(
 ///
 /// The token sequence is pure moves; the outcome token is returned in its
 /// own `outcome_token` field and consumers can opt in to prepending it via
-/// the `prepend_outcome` flag on `parse_pgn_lichess` (lib.rs).
+/// the `prepend_outcome` flag on `parse_pgn_lichess` (lib.rs). UCI strings
+/// are derived in the PyO3 wrapper so it can convert a missing-vocab error
+/// into a `PyValueError` instead of panicking.
 pub struct LichessGame {
     /// PAWN token sequence: pure moves `[ply_1, ..., ply_N]`.
     pub tokens: Vec<u16>,
     /// Raw SAN strings parsed from the PGN movetext, parallel to `tokens`.
     pub san_moves: Vec<String>,
-    /// UCI strings derived from `tokens` via `vocab::token_to_uci`,
-    /// parallel to `tokens`.
-    pub uci_moves: Vec<String>,
     /// Seconds remaining on clock after each ply (parallel to `tokens`).
     pub clocks: Vec<u16>,
     /// Number of move plies.
@@ -161,21 +160,12 @@ pub fn parse_pgn_lichess(
             let mut san_moves = san_moves;
             san_moves.truncate(result.n_tokenized);
 
-            // UCI strings are derived from tokens via O(1) vocab lookup
-            // (no second board replay). Unwrap is safe because every token
-            // produced by `san_moves_to_tokens_full` is a legal action.
-            let uci_moves: Vec<String> = tokens
-                .iter()
-                .map(|&t| vocab::token_to_uci(t).expect("tokenized move must have UCI"))
-                .collect();
-
             // Trim clocks to match tokenized moves
             let clocks = clocks_raw.into_iter().take(result.n_tokenized).collect();
 
             Some(LichessGame {
                 tokens,
                 san_moves,
-                uci_moves,
                 clocks,
                 game_length: result.n_tokenized,
                 original_length: result.n_total_moves,
@@ -1118,7 +1108,6 @@ mod tests {
         assert_eq!(g.outcome_token, crate::vocab::WHITE_CHECKMATES);
         assert_eq!(g.tokens.len(), 7);
         assert_eq!(g.san_moves.len(), 7);
-        assert_eq!(g.uci_moves.len(), 7);
         assert_eq!(g.game_length, 7);
         assert_eq!(g.original_length, 7);
     }
@@ -1209,7 +1198,6 @@ mod tests {
         // tokens: pure moves, length == game_length
         assert_eq!(g.tokens.len(), 2);
         assert_eq!(g.san_moves.len(), 2);
-        assert_eq!(g.uci_moves.len(), 2);
     }
 
     #[test]
@@ -1535,6 +1523,8 @@ mod tests {
         let e7e5 = crate::vocab::uci_token("e7e5");
         assert_eq!(g.tokens, vec![e2e4, e7e5]);
         assert_eq!(g.san_moves, vec!["e4".to_string(), "e5".to_string()]);
-        assert_eq!(g.uci_moves, vec!["e2e4".to_string(), "e7e5".to_string()]);
+        // UCI strings are derived in the PyO3 wrapper (lib.rs), not in this
+        // struct, so the Python-facing test in tests/test_enriched_pgn.py
+        // covers the SAN ↔ UCI ↔ token round-trip.
     }
 }

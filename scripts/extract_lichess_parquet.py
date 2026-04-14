@@ -74,6 +74,11 @@ from huggingface_hub.errors import RepositoryNotFoundError
 
 HF_RAW_BUCKET = "thomas-schweich/raw-lichess"
 HF_RAW_FILENAME_TEMPLATE = "lichess_{year_month}.pgn.zst"
+# Note: `parse_pgn_lichess`'s PyO3 signature defaults to `max_ply=255` to match
+# `generate_clm_batch`. The extractor deliberately overrides that to 512 so
+# virtually every Lichess game gets its natural outcome token (PLY_LIMIT is
+# reserved for games that truly exceed this cap). We always pass `--max-ply`
+# explicitly to the engine, so the PyO3 default never applies here.
 DEFAULT_MAX_PLY = 512
 DEFAULT_BATCH_SIZE = 500_000
 DEFAULT_SHARD_SIZE = 1_000_000
@@ -454,6 +459,7 @@ def process_holdout_month(
             "(process_holdout_month's early-exit assumes chronological order).",
         )
 
+    parsed_total = 0
     with open_hf_stream(year_month) as stream:
         for pgn_text in stream_pgn_games(stream, cfg.batch_size):
             if not pgn_text.strip():
@@ -469,6 +475,8 @@ def process_holdout_month(
             if df.is_empty():
                 continue
 
+            parsed_total += len(df)
+
             val_df = df.filter((pl.col("date") >= val_start) & (pl.col("date") < val_end))
             test_df = df.filter((pl.col("date") >= test_start) & (pl.col("date") < test_end))
             if not val_df.is_empty():
@@ -482,6 +490,16 @@ def process_holdout_month(
                 f"val {val_uploader.total_games:,}, test {test_uploader.total_games:,}",
                 log_prefix,
             )
+
+            # Respect --max-games-per-month symmetrically with process_train_month
+            # so smoke-test runs terminate quickly instead of streaming the whole
+            # holdout month.
+            if cfg.max_games_per_month is not None and parsed_total >= cfg.max_games_per_month:
+                log(
+                    f"Hit max_games_per_month={cfg.max_games_per_month:,} — stopping early",
+                    log_prefix,
+                )
+                break
 
             max_date_any = df["date"].max()
             if isinstance(max_date_any, datetime) and max_date_any >= test_end:
@@ -618,13 +636,26 @@ def delete_stale_shards(
     log(f"Deleting {len(paths)} orphan file(s) from previous runs")
     for p in paths:
         log(f"  - {p}")
-    api.create_commit(
-        repo_id=dest_repo,
-        repo_type="dataset",
-        revision=revision,
-        operations=[CommitOperationDelete(path_in_repo=p) for p in paths],
-        commit_message=f"Clean up {len(paths)} orphan file(s) before re-extract",
-    )
+
+    # HF Hub has an undocumented but real per-commit operation limit
+    # (roughly 100-500 files). Chunk deletions to stay well under it so
+    # `--force` on large completed extractions can't fail the cleanup
+    # commit with an opaque error.
+    chunk_size = 100
+    total = len(paths)
+    for i in range(0, total, chunk_size):
+        batch = paths[i : i + chunk_size]
+        end = min(i + chunk_size, total)
+        api.create_commit(
+            repo_id=dest_repo,
+            repo_type="dataset",
+            revision=revision,
+            operations=[CommitOperationDelete(path_in_repo=p) for p in batch],
+            commit_message=(
+                f"Clean up orphan file(s) before re-extract "
+                f"({i + 1}-{end} of {total})"
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -785,7 +816,7 @@ def main() -> int:
     log(f"Spawning {n_workers} worker(s)...")
 
     ctx = mp.get_context("spawn")
-    failures: list[tuple[WorkUnit, BaseException]] = []
+    failures: list[tuple[WorkUnit, Exception]] = []
     aggregate: dict[str, int] = {}
 
     with cf.ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
@@ -799,7 +830,7 @@ def main() -> int:
                 for k, v in stats.items():
                     aggregate[k] = aggregate.get(k, 0) + v
                 log(f"[{u.tag}] complete: {stats}")
-            except BaseException as e:
+            except Exception as e:
                 log(f"[{u.tag}] FAILED: {type(e).__name__}: {e}")
                 failures.append((u, e))
 
