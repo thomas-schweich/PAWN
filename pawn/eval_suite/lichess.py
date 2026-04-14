@@ -223,37 +223,60 @@ def evaluate_on_lichess(
             tgt = targets[start:end].to(device)
             msk = loss_mask[start:end].to(device)
 
-            logits, _ = model(ids, msk, hidden_only=True)
+            # ``forward_eval`` returns final hidden states without the
+            # ``lm_head`` projection, so we only pay for the
+            # ``(N_valid, vocab_size)`` projection below instead of
+            # materialising a full ``(B, T, vocab_size)`` logits tensor.
+            hidden = model.forward_eval(ids, msk)  # (B, T, d_model)
 
-            for i in range(end - start):
-                gi = start + i
-                T = logits.shape[1]
-                for pos in range(T):
-                    if not bool(msk[i, pos]):
-                        continue
-                    target_tok = int(tgt[i, pos])
-                    if target_tok == PAD_TOKEN:
-                        continue
+            # Skip positions where the target is PAD (game end) — they
+            # don't contribute to any metric but would still cost a
+            # ``lm_head`` row otherwise.
+            effective_mask = msk & (tgt != PAD_TOKEN)
+            if not bool(effective_mask.any()):
+                continue
 
-                    log_probs = torch.log_softmax(logits[i, pos], dim=-1)
-                    total_loss -= float(log_probs[target_tok])
-                    total_tokens += 1
+            rows, cols = torch.where(effective_mask)
+            valid_hidden = hidden[rows, cols]                # (N_valid, d_model)
+            valid_logits = model.lm_head(valid_hidden)       # (N_valid, vocab_size)
+            valid_targets = tgt[rows, cols]                  # (N_valid,)
+            valid_log_probs = torch.log_softmax(valid_logits, dim=-1)
 
-                    argmax_tok = int(logits[i, pos].argmax())
-                    if argmax_tok == target_tok:
-                        total_correct += 1
+            # Gather loss contributions for the true targets in one shot.
+            target_log_probs = valid_log_probs.gather(
+                dim=-1, index=valid_targets.unsqueeze(-1)
+            ).squeeze(-1)                                    # (N_valid,)
+            total_loss += float((-target_log_probs).sum())
+            total_tokens += int(valid_targets.shape[0])
 
-                    top5 = logits[i, pos].topk(5).indices.tolist()
-                    if target_tok in top5:
-                        total_top5_correct += 1
+            argmax = valid_logits.argmax(dim=-1)             # (N_valid,)
+            total_correct += int((argmax == valid_targets).sum())
 
-                    ply = pos + grid_offset
-                    if argmax_tok < NUM_ACTIONS and ply < grid.shape[1]:
-                        grid_idx = int(action_grid_idx[argmax_tok])
-                        src = grid_idx // 64
-                        dst = grid_idx % 64
-                        if int(grid[gi, ply, src]) >> dst & 1:
-                            total_legal += 1
+            top5_indices = valid_logits.topk(5, dim=-1).indices  # (N_valid, 5)
+            total_top5_correct += int(
+                (top5_indices == valid_targets.unsqueeze(-1)).any(dim=-1).sum()
+            )
+
+            # Legal-move rate: materialise argmax decisions on the host
+            # for the per-position grid lookup. The masked tensors are
+            # small (at most ``B * T`` but usually far fewer) so the
+            # CPU trip doesn't dominate.
+            argmax_cpu = argmax.cpu().tolist()
+            rows_cpu = rows.cpu().tolist()
+            cols_cpu = cols.cpu().tolist()
+            grid_cpu = grid.cpu()
+            for k, argmax_tok in enumerate(argmax_cpu):
+                if argmax_tok >= NUM_ACTIONS:
+                    continue
+                gi = start + rows_cpu[k]
+                ply = cols_cpu[k] + grid_offset
+                if ply >= grid_cpu.shape[1]:
+                    continue
+                grid_idx = int(action_grid_idx[argmax_tok])
+                src = grid_idx // 64
+                dst = grid_idx % 64
+                if int(grid_cpu[gi, ply, src]) >> dst & 1:
+                    total_legal += 1
 
         if total_tokens == 0:
             continue
