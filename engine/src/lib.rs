@@ -948,39 +948,52 @@ fn parse_pgn_enriched<'py>(
     Ok(dict.into())
 }
 
-/// Parse Lichess PGN with outcome tokens prepended, no eval column.
+/// Parse Lichess PGN into a numpy-friendly dict.
+///
+/// By default, `tokens` is a pure-moves array and the outcome is returned
+/// only in the separate `outcome_tokens` column. Pass `prepend_outcome=True`
+/// to get the older layout where the outcome token is prepended at position 0
+/// of every row (matching `generate_clm_batch(prepend_outcome=True)`).
 ///
 /// Returns a dict with:
-///   tokens: ndarray[i16, (N, max_ply+1)]  — [outcome, ply_1, ..., ply_N, 0, ...]
+///   tokens: ndarray[i16, (N, seq_len)]    — seq_len = max_ply + (1 if prepend_outcome else 0)
+///                                           pure moves, or [outcome, ply_1, ...] if prepended
 ///   clocks: ndarray[u16, (N, max_ply)]    — clock per move ply (no outcome slot)
-///   game_lengths: ndarray[u16, (N,)]      — move count (excl. outcome token)
+///   game_lengths: ndarray[u16, (N,)]      — move count (never counts outcome)
 ///   original_lengths: ndarray[u32, (N,)]  — full game length before truncation
 ///   outcome_tokens: ndarray[u16, (N,)]    — outcome token ID per game
-///   + all string metadata columns (same as parse_pgn_enriched)
+///   san: list[list[str]]                  — raw SAN strings per game, length == game_length
+///   uci: list[list[str]]                  — UCI strings per game, length == game_length
+///   + all string metadata columns (result, white, black, eco, opening,
+///     time_control, termination, date_time, site)
 #[pyfunction]
-#[pyo3(signature = (content, max_ply=255, max_games=1_000_000, min_ply=1))]
+#[pyo3(signature = (content, max_ply=255, max_games=1_000_000, min_ply=1, prepend_outcome=false))]
 fn parse_pgn_lichess<'py>(
     py: Python<'py>,
     content: &str,
     max_ply: usize,
     max_games: usize,
     min_ply: usize,
+    prepend_outcome: bool,
 ) -> PyResult<PyObject> {
     let games = py.allow_threads(|| {
         pgn::parse_pgn_lichess(content, max_ply, max_games, min_ply)
     });
 
     let n = games.len();
-    let seq_len = max_ply + 1; // outcome token + max_ply moves
+    let seq_len = if prepend_outcome { max_ply + 1 } else { max_ply };
     let dict = PyDict::new(py);
 
-    // Tokens: (N, seq_len) — outcome token at position 0, then moves, then 0-padding
+    // Tokens: (N, seq_len). With `prepend_outcome`, slot 0 is the outcome
+    // token and moves start at slot 1; otherwise slot 0 is the first move.
     let mut flat_tokens = vec![0i16; n * seq_len];
-    // Clocks: (N, max_ply) — parallel to moves only, no outcome slot
+    // Clocks: (N, max_ply) — parallel to moves only, never has an outcome slot.
     let mut flat_clocks = vec![0u16; n * max_ply];
     let mut lengths_out = Vec::with_capacity(n);
     let mut orig_lengths_out = Vec::with_capacity(n);
     let mut outcome_tokens_out = Vec::with_capacity(n);
+    let mut san_out: Vec<Vec<String>> = Vec::with_capacity(n);
+    let mut uci_out: Vec<Vec<String>> = Vec::with_capacity(n);
 
     let mut result_out = Vec::with_capacity(n);
     let mut white_out = Vec::with_capacity(n);
@@ -996,12 +1009,18 @@ fn parse_pgn_lichess<'py>(
     let mut datetime_out = Vec::with_capacity(n);
     let mut site_out = Vec::with_capacity(n);
 
-    for (gi, g) in games.iter().enumerate() {
-        // tokens includes outcome at [0], moves at [1..=game_length]
+    for (gi, g) in games.into_iter().enumerate() {
         let tok_offset = gi * seq_len;
+        let move_start = if prepend_outcome {
+            flat_tokens[tok_offset] = g.outcome_token as i16;
+            1
+        } else {
+            0
+        };
         for (t, &tok) in g.tokens.iter().enumerate() {
-            if t < seq_len {
-                flat_tokens[tok_offset + t] = tok as i16;
+            let slot = move_start + t;
+            if slot < seq_len {
+                flat_tokens[tok_offset + slot] = tok as i16;
             }
         }
 
@@ -1016,6 +1035,8 @@ fn parse_pgn_lichess<'py>(
         lengths_out.push(g.game_length as u16);
         orig_lengths_out.push(g.original_length as u32);
         outcome_tokens_out.push(g.outcome_token);
+        san_out.push(g.san_moves);
+        uci_out.push(g.uci_moves);
 
         let h = &g.headers;
         white_elo_out.push(h.get("WhiteElo").and_then(|s| s.parse::<u16>().ok()).unwrap_or(0));
@@ -1054,6 +1075,8 @@ fn parse_pgn_lichess<'py>(
     dict.set_item("game_lengths", lengths_arr)?;
     dict.set_item("original_lengths", orig_lengths_arr)?;
     dict.set_item("outcome_tokens", outcome_tokens_arr)?;
+    dict.set_item("san", san_out)?;
+    dict.set_item("uci", uci_out)?;
     dict.set_item("white_elo", white_elo_arr)?;
     dict.set_item("black_elo", black_elo_arr)?;
     dict.set_item("white_rating_diff", white_rd_arr)?;

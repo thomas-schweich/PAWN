@@ -79,13 +79,22 @@ pub fn parse_pgn_enriched(
         .collect()
 }
 
-/// A Lichess game parsed with outcome token prepended and no eval column.
+/// A Lichess game parsed from PGN with outcome classified separately.
+///
+/// The token sequence is pure moves; the outcome token is returned in its
+/// own `outcome_token` field and consumers can opt in to prepending it via
+/// the `prepend_outcome` flag on `parse_pgn_lichess` (lib.rs).
 pub struct LichessGame {
-    /// PAWN token sequence: [outcome_token, ply_1, ..., ply_N].
+    /// PAWN token sequence: pure moves `[ply_1, ..., ply_N]`.
     pub tokens: Vec<u16>,
-    /// Seconds remaining on clock after each ply (parallel to moves, not outcome).
+    /// Raw SAN strings parsed from the PGN movetext, parallel to `tokens`.
+    pub san_moves: Vec<String>,
+    /// UCI strings derived from `tokens` via `vocab::token_to_uci`,
+    /// parallel to `tokens`.
+    pub uci_moves: Vec<String>,
+    /// Seconds remaining on clock after each ply (parallel to `tokens`).
     pub clocks: Vec<u16>,
-    /// Number of move plies (excluding outcome token).
+    /// Number of move plies.
     pub game_length: usize,
     /// Original game length before truncation (for detecting >max_ply games).
     pub original_length: usize,
@@ -95,14 +104,17 @@ pub struct LichessGame {
     pub headers: HashMap<String, String>,
 }
 
-/// Parse Lichess PGN into games with outcome tokens prepended.
+/// Parse Lichess PGN into games with outcome classified separately.
 ///
 /// For each game:
 /// 1. Replays ALL moves (even beyond max_ply) to determine checkmate/stalemate
 /// 2. Classifies outcome using Termination header + board state
-/// 3. Prepends the outcome token to the (truncated) move sequence
-/// 4. Filters out Abandoned, Rules infraction, Unterminated games
-/// 5. Drops eval annotations (not included in output)
+/// 3. Keeps tokens as pure moves; the outcome is returned in `outcome_token`
+///    and the PyO3 wrapper can optionally prepend it to the token array.
+/// 4. Collects raw SAN (as-parsed from PGN) and UCI (derived from tokens) lists
+///    parallel to `tokens`.
+/// 5. Filters out Abandoned, Rules infraction, Unterminated games
+/// 6. Drops eval annotations (not included in output)
 pub fn parse_pgn_lichess(
     content: &str,
     max_ply: usize,
@@ -141,16 +153,28 @@ pub fn parse_pgn_lichess(
                 truncated,
             )?; // None = filtered out (Abandoned, Rules infraction, etc.)
 
-            // Build token sequence: [outcome, ply_1, ..., ply_N]
-            let mut tokens = Vec::with_capacity(result.n_tokenized + 1);
-            tokens.push(outcome);
-            tokens.extend_from_slice(&result.tokens);
+            // Tokens are pure moves; outcome is returned separately.
+            let tokens = result.tokens;
+
+            // SAN strings are what the PGN actually wrote (e.g. "Nbd2"),
+            // trimmed to the number of moves that tokenized successfully.
+            let san_moves: Vec<String> = san_moves.into_iter().take(result.n_tokenized).collect();
+
+            // UCI strings are derived from tokens via O(1) vocab lookup
+            // (no second board replay). Unwrap is safe because every token
+            // produced by `san_moves_to_tokens_full` is a legal action.
+            let uci_moves: Vec<String> = tokens
+                .iter()
+                .map(|&t| vocab::token_to_uci(t).expect("tokenized move must have UCI"))
+                .collect();
 
             // Trim clocks to match tokenized moves
             let clocks = clocks_raw.into_iter().take(result.n_tokenized).collect();
 
             Some(LichessGame {
                 tokens,
+                san_moves,
+                uci_moves,
                 clocks,
                 game_length: result.n_tokenized,
                 original_length: result.n_total_moves,
@@ -1091,7 +1115,9 @@ mod tests {
         assert_eq!(games.len(), 1);
         let g = &games[0];
         assert_eq!(g.outcome_token, crate::vocab::WHITE_CHECKMATES);
-        assert_eq!(g.tokens[0], crate::vocab::WHITE_CHECKMATES);
+        assert_eq!(g.tokens.len(), 7);
+        assert_eq!(g.san_moves.len(), 7);
+        assert_eq!(g.uci_moves.len(), 7);
         assert_eq!(g.game_length, 7);
         assert_eq!(g.original_length, 7);
     }
@@ -1109,7 +1135,8 @@ mod tests {
         assert_eq!(games.len(), 1);
         let g = &games[0];
         assert_eq!(g.outcome_token, crate::vocab::BLACK_RESIGNS);
-        assert_eq!(g.tokens[0], crate::vocab::BLACK_RESIGNS);
+        // Tokens are pure moves now — outcome is in g.outcome_token only.
+        assert_eq!(g.tokens.len(), g.game_length);
     }
 
     #[test]
@@ -1178,8 +1205,10 @@ mod tests {
         assert_eq!(g.outcome_token, crate::vocab::PLY_LIMIT);
         assert_eq!(g.game_length, 2);
         assert_eq!(g.original_length, 4);
-        // tokens: [PLY_LIMIT, ply_1, ply_2]
-        assert_eq!(g.tokens.len(), 3);
+        // tokens: pure moves, length == game_length
+        assert_eq!(g.tokens.len(), 2);
+        assert_eq!(g.san_moves.len(), 2);
+        assert_eq!(g.uci_moves.len(), 2);
     }
 
     #[test]
@@ -1318,7 +1347,7 @@ mod tests {
         assert_eq!(games.len(), 1);
         let g = &games[0];
         assert_eq!(g.outcome_token, crate::vocab::BLACK_CHECKMATES);
-        assert_eq!(g.tokens[0], crate::vocab::BLACK_CHECKMATES);
+        assert_eq!(g.tokens.len(), g.game_length);
     }
 
     #[test]
@@ -1490,7 +1519,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lichess_outcome_token_is_first() {
+    fn test_lichess_tokens_are_pure_moves_with_separate_outcome() {
         let pgn = r#"[Event "Rated Blitz game"]
 [Result "1-0"]
 [Termination "Time forfeit"]
@@ -1499,9 +1528,12 @@ mod tests {
 "#;
         let games = parse_pgn_lichess(pgn, 255, 100, 1);
         let g = &games[0];
-        // First token is outcome, second is e2e4
-        assert_eq!(g.tokens[0], crate::vocab::WHITE_WINS_ON_TIME);
+        // Tokens are pure moves — outcome is in the separate `outcome_token` field.
+        assert_eq!(g.outcome_token, crate::vocab::WHITE_WINS_ON_TIME);
         let e2e4 = crate::vocab::uci_token("e2e4");
-        assert_eq!(g.tokens[1], e2e4);
+        let e7e5 = crate::vocab::uci_token("e7e5");
+        assert_eq!(g.tokens, vec![e2e4, e7e5]);
+        assert_eq!(g.san_moves, vec!["e4".to_string(), "e5".to_string()]);
+        assert_eq!(g.uci_moves, vec!["e2e4".to_string(), "e7e5".to_string()]);
     }
 }

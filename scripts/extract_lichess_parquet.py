@@ -234,7 +234,8 @@ def process_train_month(
 
             t0 = time.monotonic()
             parsed = chess_engine.parse_pgn_lichess(
-                pgn_text, max_ply=MAX_PLY, max_games=batch_size * 2, min_ply=1
+                pgn_text, max_ply=MAX_PLY, max_games=batch_size * 2, min_ply=1,
+                prepend_outcome=True,
             )
             dt = time.monotonic() - t0
 
@@ -312,7 +313,8 @@ def process_holdout_month(
 
             t0 = time.monotonic()
             parsed = chess_engine.parse_pgn_lichess(
-                pgn_text, max_ply=MAX_PLY, max_games=batch_size * 2, min_ply=1
+                pgn_text, max_ply=MAX_PLY, max_games=batch_size * 2, min_ply=1,
+                prepend_outcome=True,
             )
             dt = time.monotonic() - t0
 
