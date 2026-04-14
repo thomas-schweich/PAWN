@@ -11,10 +11,8 @@
 #   docker run \
 #     -e MONTHS="2025-01 2025-02 2025-03" \
 #     -e HOLDOUT_MONTH="2026-01" \
-#     -e HOLDOUT_GAMES=50000 \
 #     -e HF_TOKEN=... \
-#     -e HF_REPO=thomas-schweich/pawn-lichess-full \
-#     -v /workspace:/workspace \
+#     -e DEST_REPO=thomas-schweich/pawn-lichess \
 #     thomasschweich/pawn-lichess-extract:latest
 
 # ── Build Rust engine wheel ────────────────────────────────────────────

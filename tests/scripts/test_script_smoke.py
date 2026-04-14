@@ -50,7 +50,6 @@ ARGPARSE_SCRIPTS = [
     "generate_model_cards.py",
     "generate_stockfish_data.py",
     "profile_step.py",
-    "rebuild_lichess_parquet.py",
     "run_evals_local.py",
     "run_evals_toplayer.py",
     "split_dataset.py",

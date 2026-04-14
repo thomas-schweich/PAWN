@@ -1,30 +1,35 @@
 #!/bin/bash
 # Lichess PGN -> PAWN Parquet extraction entrypoint.
-# Downloads monthly database dumps, parses via Rust engine, writes sharded
-# Parquet with train/val/test splits, and optionally pushes to HuggingFace.
+# Streams monthly database dumps, parses via the Rust engine, and uploads
+# each shard to a HuggingFace dataset repo as it's written.
 #
 # Required env vars:
-#   MONTHS          — space-separated training months (e.g., "2025-01 2025-02 2025-03")
+#   MONTHS              — space-separated training months (e.g., "2025-01 2025-02")
+#   DEST_REPO           — destination HuggingFace dataset repo
 #
 # Optional env vars:
-#   HF_TOKEN        — HuggingFace token (for pushing dataset)
-#   HF_REPO         — HuggingFace dataset repo (e.g., "thomas-schweich/pawn-lichess-full")
-#   HOLDOUT_MONTH   — month for val/test (e.g., "2023-12")
-#   HOLDOUT_GAMES   — games per split from holdout month (default: 50000)
-#   BATCH_SIZE      — games per parsing batch (default: 500000)
-#   SHARD_SIZE      — games per output shard (default: 1000000)
-#   MAX_GAMES       — stop after this many training games (for testing)
-#   OUTPUT_DIR      — output directory (default: /workspace/lichess-parquet)
-#   SEED            — random seed for holdout sampling (default: 42)
+#   HF_TOKEN            — HuggingFace token (also writes to ~/.cache/huggingface/token)
+#   HOLDOUT_MONTH       — month for val/test splits (e.g., "2026-01")
+#   VAL_DAYS            — day range for validation split (e.g., "1-3")
+#   TEST_DAYS           — day range for test split (e.g., "15-17")
+#   REVISION            — destination branch (default: "run/extract")
+#   MAX_PLY             — ply cap per game (default: 512)
+#   BATCH_SIZE          — games per parsing batch (default: 500000)
+#   SHARD_SIZE          — games per output parquet shard (default: 1000000)
+#   JOBS                — parallel worker processes (default: 4)
+#   THREADS_PER_WORKER  — rayon/polars threads per worker (default: 2)
+#   SCRATCH_DIR         — local staging dir (default: /dev/shm/pawn-lichess-extract)
+#   MAX_GAMES_PER_MONTH — cap games per month, for smoke tests
+#   FORCE               — set to 1 to ignore existing sentinels and re-extract
 set -euo pipefail
 
 echo "=== Lichess Parquet Extraction ==="
-echo "  Training months: ${MONTHS:?MONTHS env var is required}"
-echo "  Holdout month: ${HOLDOUT_MONTH:-none}"
-echo "  Holdout games/split: ${HOLDOUT_GAMES:-50000}"
-echo "  HF Repo: ${HF_REPO:-none}"
-echo "  Batch size: ${BATCH_SIZE:-500000}"
-echo "  Shard size: ${SHARD_SIZE:-1000000}"
+echo "  Training months:   ${MONTHS:?MONTHS env var is required}"
+echo "  Destination repo:  ${DEST_REPO:?DEST_REPO env var is required}"
+echo "  Revision:          ${REVISION:-run/extract}"
+echo "  Holdout month:     ${HOLDOUT_MONTH:-none}"
+echo "  Jobs:              ${JOBS:-4}"
+echo "  Threads/worker:    ${THREADS_PER_WORKER:-2}"
 echo ""
 
 # Persist HF token if provided
@@ -40,9 +45,14 @@ python3 -c "import zstandard" 2>/dev/null || pip install --no-cache-dir zstandar
 # Build the command as an array to avoid shell injection
 CMD=(python3 /opt/pawn/scripts/extract_lichess_parquet.py
     --months $MONTHS
-    --output "${OUTPUT_DIR:-/workspace/lichess-parquet}"
+    --dest-repo "$DEST_REPO"
+    --revision "${REVISION:-run/extract}"
+    --max-ply "${MAX_PLY:-512}"
     --batch-size "${BATCH_SIZE:-500000}"
     --shard-size "${SHARD_SIZE:-1000000}"
+    --jobs "${JOBS:-4}"
+    --threads-per-worker "${THREADS_PER_WORKER:-2}"
+    --scratch-dir "${SCRATCH_DIR:-/dev/shm/pawn-lichess-extract}"
 )
 
 if [ -n "${HOLDOUT_MONTH:-}" ]; then
@@ -54,11 +64,11 @@ fi
 if [ -n "${TEST_DAYS:-}" ]; then
     CMD+=(--test-days "$TEST_DAYS")
 fi
-if [ -n "${HF_REPO:-}" ]; then
-    CMD+=(--hf-repo "$HF_REPO")
+if [ -n "${MAX_GAMES_PER_MONTH:-}" ]; then
+    CMD+=(--max-games-per-month "$MAX_GAMES_PER_MONTH")
 fi
-if [ -n "${MAX_GAMES:-}" ]; then
-    CMD+=(--max-games "$MAX_GAMES")
+if [ -n "${FORCE:-}" ] && [ "${FORCE}" != "0" ]; then
+    CMD+=(--force)
 fi
 
 echo "Running: ${CMD[*]}"
