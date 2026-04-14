@@ -167,18 +167,36 @@ def evaluate_on_lichess(
         # pure-move sequences so predictions live at positions 0..gl-1.
         dummy_outcomes = torch.full((n,), PLY_LIMIT, dtype=torch.long)
 
-        # Reserve one slot for the outcome token before stripping so games
-        # that exactly fill the context window don't lose their last ply.
-        engine_max_ply = max_seq_len - 1
+        # Build the raw-move array at the full context length, then let
+        # ``pack_clm_sequences`` reserve the outcome slot. Capping at
+        # ``max_seq_len - 1`` up front would drop the last in-window ply
+        # of long games in pure-moves mode — the outcome slot is
+        # stripped again via ``strip_outcome_token`` so we can afford
+        # the full ``max_seq_len`` plies of raw moves.
+        engine_max_ply = max_seq_len if not prepend_outcome else max_seq_len - 1
         padded = np.zeros((n, engine_max_ply), dtype=move_ids.dtype)
         for i in range(n):
             gl = min(int(game_lengths[i]), engine_max_ply)
             padded[i, :gl] = move_ids[i, :gl]
         game_lengths_capped = np.minimum(game_lengths, engine_max_ply).astype(np.int16)
 
-        batch = pack_clm_sequences(padded, game_lengths_capped, dummy_outcomes, max_seq_len)
+        # ``pack_clm_sequences`` expects ``move_ids`` shape to fit into
+        # ``seq_len - 1``. In pure-moves mode we built ``padded`` at the
+        # full ``max_seq_len``, so pass ``seq_len = max_seq_len + 1``
+        # here and let ``strip_outcome_token`` slice back down to
+        # ``max_seq_len``.
+        pack_seq_len = max_seq_len + 1 if not prepend_outcome else max_seq_len
+        batch = pack_clm_sequences(padded, game_lengths_capped, dummy_outcomes, pack_seq_len)
         if not prepend_outcome:
             batch = strip_outcome_token(batch)
+            # strip_outcome_token shifts left by 1 but preserves
+            # ``seq_len``. Truncate the (B, T) tensors back down so
+            # downstream logits indexing matches ``max_seq_len``;
+            # scalar metadata entries (``prepend_outcome``) stay as-is.
+            batch = {
+                k: (v[:, :max_seq_len] if v.ndim >= 2 else v)
+                for k, v in batch.items()
+            }
 
         input_ids = batch["input_ids"]
         targets = batch["targets"]
