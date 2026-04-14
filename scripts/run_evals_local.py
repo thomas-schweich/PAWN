@@ -43,23 +43,17 @@ def main():
         "large": {"path": "data/eval_large/checkpoints/step_00100000", "cfg": CLMConfig.large()},
     }
 
-    print("Generating probe data...", flush=True)
-    # Probe data max_ply matches the model context length; evaluation
-    # below clamps to the actual loaded model's max_seq_len.
-    probe_max_ply = 512
-    train_data = extract_probe_data(
-        args.n_probe_train, probe_max_ply, seed=12345,
-        prepend_outcome=args.prepend_outcome,
-    )
-    val_data = extract_probe_data(
-        args.n_probe_val, probe_max_ply, seed=54321,
-        prepend_outcome=args.prepend_outcome,
-    )
-    print("Done.", flush=True)
-
     print("Generating diagnostic corpus...", flush=True)
     corpus = generate_diagnostic_corpus(n_per_category=args.n_per_category)
     positions = extract_diagnostic_positions(corpus, max_per_category=args.n_per_category)
+
+    # Probe data is sized per variant from the loaded model's
+    # ``max_seq_len`` so it works on 256-ctx and 512-ctx checkpoints
+    # alike. Probe hidden-state extraction in ``train_all_probes`` also
+    # needs to know where moves start: set ``no_outcome_token`` to the
+    # inverse of ``prepend_outcome`` so the probe slicing matches the
+    # checkpoint's training-time layout.
+    no_outcome_token = not args.prepend_outcome
 
     for name, info in variants.items():
         sep = "=" * 60
@@ -73,12 +67,24 @@ def main():
         model.eval()
         print(f"Loaded: {sum(p.numel() for p in model.parameters()):,} params", flush=True)
 
+        probe_max_ply = model.cfg.max_seq_len
+        print(f"Generating probe data (max_ply={probe_max_ply})...", flush=True)
+        train_data = extract_probe_data(
+            args.n_probe_train, probe_max_ply, seed=12345,
+            prepend_outcome=args.prepend_outcome,
+        )
+        val_data = extract_probe_data(
+            args.n_probe_val, probe_max_ply, seed=54321,
+            prepend_outcome=args.prepend_outcome,
+        )
+
         results = {}
 
         print("\nRunning probes...", flush=True)
         probe_results = train_all_probes(
             model, train_data, val_data, device=device,
             per_layer=True, n_epochs=args.n_epochs, verbose=True,
+            no_outcome_token=no_outcome_token,
         )
         results["probes"] = probe_results
 
@@ -94,7 +100,7 @@ def main():
             json.dump(results, f, indent=2, default=str)
         print(f"Saved: {out_path}", flush=True)
 
-        del model, state_dict
+        del model, state_dict, train_data, val_data
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
