@@ -135,51 +135,46 @@ def _process_shard_tokens(
     game_lengths_col: list[int] | np.ndarray,
     outcome_tokens_col: list[int] | np.ndarray,
     max_ply: int,
+    prepend_outcome: bool,
 ) -> dict[str, torch.Tensor | np.ndarray]:
-    """Convert parquet shard rows into outcome-prefixed training tensors.
+    """Convert parquet shard rows into training tensors.
 
-    Expects the pure-moves parquet layout written by the current
-    ``extract_lichess_parquet.py``: ``token_lists[i]`` contains only the
-    move tokens for game ``i``, and ``game_lengths_col[i]`` /
+    Expects the pure-moves parquet layout written by
+    ``scripts/extract_lichess_parquet.py``: ``token_lists[i]`` contains
+    only the move tokens for game ``i``, and ``game_lengths_col[i]`` /
     ``outcome_tokens_col[i]`` come directly from the parquet columns of
     the same name.
 
-    Produces outcome-prefixed ``input_ids`` of shape ``(N, max_ply + 1)``
-    matching ``_prepare_v2_tokens`` / ``pack_clm_sequences`` — position 0
-    holds the outcome token from the parquet column and positions
-    ``1..game_length`` hold the move tokens. The Lichess training path
-    consumes this layout verbatim.
+    ``prepend_outcome=False`` emits pure-moves tensors of shape
+    ``(N, max_ply)`` with moves at positions ``0..game_length-1``.
+    ``prepend_outcome=True`` emits outcome-prefixed tensors of shape
+    ``(N, max_ply + 1)`` with the outcome at slot 0 and moves at
+    ``1..game_length+1``. Both paths run through ``pack_clm_sequences``
+    so the shape/loss-mask semantics match what the trainer expects.
     """
-    N = len(token_lists)
-    seq_len = max_ply + 1
-    game_lengths = np.asarray(game_lengths_col, dtype=np.int16)
-    np.minimum(game_lengths, max_ply, out=game_lengths)  # cap in place
-    outcomes = np.asarray(outcome_tokens_col, dtype=np.int64)
-    move_ids = np.zeros((N, max_ply), dtype=np.int16)
+    from pawn.data import pack_clm_sequences
 
-    # Bulk numpy construction: outcome at [0], moves at [1..gl+1], PAD after.
-    ids_np = np.zeros((N, seq_len), dtype=np.int64)
-    ids_np[:, 0] = outcomes
+    N = len(token_lists)
+    game_lengths = np.asarray(game_lengths_col, dtype=np.int16).copy()
+    np.minimum(game_lengths, max_ply, out=game_lengths)
+    outcomes = torch.tensor(outcome_tokens_col, dtype=torch.long)
+
+    move_ids = np.zeros((N, max_ply), dtype=np.int16)
     for i, toks in enumerate(token_lists):
         n_moves = int(game_lengths[i])
         if n_moves > 0:
-            # `toks` may be longer than game_length if max_ply is smaller
-            # than the stored game; clamp to n_moves.
-            move_slice = toks[:n_moves]
-            ids_np[i, 1 : 1 + n_moves] = move_slice
-            move_ids[i, :n_moves] = move_slice
-    input_ids = torch.from_numpy(ids_np)
+            move_ids[i, :n_moves] = toks[:n_moves]
 
-    capped_lengths = torch.from_numpy(game_lengths).long()
-    targets = torch.zeros(N, seq_len, dtype=torch.long)
-    targets[:, :-1] = input_ids[:, 1:]
-    positions = torch.arange(seq_len).unsqueeze(0)
-    loss_mask = positions <= capped_lengths.unsqueeze(1)
+    seq_len = max_ply + 1 if prepend_outcome else max_ply
+    batch = pack_clm_sequences(
+        move_ids, game_lengths, outcomes, seq_len,
+        prepend_outcome=prepend_outcome,
+    )
 
     return {
-        "input_ids": input_ids,
-        "targets": targets,
-        "loss_mask": loss_mask,
+        "input_ids": batch["input_ids"],
+        "targets": batch["targets"],
+        "loss_mask": batch["loss_mask"],
         "move_ids": move_ids,
         "game_lengths": game_lengths,
     }
@@ -221,6 +216,7 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         shuffle_buffer: int = 50_000,
         seed: int = 42,
         cache_dir: str | None = None,
+        prepend_outcome: bool = False,
     ):
         # If cache_dir is set and repo is remote, prefetch filtered shards
         if cache_dir and not _is_local_path(hf_repo):
@@ -236,7 +232,8 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         self.elo_max = elo_max
         self.min_ply = min_ply
         self.max_ply = max_ply
-        self.seq_len = max_ply + 1
+        self.prepend_outcome = prepend_outcome
+        self.seq_len = max_ply + 1 if prepend_outcome else max_ply
         self.max_games = max_games
         self.shuffle_buffer_size = shuffle_buffer
         self.seed = seed
@@ -376,6 +373,7 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
                 df["game_length"].to_list(),
                 df["outcome_token"].to_list(),
                 self.max_ply,
+                self.prepend_outcome,
             )
 
             n = len(token_lists)
@@ -416,8 +414,12 @@ def load_val_shards(
     max_ply: int = 255,
     max_games: int = 50_000,
     cache_dir: str | None = None,
+    prepend_outcome: bool = False,
 ) -> dict:
     """Load validation data eagerly (small, needs to be stable across epochs).
+
+    ``prepend_outcome`` selects the training-tensor layout — default False
+    (pure moves) matches the loader and trainer defaults.
 
     Returns a dict compatible with LichessDataset.
     """
@@ -474,6 +476,7 @@ def load_val_shards(
 
     result: dict = _process_shard_tokens(
         all_tokens, all_game_lengths, all_outcome_tokens, max_ply,
+        prepend_outcome,
     )
     result["n_games"] = len(all_tokens)
     return result

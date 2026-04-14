@@ -106,7 +106,6 @@ class TrainingConfig:
     pause_after_steps: int | None = None
 
     # Ablations
-    no_outcome_token: bool = False  # Deprecated: sequences are pure moves by default
     prepend_outcome: bool = False  # Prepend outcome token at position 0 for outcome-conditioned training
     mate_boost: float = 0.0  # Probability of taking mate-in-1 (0.0=random, 1.0=always)
 

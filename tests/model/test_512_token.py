@@ -242,20 +242,26 @@ class TestOutcomeTokens512:
 class TestRustPythonParity512:
     @pytest.mark.integration
     def test_rust_clm_matches_python_pack_at_512(self):
-        """Rust generate_clm_batch (prepend_outcome=True) and Python _to_clm_batch agree at seq_len=512.
-
-        _to_clm_batch always prepends outcome tokens, so the Rust side must use
-        prepend_outcome=True for the outputs to match.
-        """
+        """Rust generate_clm_batch and Python _to_clm_batch agree at seq_len=512
+        in both pure-moves and outcome-prepended modes."""
         seq_len = 512
         B = 16
-        r_input_ids, r_targets, r_loss_mask, r_move_ids, r_gl, r_tc = (
-            engine.generate_clm_batch(B, seq_len, seed=42, prepend_outcome=True)
-        )
-        py_batch = _to_clm_batch(r_move_ids, r_gl, r_tc, seq_len)
-        assert torch.equal(torch.from_numpy(r_input_ids).long(), py_batch["input_ids"])
-        assert torch.equal(torch.from_numpy(r_targets).long(), py_batch["targets"])
-        assert torch.equal(torch.from_numpy(r_loss_mask), py_batch["loss_mask"])
+        for prepend in (False, True):
+            r_input_ids, r_targets, r_loss_mask, r_move_ids, r_gl, r_tc = (
+                engine.generate_clm_batch(B, seq_len, seed=42, prepend_outcome=prepend)
+            )
+            py_batch = _to_clm_batch(
+                r_move_ids, r_gl, r_tc, seq_len, prepend_outcome=prepend,
+            )
+            assert torch.equal(torch.from_numpy(r_input_ids).long(), py_batch["input_ids"]), (
+                f"input_ids mismatch at prepend_outcome={prepend}"
+            )
+            assert torch.equal(torch.from_numpy(r_targets).long(), py_batch["targets"]), (
+                f"targets mismatch at prepend_outcome={prepend}"
+            )
+            assert torch.equal(torch.from_numpy(r_loss_mask), py_batch["loss_mask"]), (
+                f"loss_mask mismatch at prepend_outcome={prepend}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -364,48 +370,6 @@ class TestLegalGrid512:
                 assert n_legal > 0, f"No legal moves at ply 256 for game {b} (gl={gl})"
                 found_late = True
         assert found_late, "No games long enough to test late-ply legal grid"
-
-
-class TestStripOutcomeMetadata:
-    """strip_outcome_token must produce a batch that downstream eval can
-    consume without shape mismatches. Regression for the `no_outcome=True`
-    + `prepend_outcome=True` combo where stale move_ids + prepend_outcome
-    flags survived the strip and broke the game-completion eval path."""
-
-    @pytest.mark.integration
-    def test_strip_overwrites_outcome_metadata(self):
-        val = create_validation_set(
-            n_games=8, max_ply=64, seed=42,
-            prepend_outcome=True, no_outcome=True,
-        )
-        # After stripping, the batch must look pure-moves to downstream:
-        assert bool(val["prepend_outcome"].item()) is False
-        # move_ids should match the new pure-moves input_ids shape, not
-        # the original (B, max_ply-1) raw shape.
-        assert val["move_ids"].shape == val["input_ids"].shape
-
-    @pytest.mark.integration
-    def test_strip_batch_runs_through_game_completion(self):
-        """End-to-end: the stripped batch must feed cleanly into
-        eval_game_completion_metrics without raising."""
-        from pawn.config import CLMConfig
-        from pawn.model import PAWNCLM
-        from pawn.trainer import eval_game_completion_metrics
-
-        val = create_validation_set(
-            n_games=4, max_ply=32, seed=42,
-            prepend_outcome=True, no_outcome=True,
-        )
-        cfg = CLMConfig.toy()
-        cfg.max_seq_len = 32
-        torch.manual_seed(0)
-        model = PAWNCLM(cfg).to("cpu").eval()
-        out = eval_game_completion_metrics(
-            model, val,
-            batch_size=2, vocab_size=cfg.vocab_size,
-            device="cpu", use_amp=False,
-        )
-        assert "val/game_completion_rate" in out
 
 
 class TestLegalGridOutcomePrepended:

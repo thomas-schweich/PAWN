@@ -81,7 +81,7 @@ You drive the loop manually. At each check-in:
 - Key tunable parameters:
   - **Architecture:** `d_model`, `n_layers`, `n_heads`, `d_ff` (override variant defaults)
   - **Sequence length:** `max_seq_len` (default 512 for long-game training)
-  - **Data generation:** `mate_boost` (0.0-1.0), `discard_ply_limit` (bool), `no_outcome_token` (bool — strips outcome conditioning)
+  - **Data generation:** `mate_boost` (0.0-1.0), `discard_ply_limit` (bool), `prepend_outcome` (bool — opt in to outcome-prefixed sequences; default pure moves)
   - **Training:** `lr`, `batch_size`, `accumulation_steps`, `warmup_frac`, `weight_decay`
   - **Validation:** `val_games` (default 512; bump to 2048+ for finer forfeit-rate detection)
   - **Early stopping:** `patience` (evals without improvement), `legality_late_ply` (ply threshold for late-game legality, defaults to `max_seq_len // 2`)

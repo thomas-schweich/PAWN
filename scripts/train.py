@@ -48,8 +48,8 @@ def _parse_cli(argv: list[str] | None = None) -> dict[str, Any]:
 
     Notes:
       Fields whose negative is baked into the name (``no_compile``,
-      ``no_outcome_token``, ``no_adapt_attn``, ``no_adapt_ffn``, etc.)
-      are set via the ordinary ``--no-compile`` form — we do *not*
+      ``no_adapt_attn``, ``no_adapt_ffn``, etc.) are set via the
+      ordinary ``--no-compile`` form — we do *not*
       strip a leading ``no-`` to negate some other field. Inverting an
       existing positive bool flag isn't supported on the CLI; use a
       JSON config with ``{"field": false}`` for that.
@@ -217,7 +217,6 @@ def run_pretrain(config: PretrainConfig) -> None:
         train_cfg.warmup_steps = int(config.warmup_frac * train_cfg.total_steps)
     train_cfg.max_grad_norm = config.max_grad_norm
     train_cfg.discard_ply_limit = config.discard_ply_limit
-    train_cfg.no_outcome_token = config.no_outcome_token
     train_cfg.prepend_outcome = config.prepend_outcome
     train_cfg.mate_boost = config.mate_boost
     train_cfg.log_interval = config.log_interval
@@ -388,6 +387,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
             min_ply=args.min_ply,
             max_games=args.val_games,
             cache_dir=args.cache_dir,
+            prepend_outcome=config.prepend_outcome,
         )
         val_ds = LichessDataset(val_data, start=0, end=val_data["n_games"])
         train_ds = ShardedLichessDataset(
@@ -397,6 +397,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
             min_ply=args.min_ply,
             max_games=args.max_games,
             cache_dir=args.cache_dir,
+            prepend_outcome=config.prepend_outcome,
         )
         print(
             f"  Val: {len(val_ds):,} games, "
@@ -409,6 +410,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
             max_ply=255,
             max_games=args.max_games or 1_000_000,
             min_ply=args.min_ply,
+            prepend_outcome=config.prepend_outcome,
         )
         n_total = data["n_games"]
         n_val = min(args.val_games, n_total // 5)
@@ -417,7 +419,8 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         train_ds = LichessDataset(data, start=0, end=n_train).share_memory()
         val_ds = LichessDataset(data, start=n_train, end=n_total)
 
-    collate = LegalMaskCollate(seq_len=max_ply + 1, vocab_size=vocab_size)
+    seq_len = max_ply + 1 if config.prepend_outcome else max_ply
+    collate = LegalMaskCollate(seq_len=seq_len, vocab_size=vocab_size)
     n_workers = args.num_workers
     train_loader = DataLoader(
         train_ds,
@@ -437,7 +440,8 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         pin_memory=True,
     )
     mask_builder = LegalMaskBuilder(
-        args.batch_size, max_ply=255, vocab_size=vocab_size, device=device
+        args.batch_size, max_ply=255, vocab_size=vocab_size, device=device,
+        prepend_outcome=config.prepend_outcome,
     )
 
     # Precompute val legal indices

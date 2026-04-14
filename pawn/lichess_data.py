@@ -16,44 +16,6 @@ import torch.utils.data
 
 import chess_engine as engine
 
-from pawn.config import (
-    OUTCOME_TOKEN_BASE,
-    WHITE_CHECKMATES,
-    BLACK_CHECKMATES,
-    DRAW_BY_RULE,
-    PLY_LIMIT,
-)
-
-
-# ---------------------------------------------------------------------------
-# PGN result → outcome token
-# ---------------------------------------------------------------------------
-
-_RESULT_MAP = {
-    "1-0": "white",
-    "0-1": "black",
-    "1/2-1/2": "draw",
-}
-
-
-def _result_to_outcome(results: list[str]) -> torch.Tensor:
-    """Map PGN result strings to outcome token IDs.
-
-    For decisive games we use the checkmate token even though the actual
-    termination was likely resignation/time — the prefix of moves is still
-    valid strategic play and the outcome token approximation is acceptable
-    per the spec (§3.4).
-    """
-    outcomes = torch.full((len(results),), PLY_LIMIT, dtype=torch.long)
-    for i, result in enumerate(results):
-        mapped = _RESULT_MAP.get(result)
-        if mapped == "white":
-            outcomes[i] = WHITE_CHECKMATES
-        elif mapped == "black":
-            outcomes[i] = BLACK_CHECKMATES
-        elif mapped == "draw":
-            outcomes[i] = DRAW_BY_RULE
-    return outcomes
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +55,13 @@ class LegalMaskBuilder:
     """
 
     def __init__(self, batch_size: int, max_ply: int, vocab_size: int = 1968,
-                 device: str = "cpu", max_index_buf: int = 4_000_000):
+                 device: str = "cpu", max_index_buf: int = 4_000_000,
+                 prepend_outcome: bool = False):
         self.vocab_size = vocab_size
         self.max_ply = max_ply
-        self.T = max_ply + 1  # seq_len = outcome token + max_ply move slots
+        # When prepend_outcome=True we reserve one extra slot for the
+        # outcome token at position 0; pure-moves mode fits in max_ply.
+        self.T = max_ply + 1 if prepend_outcome else max_ply
         self.device = device
 
         # Pre-allocated GPU output buffer
@@ -186,16 +151,18 @@ def prepare_lichess_dataset(
     min_ply: int = 10,
     elo_min: int | None = None,
     elo_max: int | None = None,
+    prepend_outcome: bool = False,
 ) -> dict:
-    """Parse a PGN or Parquet file and produce training-ready tensors.
+    """Load a pre-tokenized Lichess dataset and produce training-ready tensors.
 
-    If pgn_path ends with .parquet, delegates to prepare_lichess_parquet().
-    If pgn_path looks like a HuggingFace repo (contains '/'), loads from HF.
+    ``pgn_path`` accepts a local ``.parquet`` file path or a HuggingFace
+    dataset repo ID (contains ``/``). Raw PGN files are not supported —
+    convert them with ``scripts/extract_lichess_parquet.py`` first.
 
     Returns dict with:
         move_ids:       (N, max_ply) int16 — tokenized moves
         game_lengths:   (N,) int16
-        input_ids:      (N, seq_len) long — [outcome, move_0, ..., PAD]
+        input_ids:      (N, seq_len) long
         targets:        (N, seq_len) long — shifted left
         loss_mask:      (N, seq_len) bool
         n_games:        int
@@ -206,6 +173,7 @@ def prepare_lichess_dataset(
             parquet_path=pgn_path_str, max_ply=max_ply,
             max_games=max_games, min_ply=min_ply,
             elo_min=elo_min, elo_max=elo_max,
+            prepend_outcome=prepend_outcome,
         )
     # Check if it looks like a HF repo ID (e.g. "user/dataset")
     if "/" in pgn_path_str and not Path(pgn_path_str).exists():
@@ -213,51 +181,13 @@ def prepare_lichess_dataset(
             hf_repo=pgn_path_str, max_ply=max_ply,
             max_games=max_games, min_ply=min_ply,
             elo_min=elo_min, elo_max=elo_max,
+            prepend_outcome=prepend_outcome,
         )
-    if elo_min is not None or elo_max is not None:
-        raise ValueError("Elo filtering requires Parquet data (PGN files lack Elo columns)")
-    pgn_path = Path(pgn_path)
-
-    # Parse with min_ply=1 so every parseable game appears in the output,
-    # keeping result extraction aligned.  We apply min_ply in Python below.
-    print(f"Parsing PGN: {pgn_path}")
-    move_ids, game_lengths, n_parsed = engine.parse_pgn_file(
-        str(pgn_path), max_ply=max_ply, max_games=max_games, min_ply=1,
+    raise ValueError(
+        f"prepare_lichess_dataset accepts only .parquet files or HF dataset "
+        f"repo IDs; got {pgn_path_str!r}. Convert raw PGN with "
+        "scripts/extract_lichess_parquet.py first."
     )
-    N = move_ids.shape[0]
-    print(f"  Parsed {n_parsed} PGN games, {N} tokenized")
-
-    move_ids = move_ids[:N]
-    game_lengths = game_lengths[:N]
-
-    # Extract results — aligned with engine output since min_ply=1
-    results = _extract_results(pgn_path, n_parsed)[:N]
-
-    # Apply min_ply filter in Python on aligned arrays
-    if min_ply > 1:
-        keep = game_lengths >= min_ply
-        move_ids = move_ids[keep]
-        game_lengths = game_lengths[keep]
-        results = [r for r, k in zip(results, keep) if k]
-        N = len(results)
-        print(f"  After min_ply={min_ply} filter: {N} games")
-
-    outcome_tokens = _result_to_outcome(results)
-
-    seq_len = max_ply + 1  # outcome token + max_ply move slots
-
-    from pawn.data import pack_clm_sequences
-    batch = pack_clm_sequences(move_ids, game_lengths, outcome_tokens, seq_len)
-
-    return {
-        "move_ids": move_ids,
-        "game_lengths": game_lengths,
-        "input_ids": batch["input_ids"],
-        "targets": batch["targets"],
-        "loss_mask": batch["loss_mask"],
-        "outcome_tokens": outcome_tokens,
-        "n_games": N,
-    }
 
 
 def _scan_parquet(
@@ -303,18 +233,21 @@ def prepare_lichess_parquet(
     split: str = "train",
     elo_min: int | None = None,
     elo_max: int | None = None,
+    prepend_outcome: bool = False,
 ) -> dict:
     """Load a Parquet dataset and produce training-ready tensors.
 
-    Supports two Parquet formats:
-    1. **PAWN token format** (has ``tokens`` column): pre-tokenized list[int16].
-       No parsing needed — just pad and pack. Used by pawn-lichess-full and
-       stockfish-nodes1 datasets.
-    2. **Legacy PGN format** (has ``pgn`` column): SAN move text that needs
-       tokenization via the Rust engine.
+    The extractor writes one canonical schema: pure-moves ``tokens``,
+    ``game_length``, ``outcome_token`` (Rust-classified), and per-game
+    metadata columns. Parquets missing any of those columns raise an error —
+    legacy parquet layouts were removed along with the legacy vocabulary.
+
+    ``prepend_outcome=False`` (default) produces pure-moves tensors;
+    ``prepend_outcome=True`` prepends the outcome token at slot 0 for
+    outcome-conditioned training.
 
     Reads from a local Parquet file or a HuggingFace dataset repo.
-    Returns the same dict format as prepare_lichess_dataset().
+    Returns the same dict format as ``prepare_lichess_dataset``.
     """
     lf = _scan_parquet(parquet_path, hf_repo, split)
     schema = lf.collect_schema()
@@ -335,15 +268,7 @@ def prepare_lichess_parquet(
                 (pl.col("white_elo") < elo_max) & (pl.col("black_elo") < elo_max)
             )
 
-    if "tokens" in schema:
-        return _prepare_from_tokens(lf, max_ply, max_games, min_ply)
-    elif "pgn" in schema:
-        return _prepare_from_pgn(lf, max_ply, max_games, min_ply)
-    else:
-        raise ValueError(
-            f"Parquet schema must have 'tokens' or 'pgn' column, "
-            f"got: {list(schema.names())}"
-        )
+    return _prepare_from_tokens(lf, max_ply, max_games, min_ply, prepend_outcome)
 
 
 def _prepare_from_tokens(
@@ -351,140 +276,76 @@ def _prepare_from_tokens(
     max_ply: int,
     max_games: int,
     min_ply: int,
+    prepend_outcome: bool,
 ) -> dict:
-    """Load pre-tokenized PAWN format: tokens list[int16] + result str.
+    """Load the canonical Lichess parquet schema into training tensors.
 
-    Supports two token formats:
-    - **v2 (outcome-prepended)**: tokens[0] is an outcome token (>= OUTCOME_TOKEN_BASE),
-      followed by move tokens. Used by pawn-lichess-full v2+.
-    - **v1 (moves only)**: tokens are pure move IDs. Outcome is derived from the
-      ``result`` column. Used by stockfish-nodes1 and pawn-lichess-full v1.
+    Expects the schema written by ``scripts/extract_lichess_parquet.py``:
+    pure-moves ``tokens``, ``game_length``, ``outcome_token`` — all three
+    columns must be present or the caller gets a clear error.
 
-    Format is auto-detected from the first token of the first game.
+    When ``prepend_outcome=True``, emits the legacy outcome-prefixed layout
+    (outcome at slot 0, moves at slots 1..gl+1). When ``False`` (default),
+    emits pure-moves sequences that match the extractor's on-disk layout.
     """
+    schema = lf.collect_schema()
+    required = {"tokens", "game_length", "outcome_token"}
+    missing = required - set(schema.names())
+    if missing:
+        raise ValueError(
+            f"Parquet schema is missing required columns {sorted(missing)}. "
+            f"Got: {sorted(schema.names())}. Legacy v1/v2 layouts (coarse "
+            "result-derived outcomes, outcome-prefixed tokens) were removed "
+            "along with the legacy vocabulary; re-extract the dataset with "
+            "`scripts/extract_lichess_parquet.py`."
+        )
 
-    needed_cols = ["tokens", "result"]
-    if "game_length" in lf.collect_schema():
-        needed_cols.append("game_length")
-
-    df = lf.select(needed_cols).head(max_games).collect()
+    df = lf.select(
+        ["tokens", "game_length", "outcome_token", "result"],
+    ).head(max_games).collect()
     print(f"Loaded {len(df):,} games from pre-tokenized Parquet")
 
     token_lists = df["tokens"].to_list()
+    game_lengths_list = df["game_length"].to_list()
+    outcome_tokens_list = df["outcome_token"].to_list()
     N = len(token_lists)
+
+    seq_len = max_ply + 1 if prepend_outcome else max_ply
+
     if N == 0:
         return {"move_ids": np.zeros((0, max_ply), dtype=np.int16),
                 "game_lengths": np.zeros(0, dtype=np.int16),
-                "input_ids": torch.zeros(0, max_ply + 1, dtype=torch.long),
-                "targets": torch.zeros(0, max_ply + 1, dtype=torch.long),
-                "loss_mask": torch.zeros(0, max_ply + 1, dtype=torch.bool),
+                "input_ids": torch.zeros(0, seq_len, dtype=torch.long),
+                "targets": torch.zeros(0, seq_len, dtype=torch.long),
+                "loss_mask": torch.zeros(0, seq_len, dtype=torch.bool),
                 "outcome_tokens": torch.zeros(0, dtype=torch.long),
                 "n_games": 0}
 
-    # Auto-detect format: v2 has outcome token (>= 4273) at position 0
-    first_token = token_lists[0][0] if token_lists[0] else 0
-    has_outcome_token = first_token >= OUTCOME_TOKEN_BASE
-    seq_len = max_ply + 1
-
-    if has_outcome_token:
-        print(f"  Detected v2 format (outcome token prepended)")
-        return _prepare_v2_tokens(token_lists, df["result"].to_list(),
-                                  max_ply, min_ply, seq_len)
-    else:
-        print(f"  Detected v1 format (moves only, deriving outcomes from result)")
-        return _prepare_v1_tokens(token_lists, df["result"].to_list(),
-                                  max_ply, min_ply, seq_len)
-
-
-def _prepare_v2_tokens(
-    token_lists: list[list[int]],
-    results: list[str],
-    max_ply: int,
-    min_ply: int,
-    seq_len: int,
-) -> dict:
-    """Prepare training data from v2 tokens (outcome already prepended).
-
-    Uses the token sequence verbatim as input_ids — no disassembly.
-    """
-    N = len(token_lists)
-
-    game_lengths = np.zeros(N, dtype=np.int16)
-    move_ids = np.zeros((N, max_ply), dtype=np.int16)
-
-    # Bulk numpy construction to avoid per-game torch.tensor() overhead
-    ids_np = np.zeros((N, seq_len), dtype=np.int64)
-    for i, toks in enumerate(token_lists):
-        # toks = [outcome, move_1, ..., move_K]
-        n_moves = min(len(toks) - 1, max_ply)
-        game_lengths[i] = n_moves
-        length = min(len(toks), seq_len)
-        ids_np[i, :length] = toks[:length]
-        move_ids[i, :n_moves] = toks[1 : n_moves + 1]
-    input_ids = torch.from_numpy(ids_np)
-
-    # Apply min_ply filter
-    if min_ply > 1:
-        keep: np.ndarray = game_lengths >= min_ply
-        input_ids = input_ids[keep]
-        move_ids = move_ids[keep]
-        game_lengths = game_lengths[keep]
-        results = [r for r, k in zip(results, keep) if k]
-        N = len(results)
-        print(f"  After min_ply={min_ply} filter: {N:,} games")
-
-    outcome_tokens = input_ids[:, 0]
-    capped_lengths = torch.from_numpy(game_lengths).long().clamp(max=max_ply)
-
-    # Targets: input shifted left by 1
-    targets = torch.zeros(N, seq_len, dtype=torch.long)
-    targets[:, :-1] = input_ids[:, 1:]
-
-    # Loss mask: True for positions 0 through game_length
-    positions = torch.arange(seq_len).unsqueeze(0)
-    loss_mask = positions <= capped_lengths.unsqueeze(1)
-
-    return {
-        "move_ids": move_ids,
-        "game_lengths": game_lengths,
-        "input_ids": input_ids,
-        "targets": targets,
-        "loss_mask": loss_mask,
-        "outcome_tokens": outcome_tokens,
-        "n_games": N,
-    }
-
-
-def _prepare_v1_tokens(
-    token_lists: list[list[int]],
-    results: list[str],
-    max_ply: int,
-    min_ply: int,
-    seq_len: int,
-) -> dict:
-    """Prepare training data from v1 tokens (moves only, no outcome)."""
-    N = len(token_lists)
-
     move_ids = np.zeros((N, max_ply), dtype=np.int16)
     game_lengths = np.zeros(N, dtype=np.int16)
-
     for i, toks in enumerate(token_lists):
-        length = min(len(toks), max_ply)
-        game_lengths[i] = length
-        move_ids[i, :length] = toks[:length]
+        gl = min(int(game_lengths_list[i]), max_ply)
+        game_lengths[i] = gl
+        if gl > 0:
+            move_ids[i, :gl] = toks[:gl]
 
     if min_ply > 1:
         keep = game_lengths >= min_ply
         move_ids = move_ids[keep]
         game_lengths = game_lengths[keep]
-        results = [r for r, k in zip(results, keep) if k]
-        N = len(results)
+        outcome_tokens_list = [
+            o for o, k in zip(outcome_tokens_list, keep) if k
+        ]
+        N = len(outcome_tokens_list)
         print(f"  After min_ply={min_ply} filter: {N:,} games")
 
-    outcome_tokens = _result_to_outcome(results)
+    outcome_tokens = torch.tensor(outcome_tokens_list, dtype=torch.long)
 
     from pawn.data import pack_clm_sequences
-    batch = pack_clm_sequences(move_ids, game_lengths, outcome_tokens, seq_len)
+    batch = pack_clm_sequences(
+        move_ids, game_lengths, outcome_tokens, seq_len,
+        prepend_outcome=prepend_outcome,
+    )
 
     return {
         "move_ids": move_ids,
@@ -495,102 +356,6 @@ def _prepare_v1_tokens(
         "outcome_tokens": outcome_tokens,
         "n_games": N,
     }
-
-
-def _prepare_from_pgn(
-    lf: "pl.LazyFrame",
-    max_ply: int,
-    max_games: int,
-    min_ply: int,
-) -> dict:
-    """Load legacy PGN format: pgn str + result str, tokenize via Rust."""
-    import polars as pl
-    import re
-
-    df = lf.select(["pgn", "result"]).head(max_games).collect()
-    n_to_use = len(df)
-    print(f"Loaded {n_to_use:,} games from PGN Parquet")
-
-    pgn_strings = df["pgn"].to_list()
-    results = df["result"].to_list()
-
-    # Split PGN text into move lists, stripping comments, move numbers, results
-    games: list[list[str]] = []
-    for pgn_text in pgn_strings:
-        cleaned = re.sub(r'\{[^}]*\}', '', pgn_text)
-        tokens = cleaned.split()
-        moves = []
-        for tok in tokens:
-            if tok in ("1-0", "0-1", "1/2-1/2", "*"):
-                break
-            stripped = tok.rstrip(".")
-            if stripped and stripped.replace(".", "").isdigit():
-                continue
-            if not tok:
-                continue
-            moves.append(tok)
-        games.append(moves)
-
-    print(f"  Tokenizing {len(games):,} games...")
-    move_ids, game_lengths = engine.pgn_to_tokens(games, max_ply=max_ply)
-    N = move_ids.shape[0]
-
-    if min_ply > 1:
-        keep = game_lengths >= min_ply
-        move_ids = move_ids[keep]
-        game_lengths = game_lengths[keep]
-        results = [r for r, k in zip(results, keep) if k]
-        N = len(results)
-        print(f"  After min_ply={min_ply} filter: {N:,} games")
-
-    outcome_tokens = _result_to_outcome(results)
-
-    seq_len = max_ply + 1
-    from pawn.data import pack_clm_sequences
-    batch = pack_clm_sequences(move_ids, game_lengths, outcome_tokens, seq_len)
-
-    return {
-        "move_ids": move_ids,
-        "game_lengths": game_lengths,
-        "input_ids": batch["input_ids"],
-        "targets": batch["targets"],
-        "loss_mask": batch["loss_mask"],
-        "outcome_tokens": outcome_tokens,
-        "n_games": N,
-    }
-
-
-def _extract_results(pgn_path: Path, max_games: int) -> list[str]:
-    """Extract game results from PGN headers.
-
-    Uses [Event header to delimit games, matching the Rust parser's
-    game-boundary detection.  The previous approach (one result per
-    [Result] header) could miscount when headers were malformed.
-    """
-    import re
-    results: list[str] = []
-    current_result = "*"
-    in_game = False
-
-    with open(pgn_path) as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("[Event "):
-                if in_game:
-                    results.append(current_result)
-                    if len(results) >= max_games:
-                        break
-                current_result = "*"
-                in_game = True
-            elif line.startswith('[Result "'):
-                m = re.search(r'"([^"]+)"', line)
-                if m:
-                    current_result = m.group(1)
-        # Flush last game
-        if in_game and len(results) < max_games:
-            results.append(current_result)
-
-    return results
 
 
 # ---------------------------------------------------------------------------

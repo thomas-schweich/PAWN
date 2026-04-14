@@ -56,28 +56,44 @@ def pack_clm_sequences(
     game_lengths: np.ndarray,
     outcome_tokens: torch.Tensor,
     seq_len: int,
+    prepend_outcome: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Pack move arrays into CLM training tensors.
 
-    Constructs input_ids = [outcome, move_1, ..., move_N, PAD, ...]
-    and targets shifted left by 1.
+    The output always has width ``seq_len`` regardless of mode; the
+    difference is whether slot 0 holds the outcome or the first move.
+
+    - ``prepend_outcome=True``: input_ids = [outcome, m_1, ..., m_N, PAD, ...],
+      loss_mask covers positions ``0..game_length`` inclusive (``game_length + 1``
+      positions — one prediction per move plus the game-over prediction).
+    - ``prepend_outcome=False`` (default): input_ids = [m_1, m_2, ..., m_N, PAD, ...],
+      loss_mask covers positions ``0..game_length - 1`` (``game_length`` positions —
+      one fewer supervised position than the prefixed mode; this is the
+      documented cost of running without the outcome prefix).
+
+    The ``outcome_tokens`` argument is only read when ``prepend_outcome=True``;
+    callers may pass any tensor of the right shape when they don't care.
 
     Args:
         move_ids: (B, max_ply) raw move token IDs
-        game_lengths: (B,) actual game lengths
+        game_lengths: (B,) actual game lengths (move counts, never including
+            the outcome slot)
         outcome_tokens: (B,) pre-computed outcome token IDs
-        seq_len: total CLM sequence length
+        seq_len: total CLM sequence length (the fixed tensor width)
+        prepend_outcome: if True, write outcome at slot 0 and shift moves right
     """
     B = len(game_lengths)
-    n_move_slots = seq_len - 1  # 255 slots for moves (position 0 = outcome)
+    n_move_slots = seq_len - 1 if prepend_outcome else seq_len
     max_ply = move_ids.shape[1]
 
     game_lengths_t = torch.from_numpy(game_lengths).long()
     move_ids_t = torch.from_numpy(move_ids).long()  # (B, max_ply)
 
-    # Build input_ids: [outcome, move_0, ..., move_{N-1}, PAD, ...]
     input_ids = torch.full((B, seq_len), PAD_TOKEN, dtype=torch.long)
-    input_ids[:, 0] = outcome_tokens
+    move_start = 0
+    if prepend_outcome:
+        input_ids[:, 0] = outcome_tokens
+        move_start = 1
 
     # Mask out any non-move tokens from engine output
     cache_key = ("engine", max_ply)
@@ -88,9 +104,8 @@ def pack_clm_sequences(
     move_mask = engine_positions < game_lengths_t.unsqueeze(1)
     clean_moves = move_ids_t.where(move_mask, torch.tensor(PAD_TOKEN, dtype=torch.long))
 
-    # Place moves at positions 1..n_move_slots
     n_to_copy = min(max_ply, n_move_slots)
-    input_ids[:, 1 : n_to_copy + 1] = clean_moves[:, :n_to_copy]
+    input_ids[:, move_start : move_start + n_to_copy] = clean_moves[:, :n_to_copy]
 
     # Cap game_lengths to n_move_slots (handles edge case where engine
     # produces more moves than we have slots)
@@ -100,13 +115,19 @@ def pack_clm_sequences(
     targets = torch.full((B, seq_len), PAD_TOKEN, dtype=torch.long)
     targets[:, :-1] = input_ids[:, 1:]
 
-    # Loss mask: True for positions 0 through capped_lengths[b]
+    # Loss mask:
+    #   prepend_outcome=True  → positions 0..game_length inclusive (gl+1 True)
+    #     position 0 predicts move_1 from outcome; position game_length predicts PAD
+    #     (the game-over signal).
+    #   prepend_outcome=False → positions 0..game_length-1 (gl True)
+    #     position 0 predicts move_2 from move_1; position game_length-1 predicts PAD.
     cache_key_seq = ("seq", seq_len)
     seq_positions = _positions_cache.get(cache_key_seq)
     if seq_positions is None:
         seq_positions = torch.arange(seq_len).unsqueeze(0)
         _positions_cache[cache_key_seq] = seq_positions
-    loss_mask = seq_positions <= capped_lengths.unsqueeze(1)
+    loss_threshold = capped_lengths if prepend_outcome else (capped_lengths - 1).clamp(min=0)
+    loss_mask = seq_positions <= loss_threshold.unsqueeze(1)
 
     return {
         "input_ids": input_ids,
@@ -120,70 +141,19 @@ def _to_clm_batch(
     game_lengths: np.ndarray,
     term_codes: np.ndarray,
     seq_len: int,
+    prepend_outcome: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Convert Rust engine output to CLM training tensors.
 
     Convenience wrapper: computes outcome tokens from termination codes,
-    then delegates to pack_clm_sequences.
+    then delegates to :func:`pack_clm_sequences`. ``prepend_outcome`` is
+    forwarded — default is pure moves.
     """
     outcome_tokens = _map_termination_to_outcome(term_codes, game_lengths)
-    return pack_clm_sequences(move_ids, game_lengths, outcome_tokens, seq_len)
-
-
-def strip_outcome_token(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Remove the outcome token from position 0, shifting moves to position 0.
-
-    Original: [outcome, m1, m2, ..., mN, PAD, ...]
-    Result:   [m1, m2, ..., mN, PAD, ..., PAD]
-
-    Also shifts loss_mask and legal_grid to maintain alignment with
-    compute_legal_move_rate (prediction at position p targets ply p+1,
-    so legal_grid must shift left by 1).
-    """
-    input_ids = batch["input_ids"]
-    loss_mask = batch["loss_mask"]
-
-    # Shift input_ids left by 1 (drop outcome at position 0, pad end)
-    new_input_ids = torch.full_like(input_ids, PAD_TOKEN)
-    new_input_ids[:, :-1] = input_ids[:, 1:]
-
-    # Recompute targets from new input_ids (shifted left by 1)
-    new_targets = torch.full_like(new_input_ids, PAD_TOKEN)
-    new_targets[:, :-1] = new_input_ids[:, 1:]
-
-    # Shift loss_mask left by 1
-    new_loss_mask = torch.zeros_like(loss_mask)
-    new_loss_mask[:, :-1] = loss_mask[:, 1:]
-
-    result: dict[str, torch.Tensor] = {
-        "input_ids": new_input_ids,
-        "targets": new_targets,
-        "loss_mask": new_loss_mask,
-    }
-
-    # Shift legal_grid left by 1 to maintain alignment with predictions
-    if "legal_grid" in batch:
-        legal_grid = batch["legal_grid"]
-        new_legal = torch.zeros_like(legal_grid)
-        new_legal[:, :-1] = legal_grid[:, 1:]
-        result["legal_grid"] = new_legal
-
-    # Post-strip the batch represents pure-move sequences — overwrite the
-    # outcome-aware metadata so eval consumers (eval_game_completion_metrics,
-    # probes, etc.) apply the pure-moves alignment. Without this, the raw
-    # ``move_ids`` tensor's shape (B, seq_len-1) would no longer align with
-    # the now-pure ``input_ids`` (B, seq_len) and would crash downstream.
-    result["prepend_outcome"] = torch.tensor(False, dtype=torch.bool)
-    # For pure-move sequences, the padded ``input_ids`` can stand in for
-    # ``move_ids`` (they encode the same ply positions up to game_length).
-    result["move_ids"] = new_input_ids
-
-    # Pass through other keys unchanged
-    for k, v in batch.items():
-        if k not in result:
-            result[k] = v
-
-    return result
+    return pack_clm_sequences(
+        move_ids, game_lengths, outcome_tokens, seq_len,
+        prepend_outcome=prepend_outcome,
+    )
 
 
 class CLMDataset(torch.utils.data.IterableDataset):
@@ -194,14 +164,13 @@ class CLMDataset(torch.utils.data.IterableDataset):
     """
 
     def __init__(self, batch_size: int, max_ply: int, base_seed: int,
-                 discard_ply_limit: bool = False, no_outcome: bool = False,
+                 discard_ply_limit: bool = False,
                  mate_boost: float = 0.0, prepend_outcome: bool = False):
         super().__init__()
         self.batch_size = batch_size
         self.max_ply = max_ply
         self.base_seed = base_seed
         self.discard_ply_limit = discard_ply_limit
-        self.no_outcome = no_outcome
         self.mate_boost = mate_boost
         self.prepend_outcome = prepend_outcome
         self._start_step = 0
@@ -244,8 +213,6 @@ class CLMDataset(torch.utils.data.IterableDataset):
                 "targets": torch.from_numpy(targets).long(),
                 "loss_mask": torch.from_numpy(loss_mask),
             }
-            if self.no_outcome and self.prepend_outcome:
-                batch = strip_outcome_token(batch)
             yield batch
             step += 1
 
@@ -295,7 +262,6 @@ def align_legal_to_preds(
 def create_validation_set(
     n_games: int, max_ply: int, seed: int,
     discard_ply_limit: bool = False,
-    no_outcome: bool = False,
     mate_boost: float = 0.0,
     prepend_outcome: bool = False,
 ) -> dict[str, torch.Tensor]:
@@ -334,8 +300,5 @@ def create_validation_set(
         align_legal_to_preds(legal_grid, prepend_outcome)
     ).long()
     batch["game_lengths"] = torch.from_numpy(game_lengths).long()
-
-    if no_outcome and prepend_outcome:
-        batch = strip_outcome_token(batch)
 
     return batch

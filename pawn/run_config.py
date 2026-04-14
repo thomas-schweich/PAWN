@@ -46,7 +46,6 @@ class BaseRunConfig(BaseModel):
 
     # Ablations -----------------------------------------------------------
     mate_boost: float = 0.0
-    no_outcome_token: bool = False  # Deprecated: sequences are pure moves by default
     prepend_outcome: bool = False  # Prepend outcome token at position 0 for outcome-conditioned training
     discard_ply_limit: bool = False
 

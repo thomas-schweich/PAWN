@@ -62,6 +62,10 @@ def parse_args():
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--no-amp", action="store_true")
 
+    p.add_argument("--prepend-outcome", action="store_true",
+                    help="Match an outcome-prefixed backbone. Default is "
+                         "pure-moves, matching the canonical training layout.")
+
     return p.parse_args()
 
 
@@ -302,6 +306,7 @@ def main():
     print(f"Preparing evaluation data: {args.pgn}")
     data = prepare_lichess_dataset(
         args.pgn, max_ply=255, max_games=args.max_games, min_ply=10,
+        prepend_outcome=args.prepend_outcome,
     )
     n_total = data["n_games"]
     val_start = min(args.val_start, n_total)
@@ -315,8 +320,10 @@ def main():
     )
 
     vocab_size = model.cfg.vocab_size
-    mask_builder = LegalMaskBuilder(args.batch_size, max_ply=255,
-                                    vocab_size=vocab_size, device=device)
+    mask_builder = LegalMaskBuilder(
+        args.batch_size, max_ply=255, vocab_size=vocab_size, device=device,
+        prepend_outcome=args.prepend_outcome,
+    )
 
     # Evaluate
     print(f"\nEvaluating (min_eval_ply={args.min_eval_ply})...")

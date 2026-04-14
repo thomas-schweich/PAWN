@@ -559,7 +559,10 @@ class InProcessRoSAObjective:
         device = self.device
 
         # --- Data loaders (batch_size varies per trial) ---
-        collate = LegalMaskCollate(seq_len=256, vocab_size=vocab_size)
+        # Pure-moves layout: seq_len matches max_ply=255 (no outcome slot).
+        # If you want to sweep an outcome-prefixed backbone, thread
+        # prepend_outcome through here and bump seq_len to 256.
+        collate = LegalMaskCollate(seq_len=255, vocab_size=vocab_size)
         train_loader = DataLoader(
             self._train_ds, batch_size=batch_size, shuffle=True,
             num_workers=0, pin_memory=True, collate_fn=collate,

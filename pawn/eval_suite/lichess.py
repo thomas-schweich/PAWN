@@ -9,7 +9,7 @@ import torch
 import chess_engine as engine
 
 from pawn.config import NUM_ACTIONS, PAD_TOKEN, WHITE_CHECKMATES, PLY_LIMIT
-from pawn.data import pack_clm_sequences, _map_termination_to_outcome, strip_outcome_token
+from pawn.data import pack_clm_sequences, _map_termination_to_outcome
 from pawn.model import PAWNCLM
 from pawn.trainer import _get_action_grid_index
 
@@ -159,42 +159,25 @@ def evaluate_on_lichess(
         # We don't have true termination codes for Lichess games parsed via PGN.
         # Use PLY_LIMIT as a dummy outcome token for all games — for
         # loss/accuracy evaluation the outcome token choice doesn't matter
-        # much since we evaluate on move prediction, not outcome prediction.
-        # ``pack_clm_sequences`` always writes the outcome at position 0; we
-        # then call ``strip_outcome_token`` when the model was trained on
-        # pure-move sequences so predictions live at positions 0..gl-1.
+        # since we evaluate on move prediction, not outcome prediction.
         dummy_outcomes = torch.full((n,), PLY_LIMIT, dtype=torch.long)
 
-        # Build the raw-move array at the full context length, then let
-        # ``pack_clm_sequences`` reserve the outcome slot. Capping at
-        # ``max_seq_len - 1`` up front would drop the last in-window ply
-        # of long games in pure-moves mode — the outcome slot is
-        # stripped again via ``strip_outcome_token`` so we can afford
-        # the full ``max_seq_len`` plies of raw moves.
-        engine_max_ply = max_seq_len if not prepend_outcome else max_seq_len - 1
+        # In outcome-prefixed mode, slot 0 holds the outcome so only
+        # ``max_seq_len - 1`` moves fit; in pure-moves mode all
+        # ``max_seq_len`` slots hold moves.
+        engine_max_ply = max_seq_len - 1 if prepend_outcome else max_seq_len
         padded = np.zeros((n, engine_max_ply), dtype=move_ids.dtype)
         for i in range(n):
             gl = min(int(game_lengths[i]), engine_max_ply)
             padded[i, :gl] = move_ids[i, :gl]
         game_lengths_capped = np.minimum(game_lengths, engine_max_ply).astype(np.int16)
 
-        # ``pack_clm_sequences`` expects ``move_ids`` shape to fit into
-        # ``seq_len - 1``. In pure-moves mode we built ``padded`` at the
-        # full ``max_seq_len``, so pass ``seq_len = max_seq_len + 1``
-        # here and let ``strip_outcome_token`` slice back down to
-        # ``max_seq_len``.
-        pack_seq_len = max_seq_len + 1 if not prepend_outcome else max_seq_len
-        batch = pack_clm_sequences(padded, game_lengths_capped, dummy_outcomes, pack_seq_len)
-        if not prepend_outcome:
-            batch = strip_outcome_token(batch)
-            # strip_outcome_token shifts left by 1 but preserves
-            # ``seq_len``. Truncate the (B, T) tensors back down so
-            # downstream logits indexing matches ``max_seq_len``;
-            # scalar metadata entries (``prepend_outcome``) stay as-is.
-            batch = {
-                k: (v[:, :max_seq_len] if v.ndim >= 2 else v)
-                for k, v in batch.items()
-            }
+        # `pack_clm_sequences` picks the right layout from `prepend_outcome`
+        # — no post-hoc stripping.
+        batch = pack_clm_sequences(
+            padded, game_lengths_capped, dummy_outcomes, max_seq_len,
+            prepend_outcome=prepend_outcome,
+        )
 
         input_ids = batch["input_ids"]
         targets = batch["targets"]

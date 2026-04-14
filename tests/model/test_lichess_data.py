@@ -1,7 +1,6 @@
 """Tests for pawn/lichess_data.py.
 
-Covers _result_to_outcome, compute_legal_indices, LegalMaskBuilder,
-LegalMaskCollate.
+Covers compute_legal_indices, LegalMaskBuilder, LegalMaskCollate.
 """
 
 from __future__ import annotations
@@ -12,71 +11,11 @@ import torch
 
 import chess_engine as engine
 
-from pawn.config import (
-    BLACK_CHECKMATES,
-    DRAW_BY_RULE,
-    OUTCOME_TOKEN_BASE,
-    PLY_LIMIT,
-    WHITE_CHECKMATES,
-)
 from pawn.lichess_data import (
     LegalMaskBuilder,
     LegalMaskCollate,
-    _result_to_outcome,
     compute_legal_indices,
 )
-
-
-# ---------------------------------------------------------------------------
-# _result_to_outcome
-# ---------------------------------------------------------------------------
-
-
-class TestResultToOutcome:
-    @pytest.mark.unit
-    def test_white_win(self):
-        out = _result_to_outcome(["1-0"])
-        assert out[0].item() == WHITE_CHECKMATES
-
-    @pytest.mark.unit
-    def test_black_win(self):
-        out = _result_to_outcome(["0-1"])
-        assert out[0].item() == BLACK_CHECKMATES
-
-    @pytest.mark.unit
-    def test_draw(self):
-        """Per the module docstring, draws map to DRAW_BY_RULE."""
-        out = _result_to_outcome(["1/2-1/2"])
-        assert out[0].item() == DRAW_BY_RULE
-
-    @pytest.mark.unit
-    def test_unknown_result_is_ply_limit(self):
-        """'*' (unknown) falls through to the default PLY_LIMIT."""
-        out = _result_to_outcome(["*"])
-        assert out[0].item() == PLY_LIMIT
-
-    @pytest.mark.unit
-    def test_empty_string_is_ply_limit(self):
-        out = _result_to_outcome([""])
-        assert out[0].item() == PLY_LIMIT
-
-    @pytest.mark.unit
-    def test_batch(self):
-        out = _result_to_outcome(["1-0", "0-1", "1/2-1/2", "*"])
-        assert out.tolist() == [
-            WHITE_CHECKMATES, BLACK_CHECKMATES, DRAW_BY_RULE, PLY_LIMIT
-        ]
-
-    @pytest.mark.unit
-    def test_returns_long_tensor(self):
-        out = _result_to_outcome(["1-0", "0-1"])
-        assert out.dtype == torch.long
-
-    @pytest.mark.unit
-    def test_all_outcomes_in_vocab_range(self):
-        out = _result_to_outcome(["1-0", "0-1", "1/2-1/2", "*", "garbage"])
-        for v in out.tolist():
-            assert OUTCOME_TOKEN_BASE <= v <= 4283
 
 
 # ---------------------------------------------------------------------------
@@ -130,19 +69,33 @@ class TestComputeLegalIndices:
 
 class TestLegalMaskBuilder:
     @pytest.mark.integration
-    def test_scatter_output_shape(self):
+    def test_scatter_output_shape_pure_moves(self):
         B = 4
         max_ply = 32
         vocab = 1980
         builder = LegalMaskBuilder(
             batch_size=B, max_ply=max_ply, vocab_size=vocab, device="cpu"
         )
-        # Provide an empty index set
         indices = torch.zeros(0, dtype=torch.long)
         mask = builder.scatter(indices, B)
-        assert mask.shape == (B, max_ply + 1, vocab)
+        # Default pure-moves: T == max_ply (no outcome slot)
+        assert mask.shape == (B, max_ply, vocab)
         assert mask.dtype == torch.bool
         assert (mask == False).all()
+
+    @pytest.mark.integration
+    def test_scatter_output_shape_prepended(self):
+        B = 4
+        max_ply = 32
+        vocab = 1980
+        builder = LegalMaskBuilder(
+            batch_size=B, max_ply=max_ply, vocab_size=vocab, device="cpu",
+            prepend_outcome=True,
+        )
+        indices = torch.zeros(0, dtype=torch.long)
+        mask = builder.scatter(indices, B)
+        # Outcome-prefixed: T == max_ply + 1
+        assert mask.shape == (B, max_ply + 1, vocab)
 
     @pytest.mark.integration
     def test_scatter_sets_bits(self):
@@ -205,21 +158,21 @@ class TestLegalMaskBuilder:
 
     @pytest.mark.integration
     def test_call_produces_mask_from_batch(self):
-        """__call__ invokes Rust replay and scatters."""
+        """__call__ invokes Rust replay and scatters. Default is pure-moves
+        layout — position 0 is the first move."""
         B = 4
-        max_ply = 63  # seq_len 64
+        max_ply = 63
         move_ids, gl, _tc = engine.generate_random_games(B, max_ply, seed=42)
         builder = LegalMaskBuilder(
-            batch_size=B, max_ply=max_ply, vocab_size=1980, device="cpu"
+            batch_size=B, max_ply=max_ply, vocab_size=1980, device="cpu",
         )
         batch = {"move_ids": move_ids, "game_length": gl}
         mask = builder(batch)
-        assert mask.shape == (B, max_ply + 1, 1980)
-        # Position 0 is outcome, position 1 is first move: each row should
-        # have at least some legal moves.
+        assert mask.shape == (B, max_ply, 1980)
+        # Position 0 is the first move in pure-moves mode — should have
+        # ~20 legal moves on the initial position.
         per_position_count = mask.sum(dim=-1)
-        # First move position should have ~20 legal moves.
-        assert per_position_count[:, 1].min() >= 1
+        assert per_position_count[:, 0].min() >= 1
 
     @pytest.mark.integration
     def test_call_with_tensor_input(self):
@@ -228,14 +181,14 @@ class TestLegalMaskBuilder:
         max_ply = 15
         move_ids, gl, _tc = engine.generate_random_games(B, max_ply, seed=42)
         builder = LegalMaskBuilder(
-            batch_size=B, max_ply=max_ply, vocab_size=1980, device="cpu"
+            batch_size=B, max_ply=max_ply, vocab_size=1980, device="cpu",
         )
         batch = {
             "move_ids": torch.from_numpy(move_ids),
             "game_length": torch.from_numpy(gl),
         }
         mask = builder(batch)
-        assert mask.shape == (B, max_ply + 1, 1980)
+        assert mask.shape == (B, max_ply, 1980)
 
 
 # ---------------------------------------------------------------------------
