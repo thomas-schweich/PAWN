@@ -302,11 +302,27 @@ def main():
     model, adapter_type = load_model(args.checkpoint, args.adapter_checkpoint, device)
     print(f"  Adapter type: {adapter_type}")
 
+    # Auto-detect the backbone's training-time sequence format so the
+    # data layout matches what the model saw. `--prepend-outcome` forces
+    # the flag when the checkpoint metadata is missing or ambiguous.
+    from pawn.checkpoint import get_prepend_outcome, read_checkpoint_metadata
+    if args.prepend_outcome:
+        prepend_outcome = True
+        print("  prepend_outcome: True (forced by --prepend-outcome)")
+    else:
+        try:
+            saved = read_checkpoint_metadata(args.checkpoint)
+            prepend_outcome = get_prepend_outcome(saved.get("training_config"))
+            print(f"  prepend_outcome: {prepend_outcome} (from checkpoint metadata)")
+        except (FileNotFoundError, OSError, ValueError):
+            prepend_outcome = False
+            print("  prepend_outcome: False (default; checkpoint metadata unavailable)")
+
     # Prepare data
     print(f"Preparing evaluation data: {args.pgn}")
     data = prepare_lichess_dataset(
         args.pgn, max_ply=255, max_games=args.max_games, min_ply=10,
-        prepend_outcome=args.prepend_outcome,
+        prepend_outcome=prepend_outcome,
     )
     n_total = data["n_games"]
     val_start = min(args.val_start, n_total)
@@ -322,7 +338,7 @@ def main():
     vocab_size = model.cfg.vocab_size
     mask_builder = LegalMaskBuilder(
         args.batch_size, max_ply=255, vocab_size=vocab_size, device=device,
-        prepend_outcome=args.prepend_outcome,
+        prepend_outcome=prepend_outcome,
     )
 
     # Evaluate
