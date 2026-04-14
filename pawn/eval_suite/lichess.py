@@ -90,8 +90,6 @@ def _extract_elos_from_pgn(pgn_path: Path, max_games: int) -> list[tuple[int, in
             line = line.strip()
             if line.startswith("[Event "):
                 # New game — flush the previous one (if any)
-                if in_headers or elos:  # skip very first
-                    pass  # flushed below on *next* Event
                 if in_headers:
                     elos.append((white_elo, black_elo))
                     if len(elos) >= max_games:

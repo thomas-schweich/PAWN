@@ -45,7 +45,14 @@ def _parse_cli(argv: list[str] | None = None) -> dict[str, Any]:
       --config PATH      load JSON base config
       --flag value       set field (underscore or hyphen)
       --bool-flag        set to True  (when no value follows)
-      --no-bool-flag     set field to False
+
+    Notes:
+      Fields whose negative is baked into the name (``no_compile``,
+      ``no_outcome_token``, ``no_adapt_attn``, ``no_adapt_ffn``, etc.)
+      are set via the ordinary ``--no-compile`` form — we do *not*
+      strip a leading ``no-`` to negate some other field. Inverting an
+      existing positive bool flag isn't supported on the CLI; use a
+      JSON config with ``{"field": false}`` for that.
     """
     if argv is None:
         argv = sys.argv[1:]
@@ -67,14 +74,6 @@ def _parse_cli(argv: list[str] | None = None) -> dict[str, Any]:
             _die(f"Unexpected positional argument: {arg}")
 
         key = arg[2:]
-
-        # --no-X -> X = False
-        if key.startswith("no-"):
-            canon = key[3:].replace("-", "_")
-            overrides[canon] = False
-            i += 1
-            continue
-
         canon = key.replace("-", "_")
 
         # Peek at next token: if it is another flag or end-of-args, treat
@@ -171,7 +170,11 @@ def run_pretrain(config: PretrainConfig) -> None:
                         f"overriding prepend_outcome={config.prepend_outcome} "
                         f"→ {saved_prepend} to match."
                     )
-                    config.prepend_outcome = saved_prepend
+                    # Use model_copy so this keeps working if
+                    # BaseRunConfig ever gains ``frozen=True``.
+                    config = config.model_copy(
+                        update={"prepend_outcome": saved_prepend}
+                    )
 
     variant_factory = {
         "small": CLMConfig.small,

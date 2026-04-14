@@ -629,21 +629,32 @@ def _load_from_hf_repo(
     repo_id: str,
     device: str = "cpu",
 ) -> tuple[dict[str, torch.Tensor], dict | None]:
-    """Download and load model weights from a HuggingFace model repo."""
+    """Download and load model weights from a HuggingFace model repo.
+
+    Fetches ``config.json`` first so the vocab-compatibility gate runs
+    against real metadata. Network / auth / rate-limit errors on that
+    fetch propagate — previously they were silently swallowed, which
+    let pre-migration checkpoints load with ``config=None`` and bypass
+    ``_check_checkpoint_compatible`` entirely. Only a legitimately
+    missing ``config.json`` in the repo is treated as "no metadata".
+    """
     from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError
 
     print(f"Downloading weights from HuggingFace: {repo_id}")
-    sf_path = hf_hub_download(repo_id, "model.safetensors")
 
-    config = None
+    config: dict | None = None
     try:
         config_path = hf_hub_download(repo_id, "config.json")
+    except EntryNotFoundError:
+        # Repo has no config.json at all — bare safetensors.
+        pass
+    else:
         with open(config_path) as f:
             config = json.load(f).get("model_config")
-    except Exception:
-        pass
     _check_checkpoint_compatible(config, repo_id)
 
+    sf_path = hf_hub_download(repo_id, "model.safetensors")
     weights = load_file(sf_path, device=device)
     return weights, config
 

@@ -42,13 +42,16 @@ def find_best_step(metrics_path: Path) -> int | None:
 
 def truncate_metrics(metrics_path: Path, up_to_step: int) -> list[str]:
     """Return metrics lines up to and including the given step."""
-    lines = []
+    lines: list[str] = []
     with open(metrics_path) as f:
         for line in f:
-            lines.append(line)
             record = json.loads(line)
-            if record.get("type") in ("train", "val") and record.get("step", 0) > up_to_step:
+            if (
+                record.get("type") in ("train", "val")
+                and record.get("step", 0) > up_to_step
+            ):
                 break
+            lines.append(line)
     return lines
 
 
