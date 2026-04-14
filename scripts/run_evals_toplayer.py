@@ -23,6 +23,10 @@ def main():
     parser.add_argument("--n-probe-val", type=int, default=512)
     parser.add_argument("--n-per-category", type=int, default=10_000)
     parser.add_argument("--n-epochs", type=int, default=20)
+    parser.add_argument(
+        "--prepend-outcome", action="store_true",
+        help="Set when evaluating a model trained with prepend_outcome=True.",
+    )
     args = parser.parse_args()
 
     device = args.device
@@ -39,8 +43,15 @@ def main():
     }
 
     print("Generating probe data...", flush=True)
-    train_data = extract_probe_data(args.n_probe_train, 256, seed=12345)
-    val_data = extract_probe_data(args.n_probe_val, 256, seed=54321)
+    probe_max_ply = 512
+    train_data = extract_probe_data(
+        args.n_probe_train, probe_max_ply, seed=12345,
+        prepend_outcome=args.prepend_outcome,
+    )
+    val_data = extract_probe_data(
+        args.n_probe_val, probe_max_ply, seed=54321,
+        prepend_outcome=args.prepend_outcome,
+    )
     print("Done.", flush=True)
 
     print("Generating diagnostic corpus...", flush=True)
@@ -70,7 +81,10 @@ def main():
         results["probes"] = probe_results
 
         print("\nRunning diagnostics...", flush=True)
-        diag_results = evaluate_diagnostic_positions(model, positions, corpus, device=device)
+        diag_results = evaluate_diagnostic_positions(
+            model, positions, corpus, device=device,
+            prepend_outcome=args.prepend_outcome,
+        )
         results["diagnostics"] = diag_results
 
         out_path = f"data/eval_{name}/eval_results.json"

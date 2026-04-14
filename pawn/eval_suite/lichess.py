@@ -8,9 +8,10 @@ import torch
 
 import chess_engine as engine
 
-from pawn.config import PAD_TOKEN, WHITE_CHECKMATES, PLY_LIMIT
-from pawn.data import pack_clm_sequences, _map_termination_to_outcome
+from pawn.config import NUM_ACTIONS, PAD_TOKEN, WHITE_CHECKMATES, PLY_LIMIT
+from pawn.data import pack_clm_sequences, _map_termination_to_outcome, strip_outcome_token
 from pawn.model import PAWNCLM
+from pawn.trainer import _get_action_grid_index
 
 
 # ---------------------------------------------------------------------------
@@ -126,21 +127,31 @@ def evaluate_on_lichess(
     device: str,
     max_seq_len: int | None = None,
     eval_batch_size: int = 32,
+    prepend_outcome: bool = False,
 ) -> dict:
     """Run next-token prediction metrics on Lichess games.
 
     ``max_seq_len`` defaults to the loaded model's configured context
     length (``model.cfg.max_seq_len``) so the same eval function works
-    for both 256-ctx and 512-ctx checkpoints without callers having to
+    for 256-ctx and 512-ctx checkpoints without callers having to
     thread the value through manually.
 
-    For each Elo band, computes loss, perplexity, top-1 accuracy, top-5
-    accuracy, and legal move rate.
+    ``prepend_outcome`` must match how the model was trained: when
+    False (the current default, pure-moves), the dummy outcome token
+    is stripped so predictions are made at the positions the model
+    actually saw during training. Mis-setting this flag silently
+    shifts every prediction by one position and degrades every metric.
+
+    For each Elo band, computes loss, perplexity, top-1 accuracy,
+    top-5 accuracy, and legal move rate.
     """
     if max_seq_len is None:
         max_seq_len = model.cfg.max_seq_len
     model.eval()
     results = {}
+
+    # Searchless action → (src*64 + dst) lookup for legality decoding.
+    action_grid_idx = _get_action_grid_index(device, NUM_ACTIONS)
 
     for band_name, band_data in lichess_data["bands"].items():
         move_ids = band_data["move_ids"]
@@ -151,10 +162,14 @@ def evaluate_on_lichess(
         # Use PLY_LIMIT as a dummy outcome token for all games — for
         # loss/accuracy evaluation the outcome token choice doesn't matter
         # much since we evaluate on move prediction, not outcome prediction.
+        # ``pack_clm_sequences`` always writes the outcome at position 0; we
+        # then call ``strip_outcome_token`` when the model was trained on
+        # pure-move sequences so predictions live at positions 0..gl-1.
         dummy_outcomes = torch.full((n,), PLY_LIMIT, dtype=torch.long)
 
+        # Reserve one slot for the outcome token before stripping so games
+        # that exactly fill the context window don't lose their last ply.
         engine_max_ply = max_seq_len - 1
-        # Pad/truncate move_ids to engine_max_ply
         padded = np.zeros((n, engine_max_ply), dtype=move_ids.dtype)
         for i in range(n):
             gl = min(int(game_lengths[i]), engine_max_ply)
@@ -162,12 +177,23 @@ def evaluate_on_lichess(
         game_lengths_capped = np.minimum(game_lengths, engine_max_ply).astype(np.int16)
 
         batch = pack_clm_sequences(padded, game_lengths_capped, dummy_outcomes, max_seq_len)
+        if not prepend_outcome:
+            batch = strip_outcome_token(batch)
+
         input_ids = batch["input_ids"]
         targets = batch["targets"]
         loss_mask = batch["loss_mask"]
 
-        # Compute legal move masks for legal_move_rate
-        grid, _promo = engine.compute_legal_move_masks(padded, game_lengths_capped)
+        # Position `pos` in the sequence predicts the move at 0-based ply
+        # `pos + grid_offset`:
+        #   outcome-prefixed: logits[0] predicts m_1 (ply 0), so
+        #       grid_offset = 0;
+        #   pure-moves: logits[0] predicts m_2 (ply 1), so grid_offset = 1.
+        grid_offset = 0 if prepend_outcome else 1
+
+        # Per-game legality grid: (n, max_ply, 64) bit-packed dst masks.
+        grid_np, _promo = engine.compute_legal_move_masks(padded, game_lengths_capped)
+        grid = torch.from_numpy(grid_np).to(device)  # (n, max_ply, 64)
 
         total_loss = 0.0
         total_correct = 0
@@ -182,46 +208,36 @@ def evaluate_on_lichess(
             msk = loss_mask[start:end].to(device)
 
             logits, _ = model(ids, msk, hidden_only=True)
-            # Loss on move positions (excluding outcome and padding)
-            # Move positions: 1..game_length
+
             for i in range(end - start):
                 gi = start + i
-                gl = int(game_lengths_capped[gi])
-                # Positions 1..gl have move targets (position 0 is outcome)
-                for pos in range(1, gl + 1):
-                    if pos >= logits.shape[1]:
-                        break
-                    log_probs = torch.log_softmax(logits[i, pos], dim=-1)
-                    target_tok = int(targets[gi, pos])
-                    if target_tok <= 0:
+                T = logits.shape[1]
+                for pos in range(T):
+                    if not bool(msk[i, pos]):
+                        continue
+                    target_tok = int(tgt[i, pos])
+                    if target_tok == PAD_TOKEN:
                         continue
 
-                    total_loss -= log_probs[target_tok].item()
+                    log_probs = torch.log_softmax(logits[i, pos], dim=-1)
+                    total_loss -= float(log_probs[target_tok])
                     total_tokens += 1
 
-                    # Top-1
-                    if logits[i, pos].argmax().item() == target_tok:
+                    argmax_tok = int(logits[i, pos].argmax())
+                    if argmax_tok == target_tok:
                         total_correct += 1
 
-                    # Top-5
-                    top5 = logits[i, pos].topk(5).indices.cpu().tolist()
+                    top5 = logits[i, pos].topk(5).indices.tolist()
                     if target_tok in top5:
                         total_top5_correct += 1
 
-                    # Legal move rate (argmax is legal?)
-                    # logits[i, pos] predicts targets[pos] = move at ply pos
-                    ply = pos
-                    if ply < grid.shape[1]:
-                        argmax_tok = logits[i, pos].argmax().item()
-                        # Check if argmax token is legal
-                        if argmax_tok > 0 and argmax_tok <= 4096:
-                            src = (argmax_tok - 1) // 64
-                            dst = (argmax_tok - 1) % 64
-                            if (grid[gi, ply, src] >> dst) & 1:
-                                total_legal += 1
-                        elif argmax_tok > 4096:
-                            # Promotion token — check promo mask
-                            total_legal += 1  # approximate
+                    ply = pos + grid_offset
+                    if argmax_tok < NUM_ACTIONS and ply < grid.shape[1]:
+                        grid_idx = int(action_grid_idx[argmax_tok])
+                        src = grid_idx // 64
+                        dst = grid_idx % 64
+                        if int(grid[gi, ply, src]) >> dst & 1:
+                            total_legal += 1
 
         if total_tokens == 0:
             continue

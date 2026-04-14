@@ -923,6 +923,7 @@ def run_post_training_evals(
         positions = extract_diagnostic_positions(corpus, max_per_category=10_000)
         diag_results = evaluate_diagnostic_positions(
             model, positions, corpus, device=device,
+            prepend_outcome=prepend_outcome,
         )
         results["diagnostics"] = diag_results
         del corpus, positions
@@ -939,6 +940,7 @@ def run_post_training_evals(
             )
             lichess_results = evaluate_on_lichess(
                 model, lichess_data, device=device,
+                prepend_outcome=prepend_outcome,
             )
             results["lichess"] = lichess_results
 

@@ -232,7 +232,8 @@ def run_improbable_task_test(
 
 def _diagnostic_worker(checkpoint_path: str, device: str,
                         n_per_category: int, max_per_category: int,
-                        n_samples: int, batch_size: int) -> dict:
+                        n_samples: int, batch_size: int,
+                        prepend_outcome: bool) -> dict:
     from pawn.eval_suite.diagnostics import (
         generate_diagnostic_corpus,
         extract_diagnostic_positions, evaluate_diagnostic_positions,
@@ -243,6 +244,7 @@ def _diagnostic_worker(checkpoint_path: str, device: str,
     return evaluate_diagnostic_positions(
         model, positions, corpus, device,
         n_samples=n_samples, batch_size=batch_size,
+        prepend_outcome=prepend_outcome,
     )
 
 
@@ -253,10 +255,12 @@ def run_diagnostic_eval(
     max_per_category: int = 10_000,
     n_samples: int = 100,
     batch_size: int = 32,
+    prepend_outcome: bool = False,
 ) -> dict:
     """Generate quota-controlled diagnostic corpus and evaluate model in an isolated worker."""
     return run_in_worker(
         _diagnostic_worker,
         str(checkpoint_path), device,
         n_per_category, max_per_category, n_samples, batch_size,
+        prepend_outcome,
     )
