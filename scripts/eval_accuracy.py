@@ -45,7 +45,10 @@ def parse_args():
     p.add_argument("--adapter-checkpoint", type=str, required=True,
                     help="Path to trained adapter checkpoint (LoRA/FiLM/hybrid)")
     p.add_argument("--pgn", type=str, required=True,
-                    help="Path to Lichess PGN file")
+                    help="Lichess dataset: a .parquet file or a HuggingFace "
+                         "dataset repo ID (e.g. thomas-schweich/pawn-lichess-full). "
+                         "Raw PGN input is not supported; convert first with "
+                         "scripts/extract_lichess_parquet.py.")
 
     # Eval settings
     p.add_argument("--min-eval-ply", type=int, default=10,
