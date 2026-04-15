@@ -38,7 +38,6 @@ def _run_help(script_name: str, timeout: float = 60.0) -> subprocess.CompletedPr
 
 
 ARGPARSE_SCRIPTS = [
-    "backfill_metrics.py",
     "benchmark.py",
     "benchmark_stockfish_nodes.py",
     "compute_theoretical_ceiling.py",
@@ -49,10 +48,8 @@ ARGPARSE_SCRIPTS = [
     "generate_lc0_data.py",
     "generate_model_cards.py",
     "generate_stockfish_data.py",
-    "profile_step.py",
-    "run_evals_local.py",
-    "run_evals_toplayer.py",
-    "split_dataset.py",
+    "rename_shards.py",
+    "run_evals_backbone.py",
 ]
 
 

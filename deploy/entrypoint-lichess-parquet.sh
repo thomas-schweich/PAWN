@@ -20,6 +20,9 @@
 #   THREADS_PER_WORKER  — rayon/polars threads per worker (default: 2)
 #   SCRATCH_DIR         — local staging dir (default: /dev/shm/pawn-lichess-extract)
 #   MAX_GAMES_PER_MONTH — cap games per month, for smoke tests
+#   SOURCE              — raw PGN path template with '{year_month}' placeholder
+#                         (hf://buckets/..., hf://datasets/..., or local path).
+#                         Defaults to the raw Lichess bucket.
 #   FORCE               — set to 1 to ignore existing sentinels and re-extract
 set -euo pipefail
 
@@ -66,6 +69,9 @@ if [ -n "${TEST_DAYS:-}" ]; then
 fi
 if [ -n "${MAX_GAMES_PER_MONTH:-}" ]; then
     CMD+=(--max-games-per-month "$MAX_GAMES_PER_MONTH")
+fi
+if [ -n "${SOURCE:-}" ]; then
+    CMD+=(--source "$SOURCE")
 fi
 if [ -n "${FORCE:-}" ] && [ "${FORCE}" != "0" ]; then
     CMD+=(--force)

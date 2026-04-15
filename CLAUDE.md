@@ -336,30 +336,7 @@ When setting up recurring monitoring, **always write the monitoring script to a 
 2. User reviews and approves the script
 3. Schedule with `/loop 15m bash scripts/check_my_run.sh`
 
-**Example monitoring script:**
-
-```bash
-#!/usr/bin/env bash
-# scripts/check_my_run.sh — monitor a specific training run
-set -euo pipefail
-bash /home/tas/pawn/scripts/monitor_training.sh <POD_ID>
-```
-
-Or for local-only monitoring:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-bash /home/tas/pawn/scripts/check_progress.sh --sync
-```
-
-### Available Monitoring Tools
-
-| Tool | What it does |
-|------|-------------|
-| `scripts/monitor_training.sh [POD_ID]` | SSH to pod, sync metrics via rsync, show per-variant step/loss/acc/ETA, check HF checkpoint branches |
-| `scripts/check_progress.sh [LOG_DIR]` | Show progress from local `logs/` directory |
-| `python -m pawn.dashboard --log-dir logs` | Solara web dashboard with interactive charts |
+The primary monitoring interface is the Solara dashboard (`python -m pawn.dashboard --log-dir logs`); any ad-hoc polling helpers are one-offs the model is expected to write on demand and leave out of the repo.
 
 ### Dashboard
 
