@@ -49,10 +49,10 @@ VARIANTS = {
 }
 
 
-def fetch_config(repo: str) -> dict:
+def fetch_config(repo: str, revision: str | None = None) -> dict:
     """Download config.json from a HuggingFace model repo."""
     from huggingface_hub import hf_hub_download
-    path = hf_hub_download(repo, "config.json")
+    path = hf_hub_download(repo, "config.json", revision=revision)
     with open(path) as f:
         return json.load(f)
 
@@ -66,12 +66,12 @@ def params_str(n: int) -> str:
     return str(n)
 
 
-def count_params_from_weights(repo: str) -> int:
+def count_params_from_weights(repo: str, revision: str | None = None) -> int:
     """Count exact parameters from the safetensors weights on HuggingFace."""
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
 
-    path = hf_hub_download(repo, "model.safetensors")
+    path = hf_hub_download(repo, "model.safetensors", revision=revision)
     total = 0
     with safe_open(path, framework="pt") as f:
         for key in f.keys():
@@ -82,18 +82,28 @@ CEILING_PATH = Path("data/theoretical_ceiling.json")
 
 
 def load_ceilings() -> dict:
-    """Load accuracy ceilings from the canonical JSON artifact."""
+    """Load accuracy ceilings from the canonical JSON artifact.
+
+    The ceiling JSON predates the split-half bias correction described in
+    docs/ACCURACY_CEILING.md, so `conditional_corrected_ceiling` may be
+    absent. When it is, fall back to `conditional_ceiling` (the naive MC
+    estimate) so the bracket collapses to a single value rather than
+    blowing up. The ceiling is being recomputed for the v1.0.0 vocabulary
+    as a known TODO.
+    """
     if not CEILING_PATH.exists():
         raise FileNotFoundError(
             f"{CEILING_PATH} not found. Run scripts/compute_theoretical_ceiling.py first."
         )
     with open(CEILING_PATH) as f:
         data = json.load(f)
+    mc_naive = data["conditional_ceiling"] * 100
+    mc_corrected = data.get("conditional_corrected_ceiling", data["conditional_ceiling"]) * 100
     return {
         "uncond": data["unconditional_ceiling"] * 100,
         "naive": data["naive_conditional_ceiling"] * 100,
-        "mc_naive": data["conditional_ceiling"] * 100,
-        "mc_corrected": data["conditional_corrected_ceiling"] * 100,
+        "mc_naive": mc_naive,
+        "mc_corrected": mc_corrected,
         "n_rollouts": data["n_rollouts"],
     }
 
@@ -135,47 +145,37 @@ DIAGNOSTIC_NAMES = {
 }
 
 
-def fetch_eval_results(repo: str) -> dict:
+def fetch_eval_results(repo: str, revision: str | None = None) -> dict:
     """Download eval_results.json from a HuggingFace model repo."""
     from huggingface_hub import hf_hub_download
-    path = hf_hub_download(repo, "eval_results.json")
+    path = hf_hub_download(repo, "eval_results.json", revision=revision)
     with open(path) as f:
         return json.load(f)
 
 
-def fetch_best_metrics(repo: str) -> dict:
-    """Download metrics.jsonl and extract best val metrics.
+def fetch_best_metrics(repo: str, revision: str | None = None) -> dict:
+    """Download metrics.jsonl and return the lowest-val/loss record.
 
-    Returns the best val record by loss. If that record is missing extended
-    fields (top5_accuracy, legal_move_rate), merges them from the best val
-    record that does have them. This handles the case where val was logged
-    every 500 steps but checkpoints (with backfilled extended metrics) only
-    exist every 5K steps.
+    The trainer writes a complete val record on every eval, including the
+    extended fields (top5_accuracy, legal_move_rate, game_completion_rate,
+    etc.), so the lowest-loss val record already has everything we need —
+    no per-field backfill from earlier records.
     """
     from huggingface_hub import hf_hub_download
-    path = hf_hub_download(repo, "metrics.jsonl")
+    path = hf_hub_download(repo, "metrics.jsonl", revision=revision)
     best_loss = float("inf")
     best = None
-    best_extended_loss = float("inf")
-    best_extended = None
     with open(path) as f:
         for line in f:
             r = json.loads(line)
-            if r.get("type") == "val":
-                loss = r.get("val/loss", float("inf"))
-                if loss < best_loss:
-                    best_loss = loss
-                    best = r
-                if "val/top5_accuracy" in r and loss < best_extended_loss:
-                    best_extended_loss = loss
-                    best_extended = r
+            if r.get("type") != "val":
+                continue
+            loss = r.get("val/loss", float("inf"))
+            if loss < best_loss:
+                best_loss = loss
+                best = r
     if best is None:
         raise ValueError(f"No val records found in metrics.jsonl from {repo}")
-    # Merge extended fields from the best record that has them
-    if best_extended is not None:
-        for key in ("val/top5_accuracy", "val/perplexity", "val/legal_move_rate"):
-            if key not in best and key in best_extended:
-                best[key] = best_extended[key]
     return best
 
 
@@ -203,16 +203,20 @@ def format_diagnostic(eval_results: dict, diag_name: str) -> tuple[str, str]:
     return str(n), f"{val:.1%}"
 
 
-def build_context(variant_key: str, variant: dict) -> dict:
+def build_context(variant_key: str, variant: dict, revision: str | None = None) -> dict:
     """Build the full Jinja template context for a variant."""
     repo = variant["repo"]
-    print(f"  Fetching config and metrics from {repo}...")
+    rev_label = f" @ {revision}" if revision else ""
+    print(f"  Fetching config and metrics from {repo}{rev_label}...")
 
     ctx = dict(variant)
     ctx["variant_key"] = variant_key
 
-    # Fetch model architecture from config.json
-    config = fetch_config(repo)
+    # Fetch model architecture and training config from config.json. Every
+    # field below is auto-detected from the published checkpoint — no
+    # hardcoded values, so the same template renders correctly for any
+    # backbone regardless of how it was trained.
+    config = fetch_config(repo, revision=revision)
     mc = config["model_config"]
     ctx["d_model"] = mc["d_model"]
     ctx["n_layers"] = mc["n_layers"]
@@ -221,26 +225,38 @@ def build_context(variant_key: str, variant: dict) -> dict:
     ctx["vocab_size"] = mc["vocab_size"]
     ctx["max_seq_len"] = mc["max_seq_len"]
     ctx["head_dim"] = ctx["d_model"] // ctx["n_heads"]
-    ctx["params_num"] = count_params_from_weights(repo)
+    ctx["params_num"] = count_params_from_weights(repo, revision=revision)
     ctx["params"] = params_str(ctx["params_num"])
 
+    tc = config["training_config"]
+    ctx["total_steps"] = tc["total_steps"]
+    ctx["batch_size"] = tc["batch_size"]
+    ctx["warmup_steps"] = tc["warmup_steps"]
+    ctx["lr"] = tc["lr"]
+    ctx["weight_decay"] = tc["weight_decay"]
+    ctx["max_ply"] = tc["max_ply"]
+    ctx["prepend_outcome"] = tc.get("prepend_outcome", False)
+    ctx["sequences_seen"] = ctx["total_steps"] * ctx["batch_size"]
+
     # Fetch training metrics
-    best = fetch_best_metrics(repo)
-    if not best:
-        raise RuntimeError(f"Could not fetch metrics.jsonl from {repo}")
+    best = fetch_best_metrics(repo, revision=revision)
+    ctx["best_step"] = best["step"]
     ctx["top1"] = best["val/accuracy"] * 100
+    ctx["top5"] = best["val/top5_accuracy"] * 100
     ctx["val_loss"] = best["val/loss"]
-    # These fields were added in later training runs — warn if missing
-    if "val/top5_accuracy" not in best:
-        print(f"  WARNING: val/top5_accuracy missing from {repo} metrics")
-    if "val/legal_move_rate" not in best:
-        print(f"  WARNING: val/legal_move_rate missing from {repo} metrics")
-    ctx["top5"] = best.get("val/top5_accuracy", None)
-    if ctx["top5"] is not None:
-        ctx["top5"] *= 100
-    ctx["legal_rate"] = best.get("val/legal_move_rate", None)
-    if ctx["legal_rate"] is not None:
-        ctx["legal_rate"] *= 100
+    ctx["perplexity"] = best["val/perplexity"]
+    ctx["legal_rate"] = best["val/legal_move_rate"] * 100
+    ctx["late_legal_rate"] = best["val/late_legal_move_rate"] * 100
+    # Compound legality: did the model predict every move along one side's
+    # plies legally for an entire game? See docs/ARCHITECTURE.md for the
+    # definition. These fields were added in the v1.0.0 training runs;
+    # if they're missing the trainer used by this checkpoint pre-dates
+    # them, which means the card needs to be regenerated against a
+    # newer run before being uploaded.
+    ctx["completion_rate"] = best["val/game_completion_rate"] * 100
+    ctx["avg_pct_completion"] = best["val/avg_pct_completion"] * 100
+    ctx["avg_plies_completed"] = best["val/avg_plies_completed"]
+    ctx["median_forfeit_ply"] = best["val/median_forfeit_ply"]
 
     # Accuracy ratios
     ceil = load_ceilings()
@@ -253,7 +269,7 @@ def build_context(variant_key: str, variant: dict) -> dict:
     ctx["mc_corrected_ratio"] = round(ctx["top1"] / ceil["mc_corrected"] * 100)
 
     # Fetch eval results for probes and diagnostics
-    eval_results = fetch_eval_results(repo)
+    eval_results = fetch_eval_results(repo, revision=revision)
     if not eval_results:
         raise RuntimeError(f"Could not fetch eval_results.json from {repo}")
 
@@ -282,6 +298,19 @@ def main():
     parser.add_argument("--template", type=Path, default=Path("cards/hf_model_card.md.j2"))
     parser.add_argument("--output-dir", type=Path, default=Path("cards/model"))
     parser.add_argument("--variants", nargs="*", default=list(VARIANTS.keys()))
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help=(
+            "HuggingFace revision (branch, tag, or commit SHA) to read each "
+            "model repo from. Defaults to the repo's default branch (main). "
+            "Use this to render against an unmerged training run, e.g. "
+            "--revision run/co_pretraining_2026_04_13. The same revision is "
+            "applied to all selected variants. If --push is used together "
+            "with --revision, the rendered card is still uploaded to the "
+            "default branch (HF model cards only live on main)."
+        ),
+    )
     args = parser.parse_args()
 
     env = jinja2.Environment(
@@ -299,7 +328,7 @@ def main():
             continue
 
         print(f"\n=== {VARIANTS[variant_key]['variant_name']} ===")
-        ctx = build_context(variant_key, VARIANTS[variant_key])
+        ctx = build_context(variant_key, VARIANTS[variant_key], revision=args.revision)
         card = template.render(**ctx)
 
         output_path = args.output_dir / f"pawn-{variant_key}.md"
