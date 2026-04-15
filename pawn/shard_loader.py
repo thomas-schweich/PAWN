@@ -145,29 +145,30 @@ def _process_shard_tokens(
     ``outcome_tokens_col[i]`` come directly from the parquet columns of
     the same name.
 
-    ``prepend_outcome=False`` emits pure-moves tensors of shape
-    ``(N, max_ply)`` with moves at positions ``0..game_length-1``.
-    ``prepend_outcome=True`` emits outcome-prefixed tensors of shape
-    ``(N, max_ply + 1)`` with the outcome at slot 0 and moves at
-    ``1..game_length+1``. Both paths run through ``pack_clm_sequences``
-    so the shape/loss-mask semantics match what the trainer expects.
+    ``max_ply`` is the total output tensor width — matches the model's
+    ``max_seq_len`` and the convention used by ``pack_clm_sequences``. In
+    both modes the output has shape ``(N, max_ply)``; the difference is
+    whether slot 0 holds the outcome (``prepend_outcome=True``) or the
+    first move (``prepend_outcome=False``).
     """
     from pawn.data import pack_clm_sequences
 
     N = len(token_lists)
+    # ``max_ply`` is the total budget; effective move cap is one lower
+    # when the outcome occupies slot 0.
+    effective_max_moves = max_ply - 1 if prepend_outcome else max_ply
     game_lengths = np.asarray(game_lengths_col, dtype=np.int16).copy()
-    np.minimum(game_lengths, max_ply, out=game_lengths)
+    np.minimum(game_lengths, effective_max_moves, out=game_lengths)
     outcomes = torch.tensor(outcome_tokens_col, dtype=torch.long)
 
-    move_ids = np.zeros((N, max_ply), dtype=np.int16)
+    move_ids = np.zeros((N, effective_max_moves), dtype=np.int16)
     for i, toks in enumerate(token_lists):
         n_moves = int(game_lengths[i])
         if n_moves > 0:
             move_ids[i, :n_moves] = toks[:n_moves]
 
-    seq_len = max_ply + 1 if prepend_outcome else max_ply
     batch = pack_clm_sequences(
-        move_ids, game_lengths, outcomes, seq_len,
+        move_ids, game_lengths, outcomes, max_ply,
         prepend_outcome=prepend_outcome,
     )
 
@@ -231,9 +232,12 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         self.elo_min = elo_min
         self.elo_max = elo_max
         self.min_ply = min_ply
+        # ``max_ply`` here is the total tensor-width budget (matches the
+        # model's ``max_seq_len``); the outcome slot, if any, lives
+        # inside this budget.
         self.max_ply = max_ply
         self.prepend_outcome = prepend_outcome
-        self.seq_len = max_ply + 1 if prepend_outcome else max_ply
+        self.seq_len = max_ply
         self.max_games = max_games
         self.shuffle_buffer_size = shuffle_buffer
         self.seed = seed

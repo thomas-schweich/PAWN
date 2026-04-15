@@ -152,10 +152,14 @@ class TestProcessShardTokensPrepended:
             token_lists, game_lengths, outcome_tokens, max_ply=8,
             prepend_outcome=True,
         )
-        assert out["input_ids"].shape == (2, 9)
-        assert out["targets"].shape == (2, 9)
-        assert out["loss_mask"].shape == (2, 9)
-        assert out["move_ids"].shape == (2, 8)
+        # max_ply is the total tensor-width budget; outcome slot lives
+        # inside that budget, so the shape is (N, max_ply) in both modes.
+        assert out["input_ids"].shape == (2, 8)
+        assert out["targets"].shape == (2, 8)
+        assert out["loss_mask"].shape == (2, 8)
+        # move_ids is parallel to the move positions only — one less
+        # than the budget when prepending.
+        assert out["move_ids"].shape == (2, 7)
         assert out["game_lengths"].shape == (2,)
 
     @pytest.mark.unit
@@ -217,19 +221,21 @@ class TestProcessShardTokensPrepended:
 
     @pytest.mark.unit
     def test_max_ply_clipping(self):
-        """Games longer than max_ply get capped to max_ply moves."""
+        """Games longer than the budget get capped. In outcome-prefixed
+        mode the effective move cap is ``max_ply - 1`` because slot 0
+        holds the outcome."""
         toks = [i + 1 for i in range(10)]  # 10 moves
         out = _process_shard_tokens(
             [toks], [10], [WHITE_CHECKMATES], max_ply=4,
             prepend_outcome=True,
         )
-        # capped to max_ply = 4
-        assert out["game_lengths"][0] == 4
-        # seq_len = max_ply + 1 = 5: [outcome, m1, m2, m3, m4]
-        assert out["input_ids"].shape == (1, 5)
+        # Prepended + budget=4 → 3 move slots, so games are capped at 3.
+        assert out["game_lengths"][0] == 3
+        # Tensor width == max_ply regardless of mode: [outcome, m1, m2, m3]
+        assert out["input_ids"].shape == (1, 4)
         assert out["input_ids"][0, 0].item() == WHITE_CHECKMATES
         assert out["input_ids"][0, 1].item() == 1
-        assert out["input_ids"][0, 4].item() == 4
+        assert out["input_ids"][0, 3].item() == 3
 
 
 # ---------------------------------------------------------------------------
@@ -338,8 +344,9 @@ class TestShardedDataset:
             prepend_outcome=True,
         )
         item = next(iter(ds))
-        # prepend_outcome=True → shape == max_ply + 1 (outcome slot + moves)
-        assert item["input_ids"].shape == (17,)
+        # max_ply is the total budget — same shape in both modes; the
+        # outcome slot lives inside it when prepending.
+        assert item["input_ids"].shape == (16,)
 
     @pytest.mark.integration
     def test_max_games_limit(self, local_shard_dir):

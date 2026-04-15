@@ -78,6 +78,11 @@ HF_RAW_FILENAME_TEMPLATE = "lichess_{year_month}.pgn.zst"
 # virtually every Lichess game fits under this cap with its natural outcome
 # token, so PLY_LIMIT is only assigned to truly-degenerate games.
 DEFAULT_MAX_PLY = 512
+# Outcome tokens occupy [1969, 1979]. Mirrors ``pawn.config.OUTCOME_TOKEN_BASE``;
+# duplicated here because this script is designed to run in a slim Docker
+# image that only has ``chess_engine``, ``numpy``, ``polars``, ``zstandard``,
+# and ``huggingface_hub`` — no ``pawn`` Python package.
+OUTCOME_TOKEN_BASE = 1969
 DEFAULT_BATCH_SIZE = 500_000
 DEFAULT_SHARD_SIZE = 1_000_000
 DEFAULT_JOBS = 4
@@ -208,10 +213,9 @@ def batch_to_dataframe(parsed: dict[str, Any]) -> pl.DataFrame:
         return pl.DataFrame()
 
     # Defensive check: slot 0 of a pure-moves row must be a legal action
-    # token (< 1969 = OUTCOME_TOKEN_BASE). Outcome tokens at slot 0 mean
-    # the caller passed prepend_outcome=True, which would corrupt the
+    # token (< OUTCOME_TOKEN_BASE). Outcome tokens at slot 0 mean the
+    # caller passed prepend_outcome=True, which would corrupt the
     # parquet output.
-    from pawn.config import OUTCOME_TOKEN_BASE
     if int(tokens[0, 0]) >= OUTCOME_TOKEN_BASE:
         raise ValueError(
             "batch_to_dataframe expects pure-moves tokens from "

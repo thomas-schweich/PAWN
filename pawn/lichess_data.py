@@ -352,10 +352,15 @@ def _prepare_from_tokens(
     outcome_tokens_list = df["outcome_token"].to_list()
     N = len(token_lists)
 
-    seq_len = max_ply + 1 if prepend_outcome else max_ply
+    # ``max_ply`` is the total tensor-width budget (matches the model's
+    # ``max_seq_len`` and the convention used by ``pack_clm_sequences``).
+    # In outcome-prefixed mode the outcome slot lives inside that budget,
+    # so the effective move cap is ``max_ply - 1``.
+    seq_len = max_ply
+    effective_max_moves = max_ply - 1 if prepend_outcome else max_ply
 
     if N == 0:
-        return {"move_ids": np.zeros((0, max_ply), dtype=np.int16),
+        return {"move_ids": np.zeros((0, effective_max_moves), dtype=np.int16),
                 "game_lengths": np.zeros(0, dtype=np.int16),
                 "input_ids": torch.zeros(0, seq_len, dtype=torch.long),
                 "targets": torch.zeros(0, seq_len, dtype=torch.long),
@@ -363,10 +368,10 @@ def _prepare_from_tokens(
                 "outcome_tokens": torch.zeros(0, dtype=torch.long),
                 "n_games": 0}
 
-    move_ids = np.zeros((N, max_ply), dtype=np.int16)
+    move_ids = np.zeros((N, effective_max_moves), dtype=np.int16)
     game_lengths = np.zeros(N, dtype=np.int16)
     for i, toks in enumerate(token_lists):
-        gl = min(int(game_lengths_list[i]), max_ply)
+        gl = min(int(game_lengths_list[i]), effective_max_moves)
         game_lengths[i] = gl
         if gl > 0:
             move_ids[i, :gl] = toks[:gl]
