@@ -179,7 +179,7 @@ fn generate_random_games<'py>(
 /// `max_ply = seq_len`. When true, position 0 is the outcome token and
 /// `max_ply = seq_len - 1`.
 #[pyfunction]
-#[pyo3(signature = (batch_size, seq_len=256, seed=42, discard_ply_limit=false, mate_boost=0.0, prepend_outcome=false))]
+#[pyo3(signature = (batch_size, seq_len=512, seed=42, discard_ply_limit=false, mate_boost=0.0, prepend_outcome=false))]
 fn generate_clm_batch<'py>(
     py: Python<'py>,
     batch_size: usize,
@@ -950,24 +950,31 @@ fn parse_pgn_enriched<'py>(
 
 /// Parse Lichess PGN into a numpy-friendly dict.
 ///
-/// By default, `tokens` is a pure-moves array and the outcome is returned
-/// only in the separate `outcome_tokens` column. Pass `prepend_outcome=True`
-/// to get the older layout where the outcome token is prepended at position 0
-/// of every row (matching `generate_clm_batch(prepend_outcome=True)`).
+/// `max_ply` is the **total sequence-length budget** — the width of the
+/// `tokens` array is always exactly `max_ply`, regardless of mode. When
+/// `prepend_outcome=True` the outcome token occupies slot 0 and up to
+/// `max_ply - 1` move slots follow; when `False` (default) all `max_ply`
+/// slots hold moves and the outcome is returned in the separate
+/// `outcome_tokens` column. This matches `generate_clm_batch`'s `seq_len`
+/// convention: the caller specifies a context-window budget and the
+/// function slices the outcome slot out of it on demand.
 ///
 /// Returns a dict with:
-///   tokens: ndarray[i16, (N, seq_len)]    — seq_len = max_ply + (1 if prepend_outcome else 0)
-///                                           pure moves, or [outcome, ply_1, ...] if prepended
-///   clocks: ndarray[u16, (N, max_ply)]    — clock per move ply (no outcome slot)
-///   game_lengths: ndarray[u16, (N,)]      — move count (never counts outcome)
-///   original_lengths: ndarray[u32, (N,)]  — full game length before truncation
-///   outcome_tokens: ndarray[u16, (N,)]    — outcome token ID per game
-///   san: list[list[str]]                  — raw SAN strings per game, length == game_length
-///   uci: list[list[str]]                  — UCI strings per game, length == game_length
+///   tokens: ndarray[i16, (N, max_ply)]            — pure moves, or
+///                                                   `[outcome, m_1, ..., m_{max_ply-1}]`
+///                                                   when prepended
+///   clocks: ndarray[u16, (N, effective_max_ply)]  — clock per move ply
+///                                                   (effective_max_ply = max_ply
+///                                                   or max_ply - 1)
+///   game_lengths: ndarray[u16, (N,)]              — move count (never counts outcome)
+///   original_lengths: ndarray[u32, (N,)]          — full game length before truncation
+///   outcome_tokens: ndarray[u16, (N,)]            — outcome token ID per game
+///   san: list[list[str]]                          — raw SAN strings per game, length == game_length
+///   uci: list[list[str]]                          — UCI strings per game, length == game_length
 ///   + all string metadata columns (result, white, black, eco, opening,
 ///     time_control, termination, date_time, site)
 #[pyfunction]
-#[pyo3(signature = (content, max_ply=255, max_games=1_000_000, min_ply=1, prepend_outcome=false))]
+#[pyo3(signature = (content, max_ply=512, max_games=1_000_000, min_ply=1, prepend_outcome=false))]
 fn parse_pgn_lichess<'py>(
     py: Python<'py>,
     content: &str,
@@ -976,19 +983,28 @@ fn parse_pgn_lichess<'py>(
     min_ply: usize,
     prepend_outcome: bool,
 ) -> PyResult<PyObject> {
+    // `max_ply` is the sequence-length budget; the outcome slot (if any)
+    // consumes one of those slots, so the parser's move cap is one lower
+    // when prepending. Pure-moves mode uses the full budget for moves.
+    let effective_max_ply = if prepend_outcome {
+        max_ply.saturating_sub(1)
+    } else {
+        max_ply
+    };
     let games = py.allow_threads(|| {
-        pgn::parse_pgn_lichess(content, max_ply, max_games, min_ply)
+        pgn::parse_pgn_lichess(content, effective_max_ply, max_games, min_ply)
     });
 
     let n = games.len();
-    let seq_len = if prepend_outcome { max_ply + 1 } else { max_ply };
+    let seq_len = max_ply;
     let dict = PyDict::new(py);
 
     // Tokens: (N, seq_len). With `prepend_outcome`, slot 0 is the outcome
     // token and moves start at slot 1; otherwise slot 0 is the first move.
     let mut flat_tokens = vec![0i16; n * seq_len];
-    // Clocks: (N, max_ply) — parallel to moves only, never has an outcome slot.
-    let mut flat_clocks = vec![0u16; n * max_ply];
+    // Clocks are parallel to the move positions only (no outcome slot),
+    // so their width tracks `effective_max_ply`.
+    let mut flat_clocks = vec![0u16; n * effective_max_ply];
     let mut lengths_out = Vec::with_capacity(n);
     let mut orig_lengths_out = Vec::with_capacity(n);
     let mut outcome_tokens_out = Vec::with_capacity(n);
@@ -1044,10 +1060,10 @@ fn parse_pgn_lichess<'py>(
             })
             .collect::<PyResult<_>>()?;
 
-        // clocks parallel to moves only
-        let clk_offset = gi * max_ply;
+        // clocks parallel to moves only (no outcome slot)
+        let clk_offset = gi * effective_max_ply;
         for (t, &clk) in g.clocks.iter().enumerate() {
-            if t < max_ply {
+            if t < effective_max_ply {
                 flat_clocks[clk_offset + t] = clk;
             }
         }
@@ -1081,7 +1097,7 @@ fn parse_pgn_lichess<'py>(
     }
 
     let tokens_arr = numpy::PyArray::from_vec(py, flat_tokens).reshape([n, seq_len])?;
-    let clocks_arr = numpy::PyArray::from_vec(py, flat_clocks).reshape([n, max_ply])?;
+    let clocks_arr = numpy::PyArray::from_vec(py, flat_clocks).reshape([n, effective_max_ply])?;
     let lengths_arr = numpy::PyArray::from_vec(py, lengths_out);
     let orig_lengths_arr = numpy::PyArray::from_vec(py, orig_lengths_out);
     let outcome_tokens_arr = numpy::PyArray::from_vec(py, outcome_tokens_out);

@@ -74,11 +74,9 @@ from huggingface_hub.errors import RepositoryNotFoundError
 
 HF_RAW_BUCKET = "thomas-schweich/raw-lichess"
 HF_RAW_FILENAME_TEMPLATE = "lichess_{year_month}.pgn.zst"
-# Note: `parse_pgn_lichess`'s PyO3 signature defaults to `max_ply=255` to match
-# `generate_clm_batch`. The extractor deliberately overrides that to 512 so
-# virtually every Lichess game gets its natural outcome token (PLY_LIMIT is
-# reserved for games that truly exceed this cap). We always pass `--max-ply`
-# explicitly to the engine, so the PyO3 default never applies here.
+# Matches the 512-ply default on `parse_pgn_lichess` and `generate_clm_batch`;
+# virtually every Lichess game fits under this cap with its natural outcome
+# token, so PLY_LIMIT is only assigned to truly-degenerate games.
 DEFAULT_MAX_PLY = 512
 DEFAULT_BATCH_SIZE = 500_000
 DEFAULT_SHARD_SIZE = 1_000_000

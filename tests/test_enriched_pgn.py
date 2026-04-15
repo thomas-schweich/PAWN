@@ -250,7 +250,8 @@ class TestLichessParserOutput:
         """Default `prepend_outcome=False` → tokens shape is (N, max_ply)
         and tokens[0] is the first move, not the outcome."""
         r = chess_engine.parse_pgn_lichess(PGNS["alice_v_bob"])
-        assert r["tokens"].shape[1] == 255  # default max_ply
+        # Default max_ply is 512 (matches the 512-token context of current models)
+        assert r["tokens"].shape[1] == 512
         # The first move is white's e4 → UCI e2e4 → token id from vocab
         m2t = chess_engine.export_move_vocabulary()["move_to_token"]
         e2e4 = m2t["e2e4"]
@@ -260,10 +261,12 @@ class TestLichessParserOutput:
         assert 1969 <= int(r["outcome_tokens"][0]) <= 1979
 
     def test_prepend_outcome_opt_in_shape(self):
-        """`prepend_outcome=True` restores the legacy shape (N, max_ply+1)
-        with the outcome at position 0."""
+        """`prepend_outcome=True` still fits in `max_ply` total slots — the
+        outcome takes slot 0 and the move cap is reduced by one. The tensor
+        width matches `max_ply` in both modes, matching the convention used
+        by ``generate_clm_batch``'s ``seq_len`` parameter."""
         r = chess_engine.parse_pgn_lichess(PGNS["alice_v_bob"], prepend_outcome=True)
-        assert r["tokens"].shape[1] == 256  # max_ply + 1
+        assert r["tokens"].shape[1] == 512  # same width as pure-moves default
         assert int(r["tokens"][0, 0]) == int(r["outcome_tokens"][0])
 
     def test_san_and_uci_columns_present(self):
