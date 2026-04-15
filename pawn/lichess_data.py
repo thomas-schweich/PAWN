@@ -301,7 +301,7 @@ def _prepare_from_tokens(
         )
 
     df = lf.select(
-        ["tokens", "game_length", "outcome_token", "result"],
+        ["tokens", "game_length", "outcome_token"],
     ).head(max_games).collect()
     print(f"Loaded {len(df):,} games from pre-tokenized Parquet")
 
