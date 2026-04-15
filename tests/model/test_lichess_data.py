@@ -216,6 +216,45 @@ class TestLegalMaskBuilder:
                 )
 
     @pytest.mark.integration
+    def test_pure_moves_full_length_has_pad_legal(self):
+        """Regression test: for a pure-moves game with ``game_length == seq_len``,
+        the last supervised position's target is PAD, but the Rust engine
+        skips the PAD entry at position ``length`` (no room in the tensor)
+        and the shift-left doesn't produce one either. Without an explicit
+        fix, that position would have an all-zero legal mask and training
+        would mask out the true target.
+
+        ``compute_legal_indices`` adds PAD at position ``seq_len - 1`` for
+        full-length games to ensure the last supervised position always
+        permits the PAD target.
+        """
+        from pawn.config import PAD_TOKEN
+
+        # Craft a game that fills the entire budget exactly.
+        B = 1
+        seq_len = 20
+        move_ids, gl, _tc = engine.generate_random_games(B, seq_len, seed=42)
+        # Force game_length to seq_len so we exercise the full-length path.
+        assert int(gl[0]) <= seq_len
+        gl[0] = seq_len
+        # Ensure move_ids is fully populated up to seq_len by re-running
+        # with a seed that gives a long enough game; otherwise we just
+        # trust the games engine and accept the test may be a no-op if
+        # gl[0] < seq_len after the assignment (move_ids would have
+        # garbage, but the mask check only depends on game_length).
+
+        builder = LegalMaskBuilder(
+            batch_size=B, seq_len=seq_len, vocab_size=1980, device="cpu",
+        )
+        mask = builder({"move_ids": move_ids, "game_length": gl})
+        # Last supervised position must include PAD.
+        assert mask[0, seq_len - 1, PAD_TOKEN].item(), (
+            f"Full-length pure-moves game: mask at position {seq_len - 1} "
+            "(the last supervised slot, target=PAD) must permit PAD, "
+            "otherwise training masks out the true target."
+        )
+
+    @pytest.mark.integration
     def test_call_with_tensor_input(self):
         """__call__ should accept tensors as well as numpy arrays."""
         B = 2

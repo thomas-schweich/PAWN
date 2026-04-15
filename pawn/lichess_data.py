@@ -16,6 +16,7 @@ import torch.utils.data
 
 import chess_engine as engine
 
+from pawn.config import PAD_TOKEN
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,26 @@ def compute_legal_indices(
         per_batch_offset = indices % (seq_len * vocab_size)
         keep = per_batch_offset >= vocab_size
         indices = indices[keep] - vocab_size
+
+        # Full-length games: when ``game_length == seq_len``, the Rust
+        # engine skips the PAD entry at position ``length`` because
+        # there's no room in the (B, seq_len, V) tensor. The shift
+        # doesn't produce one either (it would come from ``raw[seq_len]``
+        # which doesn't exist), so the last supervised position
+        # (``seq_len - 1``, whose target is PAD in pure-moves mode)
+        # ends up with an all-zero legal mask. Add PAD explicitly for
+        # those games.
+        full_length = np.where(np.asarray(game_lengths) == seq_len)[0]
+        if full_length.size > 0:
+            cell_size = seq_len * vocab_size
+            last_slot_base = (seq_len - 1) * vocab_size
+            pad_indices = np.fromiter(
+                (int(b) * cell_size + last_slot_base + PAD_TOKEN
+                 for b in full_length),
+                dtype=np.int64,
+                count=full_length.size,
+            )
+            indices = np.concatenate([indices, pad_indices])
     return indices
 
 
