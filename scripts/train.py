@@ -369,8 +369,11 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
             vocab_size = cfg_obj.vocab_size
         print(f"Trainable params: {param_count:,}")
 
-    # Prepare data
-    max_ply = 255
+    # Prepare data. `seq_len` is the backbone's full context window; the
+    # legal-mask builder / collate / prepare_lichess_dataset all treat
+    # it as the total tensor width, so the outcome slot (if any) lives
+    # inside this budget.
+    seq_len = cfg_obj.max_seq_len if cfg_obj is not None else 256
     streaming = args.elo_min is not None or args.elo_max is not None
 
     from pawn.shard_loader import ShardedLichessDataset, load_val_shards
@@ -407,7 +410,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         print(f"\nPreparing data: {args.pgn}")
         data = prepare_lichess_dataset(
             args.pgn,
-            max_ply=255,
+            max_ply=seq_len,
             max_games=args.max_games or 1_000_000,
             min_ply=args.min_ply,
             prepend_outcome=config.prepend_outcome,
@@ -419,8 +422,10 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         train_ds = LichessDataset(data, start=0, end=n_train).share_memory()
         val_ds = LichessDataset(data, start=n_train, end=n_total)
 
-    seq_len = max_ply + 1 if config.prepend_outcome else max_ply
-    collate = LegalMaskCollate(seq_len=seq_len, vocab_size=vocab_size)
+    collate = LegalMaskCollate(
+        seq_len=seq_len, vocab_size=vocab_size,
+        prepend_outcome=config.prepend_outcome,
+    )
     n_workers = args.num_workers
     train_loader = DataLoader(
         train_ds,
@@ -440,7 +445,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         pin_memory=True,
     )
     mask_builder = LegalMaskBuilder(
-        args.batch_size, max_ply=255, vocab_size=vocab_size, device=device,
+        args.batch_size, seq_len=seq_len, vocab_size=vocab_size, device=device,
         prepend_outcome=config.prepend_outcome,
     )
 

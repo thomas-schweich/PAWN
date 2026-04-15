@@ -28,17 +28,43 @@ def compute_legal_indices(
     game_lengths: np.ndarray,
     seq_len: int,
     vocab_size: int = 1968,
+    prepend_outcome: bool = False,
 ) -> np.ndarray:
     """Compute flat sparse indices for legal token masks (CPU only).
 
     Calls the Rust engine to replay games and returns flat i64 indices
-    suitable for scattering into a (B, seq_len, vocab_size) bool mask.
+    suitable for scattering into a ``(B, seq_len, vocab_size)`` bool mask.
+
+    The engine returns a raw mask indexed by game-ply:
+    ``raw[p]`` = moves legal at game-ply ``p`` (i.e., the legal moves for
+    choosing the ``(p+1)``-th move). In the **outcome-prefixed layout**
+    (``prepend_outcome=True``), the model at token position ``t`` predicts
+    ``m_{t+1}``, so the raw ``raw[t]`` mask aligns directly — no shift.
+
+    In the **pure-moves layout** (``prepend_outcome=False``, the default),
+    ``pack_clm_sequences`` makes ``targets[t] == input_ids[t+1] == m_{t+2}``,
+    so the constraint at position ``t`` is ``raw[t+1]``. We need to shift
+    the raw mask left by one ply, which we do sparsely: for each flat
+    index ``(b, p, v)`` we replace ``p`` with ``p-1`` and drop the entries
+    where the original ``p == 0`` (those have no pure-moves token position
+    to align with).
     """
     move_ids = np.ascontiguousarray(move_ids, dtype=np.int16)
     game_lengths = np.asarray(game_lengths, dtype=np.int16)
-    return engine.compute_legal_token_masks_sparse(
+    indices = engine.compute_legal_token_masks_sparse(
         move_ids, game_lengths, seq_len, vocab_size,
     )
+    if not prepend_outcome:
+        # Shift left by one ply. The flat index encodes (b, p, v) as
+        #   idx = b * seq_len * vocab_size + p * vocab_size + v
+        # so ``(idx % (seq_len * vocab_size)) < vocab_size`` is the
+        # ``p == 0`` case — those entries have no corresponding pure-moves
+        # slot and must be dropped. The rest shift down by ``vocab_size``
+        # so ``new_p = old_p - 1``.
+        per_batch_offset = indices % (seq_len * vocab_size)
+        keep = per_batch_offset >= vocab_size
+        indices = indices[keep] - vocab_size
+    return indices
 
 
 class LegalMaskBuilder:
@@ -54,14 +80,24 @@ class LegalMaskBuilder:
       2. ``__call__(batch)`` — legacy path that computes indices inline.
     """
 
-    def __init__(self, batch_size: int, max_ply: int, vocab_size: int = 1968,
+    def __init__(self, batch_size: int, seq_len: int, vocab_size: int = 1968,
                  device: str = "cpu", max_index_buf: int = 4_000_000,
                  prepend_outcome: bool = False):
+        """
+        Args:
+            seq_len: total tensor width matching the model's ``max_seq_len``.
+                In outcome-prefixed mode the outcome slot lives inside this
+                budget; in pure-moves mode all ``seq_len`` slots hold moves.
+                This matches the convention used by ``pack_clm_sequences``
+                and the Rust ``parse_pgn_lichess`` wrapper.
+            prepend_outcome: required so the sparse legal mask can be shifted
+                by one ply when the data layout is pure moves (see
+                ``compute_legal_indices``).
+        """
         self.vocab_size = vocab_size
-        self.max_ply = max_ply
-        # When prepend_outcome=True we reserve one extra slot for the
-        # outcome token at position 0; pure-moves mode fits in max_ply.
-        self.T = max_ply + 1 if prepend_outcome else max_ply
+        self.seq_len = seq_len
+        self.prepend_outcome = prepend_outcome
+        self.T = seq_len
         self.device = device
 
         # Pre-allocated GPU output buffer
@@ -109,8 +145,9 @@ class LegalMaskBuilder:
         move_ids = np.ascontiguousarray(move_ids, dtype=np.int16)
         game_lengths = np.asarray(game_lengths_raw, dtype=np.int16)
 
-        indices = engine.compute_legal_token_masks_sparse(
+        indices = compute_legal_indices(
             move_ids, game_lengths, self.T, self.vocab_size,
+            prepend_outcome=self.prepend_outcome,
         )
 
         return self.scatter(torch.from_numpy(indices), B)
@@ -121,12 +158,16 @@ class LegalMaskCollate:
 
     Wraps default collation and appends a ``legal_indices`` CPU tensor
     to each batch so the Rust replay runs in worker processes, off the
-    GPU training critical path.
+    GPU training critical path. ``prepend_outcome`` must match the
+    data pipeline's layout — see ``compute_legal_indices`` for why the
+    pure-moves path shifts the mask by one ply.
     """
 
-    def __init__(self, seq_len: int, vocab_size: int = 1968):
+    def __init__(self, seq_len: int, vocab_size: int = 1968,
+                 prepend_outcome: bool = False):
         self.seq_len = seq_len
         self.vocab_size = vocab_size
+        self.prepend_outcome = prepend_outcome
 
     def __call__(self, items: list[dict]) -> dict:
         batch = torch.utils.data.default_collate(items)
@@ -134,6 +175,7 @@ class LegalMaskCollate:
         game_lengths = np.asarray(batch["game_length"], dtype=np.int16)
         indices = compute_legal_indices(
             move_ids, game_lengths, self.seq_len, self.vocab_size,
+            prepend_outcome=self.prepend_outcome,
         )
         batch["legal_indices"] = torch.from_numpy(indices)
         return batch

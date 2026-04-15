@@ -322,9 +322,10 @@ def main():
             print("  prepend_outcome: False (default; checkpoint metadata unavailable)")
 
     # Prepare data
+    seq_len = model.cfg.max_seq_len
     print(f"Preparing evaluation data: {args.pgn}")
     data = prepare_lichess_dataset(
-        args.pgn, max_ply=255, max_games=args.max_games, min_ply=10,
+        args.pgn, max_ply=seq_len, max_games=args.max_games, min_ply=10,
         prepend_outcome=prepend_outcome,
     )
     n_total = data["n_games"]
@@ -340,7 +341,7 @@ def main():
 
     vocab_size = model.cfg.vocab_size
     mask_builder = LegalMaskBuilder(
-        args.batch_size, max_ply=255, vocab_size=vocab_size, device=device,
+        args.batch_size, seq_len=seq_len, vocab_size=vocab_size, device=device,
         prepend_outcome=prepend_outcome,
     )
 

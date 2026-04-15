@@ -495,8 +495,13 @@ class InProcessRoSAObjective:
             self._prepend_outcome = False
 
         # --- Parse data once ---
+        # Use the backbone's full context window as the tensor-width budget
+        # — the legal mask and collate use the same value, so no more
+        # hardcoded 255/256 here.
+        self._seq_len = self._cfg.max_seq_len
         data = prepare_lichess_dataset(
-            pgn, max_ply=255, max_games=max_games, min_ply=min_ply,
+            pgn, max_ply=self._seq_len,
+            max_games=max_games, min_ply=min_ply,
             elo_min=elo_min, elo_max=elo_max,
             prepend_outcome=self._prepend_outcome,
         )
@@ -518,8 +523,8 @@ class InProcessRoSAObjective:
         # --- Precompute val legal indices (fixed batch size) ---
         vocab_size = self._cfg.vocab_size
         self._mask_builder = LegalMaskBuilder(
-            val_batch_size, max_ply=255, vocab_size=vocab_size, device=device,
-            prepend_outcome=self._prepend_outcome,
+            val_batch_size, seq_len=self._seq_len, vocab_size=vocab_size,
+            device=device, prepend_outcome=self._prepend_outcome,
         )
         val_loader = DataLoader(
             self._val_ds, batch_size=val_batch_size, shuffle=False,
@@ -533,6 +538,7 @@ class InProcessRoSAObjective:
             game_lengths = np.asarray(batch["game_length"], dtype=np.int16)
             indices = compute_legal_indices(
                 move_ids, game_lengths, self._mask_builder.T, vocab_size,
+                prepend_outcome=self._prepend_outcome,
             )
             self._val_legal_indices.append(torch.from_numpy(indices).pin_memory())
 
@@ -583,11 +589,13 @@ class InProcessRoSAObjective:
         device = self.device
 
         # --- Data loaders (batch_size varies per trial) ---
-        # seq_len is driven by the backbone's training-time layout (see
-        # __init__): 256 for outcome-prefixed, 255 for pure moves. The
-        # legal-mask positions must match whatever the model expects.
-        collate_seq_len = 256 if self._prepend_outcome else 255
-        collate = LegalMaskCollate(seq_len=collate_seq_len, vocab_size=vocab_size)
+        # seq_len comes from the backbone (same value as the mask builder
+        # was created with); the legal-mask shift is driven by
+        # ``prepend_outcome``.
+        collate = LegalMaskCollate(
+            seq_len=self._seq_len, vocab_size=vocab_size,
+            prepend_outcome=self._prepend_outcome,
+        )
         train_loader = DataLoader(
             self._train_ds, batch_size=batch_size, shuffle=True,
             num_workers=0, pin_memory=True, collate_fn=collate,
@@ -602,8 +610,8 @@ class InProcessRoSAObjective:
         if batch_size > mask_builder._mask_gpu.shape[0]:
             from pawn.lichess_data import LegalMaskBuilder
             mask_builder = LegalMaskBuilder(
-                batch_size, max_ply=255, vocab_size=vocab_size, device=device,
-                prepend_outcome=self._prepend_outcome,
+                batch_size, seq_len=self._seq_len, vocab_size=vocab_size,
+                device=device, prepend_outcome=self._prepend_outcome,
             )
 
         # ---------------------------------------------------------------

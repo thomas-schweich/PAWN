@@ -186,6 +186,7 @@ def precompute_val_masks(
             game_lengths,
             mask_builder.T,
             vocab_size,
+            prepend_outcome=mask_builder.prepend_outcome,
         )
         indices.append(torch.from_numpy(idx).pin_memory())
     return indices
