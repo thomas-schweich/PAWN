@@ -50,8 +50,7 @@ ARGPARSE_SCRIPTS = [
     "generate_model_cards.py",
     "generate_stockfish_data.py",
     "profile_step.py",
-    "run_evals_local.py",
-    "run_evals_toplayer.py",
+    "run_evals_backbone.py",
     "split_dataset.py",
 ]
 
