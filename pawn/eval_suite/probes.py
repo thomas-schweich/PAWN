@@ -101,8 +101,8 @@ def extract_probe_data(
             When ``prepend_outcome=True``, actual move plies in the returned
             arrays are ``max_ply - 1`` (position 0 is the outcome token).
         prepend_outcome: match the training-time outcome-prefix format. Set
-            this to ``True`` for checkpoints trained with
-            ``no_outcome_token=False``.
+            to ``True`` for checkpoints trained with ``prepend_outcome=True``;
+            leave at ``False`` (the default) for pure-moves checkpoints.
 
     Returns dict with all arrays needed for all probes.
     """
@@ -291,7 +291,7 @@ def _extract_hidden_states(
     device: str,
     layer_idx: int,
     max_batch: int = 64,
-    no_outcome_token: bool = True,
+    prepend_outcome: bool = False,
     use_amp: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract hidden states at one layer for all valid positions.
@@ -299,9 +299,9 @@ def _extract_hidden_states(
     Uses early-stop forward: only computes transformer layers up to
     layer_idx, avoiding wasted compute and GPU memory for later layers.
 
-    When no_outcome_token=True (default), moves start at position 0 and
-    ply_offset is 0. When False, position 0 is an outcome token and
-    moves start at position 1.
+    When prepend_outcome=False (default, pure-moves layout), moves start
+    at position 0 and ply_offset is 0. When True, position 0 is the
+    outcome token and moves start at position 1.
 
     Args:
         use_amp: use float16 autocast for the forward pass (GPU only).
@@ -316,7 +316,7 @@ def _extract_hidden_states(
     max_ply = data["boards"].shape[1]
     d_model = model.cfg.d_model
 
-    if no_outcome_token:
+    if not prepend_outcome:
         ply_offset = 0  # moves are at positions 0..max_ply-1
     else:
         ply_offset = 1  # moves are at positions 1..max_ply (position 0 is outcome)
@@ -363,7 +363,7 @@ def _extract_all_hidden_states(
     data: dict,
     device: str,
     max_batch: int = 64,
-    no_outcome_token: bool = True,
+    prepend_outcome: bool = False,
     use_amp: bool = False,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
     """Extract hidden states at ALL layers via a single forward pass.
@@ -387,7 +387,7 @@ def _extract_all_hidden_states(
     d_model = model.cfg.d_model
     n_out_layers = model.cfg.n_layers + 1
 
-    if no_outcome_token:
+    if not prepend_outcome:
         ply_offset = 0
     else:
         ply_offset = 1
@@ -634,7 +634,7 @@ def train_single_probe(
     lr: float = 1e-3,
     batch_size: int = 256,
     layer_idx: int = -1,
-    no_outcome_token: bool = True,
+    prepend_outcome: bool = False,
 ) -> dict:
     """Train a single probe (extracts hidden states internally).
 
@@ -642,8 +642,8 @@ def train_single_probe(
     train_all_probes which extracts hidden states once per layer.
     """
     model.eval()
-    train_h, train_valid = _extract_hidden_states(model, train_data, device, layer_idx, no_outcome_token=no_outcome_token)
-    val_h, val_valid = _extract_hidden_states(model, val_data, device, layer_idx, no_outcome_token=no_outcome_token)
+    train_h, train_valid = _extract_hidden_states(model, train_data, device, layer_idx, prepend_outcome=prepend_outcome)
+    val_h, val_valid = _extract_hidden_states(model, val_data, device, layer_idx, prepend_outcome=prepend_outcome)
 
     train_t = _extract_targets(probe_name, train_data, train_valid)
     val_t = _extract_targets(probe_name, val_data, val_valid)
@@ -890,7 +890,7 @@ def _forward_batch_positions(
     game_indices: torch.Tensor,
     device: str,
     layer_indices: list[int],
-    no_outcome_token: bool,
+    prepend_outcome: bool,
     use_amp: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run a single forward pass on a batch of games and return stacked hidden
@@ -918,7 +918,7 @@ def _forward_batch_positions(
     B = input_ids.shape[0]
     max_ply = data["boards"].shape[1]
     d_model = model.cfg.d_model
-    ply_offset = 0 if no_outcome_token else 1
+    ply_offset = 0 if not prepend_outcome else 1
 
     # Slice selected layers to move positions and flatten
     sel_flat = [
@@ -982,7 +982,7 @@ def _eval_streaming(
     probes_dict: dict[str, "BatchedLinearProbe"],
     device: str,
     layer_indices: list[int],
-    no_outcome_token: bool,
+    prepend_outcome: bool,
     use_amp: bool,
     probe_names: list[str],
     val_target_means: dict[str, torch.Tensor],
@@ -1018,7 +1018,7 @@ def _eval_streaming(
 
         stacked, g_idx, p_idx = _forward_batch_positions(
             model, val_data, game_indices, device,
-            layer_indices, no_outcome_token, use_amp,
+            layer_indices, prepend_outcome, use_amp,
         )
         n_valid_batch = stacked.shape[1]
         if n_valid_batch == 0:
@@ -1085,7 +1085,7 @@ def train_all_probes(
     lr: float = 1e-3,
     probe_names: list[str] | None = None,
     verbose: bool = True,
-    no_outcome_token: bool = True,
+    prepend_outcome: bool = False,
     use_amp: bool = False,
     game_batch_size: int = 64,
     inner_batch_size: int = 256,
@@ -1159,7 +1159,7 @@ def train_all_probes(
             game_indices = game_perm[gs:gs + game_batch_size]
             stacked, g_idx, p_idx = _forward_batch_positions(
                 model, train_data, game_indices, device,
-                layer_indices, no_outcome_token, use_amp,
+                layer_indices, prepend_outcome, use_amp,
             )
             n_valid_batch = stacked.shape[1]
             if n_valid_batch == 0:
@@ -1197,7 +1197,7 @@ def train_all_probes(
         # Per-epoch validation for best_accuracy tracking
         epoch_val = _eval_streaming(
             model, val_data, probes_dict, device, layer_indices,
-            no_outcome_token, use_amp, probe_names, val_target_means,
+            prepend_outcome, use_amp, probe_names, val_target_means,
             game_batch_size,
         )
         for pname in probe_names:
@@ -1208,7 +1208,7 @@ def train_all_probes(
     # Final evaluation for returned loss/accuracy/mae
     final_val = _eval_streaming(
         model, val_data, probes_dict, device, layer_indices,
-        no_outcome_token, use_amp, probe_names, val_target_means,
+        prepend_outcome, use_amp, probe_names, val_target_means,
         game_batch_size,
     )
     n_val_positions = final_val["_n_val_positions"]

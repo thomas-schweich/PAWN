@@ -508,7 +508,6 @@ class TestBaseRunConfig:
         assert cfg.patience is None
         assert cfg.log_interval == 100
         assert cfg.mate_boost == 0.0
-        assert cfg.no_outcome_token is False
         assert cfg.prepend_outcome is False
         assert cfg.discard_ply_limit is False
         assert cfg.no_compile is False
@@ -690,11 +689,6 @@ class TestTypeValidation:
             PretrainConfig.model_validate(
                 {"local_checkpoints": True, "lr": "fast"}
             )
-
-    def test_no_outcome_token_must_be_bool_like(self):
-        # Pydantic v2 is lenient with bool coercion; we just test explicit bad values
-        cfg = PretrainConfig(local_checkpoints=True, no_outcome_token=True)
-        assert cfg.no_outcome_token is True
 
     def test_prepend_outcome_flag(self):
         cfg = PretrainConfig(local_checkpoints=True, prepend_outcome=True)

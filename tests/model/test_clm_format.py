@@ -1,9 +1,5 @@
 """Tests for CLM sequence format, off-by-one boundaries, and engine/Python consistency.
 
-Migrated from tests/test_clm_format.py. Covers vocabulary consistency, Rust
-CLM batch invariants, Rust/Python parity, boundary cases, and strip_outcome_token
-applied to engine output.
-
 The engine's ``generate_clm_batch()`` supports two modes:
 
 - **Default** (``prepend_outcome=False``): sequences are pure moves
@@ -11,8 +7,8 @@ The engine's ``generate_clm_batch()`` supports two modes:
 - **Outcome-prepended** (``prepend_outcome=True``): sequences are
   ``[outcome, m1, ..., mN, PAD, ...]`` with ``max_ply = seq_len - 1``.
 
-``_to_clm_batch`` (from ``pawn.data``) always prepends outcome tokens, so
-consistency tests between Rust and Python use ``prepend_outcome=True``.
+Consistency tests between Rust and Python pass ``prepend_outcome=True`` to
+both sides when they want the outcome-prefixed layout.
 """
 
 from __future__ import annotations
@@ -37,7 +33,6 @@ from pawn.data import (
     _map_termination_to_outcome,
     _to_clm_batch,
     pack_clm_sequences,
-    strip_outcome_token,
 )
 
 
@@ -240,7 +235,7 @@ class TestRustPythonConsistency:
         B = 16
         r_input_ids, r_targets, r_loss_mask, r_move_ids, r_gl, r_tc = \
             engine.generate_clm_batch(B, seq_len, seed, prepend_outcome=True)
-        py_batch = _to_clm_batch(r_move_ids, r_gl, r_tc, seq_len)
+        py_batch = _to_clm_batch(r_move_ids, r_gl, r_tc, seq_len, prepend_outcome=True)
         assert torch.equal(torch.from_numpy(r_input_ids).long(), py_batch["input_ids"])
         assert torch.equal(torch.from_numpy(r_targets).long(), py_batch["targets"])
         assert torch.equal(torch.from_numpy(r_loss_mask), py_batch["loss_mask"])
@@ -307,63 +302,3 @@ class TestBoundaryCases:
         assert not np.array_equal(r1[0], r2[0])
 
 
-# ---------------------------------------------------------------------------
-# strip_outcome_token (applied to engine output)
-# ---------------------------------------------------------------------------
-
-
-class TestStripOutcomeTokenEngineOutput:
-    @pytest.fixture(scope="class")
-    def original_and_stripped(self):
-        input_ids, targets, loss_mask, move_ids, game_lengths, term_codes = \
-            engine.generate_clm_batch(32, 256, seed=42, prepend_outcome=True)
-        legal_grid, _ = engine.compute_legal_move_masks(move_ids, game_lengths)
-        original = {
-            "input_ids": torch.from_numpy(input_ids).long(),
-            "targets": torch.from_numpy(targets).long(),
-            "loss_mask": torch.from_numpy(loss_mask),
-            "legal_grid": torch.from_numpy(legal_grid).long(),
-            "game_lengths": torch.from_numpy(game_lengths).long(),
-        }
-        stripped = strip_outcome_token(original)
-        return original, stripped
-
-    @pytest.mark.integration
-    def test_position_zero_is_move(self, original_and_stripped):
-        _, stripped = original_and_stripped
-        for b in range(stripped["input_ids"].shape[0]):
-            tok = stripped["input_ids"][b, 0].item()
-            assert 0 <= tok <= NUM_ACTIONS - 1
-
-    @pytest.mark.integration
-    def test_no_outcome_tokens_in_sequence(self, original_and_stripped):
-        _, stripped = original_and_stripped
-        assert (stripped["input_ids"] < OUTCOME_TOKEN_BASE).all()
-
-    @pytest.mark.integration
-    def test_target_shift_correct(self, original_and_stripped):
-        _, stripped = original_and_stripped
-        assert torch.equal(stripped["targets"][:, :-1], stripped["input_ids"][:, 1:])
-        assert (stripped["targets"][:, -1] == PAD_TOKEN).all()
-
-    @pytest.mark.integration
-    def test_loss_mask_count(self, original_and_stripped):
-        original, stripped = original_and_stripped
-        for b in range(original["loss_mask"].shape[0]):
-            orig_count = original["loss_mask"][b].sum().item()
-            strip_count = stripped["loss_mask"][b].sum().item()
-            assert strip_count == orig_count - 1
-
-    @pytest.mark.integration
-    def test_legal_grid_shifted(self, original_and_stripped):
-        original, stripped = original_and_stripped
-        max_ply = original["legal_grid"].shape[1]
-        assert torch.equal(
-            stripped["legal_grid"][:, :max_ply - 1],
-            original["legal_grid"][:, 1:],
-        )
-
-    @pytest.mark.integration
-    def test_game_lengths_unchanged(self, original_and_stripped):
-        original, stripped = original_and_stripped
-        assert torch.equal(original["game_lengths"], stripped["game_lengths"])

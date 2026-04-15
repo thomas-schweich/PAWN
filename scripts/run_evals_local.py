@@ -49,11 +49,7 @@ def main():
 
     # Probe data is sized per variant from the loaded model's
     # ``max_seq_len`` so it works on 256-ctx and 512-ctx checkpoints
-    # alike. Probe hidden-state extraction in ``train_all_probes`` also
-    # needs to know where moves start: set ``no_outcome_token`` to the
-    # inverse of ``prepend_outcome`` so the probe slicing matches the
-    # checkpoint's training-time layout.
-    no_outcome_token = not args.prepend_outcome
+    # alike.
 
     for name, info in variants.items():
         sep = "=" * 60
@@ -84,7 +80,7 @@ def main():
         probe_results = train_all_probes(
             model, train_data, val_data, device=device,
             per_layer=True, n_epochs=args.n_epochs, verbose=True,
-            no_outcome_token=no_outcome_token,
+            prepend_outcome=args.prepend_outcome,
         )
         results["probes"] = probe_results
 

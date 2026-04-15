@@ -65,6 +65,20 @@ The only extras are GPU backends (`rocm` or `cu128`). Everything else (pytest, s
 - Factored embeddings: `src_embed[s] + dst_embed[d] + promo_embed[p]`
 - Sequence format: `[ply_1] ... [ply_N] [PAD] ... [PAD]` (512 tokens) — outcome prefix is optional via `prepend_outcome` flag
 
+> **Legacy note.** Earlier versions of this codebase used a ~60k-entry move
+> vocabulary and two separate parquet layouts ("v1" = pure-moves tokens with
+> outcomes derived coarsely from the PGN `result` header, "v2" = tokens with
+> the outcome prepended at position 0). **Both are gone.** The current code
+> only knows about the 1,968-action vocabulary and the single canonical
+> parquet schema written by `scripts/extract_lichess_parquet.py` (pure-moves
+> `tokens` + granular `outcome_token` column + per-game metadata). If you
+> find a reference to a "v1 vocab", "v2 format", `_result_to_outcome`,
+> `strip_outcome_token`, or `no_outcome_token`, it's a bug — those were all
+> removed during the 0.x → stable transition. Legacy checkpoints trained
+> against the old vocabulary are accessible only via the
+> `pre-vocab-transition` git tag; they cannot be loaded or trained against
+> from the current tree.
+
 ### Variants
 - `CLMConfig.small()`: d=256, 8 layers, 4 heads, ~9.5M params
 - `CLMConfig.base()`: d=512, 8 layers, 8 heads, ~35.8M params (default)

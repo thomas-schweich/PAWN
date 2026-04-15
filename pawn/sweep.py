@@ -456,7 +456,9 @@ class InProcessRoSAObjective:
         import torch
         from pawn.config import CLMConfig
         from pawn.model import PAWNCLM
-        from pawn.checkpoint import load_backbone_weights
+        from pawn.checkpoint import (
+            get_prepend_outcome, load_backbone_weights, read_checkpoint_metadata,
+        )
         from pawn.gpu import configure_gpu
         from pawn.lichess_data import (
             prepare_lichess_dataset,
@@ -472,10 +474,36 @@ class InProcessRoSAObjective:
         self._cfg = CLMConfig(**model_config) if model_config else CLMConfig()
         self._backbone_state = state_dict
 
-        # --- Parse PGN once ---
+        # Auto-detect the backbone's training-time sequence format so all
+        # downstream data shaping (dataset, collate, legal mask builder)
+        # agrees with what the model actually saw. Mis-setting this flag
+        # silently shifts predictions by one ply — the exact latent bug
+        # that motivated the prepend_outcome refactor.
+        try:
+            saved = read_checkpoint_metadata(checkpoint)
+            self._prepend_outcome = get_prepend_outcome(saved.get("training_config"))
+        except (FileNotFoundError, OSError, ValueError):
+            # Bare safetensors / HF repo without training_config: assume
+            # the new canonical default (pure moves). Log once so a user
+            # running a sweep on an ambiguous checkpoint sees it.
+            print(
+                "InProcessRoSAObjective: could not read prepend_outcome from "
+                f"{checkpoint}; defaulting to pure-moves. Pass an outcome-"
+                "prefixed checkpoint only if you know it was trained with "
+                "prepend_outcome=True."
+            )
+            self._prepend_outcome = False
+
+        # --- Parse data once ---
+        # Use the backbone's full context window as the tensor-width budget
+        # — the legal mask and collate use the same value, so no more
+        # hardcoded 255/256 here.
+        self._seq_len = self._cfg.max_seq_len
         data = prepare_lichess_dataset(
-            pgn, max_ply=255, max_games=max_games, min_ply=min_ply,
+            pgn, max_ply=self._seq_len,
+            max_games=max_games, min_ply=min_ply,
             elo_min=elo_min, elo_max=elo_max,
+            prepend_outcome=self._prepend_outcome,
         )
         n_total = data["n_games"]
         n_val = min(val_games, n_total // 5)
@@ -495,7 +523,8 @@ class InProcessRoSAObjective:
         # --- Precompute val legal indices (fixed batch size) ---
         vocab_size = self._cfg.vocab_size
         self._mask_builder = LegalMaskBuilder(
-            val_batch_size, max_ply=255, vocab_size=vocab_size, device=device,
+            val_batch_size, seq_len=self._seq_len, vocab_size=vocab_size,
+            device=device, prepend_outcome=self._prepend_outcome,
         )
         val_loader = DataLoader(
             self._val_ds, batch_size=val_batch_size, shuffle=False,
@@ -509,6 +538,7 @@ class InProcessRoSAObjective:
             game_lengths = np.asarray(batch["game_length"], dtype=np.int16)
             indices = compute_legal_indices(
                 move_ids, game_lengths, self._mask_builder.T, vocab_size,
+                prepend_outcome=self._prepend_outcome,
             )
             self._val_legal_indices.append(torch.from_numpy(indices).pin_memory())
 
@@ -559,7 +589,13 @@ class InProcessRoSAObjective:
         device = self.device
 
         # --- Data loaders (batch_size varies per trial) ---
-        collate = LegalMaskCollate(seq_len=256, vocab_size=vocab_size)
+        # seq_len comes from the backbone (same value as the mask builder
+        # was created with); the legal-mask shift is driven by
+        # ``prepend_outcome``.
+        collate = LegalMaskCollate(
+            seq_len=self._seq_len, vocab_size=vocab_size,
+            prepend_outcome=self._prepend_outcome,
+        )
         train_loader = DataLoader(
             self._train_ds, batch_size=batch_size, shuffle=True,
             num_workers=0, pin_memory=True, collate_fn=collate,
@@ -574,7 +610,8 @@ class InProcessRoSAObjective:
         if batch_size > mask_builder._mask_gpu.shape[0]:
             from pawn.lichess_data import LegalMaskBuilder
             mask_builder = LegalMaskBuilder(
-                batch_size, max_ply=255, vocab_size=vocab_size, device=device,
+                batch_size, seq_len=self._seq_len, vocab_size=vocab_size,
+                device=device, prepend_outcome=self._prepend_outcome,
             )
 
         # ---------------------------------------------------------------

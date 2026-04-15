@@ -499,15 +499,6 @@ class CLMTrainer:
         )
         self.scaler = torch.amp.GradScaler(self.device, enabled=train_cfg.use_amp)
 
-        if train_cfg.no_outcome_token:
-            import warnings
-            warnings.warn(
-                "no_outcome_token is deprecated and has no effect. "
-                "Sequences are pure moves by default (no outcome prefix). "
-                "Use prepend_outcome=True if you need outcome-conditioned training.",
-                DeprecationWarning, stacklevel=2,
-            )
-
         self.dataset = CLMDataset(
             train_cfg.batch_size, train_cfg.max_ply, train_cfg.base_seed,
             discard_ply_limit=train_cfg.discard_ply_limit,

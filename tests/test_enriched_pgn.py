@@ -1,6 +1,7 @@
 """Tests for enriched PGN parsing and dataset extraction pipeline."""
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -14,22 +15,21 @@ def _load_extract_module():
     """Load scripts/extract_lichess_parquet.py as a standalone module.
 
     The scripts/ directory isn't a package, so we use importlib.util to
-    load the file directly by path.
+    load the file directly by path. Registering in sys.modules before
+    exec_module is required for dataclasses defined at module scope under
+    Python 3.10 (dataclass decorator looks up ``sys.modules[cls.__module__]``
+    when checking for KW_ONLY sentinels).
     """
     path = Path(__file__).resolve().parent.parent / "scripts" / "extract_lichess_parquet.py"
     spec = importlib.util.spec_from_file_location("extract_lichess_parquet", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
+    sys.modules["extract_lichess_parquet"] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
 batch_to_dataframe = _load_extract_module().batch_to_dataframe
-
-# batch_to_dataframe expects parse_pgn_lichess output; use this for tests
-def parse_and_build_df(pgn: str):
-    """Parse PGN with Lichess parser and build DataFrame."""
-    return batch_to_dataframe(chess_engine.parse_pgn_lichess(pgn))
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +243,100 @@ class TestEnrichedParsing:
                 )
 
 
+class TestLichessParserOutput:
+    """Direct assertions on parse_pgn_lichess (pure-moves layout)."""
+
+    def test_pure_moves_default_shape(self):
+        """Default `prepend_outcome=False` → tokens shape is (N, max_ply)
+        and tokens[0] is the first move, not the outcome."""
+        r = chess_engine.parse_pgn_lichess(PGNS["alice_v_bob"])
+        # Default max_ply is 512 (matches the 512-token context of current models)
+        assert r["tokens"].shape[1] == 512
+        # The first move is white's e4 → UCI e2e4 → token id from vocab
+        m2t = chess_engine.export_move_vocabulary()["move_to_token"]
+        e2e4 = m2t["e2e4"]
+        assert r["tokens"][0, 0] == e2e4
+        # Outcome lives in its own column
+        assert r["outcome_tokens"].shape == (1,)
+        assert 1969 <= int(r["outcome_tokens"][0]) <= 1979
+
+    def test_prepend_outcome_opt_in_shape(self):
+        """`prepend_outcome=True` still fits in `max_ply` total slots — the
+        outcome takes slot 0 and the move cap is reduced by one. The tensor
+        width matches `max_ply` in both modes, matching the convention used
+        by ``generate_clm_batch``'s ``seq_len`` parameter."""
+        r = chess_engine.parse_pgn_lichess(PGNS["alice_v_bob"], prepend_outcome=True)
+        assert r["tokens"].shape[1] == 512  # same width as pure-moves default
+        assert int(r["tokens"][0, 0]) == int(r["outcome_tokens"][0])
+
+    def test_san_and_uci_columns_present(self):
+        r = chess_engine.parse_pgn_lichess(PGNS["alice_v_bob"])
+        assert isinstance(r["san"], list)
+        assert isinstance(r["uci"], list)
+        assert r["san"][0] == ["e4", "e5", "Nf3", "Nc6"]
+        assert r["uci"][0] == ["e2e4", "e7e5", "g1f3", "b8c6"]
+
+    def test_san_raw_from_pgn(self):
+        """SAN strings are what the PGN actually wrote, including short-SAN
+        disambiguation (e.g. `Bg5` not `B1g5`)."""
+        r = chess_engine.parse_pgn_lichess(PGNS["xavier_v_alice"])
+        assert r["san"][0] == ["d4", "Nf6", "Bg5"]
+
+
+class TestSanUciTokenConsistency:
+    """The three move representations must agree row by row.
+
+    tokens are derived from SAN by the Rust parser; UCI is derived from
+    tokens via `vocab::token_to_uci`. These tests prove both derivations
+    are internally consistent by round-tripping through independent
+    engine entry points.
+    """
+
+    @pytest.fixture(scope="class")
+    def combined_output(self):
+        pgns = "\n".join(PGNS.values())
+        return chess_engine.parse_pgn_lichess(pgns)
+
+    def test_lengths_agree(self, combined_output):
+        n = combined_output["tokens"].shape[0]
+        for i in range(n):
+            gl = int(combined_output["game_lengths"][i])
+            assert len(combined_output["san"][i]) == gl
+            assert len(combined_output["uci"][i]) == gl
+            # tokens row is fixed-width; the first `gl` entries are the moves
+            row = combined_output["tokens"][i]
+            assert gl <= row.shape[0]
+
+    def test_uci_matches_vocab_token_lookup(self, combined_output):
+        """For every (token, uci) pair, vocab['token_to_move'][token] == uci."""
+        t2m = chess_engine.export_move_vocabulary()["token_to_move"]
+        n = combined_output["tokens"].shape[0]
+        for i in range(n):
+            gl = int(combined_output["game_lengths"][i])
+            tokens = combined_output["tokens"][i, :gl].tolist()
+            ucis = combined_output["uci"][i]
+            for t, u in zip(tokens, ucis):
+                assert t2m[int(t)] == u, f"game {i}: token {t} → {t2m[int(t)]!r}, uci column says {u!r}"
+
+    def test_san_converted_to_uci_matches_uci_column(self, combined_output):
+        """pgn_to_uci(san) must reproduce the uci column exactly."""
+        san_rows: list[list[str]] = combined_output["san"]
+        recovered = chess_engine.pgn_to_uci(san_rows)
+        assert recovered == combined_output["uci"]
+
+    def test_uci_back_to_tokens_matches_token_column(self, combined_output):
+        """Feeding the UCI strings back through `uci_to_tokens` reproduces
+        the token column exactly (and lengths agree)."""
+        uci_rows: list[list[str]] = combined_output["uci"]
+        # uci_to_tokens returns (move_ids: (N, max_ply) i16, lengths: (N,) i16)
+        recovered_tokens, recovered_lengths = chess_engine.uci_to_tokens(uci_rows, max_ply=512)
+        n = combined_output["tokens"].shape[0]
+        for i in range(n):
+            gl = int(combined_output["game_lengths"][i])
+            assert int(recovered_lengths[i]) == gl
+            assert recovered_tokens[i, :gl].tolist() == combined_output["tokens"][i, :gl].tolist()
+
+
 class TestPlayerHashing:
     """Test that player username hashing is deterministic and independent of context.
 
@@ -363,14 +457,17 @@ class TestPlayerHashRegression:
 
 
 class TestBatchToDataframe:
-    """Test the full batch_to_dataframe pipeline."""
+    """Test the full batch_to_dataframe pipeline (pure-moves layout)."""
 
     def test_schema(self):
         r = chess_engine.parse_pgn_lichess(PGNS["alice_v_bob"])
         df = batch_to_dataframe(r)
         assert df["tokens"].dtype == pl.List(pl.Int16)
+        assert df["san"].dtype == pl.List(pl.Utf8)
+        assert df["uci"].dtype == pl.List(pl.Utf8)
         assert df["clock"].dtype == pl.List(pl.UInt16)
         assert df["game_length"].dtype == pl.UInt16
+        assert df["outcome_token"].dtype == pl.UInt16
         assert df["white_elo"].dtype == pl.UInt16
         assert df["black_elo"].dtype == pl.UInt16
         assert df["white_rating_diff"].dtype == pl.Int16
@@ -379,12 +476,45 @@ class TestBatchToDataframe:
         assert df["black_player"].dtype == pl.UInt64
 
     def test_list_columns_trimmed_to_game_length(self):
-        """Token and clock lists are aligned: both game_length + 1 (outcome slot + moves)."""
+        """All per-ply list columns (tokens, san, uci, clock) have length
+        exactly == game_length — no outcome prefix, no padding."""
         r = chess_engine.parse_pgn_lichess(PGNS["bob_v_xavier"])
         df = batch_to_dataframe(r)
-        gl = df["game_length"][0]
-        assert len(df["tokens"][0]) == gl + 1  # outcome + moves
-        assert len(df["clock"][0]) == gl + 1   # aligned with tokens (0 for outcome slot)
+        gl = int(df["game_length"][0])
+        assert len(df["tokens"][0]) == gl
+        assert len(df["san"][0]) == gl
+        assert len(df["uci"][0]) == gl
+        assert len(df["clock"][0]) == gl
+
+    def test_outcome_token_column_is_separate(self):
+        """The outcome token lives only in its own column; the tokens list
+        is pure moves with no outcome prefix."""
+        r = chess_engine.parse_pgn_lichess(PGNS["alice_v_bob"])
+        df = batch_to_dataframe(r)
+        outcome = int(df["outcome_token"][0])
+        assert 1969 <= outcome <= 1979
+        # The tokens column must not contain the outcome value anywhere.
+        for tok in df["tokens"][0]:
+            assert tok != outcome
+            assert 0 <= int(tok) <= 1967
+
+    def test_san_uci_tokens_consistent_in_dataframe(self):
+        """End-to-end: pull san/uci/tokens out of the DataFrame and verify
+        they agree with each other via the engine's vocab tables."""
+        combined = "\n".join(PGNS.values())
+        r = chess_engine.parse_pgn_lichess(combined)
+        df = batch_to_dataframe(r)
+
+        t2m = chess_engine.export_move_vocabulary()["token_to_move"]
+        san_rows = df["san"].to_list()
+        uci_rows = df["uci"].to_list()
+        token_rows = df["tokens"].to_list()
+
+        # SAN → UCI via engine matches the uci column.
+        assert chess_engine.pgn_to_uci(san_rows) == uci_rows
+        # token → UCI via vocab matches the uci column.
+        for toks, ucis in zip(token_rows, uci_rows):
+            assert [t2m[int(t)] for t in toks] == ucis
 
     def test_parquet_roundtrip(self, tmp_path):
         """Write to Parquet and read back — all values must survive."""
@@ -395,7 +525,10 @@ class TestBatchToDataframe:
         df2 = pl.read_parquet(path)
         assert df.shape == df2.shape
         assert df["tokens"].to_list() == df2["tokens"].to_list()
+        assert df["san"].to_list() == df2["san"].to_list()
+        assert df["uci"].to_list() == df2["uci"].to_list()
         assert df["clock"].to_list() == df2["clock"].to_list()
+        assert df["outcome_token"].to_list() == df2["outcome_token"].to_list()
         assert df["white_player"].to_list() == df2["white_player"].to_list()
 
     def test_multi_game_batch(self):

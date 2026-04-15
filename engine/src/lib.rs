@@ -179,7 +179,7 @@ fn generate_random_games<'py>(
 /// `max_ply = seq_len`. When true, position 0 is the outcome token and
 /// `max_ply = seq_len - 1`.
 #[pyfunction]
-#[pyo3(signature = (batch_size, seq_len=256, seed=42, discard_ply_limit=false, mate_boost=0.0, prepend_outcome=false))]
+#[pyo3(signature = (batch_size, seq_len=512, seed=42, discard_ply_limit=false, mate_boost=0.0, prepend_outcome=false))]
 fn generate_clm_batch<'py>(
     py: Python<'py>,
     batch_size: usize,
@@ -948,39 +948,68 @@ fn parse_pgn_enriched<'py>(
     Ok(dict.into())
 }
 
-/// Parse Lichess PGN with outcome tokens prepended, no eval column.
+/// Parse Lichess PGN into a numpy-friendly dict.
+///
+/// `max_ply` is the **total sequence-length budget** — the width of the
+/// `tokens` array is always exactly `max_ply`, regardless of mode. When
+/// `prepend_outcome=True` the outcome token occupies slot 0 and up to
+/// `max_ply - 1` move slots follow; when `False` (default) all `max_ply`
+/// slots hold moves and the outcome is returned in the separate
+/// `outcome_tokens` column. This matches `generate_clm_batch`'s `seq_len`
+/// convention: the caller specifies a context-window budget and the
+/// function slices the outcome slot out of it on demand.
 ///
 /// Returns a dict with:
-///   tokens: ndarray[i16, (N, max_ply+1)]  — [outcome, ply_1, ..., ply_N, 0, ...]
-///   clocks: ndarray[u16, (N, max_ply)]    — clock per move ply (no outcome slot)
-///   game_lengths: ndarray[u16, (N,)]      — move count (excl. outcome token)
-///   original_lengths: ndarray[u32, (N,)]  — full game length before truncation
-///   outcome_tokens: ndarray[u16, (N,)]    — outcome token ID per game
-///   + all string metadata columns (same as parse_pgn_enriched)
+///   tokens: ndarray[i16, (N, max_ply)]            — pure moves, or
+///                                                   `[outcome, m_1, ..., m_{max_ply-1}]`
+///                                                   when prepended
+///   clocks: ndarray[u16, (N, effective_max_ply)]  — clock per move ply
+///                                                   (effective_max_ply = max_ply
+///                                                   or max_ply - 1)
+///   game_lengths: ndarray[u16, (N,)]              — move count (never counts outcome)
+///   original_lengths: ndarray[u32, (N,)]          — full game length before truncation
+///   outcome_tokens: ndarray[u16, (N,)]            — outcome token ID per game
+///   san: list[list[str]]                          — raw SAN strings per game, length == game_length
+///   uci: list[list[str]]                          — UCI strings per game, length == game_length
+///   + all string metadata columns (result, white, black, eco, opening,
+///     time_control, termination, date_time, site)
 #[pyfunction]
-#[pyo3(signature = (content, max_ply=255, max_games=1_000_000, min_ply=1))]
+#[pyo3(signature = (content, max_ply=512, max_games=1_000_000, min_ply=1, prepend_outcome=false))]
 fn parse_pgn_lichess<'py>(
     py: Python<'py>,
     content: &str,
     max_ply: usize,
     max_games: usize,
     min_ply: usize,
+    prepend_outcome: bool,
 ) -> PyResult<PyObject> {
+    // `max_ply` is the sequence-length budget; the outcome slot (if any)
+    // consumes one of those slots, so the parser's move cap is one lower
+    // when prepending. Pure-moves mode uses the full budget for moves.
+    let effective_max_ply = if prepend_outcome {
+        max_ply.saturating_sub(1)
+    } else {
+        max_ply
+    };
     let games = py.allow_threads(|| {
-        pgn::parse_pgn_lichess(content, max_ply, max_games, min_ply)
+        pgn::parse_pgn_lichess(content, effective_max_ply, max_games, min_ply)
     });
 
     let n = games.len();
-    let seq_len = max_ply + 1; // outcome token + max_ply moves
+    let seq_len = max_ply;
     let dict = PyDict::new(py);
 
-    // Tokens: (N, seq_len) — outcome token at position 0, then moves, then 0-padding
+    // Tokens: (N, seq_len). With `prepend_outcome`, slot 0 is the outcome
+    // token and moves start at slot 1; otherwise slot 0 is the first move.
     let mut flat_tokens = vec![0i16; n * seq_len];
-    // Clocks: (N, max_ply) — parallel to moves only, no outcome slot
-    let mut flat_clocks = vec![0u16; n * max_ply];
+    // Clocks are parallel to the move positions only (no outcome slot),
+    // so their width tracks `effective_max_ply`.
+    let mut flat_clocks = vec![0u16; n * effective_max_ply];
     let mut lengths_out = Vec::with_capacity(n);
     let mut orig_lengths_out = Vec::with_capacity(n);
     let mut outcome_tokens_out = Vec::with_capacity(n);
+    let mut san_out: Vec<Vec<String>> = Vec::with_capacity(n);
+    let mut uci_out: Vec<Vec<String>> = Vec::with_capacity(n);
 
     let mut result_out = Vec::with_capacity(n);
     let mut white_out = Vec::with_capacity(n);
@@ -996,19 +1025,45 @@ fn parse_pgn_lichess<'py>(
     let mut datetime_out = Vec::with_capacity(n);
     let mut site_out = Vec::with_capacity(n);
 
-    for (gi, g) in games.iter().enumerate() {
-        // tokens includes outcome at [0], moves at [1..=game_length]
+    for (gi, g) in games.into_iter().enumerate() {
         let tok_offset = gi * seq_len;
+        let move_start = if prepend_outcome {
+            flat_tokens[tok_offset] = g.outcome_token as i16;
+            1
+        } else {
+            0
+        };
         for (t, &tok) in g.tokens.iter().enumerate() {
-            if t < seq_len {
-                flat_tokens[tok_offset + t] = tok as i16;
+            let slot = move_start + t;
+            if slot < seq_len {
+                flat_tokens[tok_offset + slot] = tok as i16;
             }
         }
 
-        // clocks parallel to moves only
-        let clk_offset = gi * max_ply;
+        // UCI strings are derived from tokens via O(1) vocab lookup.
+        // The invariant is that every token produced by `san_moves_to_tokens_full`
+        // is a legal action in [0, NUM_ACTIONS), so `token_to_uci` always
+        // returns Some — but we surface a missing-token case as a
+        // `PyValueError` rather than a `PanicException` so a future invariant
+        // violation produces a clean Python exception.
+        let uci_moves: Vec<String> = g
+            .tokens
+            .iter()
+            .map(|&t| {
+                vocab::token_to_uci(t).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "tokenized move {} has no UCI representation \
+                         (vocab invariant violated)",
+                        t,
+                    ))
+                })
+            })
+            .collect::<PyResult<_>>()?;
+
+        // clocks parallel to moves only (no outcome slot)
+        let clk_offset = gi * effective_max_ply;
         for (t, &clk) in g.clocks.iter().enumerate() {
-            if t < max_ply {
+            if t < effective_max_ply {
                 flat_clocks[clk_offset + t] = clk;
             }
         }
@@ -1016,6 +1071,8 @@ fn parse_pgn_lichess<'py>(
         lengths_out.push(g.game_length as u16);
         orig_lengths_out.push(g.original_length as u32);
         outcome_tokens_out.push(g.outcome_token);
+        san_out.push(g.san_moves);
+        uci_out.push(uci_moves);
 
         let h = &g.headers;
         white_elo_out.push(h.get("WhiteElo").and_then(|s| s.parse::<u16>().ok()).unwrap_or(0));
@@ -1040,7 +1097,7 @@ fn parse_pgn_lichess<'py>(
     }
 
     let tokens_arr = numpy::PyArray::from_vec(py, flat_tokens).reshape([n, seq_len])?;
-    let clocks_arr = numpy::PyArray::from_vec(py, flat_clocks).reshape([n, max_ply])?;
+    let clocks_arr = numpy::PyArray::from_vec(py, flat_clocks).reshape([n, effective_max_ply])?;
     let lengths_arr = numpy::PyArray::from_vec(py, lengths_out);
     let orig_lengths_arr = numpy::PyArray::from_vec(py, orig_lengths_out);
     let outcome_tokens_arr = numpy::PyArray::from_vec(py, outcome_tokens_out);
@@ -1054,6 +1111,8 @@ fn parse_pgn_lichess<'py>(
     dict.set_item("game_lengths", lengths_arr)?;
     dict.set_item("original_lengths", orig_lengths_arr)?;
     dict.set_item("outcome_tokens", outcome_tokens_arr)?;
+    dict.set_item("san", san_out)?;
+    dict.set_item("uci", uci_out)?;
     dict.set_item("white_elo", white_elo_arr)?;
     dict.set_item("black_elo", black_elo_arr)?;
     dict.set_item("white_rating_diff", white_rd_arr)?;

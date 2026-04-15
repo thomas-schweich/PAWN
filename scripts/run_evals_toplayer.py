@@ -47,11 +47,7 @@ def main():
     positions = extract_diagnostic_positions(corpus, max_per_category=args.n_per_category)
     print("Done.", flush=True)
 
-    # Probe data is sized from the loaded model's ``max_seq_len``; the
-    # probe extractor also needs ``no_outcome_token = not prepend_outcome``
-    # so its hidden-state slicing matches the checkpoint's training
-    # layout. See run_evals_local.py for the longer note.
-    no_outcome_token = not args.prepend_outcome
+    # Probe data is sized from the loaded model's ``max_seq_len``.
 
     for name, info in variants.items():
         sep = "=" * 60
@@ -82,7 +78,7 @@ def main():
         probe_results = train_all_probes(
             model, train_data, val_data, device=device,
             per_layer=False, n_epochs=args.n_epochs, verbose=True,
-            no_outcome_token=no_outcome_token,
+            prepend_outcome=args.prepend_outcome,
         )
         results["probes"] = probe_results
 

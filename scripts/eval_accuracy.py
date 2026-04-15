@@ -45,7 +45,10 @@ def parse_args():
     p.add_argument("--adapter-checkpoint", type=str, required=True,
                     help="Path to trained adapter checkpoint (LoRA/FiLM/hybrid)")
     p.add_argument("--pgn", type=str, required=True,
-                    help="Path to Lichess PGN file")
+                    help="Lichess dataset: a .parquet file or a HuggingFace "
+                         "dataset repo ID (e.g. thomas-schweich/pawn-lichess-full). "
+                         "Raw PGN input is not supported; convert first with "
+                         "scripts/extract_lichess_parquet.py.")
 
     # Eval settings
     p.add_argument("--min-eval-ply", type=int, default=10,
@@ -61,6 +64,10 @@ def parse_args():
     # Device
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--no-amp", action="store_true")
+
+    p.add_argument("--prepend-outcome", action="store_true",
+                    help="Match an outcome-prefixed backbone. Default is "
+                         "pure-moves, matching the canonical training layout.")
 
     return p.parse_args()
 
@@ -298,10 +305,28 @@ def main():
     model, adapter_type = load_model(args.checkpoint, args.adapter_checkpoint, device)
     print(f"  Adapter type: {adapter_type}")
 
+    # Auto-detect the backbone's training-time sequence format so the
+    # data layout matches what the model saw. `--prepend-outcome` forces
+    # the flag when the checkpoint metadata is missing or ambiguous.
+    from pawn.checkpoint import get_prepend_outcome, read_checkpoint_metadata
+    if args.prepend_outcome:
+        prepend_outcome = True
+        print("  prepend_outcome: True (forced by --prepend-outcome)")
+    else:
+        try:
+            saved = read_checkpoint_metadata(args.checkpoint)
+            prepend_outcome = get_prepend_outcome(saved.get("training_config"))
+            print(f"  prepend_outcome: {prepend_outcome} (from checkpoint metadata)")
+        except (FileNotFoundError, OSError, ValueError):
+            prepend_outcome = False
+            print("  prepend_outcome: False (default; checkpoint metadata unavailable)")
+
     # Prepare data
+    seq_len = model.cfg.max_seq_len
     print(f"Preparing evaluation data: {args.pgn}")
     data = prepare_lichess_dataset(
-        args.pgn, max_ply=255, max_games=args.max_games, min_ply=10,
+        args.pgn, max_ply=seq_len, max_games=args.max_games, min_ply=10,
+        prepend_outcome=prepend_outcome,
     )
     n_total = data["n_games"]
     val_start = min(args.val_start, n_total)
@@ -315,8 +340,10 @@ def main():
     )
 
     vocab_size = model.cfg.vocab_size
-    mask_builder = LegalMaskBuilder(args.batch_size, max_ply=255,
-                                    vocab_size=vocab_size, device=device)
+    mask_builder = LegalMaskBuilder(
+        args.batch_size, seq_len=seq_len, vocab_size=vocab_size, device=device,
+        prepend_outcome=prepend_outcome,
+    )
 
     # Evaluate
     print(f"\nEvaluating (min_eval_ply={args.min_eval_ply})...")

@@ -14,7 +14,7 @@ import polars as pl
 import pytest
 import torch
 
-from pawn.config import WHITE_CHECKMATES, OUTCOME_TOKEN_BASE
+from pawn.config import PAD_TOKEN, WHITE_CHECKMATES, OUTCOME_TOKEN_BASE
 from pawn.shard_loader import (
     ShardedLichessDataset,
     _hf_storage_options,
@@ -87,53 +87,123 @@ class TestHfStorageOptions:
 # ---------------------------------------------------------------------------
 
 
-class TestProcessShardTokens:
+class TestProcessShardTokensPureMoves:
+    """Default pure-moves path: ``_process_shard_tokens(..., prepend_outcome=False)``
+    emits ``(N, max_ply)`` tensors with moves at positions ``0..gl-1``."""
+
     @pytest.mark.unit
     def test_basic_shapes(self):
-        token_lists = [
-            [WHITE_CHECKMATES, 10, 20, 30],  # outcome + 3 moves
-            [WHITE_CHECKMATES + 1, 11, 22],  # outcome + 2 moves
-        ]
-        out = _process_shard_tokens(token_lists, max_ply=8, seq_len=9)
-        assert out["input_ids"].shape == (2, 9)
-        assert out["targets"].shape == (2, 9)
-        assert out["loss_mask"].shape == (2, 9)
+        token_lists = [[10, 20, 30], [11, 22]]
+        game_lengths = [3, 2]
+        outcome_tokens = [WHITE_CHECKMATES, WHITE_CHECKMATES + 1]
+        out = _process_shard_tokens(
+            token_lists, game_lengths, outcome_tokens, max_ply=8,
+            prepend_outcome=False,
+        )
+        assert out["input_ids"].shape == (2, 8)
+        assert out["targets"].shape == (2, 8)
+        assert out["loss_mask"].shape == (2, 8)
         assert out["move_ids"].shape == (2, 8)
         assert out["game_lengths"].shape == (2,)
 
     @pytest.mark.unit
+    def test_position_zero_is_first_move(self):
+        out = _process_shard_tokens(
+            [[10, 20]], [2], [WHITE_CHECKMATES], max_ply=8,
+            prepend_outcome=False,
+        )
+        assert out["input_ids"][0, 0].item() == 10
+        assert out["input_ids"][0, 1].item() == 20
+        assert out["input_ids"][0, 2].item() == PAD_TOKEN
+
+    @pytest.mark.unit
+    def test_loss_mask_boundary(self):
+        out = _process_shard_tokens(
+            [[10, 20, 30]], [3], [WHITE_CHECKMATES], max_ply=8,
+            prepend_outcome=False,
+        )
+        # Pure-moves: positions 0..2 True (gl=3 loss positions)
+        assert out["loss_mask"][0, :3].all()
+        assert not out["loss_mask"][0, 3:].any()
+
+    @pytest.mark.unit
+    def test_move_ids_match_tokens(self):
+        out = _process_shard_tokens(
+            [[10, 20, 30]], [3], [WHITE_CHECKMATES], max_ply=8,
+            prepend_outcome=False,
+        )
+        assert out["move_ids"][0, 0] == 10
+        assert out["move_ids"][0, 1] == 20
+        assert out["move_ids"][0, 2] == 30
+        assert out["move_ids"][0, 3] == 0
+
+
+class TestProcessShardTokensPrepended:
+    """Outcome-prefixed path: ``_process_shard_tokens(..., prepend_outcome=True)``
+    emits ``(N, max_ply + 1)`` tensors with the outcome at slot 0 and moves
+    at ``1..gl+1``, matching ``pack_clm_sequences(prepend_outcome=True)``."""
+
+    @pytest.mark.unit
+    def test_basic_shapes(self):
+        token_lists = [[10, 20, 30], [11, 22]]
+        game_lengths = [3, 2]
+        outcome_tokens = [WHITE_CHECKMATES, WHITE_CHECKMATES + 1]
+        out = _process_shard_tokens(
+            token_lists, game_lengths, outcome_tokens, max_ply=8,
+            prepend_outcome=True,
+        )
+        # max_ply is the total tensor-width budget; outcome slot lives
+        # inside that budget, so the shape is (N, max_ply) in both modes.
+        assert out["input_ids"].shape == (2, 8)
+        assert out["targets"].shape == (2, 8)
+        assert out["loss_mask"].shape == (2, 8)
+        # move_ids is parallel to the move positions only — one less
+        # than the budget when prepending.
+        assert out["move_ids"].shape == (2, 7)
+        assert out["game_lengths"].shape == (2,)
+
+    @pytest.mark.unit
     def test_outcome_at_position_zero(self):
-        token_lists = [[WHITE_CHECKMATES, 10, 20]]
-        out = _process_shard_tokens(token_lists, max_ply=8, seq_len=9)
+        out = _process_shard_tokens(
+            [[10, 20]], [2], [WHITE_CHECKMATES], max_ply=8,
+            prepend_outcome=True,
+        )
         assert out["input_ids"][0, 0].item() == WHITE_CHECKMATES
         assert out["input_ids"][0, 1].item() == 10
         assert out["input_ids"][0, 2].item() == 20
-        assert out["input_ids"][0, 3].item() == 0  # PAD after game end
+        assert out["input_ids"][0, 3].item() == PAD_TOKEN
 
     @pytest.mark.unit
     def test_targets_shift_left(self):
-        token_lists = [[WHITE_CHECKMATES, 10, 20, 30]]
-        out = _process_shard_tokens(token_lists, max_ply=8, seq_len=9)
+        out = _process_shard_tokens(
+            [[10, 20, 30]], [3], [WHITE_CHECKMATES], max_ply=8,
+            prepend_outcome=True,
+        )
         T = out["targets"].shape[1]
         for t in range(T - 1):
             assert out["targets"][0, t] == out["input_ids"][0, t + 1]
-        assert out["targets"][0, T - 1] == 0
+        assert out["targets"][0, T - 1] == PAD_TOKEN
 
     @pytest.mark.unit
-    def test_game_lengths_correct(self):
-        token_lists = [
-            [WHITE_CHECKMATES, 10, 20, 30],  # 3 moves
-            [WHITE_CHECKMATES, 1, 2, 3, 4, 5],  # 5 moves
-        ]
-        out = _process_shard_tokens(token_lists, max_ply=8, seq_len=9)
+    def test_game_lengths_from_column(self):
+        """game_length comes from the parquet column, not ``len(tokens)``."""
+        out = _process_shard_tokens(
+            [[10, 20, 30], [1, 2, 3, 4, 5]],
+            [3, 5],
+            [WHITE_CHECKMATES, WHITE_CHECKMATES],
+            max_ply=8,
+            prepend_outcome=True,
+        )
         assert out["game_lengths"][0] == 3
         assert out["game_lengths"][1] == 5
 
     @pytest.mark.unit
     def test_move_ids_excludes_outcome(self):
-        token_lists = [[WHITE_CHECKMATES, 10, 20, 30]]
-        out = _process_shard_tokens(token_lists, max_ply=8, seq_len=9)
-        # move_ids[0] should start with [10, 20, 30, 0, 0, ...]
+        out = _process_shard_tokens(
+            [[10, 20, 30]], [3], [WHITE_CHECKMATES], max_ply=8,
+            prepend_outcome=True,
+        )
+        # move_ids is always pure moves regardless of layout
         assert out["move_ids"][0, 0] == 10
         assert out["move_ids"][0, 1] == 20
         assert out["move_ids"][0, 2] == 30
@@ -141,24 +211,31 @@ class TestProcessShardTokens:
 
     @pytest.mark.unit
     def test_loss_mask_boundary(self):
-        token_lists = [[WHITE_CHECKMATES, 10, 20, 30]]  # 3 moves → game_length=3
-        out = _process_shard_tokens(token_lists, max_ply=8, seq_len=9)
-        # loss_mask: positions 0..3 True (outcome + 3 moves)
+        out = _process_shard_tokens(
+            [[10, 20, 30]], [3], [WHITE_CHECKMATES], max_ply=8,
+            prepend_outcome=True,
+        )
+        # Outcome-prefixed: positions 0..3 True (gl+1 loss positions)
         assert out["loss_mask"][0, :4].all()
         assert not out["loss_mask"][0, 4:].any()
 
     @pytest.mark.unit
     def test_max_ply_clipping(self):
-        """Tokens beyond max_ply are clipped."""
-        # 10 moves, but max_ply=4
-        toks = [WHITE_CHECKMATES] + [i + 1 for i in range(10)]
-        out = _process_shard_tokens([toks], max_ply=4, seq_len=5)
-        # n_moves = min(10, 4) = 4
-        assert out["game_lengths"][0] == 4
-        # input_ids has seq_len=5 slots: [outcome, m1, m2, m3, m4]
+        """Games longer than the budget get capped. In outcome-prefixed
+        mode the effective move cap is ``max_ply - 1`` because slot 0
+        holds the outcome."""
+        toks = [i + 1 for i in range(10)]  # 10 moves
+        out = _process_shard_tokens(
+            [toks], [10], [WHITE_CHECKMATES], max_ply=4,
+            prepend_outcome=True,
+        )
+        # Prepended + budget=4 → 3 move slots, so games are capped at 3.
+        assert out["game_lengths"][0] == 3
+        # Tensor width == max_ply regardless of mode: [outcome, m1, m2, m3]
+        assert out["input_ids"].shape == (1, 4)
         assert out["input_ids"][0, 0].item() == WHITE_CHECKMATES
         assert out["input_ids"][0, 1].item() == 1
-        assert out["input_ids"][0, 4].item() == 4
+        assert out["input_ids"][0, 3].item() == 3
 
 
 # ---------------------------------------------------------------------------
@@ -205,15 +282,18 @@ class TestListShards:
 
 def _write_test_shard(path: Path, n_games: int, game_length: int = 10,
                      white_elo: int = 1800, black_elo: int = 1800) -> None:
-    """Create a test parquet shard with v2-format tokens (outcome + moves)."""
-    token_lists = []
-    for i in range(n_games):
-        # outcome + game_length moves
-        tokens = [WHITE_CHECKMATES + (i % 2)] + [1 + ((i + j) % 100) for j in range(game_length)]
-        token_lists.append(tokens)
+    """Create a test parquet shard in the pure-moves layout the current
+    extract_lichess_parquet.py emits: `tokens` is moves only and the
+    outcome is in its own column."""
+    token_lists = [
+        [1 + ((i + j) % 100) for j in range(game_length)]
+        for i in range(n_games)
+    ]
+    outcome_tokens = [WHITE_CHECKMATES + (i % 2) for i in range(n_games)]
     df = pl.DataFrame({
         "tokens": token_lists,
         "game_length": [game_length] * n_games,
+        "outcome_token": outcome_tokens,
         "white_elo": [white_elo] * n_games,
         "black_elo": [black_elo] * n_games,
         "result": ["1-0"] * n_games,
@@ -243,7 +323,7 @@ class TestShardedDataset:
         assert len(items) == 7  # 4 + 3
 
     @pytest.mark.integration
-    def test_yields_dict_items(self, local_shard_dir):
+    def test_yields_dict_items_pure_moves(self, local_shard_dir):
         ds = ShardedLichessDataset(
             local_shard_dir, split="train",
             min_ply=0, max_ply=16, shuffle_shards=False,
@@ -253,7 +333,20 @@ class TestShardedDataset:
         assert set(item.keys()) >= {
             "input_ids", "targets", "loss_mask", "move_ids", "game_length"
         }
-        assert item["input_ids"].shape == (17,)  # max_ply + 1
+        # Default is pure-moves → shape == max_ply (no outcome slot)
+        assert item["input_ids"].shape == (16,)
+
+    @pytest.mark.integration
+    def test_yields_dict_items_prepended(self, local_shard_dir):
+        ds = ShardedLichessDataset(
+            local_shard_dir, split="train",
+            min_ply=0, max_ply=16, shuffle_shards=False,
+            prepend_outcome=True,
+        )
+        item = next(iter(ds))
+        # max_ply is the total budget — same shape in both modes; the
+        # outcome slot lives inside it when prepending.
+        assert item["input_ids"].shape == (16,)
 
     @pytest.mark.integration
     def test_max_games_limit(self, local_shard_dir):
@@ -325,11 +418,23 @@ class TestShardedDataset:
         assert len(items) == 3
 
     @pytest.mark.integration
-    def test_tokens_are_v2_format(self, local_shard_dir):
-        """Item[0] in input_ids should be an outcome token (>= 4273)."""
+    def test_pure_moves_never_has_outcome_in_sequence(self, local_shard_dir):
+        """Default pure-moves layout must never surface an outcome token
+        inside ``input_ids`` — outcomes live in their own parquet column."""
         ds = ShardedLichessDataset(
             local_shard_dir, split="train",
             min_ply=0, max_ply=16, shuffle_shards=False,
+        )
+        for item in ds:
+            assert (item["input_ids"] < OUTCOME_TOKEN_BASE).all()
+
+    @pytest.mark.integration
+    def test_prepended_input_ids_have_outcome_at_position_zero(self, local_shard_dir):
+        """When ``prepend_outcome=True``, slot 0 must be an outcome token."""
+        ds = ShardedLichessDataset(
+            local_shard_dir, split="train",
+            min_ply=0, max_ply=16, shuffle_shards=False,
+            prepend_outcome=True,
         )
         for item in ds:
             tok = int(item["input_ids"][0])

@@ -53,12 +53,12 @@ def main():
     parser.add_argument("--run", type=str, default=None, help="Only evaluate this run dir name")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Evaluate a single checkpoint path directly (skips log-dir scan)")
-    parser.add_argument("--no-outcome-token", action="store_true",
-                        help="Force pure-moves probe data (overrides checkpoint auto-detection)")
     parser.add_argument("--prepend-outcome", action="store_true",
                         help="Force outcome-prefixed probe data (overrides auto-detection). "
                              "Required for ambiguous pre-flag checkpoints (1980-vocab/512-ctx "
                              "without training.prepend_outcome in config.json).")
+    parser.add_argument("--pure-moves", action="store_true",
+                        help="Force pure-moves probe data (overrides checkpoint auto-detection).")
     parser.add_argument("--top-layer-only", action="store_true",
                         help="Only probe the top layer (skip per-layer sweep)")
     parser.add_argument("--max-ply", type=int, default=None,
@@ -166,9 +166,9 @@ def main():
         if args.prepend_outcome:
             prepend_outcome = True
             reason = "forced by --prepend-outcome CLI override"
-        elif args.no_outcome_token:
+        elif args.pure_moves:
             prepend_outcome = False
-            reason = "forced by --no-outcome-token CLI override"
+            reason = "forced by --pure-moves CLI override"
         else:
             try:
                 prepend_outcome = get_prepend_outcome(train_cfg)
@@ -176,10 +176,9 @@ def main():
             except ValueError as err:
                 raise SystemExit(
                     f"ERROR: {run_dir.name}: {err} Re-run with "
-                    "--prepend-outcome or --no-outcome-token to force the "
+                    "--prepend-outcome or --pure-moves to force the "
                     "correct layout."
                 )
-        no_outcome = not prepend_outcome
         max_ply = args.max_ply or model_cfg.get("max_seq_len") or 512
         print(
             f"  max_ply={max_ply}, prepend_outcome={prepend_outcome} ({reason})"
@@ -190,7 +189,7 @@ def main():
         results = train_all_probes(
             model, train_data, val_data, device,
             per_layer=not args.top_layer_only, n_epochs=args.n_epochs, verbose=True,
-            no_outcome_token=no_outcome, use_amp=(device != "cpu"),
+            prepend_outcome=prepend_outcome, use_amp=(device != "cpu"),
         )
 
         # Save results
@@ -200,7 +199,7 @@ def main():
             "step": int(step),
             "variant": variant,
             "discard_ply_limit": discard,
-            "no_outcome_token": no_outcome,
+            "prepend_outcome": prepend_outcome,
             "model_config": model_cfg,
             "probes": {
                 pname: {

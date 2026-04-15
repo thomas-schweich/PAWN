@@ -577,14 +577,6 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     print(f"Variants: {', '.join(variant_names)}")
     if config.shm_checkpoints:
         print("Checkpoints: /dev/shm (volatile, HF push is durable store)")
-    if config.no_outcome_token:
-        import warnings
-        warnings.warn(
-            "no_outcome_token is deprecated and has no effect in cotraining. "
-            "Sequences are pure moves by default; use prepend_outcome=True for "
-            "outcome-conditioned training.",
-            DeprecationWarning, stacklevel=2,
-        )
     if config.prepend_outcome:
         print("Outcome token: PREPENDED at position 0 (outcome-conditioned training)")
     print(f"LR: {config.lr:.2e}")
@@ -901,7 +893,6 @@ def run_post_training_evals(
         # as pure moves while hidden states were extracted at
         # ply_offset=0, measuring off-by-one shifted representations.
         prepend_outcome = slot.train_cfg.prepend_outcome
-        no_outcome_token = not prepend_outcome
         print(f"  Running probes (prepend_outcome={prepend_outcome})...")
         train_data = extract_probe_data(
             2048, 256, seed=12345, prepend_outcome=prepend_outcome,
@@ -912,7 +903,7 @@ def run_post_training_evals(
         probe_results = train_all_probes(
             model, train_data, val_data, device=device,
             per_layer=True, n_epochs=20, verbose=True,
-            no_outcome_token=no_outcome_token,
+            prepend_outcome=prepend_outcome,
         )
         results["probes"] = probe_results
         del train_data, val_data
