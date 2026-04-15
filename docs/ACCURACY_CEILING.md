@@ -90,7 +90,7 @@ For a model with top-1 accuracy A:
   model is to the Bayes-optimal predictor with perfect outcome knowledge.
   Report against both the naive and corrected estimates for transparency.
 
-### Final model results (100K steps)
+### Legacy model results (100K steps, 4,278-token vocab, prepend_outcome=True)
 
 | Variant | Top-1 | vs Uncond | vs MC Naive | vs MC Corrected |
 |---------|-------|-----------|-------------|-----------------|
@@ -98,11 +98,51 @@ For a model with top-1 accuracy A:
 | base (36M) | 6.86% | 105% | 94% | 103% |
 | small (10M) | 6.73% | 103% | 92% | 101% |
 
-All models exceed the unconditional ceiling, suggesting they exploit the
-outcome token. Against the MC corrected ceiling, all models appear to be
-at or slightly above the estimate — expected, since the corrected estimate
-is biased downward. The true ceiling lies somewhere in the bracket, and
-the models are close to it.
+These numbers are from the legacy backbones (pre-`pre-vocab-transition`),
+which were trained with the outcome token prepended at position 0 — so the
+"vs MC corrected" column was the load-bearing comparison: it measures how
+close the model is to the Bayes-optimal predictor *that also knows the
+outcome*. All three exceeded the unconditional ceiling, confirming they
+exploited the outcome token; against the MC corrected ceiling they sat
+around it, which (given the corrected estimate is biased downward) means
+the legacy models were close to the achievable ceiling for an outcome-
+conditioned predictor.
+
+### v1.0.0 model results (200K steps, 1,980-token vocab, prepend_outcome=False)
+
+The current published checkpoints were trained **without** an outcome
+prefix, so the comparison framework above doesn't apply unchanged: there
+is no leaked outcome information for the model to exploit, and the MC
+ceiling collapses to the unconditional ceiling.
+
+The vocabulary also changed from 4,278 coordinate pairs to the 1,968-entry
+searchless_chess action set (no impossible moves like `a1a1` or `b1a7`).
+This both lowers the random baseline (fewer plausible candidates per
+position) and removes the "model has to learn the action set" tax. For a
+plain top-1 number to be comparable across vocabularies, you have to
+recompute `E[1/N_legal]` against the *legal* moves, which is what the
+new vocabulary already enforces — the unconditional ceiling is still the
+right comparison, but the constant has shifted slightly.
+
+| Variant | Params | Top-1 | Top-5 | Per-move legal | Game completion |
+|---------|--------|-------|-------|----------------|-----------------|
+| Small | 8.94M | 8.53% | 35.44% | 99.7457% | 51.66% |
+| Base | 34.65M | 8.54% | 35.49% | 99.9962% | 99.02% |
+| Large | 66.91M | 8.65% | 35.56% | 99.9996% | 99.80% |
+
+Top-1 numbers across all three sizes are tightly clustered (~8.5%, vs
+the legacy ~6.8%) and the loss curves were essentially indistinguishable
+between sizes. The signal that actually separates capacity is **game
+completion rate**: a model with a 99.7% per-move legal rate forfeits about
+half its games on the way to terminal, while 99.999% clears nearly all of
+them. See [docs/ARCHITECTURE.md](ARCHITECTURE.md#game-completion-rate)
+for that analysis.
+
+The unconditional / MC ceilings reported in the table at the top of this
+document were computed against the **legacy** vocabulary and prepended-
+outcome layout. Recomputing them under the v1.0.0 setup is a known TODO;
+the methodology in the rest of this document still applies, only the
+constants change.
 
 ## Per-outcome breakdown
 
