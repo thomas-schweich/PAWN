@@ -53,7 +53,10 @@ def parse_model_spec(spec: str) -> tuple[str, str]:
     """Parse a ``[name=]path`` model spec into ``(name, path)``.
 
     Only splits on the first ``=`` so paths containing ``=`` still work
-    when an explicit name is given. Refuses empty names/paths.
+    when an explicit name is given. Refuses empty names/paths. Registered
+    as ``type=parse_model_spec`` on ``add_argument`` so argparse converts
+    the raw ``ArgumentTypeError`` into a standard
+    ``error: argument models: ...`` message.
     """
     if "=" in spec:
         name, _, path = spec.partition("=")
@@ -66,8 +69,6 @@ def parse_model_spec(spec: str) -> tuple[str, str]:
             )
         return name, path
     path = spec.strip()
-    if not path:
-        raise argparse.ArgumentTypeError("empty model spec")
     return derive_name(path), path
 
 
@@ -76,7 +77,7 @@ def main() -> None:
         description="Run probes and diagnostics on one or more trained PAWN backbones.",
     )
     parser.add_argument(
-        "models", nargs="+",
+        "models", nargs="+", type=parse_model_spec, metavar="MODEL",
         help=(
             "Model spec(s) as '[name=]path'. Path is a HuggingFace model "
             "repo ID (e.g. 'thomas-schweich/pawn-base') or a local "
@@ -105,7 +106,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    specs: list[tuple[str, str]] = [parse_model_spec(s) for s in args.models]
+    specs: list[tuple[str, str]] = args.models
     seen_names: set[str] = set()
     for name, _ in specs:
         if name in seen_names:
@@ -136,7 +137,20 @@ def main() -> None:
         print(sep, flush=True)
 
         state_dict, model_config = load_backbone_weights(path)
-        cfg = CLMConfig(**model_config) if model_config else CLMConfig()
+        if not model_config:
+            # Falling back to ``CLMConfig()`` would silently load a
+            # base-variant architecture against whatever weights the
+            # caller passed in — either a confusing ``load_state_dict``
+            # key/shape error, or (worse) garbage probe/diagnostic
+            # results if dims happen to collide. Every checkpoint the
+            # current tree can load writes config.json, so a missing
+            # model_config is a bug, not a recoverable state.
+            raise RuntimeError(
+                f"Checkpoint {path!r} has no saved model_config; cannot "
+                "reconstruct CLMConfig. Is this a pre-vocab-transition "
+                "or bare-safetensors checkpoint?"
+            )
+        cfg = CLMConfig(**model_config)
         model = PAWNCLM(cfg).to(device)
         model.load_state_dict(state_dict)
         model.eval()
@@ -179,7 +193,7 @@ def main() -> None:
         print(f"Saved: {out_path}", flush=True)
 
         del model, state_dict, train_data, val_data
-        if torch.cuda.is_available():
+        if device == "cuda":
             torch.cuda.empty_cache()
 
     print("\nALL EVALS COMPLETE", flush=True)

@@ -48,6 +48,7 @@ ARGPARSE_SCRIPTS = [
     "generate_lc0_data.py",
     "generate_model_cards.py",
     "generate_stockfish_data.py",
+    "rename_shards.py",
     "run_evals_backbone.py",
 ]
 

@@ -140,8 +140,8 @@ class RunConfig:
 def open_source_stream(source: str, year_month: str) -> Any:
     """Open a monthly PGN dump as a binary stream from a parameterized source.
 
-    The ``source`` string may contain a ``{year_month}`` placeholder and is
-    dispatched by prefix:
+    The ``source`` string contains a ``{year_month}`` placeholder (guaranteed
+    by the CLI validator in ``main``) and is dispatched by prefix:
 
     * ``hf://buckets/<namespace>/<name>/<path>`` — HuggingFace bucket. Opened
       via ``HfFileSystem`` with ranged HTTP so no bytes land on disk.
@@ -151,8 +151,12 @@ def open_source_stream(source: str, year_month: str) -> Any:
 
     Returns a file-like binary handle the caller is expected to close
     (``open_source_stream`` is always used inside a ``with`` block).
+
+    Substitution uses ``str.replace`` rather than ``str.format`` so stray
+    ``{...}`` patterns in the source path (e.g. weird bucket names) don't
+    trip a ``KeyError`` mid-run.
     """
-    rendered = source.format(year_month=year_month)
+    rendered = source.replace("{year_month}", year_month)
 
     if rendered.startswith("hf://"):
         hf_path = rendered[len("hf://"):]
