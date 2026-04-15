@@ -72,8 +72,12 @@ from huggingface_hub import CommitOperationDelete, HfApi, HfFileSystem
 from huggingface_hub.errors import RepositoryNotFoundError
 
 
-HF_RAW_BUCKET = "thomas-schweich/raw-lichess"
-HF_RAW_FILENAME_TEMPLATE = "lichess_{year_month}.pgn.zst"
+# Source location for the raw monthly PGN dumps. HuggingFace sources use
+# the native ``hf://`` scheme (``hf://buckets/...`` for buckets,
+# ``hf://datasets/...`` for datasets); anything without an ``hf://`` prefix
+# is treated as a local filesystem path. The ``{year_month}`` placeholder
+# is substituted per work unit.
+DEFAULT_SOURCE = "hf://buckets/thomas-schweich/raw-lichess/lichess_{year_month}.pgn.zst"
 # Matches the 512-ply default on `parse_pgn_lichess` and `generate_clm_batch`;
 # virtually every Lichess game fits under this cap with its natural outcome
 # token, so PLY_LIMIT is only assigned to truly-degenerate games.
@@ -119,6 +123,7 @@ class WorkUnit:
 class RunConfig:
     dest_repo: str
     revision: str
+    source: str
     max_ply: int
     batch_size: int
     shard_size: int
@@ -132,18 +137,36 @@ class RunConfig:
 # Streaming PGN ingest
 # ---------------------------------------------------------------------------
 
-def open_hf_stream(year_month: str) -> Any:
-    """Open a monthly Lichess zstd PGN dump from HF as a byte stream.
+def open_source_stream(source: str, year_month: str) -> Any:
+    """Open a monthly PGN dump as a binary stream from a parameterized source.
 
-    The raw dumps live in a HuggingFace *bucket*, not a dataset repo, so
-    the path is `buckets/<namespace>/<name>/...`. Returns an `fsspec` file
-    handle backed by ranged HTTP requests — bytes are pulled on demand, so
-    the full compressed dump never lands on disk.
+    The ``source`` string may contain a ``{year_month}`` placeholder and is
+    dispatched by prefix:
+
+    * ``hf://buckets/<namespace>/<name>/<path>`` — HuggingFace bucket. Opened
+      via ``HfFileSystem`` with ranged HTTP so no bytes land on disk.
+    * ``hf://datasets/<namespace>/<name>/<path>`` — HuggingFace dataset repo.
+      Same on-demand streaming, different path root.
+    * anything else — a local filesystem path.
+
+    Returns a file-like binary handle the caller is expected to close
+    (``open_source_stream`` is always used inside a ``with`` block).
     """
-    filename = HF_RAW_FILENAME_TEMPLATE.format(year_month=year_month)
-    hf_path = f"buckets/{HF_RAW_BUCKET}/{filename}"
-    fs = HfFileSystem()
-    return fs.open(hf_path, "rb")
+    rendered = source.format(year_month=year_month)
+
+    if rendered.startswith("hf://"):
+        hf_path = rendered[len("hf://"):]
+        if not (hf_path.startswith("buckets/") or hf_path.startswith("datasets/")):
+            raise ValueError(
+                f"Unsupported hf:// path in {rendered!r}: expected "
+                "'hf://buckets/...' or 'hf://datasets/...'."
+            )
+        return HfFileSystem().open(hf_path, "rb")
+
+    local = Path(rendered)
+    if not local.exists():
+        raise FileNotFoundError(f"Local source not found: {local}")
+    return local.open("rb")
 
 
 def stream_pgn_games(fileobj: Any, batch_size: int) -> Iterator[str]:
@@ -422,10 +445,10 @@ def process_train_month(
     cfg: RunConfig,
     log_prefix: str,
 ) -> int:
-    log("Streaming from HuggingFace", log_prefix)
+    log(f"Streaming from {cfg.source}", log_prefix)
 
     total = 0
-    with open_hf_stream(year_month) as stream:
+    with open_source_stream(cfg.source, year_month) as stream:
         for pgn_text in stream_pgn_games(stream, cfg.batch_size):
             if not pgn_text.strip():
                 continue
@@ -475,7 +498,7 @@ def process_holdout_month(
     val/test splits will be truncated. ``val_days`` must also precede
     ``test_days`` for the early-exit to cover both splits correctly.
     """
-    log("Streaming from HuggingFace", log_prefix)
+    log(f"Streaming from {cfg.source}", log_prefix)
 
     year, mon = year_month.split("-")
     val_start = datetime(int(year), int(mon), cfg.val_days[0])
@@ -489,7 +512,7 @@ def process_holdout_month(
         )
 
     parsed_total = 0
-    with open_hf_stream(year_month) as stream:
+    with open_source_stream(cfg.source, year_month) as stream:
         for pgn_text in stream_pgn_games(stream, cfg.batch_size):
             if not pgn_text.strip():
                 continue
@@ -731,6 +754,15 @@ def main() -> int:
         help="Destination HuggingFace dataset repo (created if missing)",
     )
     parser.add_argument(
+        "--source", default=DEFAULT_SOURCE,
+        help=(
+            "Path template for the raw monthly PGN dumps. Must contain "
+            "'{year_month}'. HuggingFace sources use 'hf://buckets/<ns>/"
+            "<name>/<path>' or 'hf://datasets/<ns>/<name>/<path>'; anything "
+            f"without an 'hf://' prefix is a local path. Default: {DEFAULT_SOURCE!r}."
+        ),
+    )
+    parser.add_argument(
         "--revision", default=DEFAULT_REVISION,
         help=(
             f"Branch to write to (default {DEFAULT_REVISION!r}); will be "
@@ -782,9 +814,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if "{year_month}" not in args.source:
+        parser.error("--source must contain the '{year_month}' placeholder")
+
     cfg = RunConfig(
         dest_repo=args.dest_repo,
         revision=args.revision,
+        source=args.source,
         max_ply=args.max_ply,
         batch_size=args.batch_size,
         shard_size=args.shard_size,
@@ -807,6 +843,7 @@ def main() -> int:
         os.environ["POLARS_MAX_THREADS"] = str(args.threads_per_worker)
 
     log("=== Lichess parquet extraction ===")
+    log(f"Source:         {cfg.source}")
     log(f"Training months: {args.months}")
     if args.holdout_month:
         log(f"Holdout month:  {args.holdout_month} (val {cfg.val_days}, test {cfg.test_days})")
