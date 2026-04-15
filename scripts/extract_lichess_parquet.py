@@ -190,10 +190,37 @@ def stream_pgn_games(fileobj: Any, batch_size: int) -> Iterator[str]:
 # ---------------------------------------------------------------------------
 
 def batch_to_dataframe(parsed: dict[str, Any]) -> pl.DataFrame:
+    """Convert a ``parse_pgn_lichess`` batch into a parquet-writable DataFrame.
+
+    **Precondition**: the input must come from ``parse_pgn_lichess`` called
+    with ``prepend_outcome=False`` (the default). The extractor writes a
+    pure-moves parquet schema with the outcome in its own ``outcome_token``
+    column, so this function never needs to cope with an outcome-prefixed
+    ``tokens`` array. If a future caller accidentally passes
+    ``prepend_outcome=True``, the runtime check below catches it — without
+    the guard, the ``tokens[i, :game_length]`` slice would silently drop
+    each row's last move (since slot 0 would hold the outcome token and
+    ``game_length`` counts only moves).
+    """
     tokens: np.ndarray = parsed["tokens"]
     n = int(tokens.shape[0])
     if n == 0:
         return pl.DataFrame()
+
+    # Defensive check: slot 0 of a pure-moves row must be a legal action
+    # token (< 1969 = OUTCOME_TOKEN_BASE). Outcome tokens at slot 0 mean
+    # the caller passed prepend_outcome=True, which would corrupt the
+    # parquet output.
+    from pawn.config import OUTCOME_TOKEN_BASE
+    if int(tokens[0, 0]) >= OUTCOME_TOKEN_BASE:
+        raise ValueError(
+            "batch_to_dataframe expects pure-moves tokens from "
+            "parse_pgn_lichess(..., prepend_outcome=False). Got "
+            f"tokens[0, 0] = {int(tokens[0, 0])}, which is in the "
+            "outcome-token range — the caller likely passed "
+            "prepend_outcome=True. The extractor's parquet schema is "
+            "pure-moves by design; the outcome lives in its own column."
+        )
 
     game_lengths: np.ndarray = parsed["game_lengths"]
     # `tokens` is pure moves (prepend_outcome=False), so slice to game_length.
@@ -473,6 +500,17 @@ def process_holdout_month(
             if df.is_empty():
                 continue
 
+            # Respect --max-games-per-month symmetrically with
+            # ``process_train_month``: trim the batch *before* uploading
+            # so smoke-test runs can't overshoot the cap by up to one
+            # full parser batch.
+            if cfg.max_games_per_month is not None:
+                remaining = cfg.max_games_per_month - parsed_total
+                if remaining <= 0:
+                    break
+                if len(df) > remaining:
+                    df = df.head(remaining)
+
             parsed_total += len(df)
 
             val_df = df.filter((pl.col("date") >= val_start) & (pl.col("date") < val_end))
@@ -489,9 +527,6 @@ def process_holdout_month(
                 log_prefix,
             )
 
-            # Respect --max-games-per-month symmetrically with process_train_month
-            # so smoke-test runs terminate quickly instead of streaming the whole
-            # holdout month.
             if cfg.max_games_per_month is not None and parsed_total >= cfg.max_games_per_month:
                 log(
                     f"Hit max_games_per_month={cfg.max_games_per_month:,} — stopping early",
