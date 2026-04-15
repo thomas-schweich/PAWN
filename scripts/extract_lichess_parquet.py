@@ -34,6 +34,8 @@ branch name to run multiple extractions in parallel.
 Shard names include the source month so a mid-run crash in month M never
 collides with shards from month M+1: `data/<split>-<YYYY-MM>-<NNNN>.parquet`.
 
+To rename them to the canonical `<split>-NNNNN-of-NNNNN.parquet`, use `rename_shards.py`.
+
 Standalone: imports only `chess_engine`, `polars`, `numpy`, `zstandard`, and
 `huggingface_hub`. No dependency on the `pawn` Python package.
 
