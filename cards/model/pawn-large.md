@@ -42,10 +42,10 @@ model-index:
         metrics:
           - name: Game Completion Rate
             type: accuracy
-            value: 0.9980
+            value: 0.998047
           - name: Legal Move Rate
             type: accuracy
-            value: 1.0000
+            value: 0.999992
           - name: Top-1 Accuracy
             type: accuracy
             value: 0.0865
@@ -55,7 +55,7 @@ model-index:
           - name: Val Loss
             type: loss
             value: 2.8650
-          - name: Sequences Seen
+          - name: Total Training Sequences
             type: other
             value: 51200000
 ---
@@ -92,7 +92,7 @@ These come from the lowest-val/loss checkpoint of this run (step 196000 out of 2
 | Val loss | 2.865 |
 | Val perplexity | 17.55 |
 
-**Game completion rate** is the share of validation games in which *every* prediction along one side's plies was a legal move — i.e., the model would not have forfeited had it been generating the moves itself. It compounds illegality the way real autoregressive play would, and is a much stricter metric than per-move legal rate. See the [game completion section of the architecture doc](https://github.com/thomas-schweich/PAWN/blob/main/docs/ARCHITECTURE.md#game-completion-rate) for the full discussion.
+**Game completion rate** is the share of validation games in which *every* prediction along one side's plies was a legal move. The measurement is **non-autoregressive**: at each ply the model is shown the true ground-truth history (an early illegal prediction does not corrupt subsequent ones), so this is a lower bound on per-move competence rather than a faithful simulation of autoregressive play. The true autoregressive forfeit rate would be higher, especially for the small variant. Even so, game completion rate is a much stricter metric than per-move legal rate, and is the main signal that separates capacity between sizes; see the [game completion section of the architecture doc](https://github.com/thomas-schweich/PAWN/blob/main/docs/ARCHITECTURE.md#game-completion-rate) for the full discussion.
 
 | Compound-legality detail | Value |
 |--------------------------|-------|
@@ -159,7 +159,7 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 | Head dimension | 80 |
 | d_ff | 2560 |
 | Parameters | ~66.9M |
-| Vocabulary | 1980 tokens (1,968 searchless_chess actions + 1 PAD + 11 outcome tokens) |
+| Vocabulary | 1,980 tokens (1,968 searchless_chess actions + 1 PAD + 11 outcome tokens) |
 | Context length | 512 tokens |
 | Normalization | Pre-norm RMSNorm |
 | FFN | SwiGLU (4x expansion) |
@@ -176,7 +176,7 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 | Outcome conditioning | Disabled (prepend_outcome=False) — pure moves, no outcome leakage |
 | Total steps | 200,000 |
 | Batch size | 256 |
-| Sequences seen | 51,200,000 |
+| Total training sequences | 51,200,000 (= total steps × batch size; the headline metrics come from the lowest-val/loss checkpoint at step 196,000, slightly earlier) |
 | Max ply per example | 512 |
 | Learning rate | 0.0003 (cosine decay with 10,000-step warmup) |
 | Optimizer | AdamW (weight decay 0.01) |

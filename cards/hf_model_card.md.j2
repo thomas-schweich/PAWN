@@ -42,10 +42,10 @@ model-index:
         metrics:
           - name: Game Completion Rate
             type: accuracy
-            value: {{ "%.4f"|format(completion_rate / 100) }}
+            value: {{ "%.6f"|format(completion_rate / 100) }}
           - name: Legal Move Rate
             type: accuracy
-            value: {{ "%.4f"|format(legal_rate / 100) }}
+            value: {{ "%.6f"|format(legal_rate / 100) }}
           - name: Top-1 Accuracy
             type: accuracy
             value: {{ "%.4f"|format(top1 / 100) }}
@@ -55,7 +55,7 @@ model-index:
           - name: Val Loss
             type: loss
             value: {{ "%.4f"|format(val_loss) }}
-          - name: Sequences Seen
+          - name: Total Training Sequences
             type: other
             value: {{ sequences_seen }}
 ---
@@ -92,7 +92,7 @@ These come from the lowest-val/loss checkpoint of this run (step {{ best_step }}
 | Val loss | {{ "%.3f"|format(val_loss) }} |
 | Val perplexity | {{ "%.2f"|format(perplexity) }} |
 
-**Game completion rate** is the share of validation games in which *every* prediction along one side's plies was a legal move — i.e., the model would not have forfeited had it been generating the moves itself. It compounds illegality the way real autoregressive play would, and is a much stricter metric than per-move legal rate. See the [game completion section of the architecture doc](https://github.com/thomas-schweich/PAWN/blob/main/docs/ARCHITECTURE.md#game-completion-rate) for the full discussion.
+**Game completion rate** is the share of validation games in which *every* prediction along one side's plies was a legal move. The measurement is **non-autoregressive**: at each ply the model is shown the true ground-truth history (an early illegal prediction does not corrupt subsequent ones), so this is a lower bound on per-move competence rather than a faithful simulation of autoregressive play. The true autoregressive forfeit rate would be higher, especially for the small variant. Even so, game completion rate is a much stricter metric than per-move legal rate, and is the main signal that separates capacity between sizes; see the [game completion section of the architecture doc](https://github.com/thomas-schweich/PAWN/blob/main/docs/ARCHITECTURE.md#game-completion-rate) for the full discussion.
 
 | Compound-legality detail | Value |
 |--------------------------|-------|
@@ -146,7 +146,7 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 | Head dimension | {{ head_dim }} |
 | d_ff | {{ d_ff }} |
 | Parameters | {{ params }} |
-| Vocabulary | {{ vocab_size }} tokens (1,968 searchless_chess actions + 1 PAD + 11 outcome tokens) |
+| Vocabulary | {{ "{:,}".format(vocab_size) }} tokens (1,968 searchless_chess actions + 1 PAD + 11 outcome tokens) |
 | Context length | {{ max_seq_len }} tokens |
 | Normalization | Pre-norm RMSNorm |
 | FFN | SwiGLU (4x expansion) |
@@ -163,7 +163,7 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 | Outcome conditioning | {{ "Enabled (prepend_outcome=True)" if prepend_outcome else "Disabled (prepend_outcome=False) — pure moves, no outcome leakage" }} |
 | Total steps | {{ "{:,}".format(total_steps) }} |
 | Batch size | {{ batch_size }} |
-| Sequences seen | {{ "{:,}".format(sequences_seen) }} |
+| Total training sequences | {{ "{:,}".format(sequences_seen) }} (= total steps × batch size; the headline metrics come from the lowest-val/loss checkpoint at step {{ "{:,}".format(best_step) }}, slightly earlier) |
 | Max ply per example | {{ max_ply }} |
 | Learning rate | {{ lr }} (cosine decay with {{ "{:,}".format(warmup_steps) }}-step warmup) |
 | Optimizer | AdamW (weight decay {{ weight_decay }}) |

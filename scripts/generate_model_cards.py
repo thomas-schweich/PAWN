@@ -101,7 +101,6 @@ def load_ceilings() -> dict:
     mc_corrected = data.get("conditional_corrected_ceiling", data["conditional_ceiling"]) * 100
     return {
         "uncond": data["unconditional_ceiling"] * 100,
-        "naive": data["naive_conditional_ceiling"] * 100,
         "mc_naive": mc_naive,
         "mc_corrected": mc_corrected,
         "n_rollouts": data["n_rollouts"],

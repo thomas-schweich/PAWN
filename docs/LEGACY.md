@@ -54,11 +54,13 @@ in the game forfeits the whole game. When measured directly as a **game
 completion rate** (no illegal predictions across an entire game's plies
 on one side), the legacy models looked like:
 
-| Variant | Steps | Params | Forfeit rate | Per-move illegal rate | Avg plies completed | Median forfeit ply | Min/max forfeit ply |
+In the table below, "avg plies completed" is the average number of legal plies the model produced before either reaching the end of the game or making its first illegal prediction. It is shown out of the legacy 255-ply context limit, since legacy validation games could not extend further.
+
+| Variant | Steps | Params | Forfeit rate | Per-move illegal rate | Avg plies completed (out of 255) | Median forfeit ply | Min/max forfeit ply |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `pawn-small`-legacy  | 100K | 9.5M  | 0.6797 | 6.8e-3 | 146.7 / 255 | 105 | 13 / 252 |
-| `pawn-base`-legacy   | 100K | 35.8M | 0.0542 | 2.71e-4 | 229.7 / 255 | 126 | 39 / 251 |
-| `pawn-large`-legacy  | 100K | 68.4M | 0.0327 | ~2.0e-4 | 232.4 / 255 | 121 | 37 / 254 |
+| `pawn-small`-legacy  | 100K | 9.5M  | 0.6797 | 6.8e-3 | 146.7 | 105 | 13 / 252 |
+| `pawn-base`-legacy   | 100K | 35.8M | 0.0542 | 2.71e-4 | 229.7 | 126 | 39 / 251 |
+| `pawn-large`-legacy  | 100K | 68.4M | 0.0327 | ~2.0e-4 | 232.4 | 121 | 37 / 254 |
 
 Once it became clear the legacy models really weren't "done" training,
 doubling the step count to 200K (with the wider context and the cleaner
