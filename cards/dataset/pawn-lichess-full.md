@@ -1,5 +1,5 @@
 ---
-license: apache-2.0
+license: cc-by-4.0
 task_categories:
   - other
 tags:
@@ -172,4 +172,4 @@ Earlier revisions of this dataset used the legacy 4,278-token PAWN vocabulary in
 
 ## License
 
-[Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0). Derived from the [Lichess database](https://database.lichess.org/), released under [Creative Commons CC0](https://creativecommons.org/publicdomain/zero/1.0/).
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Derived from the [Lichess database](https://database.lichess.org/), released under [Creative Commons CC0](https://creativecommons.org/publicdomain/zero/1.0/).
