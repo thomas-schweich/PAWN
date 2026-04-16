@@ -126,9 +126,9 @@ Despite training exclusively on random games, PAWN develops rich internal repres
 
 For up-to-date probe numbers (small/base/large), see each model's HuggingFace card.
 
-The base and large variants also achieve >99.99% per-move legal move rate on a held-out validation set of fresh random games, and >99% **game completion rate** — the share of validation games in which the model would not have made a single illegal move had it been generating the moves itself. Game completion is much harder than per-move legality (one mistake anywhere in the game forfeits), and turns out to depend strongly on model capacity. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate) for the full story.
+The base and large variants also achieve >99.99% per-move legal move rate on a held-out validation set of fresh random games, and >99% **game completion rate** — the share of validation games in which every position-by-position prediction along one side's plies was legal. Game completion is much harder than per-move legality (one mistake anywhere in the game forfeits), and turns out to depend strongly on model capacity. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate) for the full story.
 
-The [theoretical accuracy ceiling](docs/ACCURACY_CEILING.md) for random game prediction (without outcome conditioning) is 6.52%. With the new searchless_chess action vocabulary (1,968 actions instead of the legacy 4,278 coordinate pairs), top-1 numbers are not directly comparable to the legacy models — the smaller, mostly-legal-by-construction vocabulary inflates accuracy slightly, since the random baseline now sees a smaller set of plausible candidates. The ceiling analysis lives in [docs/ACCURACY_CEILING.md](docs/ACCURACY_CEILING.md) and is being updated for the v1.0.0 vocabulary.
+The [theoretical top-1 ceiling](docs/ACCURACY_CEILING.md) for random-game prediction (without outcome conditioning) is `E[1/N_legal] = 8.43%` over the v1.0.0 position distribution (random games of up to 512 plies, 95% CI [8.41%, 8.45%] from 50,000 games). All three published variants sit at ~101–102% of that ceiling — essentially saturating the metric. Top-1 accuracy is therefore not a useful way to compare sizes under the v1.0.0 setup; **game completion rate is the only headline metric that meaningfully separates them.**
 
 ## Adapter Methods
 

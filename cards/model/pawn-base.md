@@ -100,14 +100,11 @@ These come from the published `model.safetensors` (step 195,000 out of 200,000 �
 | Average % of game completed | 99.27% |
 | Median forfeit ply (when forfeit) | 101 |
 
-### Accuracy Ratios
+### Accuracy ceiling
 
-PAWN is trained on uniformly random chess games, so top-1 accuracy has a hard theoretical ceiling. The unconditional ratio below is computed against the **legacy** (4,278-token vocab) ceiling estimate and is kept for continuity; the v1.0.0 vocabulary changes the constant slightly, and a re-derivation is a known TODO. See the [accuracy ceiling analysis](https://github.com/thomas-schweich/PAWN/blob/main/docs/ACCURACY_CEILING.md) for methodology.
+PAWN is trained on uniformly random chess games. At each position with N legal moves, the next move is drawn uniformly, so the Bayes-optimal predictor that does not know the game's outcome can do no better than 1/N at that position. Averaged over the position distribution induced by random games of up to 512 plies, the top-1 ceiling is **E\[1/N_legal\] ≈ 8.43%** (95% CI \[8.41%, 8.45%\], computed over 50,000 fresh random games — see [docs/ACCURACY_CEILING.md](https://github.com/thomas-schweich/PAWN/blob/main/docs/ACCURACY_CEILING.md)).
 
-| Ceiling | Ratio |
-|---------|-------|
-| Unconditioned (E\[1/N_legal\] ≈ 6.43%) | 133% |
-
+This model's top-1 accuracy of **8.57%** is **102% of that ceiling** — i.e., essentially at the limit of what any predictor can achieve on this task without outcome information.
 
 
 ## Probe Results

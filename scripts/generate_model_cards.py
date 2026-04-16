@@ -78,18 +78,17 @@ def count_params_from_weights(repo: str, revision: str | None = None) -> int:
             total += f.get_tensor(key).numel()
     return total
 
-CEILING_PATH = Path("data/theoretical_ceiling.json")
+CEILING_PATH = Path("cards/theoretical_ceiling.json")
 
 
 def load_ceilings() -> dict:
-    """Load accuracy ceilings from the canonical JSON artifact.
+    """Load the unconditional ceiling from the canonical JSON artifact.
 
-    The ceiling JSON predates the split-half bias correction described in
-    docs/ACCURACY_CEILING.md, so `conditional_corrected_ceiling` may be
-    absent. When it is, fall back to `conditional_ceiling` (the naive MC
-    estimate) so the bracket collapses to a single value rather than
-    blowing up. The ceiling is being recomputed for the v1.0.0 vocabulary
-    as a known TODO.
+    The v1.0.0 backbones do not use outcome conditioning, so the only
+    relevant ceiling is the unconditional E[1/N_legal] over positions
+    sampled from random games of up to max_ply plies. See
+    scripts/compute_theoretical_ceiling.py for how the artifact is
+    produced and docs/ACCURACY_CEILING.md for the methodology.
     """
     if not CEILING_PATH.exists():
         raise FileNotFoundError(
@@ -97,13 +96,14 @@ def load_ceilings() -> dict:
         )
     with open(CEILING_PATH) as f:
         data = json.load(f)
-    mc_naive = data["conditional_ceiling"] * 100
-    mc_corrected = data.get("conditional_corrected_ceiling", data["conditional_ceiling"]) * 100
     return {
         "uncond": data["unconditional_ceiling"] * 100,
-        "mc_naive": mc_naive,
-        "mc_corrected": mc_corrected,
-        "n_rollouts": data["n_rollouts"],
+        "uncond_ci_low": data["ceiling_ci_low_95"] * 100,
+        "uncond_ci_high": data["ceiling_ci_high_95"] * 100,
+        "mean_n_legal": data["mean_n_legal"],
+        "n_games": data["n_games"],
+        "n_positions": data["n_positions"],
+        "max_ply": data["max_ply"],
     }
 
 PROBE_DESCRIPTIONS = {
@@ -285,15 +285,16 @@ def build_context(variant_key: str, variant: dict, revision: str | None = None) 
     ctx["avg_plies_completed"] = val["val/avg_plies_completed"]
     ctx["median_forfeit_ply"] = val["val/median_forfeit_ply"]
 
-    # Accuracy ratios
+    # Accuracy ratio against the unconditional ceiling. The v1.0.0
+    # backbones don't use outcome conditioning, so this is the only
+    # relevant ceiling — see docs/ACCURACY_CEILING.md.
     ceil = load_ceilings()
     ctx["uncond_ceiling"] = ceil["uncond"]
-    ctx["mc_naive_ceiling"] = ceil["mc_naive"]
-    ctx["mc_corrected_ceiling"] = ceil["mc_corrected"]
-    ctx["n_rollouts"] = ceil["n_rollouts"]
-    ctx["uncond_ratio"] = round(ctx["top1"] / ceil["uncond"] * 100)
-    ctx["mc_naive_ratio"] = round(ctx["top1"] / ceil["mc_naive"] * 100)
-    ctx["mc_corrected_ratio"] = round(ctx["top1"] / ceil["mc_corrected"] * 100)
+    ctx["uncond_ceiling_ci_low"] = ceil["uncond_ci_low"]
+    ctx["uncond_ceiling_ci_high"] = ceil["uncond_ci_high"]
+    ctx["ceiling_n_games"] = ceil["n_games"]
+    ctx["ceiling_max_ply"] = ceil["max_ply"]
+    ctx["uncond_ratio"] = ctx["top1"] / ceil["uncond"] * 100
 
     # Fetch eval results for probes and diagnostics
     eval_results = fetch_eval_results(repo, revision=revision)
