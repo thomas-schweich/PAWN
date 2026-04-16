@@ -22,7 +22,7 @@ configs:
 
 # PAWN Lichess Full
 
-Rated Lichess games from Q1 2025 plus a January 2026 holdout, pre-tokenized in the [PAWN](https://github.com/thomas-schweich/PAWN) v1.0.0 training format. Primary purpose: finetuning the [PAWN](https://huggingface.co/thomas-schweich/pawn-base) backbones on real human play. The dataset also keeps the raw SAN and UCI move strings, full Lichess metadata, and clock annotations, so it works as a general-purpose pre-parsed Lichess feed even outside the PAWN ecosystem — see [Other uses](#other-uses) below.
+Rated Lichess games from Q1 2025 plus a January 2026 holdout, pre-tokenized in the [PAWN](https://github.com/thomas-schweich/PAWN) v1.0.0 training format. Primarily intended finetuning the [PAWN](https://huggingface.co/thomas-schweich/pawn-base) backbones on real human play. The dataset also keeps the raw SAN and UCI move strings, full Lichess metadata, and clock annotations, so it works as a general-purpose pre-parsed Lichess feed even outside the PAWN ecosystem — see [Other uses](#other-uses) below.
 
 ## Splits
 
@@ -32,7 +32,6 @@ Rated Lichess games from Q1 2025 plus a January 2026 holdout, pre-tokenized in t
 | validation | January 1–3, 2026 | 9,295,654 | 10 |
 | test | January 15–17, 2026 | 8,966,793 | 9 |
 
-Validation and test splits are **full days**, not random subsets — every rated game on Lichess inside the date range is included. This matters if you care about player-level holdouts: there is a clear ~10-month temporal gap between train and val/test, and val/test cover entire days so a single Lichess account either appears across the whole window or not at all (no leakage from sampling within a day).
 
 ## Schema
 
@@ -82,8 +81,8 @@ The first five also appear in random-game pretraining; the last six are Lichess-
 
 ### Sentinel values
 
-- **Clock** `0`: no clock annotation for that ply (rare for rated games, common for very short ones).
-- **`game_length` = 512**: game was truncated. Look at `outcome_token == 1973` to filter for truncations.
+- **Clock** `0`: no clock annotation for that ply
+- **`outcome_token == 1973`** indicates that a game was truncated to 512 plies.
 
 ## Usage
 
@@ -91,7 +90,7 @@ The headline use is finetuning the PAWN backbones via behavioral cloning. The `t
 
 ### Behavioral cloning of an Elo band
 
-The unified PAWN trainer accepts the dataset as a `--pgn` source and pulls predicates straight through to Polars. Filter to a 100-Elo band:
+The PAWN trainer accepts the dataset as a `--pgn` source and pulls predicates straight through to Polars. Filter to a 100-Elo band:
 
 ```bash
 uv run python scripts/train.py --run-type adapter --strategy bottleneck \
@@ -103,7 +102,7 @@ uv run python scripts/train.py --run-type adapter --strategy bottleneck \
 
 ### Polars with predicate pushdown
 
-Filter to a specific Elo band without downloading the full dataset. Polars pushes the predicate down into each parquet file's row-group statistics, so only matching row groups get fetched:
+You can easily filter to a specific Elo band without downloading the full dataset. Polars pushes the predicate down into each parquet file's row-group statistics, so only matching row groups get fetched:
 
 ```python
 import polars as pl
@@ -158,16 +157,16 @@ If you need the original PGN bytes rather than parsed games, see [Raw monthly ar
 
 ## Raw monthly archives
 
-The repo intentionally keeps the source `.pgn.zst` files (`lichess_2025-01.pgn.zst`, etc.) alongside the parquet data. They are the exact monthly dumps that the parser consumed, mirrored here so the parquet outputs are reproducible and so HuggingFace's CDN can hand them out faster than the upstream Lichess server. The dataset has had >1000 downloads and a meaningful share of those are likely just for the raw `.pgn.zst` files; that is a supported use, please carry on.
+The repo includes the original `.pgn.zst` files (`lichess_2025-01.pgn.zst`, etc.) alongside the parquet data. They are the exact monthly dumps that the parser consumed, mirrored here so the parquet outputs are reproducible and because HuggingFace's CDN can hand them out faster than the upstream Lichess server.
 
 ## Generation
 
-Extracted from [Lichess database dumps](https://database.lichess.org/) (CC0) using the PAWN Rust chess engine for SAN→UCI→token conversion. See [`scripts/extract_lichess_parquet.py`](https://github.com/thomas-schweich/PAWN/blob/main/scripts/extract_lichess_parquet.py) in the [PAWN repository](https://github.com/thomas-schweich/PAWN) for the authoritative pipeline definition — every column in the schema above is produced by that script and any future schema changes will land there first.
+Extracted from [Lichess database dumps](https://database.lichess.org/) (CC0) using the PAWN Rust chess engine for SAN→UCI→token conversion. See [`scripts/extract_lichess_parquet.py`](https://github.com/thomas-schweich/PAWN/blob/main/scripts/extract_lichess_parquet.py) in the [PAWN repository](https://github.com/thomas-schweich/PAWN).
 
 Pipeline at a glance:
 
 ```
-zstd PGN dumps  →  Rust enriched parser  →  Polars DataFrame  →  zstd Parquet shard  →  HuggingFace
+zstd PGN dumps  →  Rust enriched PGN parser  →  Polars DataFrame  →  zstd Parquet shard  →  HuggingFace
                   (single-pass extraction
                    of moves, clocks, headers,
                    token ID conversion)
@@ -177,7 +176,7 @@ The extractor is streaming and resumable: shards are uploaded as they finish, se
 
 ## Legacy revisions
 
-Earlier revisions of this dataset used the legacy 4,278-token PAWN vocabulary in the `tokens` column and a different val/test layout (50K random samples instead of full days). Those revisions are still accessible via git history if you need to reproduce prior experiments — the current `main` revision uses the v1.0.0 1,980-token searchless_chess action vocabulary described above. There is intentionally no separate `-legacy` dataset repo: the raw `.pgn.zst` files are vocabulary-agnostic and useful regardless of which token layout you want to consume.
+Earlier revisions of this dataset used the legacy 4,278-token PAWN vocabulary in the `tokens` column and a different val/test layout (50K random samples instead of full days). Those revisions are still accessible via git history if you need to reproduce prior experiments — the current `main` revision uses the v1.0.0 1,980-token searchless_chess action vocabulary described above.
 
 ## License
 
