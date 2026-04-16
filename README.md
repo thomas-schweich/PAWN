@@ -19,7 +19,7 @@ Three sizes, all trained from scratch on random chess games generated on-the-fly
 | **PAWN (Base)** | 512 | 8 | 8 | 34.65M | 8.57% | 99.9962% | 98.97% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
 | **PAWN-Large** | 640 | 10 | 8 | 66.91M | 8.63% | 99.9990% | 99.76% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
 
-*Top-1 and legal rate are measured on a 2,048-game validation set of fresh random games. **Game completion** is the share of validation games in which every prediction along one side's plies was legal. The measurement is non-autoregressive: the model sees the true ground-truth history at each ply, so each prediction is independent given that history. Autoregressive completion has not yet been measured. Game completion is still a much stricter metric than per-move legal rate, and the main signal that separates capacity between sizes — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate).*
+*Metrics measured on a 2,048-game validation set of fresh random games. **Game completion** is non-autoregressive: each ply sees the true history, so predictions are independent. It is the main signal that separates capacity between sizes — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate).*
 
 All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), factored move embeddings, and a vocabulary covering:
 
@@ -30,13 +30,9 @@ All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.0
 PAWN learns to avoid impossible moves like `a1a1` and `b1a5` since they don't appear in its training examples (and now don't appear in the action vocabulary either).
 
 > [!note]
-> A previous generation of PAWN backbones (`pawn-{small,base,large}-legacy`) used a 4,278-token coordinate vocabulary, a 256-token context window, and outcome conditioning. They are still available on HuggingFace, and the `pre-vocab-transition` git tag preserves the exact code they were trained with. See [docs/LEGACY.md](docs/LEGACY.md) for background on what changed and why.
+> A previous generation of PAWN backbones (`pawn-{small,base,large}-legacy`) used a 4,278-token coordinate vocabulary, a 256-token context window, and outcome conditioning. They are still available on HuggingFace, and the `pre-vocab-transition` git tag marks the last commit before the vocabulary transition — it will load and work with the old checkpoints. See [docs/LEGACY.md](docs/LEGACY.md) for background on what changed and why.
 
-Tokens are best thought of as a move in UCI notation -- coordinate pairs. They do not include any information on the type of piece, side to play, or direct board state information.
-
-For example, `e2e4` could double push the king's pawn, but the same token would be used for moving a rook from e2 to e4 in the late game. The model learns to track which type of piece is on each square at any given ply.
-
-It also isn't told what piece types exist, what movement patterns they follow, or indeed the concept of a piece. All of that understanding comes from observation and can be isolated via [linear probes](https://arxiv.org/abs/1610.01644) (Alain & Bengio, 2016).
+Tokens are coordinate pairs (UCI notation) with no piece type or side-to-move information — `e2e4` means the same token whether it's a pawn double-push or a rook move. The model learns to track piece placement, movement rules, and game state entirely from observation, which can be isolated via [linear probes](https://arxiv.org/abs/1610.01644) (Alain & Bengio, 2016).
 
 ## Quickstart
 
@@ -82,53 +78,38 @@ uv run python -m pawn.dashboard --log-dir logs  # real-time monitoring
 
 ## Datasets
 
-These datasets are for adapter training (behavioral cloning), not for pretraining PAWN itself. PAWN is pretrained exclusively on random legal games generated on-the-fly -- it never sees human or engine games during pretraining. The datasets below provide real gameplay data for finetuning the frozen PAWN backbone into player models that mimic specific playstyles or skill levels.
+For adapter training (behavioral cloning), not pretraining. PAWN is pretrained on random games generated on-the-fly — it never sees human or engine games.
 
 | Dataset | Games | Description | Link |
 |---------|-------|-------------|------|
 | Lichess Full | 286M train + 9.3M val + 9.0M test | Rated games from Q1 2025 (all Elos), holdout from Jan 2026 | [pawn-lichess-full](https://huggingface.co/datasets/thomas-schweich/pawn-lichess-full) |
 | Stockfish nodes=1 | 900K train + 50K val + 50K test | NNUE self-play, 1 node/move | [stockfish-nodes1](https://huggingface.co/datasets/thomas-schweich/stockfish-nodes1) |
 
-All datasets use the PAWN token format: pre-tokenized `list[int16]` move sequences (`tokens` column) ready for training without any parsing. The Lichess dataset also includes the raw `san` and `uci` move strings, clock annotations, player hashes, Elo ratings, and full game metadata, and is happy to be used as a pre-parsed Lichess feed even outside the PAWN ecosystem.
-
-Datasets load directly from HuggingFace via Polars lazy scan -- predicate pushdown on columns like `white_elo` and `date` lets you efficiently filter to specific Elo bands or time periods without downloading the full dataset.
+All datasets use pre-tokenized `list[int16]` move sequences (`tokens` column). The Lichess dataset also includes raw `san`/`uci` strings, clock annotations, Elo ratings, and full game metadata. Datasets load directly from HuggingFace via Polars lazy scan with predicate pushdown.
 
 ## Architecture
 
 <sub>More info: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)</sub>
 
-PAWN is a standard decoder-only [transformer](https://arxiv.org/abs/1706.03762) trained with next-token prediction on chess move sequences. Each training example is:
-
-```
-[ply_1] [ply_2] ... [ply_N] [PAD] ... [PAD]
-```
-
-(An optional outcome-conditioning prefix can be enabled via the `prepend_outcome` training config; pure moves is the default.)
-
-Ply tokens use a factored embedding: each move is decomposed into source square + destination square + promotion piece, with embeddings summed. This gives the model explicit spatial structure while keeping the vocabulary compact. The context window is 512 tokens, which fits the vast majority of random games end-to-end.
-
-The model's predictions are not masked to legal moves during training; it has to determine what moves are currently legal based on the sequence of moves so far.
-
-No attempt is made to provide the model with information about other pieces. In other words, it only thinks in moves. There is no equivalent of the multi-plane 8x8xN board representation used by e.g. [AlphaZero](https://arxiv.org/abs/1712.01815) (Silver et al., 2018) and [Lc0](https://github.com/LeelaChessZero/lc0), so any and all state representation is learned by the model internally.
+Standard decoder-only [transformer](https://arxiv.org/abs/1706.03762) with next-token prediction. Each training example is a move sequence padded to 512 tokens. Factored embeddings decompose each move into source square + destination square + promotion piece. Predictions are not masked to legal moves — the model must infer legality from the move history alone. There is no board representation like [AlphaZero](https://arxiv.org/abs/1712.01815)'s 8x8xN planes; all state tracking is learned internally.
 
 ## What the Model Learns
 
-Despite training exclusively on random games, PAWN develops rich internal representations. Linear probes on the base model's hidden states decode chess concepts that the model is never explicitly told about:
+Despite training exclusively on random games, PAWN develops rich internal representations. Linear probes on frozen hidden states decode chess concepts the model is never explicitly told about:
 
-| Probe | Accuracy |
-|-------|----------|
-| Side to move | 100.0% |
-| En passant square | ~99.7% |
-| Castling rights | ~96.6% |
-| Piece type at square | 89.7% |
-| Is check | ~94.2% |
-| Game phase | ~90.7% |
+| Probe | Small | Base | Large |
+|-------|-------|------|-------|
+| Side to move | 100.0% | 100.0% | 100.0% |
+| En passant square | 99.8% | 99.7% | 99.7% |
+| Castling rights | 96.5% | 96.6% | 96.8% |
+| Is check | 94.3% | 94.2% | 93.9% |
+| Game phase | 91.1% | 90.7% | 91.3% |
+| Piece type | 89.1% | 89.7% | 90.3% |
+| Material count | 86.5% | 86.1% | 86.9% |
 
-For up-to-date probe numbers (small/base/large), see each model's HuggingFace card.
+Full probe results including diagnostics are on each variant's [HuggingFace model card](https://huggingface.co/thomas-schweich/pawn-base).
 
-The base and large variants also achieve >99.99% per-move legal move rate on a held-out validation set of fresh random games, and >99% **game completion rate** — the share of validation games in which every position-by-position prediction along one side's plies was legal. Game completion is much harder than per-move legality (one mistake anywhere in the game forfeits), and turns out to depend strongly on model capacity. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate) for the full story.
-
-The [theoretical top-1 ceiling](docs/ACCURACY_CEILING.md) for random-game prediction (without outcome conditioning) is `E[1/N_legal] = 8.43%` over the v1.0.0 position distribution (random games of up to 512 plies, 95% CI [8.41%, 8.45%] from 50,000 games). All three published variants sit at ~101–102% of that ceiling — essentially saturating the metric. Top-1 accuracy is therefore not a useful way to compare sizes under the v1.0.0 setup; **game completion rate is the only headline metric that meaningfully separates them.**
+All three variants sit at ~101–102% of the [theoretical top-1 ceiling](docs/ACCURACY_CEILING.md) (`E[1/N_legal] = 8.43%`, 95% CI [8.41%, 8.45%]), essentially saturating the metric. **Game completion rate is the only headline metric that meaningfully separates sizes** — see the [model variant table](#model-variants) above.
 
 ## Adapter Methods
 

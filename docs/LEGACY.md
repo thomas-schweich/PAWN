@@ -146,9 +146,10 @@ cd engine && uv run --with maturin maturin develop --release && cd ..
 uv sync --extra cu128   # or --extra rocm
 ```
 
-That tag preserves the exact code the legacy checkpoints were trained
-with, including the dual-vocabulary support (one vocab for pretraining,
-one for finetuning) and the `prepend_outcome=True` defaults.
+That tag is the last commit before the vocabulary transition and will
+load and work with the old checkpoints, including the dual-vocabulary
+support (one vocab for pretraining, one for finetuning) and the
+`prepend_outcome=True` defaults.
 
 ### Legacy Lichess data
 

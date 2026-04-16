@@ -1,5 +1,5 @@
 ---
-license: cc-by-4.0
+license: apache-2.0
 task_categories:
   - other
 tags:
@@ -22,7 +22,7 @@ configs:
 
 # PAWN Lichess Full
 
-Rated Lichess games from Q1 2025 plus a January 2026 holdout, pre-tokenized in the [PAWN](https://github.com/thomas-schweich/PAWN) v1.0.0 training format. Primarily intended finetuning the [PAWN](https://huggingface.co/thomas-schweich/pawn-base) backbones on real human play. The dataset also keeps the raw SAN and UCI move strings, full Lichess metadata, and clock annotations, so it works as a general-purpose pre-parsed Lichess feed even outside the PAWN ecosystem — see [Other uses](#other-uses) below.
+Rated Lichess games from Q1 2025 plus a January 2026 holdout, pre-tokenized in the [PAWN](https://github.com/thomas-schweich/PAWN) v1.0.0 training format. Designed for finetuning the [PAWN](https://huggingface.co/thomas-schweich/pawn-base) backbones on real human play, but also usable as a general-purpose pre-parsed Lichess feed since it includes raw SAN/UCI move strings, clock annotations, and full game metadata.
 
 ## Splits
 
@@ -118,9 +118,9 @@ df = (
 )
 ```
 
-### Column projection (only fetch what you need)
+### Column projection
 
-You don't have to take every column. Project just `uci` and a few metadata fields and Polars will only download those columns from each parquet file — useful if you want a clean Lichess feed without dragging the PAWN tokens or per-ply clock arrays along for the ride:
+Polars only downloads the columns you select:
 
 ```python
 import polars as pl
@@ -132,8 +132,6 @@ df = (
     .collect()
 )
 ```
-
-The same pattern works for `san`, `tokens`, `eco`, etc. The combined `select` + `filter` is the standard idiom for using this dataset as a pre-parsed Lichess feed.
 
 ### HuggingFace `datasets`
 
@@ -147,13 +145,7 @@ for game in ds.take(5):
 
 ## Other uses
 
-The dataset is built for PAWN finetuning, but it is also a perfectly serviceable parsed Lichess feed:
-
-- **You don't have to use the `tokens` column.** Project `san`/`uci` and ignore the rest — the parquet layout means you only download what you select. No PAWN install, no Rust engine build.
-- **Predicate pushdown on `white_elo`/`black_elo`/`date`** lets you carve out specific Elo bands or date ranges without ever materializing the full ~287M-game corpus.
-- **The hashed `white_player`/`black_player` columns** support player-level grouping and analysis without republishing usernames; the `site` URL can be used to recover the original username on Lichess if needed.
-
-If you need the original PGN bytes rather than parsed games, see [Raw monthly archives](#raw-monthly-archives) below.
+The `tokens` column is PAWN-specific, but the rest of the schema (`san`, `uci`, Elo, clock, metadata) stands on its own as a parsed Lichess feed — no PAWN install required. Use column projection to download only what you need.
 
 ## Raw monthly archives
 
@@ -180,4 +172,4 @@ Earlier revisions of this dataset used the legacy 4,278-token PAWN vocabulary in
 
 ## License
 
-[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Derived from the [Lichess database](https://database.lichess.org/), released under [Creative Commons CC0](https://creativecommons.org/publicdomain/zero/1.0/).
+[Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0). Derived from the [Lichess database](https://database.lichess.org/), released under [Creative Commons CC0](https://creativecommons.org/publicdomain/zero/1.0/).
