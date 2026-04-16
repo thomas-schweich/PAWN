@@ -111,17 +111,17 @@ This model's top-1 accuracy of **8.54%** is **101% of that ceiling** — i.e., e
 
 Linear probes trained on frozen hidden states measure how well the model's internal representations encode board-level features. The model is never explicitly told about pieces, sides, or rules — these representations emerge purely from next-token prediction on random games.
 
-| Probe | Accuracy | Description |
-|-------|----------|-------------|
-| Piece type | 89.1% | Per-square piece type (13 classes x 64 squares) |
+| Probe | Metric | Description |
+|-------|--------|-------------|
+| Piece type | 89.0% | Per-square piece type (13 classes x 64 squares) |
 | Side to move | 100.0% | Whose turn it is |
-| Is check | 94.3% | Whether the side to move is in check |
-| Castling rights | 96.5% | KQkq castling availability |
-| En passant square | 99.8% | En passant target square (64 + none) |
-| Material count | 86.5% (MAE 4.9) | Piece counts per type per color |
-| Legal move count | 30.7% (MAE 7.4) | Number of legal moves available |
-| Halfmove clock | 13.3% (MAE 3.9) | Plies since last capture or pawn move |
-| Game phase | 91.1% | Opening / middlegame / endgame |
+| Is check | 95.2% | Whether the side to move is in check |
+| Castling rights | 98.4% | KQkq castling availability |
+| En passant square | 99.9% | En passant target square (64 + none) |
+| Material count | R² 0.81 (MAE 4.3) | Piece counts per type per color |
+| Legal move count | R² 0.60 (MAE 5.8) | Number of legal moves available |
+| Halfmove clock | R² 0.49 (MAE 10.5) | Plies since last capture or pawn move |
+| Game phase | 94.8% | Opening / middlegame / endgame |
 
 
 

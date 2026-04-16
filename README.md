@@ -100,12 +100,12 @@ Despite training exclusively on random games, PAWN develops rich internal repres
 | Probe | Small | Base | Large |
 |-------|-------|------|-------|
 | Side to move | 100.0% | 100.0% | 100.0% |
-| En passant square | 99.8% | 99.7% | 99.7% |
-| Castling rights | 96.5% | 96.6% | 96.8% |
-| Is check | 94.3% | 94.2% | 93.9% |
-| Game phase | 91.1% | 90.7% | 91.3% |
-| Piece type | 89.1% | 89.7% | 90.3% |
-| Material count | 86.5% | 86.1% | 86.9% |
+| En passant square | 99.9% | 99.9% | 99.9% |
+| Castling rights | 98.4% | 99.3% | 99.3% |
+| Is check | 95.2% | 95.0% | 95.0% |
+| Game phase | 94.8% | 96.0% | 95.8% |
+| Piece type | 89.0% | 91.9% | 92.3% |
+| Material count (R²) | 0.81 | 0.84 | 0.83 |
 
 Full probe results including diagnostics are on each variant's [HuggingFace model card](https://huggingface.co/thomas-schweich/pawn-base).
 
