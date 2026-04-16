@@ -303,8 +303,8 @@ def _check_checkpoint_compatible(model_config: dict | None, path_hint: str | Pat
     as the wrong move.
 
     Refuse to load those checkpoints and point the user at the
-    ``pre-vocab-transition`` git tag, which preserves the code the old
-    checkpoints were trained with.
+    ``pre-vocab-transition`` git tag, the last commit before the vocabulary
+    transition that will load and work with the old checkpoints.
     """
     if not model_config:
         return

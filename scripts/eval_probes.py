@@ -152,10 +152,11 @@ def main():
         train_cfg = run_cfg.get("training", {})
         variant = f"{model_cfg.get('d_model', '?')}d/{model_cfg.get('n_layers', '?')}L"
         discard = train_cfg.get("discard_ply_limit", False)
-        step = ckpt_path.stem.replace("step_", "")
+        step_raw = ckpt_path.stem.replace("step_", "")
+        step = int(step_raw) if step_raw.isdigit() else step_raw
 
         print(f"\n{'='*60}")
-        print(f"Run: {run_dir.name}  ({variant}, discard_ply={discard}, step={step})")
+        print(f"Run: {run_dir.name}  ({variant}, discard_ply={discard}, step={step_raw})")
         print(f"Checkpoint: {ckpt_path}")
         print(f"{'='*60}")
 
@@ -196,7 +197,7 @@ def main():
         output = {
             "run": run_dir.name,
             "checkpoint": str(ckpt_path),
-            "step": int(step),
+            "step": step,
             "variant": variant,
             "discard_ply_limit": discard,
             "prepend_outcome": prepend_outcome,
