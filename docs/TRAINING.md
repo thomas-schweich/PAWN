@@ -36,9 +36,9 @@ uv run python scripts/train.py --variant base
 
 | Variant | Params | d_model | Layers | Heads | d_ff |
 |---------|--------|---------|--------|-------|------|
-| `small` | ~9.5M  | 256     | 8      | 4     | 1024 |
-| `base`  | ~36M   | 512     | 8      | 8     | 2048 |
-| `large` | ~68M   | 640     | 10     | 8     | 2560 |
+| `small` | ~8.9M  | 256     | 8      | 4     | 1024 |
+| `base`  | ~34.7M | 512     | 8      | 8     | 2048 |
+| `large` | ~66.9M | 640     | 10     | 8     | 2560 |
 | `toy`   | tiny   | 64      | 2      | 4     | 256  |
 
 ### Default training configuration

@@ -54,7 +54,7 @@ in the game forfeits the whole game. When measured directly as a **game
 completion rate** (no illegal predictions across an entire game's plies
 on one side), the legacy models looked like:
 
-In the table below, "avg plies completed" is the average number of legal plies the model produced before either reaching the end of the game or making its first illegal prediction. It is shown out of the legacy 255-ply context limit, since legacy validation games could not extend further.
+In the table below, "avg plies completed" is the average number of legal plies the model produced before either reaching the end of the game or making its first illegal prediction. It is shown out of the legacy 255-ply limit (the 256-token context minus one position consumed by the prepended outcome token), since legacy validation games could not extend further.
 
 | Variant | Steps | Params | Forfeit rate | Per-move illegal rate | Avg plies completed (out of 255) | Median forfeit ply | Min/max forfeit ply |
 |---|---:|---:|---:|---:|---:|---:|---:|

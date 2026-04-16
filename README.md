@@ -134,7 +134,7 @@ The [theoretical top-1 ceiling](docs/ACCURACY_CEILING.md) for random-game predic
 
 <sub>More info: [docs/ADAPTERS.md](docs/ADAPTERS.md)</sub>
 
-PAWN ships with six adapter implementations for fine-tuning the frozen backbone on human game data:
+PAWN ships with six adapter implementations for fine-tuning the frozen backbone on human game data. *(The numbers below are from the legacy backbone — see [docs/ADAPTERS.md](docs/ADAPTERS.md) for full context.)*
 
 | Method | Params (typical) | Accuracy (1800 Elo) | Description |
 |--------|-----------------|---------------------|-------------|
@@ -216,7 +216,7 @@ PAWN builds on ideas and tools from the following projects and publications:
 @software{schweich2026pawn,
   author = {Schweich, Thomas},
   title = {{PAWN}: Playstyle-Agnostic World-model Network for Chess},
-  year = 2026,
+  year = {2026},
   url = {https://github.com/thomas-schweich/PAWN},
   license = {Apache-2.0}
 }
