@@ -166,7 +166,10 @@ Each adapter exposes three helpers:
 
 ## Results Summary
 
-All results on the PAWN-Base backbone (~35.8M params, 8 layers, d_model=512), trained via behavioral cloning on Lichess games with legal-move-masked cross-entropy loss.
+> [!note]
+> The numbers in this section were measured on the **legacy** PAWN-Base backbone (~35.8M params, 4,278-token vocab, 256 context, prepend_outcome=True). They have not yet been re-run on the v1.0.0 backbones (1,980-token vocab, 512 context, no outcome prefix). They are kept here as the most recent end-to-end adapter sweep; expect updated numbers in a future release.
+
+All results on the PAWN-Base backbone (8 layers, d_model=512), trained via behavioral cloning on Lichess games with legal-move-masked cross-entropy loss.
 
 ### Method comparison (~65K params, 1000-1100 Elo, 100K games)
 

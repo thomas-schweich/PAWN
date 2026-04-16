@@ -36,20 +36,21 @@ uv run python scripts/train.py --variant base
 
 | Variant | Params | d_model | Layers | Heads | d_ff |
 |---------|--------|---------|--------|-------|------|
-| `small` | ~9.5M  | 256     | 8      | 4     | 1024 |
-| `base`  | ~36M   | 512     | 8      | 8     | 2048 |
-| `large` | ~68M   | 640     | 10     | 8     | 2560 |
+| `small` | ~8.9M  | 256     | 8      | 4     | 1024 |
+| `base`  | ~34.7M | 512     | 8      | 8     | 2048 |
+| `large` | ~66.9M | 640     | 10     | 8     | 2560 |
 | `toy`   | tiny   | 64      | 2      | 4     | 256  |
 
 ### Default training configuration
 
-- **Total steps**: 100,000
+- **Total steps**: 100,000 (the published v1.0.0 backbones were cotrained for 200,000 steps)
 - **Batch size**: 256
 - **Optimizer**: [AdamW](https://arxiv.org/abs/1711.05101) (Loshchilov & Hutter, 2017) (lr=3e-4, weight_decay=0.01)
-- **LR schedule**: [cosine decay](https://arxiv.org/abs/1608.03983) (Loshchilov & Hutter, 2016) with 1,000-step warmup
+- **LR schedule**: [cosine decay](https://arxiv.org/abs/1608.03983) (Loshchilov & Hutter, 2016) with 1,000-step warmup (10,000 for the published backbones)
 - **Mixed precision**: fp16 [AMP](https://arxiv.org/abs/1710.03740) (Micikevicius et al., 2017) (auto-detected)
 - **Checkpoints**: saved every 5,000 steps to `checkpoints/`
-- **Eval**: every 500 steps on 512 held-out random games
+- **Eval**: every 500 steps on 512 held-out random games (1,000 / 2,048 for the published backbones)
+- **Outcome conditioning**: off by default. The training config exposes a `prepend_outcome` flag that prefixes each example with one of 11 game-outcome tokens; the published v1.0.0 checkpoints use the no-prefix mode (pure moves, no outcome leakage), and so should any new backbones intended to be comparable to standard chess models
 
 ### Common overrides
 

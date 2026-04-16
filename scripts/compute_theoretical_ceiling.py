@@ -1,23 +1,35 @@
 #!/usr/bin/env python3
-"""Compute theoretical maximum top-1 accuracy for random chess play.
+"""Compute the unconditional top-1 accuracy ceiling for random chess play.
 
-Three ceilings computed via Monte Carlo rollouts in the Rust engine:
+PAWN's training distribution is uniformly random legal play. At each
+position with N legal moves, the next move is drawn uniformly from the
+N legal moves, so the Bayes-optimal predictor that does not know the
+game outcome can do no better than 1/N at that position. Averaged over
+the position distribution induced by random play, the top-1 accuracy
+ceiling is therefore::
 
-1. Unconditional: E[1/N_legal] — best accuracy without knowing the outcome.
-2. Naive conditional (0-depth): prune moves that immediately terminate with
-   the wrong outcome, then 1/N_remaining.
-3. MC conditional: E[max_m P(m|outcome, history)] — best accuracy when the
-   outcome token is known. Estimated via random rollouts from each legal move.
+    E[1/N_legal]
 
-The MC conditional is reported as a bracket [corrected, naive] because:
-- The naive estimator (max of noisy estimates) is biased upward.
-- The split-half corrected estimator (A selects, B evaluates) is biased downward.
-- The true Bayes-optimal ceiling lies between the two.
+where the expectation is over positions sampled from random games.
 
-Usage:
+This is **not** equal to ``1 / E[N_legal]``: by Jensen's inequality
+(``1/x`` is convex), ``E[1/N] >= 1/E[N]``, with equality only if N is
+constant. Computing the ceiling honestly requires evaluating ``1/N`` at
+each position and then averaging.
+
+The previous version of this script also computed an outcome-
+conditioned ceiling via Monte Carlo rollouts, which is meaningful when
+the model gets to see the game's actual outcome as a prefix token (the
+v0.x outcome-conditioned PAWN backbones did). The v1.0.0 backbones do
+not use outcome conditioning, so the MC ceiling collapses to the
+unconditional ceiling and the rollouts are wasted work. This script
+no longer does them.
+
+Usage::
+
     uv run python scripts/compute_theoretical_ceiling.py
-    uv run python scripts/compute_theoretical_ceiling.py --n-games 5000 --rollouts 128 --sample-rate 0.05
-    uv run python scripts/compute_theoretical_ceiling.py --model-accuracy 0.070
+    uv run python scripts/compute_theoretical_ceiling.py --n-games 50000
+    uv run python scripts/compute_theoretical_ceiling.py --max-ply 512 --n-games 20000
 """
 
 from __future__ import annotations
@@ -30,6 +42,7 @@ from pathlib import Path
 import numpy as np
 
 import chess_engine as engine
+from pawn.config import CLMConfig, PAD_TOKEN
 
 
 def bootstrap_ci_clustered(
@@ -39,259 +52,235 @@ def bootstrap_ci_clustered(
     ci: float = 0.95,
     seed: int = 42,
 ) -> tuple[float, float, float]:
-    """Bootstrap CI resampling by cluster (game), not by position.
+    """Bootstrap mean + CI resampling by cluster (game), not by position.
 
-    Returns (mean, ci_low, ci_high).
+    Position-level resampling underestimates variance because positions
+    within a single random game are correlated (legal-move counts shift
+    smoothly along a game). Resampling whole games at a time gives an
+    honest CI.
+
+    Vectorized: precompute per-cluster sum and count once, then each
+    bootstrap iteration is a pair of integer-indexed sums of length
+    n_clusters — O(n_boot × n_clusters) instead of
+    O(n_boot × n_positions). For 50K games × ~360 plies/game and
+    n_boot=2000 that's ~100M ops instead of ~36 billion, which is the
+    difference between "instant" and "wall clock fall-off-a-cliff."
     """
     rng = np.random.default_rng(seed)
-    unique_ids = np.unique(cluster_ids)
+    unique_ids, inv = np.unique(cluster_ids, return_inverse=True)
     n_clusters = len(unique_ids)
 
-    # Build cluster->position index for fast resampling
-    cluster_positions: dict[int, np.ndarray] = {}
-    for cid in unique_ids:
-        cluster_positions[int(cid)] = np.where(cluster_ids == cid)[0]
+    cluster_sum = np.zeros(n_clusters, dtype=np.float64)
+    cluster_count = np.zeros(n_clusters, dtype=np.int64)
+    np.add.at(cluster_sum, inv, values)
+    np.add.at(cluster_count, inv, 1)
 
-    boot_means = np.empty(n_boot)
-    for b in range(n_boot):
-        sampled = rng.choice(unique_ids, size=n_clusters, replace=True)
-        indices = np.concatenate([cluster_positions[int(c)] for c in sampled])
-        boot_means[b] = values[indices].mean()
+    sampled = rng.integers(0, n_clusters, size=(n_boot, n_clusters))
+    sums = cluster_sum[sampled].sum(axis=1)
+    counts = cluster_count[sampled].sum(axis=1)
+    boot_means = sums / counts
 
     alpha = (1 - ci) / 2
     lo, hi = np.quantile(boot_means, [alpha, 1 - alpha])
     return float(values.mean()), float(lo), float(hi)
 
 
+def compute_ceiling(
+    n_games: int,
+    max_ply: int,
+    seed: int,
+    vocab_size: int,
+) -> dict:
+    """Generate random games and compute E[1/N_legal] over their positions.
+
+    All heavy lifting is done in Rust:
+    - ``generate_random_games`` emits ``n_games`` games with up to
+      ``max_ply`` plies each.
+    - ``compute_legal_token_masks_sparse`` returns flat int64 indices
+      into a (batch, seq_len, vocab_size) tensor; one index per
+      (game, ply, legal_token). Counting indices per (game, ply) gives
+      the per-position legal-move count.
+
+    Then 1/N is computed in numpy and averaged.
+    """
+    seq_len = max_ply  # no outcome prefix in v1.0.0
+
+    move_ids, game_lengths, _term_codes = engine.generate_random_games(
+        n_games, max_ply, seed, False, 0.0,
+    )
+    move_ids_np = np.asarray(move_ids, dtype=np.int16)
+    game_lengths_np = np.asarray(game_lengths, dtype=np.int16)
+
+    sparse = engine.compute_legal_token_masks_sparse(
+        move_ids_np, game_lengths_np, seq_len, vocab_size,
+    )
+    sparse_np = np.asarray(sparse, dtype=np.int64)
+
+    # Each index = b * seq_len * vocab_size + t * vocab_size + token_id.
+    # Strip the token_id by integer-dividing by vocab_size, leaving a
+    # flat (b * seq_len + t) index per legal token. Counting these gives
+    # the legal-move count at each (b, t).
+    flat_pos = sparse_np // vocab_size
+    counts = np.bincount(flat_pos, minlength=n_games * seq_len)
+    counts = counts.reshape(n_games, seq_len)
+
+    # The sparse mask intentionally adds a PAD entry at position
+    # t == length (so loss at the end-of-game target is finite). For the
+    # ceiling we only care about positions with a real legal move, so
+    # mask to t < length.
+    game_lengths_int = game_lengths_np.astype(np.int64)
+    ply_idx = np.arange(seq_len, dtype=np.int64)[None, :]
+    valid = ply_idx < game_lengths_int[:, None]
+
+    n_legal_per_pos = counts[valid]
+    if (n_legal_per_pos == 0).any():
+        n_zero = int((n_legal_per_pos == 0).sum())
+        raise RuntimeError(
+            f"{n_zero} sampled positions had zero legal moves — should be "
+            "impossible for non-terminal positions in random play."
+        )
+
+    inv_n = 1.0 / n_legal_per_pos.astype(np.float64)
+
+    # Build per-position cluster IDs (game index) for clustered bootstrap.
+    game_idx_2d = np.broadcast_to(
+        np.arange(n_games, dtype=np.int64)[:, None], (n_games, seq_len),
+    )
+    game_idx_per_pos = game_idx_2d[valid]
+
+    # Per-game length and per-position ply (for the ply-bucket breakdown).
+    ply_2d = np.broadcast_to(ply_idx, (n_games, seq_len))
+    ply_per_pos = ply_2d[valid]
+
+    return {
+        "inv_n": inv_n,
+        "n_legal": n_legal_per_pos,
+        "game_idx_per_pos": game_idx_per_pos,
+        "ply_per_pos": ply_per_pos,
+        "game_lengths": game_lengths_int,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Compute theoretical accuracy ceilings for random chess"
+        description="Compute the unconditional top-1 accuracy ceiling for "
+                    "PAWN (E[1/N_legal] over random-game positions)."
     )
-    parser.add_argument("--n-games", type=int, default=2000,
-                        help="Number of random games to generate")
-    parser.add_argument("--rollouts", type=int, default=32,
-                        help="Monte Carlo rollouts per legal move")
-    parser.add_argument("--sample-rate", type=float, default=0.02,
-                        help="Fraction of positions to sample (1.0=all, 0.02=2%%)")
+    parser.add_argument("--n-games", type=int, default=20_000,
+                        help="Number of random games to generate.")
+    parser.add_argument("--max-ply", type=int, default=None,
+                        help="Maximum game length (default: CLMConfig().max_seq_len).")
     parser.add_argument("--seed", type=int, default=77777)
-    parser.add_argument("--output", type=str, default="data/theoretical_ceiling.json")
-    parser.add_argument("--model-accuracy", type=float, default=None,
-                        help="Model top-1 accuracy to compute adjusted score")
-    parser.add_argument("--max-ply", type=int, default=255,
-                        help="Maximum game length in plies (default: 255)")
+    parser.add_argument("--output", type=str, default="cards/theoretical_ceiling.json",
+                        help="Where to save the JSON artifact. Defaults to "
+                             "cards/theoretical_ceiling.json (read by "
+                             "scripts/generate_model_cards.py to fill in the "
+                             "accuracy ceiling section of each model card).")
     parser.add_argument("--bootstrap", type=int, default=2000,
-                        help="Number of bootstrap resamples for CIs (0 to skip)")
+                        help="Number of clustered-bootstrap resamples for the CI "
+                             "(0 to skip).")
+    parser.add_argument("--model-accuracy", type=float, default=None,
+                        help="If given, also report the ratio of this top-1 "
+                             "accuracy to the computed ceiling.")
     args = parser.parse_args()
+
+    cfg = CLMConfig()
+    max_ply = args.max_ply if args.max_ply is not None else cfg.max_seq_len
+    vocab_size = cfg.vocab_size
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Computing theoretical accuracy ceilings")
-    print(f"  Games: {args.n_games:,}")
-    print(f"  Rollouts/move: {args.rollouts}")
-    print(f"  Sample rate: {args.sample_rate:.0%}")
-    print(f"  Seed: {args.seed}")
+    print("Computing unconditional accuracy ceiling")
+    print(f"  Games:      {args.n_games:,}")
+    print(f"  Max ply:    {max_ply}")
+    print(f"  Vocab size: {vocab_size}")
+    print(f"  Seed:       {args.seed}")
     print()
-
-    # Process in batches for progress reporting
-    batch_size = max(100, args.n_games // 10)
-    n_batches = (args.n_games + batch_size - 1) // batch_size
-
-    all_outcomes = []
-    all_conditionals = []
-    all_corrected = []
-    all_naive = []
-    all_unconditionals = []
-    all_game_ids = []
-    all_plies = []
-    all_game_lengths = []
-    total_positions = 0
-    game_id_offset = 0
 
     t0 = time.time()
-    games_done = 0
-
-    for batch_idx in range(n_batches):
-        batch_n = min(batch_size, args.n_games - games_done)
-        batch_seed = args.seed + batch_idx * 100000
-
-        bt = time.time()
-        result = engine.compute_accuracy_ceiling(
-            n_games=batch_n,
-            max_ply=args.max_ply,
-            n_rollouts=args.rollouts,
-            sample_rate=args.sample_rate,
-            seed=batch_seed,
-        )
-        batch_elapsed = time.time() - bt
-
-        n_pos = result["n_positions"]
-        total_positions += n_pos
-        games_done += batch_n
-
-        # Accumulate per-position arrays
-        all_outcomes.append(np.asarray(result["outcome"]))
-        all_conditionals.append(np.asarray(result["conditional"]))
-        all_corrected.append(np.asarray(result["conditional_corrected"]))
-        all_naive.append(np.asarray(result["naive_conditional"]))
-        all_unconditionals.append(np.asarray(result["unconditional"]))
-        all_game_ids.append(np.asarray(result["game_idx"]) + game_id_offset)
-        all_plies.append(np.asarray(result["ply"]))
-        all_game_lengths.append(np.asarray(result["game_length"]))
-        game_id_offset += batch_n
-
-        # Running estimates
-        uc_so_far = np.concatenate(all_unconditionals).mean()
-        mc_so_far = np.concatenate(all_conditionals).mean()
-        mc_corr_so_far = np.concatenate(all_corrected).mean()
-        bracket = (mc_so_far - mc_corr_so_far) * 100
-
-        elapsed_so_far = time.time() - t0
-        rate = games_done / elapsed_so_far
-        eta = (args.n_games - games_done) / rate if rate > 0 else 0
-
-        print(
-            f"[batch {batch_idx+1}/{n_batches}] "
-            f"{games_done}/{args.n_games} games, {total_positions:,} positions | "
-            f"uncond={uc_so_far:.4f}  mc=[{mc_corr_so_far:.4f}, {mc_so_far:.4f}] "
-            f"bracket={bracket:.3f}pp | "
-            f"{batch_elapsed:.0f}s/batch, ETA {eta/60:.0f}m",
-            flush=True,
-        )
-
+    result = compute_ceiling(args.n_games, max_ply, args.seed, vocab_size)
     elapsed = time.time() - t0
 
-    # Concatenate all batches
-    outcomes = np.concatenate(all_outcomes)
-    conditionals = np.concatenate(all_conditionals)
-    corrected_conditionals = np.concatenate(all_corrected)
-    naive_conditionals = np.concatenate(all_naive)
-    unconditionals = np.concatenate(all_unconditionals)
-    game_ids = np.concatenate(all_game_ids)
+    inv_n = result["inv_n"]
+    n_legal = result["n_legal"]
+    game_idx_per_pos = result["game_idx_per_pos"]
+    ply_per_pos = result["ply_per_pos"]
+    game_lengths = result["game_lengths"]
 
-    uncond = float(unconditionals.mean())
-    naive_cond = float(naive_conditionals.mean())
-    cond = float(conditionals.mean())
-    cond_corr = float(corrected_conditionals.mean())
-    boost_naive = naive_cond / uncond if uncond > 0 else 0
-    boost = cond / uncond if uncond > 0 else 0
-    boost_corr = cond_corr / uncond if uncond > 0 else 0
+    n_positions = int(inv_n.size)
+    ceiling = float(inv_n.mean())
+    mean_n_legal = float(n_legal.mean())
+    one_over_mean_n = 1.0 / mean_n_legal
+    mean_game_len = float(game_lengths.mean())
 
+    print(f"Generated {args.n_games:,} games "
+          f"({n_positions:,} non-terminal positions, "
+          f"avg {mean_game_len:.1f} ply/game) in {elapsed:.1f}s")
     print()
-    print(f"Positions sampled: {total_positions:,}")
-    print(f"Unconditional ceiling:         {uncond:.4f} ({uncond*100:.2f}%)")
-    print(f"Naive conditional ceiling:     {naive_cond:.4f} ({naive_cond*100:.2f}%)  {boost_naive:.2f}x")
-    print(f"MC conditional (naive est.):   {cond:.4f} ({cond*100:.2f}%)  {boost:.2f}x  [biased up]")
-    print(f"MC conditional (corrected):    {cond_corr:.4f} ({cond_corr*100:.2f}%)  {boost_corr:.2f}x  [biased down]")
-    print(f"  Bias bracket width:          {(cond - cond_corr)*100:.3f}pp")
-    print(f"Time: {elapsed:.0f}s")
+    print(f"Unconditional ceiling (E[1/N_legal]): {ceiling:.6f}  "
+          f"({ceiling * 100:.4f}%)")
+    print(f"  Lower bound (1/E[N_legal]):         {one_over_mean_n:.6f}  "
+          f"({one_over_mean_n * 100:.4f}%)  [Jensen lower bound, not the ceiling]")
+    print(f"  Avg legal moves per position:       {mean_n_legal:.2f}")
     print()
 
-    outcome_names = [
-        "W checkmated", "B checkmated", "Stalemate", "75-move",
-        "5-fold rep", "Insuff mat", "Ply limit",
-    ]
-
-    # Bootstrap CIs (clustered by game)
-    ci_data = {}
+    ci_low: float | None = None
+    ci_high: float | None = None
     if args.bootstrap > 0:
-        print(f"Bootstrap CIs ({args.bootstrap} resamples, clustered by game):")
-        for label, vals in [
-            ("unconditional", unconditionals),
-            ("naive_conditional", naive_conditionals),
-            ("mc_conditional", conditionals),
-            ("mc_corrected", corrected_conditionals),
-        ]:
-            mean, lo, hi = bootstrap_ci_clustered(vals, game_ids, n_boot=args.bootstrap)
-            ci_data[label] = {"mean": mean, "ci_low": lo, "ci_high": hi}
-            print(f"  {label:>20}: {mean:.4f}  95% CI [{lo:.4f}, {hi:.4f}]")
+        print(f"Bootstrap CI ({args.bootstrap} resamples, clustered by game):")
+        _, ci_low, ci_high = bootstrap_ci_clustered(
+            inv_n, game_idx_per_pos, n_boot=args.bootstrap,
+        )
+        print(f"  ceiling = {ceiling:.6f}  95% CI [{ci_low:.6f}, {ci_high:.6f}]")
         print()
 
-    # Per-outcome breakdown
-    print("Per-outcome breakdown:")
-    outcome_data = {}
-    for oi in range(7):
-        mask = outcomes == oi
+    # Per-ply-bucket breakdown — useful for sanity-checking that the
+    # ceiling is dominated by the long tail of mid-game positions and
+    # not by early-opening or near-terminal positions.
+    print("Ceiling by ply bucket:")
+    bucket_data = {}
+    bucket_edges = [0, 10, 20, 40, 80, 160, 256, 384, max_ply + 1]
+    for lo, hi in zip(bucket_edges[:-1], bucket_edges[1:]):
+        mask = (ply_per_pos >= lo) & (ply_per_pos < hi)
         n = int(mask.sum())
-        if n > 0:
-            uc = float(unconditionals[mask].mean())
-            nc = float(naive_conditionals[mask].mean())
-            cc = float(conditionals[mask].mean())
-            cc_corr = float(corrected_conditionals[mask].mean())
-            print(f"  {outcome_names[oi]:>12}: uncond={uc:.4f}  naive={nc:.4f}  "
-                  f"mc={cc:.4f}  corrected={cc_corr:.4f}  (n={n})")
-            outcome_data[outcome_names[oi]] = {
-                "unconditional": uc, "naive_conditional": nc,
-                "conditional": cc, "conditional_corrected": cc_corr,
-                "n_positions": n,
-            }
+        if n == 0:
+            continue
+        bucket_ceiling = float(inv_n[mask].mean())
+        bucket_n_legal = float(n_legal[mask].mean())
+        print(f"  plies [{lo:>3}, {hi - 1:>3}]: ceiling={bucket_ceiling * 100:.3f}%  "
+              f"avg N={bucket_n_legal:.1f}  n={n:,}")
+        bucket_data[f"{lo}-{hi - 1}"] = {
+            "ceiling": bucket_ceiling,
+            "mean_n_legal": bucket_n_legal,
+            "n_positions": n,
+        }
     print()
 
-    # Per-ply-from-end breakdown
-    plies = np.concatenate(all_plies)
-    game_lengths = np.concatenate(all_game_lengths)
-    plies_from_end = game_lengths - plies
-
-    print("Ceiling by distance from game end:")
-    distance_data = {}
-    for dist in range(1, 21):
-        mask = plies_from_end == dist
-        n = int(mask.sum())
-        if n > 10:
-            uc = float(unconditionals[mask].mean())
-            nc = float(naive_conditionals[mask].mean())
-            cc = float(conditionals[mask].mean())
-            cc_corr = float(corrected_conditionals[mask].mean())
-            bar = "#" * int(cc * 200)
-            print(f"  {dist:>3} plies from end: uncond={uc:.4f}  naive={nc:.4f}  "
-                  f"mc={cc:.4f}  corrected={cc_corr:.4f}  {bar}")
-            distance_data[dist] = {
-                "unconditional": uc, "naive_conditional": nc,
-                "conditional": cc, "conditional_corrected": cc_corr, "n": n,
-            }
-    print()
-
-    # Model adjusted accuracy
     if args.model_accuracy is not None:
         ma = args.model_accuracy
-        adj_uncond = ma / uncond if uncond > 0 else 0
-        adj_naive = ma / naive_cond if naive_cond > 0 else 0
-        adj_cond = ma / cond if cond > 0 else 0
-        adj_corr = ma / cond_corr if cond_corr > 0 else 0
-        print(f"Model accuracy: {ma:.4f} ({ma*100:.2f}%)")
-        print(f"  vs unconditional ceiling:      {adj_uncond:.1%} of theoretical max")
-        print(f"  vs naive conditional ceiling:  {adj_naive:.1%} of theoretical max")
-        print(f"  vs MC conditional (naive):     {adj_cond:.1%} of theoretical max")
-        print(f"  vs MC conditional (corrected): {adj_corr:.1%} of theoretical max")
+        ratio = ma / ceiling if ceiling > 0 else 0
+        print(f"Model accuracy {ma * 100:.2f}%  →  {ratio * 100:.1f}% of the unconditional ceiling")
         print()
 
-    # Save results
     data = {
-        "unconditional_ceiling": float(uncond),
-        "naive_conditional_ceiling": float(naive_cond),
-        "conditional_ceiling": float(cond),
-        "conditional_corrected_ceiling": float(cond_corr),
-        "naive_conditioning_boost": float(boost_naive),
-        "mc_conditioning_boost": float(boost),
-        "mc_corrected_conditioning_boost": float(boost_corr),
-        "bias_bracket_pp": float((cond - cond_corr) * 100),
-        "n_positions": total_positions,
+        "unconditional_ceiling": ceiling,
+        "ceiling_ci_low_95": ci_low,
+        "ceiling_ci_high_95": ci_high,
+        "mean_n_legal": mean_n_legal,
+        "one_over_mean_n_legal": one_over_mean_n,
         "n_games": args.n_games,
-        "n_rollouts": args.rollouts,
-        "sample_rate": args.sample_rate,
+        "n_positions": n_positions,
+        "max_ply": max_ply,
+        "vocab_size": vocab_size,
         "seed": args.seed,
         "elapsed_seconds": elapsed,
-        "per_outcome": outcome_data,
-        "per_distance_from_end": {str(k): v for k, v in distance_data.items()},
+        "by_ply_bucket": bucket_data,
+        "method": "E[1/N_legal] over positions sampled from uniformly random games",
     }
-    if ci_data:
-        data["bootstrap_ci"] = ci_data
     if args.model_accuracy is not None:
         data["model_accuracy"] = args.model_accuracy
-        data["adjusted_vs_unconditional"] = adj_uncond
-        data["adjusted_vs_naive_conditional"] = adj_naive
-        data["adjusted_vs_conditional"] = adj_cond
-        data["adjusted_vs_conditional_corrected"] = adj_corr
+        data["model_ratio_vs_ceiling"] = ma / ceiling
 
     with open(output_path, "w") as f:
         json.dump(data, f, indent=2)

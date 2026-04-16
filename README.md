@@ -6,37 +6,31 @@ I've found PAWN to be a viable testbed for finetuning and augmentation methods a
 
 Finetuning PAWN has proven significantly more parameter-efficient than training new models from scratch and requires minimal compute resources.
 
-Feel free to use PAWN in your own experiments. Note that PAWN was developed as a personal project by a single developer and his imaginary friend (Claude) and has not been published or audited. If you spot a bug or inaccuracy, please help out by creating an issue or PR.
-
-**PAWN is under active development and is not yet stable. All results are preliminary.**
-
-
-> [!important]
-> The `main` branch trains a new architecture with:
->
-> - A vocabulary borrowed from Google DeepMind's [searchless_chess project (Amortized Planning with Large-Scale Transformers: A Case Study on Chess)](https://github.com/google-deepmind/searchless_chess), which doesn't include impossible moves (1,980 tokens total).
-> - A wider 512-token context window.
->
-> Retraining of the published HuggingFace checkpoints is still in progress, so the model table below reflects the *currently-published* weights (old 4,278-token vocab, 256-token context). The `pre-vocab-transition` git tag preserves the exact code those checkpoints were trained with; once new weights are uploaded, this table will be refreshed in a separate PR.
+Feel free to use PAWN in your own experiments. PAWN is developed as a personal project by a single developer and his imaginary friend (Claude) and has not been published or audited — treat the numbers below as a single-developer snapshot rather than peer-reviewed results. If you spot a bug or inaccuracy, please help out by creating an issue or PR.
 
 
 ## Model Variants
 
-Three sizes, trained for 100K steps on random games (~25.6M games each):
+Three sizes, all trained from scratch on random chess games generated on-the-fly by a Rust engine. The published v1.0.0 weights were trained together for 200K steps at batch size 256 on a single B200 — all three variants see the same random-game batches each step, with one forward/backward pass per variant in sequence on the same GPU (see [cotrain config](configs/cotrain_three_variants.json)). The numbers below come from the best 5K-cadence checkpoint by val loss (step 195,000 ≈ 49.9M sequences) for all three variants:
 
-| Variant | d_model | Layers | Heads | Params | Top-1 | Legal Rate | Download |
-|---------|---------|--------|-------|--------|-------|------------|----------|
-| **PAWN-Small** | 256 | 8 | 4 | ~9.5M | 6.75% | 99.19% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-small) |
-| **PAWN (Base)** | 512 | 8 | 8 | ~35.8M | 7.02% | 99.87% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
-| **PAWN-Large** | 640 | 10 | 8 | ~68.4M | 6.95% | 99.89% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
+| Variant | d_model | Layers | Heads | Params | Top-1 | Legal rate | Game completion | Download |
+|---------|---------|--------|-------|--------|-------|------------|-----------------|----------|
+| **PAWN-Small** | 256 | 8 | 4 | 8.94M | 8.54% | 99.7451% | 52.34% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-small) |
+| **PAWN (Base)** | 512 | 8 | 8 | 34.65M | 8.57% | 99.9962% | 98.97% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
+| **PAWN-Large** | 640 | 10 | 8 | 66.91M | 8.63% | 99.9990% | 99.76% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
+
+*Top-1 and legal rate are measured on a 2,048-game validation set of fresh random games. **Game completion** is the share of validation games in which every prediction along one side's plies was legal. The measurement is non-autoregressive: the model sees the true ground-truth history at each ply, so each prediction is independent given that history. Autoregressive completion has not yet been measured. Game completion is still a much stricter metric than per-move legal rate, and the main signal that separates capacity between sizes — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate).*
 
 All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), factored move embeddings, and a vocabulary covering:
 
 - 1,968 move actions (the searchless_chess vocabulary, one entry per legally-reachable (src, dst[, promotion]) tuple),
 - 11 game-outcome tokens (pretraining outcomes: `WHITE_CHECKMATES`, `BLACK_CHECKMATES`, `STALEMATE`, `DRAW_BY_RULE`, `PLY_LIMIT`; Lichess-specific outcomes: `WHITE_RESIGNS`, `BLACK_RESIGNS`, `DRAW_BY_AGREEMENT`, `WHITE_WINS_ON_TIME`, `BLACK_WINS_ON_TIME`, `DRAW_BY_TIME`),
-- and a padding token — 1,980 tokens total on `main`. (Published checkpoints predate this change; see the note above.)
+- and a single PAD token — 1,980 tokens total.
 
-PAWN learns to avoid impossible moves like `a1a1` and `b1a5` since they don't appear in its training examples.
+PAWN learns to avoid impossible moves like `a1a1` and `b1a5` since they don't appear in its training examples (and now don't appear in the action vocabulary either).
+
+> [!note]
+> A previous generation of PAWN backbones (`pawn-{small,base,large}-legacy`) used a 4,278-token coordinate vocabulary, a 256-token context window, and outcome conditioning. They are still available on HuggingFace, and the `pre-vocab-transition` git tag preserves the exact code they were trained with. See [docs/LEGACY.md](docs/LEGACY.md) for background on what changed and why.
 
 Tokens are best thought of as a move in UCI notation -- coordinate pairs. They do not include any information on the type of piece, side to play, or direct board state information.
 
@@ -92,10 +86,10 @@ These datasets are for adapter training (behavioral cloning), not for pretrainin
 
 | Dataset | Games | Description | Link |
 |---------|-------|-------------|------|
-| Lichess Full | ~289M train + 50K val + 50K test | Rated games from Q1 2025 (all Elos), holdout from Jan 2026 | [pawn-lichess-full](https://huggingface.co/datasets/thomas-schweich/pawn-lichess-full) |
+| Lichess Full | 286M train + 9.3M val + 9.0M test | Rated games from Q1 2025 (all Elos), holdout from Jan 2026 | [pawn-lichess-full](https://huggingface.co/datasets/thomas-schweich/pawn-lichess-full) |
 | Stockfish nodes=1 | 900K train + 50K val + 50K test | NNUE self-play, 1 node/move | [stockfish-nodes1](https://huggingface.co/datasets/thomas-schweich/stockfish-nodes1) |
 
-All datasets use the PAWN token format: pre-tokenized `list[int16]` move sequences, ready for training without any parsing. The Lichess dataset also includes clock annotations, Stockfish eval annotations (~8% of games), player hashes, Elo ratings, and game metadata.
+All datasets use the PAWN token format: pre-tokenized `list[int16]` move sequences (`tokens` column) ready for training without any parsing. The Lichess dataset also includes the raw `san` and `uci` move strings, clock annotations, player hashes, Elo ratings, and full game metadata, and is happy to be used as a pre-parsed Lichess feed even outside the PAWN ecosystem.
 
 Datasets load directly from HuggingFace via Polars lazy scan -- predicate pushdown on columns like `white_elo` and `date` lets you efficiently filter to specific Elo bands or time periods without downloading the full dataset.
 
@@ -111,7 +105,7 @@ PAWN is a standard decoder-only [transformer](https://arxiv.org/abs/1706.03762) 
 
 (An optional outcome-conditioning prefix can be enabled via the `prepend_outcome` training config; pure moves is the default.)
 
-Ply tokens use a factored embedding: each move is decomposed into source square + destination square + promotion piece, with embeddings summed. This gives the model explicit spatial structure while keeping the vocabulary compact. On `main`, the context window is 512 tokens (the currently-published checkpoints use 256).
+Ply tokens use a factored embedding: each move is decomposed into source square + destination square + promotion piece, with embeddings summed. This gives the model explicit spatial structure while keeping the vocabulary compact. The context window is 512 tokens, which fits the vast majority of random games end-to-end.
 
 The model's predictions are not masked to legal moves during training; it has to determine what moves are currently legal based on the sequence of moves so far.
 
@@ -119,27 +113,28 @@ No attempt is made to provide the model with information about other pieces. In 
 
 ## What the Model Learns
 
-Despite training exclusively on random games, PAWN develops rich internal representations. Linear probes on the base model's hidden states decode:
+Despite training exclusively on random games, PAWN develops rich internal representations. Linear probes on the base model's hidden states decode chess concepts that the model is never explicitly told about:
 
 | Probe | Accuracy |
 |-------|----------|
 | Side to move | 100.0% |
-| En passant square | 99.7% |
-| Castling rights | 96.6% |
-| Game phase | 90.7% |
+| En passant square | ~99.7% |
+| Castling rights | ~96.6% |
 | Piece type at square | 89.7% |
-| Is check | 94.2% |
-| Material count (MAE) | 6.1 |
+| Is check | ~94.2% |
+| Game phase | ~90.7% |
 
-The model also achieves >99.8% legal move rate on the base and large variants, correctly identifying legal moves from move history alone.
+For up-to-date probe numbers (small/base/large), see each model's HuggingFace card.
 
-The [theoretical accuracy ceiling](docs/ACCURACY_CEILING.md) for random game prediction is 6.52% (unconditional). The MC-conditioned ceiling (Bayes-optimal with outcome knowledge) is estimated at [6.67%, 7.34%] via split-half bias correction. All three models exceed the unconditional ceiling, confirming they exploit the outcome token to make non-uniform predictions.
+The base and large variants also achieve >99.99% per-move legal move rate on a held-out validation set of fresh random games, and >99% **game completion rate** — the share of validation games in which every position-by-position prediction along one side's plies was legal. Game completion is much harder than per-move legality (one mistake anywhere in the game forfeits), and turns out to depend strongly on model capacity. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate) for the full story.
+
+The [theoretical top-1 ceiling](docs/ACCURACY_CEILING.md) for random-game prediction (without outcome conditioning) is `E[1/N_legal] = 8.43%` over the v1.0.0 position distribution (random games of up to 512 plies, 95% CI [8.41%, 8.45%] from 50,000 games). All three published variants sit at ~101–102% of that ceiling — essentially saturating the metric. Top-1 accuracy is therefore not a useful way to compare sizes under the v1.0.0 setup; **game completion rate is the only headline metric that meaningfully separates them.**
 
 ## Adapter Methods
 
 <sub>More info: [docs/ADAPTERS.md](docs/ADAPTERS.md)</sub>
 
-PAWN ships with six adapter implementations for fine-tuning the frozen backbone on human game data:
+PAWN ships with six adapter implementations for fine-tuning the frozen backbone on human game data. *(The numbers below are from the legacy backbone — see [docs/ADAPTERS.md](docs/ADAPTERS.md) for full context.)*
 
 | Method | Params (typical) | Accuracy (1800 Elo) | Description |
 |--------|-----------------|---------------------|-------------|
@@ -181,10 +176,11 @@ The engine generates training data on-the-fly via `chess_engine.generate_random_
 
 ## More info
 
-- [Architecture](docs/ARCHITECTURE.md) -- model design, embeddings, training objective
+- [Architecture](docs/ARCHITECTURE.md) -- model design, embeddings, training objective, game completion analysis
 - [Training](docs/TRAINING.md) -- pretraining, adapter training, deployment
 - [Adapters](docs/ADAPTERS.md) -- adapter methods, results, quick start
 - [Accuracy Ceiling](docs/ACCURACY_CEILING.md) -- theoretical limits for random game prediction
+- [Legacy Architecture](docs/LEGACY.md) -- the v0.x backbones, why they were retired, and how to load them
 
 \*None of the existing experiments use FiLM to condition on anything. The existing FiLM experiments ask the question, 'how does FiLM perform when all parameters are learned'.
 
@@ -220,7 +216,7 @@ PAWN builds on ideas and tools from the following projects and publications:
 @software{schweich2026pawn,
   author = {Schweich, Thomas},
   title = {{PAWN}: Playstyle-Agnostic World-model Network for Chess},
-  year = 2026,
+  year = {2026},
   url = {https://github.com/thomas-schweich/PAWN},
   license = {Apache-2.0}
 }

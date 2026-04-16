@@ -40,25 +40,24 @@ model-index:
           type: next-token-prediction
           name: Chess Move Prediction (Random Games)
         metrics:
-{% if legal_rate is not none %}
+          - name: Game Completion Rate
+            type: accuracy
+            value: {{ "%.6f"|format(completion_rate / 100) }}
           - name: Legal Move Rate
             type: accuracy
-            value: {{ "%.4f"|format(legal_rate / 100) }}
-{% endif %}
+            value: {{ "%.6f"|format(legal_rate / 100) }}
           - name: Top-1 Accuracy
             type: accuracy
             value: {{ "%.4f"|format(top1 / 100) }}
-{% if top5 is not none %}
           - name: Top-5 Accuracy
             type: accuracy
             value: {{ "%.4f"|format(top5 / 100) }}
-{% endif %}
           - name: Val Loss
             type: loss
             value: {{ "%.4f"|format(val_loss) }}
-          - name: Games Seen
+          - name: Total Training Sequences
             type: other
-            value: 25600000
+            value: {{ sequences_seen }}
 ---
 
 # PAWN-{{ variant_name }}
@@ -73,32 +72,44 @@ This is the **{{ variant_label }}** variant ({{ params }} parameters). PAWN is d
 
 | Variant | Parameters | Link |
 |---------|------------|------|
-| PAWN-Small | ~9.5M | [thomas-schweich/pawn-small](https://huggingface.co/thomas-schweich/pawn-small) |
-| PAWN (Base) | ~35.8M | [thomas-schweich/pawn-base](https://huggingface.co/thomas-schweich/pawn-base) |
-| PAWN-Large | ~68.4M | [thomas-schweich/pawn-large](https://huggingface.co/thomas-schweich/pawn-large) |
+| PAWN-Small | ~9M | [thomas-schweich/pawn-small](https://huggingface.co/thomas-schweich/pawn-small) |
+| PAWN (Base) | ~35M | [thomas-schweich/pawn-base](https://huggingface.co/thomas-schweich/pawn-base) |
+| PAWN-Large | ~67M | [thomas-schweich/pawn-large](https://huggingface.co/thomas-schweich/pawn-large) |
+
+A previous generation of PAWN backbones (`pawn-{small,base,large}-legacy`) used a 4,278-token coordinate vocabulary, a 256-token context window, and outcome conditioning. They are still available on HuggingFace; see [docs/LEGACY.md](https://github.com/thomas-schweich/PAWN/blob/main/docs/LEGACY.md) for the full story.
 
 ## Headline Metrics
 
+These come from the published `model.safetensors` (step {{ "{:,}".format(published_step) }} out of {{ "{:,}".format(total_steps) }} — the best 5,000-step-cadence checkpoint by val loss), measured on a fresh validation set of random games.
+
 | Metric | Value |
 |--------|-------|
-{% if legal_rate is not none %}| Legal move rate | {{ "%.2f"|format(legal_rate) }}% |
-{% endif %}| Top-1 accuracy | {{ "%.2f"|format(top1) }}% |
-{% if top5 is not none %}| Top-5 accuracy | {{ "%.2f"|format(top5) }}% |
-{% endif %}| Val loss | {{ "%.3f"|format(val_loss) }} |
+| Game completion rate | {{ "%.2f"|format(completion_rate) }}% |
+| Per-move legal rate | {{ "%.4f"|format(legal_rate) }}% |
+| Late-game legal rate | {{ "%.4f"|format(late_legal_rate) }}% |
+| Top-1 accuracy | {{ "%.2f"|format(top1) }}% |
+| Top-5 accuracy | {{ "%.2f"|format(top5) }}% |
+| Val loss | {{ "%.3f"|format(val_loss) }} |
+| Val perplexity | {{ "%.2f"|format(perplexity) }} |
 
-### Accuracy Ratios
+**Game completion rate** is the share of validation games in which *every* prediction along one side's plies was a legal move. The measurement is **non-autoregressive**: at each ply the model is shown the true ground-truth history and asked for that side's next move, and an illegal prediction at any ply forfeits the game. Errors do not corrupt subsequent positions — each prediction is independent given the true history. Autoregressive game completion has not been measured for these checkpoints and could be higher or lower; see the [game completion section of the architecture doc](https://github.com/thomas-schweich/PAWN/blob/main/docs/ARCHITECTURE.md#game-completion-rate) for the full definition. Game completion rate is a much stricter metric than per-move legal rate, and is the main signal that separates capacity between sizes.
 
-PAWN is trained on uniformly random chess games, so top-1 accuracy has a hard theoretical ceiling. Ratios above 100% on the unconditioned ceiling indicate the model exploits the outcome token to make non-uniform predictions. The MC conditioned ceiling is an estimate reported as a bracket \[corrected, naive\]; see [Accuracy Ceiling Analysis](https://github.com/thomas-schweich/PAWN/blob/main/docs/ACCURACY_CEILING.md) for methodology.
+| Compound-legality detail | Value |
+|--------------------------|-------|
+| Average plies completed per game | {{ "%.0f"|format(avg_plies_completed) }} |
+| Average % of game completed | {{ "%.2f"|format(avg_pct_completion) }}% |
+| Median forfeit ply (when forfeit) | {{ "%.0f"|format(median_forfeit_ply) }} |
 
-| Ceiling | Ratio |
-|---------|-------|
-| Unconditioned (E\[1/N_legal\] = {{ "%.2f"|format(uncond_ceiling) }}%) | {{ uncond_ratio }}% |
-| Bayes-optimal conditioned (MC, {{ n_rollouts }} rollouts = \[{{ "%.2f"|format(mc_corrected_ceiling) }}, {{ "%.2f"|format(mc_naive_ceiling) }}\]%) | {{ mc_corrected_ratio }}–{{ mc_naive_ratio }}% |
+### Accuracy ceiling
+
+PAWN is trained on uniformly random chess games. At each position with N legal moves, the next move is drawn uniformly, so the Bayes-optimal predictor that does not know the game's outcome can do no better than 1/N at that position. Averaged over the position distribution induced by random games of up to {{ ceiling_max_ply }} plies, the top-1 ceiling is **E\[1/N_legal\] ≈ {{ "%.2f"|format(uncond_ceiling) }}%** (95% CI \[{{ "%.2f"|format(uncond_ceiling_ci_low) }}%, {{ "%.2f"|format(uncond_ceiling_ci_high) }}%\], computed over {{ "{:,}".format(ceiling_n_games) }} fresh random games — see [docs/ACCURACY_CEILING.md](https://github.com/thomas-schweich/PAWN/blob/main/docs/ACCURACY_CEILING.md)).
+
+This model's top-1 accuracy of **{{ "%.2f"|format(top1) }}%** is **{{ "%.0f"|format(uncond_ratio) }}% of that ceiling** — i.e., essentially at the limit of what any predictor can achieve on this task without outcome information.
 {% if probes %}
 
 ## Probe Results
 
-Linear probes trained on frozen hidden states measure how well the model's internal representations encode board-level features.
+Linear probes trained on frozen hidden states measure how well the model's internal representations encode board-level features. The model is never explicitly told about pieces, sides, or rules — these representations emerge purely from next-token prediction on random games.
 
 | Probe | Accuracy | Description |
 |-------|----------|-------------|
@@ -130,7 +141,7 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 | Head dimension | {{ head_dim }} |
 | d_ff | {{ d_ff }} |
 | Parameters | {{ params }} |
-| Vocabulary | {{ vocab_size }} tokens |
+| Vocabulary | {{ "{:,}".format(vocab_size) }} tokens (1,968 searchless_chess actions + 1 PAD + 11 outcome tokens) |
 | Context length | {{ max_seq_len }} tokens |
 | Normalization | Pre-norm RMSNorm |
 | FFN | SwiGLU (4x expansion) |
@@ -144,13 +155,14 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 |-----------|-------|
 | Training data | On-the-fly uniformly random legal games (no external dataset) |
 | Objective | Next-token cross-entropy (non-padding positions only) |
-| Total steps | 100,000 |
-| Batch size | 256 |
-| Games seen | 25,600,000 |
-| Learning rate | 3e-4 (cosine decay with 1,000-step warmup) |
-| Optimizer | AdamW (weight decay 0.01) |
+| Outcome conditioning | {{ "Enabled (prepend_outcome=True)" if prepend_outcome else "Disabled (prepend_outcome=False) — pure moves, no outcome leakage" }} |
+| Total steps | {{ "{:,}".format(total_steps) }} |
+| Batch size | {{ batch_size }} |
+| Total training sequences | {{ "{:,}".format(sequences_seen) }} (= total steps × batch size; the published checkpoint is the best 5K-cadence step by val loss, at step {{ "{:,}".format(published_step) }} ≈ {{ "{:,}".format(published_sequences) }} sequences) |
+| Max ply per example | {{ max_ply }} |
+| Learning rate | {{ lr }} (cosine decay with {{ "{:,}".format(warmup_steps) }}-step warmup) |
+| Optimizer | AdamW (weight decay {{ weight_decay }}) |
 | Precision | Mixed (AMP) |
-| Hardware | NVIDIA H200 |
 
 ## Usage
 
@@ -208,7 +220,7 @@ PAWN builds on ideas and tools from the following projects and publications:
 | FiLM | [Perez et al., "FiLM: Visual Reasoning with a General Conditioning Layer", AAAI 2018](https://arxiv.org/abs/1709.07871) |
 | RoSA | [Nikdan et al., "RoSA: Accurate Parameter-Efficient Fine-Tuning via Robust Adaptation", 2024](https://arxiv.org/abs/2401.04679) |
 | Linear probes | [Alain & Bengio, "Understanding Intermediate Layers Using Linear Classifier Probes", ICLR Workshop 2017](https://arxiv.org/abs/1610.01644) |
-| Intrinsic dimensionality | [Aghajanyan et al., "Intrinsic Dimensionality Explains the Effectiveness of Language Model Fine-Tuning", ACL 2021](https://arxiv.org/abs/2012.13255) |
+| Searchless Chess (action vocab) | [Ruoss et al., "Amortized Planning with Large-Scale Transformers: A Case Study on Chess", 2024](https://arxiv.org/abs/2402.04494) |
 | MAIA | [McIlroy-Young et al., "Aligning Superhuman AI with Human Behavior: Chess as a Model System", KDD 2020](https://arxiv.org/abs/2006.01855) |
 | AlphaZero | [Silver et al., "A General Reinforcement Learning Algorithm that Masters Chess, Shogi, and Go through Self-Play", Science 2018](https://arxiv.org/abs/1712.01815) |
 | Leela Chess Zero | [github.com/LeelaChessZero/lc0](https://github.com/LeelaChessZero/lc0) |

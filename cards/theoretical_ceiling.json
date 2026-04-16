@@ -1,0 +1,56 @@
+{
+  "unconditional_ceiling": 0.08430143824074501,
+  "ceiling_ci_low_95": 0.0841198213165711,
+  "ceiling_ci_high_95": 0.08447865797989412,
+  "mean_n_legal": 22.058715810906552,
+  "one_over_mean_n_legal": 0.04533355470791129,
+  "n_games": 50000,
+  "n_positions": 17598156,
+  "max_ply": 512,
+  "vocab_size": 1980,
+  "seed": 77777,
+  "elapsed_seconds": 13.306303024291992,
+  "by_ply_bucket": {
+    "0-9": {
+      "ceiling": 0.04471171432503539,
+      "mean_n_legal": 23.835853883433977,
+      "n_positions": 499957
+    },
+    "10-19": {
+      "ceiling": 0.03995574799432967,
+      "mean_n_legal": 29.601089701103117,
+      "n_positions": 499403
+    },
+    "20-39": {
+      "ceiling": 0.04060741382315705,
+      "mean_n_legal": 32.34159447494956,
+      "n_positions": 996190
+    },
+    "40-79": {
+      "ceiling": 0.04536623382722469,
+      "mean_n_legal": 32.62762487330297,
+      "n_positions": 1971238
+    },
+    "80-159": {
+      "ceiling": 0.06035711899543388,
+      "mean_n_legal": 27.364882550508472,
+      "n_positions": 3784563
+    },
+    "160-255": {
+      "ceiling": 0.09106402130793405,
+      "mean_n_legal": 19.287107858114986,
+      "n_positions": 4185953
+    },
+    "256-383": {
+      "ceiling": 0.11956837856814281,
+      "mean_n_legal": 14.812221800087643,
+      "n_positions": 4116644
+    },
+    "384-512": {
+      "ceiling": 0.13568514206115947,
+      "mean_n_legal": 12.745735678095178,
+      "n_positions": 1544208
+    }
+  },
+  "method": "E[1/N_legal] over positions sampled from uniformly random games"
+}
