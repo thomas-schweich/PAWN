@@ -152,30 +152,54 @@ def fetch_eval_results(repo: str, revision: str | None = None) -> dict:
         return json.load(f)
 
 
-def fetch_best_metrics(repo: str, revision: str | None = None) -> dict:
-    """Download metrics.jsonl and return the lowest-val/loss record.
+def fetch_published_step(repo: str, revision: str | None = None) -> int:
+    """Read the global_step that the published model.safetensors was saved at.
 
-    The trainer writes a complete val record on every eval, including the
-    extended fields (top5_accuracy, legal_move_rate, game_completion_rate,
-    etc.), so the lowest-loss val record already has everything we need —
-    no per-field backfill from earlier records.
+    The trainer keeps val every `eval_interval` steps but only saves
+    checkpoints every `checkpoint_interval` steps (typically 1K vs 5K).
+    The published `model.safetensors` at the root of the repo is the
+    best 5K-cadence checkpoint by val loss, *not* the lowest-loss val
+    record across every val step. The two diverge whenever val noise
+    around the eventual best happens to dip lower at an in-between
+    step, which is the common case. Reading `global_step` from the
+    co-published `training_state.json` is the only authoritative
+    source for which step the weights came from.
+    """
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download(repo, "training_state.json", revision=revision)
+    with open(path) as f:
+        ts = json.load(f)
+    step = ts.get("global_step")
+    if step is None:
+        raise ValueError(
+            f"training_state.json from {repo} has no global_step field; "
+            f"cannot determine which step the published model.safetensors "
+            f"was saved at."
+        )
+    return int(step)
+
+
+def fetch_metrics_at_step(repo: str, step: int, revision: str | None = None) -> dict:
+    """Download metrics.jsonl and return the val record at the given step.
+
+    Used to pull the val metrics for the exact checkpoint the published
+    `model.safetensors` was saved at — see `fetch_published_step` for
+    the why. The trainer writes a complete val record on every eval
+    (including the extended compound-legality fields), so a single
+    record is enough — no need to merge anything across records.
     """
     from huggingface_hub import hf_hub_download
     path = hf_hub_download(repo, "metrics.jsonl", revision=revision)
-    best_loss = float("inf")
-    best = None
     with open(path) as f:
         for line in f:
             r = json.loads(line)
-            if r.get("type") != "val":
-                continue
-            loss = r.get("val/loss", float("inf"))
-            if loss < best_loss:
-                best_loss = loss
-                best = r
-    if best is None:
-        raise ValueError(f"No val records found in metrics.jsonl from {repo}")
-    return best
+            if r.get("type") == "val" and r.get("step") == step:
+                return r
+    raise ValueError(
+        f"No val record at step {step} in metrics.jsonl from {repo}. "
+        f"This typically means the published checkpoint's step is not a "
+        f"multiple of the eval interval, which would be a trainer bug."
+    )
 
 
 def format_probe(eval_results: dict, probe_name: str) -> str:
@@ -237,25 +261,29 @@ def build_context(variant_key: str, variant: dict, revision: str | None = None) 
     ctx["prepend_outcome"] = tc.get("prepend_outcome", False)
     ctx["sequences_seen"] = ctx["total_steps"] * ctx["batch_size"]
 
-    # Fetch training metrics
-    best = fetch_best_metrics(repo, revision=revision)
-    ctx["best_step"] = best["step"]
-    ctx["top1"] = best["val/accuracy"] * 100
-    ctx["top5"] = best["val/top5_accuracy"] * 100
-    ctx["val_loss"] = best["val/loss"]
-    ctx["perplexity"] = best["val/perplexity"]
-    ctx["legal_rate"] = best["val/legal_move_rate"] * 100
-    ctx["late_legal_rate"] = best["val/late_legal_move_rate"] * 100
+    # Fetch training metrics for the EXACT step the published
+    # model.safetensors was saved at, not the lowest-val/loss val record
+    # in metrics.jsonl. See fetch_published_step for the why.
+    published_step = fetch_published_step(repo, revision=revision)
+    ctx["published_step"] = published_step
+    ctx["published_sequences"] = published_step * ctx["batch_size"]
+    val = fetch_metrics_at_step(repo, published_step, revision=revision)
+    ctx["top1"] = val["val/accuracy"] * 100
+    ctx["top5"] = val["val/top5_accuracy"] * 100
+    ctx["val_loss"] = val["val/loss"]
+    ctx["perplexity"] = val["val/perplexity"]
+    ctx["legal_rate"] = val["val/legal_move_rate"] * 100
+    ctx["late_legal_rate"] = val["val/late_legal_move_rate"] * 100
     # Compound legality: did the model predict every move along one side's
     # plies legally for an entire game? See docs/ARCHITECTURE.md for the
     # definition. These fields were added in the v1.0.0 training runs;
     # if they're missing the trainer used by this checkpoint pre-dates
     # them, which means the card needs to be regenerated against a
     # newer run before being uploaded.
-    ctx["completion_rate"] = best["val/game_completion_rate"] * 100
-    ctx["avg_pct_completion"] = best["val/avg_pct_completion"] * 100
-    ctx["avg_plies_completed"] = best["val/avg_plies_completed"]
-    ctx["median_forfeit_ply"] = best["val/median_forfeit_ply"]
+    ctx["completion_rate"] = val["val/game_completion_rate"] * 100
+    ctx["avg_pct_completion"] = val["val/avg_pct_completion"] * 100
+    ctx["avg_plies_completed"] = val["val/avg_plies_completed"]
+    ctx["median_forfeit_ply"] = val["val/median_forfeit_ply"]
 
     # Accuracy ratios
     ceil = load_ceilings()

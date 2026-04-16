@@ -42,19 +42,19 @@ model-index:
         metrics:
           - name: Game Completion Rate
             type: accuracy
-            value: 0.998047
+            value: 0.997559
           - name: Legal Move Rate
             type: accuracy
-            value: 0.999992
+            value: 0.999990
           - name: Top-1 Accuracy
             type: accuracy
-            value: 0.0865
+            value: 0.0863
           - name: Top-5 Accuracy
             type: accuracy
             value: 0.3556
           - name: Val Loss
             type: loss
-            value: 2.8650
+            value: 2.8652
           - name: Total Training Sequences
             type: other
             value: 51200000
@@ -80,14 +80,14 @@ A previous generation of PAWN backbones (`pawn-{small,base,large}-legacy`) used 
 
 ## Headline Metrics
 
-These come from the lowest-val/loss checkpoint of this run (step 196000 out of 200000), measured on a fresh validation set of random games.
+These come from the published `model.safetensors` (step 195,000 out of 200,000 — the best 5,000-step-cadence checkpoint by val loss), measured on a fresh validation set of random games.
 
 | Metric | Value |
 |--------|-------|
-| Game completion rate | 99.80% |
-| Per-move legal rate | 99.9992% |
+| Game completion rate | 99.76% |
+| Per-move legal rate | 99.9990% |
 | Late-game legal rate | 99.9996% |
-| Top-1 accuracy | 8.65% |
+| Top-1 accuracy | 8.63% |
 | Top-5 accuracy | 35.56% |
 | Val loss | 2.865 |
 | Val perplexity | 17.55 |
@@ -97,8 +97,8 @@ These come from the lowest-val/loss checkpoint of this run (step 196000 out of 2
 | Compound-legality detail | Value |
 |--------------------------|-------|
 | Average plies completed per game | 349 |
-| Average % of game completed | 99.90% |
-| Median forfeit ply (when forfeit) | 147 |
+| Average % of game completed | 99.88% |
+| Median forfeit ply (when forfeit) | 153 |
 
 ### Accuracy Ratios
 
@@ -106,7 +106,7 @@ PAWN is trained on uniformly random chess games, so top-1 accuracy has a hard th
 
 | Ceiling | Ratio |
 |---------|-------|
-| Unconditioned (E\[1/N_legal\] ≈ 6.43%) | 135% |
+| Unconditioned (E\[1/N_legal\] ≈ 6.43%) | 134% |
 
 
 
@@ -176,7 +176,7 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 | Outcome conditioning | Disabled (prepend_outcome=False) — pure moves, no outcome leakage |
 | Total steps | 200,000 |
 | Batch size | 256 |
-| Total training sequences | 51,200,000 (= total steps × batch size; the headline metrics come from the lowest-val/loss checkpoint at step 196,000, slightly earlier) |
+| Total training sequences | 51,200,000 (= total steps × batch size; the published checkpoint is the best 5K-cadence step by val loss, at step 195,000 ≈ 49,920,000 sequences) |
 | Max ply per example | 512 |
 | Learning rate | 0.0003 (cosine decay with 10,000-step warmup) |
 | Optimizer | AdamW (weight decay 0.01) |

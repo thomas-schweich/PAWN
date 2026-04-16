@@ -11,13 +11,13 @@ Feel free to use PAWN in your own experiments. PAWN is developed as a personal p
 
 ## Model Variants
 
-Three sizes, all trained from scratch on random chess games generated on-the-fly by a Rust engine. The published v1.0.0 weights were cotrained for 200K steps (≈51M sequences, ~25B tokens) at batch size 256 on a single H200 SXM:
+Three sizes, all trained from scratch on random chess games generated on-the-fly by a Rust engine. The published v1.0.0 weights were cotrained for 200K steps at batch size 256 on a single H200 SXM. The numbers below come from the best 5K-cadence checkpoint by val loss (step 195,000 ≈ 49.9M sequences) for all three variants:
 
 | Variant | d_model | Layers | Heads | Params | Top-1 | Legal rate | Game completion | Download |
 |---------|---------|--------|-------|--------|-------|------------|-----------------|----------|
-| **PAWN-Small** | 256 | 8 | 4 | 8.94M | 8.53% | 99.74% | 51.7% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-small) |
-| **PAWN (Base)** | 512 | 8 | 8 | 34.65M | 8.54% | 99.997% | 99.0% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
-| **PAWN-Large** | 640 | 10 | 8 | 66.91M | 8.65% | 99.999% | 99.8% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
+| **PAWN-Small** | 256 | 8 | 4 | 8.94M | 8.54% | 99.7451% | 52.34% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-small) |
+| **PAWN (Base)** | 512 | 8 | 8 | 34.65M | 8.57% | 99.9962% | 98.97% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
+| **PAWN-Large** | 640 | 10 | 8 | 66.91M | 8.63% | 99.9990% | 99.76% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
 
 *Top-1 and legal rate are measured on a 2,048-game validation set of fresh random games. **Game completion** is the share of validation games in which every prediction along one side's plies was legal. The measurement is non-autoregressive (the model sees the true ground-truth history at each ply, so an early mistake doesn't snowball into the rest of the game), so it is a lower bound on per-move competence rather than a faithful simulation of autoregressive play. It is still a much stricter metric than per-move legal rate, and the main signal that separates capacity between sizes — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate).*
 

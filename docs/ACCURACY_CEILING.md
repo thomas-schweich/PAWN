@@ -126,9 +126,12 @@ right comparison, but the constant has shifted slightly.
 
 | Variant | Params | Top-1 | Top-5 | Per-move legal | Game completion |
 |---------|--------|-------|-------|----------------|-----------------|
-| Small | 8.94M | 8.53% | 35.44% | 99.7457% | 51.66% |
-| Base | 34.65M | 8.54% | 35.49% | 99.9962% | 99.02% |
-| Large | 66.91M | 8.65% | 35.56% | 99.9996% | 99.80% |
+| Small | 8.94M | 8.54% | 35.45% | 99.7451% | 52.34% |
+| Base | 34.65M | 8.57% | 35.45% | 99.9962% | 98.97% |
+| Large | 66.91M | 8.63% | 35.56% | 99.9990% | 99.76% |
+
+(Numbers are from the best 5K-cadence checkpoint by val loss for each
+variant — step 195,000 of 200,000 for all three.)
 
 Top-1 numbers across all three sizes are tightly clustered (~8.5%, vs
 the legacy ~6.8%) and the loss curves were essentially indistinguishable

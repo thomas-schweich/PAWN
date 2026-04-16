@@ -80,7 +80,7 @@ A previous generation of PAWN backbones (`pawn-{small,base,large}-legacy`) used 
 
 ## Headline Metrics
 
-These come from the lowest-val/loss checkpoint of this run (step {{ best_step }} out of {{ total_steps }}), measured on a fresh validation set of random games.
+These come from the published `model.safetensors` (step {{ "{:,}".format(published_step) }} out of {{ "{:,}".format(total_steps) }} — the best 5,000-step-cadence checkpoint by val loss), measured on a fresh validation set of random games.
 
 | Metric | Value |
 |--------|-------|
@@ -163,7 +163,7 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 | Outcome conditioning | {{ "Enabled (prepend_outcome=True)" if prepend_outcome else "Disabled (prepend_outcome=False) — pure moves, no outcome leakage" }} |
 | Total steps | {{ "{:,}".format(total_steps) }} |
 | Batch size | {{ batch_size }} |
-| Total training sequences | {{ "{:,}".format(sequences_seen) }} (= total steps × batch size; the headline metrics come from the lowest-val/loss checkpoint at step {{ "{:,}".format(best_step) }}, slightly earlier) |
+| Total training sequences | {{ "{:,}".format(sequences_seen) }} (= total steps × batch size; the published checkpoint is the best 5K-cadence step by val loss, at step {{ "{:,}".format(published_step) }} ≈ {{ "{:,}".format(published_sequences) }} sequences) |
 | Max ply per example | {{ max_ply }} |
 | Learning rate | {{ lr }} (cosine decay with {{ "{:,}".format(warmup_steps) }}-step warmup) |
 | Optimizer | AdamW (weight decay {{ weight_decay }}) |

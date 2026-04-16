@@ -148,9 +148,11 @@ This metric compounds illegality the way real generation would, and turns out to
 
 | Variant | Top-1 legal rate | Game completion rate |
 |---------|------------------|----------------------|
-| Small (8.94M) | 99.7457% | 51.66% |
-| Base (34.65M) | 99.9962% | 99.02% |
-| Large (66.91M) | 99.9996% | 99.80% |
+| Small (8.94M) | 99.7451% | 52.34% |
+| Base (34.65M) | 99.9962% | 98.97% |
+| Large (66.91M) | 99.9990% | 99.76% |
+
+(Numbers are from the published `model.safetensors` for each variant — the best 5K-cadence checkpoint by val loss, at step 195,000 of 200,000 for all three.)
 
 The small model has a respectable per-move legal rate but forfeits roughly half its games on the way to terminal. The base and large models clear nearly every game. This gap is essentially invisible at the loss level — train/val curves for all three sizes look similar — and only shows up once you measure compound legality. It was the main signal that the legacy 100K-step models were nowhere near "done" training; doubling the step count to 200K made the difference.
 

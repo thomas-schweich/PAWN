@@ -68,9 +68,9 @@ vocabulary) brought them dramatically closer to "knows the rules":
 
 | Variant | Steps | Params | Game completion | Per-move legal rate |
 |---|---:|---:|---:|---:|
-| pawn-small  | 200K | 8.94M  | 51.66% | 99.7457% |
-| pawn-base   | 200K | 34.65M | 99.02% | 99.9962% |
-| pawn-large  | 200K | 66.91M | 99.80% | 99.9996% |
+| pawn-small  | 200K (best ckpt @ 195K) | 8.94M  | 52.34% | 99.7451% |
+| pawn-base   | 200K (best ckpt @ 195K) | 34.65M | 98.97% | 99.9962% |
+| pawn-large  | 200K (best ckpt @ 195K) | 66.91M | 99.76% | 99.9990% |
 
 Note also that the v1.0.0 numbers above were measured against games of
 **up to 512 ply** — a significantly harder evaluation than the legacy

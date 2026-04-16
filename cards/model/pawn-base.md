@@ -42,19 +42,19 @@ model-index:
         metrics:
           - name: Game Completion Rate
             type: accuracy
-            value: 0.990234
+            value: 0.989746
           - name: Legal Move Rate
             type: accuracy
-            value: 0.999965
+            value: 0.999962
           - name: Top-1 Accuracy
             type: accuracy
-            value: 0.0854
+            value: 0.0857
           - name: Top-5 Accuracy
             type: accuracy
-            value: 0.3549
+            value: 0.3545
           - name: Val Loss
             type: loss
-            value: 2.8674
+            value: 2.8679
           - name: Total Training Sequences
             type: other
             value: 51200000
@@ -80,25 +80,25 @@ A previous generation of PAWN backbones (`pawn-{small,base,large}-legacy`) used 
 
 ## Headline Metrics
 
-These come from the lowest-val/loss checkpoint of this run (step 193000 out of 200000), measured on a fresh validation set of random games.
+These come from the published `model.safetensors` (step 195,000 out of 200,000 — the best 5,000-step-cadence checkpoint by val loss), measured on a fresh validation set of random games.
 
 | Metric | Value |
 |--------|-------|
-| Game completion rate | 99.02% |
-| Per-move legal rate | 99.9965% |
+| Game completion rate | 98.97% |
+| Per-move legal rate | 99.9962% |
 | Late-game legal rate | 100.0000% |
-| Top-1 accuracy | 8.54% |
-| Top-5 accuracy | 35.49% |
-| Val loss | 2.867 |
-| Val perplexity | 17.59 |
+| Top-1 accuracy | 8.57% |
+| Top-5 accuracy | 35.45% |
+| Val loss | 2.868 |
+| Val perplexity | 17.60 |
 
 **Game completion rate** is the share of validation games in which *every* prediction along one side's plies was a legal move. The measurement is **non-autoregressive**: at each ply the model is shown the true ground-truth history (an early illegal prediction does not corrupt subsequent ones), so this is a lower bound on per-move competence rather than a faithful simulation of autoregressive play. The true autoregressive forfeit rate would be higher, especially for the small variant. Even so, game completion rate is a much stricter metric than per-move legal rate, and is the main signal that separates capacity between sizes; see the [game completion section of the architecture doc](https://github.com/thomas-schweich/PAWN/blob/main/docs/ARCHITECTURE.md#game-completion-rate) for the full discussion.
 
 | Compound-legality detail | Value |
 |--------------------------|-------|
 | Average plies completed per game | 347 |
-| Average % of game completed | 99.40% |
-| Median forfeit ply (when forfeit) | 107 |
+| Average % of game completed | 99.27% |
+| Median forfeit ply (when forfeit) | 101 |
 
 ### Accuracy Ratios
 
@@ -176,7 +176,7 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 | Outcome conditioning | Disabled (prepend_outcome=False) — pure moves, no outcome leakage |
 | Total steps | 200,000 |
 | Batch size | 256 |
-| Total training sequences | 51,200,000 (= total steps × batch size; the headline metrics come from the lowest-val/loss checkpoint at step 193,000, slightly earlier) |
+| Total training sequences | 51,200,000 (= total steps × batch size; the published checkpoint is the best 5K-cadence step by val loss, at step 195,000 ≈ 49,920,000 sequences) |
 | Max ply per example | 512 |
 | Learning rate | 0.0003 (cosine decay with 10,000-step warmup) |
 | Optimizer | AdamW (weight decay 0.01) |
