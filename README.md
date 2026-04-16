@@ -19,7 +19,7 @@ Three sizes, all trained from scratch on random chess games generated on-the-fly
 | **PAWN (Base)** | 512 | 8 | 8 | 34.65M | 8.57% | 99.9962% | 98.97% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
 | **PAWN-Large** | 640 | 10 | 8 | 66.91M | 8.63% | 99.9990% | 99.76% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
 
-*Metrics measured on a 2,048-game validation set of fresh random games. **Game completion** is non-autoregressive: each ply sees the true history, so predictions are independent. It is the main signal that separates capacity between sizes — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate).*
+*Metrics measured on a 2,048-game validation set of fresh random games. **Game completion** is non-autoregressive: each ply sees the true history, so predictions are independent and autoregressive completion has not yet been measured. It is the main signal that separates capacity between sizes — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate).*
 
 All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), factored move embeddings, and a vocabulary covering:
 
