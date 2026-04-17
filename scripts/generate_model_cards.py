@@ -212,8 +212,15 @@ def format_probe(eval_results: dict, probe_name: str) -> str:
     the R² value, which is misleading to display as a percentage.
     """
     probe = eval_results["probes"][probe_name]
+    # Narrow to known per-layer entries so a future sibling metadata key
+    # (e.g. ``config`` / ``n_samples``) at the same level wouldn't crash
+    # the ``accuracy`` lookup with an opaque KeyError.
+    layer_keys = [
+        k for k, v in probe.items()
+        if isinstance(v, dict) and "accuracy" in v
+    ]
     layer_key = max(
-        probe.keys(),
+        layer_keys,
         key=lambda k: probe[k].get("best_accuracy", probe[k]["accuracy"]),
     )
     data = probe[layer_key]
@@ -323,8 +330,8 @@ def build_context(variant_key: str, variant: dict, revision: str | None = None) 
     ctx["diagnostics"] = []
     for k, name in DIAGNOSTIC_NAMES.items():
         if k in eval_results.get("diagnostics", {}):
-            n, val = format_diagnostic(eval_results, k)
-            ctx["diagnostics"].append({"name": name, "n": n, "value": val})
+            n_pos, formatted = format_diagnostic(eval_results, k)
+            ctx["diagnostics"].append({"name": name, "n": n_pos, "value": formatted})
 
     return ctx
 
