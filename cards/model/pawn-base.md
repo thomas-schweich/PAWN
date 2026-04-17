@@ -113,15 +113,15 @@ Linear probes trained on frozen hidden states measure how well the model's inter
 
 | Probe | Metric | Description |
 |-------|--------|-------------|
-| Piece type | 91.9% | Per-square piece type (13 classes x 64 squares) |
+| Piece type | 91.8% | Per-square piece type (13 classes x 64 squares) |
 | Side to move | 100.0% | Whose turn it is |
 | Is check | 95.0% | Whether the side to move is in check |
 | Castling rights | 99.3% | KQkq castling availability |
 | En passant square | 99.9% | En passant target square (64 + none) |
-| Material count | R² 0.84 (MAE 4.0) | Piece counts per type per color |
-| Legal move count | R² 0.68 (MAE 5.1) | Number of legal moves available |
-| Halfmove clock | R² 0.49 (MAE 10.7) | Plies since last capture or pawn move |
-| Game phase | 96.0% | Opening / middlegame / endgame |
+| Material count | R² 0.84 (MAE 4.1) | Piece counts per type per color |
+| Legal move count | R² 0.68 (MAE 5.2) | Number of legal moves available |
+| Halfmove clock | R² 0.47 (MAE 10.4) | Plies since last capture or pawn move |
+| Game phase | 95.8% | Opening / middlegame / endgame |
 
 
 
@@ -132,16 +132,16 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 
 | Category | Positions | Legal Rate |
 |----------|-----------|------------|
-| In check | 1000 | 97.7% |
-| Double check | 71 | 91.2% |
-| Pin restricts movement | 1000 | 97.2% |
-| En passant available | 940 | 99.2% |
-| Castling legal (kingside) | 1000 | 99.7% |
-| Castling legal (queenside) | 1000 | 99.6% |
-| Castling blocked by check | 892 | 99.4% |
-| Promotion available | 1000 | 99.4% |
-| Checkmate (terminal) | 276 | 91.2% |
-| Stalemate (terminal) | 41 | 84.2% |
+| In check | 10000 | 99.1% |
+| Double check | 10000 | 96.8% |
+| Pin restricts movement | 10000 | 98.9% |
+| En passant available | 10000 | 99.6% |
+| Castling legal (kingside) | 10000 | 99.8% |
+| Castling legal (queenside) | 10000 | 99.7% |
+| Castling blocked by check | 10000 | 99.6% |
+| Promotion available | 10000 | 99.7% |
+| Checkmate (terminal) | 10000 | 91.5% |
+| Stalemate (terminal) | 10000 | 96.7% |
 
 
 

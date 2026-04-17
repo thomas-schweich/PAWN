@@ -203,15 +203,31 @@ def fetch_metrics_at_step(repo: str, step: int, revision: str | None = None) -> 
 
 
 def format_probe(eval_results: dict, probe_name: str) -> str:
-    """Format a probe result."""
+    """Format a probe result.
+
+    Picks the best layer by ``best_accuracy`` and formats classification
+    probes as a percentage and regression probes as ``R² X.XX (MAE Y.Y)``.
+    Regression probes are identified by the presence of an ``mae`` field —
+    the ``accuracy`` / ``best_accuracy`` fields on regression probes hold
+    the R² value, which is misleading to display as a percentage.
+    """
     probe = eval_results["probes"][probe_name]
-    # Use the highest layer
-    layer_key = sorted(probe.keys(), reverse=True)[0]
+    # Narrow to known per-layer entries so a future sibling metadata key
+    # (e.g. ``config`` / ``n_samples``) at the same level wouldn't crash
+    # the ``accuracy`` lookup with an opaque KeyError.
+    layer_keys = [
+        k for k, v in probe.items()
+        if isinstance(v, dict) and "accuracy" in v
+    ]
+    layer_key = max(
+        layer_keys,
+        key=lambda k: probe[k].get("best_accuracy", probe[k]["accuracy"]),
+    )
     data = probe[layer_key]
     acc = data.get("best_accuracy", data["accuracy"])
     mae = data.get("mae")
     if mae is not None:
-        return f"{acc:.1%} (MAE {mae:.1f})"
+        return f"R² {acc:.2f} (MAE {mae:.1f})"
     return f"{acc:.1%}"
 
 
@@ -314,8 +330,8 @@ def build_context(variant_key: str, variant: dict, revision: str | None = None) 
     ctx["diagnostics"] = []
     for k, name in DIAGNOSTIC_NAMES.items():
         if k in eval_results.get("diagnostics", {}):
-            n, val = format_diagnostic(eval_results, k)
-            ctx["diagnostics"].append({"name": name, "n": n, "value": val})
+            n_pos, formatted = format_diagnostic(eval_results, k)
+            ctx["diagnostics"].append({"name": name, "n": n_pos, "value": formatted})
 
     return ctx
 
