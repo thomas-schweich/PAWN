@@ -111,8 +111,8 @@ This model's top-1 accuracy of **{{ "%.2f"|format(top1) }}%** is **{{ "%.0f"|for
 
 Linear probes trained on frozen hidden states measure how well the model's internal representations encode board-level features. The model is never explicitly told about pieces, sides, or rules — these representations emerge purely from next-token prediction on random games.
 
-| Probe | Accuracy | Description |
-|-------|----------|-------------|
+| Probe | Metric | Description |
+|-------|--------|-------------|
 {% for probe in probes -%}
 | {{ probe.name }} | {{ probe.result }} | {{ probe.description }} |
 {% endfor %}

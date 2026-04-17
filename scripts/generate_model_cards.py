@@ -203,15 +203,24 @@ def fetch_metrics_at_step(repo: str, step: int, revision: str | None = None) -> 
 
 
 def format_probe(eval_results: dict, probe_name: str) -> str:
-    """Format a probe result."""
+    """Format a probe result.
+
+    Picks the best layer by ``best_accuracy`` and formats classification
+    probes as a percentage and regression probes as ``R² X.XX (MAE Y.Y)``.
+    Regression probes are identified by the presence of an ``mae`` field —
+    the ``accuracy`` / ``best_accuracy`` fields on regression probes hold
+    the R² value, which is misleading to display as a percentage.
+    """
     probe = eval_results["probes"][probe_name]
-    # Use the highest layer
-    layer_key = sorted(probe.keys(), reverse=True)[0]
+    layer_key = max(
+        probe.keys(),
+        key=lambda k: probe[k].get("best_accuracy", probe[k]["accuracy"]),
+    )
     data = probe[layer_key]
     acc = data.get("best_accuracy", data["accuracy"])
     mae = data.get("mae")
     if mae is not None:
-        return f"{acc:.1%} (MAE {mae:.1f})"
+        return f"R² {acc:.2f} (MAE {mae:.1f})"
     return f"{acc:.1%}"
 
 

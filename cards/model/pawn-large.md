@@ -113,15 +113,15 @@ Linear probes trained on frozen hidden states measure how well the model's inter
 
 | Probe | Metric | Description |
 |-------|--------|-------------|
-| Piece type | 92.3% | Per-square piece type (13 classes x 64 squares) |
+| Piece type | 92.2% | Per-square piece type (13 classes x 64 squares) |
 | Side to move | 100.0% | Whose turn it is |
-| Is check | 95.0% | Whether the side to move is in check |
+| Is check | 94.9% | Whether the side to move is in check |
 | Castling rights | 99.3% | KQkq castling availability |
 | En passant square | 99.9% | En passant target square (64 + none) |
-| Material count | R² 0.83 (MAE 4.1) | Piece counts per type per color |
-| Legal move count | R² 0.70 (MAE 4.9) | Number of legal moves available |
-| Halfmove clock | R² 0.48 (MAE 10.6) | Plies since last capture or pawn move |
-| Game phase | 95.8% | Opening / middlegame / endgame |
+| Material count | R² 0.83 (MAE 4.2) | Piece counts per type per color |
+| Legal move count | R² 0.70 (MAE 5.0) | Number of legal moves available |
+| Halfmove clock | R² 0.46 (MAE 10.8) | Plies since last capture or pawn move |
+| Game phase | 95.9% | Opening / middlegame / endgame |
 
 
 
@@ -132,16 +132,16 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 
 | Category | Positions | Legal Rate |
 |----------|-----------|------------|
-| In check | 1000 | 98.4% |
-| Double check | 71 | 95.0% |
-| Pin restricts movement | 1000 | 97.9% |
-| En passant available | 940 | 99.4% |
-| Castling legal (kingside) | 1000 | 99.8% |
-| Castling legal (queenside) | 1000 | 99.7% |
-| Castling blocked by check | 892 | 99.5% |
-| Promotion available | 1000 | 99.6% |
-| Checkmate (terminal) | 276 | 92.2% |
-| Stalemate (terminal) | 41 | 94.9% |
+| In check | 10000 | 99.6% |
+| Double check | 10000 | 98.1% |
+| Pin restricts movement | 10000 | 99.5% |
+| En passant available | 10000 | 99.8% |
+| Castling legal (kingside) | 10000 | 99.9% |
+| Castling legal (queenside) | 10000 | 99.8% |
+| Castling blocked by check | 10000 | 99.8% |
+| Promotion available | 10000 | 99.8% |
+| Checkmate (terminal) | 10000 | 96.4% |
+| Stalemate (terminal) | 10000 | 99.1% |
 
 
 
