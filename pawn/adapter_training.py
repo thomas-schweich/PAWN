@@ -472,7 +472,9 @@ def rosa_warmup(
     optimizer = torch.optim.AdamW(
         lora_params, lr=lr, weight_decay=args.weight_decay
     )
-    scaler = torch.amp.GradScaler() if amp_dtype is not None else None
+    # GradScaler is only needed for fp16 (underflow risk). bf16 has
+    # fp32-range exponents and the scaler just adds per-step overhead.
+    scaler = torch.amp.GradScaler() if amp_dtype == torch.float16 else None
 
     model.train()
     step = 0
@@ -574,7 +576,8 @@ def rosa_mask_generation(
     total_elements = sum(m.numel() for m in masks.values())
     print(
         f"  Total: {total_active:,.0f} / {total_elements:,} "
-        f"({100 * total_active / total_elements:.2f}%)"
+        f"({100 * total_active / total_elements:.2f}%)",
+        flush=True,
     )
     return masks
 
@@ -808,7 +811,9 @@ def train(
 
     warmup_steps = args.warmup_steps if args.warmup_steps is not None else int(args.warmup_frac * total_steps)
     scheduler = cosine_warmup_schedule(optimizer, warmup_steps, total_steps)
-    scaler = torch.amp.GradScaler() if amp_dtype is not None else None
+    # GradScaler is only needed for fp16 (underflow risk). bf16 has
+    # fp32-range exponents and the scaler just adds per-step overhead.
+    scaler = torch.amp.GradScaler() if amp_dtype == torch.float16 else None
 
     # Resume
     start_epoch = 0
@@ -948,11 +953,16 @@ def train(
         if hasattr(train_loader.dataset, "set_epoch"):
             train_loader.dataset.set_epoch(epoch)  # type: ignore[union-attr]
         model.train()
-        epoch_loss = 0.0
-        epoch_top1 = 0.0
+        # Accumulate loss/top1 as GPU tensors so the training loop never
+        # issues a ``.item()`` per step. Each ``.item()`` is a blocking
+        # host-device sync that prevents the GPU from running batch N+1
+        # while the CPU reads the scalar for batch N — on ROCm this shows
+        # up as ~30% GPU utilization even when the data pipeline is idle.
+        epoch_loss_t = torch.zeros((), device=device)
+        epoch_top1_t = torch.zeros((), device=device)
         epoch_positions = 0
-        log_loss = 0.0
-        log_top1 = 0.0
+        log_loss_t = torch.zeros((), device=device)
+        log_top1_t = torch.zeros((), device=device)
         log_positions = 0
         t0 = time.time()
 
@@ -987,28 +997,33 @@ def train(
                 optimizer.step()
             scheduler.step()
 
+            # Stay on GPU: no ``.item()`` inside the hot loop.
             with torch.no_grad():
                 preds = valid_logits.argmax(dim=-1)
-                top1 = (preds == valid_targets).float().mean().item()
+                top1_sum = (preds == valid_targets).sum()
 
             n_pos = valid_targets.shape[0]
-            epoch_loss += loss.item() * n_pos
-            epoch_top1 += top1 * n_pos
+            loss_sum = loss.detach() * n_pos
+            epoch_loss_t += loss_sum
+            epoch_top1_t += top1_sum
             epoch_positions += n_pos
-            log_loss += loss.item() * n_pos
-            log_top1 += top1 * n_pos
+            log_loss_t += loss_sum
+            log_top1_t += top1_sum
             log_positions += n_pos
             global_step += 1
 
             if global_step % args.log_interval == 0 and log_positions > 0:
-                avg_loss = log_loss / log_positions
-                avg_top1 = log_top1 / log_positions
+                avg_loss = (log_loss_t / log_positions).item()
+                avg_top1 = (log_top1_t / log_positions).item()
+                log_loss_t.zero_()
+                log_top1_t.zero_()
                 lr = optimizer.param_groups[0]["lr"]
                 print(
                     f"  step {global_step:6d} | loss={avg_loss:.4f} "
-                    f"top1={avg_top1:.4%} lr={lr:.2e}"
+                    f"top1={avg_top1:.4%} lr={lr:.2e}",
+                    flush=True,
                 )
-                log_loss = log_top1 = log_positions = 0
+                log_positions = 0
 
             if eval_interval and global_step % eval_interval == 0:
                 val_metrics = _do_eval()
@@ -1048,8 +1063,10 @@ def train(
                 break
 
         dt = time.time() - t0
-        train_loss = epoch_loss / max(epoch_positions, 1)
-        train_top1 = epoch_top1 / max(epoch_positions, 1)
+        # One sync at end of epoch to pull the accumulated totals.
+        denom = max(epoch_positions, 1)
+        train_loss = (epoch_loss_t / denom).item()
+        train_top1 = (epoch_top1_t / denom).item()
 
         do_val = not eval_interval and (
             (epoch % args.val_every == 0) or (epoch == args.epochs - 1)
