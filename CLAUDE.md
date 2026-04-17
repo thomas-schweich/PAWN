@@ -150,7 +150,7 @@ Common adapter args: `--epochs 50`, `--batch-size 64`, `--lr 3e-4`, `--patience 
 
 ### Common CLI Patterns
 
-- `--sdpa-math` — force MATH SDPA backend (required for ROCm + torch.compile)
+- `--sdpa-math` — force MATH SDPA backend (debugging escape hatch; not required anymore on ROCm)
 - `--no-compile` — disable torch.compile
 - `--no-amp` — disable mixed precision
 - `--num-workers N` — DataLoader workers (default: 8 for adapters, 4 for pretraining)
@@ -372,8 +372,8 @@ Supports all adapter types + architecture search. GPU affinity assigns `CUDA_VIS
 
 - **DataLoader workers must use `multiprocessing_context='spawn'`** — the Rust engine uses rayon, and fork after rayon init causes deadlocks.
 - **`SDPA_BACKEND` must be set before `torch.compile()`** — compiled code captures the backend at trace time. `apply_gpu_config()` handles this.
-- **ROCm works**: The only known ROCm issue is a stride mismatch in flash attention backward when combined with `torch.compile` + AMP. The workaround is `--sdpa-math` (use the MATH SDPA backend instead of flash), which `configure_gpu()` applies automatically on AMD GPUs. Everything else — training, eval, adapters, data loading — works identically on ROCm and CUDA. **Do not assume bugs are ROCm-specific.** Every other time something has failed on AMD it turned out to be a bug in our code (wrong torch version installed, stale lockfile, missing dependency, etc.), not a ROCm issue.
+- **ROCm works**: Previously the flash-attention backward on ROCm hit a stride mismatch when combined with `torch.compile` + AMP. We worked around it by forcing RoPE outputs to be contiguous before SDPA in `pawn.model.Attention.forward` — flash is now the default on AMD too. `--sdpa-math` remains available as a debugging escape hatch but is no longer required. Everything else — training, eval, adapters, data loading — works identically on ROCm and CUDA. **Do not assume bugs are ROCm-specific.** Every other time something has failed on AMD it turned out to be a bug in our code (wrong torch version installed, stale lockfile, missing dependency, etc.), not a ROCm issue.
 - **Sparse logit projection**: `forward_hidden()` returns `(B,T,d_model)`, then only loss-masked positions project through `lm_head` — avoids full `(B,T,1980)` materialization.
 - **Legal mask via Rust**: `LegalMaskBuilder` replays games in Rust, returns sparse indices (~2 MB) scattered into a pre-allocated GPU buffer (vs ~70 MB dense).
-- **GPU auto-detection**: `pawn.gpu.configure_gpu()` selects compile/AMP/SDPA settings. `apply_gpu_config()` applies them. NVIDIA uses flash attention + compile; AMD uses MATH SDPA + compile. Both paths are tested and production-validated.
+- **GPU auto-detection**: `pawn.gpu.configure_gpu()` selects compile/AMP/SDPA settings. `apply_gpu_config()` applies them. Both NVIDIA and AMD use flash attention + compile by default (flash on AMD relies on the RoPE contiguous fix in `Attention.forward`). Both paths are tested and production-validated.
 - **Factored embeddings**: each move token decomposes into `src_embed[s] + dst_embed[d] + promo_embed[p]`, reducing embedding parameters by ~32x.

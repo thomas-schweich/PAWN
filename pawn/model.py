@@ -110,10 +110,10 @@ class Attention(nn.Module):
 
         q = self.wq(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.wk(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.wv(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.wv(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
 
-        q = _apply_rope(q, rope_cos, rope_sin)
-        k = _apply_rope(k, rope_cos, rope_sin)
+        q = _apply_rope(q, rope_cos, rope_sin).contiguous()
+        k = _apply_rope(k, rope_cos, rope_sin).contiguous()
 
         if SDPA_BACKEND is not None:
             with sdpa_kernel(SDPA_BACKEND):

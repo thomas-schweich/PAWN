@@ -2,8 +2,10 @@
 
 Auto-detects NVIDIA vs AMD GPUs and configures torch.compile and SDPA
 backend for best performance. ROCm's flash attention backward has stride
-mismatches with torch.compile, so we fall back to the MATH SDPA backend
-on AMD GPUs (still ~30% faster than no compile at all).
+mismatches with torch.compile — worked around by forcing RoPE outputs to
+be contiguous in ``Attention.forward`` so the layout into SDPA matches
+what flash attention's backward expects. Flash is now the default on AMD.
+``sdpa_math=True`` remains available as an escape hatch.
 
 Raises RuntimeError if no GPU is detected at runtime, unless the
 environment variable PAWN_ALLOW_CPU=1 is set.
@@ -38,7 +40,10 @@ def configure_gpu(
     set, the function picks the fastest settings for the detected GPU:
 
         NVIDIA: compile + AMP + flash attention (default SDPA)
-        AMD:    compile + AMP + MATH SDPA (avoids flash attn backward bug)
+        AMD:    compile + AMP + flash attention (default SDPA; the RoPE
+                contiguous fix in ``pawn.model.Attention.forward`` avoids
+                the flash-backward stride mismatch that used to require
+                falling back to MATH)
         CPU:    no compile, no AMP (requires PAWN_ALLOW_CPU=1)
     """
     import torch
@@ -51,13 +56,9 @@ def configure_gpu(
     use_compile = is_cuda and not no_compile
     use_amp = is_cuda and not no_amp
 
-    # SDPA backend: use MATH on ROCm (flash attn backward is broken with compile)
-    if sdpa_math:
-        sdpa_backend = SDPBackend.MATH
-    elif rocm and use_compile:
-        sdpa_backend = SDPBackend.MATH
-    else:
-        sdpa_backend = None
+    # SDPA backend: default is None (PyTorch auto-select → flash on modern
+    # CUDA/ROCm). ``sdpa_math`` remains an escape hatch for debugging.
+    sdpa_backend = SDPBackend.MATH if sdpa_math else None
 
     # Log what we're doing
     if is_cuda:
