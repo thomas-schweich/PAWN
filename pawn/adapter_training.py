@@ -959,10 +959,13 @@ def train(
         # while the CPU reads the scalar for batch N — on ROCm this shows
         # up as ~30% GPU utilization even when the data pipeline is idle.
         epoch_loss_t = torch.zeros((), device=device)
-        epoch_top1_t = torch.zeros((), device=device)
+        # top-1 accumulators hold a count of correct predictions, so
+        # they're int64 to match ``(preds == targets).sum()``. Keeping
+        # the dtype explicit avoids a silent float32 cast on ``+=``.
+        epoch_top1_t = torch.zeros((), device=device, dtype=torch.int64)
         epoch_positions = 0
         log_loss_t = torch.zeros((), device=device)
-        log_top1_t = torch.zeros((), device=device)
+        log_top1_t = torch.zeros((), device=device, dtype=torch.int64)
         log_positions = 0
         t0 = time.time()
 

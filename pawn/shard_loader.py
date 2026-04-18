@@ -83,8 +83,14 @@ def prefetch_shards(
                         fetched += pl.scan_parquet(out_path).select(
                             pl.len()
                         ).collect().item()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # A corrupt/unreadable cached shard counts as 0
+                        # rows, which causes us to over-download to hit
+                        # the budget. Warn so the discrepancy is visible.
+                        print(
+                            f"  Warning: couldn't count {out_path}: {e}",
+                            flush=True,
+                        )
             if fetched:
                 print(f"  Already cached: {fetched:,} games", flush=True)
 

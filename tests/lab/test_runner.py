@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -729,7 +729,7 @@ class TestMonitorExitCode:
         with patch("pawn.lab.runner.is_alive", side_effect=[(False, 0)]), \
              patch("pawn.lab.runner.read_metrics"), \
              patch("pawn.lab.runner.check_health", return_value=None), \
-             patch("asyncio.sleep", new=MagicMock(return_value=asyncio.sleep(0))):
+             patch("asyncio.sleep", new_callable=AsyncMock):
             asyncio.run(runner._monitor(t.trial_id))
         assert runner.trials[t.trial_id].status == "completed"
 
@@ -740,7 +740,7 @@ class TestMonitorExitCode:
         with patch("pawn.lab.runner.is_alive", side_effect=[(False, 1)]), \
              patch("pawn.lab.runner.read_metrics"), \
              patch("pawn.lab.runner.check_health", return_value=None), \
-             patch("asyncio.sleep", new=MagicMock(return_value=asyncio.sleep(0))):
+             patch("asyncio.sleep", new_callable=AsyncMock):
             asyncio.run(runner._monitor(t.trial_id))
         assert runner.trials[t.trial_id].status == "failed"
         failed_events = [
@@ -760,6 +760,6 @@ class TestMonitorExitCode:
         with patch("pawn.lab.runner.is_alive", side_effect=[(False, None)]), \
              patch("pawn.lab.runner.read_metrics"), \
              patch("pawn.lab.runner.check_health", return_value=None), \
-             patch("asyncio.sleep", new=MagicMock(return_value=asyncio.sleep(0))):
+             patch("asyncio.sleep", new_callable=AsyncMock):
             asyncio.run(runner._monitor(t.trial_id))
         assert runner.trials[t.trial_id].status == "failed"
