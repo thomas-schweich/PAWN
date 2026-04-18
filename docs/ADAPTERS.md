@@ -190,7 +190,7 @@ Pareto-optimal points are in bold.
 
 ### Backbone leverage (legacy reference)
 
-For historical context, the legacy v0.x sweep measured a standalone tiny transformer at the same ~524K parameter count at 30.9% top-1 vs. a 524K bottleneck on the frozen legacy backbone at 42.2%. The v1.0.0 bottleneck dim=32 (524K) lands at 39.82% on 2M games, still providing ~9pp of "free" accuracy over a from-scratch model at the same parameter count. A current-backbone version of the standalone baseline is on the to-do list.
+For historical context, the legacy v0.x sweep measured a standalone tiny transformer (no backbone, trained from scratch) at 524K params and 30.9% top-1 vs. a 524K bottleneck on the frozen legacy backbone at 42.2%. The v1.0.0 bottleneck dim=32 (524K trainable) lands at 39.82% on 2M games; we haven't yet re-run the from-scratch baseline on the v1.0.0 data pipeline (1,980-vocab, 512-ctx, no outcome prefix) to directly quantify the frozen-backbone lift under current conditions, so the ~9pp implied by subtracting the two eras is indicative rather than a like-for-like measurement. A matched from-scratch 524K standalone on the current data is on the to-do list.
 
 ---
 
