@@ -463,10 +463,20 @@ class TrialRunner:
                     self._release_gpu(trial.gpu_id)
                 read_metrics(trial, self.log_dir, self._metrics_offsets)
                 self._save_state()
-            elif exit_code == 0 or trial.best_val_loss is not None:
+            elif exit_code == 0:
                 self._complete(trial_id)
             else:
-                reason = f"exit code {exit_code}" if exit_code is not None else "process exited"
+                # Any non-zero exit = failure. Previously we fell back to
+                # ``trial.best_val_loss is not None`` as a safety net, but
+                # that misclassified crashed trials as "completed" once the
+                # baseline eval populated ``best_val_loss`` before the real
+                # failure point — e.g. OOMs at step 0 or Python tracebacks
+                # after model load.
+                reason = (
+                    f"exit code {exit_code}"
+                    if exit_code is not None
+                    else "process exited (exit code unavailable)"
+                )
                 self._fail(trial_id, reason)
 
         except asyncio.CancelledError:

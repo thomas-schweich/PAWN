@@ -492,7 +492,12 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
             state_dict_fn,
             weight_report_fn,
         ) = rosa_build_phase3(model, masks, args, device)
-        print(f"Trainable params: {param_count:,}")
+        print(f"Trainable params: {param_count:,}", flush=True)
+        # RoSA logs its config once with param_count=0 before Phase 3,
+        # because the Phase 3 adapter model hasn't been built yet. Re-log
+        # now so the lab monitor (which reads ``param_count`` from
+        # metrics.jsonl) picks up the real trainable-param count.
+        logger.log_config(run_type=args.strategy, param_count=param_count)
     else:
         logger.log_config(
             run_type=args.strategy,
