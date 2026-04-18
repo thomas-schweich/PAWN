@@ -115,18 +115,18 @@ All three variants sit at ~101–102% of the [theoretical top-1 ceiling](docs/AC
 
 <sub>More info: [docs/ADAPTERS.md](docs/ADAPTERS.md)</sub>
 
-PAWN ships with six adapter implementations for fine-tuning the frozen backbone on human game data. *(The numbers below are from the legacy backbone — see [docs/ADAPTERS.md](docs/ADAPTERS.md) for full context.)*
+PAWN ships with six adapter implementations for fine-tuning the frozen backbone on human game data. Numbers below are from the v1.0.0 `pawn-base` backbone trained on 2M Lichess games at 1800-1900 Elo, one pass.
 
-| Method | Params (typical) | Accuracy (1800 Elo) | Description |
-|--------|-----------------|---------------------|-------------|
-| **[Bottleneck](https://arxiv.org/abs/1902.00751)** | 131K | 41.7% | Houlsby-style residual MLP adapters |
-| **[RoSA](https://arxiv.org/abs/2401.04679)** | configurable | -- | Gradient-informed sparse + LoRA |
-| **Sparse** | 503K-2.7M | 40.2-44.7% | Random binary mask on frozen weights |
-| **[LoRA](https://arxiv.org/abs/2106.09685)** | ~65K | 34.1% | Low-rank attention projection adapters |
-| **Hybrid** | ~65K | 34.1% | LoRA + FiLM combined |
-| **[FiLM](https://arxiv.org/abs/1709.07871)** | ~17K | 30.3% | Per-channel affine modulation* |
+| Method | Params | Val top-1 (1800-1900 Elo) | Description |
+|--------|-------:|--------------------------:|-------------|
+| **[Bottleneck](https://arxiv.org/abs/1902.00751)** dim=512 | 8.4M | **46.14%** | Houlsby-style residual MLP adapters |
+| **Bottleneck** dim=64 | 1.05M | 41.56% | |
+| **Bottleneck** dim=32 | 524K | 39.82% | |
+| **[LoRA](https://arxiv.org/abs/2106.09685)** rank=16 qkvo | 524K | 35.62% | Low-rank attention projection adapters |
+| **[RoSA](https://arxiv.org/abs/2401.04679)** retro-sparse d=0.01 | 84K | 30.45% | Gradient-informed sparse mask from LoRA warmup |
+| **Sparse** density=0.015 qkvo | 126K | 29.18% | Random binary mask on frozen weights |
 
-A 524K bottleneck adapter achieves 42.2% accuracy predicting moves by 1800-rated Lichess players, vs. 30.9% for a standalone model with the same architecture and parameter count -- an ~11 percentage point "free" accuracy lift from the frozen backbone.
+Hybrid (LoRA+FiLM) and [FiLM](https://arxiv.org/abs/1709.07871) remain in the codebase but aren't in the current sweep. See [docs/ADAPTERS.md](docs/ADAPTERS.md) for full methodology and Pareto discussion.
 
 ## Repository Structure
 
