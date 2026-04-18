@@ -351,9 +351,6 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
     vocab_size: int = CLMConfig().vocab_size
     if args.strategy == "rosa":
         model, _, _, _, _ = build_model(args, device)
-        vocab_size = getattr(
-            getattr(model, "cfg", None), "vocab_size", vocab_size
-        )
     else:
         (
             model,
@@ -362,12 +359,12 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
             state_dict_fn,
             weight_report_fn,
         ) = build_model(args, device)
-        cfg_obj = getattr(model, "cfg", None) or getattr(
-            getattr(model, "bb", None), "cfg", None
-        )
-        if cfg_obj is not None:
-            vocab_size = cfg_obj.vocab_size
         print(f"Trainable params: {param_count:,}")
+    cfg_obj = getattr(model, "cfg", None) or getattr(
+        getattr(model, "bb", None), "cfg", None
+    )
+    if cfg_obj is not None:
+        vocab_size = cfg_obj.vocab_size
 
     # Prepare data. `seq_len` is the backbone's full context window; the
     # legal-mask builder / collate / prepare_lichess_dataset all treat
@@ -487,7 +484,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
             amp_dtype,
             logger,
         )
-        print(f"\n=== RoSA Phase 3: {args.rosa_mode} training ===")
+        print(f"\n=== RoSA Phase 3: {args.rosa_mode} training ===", flush=True)
         (
             model,
             trainable_params,
@@ -495,7 +492,12 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
             state_dict_fn,
             weight_report_fn,
         ) = rosa_build_phase3(model, masks, args, device)
-        print(f"Trainable params: {param_count:,}")
+        print(f"Trainable params: {param_count:,}", flush=True)
+        # RoSA logs its config once with param_count=0 before Phase 3,
+        # because the Phase 3 adapter model hasn't been built yet. Re-log
+        # now so the lab monitor (which reads ``param_count`` from
+        # metrics.jsonl) picks up the real trainable-param count.
+        logger.log_config(run_type=args.strategy, param_count=param_count)
     else:
         logger.log_config(
             run_type=args.strategy,

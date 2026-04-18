@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -697,3 +697,69 @@ class TestShutdown:
         runner = TrialRunner(workspace=str(tmp_path))
         runner.shutdown()
         assert runner.state_path.exists()
+
+
+# =====================================================================
+# _monitor exit-code handling
+# =====================================================================
+
+
+def _running_trial(runner, trial_id=0, best_val_loss=None) -> Trial:
+    t = Trial(
+        trial_id=trial_id, strategy="bottleneck", params={}, cli_command=[],
+        status="running", pid=12345,
+        best_val_loss=best_val_loss, gpu_id=None,
+    )
+    runner.trials[trial_id] = t
+    return t
+
+
+class TestMonitorExitCode:
+    """The _monitor loop must not mask crashes as completions.
+
+    Regression: before 2026-04, a trial that crashed with a non-zero exit
+    code (OOM, Python traceback) was still classified as ``completed`` if
+    ``best_val_loss`` had been populated by the baseline eval — which
+    runs before any training step. That silently hid real failures.
+    """
+
+    def test_clean_exit_completes(self, tmp_path):
+        runner = TrialRunner(workspace=str(tmp_path))
+        t = _running_trial(runner, best_val_loss=None)
+        with patch("pawn.lab.runner.is_alive", side_effect=[(False, 0)]), \
+             patch("pawn.lab.runner.read_metrics"), \
+             patch("pawn.lab.runner.check_health", return_value=None), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            asyncio.run(runner._monitor(t.trial_id))
+        assert runner.trials[t.trial_id].status == "completed"
+
+    def test_nonzero_exit_fails_even_with_baseline_val(self, tmp_path):
+        """Baseline eval populates best_val_loss; that must not mask a crash."""
+        runner = TrialRunner(workspace=str(tmp_path))
+        t = _running_trial(runner, best_val_loss=3.21)  # set by baseline eval
+        with patch("pawn.lab.runner.is_alive", side_effect=[(False, 1)]), \
+             patch("pawn.lab.runner.read_metrics"), \
+             patch("pawn.lab.runner.check_health", return_value=None), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            asyncio.run(runner._monitor(t.trial_id))
+        assert runner.trials[t.trial_id].status == "failed"
+        failed_events = [
+            e for e in runner.events if e["type"] == "trial_failed"
+        ]
+        assert len(failed_events) == 1
+        assert "exit code 1" in failed_events[0]["data"]["reason"]
+
+    def test_missing_exit_code_fails(self, tmp_path):
+        """If we can't retrieve an exit code, treat it as a failure.
+
+        This prevents silently promoting uncertain outcomes to
+        ``completed``.
+        """
+        runner = TrialRunner(workspace=str(tmp_path))
+        t = _running_trial(runner, best_val_loss=3.21)
+        with patch("pawn.lab.runner.is_alive", side_effect=[(False, None)]), \
+             patch("pawn.lab.runner.read_metrics"), \
+             patch("pawn.lab.runner.check_health", return_value=None), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            asyncio.run(runner._monitor(t.trial_id))
+        assert runner.trials[t.trial_id].status == "failed"

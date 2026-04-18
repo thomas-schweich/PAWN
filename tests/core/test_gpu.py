@@ -118,11 +118,19 @@ class TestConfigureGpuAmd:
         mocker.patch("torch.cuda.get_device_name", return_value="AMD Instinct MI300X")
         mocker.patch("pawn.gpu.is_rocm", return_value=True)
 
-    def test_sdpa_math_selected_on_amd_with_compile(self):
-        from torch.nn.attention import SDPBackend
+    def test_sdpa_backend_none_by_default_on_amd(self):
+        """Flash is the default on AMD+compile now that the RoPE
+        contiguous fix in ``pawn.model.Attention.forward`` handles the
+        flash-backward stride mismatch."""
         cfg = configure_gpu()
-        assert cfg["sdpa_backend"] == SDPBackend.MATH
+        assert cfg["sdpa_backend"] is None
         assert cfg["use_compile"] is True
+
+    def test_sdpa_math_flag_still_selects_math_on_amd(self):
+        """``sdpa_math=True`` remains an escape hatch."""
+        from torch.nn.attention import SDPBackend
+        cfg = configure_gpu(sdpa_math=True)
+        assert cfg["sdpa_backend"] == SDPBackend.MATH
 
     def test_sdpa_backend_none_when_no_compile_on_amd(self):
         cfg = configure_gpu(no_compile=True)

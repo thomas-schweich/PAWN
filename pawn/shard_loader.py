@@ -41,12 +41,19 @@ def prefetch_shards(
     elo_max: int | None = None,
     min_ply: int = 10,
     splits: tuple[str, ...] = ("train", "validation"),
+    max_games: int | None = None,
 ) -> str:
     """Download and filter HF parquet shards to a local directory.
 
     Builds a filter-specific subdirectory name so different Elo bands
     don't collide. Skips shards that already exist locally. Returns
     the path to use as --pgn.
+
+    ``max_games`` only applies to the ``train`` split (where it matters
+    for throughput). Val/test are always prefetched in full since they're
+    small. When the cumulative filtered-game count reaches ``max_games``,
+    prefetch stops early. Subsequent runs with a larger ``max_games``
+    will resume from the next unfetched shard.
     """
     # Build a cache key from filter params
     parts = [hf_repo.replace("/", "_")]
@@ -60,10 +67,41 @@ def prefetch_shards(
 
     for split in splits:
         shards = _list_shards(hf_repo, split)
+        budget = max_games if split == "train" else None
+        budget_str = f", budget={budget}" if budget is not None else ""
         print(f"Prefetch: filtering {len(shards)} {split} shards "
-              f"(elo={elo_min}-{elo_max}, min_ply={min_ply})...", flush=True)
+              f"(elo={elo_min}-{elo_max}, min_ply={min_ply}{budget_str})...",
+              flush=True)
+
+        # When resuming, count games already on disk so we don't overshoot.
+        fetched = 0
+        if budget is not None:
+            for shard in shards:
+                out_path = cache_dir / shard
+                if out_path.exists():
+                    try:
+                        fetched += pl.scan_parquet(out_path).select(
+                            pl.len()
+                        ).collect().item()
+                    except Exception as e:
+                        # A corrupt/unreadable cached shard counts as 0
+                        # rows, which causes us to over-download to hit
+                        # the budget. Warn so the discrepancy is visible.
+                        print(
+                            f"  Warning: couldn't count {out_path}: {e}",
+                            flush=True,
+                        )
+            if fetched:
+                print(f"  Already cached: {fetched:,} games", flush=True)
 
         for i, shard in enumerate(shards):
+            if budget is not None and fetched >= budget:
+                print(
+                    f"  Hit train budget: {fetched:,} >= {budget:,} "
+                    f"after {i} shards; stopping",
+                    flush=True,
+                )
+                break
             out_path = cache_dir / shard
             if out_path.exists():
                 continue
@@ -91,12 +129,17 @@ def prefetch_shards(
                 if len(df) > 0:
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     df.write_parquet(out_path)
+                    fetched += len(df)
                 if (i + 1) % 50 == 0:
-                    print(f"  [{i+1}/{len(shards)}] {split}", flush=True)
+                    print(
+                        f"  [{i+1}/{len(shards)}] {split} "
+                        f"(fetched={fetched:,})",
+                        flush=True,
+                    )
             except Exception as e:
                 print(f"  Warning: {shard}: {e}", flush=True)
 
-        print(f"  {split} done", flush=True)
+        print(f"  {split} done (fetched={fetched:,})", flush=True)
 
     print(f"Prefetch complete: {cache_dir}", flush=True)
     return str(cache_dir)
@@ -219,12 +262,15 @@ class ShardedLichessDataset(torch.utils.data.IterableDataset):
         cache_dir: str | None = None,
         prepend_outcome: bool = False,
     ):
-        # If cache_dir is set and repo is remote, prefetch filtered shards
+        # If cache_dir is set and repo is remote, prefetch filtered shards.
+        # The train split respects ``max_games`` so we don't pull 287 GB
+        # for a 1M-game run; val/test always prefetch in full (small).
         if cache_dir and not _is_local_path(hf_repo):
             hf_repo = prefetch_shards(
                 hf_repo, cache_dir,
                 elo_min=elo_min, elo_max=elo_max, min_ply=min_ply,
                 splits=(split,),
+                max_games=max_games if split == "train" else None,
             )
 
         self.hf_repo = hf_repo

@@ -174,7 +174,7 @@ The `pawn.gpu` module auto-detects your GPU and configures:
 
 - **torch.compile**: enabled on CUDA, uses inductor backend
 - **AMP**: fp16 automatic mixed precision on CUDA
-- **SDPA backend**: flash attention on NVIDIA; MATH backend on AMD (ROCm's flash attention backward has stride mismatches with torch.compile)
+- **SDPA backend**: flash attention on both NVIDIA and AMD. ROCm's flash-backward previously had stride mismatches with `torch.compile` + AMP; we work around it by making RoPE outputs contiguous before SDPA in `Attention.forward`. `--sdpa-math` remains a debugging escape hatch.
 
 No manual flags are needed in most cases. Override with `--no-compile`, `--no-amp`, or `--sdpa-math` if needed.
 

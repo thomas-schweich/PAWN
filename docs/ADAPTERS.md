@@ -166,45 +166,31 @@ Each adapter exposes three helpers:
 
 ## Results Summary
 
-> [!note]
-> The numbers in this section were measured on the **legacy** PAWN-Base backbone (~35.8M params, 4,278-token vocab, 256 context, prepend_outcome=True). They have not yet been re-run on the v1.0.0 backbones (1,980-token vocab, 512 context, no outcome prefix). They are kept here as the most recent end-to-end adapter sweep; expect updated numbers in a future release.
+All results on the v1.0.0 `pawn-base` backbone (8 layers, d_model=512, 1,980-token vocab, 512-token context, no outcome prefix) trained via behavioral cloning on Lichess games with legal-move-masked cross-entropy loss. Every run streams one pass through 2M games filtered to Elo 1800-1900 with `min_ply=10`, bs=128 (bs=96 for dim=512 to fit activation memory on a 21 GB card), `lr=3e-4`, bf16 AMP, flash SDPA + `torch.compile`. FiLM and Hybrid remain in the codebase but were not part of this sweep.
 
-All results on the PAWN-Base backbone (8 layers, d_model=512), trained via behavioral cloning on Lichess games with legal-move-masked cross-entropy loss.
+### Phase 2 v2 sweep (2M games, 1800-1900 Elo, one pass)
 
-### Method comparison (~65K params, 1000-1100 Elo, 100K games)
+| Method | Params | Val top-1 | Val top-5 | Val loss | Wall |
+|--------|-------:|----------:|----------:|---------:|------|
+| Sparse (density=0.015, qkvo, random mask) | 126K | 29.18% | 61.38% | 2.495 | 1h27m |
+| RoSA retro-sparse (density=0.01, grad mask) | 84K | **30.45%** | 63.15% | 2.438 | 1h28m |
+| LoRA (rank=16, qkvo) | 524K | 35.62% | 70.33% | 2.206 | 1h36m |
+| Bottleneck (dim=32, attn+ffn, all layers) | 524K | **39.82%** | 76.07% | 2.013 | 1h30m |
+| Bottleneck (dim=64) | 1.05M | **41.56%** | 78.07% | 1.942 | 1h28m |
+| Bottleneck (dim=512, bs=96) | 8.4M | **46.14%** | 82.88% | 1.751 | 1h44m |
 
-| Method | Params | Val top-1 |
-|--------|--------|-----------|
-| Bottleneck (dim=8) | 65K | 39.3% |
-| Sparse (density=0.031) | 65K | 35.2% |
-| Hybrid (LoRA+FiLM) | ~65K | 34.1% |
-| FiLM | ~33K | 30.3% |
+Pareto-optimal points are in bold.
 
-Bottleneck dominates at matched parameter budgets on low-Elo data.
+### Takeaways
 
-### Backbone leverage
+- **Bottleneck dominates at matched parameter budgets.** At 524K, bottleneck dim=32 (39.82%) beats LoRA rank=16 qkvo (35.62%) by 4.2pp — the gap is structural and does not close under more data (consistent with the earlier 12K-game phase-1 sweep, where the same ordering held).
+- **Gradient-informed masks beat random masks.** RoSA retro-sparse (84K) beats random-mask sparse (126K) by 1.27pp at a third fewer trainable parameters. The 3-phase training overhead (LoRA warmup → mask generation → sparse-only training) pays for itself cleanly.
+- **Bottleneck hasn't saturated.** 16× params (dim=32 → dim=512) gave +6.32pp, and the last 8× step (dim=64 → dim=512) contributed +4.58pp on its own. The sweep didn't reach the point of diminishing returns.
+- **The legacy v0.x adapter sweep (which used `prepend_outcome=True` plus a coarser 4,278-token vocab and 256-token context) is preserved in git history at tag `pre-vocab-transition`.** Direct comparison with those numbers is apples-to-oranges because the backbone architecture, vocabulary, and training schedule all changed; use the table above as the canonical reference for v1.0.0.
 
-| Model | Params | Val top-1 |
-|-------|--------|-----------|
-| Standalone tiny transformer | 529K | 30.9% |
-| Bottleneck on frozen PAWN | 524K | 42.2% |
+### Backbone leverage (legacy reference)
 
-The frozen backbone provides ~11 percentage points of "free" accuracy (36% relative improvement). Adapters specialize existing representations rather than learning from scratch.
-
-### Capacity scaling (1800-1900 Elo, 1M games)
-
-| Method | Params | Val top-1 |
-|--------|--------|-----------|
-| Sparse (density=0.081, qkvo+FFN) | 2.7M | 44.7% |
-| Bottleneck (dim=64, all layers) | 1.0M | 43.5% |
-| Bottleneck (dim=32, all layers) | 524K | 41.7% |
-| Sparse (density=0.015, qkvo+FFN) | 503K | 40.2% |
-
-Below ~1M params, bottleneck is more parameter-efficient. Above ~1M, sparse catches up and overtakes -- likely because direct weight perturbation can modify more individual weight entries than a structured bottleneck at the same total parameter count.
-
-### Data scaling (1000-1100 Elo, bottleneck dim=32)
-
-10x more data (100K to 1M games) yields +2.9pp (39.3% to 42.2%) and reduces train/val gap from ~1pp to ~0.3pp.
+For historical context, the legacy v0.x sweep measured a standalone tiny transformer (no backbone, trained from scratch) at 524K params and 30.9% top-1 vs. a 524K bottleneck on the frozen legacy backbone at 42.2%. The v1.0.0 bottleneck dim=32 (524K trainable) lands at 39.82% on 2M games; we haven't yet re-run the from-scratch baseline on the v1.0.0 data pipeline (1,980-vocab, 512-ctx, no outcome prefix) to directly quantify the frozen-backbone lift under current conditions, so the ~9pp implied by subtracting the two eras is indicative rather than a like-for-like measurement. A matched from-scratch 524K standalone on the current data is on the to-do list.
 
 ---
 
