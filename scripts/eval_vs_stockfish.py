@@ -176,7 +176,7 @@ def play_one_game(
     token_to_uci: list[str],
     movetime_ms: int,
     max_ply: int,
-    first_move_uci: str,
+    first_move_uci: str | None,
     temperature: float,
     rng: torch.Generator,
 ) -> dict[str, Any]:
@@ -207,6 +207,7 @@ def play_one_game(
                 "term": int(term),
                 "plies": len(moves_uci),
                 "pawn_white": pawn_plays_white,
+                "first_move": first_move_uci if pawn_plays_white else None,
                 "moves": moves_uci,
             }
 
@@ -216,6 +217,10 @@ def play_one_game(
         if pawn_to_move:
             if len(moves_uci) == 0:
                 # First move of the game, PAWN plays white: book opening.
+                if first_move_uci is None:
+                    raise RuntimeError(
+                        "PAWN plays white but no book move was provided"
+                    )
                 uci = first_move_uci
                 tok = uci_to_token.get(uci)
                 if tok is None:
@@ -266,6 +271,7 @@ def play_one_game(
         "term": -1,
         "plies": len(moves_uci),
         "pawn_white": pawn_plays_white,
+        "first_move": first_move_uci if pawn_plays_white else None,
         "moves": moves_uci,
     }
 
@@ -292,21 +298,37 @@ def run_match(
     token_to_uci: list[str],
     movetime_ms: int,
     max_ply: int,
-    first_move_uci: str,
+    first_moves: list[str],
     n_games: int,
     temperature: float,
     rng: torch.Generator,
     label: str = "",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Play ``n_games`` PAWN-vs-Stockfish with alternating colors."""
+    """Play ``n_games`` PAWN-vs-Stockfish with alternating colors.
+
+    When PAWN plays white, the book move rotates through
+    ``first_moves`` so each opening is sampled equally. The rotation is
+    deterministic on the white-game index, independent of the overall
+    game index, so adding more temperatures or games doesn't reshuffle.
+    """
+    assert first_moves, "run_match needs at least one book opening"
     wins = draws = losses = 0
     w_w = w_d = w_l = 0
     b_w = b_d = b_l = 0
+    per_opening: dict[str, dict[str, int]] = {
+        mv: {"w": 0, "d": 0, "l": 0} for mv in first_moves
+    }
     games: list[dict[str, Any]] = []
     t0 = time.time()
 
+    white_game_idx = 0
     for i in range(n_games):
         pawn_white = (i % 2 == 0)
+        if pawn_white:
+            first_move = first_moves[white_game_idx % len(first_moves)]
+            white_game_idx += 1
+        else:
+            first_move = None
         g = play_one_game(
             model=model, sf=sf, pawn_plays_white=pawn_white,
             device=device,
@@ -314,23 +336,32 @@ def run_match(
             token_to_uci=token_to_uci,
             movetime_ms=movetime_ms,
             max_ply=max_ply,
-            first_move_uci=first_move_uci,
+            first_move_uci=first_move,
             temperature=temperature,
             rng=rng,
         )
         g["temperature"] = temperature
         if g["result"] == "win":
             wins += 1
-            if pawn_white: w_w += 1
-            else: b_w += 1
+            if pawn_white:
+                w_w += 1
+                per_opening[first_move]["w"] += 1  # type: ignore[index]
+            else:
+                b_w += 1
         elif g["result"] == "loss":
             losses += 1
-            if pawn_white: w_l += 1
-            else: b_l += 1
+            if pawn_white:
+                w_l += 1
+                per_opening[first_move]["l"] += 1  # type: ignore[index]
+            else:
+                b_l += 1
         else:
             draws += 1
-            if pawn_white: w_d += 1
-            else: b_d += 1
+            if pawn_white:
+                w_d += 1
+                per_opening[first_move]["d"] += 1  # type: ignore[index]
+            else:
+                b_d += 1
         games.append(g)
         if (i + 1) % 10 == 0 or i == n_games - 1:
             score = wins + 0.5 * draws
@@ -353,6 +384,7 @@ def run_match(
         "winrate_strict": wins / max(n_games, 1),
         "as_white_wdl": [w_w, w_d, w_l],
         "as_black_wdl": [b_w, b_d, b_l],
+        "per_opening": per_opening,
         "wall_seconds": time.time() - t0,
     }
     return summary, games
@@ -370,9 +402,12 @@ def main() -> None:
     p.add_argument("--games", type=int, default=100,
                    help="Games per temperature setting")
     p.add_argument("--max-ply", type=int, default=400)
-    p.add_argument("--first-move", default="e2e4",
-                   help="PAWN's white-opening book move (move 1 is "
-                        "untrained with prepend_outcome=False)")
+    p.add_argument("--first-moves", default="e2e4,d2d4,g1f3",
+                   help="Comma-separated list of PAWN's white-opening "
+                        "book moves. When PAWN plays white the book "
+                        "move rotates across this list so each opening "
+                        "gets an equal share of the white games. Move 1 "
+                        "is untrained with prepend_outcome=False.")
     p.add_argument("--temperatures", default="0.0,0.5,1.0",
                    help="Comma-separated list of sampling temperatures. "
                         "0 = greedy argmax.")
@@ -383,6 +418,9 @@ def main() -> None:
     args = p.parse_args()
 
     temperatures = [float(x) for x in args.temperatures.split(",") if x.strip()]
+    first_moves = [m.strip() for m in args.first_moves.split(",") if m.strip()]
+    if not first_moves:
+        raise SystemExit("--first-moves must contain at least one UCI move")
 
     torch.manual_seed(args.seed)
     rng = torch.Generator(device=args.device)
@@ -414,6 +452,9 @@ def main() -> None:
           flush=True)
     sf = StockfishEngine(args.stockfish, elo=args.stockfish_elo)
 
+    print(f"first-move book (rotated across white games): {first_moves}",
+          flush=True)
+
     all_summaries: list[dict[str, Any]] = []
     all_games: list[dict[str, Any]] = []
     try:
@@ -423,7 +464,7 @@ def main() -> None:
                 model=model, sf=sf, device=args.device,
                 uci_to_token=uci_to_token, token_to_uci=token_to_uci,
                 movetime_ms=args.movetime_ms, max_ply=args.max_ply,
-                first_move_uci=args.first_move, n_games=args.games,
+                first_moves=first_moves, n_games=args.games,
                 temperature=temp, rng=rng, label=f"T={temp}",
             )
             all_summaries.append(summary)
@@ -439,6 +480,16 @@ def main() -> None:
             f"{s['wins']:>4} {s['draws']:>4} {s['losses']:>4} "
             f"{s['score_rate']:>12.3f} {s['wall_seconds']:>8.1f}"
         )
+    print("\n=== Per-opening breakdown ===")
+    print(f"{'T':>6} {'opening':>8} {'W':>4} {'D':>4} {'L':>4} {'score_rate':>12}")
+    for s in all_summaries:
+        for opening, w in s["per_opening"].items():
+            n = w["w"] + w["d"] + w["l"]
+            rate = (w["w"] + 0.5 * w["d"]) / max(n, 1)
+            print(
+                f"{s['temperature']:>6.2f} {opening:>8} "
+                f"{w['w']:>4} {w['d']:>4} {w['l']:>4} {rate:>12.3f}"
+            )
 
     if args.output:
         out_path = Path(args.output)
@@ -451,7 +502,7 @@ def main() -> None:
                 "movetime_ms": args.movetime_ms,
                 "games_per_temperature": args.games,
                 "temperatures": temperatures,
-                "first_move": args.first_move,
+                "first_moves": first_moves,
                 "seed": args.seed,
             },
             "summaries": all_summaries,

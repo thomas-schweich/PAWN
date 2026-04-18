@@ -43,6 +43,7 @@ ARGPARSE_SCRIPTS = [
     "compute_theoretical_ceiling.py",
     "eval_accuracy.py",
     "eval_probes.py",
+    "eval_vs_stockfish.py",
     "export_hf_repo.py",
     "extract_lichess_parquet.py",
     "generate_lc0_data.py",
