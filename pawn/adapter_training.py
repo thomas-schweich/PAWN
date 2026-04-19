@@ -80,6 +80,147 @@ def cosine_warmup_schedule(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def wsd_schedule(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    decay_steps: int,
+    total_steps: int,
+    min_lr_ratio: float = 0.0,
+    decay_shape: str = "linear",
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Warmup-Stable-Decay scheduler.
+
+    Three phases:
+        [0, warmup_steps)                         – linear 0 → 1
+        [warmup_steps, total_steps - decay_steps) – flat 1 (stable)
+        [total_steps - decay_steps, total_steps]  – 1 → min_lr_ratio
+
+    ``decay_shape`` selects the decay curve:
+      * ``"linear"`` (default) — straight line 1 → min_lr_ratio
+      * ``"cosine"`` — half-cosine fall; matches the tail of a standard
+        cosine schedule over the decay window. Empirically ~0.1-0.2pp
+        better than linear in several recent WSD papers at the same
+        budget (e.g. MiniCPM).
+
+    When the stable phase is exhausted (``warmup + decay > total``) the
+    stable phase is clipped to zero and we fall back to a warmup →
+    decay schedule of the chosen shape.
+    """
+    if decay_shape not in ("linear", "cosine"):
+        raise ValueError(
+            f"Unknown wsd decay_shape: {decay_shape!r} "
+            "(expected 'linear' or 'cosine')"
+        )
+    stable_end = max(warmup_steps, total_steps - decay_steps)
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        if step < stable_end:
+            return 1.0
+        decay_window = max(total_steps - stable_end, 1)
+        progress = min((step - stable_end) / decay_window, 1.0)
+        if decay_shape == "linear":
+            return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - progress)
+        # Cosine: 0.5 * (1 + cos(π * progress)) maps 0→1 and 1→0.
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def constant_warmup_schedule(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Linear warmup → hold peak LR indefinitely.
+
+    The cleanest control against WSD: "does any decay help at all?"
+    Pair with patience-based early stopping — without a schedule-driven
+    end, the run keeps training at peak LR until val stops improving.
+    """
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        return 1.0
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def one_cycle_schedule(
+    optimizer: torch.optim.Optimizer,
+    peak_step: int,
+    total_steps: int,
+    initial_div: float = 25.0,
+    final_div: float = 1e4,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Smith one-cycle schedule with cosine annealing between phases.
+
+    Ramps from ``peak_lr / initial_div`` up to ``peak_lr`` over the first
+    ``peak_step`` steps, then decays cosine-wise to
+    ``peak_lr / final_div`` over the remaining steps. No separate
+    warmup — the ramp-up is the warmup.
+
+    References:
+        Smith (2018) "A disciplined approach to neural network
+        hyper-parameters" arXiv:1803.09820.
+    """
+    if peak_step <= 0:
+        raise ValueError("one_cycle_schedule requires peak_step > 0")
+    if peak_step >= total_steps:
+        raise ValueError("one_cycle_schedule requires peak_step < total_steps")
+    initial_frac = 1.0 / initial_div
+    final_frac = 1.0 / final_div
+
+    def lr_lambda(step: int) -> float:
+        if step <= peak_step:
+            # Cosine ramp from initial_frac to 1.0.
+            progress = step / max(peak_step, 1)
+            return initial_frac + (1.0 - initial_frac) * 0.5 * (
+                1.0 - math.cos(math.pi * progress)
+            )
+        # Cosine decay from 1.0 to final_frac.
+        progress = min((step - peak_step) / max(total_steps - peak_step, 1), 1.0)
+        return final_frac + (1.0 - final_frac) * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    schedule: str = "cosine",
+    decay_steps: int | None = None,
+    wsd_decay_shape: str = "linear",
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Dispatch one of the supported LR schedules by name.
+
+    Supported schedules: ``"cosine"``, ``"wsd"``, ``"constant"``,
+    ``"one_cycle"``. See the individual scheduler docstrings for
+    parameter meaning. ``warmup_steps`` is reused as the ramp-up for
+    ``one_cycle`` — set it to ~0.3 * total_steps for the canonical
+    Smith shape.
+    """
+    if schedule == "cosine":
+        return cosine_warmup_schedule(optimizer, warmup_steps, total_steps)
+    if schedule == "wsd":
+        if decay_steps is None:
+            raise ValueError("WSD schedule requires decay_steps")
+        return wsd_schedule(
+            optimizer, warmup_steps, decay_steps, total_steps,
+            decay_shape=wsd_decay_shape,
+        )
+    if schedule == "constant":
+        return constant_warmup_schedule(optimizer, warmup_steps)
+    if schedule == "one_cycle":
+        return one_cycle_schedule(optimizer, warmup_steps, total_steps)
+    raise ValueError(f"Unknown lr_schedule: {schedule!r}")
+
+
 def sparse_forward(
     model: nn.Module,
     ids: torch.Tensor,
@@ -810,7 +951,14 @@ def train(
         total_steps = args.epochs * len(train_loader)
 
     warmup_steps = args.warmup_steps if args.warmup_steps is not None else int(args.warmup_frac * total_steps)
-    scheduler = cosine_warmup_schedule(optimizer, warmup_steps, total_steps)
+    schedule = getattr(args, "lr_schedule", "cosine")
+    decay_frac = getattr(args, "decay_frac", 0.1)
+    decay_steps = int(decay_frac * total_steps) if schedule == "wsd" else None
+    scheduler = build_scheduler(
+        optimizer, warmup_steps, total_steps,
+        schedule=schedule, decay_steps=decay_steps,
+        wsd_decay_shape=getattr(args, "wsd_decay_shape", "linear"),
+    )
     # GradScaler is only needed for fp16 (underflow risk). bf16 has
     # fp32-range exponents and the scaler just adds per-step overhead.
     scaler = torch.amp.GradScaler() if amp_dtype == torch.float16 else None

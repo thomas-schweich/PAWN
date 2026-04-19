@@ -15,10 +15,14 @@ import torch.nn as nn
 
 from pawn.adapter_training import (
     STRATEGIES,
+    build_scheduler,
+    constant_warmup_schedule,
     cosine_warmup_schedule,
     load_backbone,
+    one_cycle_schedule,
     parse_layers,
     sparse_forward,
+    wsd_schedule,
 )
 
 
@@ -118,6 +122,255 @@ class TestCosineWarmupSchedule:
         sched = cosine_warmup_schedule(opt, warmup_steps=0, total_steps=100)
         # step 0 is not < 0 -> cosine path immediately, progress=0, scale=1
         assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+
+
+# ---------------------------------------------------------------------------
+# wsd_schedule (warmup-stable-decay)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+class TestWSDSchedule:
+    def test_returns_lambda_lr(self):
+        opt = _make_opt()
+        sched = wsd_schedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        assert isinstance(sched, torch.optim.lr_scheduler.LambdaLR)
+
+    def test_initial_lr_is_zero(self):
+        opt = _make_opt(lr=1e-3)
+        wsd_schedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.0)
+
+    def test_warmup_ramps_linearly(self):
+        peak = 1e-3
+        opt = _make_opt(lr=peak)
+        sched = wsd_schedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        sched.step()  # step 1
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.1 * peak)
+        for _ in range(4):
+            sched.step()  # step 5
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.5 * peak)
+
+    def test_stable_phase_holds_peak(self):
+        peak = 1e-3
+        opt = _make_opt(lr=peak)
+        sched = wsd_schedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        # Walk through warmup → land in stable phase at multiple points.
+        for _ in range(10):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+        for _ in range(40):  # step 50 — still in stable (10..80)
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+        for _ in range(29):  # step 79 — still in stable
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+
+    def test_decay_phase_falls_linearly(self):
+        peak = 1.0
+        opt = _make_opt(lr=peak)
+        sched = wsd_schedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        # Advance to the start of decay (step 80).
+        for _ in range(80):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+        # Midway through decay (step 90): LR = 0.5 * peak.
+        for _ in range(10):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.5)
+        # End of schedule (step 100): LR = 0.
+        for _ in range(10):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.0, abs=1e-10)
+
+    def test_min_lr_ratio_floor(self):
+        opt = _make_opt(lr=1.0)
+        sched = wsd_schedule(
+            opt, warmup_steps=5, decay_steps=10, total_steps=50,
+            min_lr_ratio=0.1,
+        )
+        for _ in range(50):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.1)
+
+    def test_decay_overflow_clamps_stable(self):
+        # warmup + decay > total: stable phase clipped to zero.
+        peak = 1.0
+        opt = _make_opt(lr=peak)
+        sched = wsd_schedule(opt, warmup_steps=10, decay_steps=100, total_steps=50)
+        for _ in range(10):
+            sched.step()  # end of warmup → immediately into decay
+        # Decay window = 50 - 10 = 40 (clipped by stable_end = max(warmup, total-decay))
+        # stable_end = max(10, 50-100) = 10. So LR at step 10 is already at start of decay: 1.0.
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+        for _ in range(20):  # step 30 → halfway through a 40-step decay
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# build_scheduler dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestBuildScheduler:
+    def test_cosine_dispatch(self):
+        opt = _make_opt()
+        sched = build_scheduler(opt, 10, 100, schedule="cosine")
+        assert isinstance(sched, torch.optim.lr_scheduler.LambdaLR)
+
+    def test_wsd_dispatch(self):
+        opt = _make_opt()
+        sched = build_scheduler(
+            opt, 10, 100, schedule="wsd", decay_steps=20,
+        )
+        assert isinstance(sched, torch.optim.lr_scheduler.LambdaLR)
+
+    def test_wsd_requires_decay_steps(self):
+        opt = _make_opt()
+        with pytest.raises(ValueError, match="decay_steps"):
+            build_scheduler(opt, 10, 100, schedule="wsd")
+
+    def test_wsd_cosine_decay_shape(self):
+        opt = _make_opt()
+        sched = build_scheduler(
+            opt, 10, 100, schedule="wsd",
+            decay_steps=20, wsd_decay_shape="cosine",
+        )
+        assert isinstance(sched, torch.optim.lr_scheduler.LambdaLR)
+
+    def test_constant_dispatch(self):
+        opt = _make_opt()
+        sched = build_scheduler(opt, 10, 100, schedule="constant")
+        assert isinstance(sched, torch.optim.lr_scheduler.LambdaLR)
+
+    def test_one_cycle_dispatch(self):
+        opt = _make_opt()
+        sched = build_scheduler(opt, 30, 100, schedule="one_cycle")
+        assert isinstance(sched, torch.optim.lr_scheduler.LambdaLR)
+
+    def test_unknown_schedule_raises(self):
+        opt = _make_opt()
+        with pytest.raises(ValueError, match="Unknown lr_schedule"):
+            build_scheduler(opt, 10, 100, schedule="step")
+
+
+# ---------------------------------------------------------------------------
+# constant_warmup_schedule
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+class TestConstantWarmupSchedule:
+    def test_initial_lr_is_zero(self):
+        opt = _make_opt(lr=1.0)
+        constant_warmup_schedule(opt, warmup_steps=10)
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.0)
+
+    def test_warmup_linear(self):
+        peak = 1.0
+        opt = _make_opt(lr=peak)
+        sched = constant_warmup_schedule(opt, warmup_steps=10)
+        sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.1)
+        for _ in range(4):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.5)
+
+    def test_holds_peak_after_warmup(self):
+        peak = 1.0
+        opt = _make_opt(lr=peak)
+        sched = constant_warmup_schedule(opt, warmup_steps=10)
+        for _ in range(10):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+        for _ in range(5000):
+            sched.step()
+        # still at peak, no decay
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+
+    def test_zero_warmup_starts_at_peak(self):
+        peak = 1.0
+        opt = _make_opt(lr=peak)
+        constant_warmup_schedule(opt, warmup_steps=0)
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+
+
+# ---------------------------------------------------------------------------
+# wsd_schedule with cosine decay
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+class TestWSDCosineDecay:
+    def test_cosine_decay_is_smooth(self):
+        """Cosine-shaped decay is strictly monotonic and hits 0 at the end."""
+        peak = 1.0
+        opt = _make_opt(lr=peak)
+        sched = wsd_schedule(
+            opt, warmup_steps=10, decay_steps=20, total_steps=100,
+            decay_shape="cosine",
+        )
+        for _ in range(80):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+        # midway through decay: cosine at π/2 → 0.5 * (1 + 0) = 0.5
+        for _ in range(10):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.5)
+        for _ in range(10):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.0, abs=1e-10)
+
+    def test_unknown_decay_shape_raises(self):
+        opt = _make_opt()
+        with pytest.raises(ValueError, match="decay_shape"):
+            wsd_schedule(opt, 10, 20, 100, decay_shape="exponential")
+
+
+# ---------------------------------------------------------------------------
+# one_cycle_schedule (Smith)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+class TestOneCycleSchedule:
+    def test_initial_lr_is_low(self):
+        peak = 1.0
+        opt = _make_opt(lr=peak)
+        one_cycle_schedule(opt, peak_step=30, total_steps=100)
+        # Step 0 → initial_frac = 1/25 = 0.04
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.04)
+
+    def test_reaches_peak_at_peak_step(self):
+        peak = 1.0
+        opt = _make_opt(lr=peak)
+        sched = one_cycle_schedule(opt, peak_step=30, total_steps=100)
+        for _ in range(30):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+
+    def test_decays_to_final_floor(self):
+        peak = 1.0
+        opt = _make_opt(lr=peak)
+        sched = one_cycle_schedule(
+            opt, peak_step=30, total_steps=100,
+            final_div=1e4,
+        )
+        for _ in range(100):
+            sched.step()
+        # End of schedule → final_frac = 1/10000
+        assert opt.param_groups[0]["lr"] == pytest.approx(1e-4, abs=1e-6)
+
+    def test_peak_step_must_be_positive(self):
+        opt = _make_opt()
+        with pytest.raises(ValueError, match="peak_step > 0"):
+            one_cycle_schedule(opt, peak_step=0, total_steps=100)
+
+    def test_peak_step_must_be_less_than_total(self):
+        opt = _make_opt()
+        with pytest.raises(ValueError, match="peak_step < total_steps"):
+            one_cycle_schedule(opt, peak_step=100, total_steps=100)
 
 
 # ---------------------------------------------------------------------------
