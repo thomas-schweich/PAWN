@@ -71,18 +71,16 @@ def list_trials(log_dir: Path) -> list[str]:
     if not dirs:
         return []
     trial_to_mtime: dict[str, float] = {}
-    flat_present = False
     for d in dirs:
         rel = d.relative_to(log_dir)
         parts = rel.parts
         if len(parts) <= 1:
-            flat_present = True
             continue
         trial = parts[0]
         m = (d / "metrics.jsonl").stat().st_mtime
         if m > trial_to_mtime.get(trial, 0.0):
             trial_to_mtime[trial] = m
-    if not trial_to_mtime or flat_present and not trial_to_mtime:
+    if not trial_to_mtime:
         return []
     return sorted(trial_to_mtime, key=lambda t: trial_to_mtime[t], reverse=True)
 

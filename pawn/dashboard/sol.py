@@ -664,9 +664,15 @@ def _runs_for_trial(all_runs: list[str], trial: str) -> list[str]:
 def RunSelector(auto_refresh: bool = False, on_auto_refresh=None,
                 interval: float = 10.0, on_interval=None):
     # Default "All" on when the 1-hour window is empty — otherwise the user
-    # sees a populated trial dropdown but an empty run list, and selecting a
-    # trial appears to do nothing.
-    initial_show_all = not bool(load_runs(log_dir.value, max_age_hours=1.0))
+    # sees a populated trial dropdown but an empty run list, and selecting
+    # a trial appears to do nothing. ``use_memo`` with an empty dependency
+    # list computes the initial scan exactly once per mount, keeping the
+    # filesystem scan off the auto-refresh render path. ``use_state`` then
+    # seeds the toggle from that one-shot initial and owns it from there.
+    initial_show_all = solara.use_memo(
+        lambda: not bool(load_runs(log_dir.value, max_age_hours=1.0)),
+        dependencies=[],
+    )
     show_all, set_show_all = solara.use_state(initial_show_all)
 
     def _load():
@@ -805,8 +811,10 @@ def NotesEditor():
         set_status("Discarded")
 
     dirty = draft != saved
+    import html as _html
     from .metrics import notes_path
     target = notes_path(log_dir.value, run)
+    target_display = _html.escape(str(target))
 
     with solara.Div(classes=["pawn-card"], style={"margin-bottom": "18px"}):
         solara.HTML(
@@ -814,7 +822,7 @@ def NotesEditor():
             unsafe_innerHTML=(
                 '<div class="pawn-desc" style="font-size:13px;color:var(--pawn-text);'
                 'font-weight:600;letter-spacing:0.02em;">Trial Notes</div>'
-                f'<div class="pawn-desc" style="margin-bottom:8px;">{target}</div>'
+                f'<div class="pawn-desc" style="margin-bottom:8px;">{target_display}</div>'
             ),
         )
         solara.InputTextArea(
@@ -986,8 +994,15 @@ def _chart_title_text(fig) -> str:
 def ChartCard(chart, description: str = ""):
     """A card wrapper that shows the description above the chart and renders
     per-axis log-scale toggle pills. Toggle state is keyed by the chart's
-    title so it survives re-renders (including live auto-refresh ticks)."""
-    chart_id = _chart_title_text(chart) or description or id(chart)
+    title so it survives re-renders (including live auto-refresh ticks).
+
+    Every dashboard callsite passes a titled figure and a non-empty
+    description, so ``chart_id`` resolves to one of those. An empty-id
+    fallback would be unstable across re-renders (``id()`` changes per
+    tick), so we require at least a title or description up front.
+    """
+    chart_id = _chart_title_text(chart) or description
+    assert chart_id, "ChartCard requires a titled figure or a non-empty description"
 
     default_x, default_y = charts.current_axis_log(chart)
     override = chart_axis_overrides.value.get(chart_id)

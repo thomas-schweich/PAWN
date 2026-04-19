@@ -46,12 +46,13 @@ def apply_axis_log(fig, x_log: bool, y_log: bool):
     """Force-set the axis types on a figure.
 
     Used by the dashboard to apply per-chart log-scale overrides chosen by
-    the user, on top of whatever default the chart builder picked. When
-    switching y from ``log`` back to ``linear`` we also clear any explicit
-    y-range that was appropriate only in log space.
+    the user, on top of whatever default the chart builder picked. Any
+    explicit axis range is cleared and autorange re-enabled so a range that
+    only made sense in log space (e.g. ``[-2, 0]``) doesn't leave the chart
+    looking empty when the user switches back to linear.
     """
-    fig.update_xaxes(type="log" if x_log else "linear")
-    fig.update_yaxes(type="log" if y_log else "linear")
+    fig.update_xaxes(type="log" if x_log else "linear", range=None, autorange=True)
+    fig.update_yaxes(type="log" if y_log else "linear", range=None, autorange=True)
     return fig
 
 
