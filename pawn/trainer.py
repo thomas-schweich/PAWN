@@ -115,6 +115,8 @@ class WSDSchedule:
         self.total_steps = total_steps
         self.min_lr_ratio = min_lr_ratio
         self.decay_shape = decay_shape
+        self._stable_end = max(warmup_steps, total_steps - decay_steps)
+        self._decay_window = max(total_steps - self._stable_end, 1)
         self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
         self._step = 0
         self._apply_lr(0)
@@ -131,11 +133,9 @@ class WSDSchedule:
     def _compute_lr_scale(self, step: int) -> float:
         if step < self.warmup_steps:
             return step / max(1, self.warmup_steps)
-        stable_end = max(self.warmup_steps, self.total_steps - self.decay_steps)
-        if step < stable_end:
+        if step < self._stable_end:
             return 1.0
-        decay_window = max(self.total_steps - stable_end, 1)
-        progress = min((step - stable_end) / decay_window, 1.0)
+        progress = min((step - self._stable_end) / self._decay_window, 1.0)
         if self.decay_shape == "linear":
             return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * (1.0 - progress)
         return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * 0.5 * (
@@ -668,20 +668,19 @@ class CLMTrainer:
             weight_decay=train_cfg.weight_decay,
             betas=(0.9, 0.95),
         )
-        lr_schedule = getattr(train_cfg, "lr_schedule", "cosine")
-        if lr_schedule == "wsd":
+        if train_cfg.lr_schedule == "wsd":
             self.scheduler = WSDSchedule(
                 self.optimizer,
                 warmup_steps=train_cfg.warmup_steps,
-                decay_steps=getattr(train_cfg, "decay_steps", 10_000),
+                decay_steps=train_cfg.decay_steps,
                 total_steps=train_cfg.total_steps,
-                decay_shape=getattr(train_cfg, "wsd_decay_shape", "linear"),
+                decay_shape=train_cfg.wsd_decay_shape,
             )
-        elif lr_schedule == "constant":
+        elif train_cfg.lr_schedule == "constant":
             self.scheduler = ConstantWithWarmup(
                 self.optimizer, warmup_steps=train_cfg.warmup_steps,
             )
-        elif lr_schedule == "one_cycle":
+        elif train_cfg.lr_schedule == "one_cycle":
             self.scheduler = OneCycle(
                 self.optimizer,
                 peak_step=train_cfg.warmup_steps,

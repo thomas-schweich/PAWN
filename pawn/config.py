@@ -1,6 +1,7 @@
 """PAWN model and training configuration."""
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 # ---- New vocabulary (searchless_chess) ----
@@ -87,12 +88,12 @@ class TrainingConfig:
     # LR schedule: ``"cosine"`` (default), ``"wsd"``, ``"constant"``, or
     # ``"one_cycle"``. See ``pawn.trainer`` for the class implementations
     # and ``pawn.run_config.BaseRunConfig.lr_schedule`` for semantics.
-    lr_schedule: str = "cosine"
+    lr_schedule: Literal["cosine", "wsd", "constant", "one_cycle"] = "cosine"
     # WSD decay-phase length. Used only when ``lr_schedule == "wsd"``.
     decay_steps: int = 10_000
     # WSD decay curve: ``"linear"`` or ``"cosine"``. Ignored for
     # non-WSD schedules.
-    wsd_decay_shape: str = "linear"
+    wsd_decay_shape: Literal["linear", "cosine"] = "linear"
 
     # Batch
     batch_size: int = 256
