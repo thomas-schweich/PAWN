@@ -228,7 +228,17 @@ def sparse_forward(
     legal_mask: torch.Tensor,
     amp_dtype: torch.dtype | None,
     device: str,
-) -> torch.Tensor:
+    apply_legal_mask: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward + sparse logit projection.
+
+    Returns ``(valid_logits, valid_legal)`` — both indexed by the
+    loss mask. When ``apply_legal_mask=True`` (the default), illegal
+    logits are filled with ``-inf`` so the softmax never assigns mass
+    to them. When False, the raw logits are returned and the caller
+    is expected to use ``valid_legal`` (a bool tensor over positions ×
+    vocab) for any legality-aware loss term or metric.
+    """
     with torch.amp.autocast(
         "cuda", dtype=amp_dtype, enabled=amp_dtype is not None
     ):
@@ -237,8 +247,32 @@ def sparse_forward(
         valid_logits = model.project_head(valid_hidden)  # type: ignore[attr-defined]
     valid_legal = legal_mask[msk]
     valid_logits = valid_logits.float()
-    valid_logits.masked_fill_(~valid_legal, float("-inf"))
-    return valid_logits
+    if apply_legal_mask:
+        valid_logits.masked_fill_(~valid_legal, float("-inf"))
+    return valid_logits, valid_legal
+
+
+def compute_adapter_loss(
+    valid_logits: torch.Tensor,
+    valid_targets: torch.Tensor,
+    valid_legal: torch.Tensor,
+    *,
+    illegal_penalty: float,
+) -> torch.Tensor:
+    """Cross-entropy over moves, plus optional illegal-mass penalty.
+
+    When ``illegal_penalty > 0`` we add ``lambda * E[P_illegal]`` —
+    the expected softmax mass landing on illegal moves, averaged over
+    positions — to the loss. If legality was masked inside
+    ``sparse_forward``, the illegal probability mass is exactly zero,
+    so the penalty term contributes nothing regardless of ``lambda``.
+    """
+    loss = F.cross_entropy(valid_logits, valid_targets)
+    if illegal_penalty > 0:
+        probs = torch.softmax(valid_logits, dim=-1)
+        illegal_prob = (probs * (~valid_legal).float()).sum(dim=-1).mean()
+        loss = loss + illegal_penalty * illegal_prob
+    return loss
 
 
 @torch.no_grad()
@@ -249,11 +283,15 @@ def evaluate(
     device: str,
     amp_dtype: torch.dtype | None = None,
     precomputed_indices: list[torch.Tensor] | None = None,
+    apply_legal_mask: bool = True,
+    illegal_penalty: float = 0.0,
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
     total_top1 = 0.0
     total_top5 = 0.0
+    total_illegal_pred = 0.0
+    total_illegal_mass = 0.0
     total_positions = 0
 
     for i, batch in enumerate(dataloader):
@@ -271,15 +309,19 @@ def evaluate(
         else:
             legal_mask = mask_builder(batch)
 
-        valid_logits = sparse_forward(
-            model, ids, msk, legal_mask, amp_dtype, device
+        valid_logits, valid_legal = sparse_forward(
+            model, ids, msk, legal_mask, amp_dtype, device,
+            apply_legal_mask=apply_legal_mask,
         )
         valid_targets = tgt[msk]
         n_pos = valid_targets.shape[0]
         if n_pos == 0:
             continue
 
-        loss = F.cross_entropy(valid_logits, valid_targets)
+        loss = compute_adapter_loss(
+            valid_logits, valid_targets, valid_legal,
+            illegal_penalty=illegal_penalty,
+        )
         preds = valid_logits.argmax(dim=-1)
         top1 = (preds == valid_targets).float().mean().item()
         top5 = valid_logits.topk(5, dim=-1).indices
@@ -291,17 +333,35 @@ def evaluate(
             .item()
         )
 
+        # Legality diagnostics. When the mask is applied, illegal
+        # logits are -inf, so both rates are zero — the metric still
+        # gets logged for uniformity.
+        pred_legal = valid_legal.gather(1, preds.unsqueeze(-1)).squeeze(-1)
+        illegal_pred_rate = (~pred_legal).float().mean().item()
+        probs = torch.softmax(valid_logits, dim=-1)
+        illegal_mass = (probs * (~valid_legal).float()).sum(dim=-1).mean().item()
+
         total_loss += loss.item() * n_pos
         total_top1 += top1 * n_pos
         total_top5 += top5_acc * n_pos
+        total_illegal_pred += illegal_pred_rate * n_pos
+        total_illegal_mass += illegal_mass * n_pos
         total_positions += n_pos
 
     if total_positions == 0:
-        return {"loss": 0.0, "top1_accuracy": 0.0, "top5_accuracy": 0.0}
+        return {
+            "loss": 0.0,
+            "top1_accuracy": 0.0,
+            "top5_accuracy": 0.0,
+            "illegal_pred_rate": 0.0,
+            "illegal_prob_mass": 0.0,
+        }
     return {
         "loss": total_loss / total_positions,
         "top1_accuracy": total_top1 / total_positions,
         "top5_accuracy": total_top5 / total_positions,
+        "illegal_pred_rate": total_illegal_pred / total_positions,
+        "illegal_prob_mass": total_illegal_mass / total_positions,
     }
 
 
@@ -617,6 +677,9 @@ def rosa_warmup(
     # fp32-range exponents and the scaler just adds per-step overhead.
     scaler = torch.amp.GradScaler() if amp_dtype == torch.float16 else None
 
+    apply_legal_mask = not bool(getattr(args, "disable_legal_mask", False))
+    illegal_penalty = float(getattr(args, "illegal_penalty", 0.0))
+
     model.train()
     step = 0
     total_loss = 0.0
@@ -641,14 +704,18 @@ def rosa_warmup(
             else:
                 legal_mask = mask_builder(batch)
 
-            valid_logits = sparse_forward(
-                model, ids, msk, legal_mask, amp_dtype, device
+            valid_logits, valid_legal = sparse_forward(
+                model, ids, msk, legal_mask, amp_dtype, device,
+                apply_legal_mask=apply_legal_mask,
             )
             valid_targets = tgt[msk]
             if valid_targets.shape[0] == 0:
                 continue
 
-            loss = F.cross_entropy(valid_logits, valid_targets)
+            loss = compute_adapter_loss(
+                valid_logits, valid_targets, valid_legal,
+                illegal_penalty=illegal_penalty,
+            )
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -711,6 +778,10 @@ def rosa_mask_generation(
         device=device,
         use_amp=use_amp,
         max_batches=args.mask_samples,
+        apply_legal_mask=not bool(
+            getattr(args, "disable_legal_mask", False)
+        ),
+        illegal_penalty=float(getattr(args, "illegal_penalty", 0.0)),
     )
 
     total_active = sum(m.sum().item() for m in masks.values())
@@ -897,6 +968,11 @@ def build_config_json(args: Any, param_count: int) -> dict[str, Any]:
         )
         if args.strategy == "unfreeze"
         else None,
+        # Legality handling
+        "disable_legal_mask": bool(
+            getattr(args, "disable_legal_mask", False)
+        ),
+        "illegal_penalty": float(getattr(args, "illegal_penalty", 0.0)),
     }
     return cfg
 
@@ -963,6 +1039,12 @@ def train(
     # fp32-range exponents and the scaler just adds per-step overhead.
     scaler = torch.amp.GradScaler() if amp_dtype == torch.float16 else None
 
+    # Legality options — default to current behavior (mask on, no penalty)
+    # when the args namespace predates these fields (e.g. callers still
+    # constructing a bare ``argparse.Namespace`` by hand).
+    apply_legal_mask = not bool(getattr(args, "disable_legal_mask", False))
+    illegal_penalty = float(getattr(args, "illegal_penalty", 0.0))
+
     # Resume
     start_epoch = 0
     best_val_loss = float("inf")
@@ -1009,6 +1091,8 @@ def train(
             device,
             amp_dtype=amp_dtype,
             precomputed_indices=val_legal_indices,
+            apply_legal_mask=apply_legal_mask,
+            illegal_penalty=illegal_penalty,
         )
         print(
             f"  loss={baseline['loss']:.4f}, top1={baseline['top1_accuracy']:.4%}, "
@@ -1022,6 +1106,8 @@ def train(
             val_loss=baseline["loss"],
             val_top1=baseline["top1_accuracy"],
             val_top5=baseline["top5_accuracy"],
+            val_illegal_pred_rate=baseline["illegal_pred_rate"],
+            val_illegal_prob_mass=baseline["illegal_prob_mass"],
         )
         val_metrics = baseline
     else:
@@ -1032,6 +1118,8 @@ def train(
             device,
             amp_dtype=amp_dtype,
             precomputed_indices=val_legal_indices,
+            apply_legal_mask=apply_legal_mask,
+            illegal_penalty=illegal_penalty,
         )
 
     # Graceful shutdown
@@ -1056,6 +1144,10 @@ def train(
     print(
         f"  Warmup: {warmup_steps} steps, LR: {args.lr}, AMP: {args.amp_dtype}"
     )
+    if not apply_legal_mask:
+        print(
+            f"  Legal-move masking DISABLED; illegal_penalty={illegal_penalty}"
+        )
 
     def _do_eval() -> dict[str, float]:
         return evaluate(
@@ -1065,6 +1157,8 @@ def train(
             device,
             amp_dtype=amp_dtype,
             precomputed_indices=val_legal_indices,
+            apply_legal_mask=apply_legal_mask,
+            illegal_penalty=illegal_penalty,
         )
 
     def _save_best(vm: dict[str, float], ep: int) -> None:
@@ -1125,11 +1219,15 @@ def train(
                 batch["legal_indices"], ids.shape[0]
             )
 
-            valid_logits = sparse_forward(
-                model, ids, msk, legal_mask, amp_dtype, device
+            valid_logits, valid_legal = sparse_forward(
+                model, ids, msk, legal_mask, amp_dtype, device,
+                apply_legal_mask=apply_legal_mask,
             )
             valid_targets = tgt[msk]
-            loss = F.cross_entropy(valid_logits, valid_targets)
+            loss = compute_adapter_loss(
+                valid_logits, valid_targets, valid_legal,
+                illegal_penalty=illegal_penalty,
+            )
 
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
@@ -1182,7 +1280,8 @@ def train(
                     f"  [eval @ step {global_step}] "
                     f"val_loss={val_metrics['loss']:.4f} "
                     f"val_top1={val_metrics['top1_accuracy']:.4%} "
-                    f"val_top5={val_metrics['top5_accuracy']:.4%}"
+                    f"val_top5={val_metrics['top5_accuracy']:.4%} "
+                    f"illegal_pred={val_metrics['illegal_pred_rate']:.2%}"
                 )
                 logger.log_train(
                     step=global_step,
@@ -1191,6 +1290,8 @@ def train(
                     val_loss=val_metrics["loss"],
                     val_top1=val_metrics["top1_accuracy"],
                     val_top5=val_metrics["top5_accuracy"],
+                    val_illegal_pred_rate=val_metrics["illegal_pred_rate"],
+                    val_illegal_prob_mass=val_metrics["illegal_prob_mass"],
                 )
                 if val_metrics["loss"] < best_val_loss:
                     best_val_loss = val_metrics["loss"]
@@ -1238,6 +1339,8 @@ def train(
             val_loss=val_metrics["loss"],
             val_top1=val_metrics["top1_accuracy"],
             val_top5=val_metrics["top5_accuracy"],
+            val_illegal_pred_rate=val_metrics.get("illegal_pred_rate", 0.0),
+            val_illegal_prob_mass=val_metrics.get("illegal_prob_mass", 0.0),
             epoch_time_s=dt,
             **report,
         )

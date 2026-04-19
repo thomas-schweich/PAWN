@@ -601,6 +601,8 @@ def generate_gradient_masks(
     device: str = "cuda",
     use_amp: bool = False,
     max_batches: int = 32,
+    apply_legal_mask: bool = True,
+    illegal_penalty: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Generate sparse masks via gradient accumulation on a warmed-up model.
 
@@ -662,13 +664,18 @@ def generate_gradient_masks(
 
         valid_legal = legal_mask[msk]
         valid_logits = valid_logits.float()
-        valid_logits.masked_fill_(~valid_legal, float("-inf"))
+        if apply_legal_mask:
+            valid_logits.masked_fill_(~valid_legal, float("-inf"))
         valid_targets = tgt[msk]
 
         if valid_targets.shape[0] == 0:
             continue
 
         loss = F.cross_entropy(valid_logits, valid_targets)
+        if illegal_penalty > 0:
+            probs = torch.softmax(valid_logits, dim=-1)
+            illegal_prob = (probs * (~valid_legal).float()).sum(dim=-1).mean()
+            loss = loss + illegal_penalty * illegal_prob
         loss.backward()
 
         # Accumulate |grad|^alpha
