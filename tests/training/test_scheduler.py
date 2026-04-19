@@ -12,7 +12,7 @@ import math
 import pytest
 import torch
 
-from pawn.trainer import CosineWithWarmup, WSDSchedule
+from pawn.trainer import ConstantWithWarmup, CosineWithWarmup, OneCycle, WSDSchedule
 
 
 def _make_optimizer(lr: float = 1e-3, n_groups: int = 1) -> torch.optim.Optimizer:
@@ -302,3 +302,114 @@ class TestWSDSchedule:
         sched2 = WSDSchedule(_make_optimizer(lr=peak), 5, 10, 50)
         sched2.load_state_dict(state)
         assert sched2.get_lr() == pytest.approx(lr_before)
+
+    def test_cosine_decay_shape(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = WSDSchedule(
+            opt, warmup_steps=10, decay_steps=20, total_steps=100,
+            decay_shape="cosine",
+        )
+        for _ in range(90):
+            sched.step()
+        # Midway through cosine decay: 0.5 * (1 + 0) = 0.5.
+        assert sched.get_lr() == pytest.approx(0.5)
+        for _ in range(10):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(0.0, abs=1e-10)
+
+    def test_unknown_decay_shape_raises(self):
+        opt = _make_optimizer()
+        with pytest.raises(ValueError, match="decay_shape"):
+            WSDSchedule(opt, 5, 10, 50, decay_shape="exponential")
+
+
+class TestConstantWithWarmup:
+    """Warmup → hold peak. No decay."""
+
+    def test_initial_lr_zero(self):
+        opt = _make_optimizer(lr=1.0)
+        ConstantWithWarmup(opt, warmup_steps=10)
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.0)
+
+    def test_warmup_linear(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = ConstantWithWarmup(opt, warmup_steps=10)
+        sched.step()
+        assert sched.get_lr() == pytest.approx(0.1)
+        for _ in range(4):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(0.5)
+
+    def test_holds_peak_forever(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = ConstantWithWarmup(opt, warmup_steps=10)
+        for _ in range(10):
+            sched.step()
+        for _ in range(10_000):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(peak)
+
+    def test_state_dict_roundtrip(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = ConstantWithWarmup(opt, warmup_steps=10)
+        for _ in range(25):
+            sched.step()
+        before = sched.get_lr()
+        state = sched.state_dict()
+        sched2 = ConstantWithWarmup(_make_optimizer(lr=peak), 10)
+        sched2.load_state_dict(state)
+        assert sched2.get_lr() == pytest.approx(before)
+
+
+class TestOneCycle:
+    """Smith one-cycle: ramp to peak → cosine decay."""
+
+    def test_initial_lr_is_low(self):
+        opt = _make_optimizer(lr=1.0)
+        OneCycle(opt, peak_step=30, total_steps=100)
+        # Initial = 1/25 = 0.04
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.04)
+
+    def test_reaches_peak_at_peak_step(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = OneCycle(opt, peak_step=30, total_steps=100)
+        for _ in range(30):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(peak)
+
+    def test_decays_to_final_floor(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = OneCycle(
+            opt, peak_step=30, total_steps=100, final_div=1e4,
+        )
+        for _ in range(100):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(1e-4, abs=1e-6)
+
+    def test_peak_step_must_be_positive(self):
+        opt = _make_optimizer()
+        with pytest.raises(ValueError, match="peak_step > 0"):
+            OneCycle(opt, peak_step=0, total_steps=100)
+
+    def test_peak_step_must_be_less_than_total(self):
+        opt = _make_optimizer()
+        with pytest.raises(ValueError, match="peak_step < total_steps"):
+            OneCycle(opt, peak_step=100, total_steps=100)
+
+    def test_state_dict_roundtrip(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = OneCycle(opt, peak_step=30, total_steps=100)
+        for _ in range(50):
+            sched.step()
+        before = sched.get_lr()
+        state = sched.state_dict()
+        sched2 = OneCycle(_make_optimizer(lr=peak), 30, 100)
+        sched2.load_state_dict(state)
+        assert sched2.get_lr() == pytest.approx(before)

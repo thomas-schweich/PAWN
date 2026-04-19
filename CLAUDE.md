@@ -148,7 +148,10 @@ uv run python scripts/train.py --run-type adapter --strategy lora \
 
 Common adapter args: `--epochs 50`, `--batch-size 64`, `--lr 3e-4`, `--patience 10`, `--val-every 1`, `--max-games 12000`, `--min-ply 10`
 
-LR schedule: `--lr-schedule cosine` (default) or `wsd` (warmup-stable-decay). WSD holds peak LR through `1 - warmup_frac - decay_frac` of training, then linearly decays over the last `--decay-frac` (default 0.1) — useful for long runs where the cosine tail visibly cuts gains short.
+LR schedule: `--lr-schedule {cosine,wsd,constant,one_cycle}`. Default `cosine`.
+- `wsd` — Warmup-Stable-Decay. Holds peak LR for `1 - warmup_frac - decay_frac` of training, then decays over the last `--decay-frac` (default 0.1). `--wsd-decay-shape {linear,cosine}` controls the tail curve.
+- `constant` — linear warmup → hold peak indefinitely. Pair with `--patience` to actually stop.
+- `one_cycle` — Smith (2018) one-cycle: ramp from `peak/25` → `peak` over `--warmup-frac` of steps (try 0.3), then cosine-decay to `peak/10000`.
 
 ### Common CLI Patterns
 

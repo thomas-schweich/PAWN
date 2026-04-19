@@ -88,9 +88,11 @@ class CosineWithWarmup:
 class WSDSchedule:
     """Warmup-Stable-Decay schedule.
 
-    Three phases: linear warmup → flat peak → linear decay. The stable
-    phase dominates the schedule, which keeps peak LR for long runs
-    where a cosine tail prematurely cuts gains.
+    Three phases: linear warmup → flat peak → linear or cosine decay.
+    The stable phase dominates the schedule, which keeps peak LR for
+    long runs where a cosine tail prematurely cuts gains.
+    ``decay_shape`` controls the decay curve (``"linear"`` or
+    ``"cosine"``).
     """
 
     def __init__(
@@ -100,12 +102,19 @@ class WSDSchedule:
         decay_steps: int,
         total_steps: int,
         min_lr_ratio: float = 0.0,
+        decay_shape: str = "linear",
     ):
+        if decay_shape not in ("linear", "cosine"):
+            raise ValueError(
+                f"Unknown decay_shape: {decay_shape!r} "
+                "(expected 'linear' or 'cosine')"
+            )
         self.optimizer = optimizer
         self.warmup_steps = warmup_steps
         self.decay_steps = decay_steps
         self.total_steps = total_steps
         self.min_lr_ratio = min_lr_ratio
+        self.decay_shape = decay_shape
         self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
         self._step = 0
         self._apply_lr(0)
@@ -127,7 +136,119 @@ class WSDSchedule:
             return 1.0
         decay_window = max(self.total_steps - stable_end, 1)
         progress = min((step - stable_end) / decay_window, 1.0)
-        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * (1.0 - progress)
+        if self.decay_shape == "linear":
+            return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * (1.0 - progress)
+        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    def get_lr(self) -> float:
+        return self.optimizer.param_groups[0]["lr"]
+
+    def state_dict(self) -> dict[str, int]:
+        return {"step": self._step}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self._step = state["step"]
+        self._apply_lr(self._step)
+
+
+class ConstantWithWarmup:
+    """Linear warmup → hold peak LR indefinitely.
+
+    Mirrors ``CosineWithWarmup``'s state-dict shape for checkpoint
+    compatibility. Pair with patience-based early stopping to actually
+    stop training.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_steps: int,
+    ):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+        self._step = 0
+        self._apply_lr(0)
+
+    def _apply_lr(self, step: int) -> None:
+        lr_scale = step / max(1, self.warmup_steps) if step < self.warmup_steps else 1.0
+        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
+            pg["lr"] = base_lr * lr_scale
+
+    def step(self) -> None:
+        self._step += 1
+        self._apply_lr(self._step)
+
+    def get_lr(self) -> float:
+        return self.optimizer.param_groups[0]["lr"]
+
+    def state_dict(self) -> dict[str, int]:
+        return {"step": self._step}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self._step = state["step"]
+        self._apply_lr(self._step)
+
+
+class OneCycle:
+    """Smith (2018) one-cycle schedule with cosine annealing.
+
+    Ramps from ``peak_lr / initial_div`` up to ``peak_lr`` over the
+    first ``peak_step`` steps, then decays cosine-wise to
+    ``peak_lr / final_div`` over the remaining steps. No separate
+    warmup phase — the ramp-up is the warmup. ``peak_step`` can be set
+    via ``warmup_steps`` at the call site (~0.3 × total_steps for the
+    canonical Smith shape).
+
+    References:
+        Smith (2018) arXiv:1803.09820.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        peak_step: int,
+        total_steps: int,
+        initial_div: float = 25.0,
+        final_div: float = 1e4,
+    ):
+        if peak_step <= 0:
+            raise ValueError("OneCycle requires peak_step > 0")
+        if peak_step >= total_steps:
+            raise ValueError("OneCycle requires peak_step < total_steps")
+        self.optimizer = optimizer
+        self.peak_step = peak_step
+        self.total_steps = total_steps
+        self.initial_frac = 1.0 / initial_div
+        self.final_frac = 1.0 / final_div
+        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+        self._step = 0
+        self._apply_lr(0)
+
+    def _apply_lr(self, step: int) -> None:
+        lr_scale = self._compute_lr_scale(step)
+        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
+            pg["lr"] = base_lr * lr_scale
+
+    def step(self) -> None:
+        self._step += 1
+        self._apply_lr(self._step)
+
+    def _compute_lr_scale(self, step: int) -> float:
+        if step <= self.peak_step:
+            progress = step / max(1, self.peak_step)
+            return self.initial_frac + (1.0 - self.initial_frac) * 0.5 * (
+                1.0 - math.cos(math.pi * progress)
+            )
+        progress = min(
+            (step - self.peak_step) / max(1, self.total_steps - self.peak_step),
+            1.0,
+        )
+        return self.final_frac + (1.0 - self.final_frac) * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
 
     def get_lr(self) -> float:
         return self.optimizer.param_groups[0]["lr"]
@@ -547,11 +668,23 @@ class CLMTrainer:
             weight_decay=train_cfg.weight_decay,
             betas=(0.9, 0.95),
         )
-        if getattr(train_cfg, "lr_schedule", "cosine") == "wsd":
+        lr_schedule = getattr(train_cfg, "lr_schedule", "cosine")
+        if lr_schedule == "wsd":
             self.scheduler = WSDSchedule(
                 self.optimizer,
                 warmup_steps=train_cfg.warmup_steps,
                 decay_steps=getattr(train_cfg, "decay_steps", 10_000),
+                total_steps=train_cfg.total_steps,
+                decay_shape=getattr(train_cfg, "wsd_decay_shape", "linear"),
+            )
+        elif lr_schedule == "constant":
+            self.scheduler = ConstantWithWarmup(
+                self.optimizer, warmup_steps=train_cfg.warmup_steps,
+            )
+        elif lr_schedule == "one_cycle":
+            self.scheduler = OneCycle(
+                self.optimizer,
+                peak_step=train_cfg.warmup_steps,
                 total_steps=train_cfg.total_steps,
             )
         else:

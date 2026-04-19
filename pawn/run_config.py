@@ -38,16 +38,26 @@ class BaseRunConfig(BaseModel):
     weight_decay: float = 0.0
     warmup_frac: float = 0.05
     warmup_steps: int | None = None  # explicit override of warmup_frac
-    # LR schedule shape. "cosine" is the classic warmup → cosine-decay
-    # curve. "wsd" (Warmup-Stable-Decay) holds peak LR through the bulk
-    # of training and only decays over the final ``decay_frac`` of
-    # steps — useful when the cosine tail appears to be leaving
-    # accuracy on the table.
-    lr_schedule: Literal["cosine", "wsd"] = "cosine"
+    # LR schedule shape:
+    #   ``"cosine"``    — classic warmup → cosine decay to 0.
+    #   ``"wsd"``       — Warmup-Stable-Decay: hold peak LR through the
+    #                     bulk of training and only decay over the
+    #                     final ``decay_frac`` of steps. Useful when
+    #                     the cosine tail is leaving accuracy on the
+    #                     table.
+    #   ``"constant"``  — linear warmup → hold peak LR indefinitely.
+    #                     Pair with ``patience`` to stop on val plateau.
+    #   ``"one_cycle"`` — Smith (2018) one-cycle: ramp up from
+    #                     peak/25 → peak over ``warmup_frac`` of steps,
+    #                     then cosine-decay to peak/10000 over the rest.
+    lr_schedule: Literal["cosine", "wsd", "constant", "one_cycle"] = "cosine"
     # Fraction of ``total_steps`` used for the WSD decay phase. Ignored
-    # when ``lr_schedule == "cosine"``. The stable phase gets
+    # when ``lr_schedule`` is not "wsd". The stable phase gets
     # ``1 - warmup_frac - decay_frac`` of the schedule.
     decay_frac: float = 0.1
+    # WSD decay-phase curve: ``"linear"`` (default) or ``"cosine"`` for
+    # a half-cosine fall. Ignored for non-WSD schedules.
+    wsd_decay_shape: Literal["linear", "cosine"] = "linear"
     max_grad_norm: float = 1.0
     patience: int | None = None
     eval_interval: int | None = None
