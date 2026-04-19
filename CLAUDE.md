@@ -148,6 +148,8 @@ uv run python scripts/train.py --run-type adapter --strategy lora \
 
 Common adapter args: `--epochs 50`, `--batch-size 64`, `--lr 3e-4`, `--patience 10`, `--val-every 1`, `--max-games 12000`, `--min-ply 10`
 
+LR schedule: `--lr-schedule cosine` (default) or `wsd` (warmup-stable-decay). WSD holds peak LR through `1 - warmup_frac - decay_frac` of training, then linearly decays over the last `--decay-frac` (default 0.1) — useful for long runs where the cosine tail visibly cuts gains short.
+
 ### Common CLI Patterns
 
 - `--sdpa-math` — force MATH SDPA backend (debugging escape hatch; not required anymore on ROCm)

@@ -85,6 +85,61 @@ class CosineWithWarmup:
         self._apply_lr(self._step)
 
 
+class WSDSchedule:
+    """Warmup-Stable-Decay schedule.
+
+    Three phases: linear warmup → flat peak → linear decay. The stable
+    phase dominates the schedule, which keeps peak LR for long runs
+    where a cosine tail prematurely cuts gains.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_steps: int,
+        decay_steps: int,
+        total_steps: int,
+        min_lr_ratio: float = 0.0,
+    ):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.decay_steps = decay_steps
+        self.total_steps = total_steps
+        self.min_lr_ratio = min_lr_ratio
+        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+        self._step = 0
+        self._apply_lr(0)
+
+    def _apply_lr(self, step: int) -> None:
+        lr_scale = self._compute_lr_scale(step)
+        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
+            pg["lr"] = base_lr * lr_scale
+
+    def step(self) -> None:
+        self._step += 1
+        self._apply_lr(self._step)
+
+    def _compute_lr_scale(self, step: int) -> float:
+        if step < self.warmup_steps:
+            return step / max(1, self.warmup_steps)
+        stable_end = max(self.warmup_steps, self.total_steps - self.decay_steps)
+        if step < stable_end:
+            return 1.0
+        decay_window = max(self.total_steps - stable_end, 1)
+        progress = min((step - stable_end) / decay_window, 1.0)
+        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * (1.0 - progress)
+
+    def get_lr(self) -> float:
+        return self.optimizer.param_groups[0]["lr"]
+
+    def state_dict(self) -> dict[str, int]:
+        return {"step": self._step}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self._step = state["step"]
+        self._apply_lr(self._step)
+
+
 def _build_action_grid_index(n_actions: int) -> list[int]:
     """Build a mapping from action token to grid index (src*64 + dst).
 
@@ -492,11 +547,19 @@ class CLMTrainer:
             weight_decay=train_cfg.weight_decay,
             betas=(0.9, 0.95),
         )
-        self.scheduler = CosineWithWarmup(
-            self.optimizer,
-            warmup_steps=train_cfg.warmup_steps,
-            total_steps=train_cfg.total_steps,
-        )
+        if getattr(train_cfg, "lr_schedule", "cosine") == "wsd":
+            self.scheduler = WSDSchedule(
+                self.optimizer,
+                warmup_steps=train_cfg.warmup_steps,
+                decay_steps=getattr(train_cfg, "decay_steps", 10_000),
+                total_steps=train_cfg.total_steps,
+            )
+        else:
+            self.scheduler = CosineWithWarmup(
+                self.optimizer,
+                warmup_steps=train_cfg.warmup_steps,
+                total_steps=train_cfg.total_steps,
+            )
         self.scaler = torch.amp.GradScaler(self.device, enabled=train_cfg.use_amp)
 
         self.dataset = CLMDataset(

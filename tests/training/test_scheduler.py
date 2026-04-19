@@ -12,7 +12,7 @@ import math
 import pytest
 import torch
 
-from pawn.trainer import CosineWithWarmup
+from pawn.trainer import CosineWithWarmup, WSDSchedule
 
 
 def _make_optimizer(lr: float = 1e-3, n_groups: int = 1) -> torch.optim.Optimizer:
@@ -246,3 +246,59 @@ class TestBaseLrsCaptured:
         sched.step()
         # scheduler uses base_lrs captured at construction (1e-3)
         assert sched.get_lr() == pytest.approx(1e-3 * 1/10)
+
+
+class TestWSDSchedule:
+    """Warmup-Stable-Decay schedule for pretraining."""
+
+    def test_step_zero_is_zero(self):
+        opt = _make_optimizer(lr=1e-3)
+        sched = WSDSchedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        assert sched.get_lr() == pytest.approx(0.0)
+
+    def test_warmup_linear(self):
+        peak = 1e-3
+        opt = _make_optimizer(lr=peak)
+        sched = WSDSchedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        sched.step()
+        assert sched.get_lr() == pytest.approx(0.1 * peak)
+        for _ in range(4):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(0.5 * peak)
+
+    def test_stable_phase_holds_peak(self):
+        peak = 1e-3
+        opt = _make_optimizer(lr=peak)
+        sched = WSDSchedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        for _ in range(10):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(peak)
+        for _ in range(40):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(peak)
+
+    def test_decay_phase_linear(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = WSDSchedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        for _ in range(80):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(peak)
+        for _ in range(10):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(0.5)
+        for _ in range(10):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(0.0, abs=1e-10)
+
+    def test_state_dict_roundtrip(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = WSDSchedule(opt, warmup_steps=5, decay_steps=10, total_steps=50)
+        for _ in range(20):
+            sched.step()
+        lr_before = sched.get_lr()
+        state = sched.state_dict()
+        sched2 = WSDSchedule(_make_optimizer(lr=peak), 5, 10, 50)
+        sched2.load_state_dict(state)
+        assert sched2.get_lr() == pytest.approx(lr_before)

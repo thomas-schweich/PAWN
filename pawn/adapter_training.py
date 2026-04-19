@@ -80,6 +80,56 @@ def cosine_warmup_schedule(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def wsd_schedule(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    decay_steps: int,
+    total_steps: int,
+    min_lr_ratio: float = 0.0,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Warmup-Stable-Decay scheduler.
+
+    Three phases:
+        [0, warmup_steps)                         – linear 0 → 1
+        [warmup_steps, total_steps - decay_steps) – flat 1 (stable)
+        [total_steps - decay_steps, total_steps]  – linear 1 → min_lr_ratio
+
+    When the stable phase is exhausted (``warmup + decay > total``) the
+    stable phase is clipped to zero and we fall back to a warmup →
+    linear-decay schedule.
+    """
+    stable_end = max(warmup_steps, total_steps - decay_steps)
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        if step < stable_end:
+            return 1.0
+        # Linear decay from 1.0 to min_lr_ratio across the decay window.
+        decay_window = max(total_steps - stable_end, 1)
+        progress = min((step - stable_end) / decay_window, 1.0)
+        return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - progress)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    schedule: str = "cosine",
+    decay_steps: int | None = None,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Dispatch ``"cosine"`` or ``"wsd"`` by name."""
+    if schedule == "cosine":
+        return cosine_warmup_schedule(optimizer, warmup_steps, total_steps)
+    if schedule == "wsd":
+        if decay_steps is None:
+            raise ValueError("WSD schedule requires decay_steps")
+        return wsd_schedule(optimizer, warmup_steps, decay_steps, total_steps)
+    raise ValueError(f"Unknown lr_schedule: {schedule!r}")
+
+
 def sparse_forward(
     model: nn.Module,
     ids: torch.Tensor,
@@ -810,7 +860,13 @@ def train(
         total_steps = args.epochs * len(train_loader)
 
     warmup_steps = args.warmup_steps if args.warmup_steps is not None else int(args.warmup_frac * total_steps)
-    scheduler = cosine_warmup_schedule(optimizer, warmup_steps, total_steps)
+    schedule = getattr(args, "lr_schedule", "cosine")
+    decay_frac = getattr(args, "decay_frac", 0.1)
+    decay_steps = int(decay_frac * total_steps) if schedule == "wsd" else None
+    scheduler = build_scheduler(
+        optimizer, warmup_steps, total_steps,
+        schedule=schedule, decay_steps=decay_steps,
+    )
     # GradScaler is only needed for fp16 (underflow risk). bf16 has
     # fp32-range exponents and the scaler just adds per-step overhead.
     scaler = torch.amp.GradScaler() if amp_dtype == torch.float16 else None

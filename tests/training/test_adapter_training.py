@@ -15,10 +15,12 @@ import torch.nn as nn
 
 from pawn.adapter_training import (
     STRATEGIES,
+    build_scheduler,
     cosine_warmup_schedule,
     load_backbone,
     parse_layers,
     sparse_forward,
+    wsd_schedule,
 )
 
 
@@ -118,6 +120,119 @@ class TestCosineWarmupSchedule:
         sched = cosine_warmup_schedule(opt, warmup_steps=0, total_steps=100)
         # step 0 is not < 0 -> cosine path immediately, progress=0, scale=1
         assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+
+
+# ---------------------------------------------------------------------------
+# wsd_schedule (warmup-stable-decay)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+class TestWSDSchedule:
+    def test_returns_lambda_lr(self):
+        opt = _make_opt()
+        sched = wsd_schedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        assert isinstance(sched, torch.optim.lr_scheduler.LambdaLR)
+
+    def test_initial_lr_is_zero(self):
+        opt = _make_opt(lr=1e-3)
+        wsd_schedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.0)
+
+    def test_warmup_ramps_linearly(self):
+        peak = 1e-3
+        opt = _make_opt(lr=peak)
+        sched = wsd_schedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        sched.step()  # step 1
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.1 * peak)
+        for _ in range(4):
+            sched.step()  # step 5
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.5 * peak)
+
+    def test_stable_phase_holds_peak(self):
+        peak = 1e-3
+        opt = _make_opt(lr=peak)
+        sched = wsd_schedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        # Walk through warmup → land in stable phase at multiple points.
+        for _ in range(10):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+        for _ in range(40):  # step 50 — still in stable (10..80)
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+        for _ in range(29):  # step 79 — still in stable
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+
+    def test_decay_phase_falls_linearly(self):
+        peak = 1.0
+        opt = _make_opt(lr=peak)
+        sched = wsd_schedule(opt, warmup_steps=10, decay_steps=20, total_steps=100)
+        # Advance to the start of decay (step 80).
+        for _ in range(80):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+        # Midway through decay (step 90): LR = 0.5 * peak.
+        for _ in range(10):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.5)
+        # End of schedule (step 100): LR = 0.
+        for _ in range(10):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.0, abs=1e-10)
+
+    def test_min_lr_ratio_floor(self):
+        opt = _make_opt(lr=1.0)
+        sched = wsd_schedule(
+            opt, warmup_steps=5, decay_steps=10, total_steps=50,
+            min_lr_ratio=0.1,
+        )
+        for _ in range(50):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.1)
+
+    def test_decay_overflow_clamps_stable(self):
+        # warmup + decay > total: stable phase clipped to zero.
+        peak = 1.0
+        opt = _make_opt(lr=peak)
+        sched = wsd_schedule(opt, warmup_steps=10, decay_steps=100, total_steps=50)
+        for _ in range(10):
+            sched.step()  # end of warmup → immediately into decay
+        # Decay window = 50 - 10 = 40 (clipped by stable_end = max(warmup, total-decay))
+        # stable_end = max(10, 50-100) = 10. So LR at step 10 is already at start of decay: 1.0.
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak)
+        for _ in range(20):  # step 30 → halfway through a 40-step decay
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# build_scheduler dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestBuildScheduler:
+    def test_cosine_dispatch(self):
+        opt = _make_opt()
+        sched = build_scheduler(opt, 10, 100, schedule="cosine")
+        assert isinstance(sched, torch.optim.lr_scheduler.LambdaLR)
+
+    def test_wsd_dispatch(self):
+        opt = _make_opt()
+        sched = build_scheduler(
+            opt, 10, 100, schedule="wsd", decay_steps=20,
+        )
+        assert isinstance(sched, torch.optim.lr_scheduler.LambdaLR)
+
+    def test_wsd_requires_decay_steps(self):
+        opt = _make_opt()
+        with pytest.raises(ValueError, match="decay_steps"):
+            build_scheduler(opt, 10, 100, schedule="wsd")
+
+    def test_unknown_schedule_raises(self):
+        opt = _make_opt()
+        with pytest.raises(ValueError, match="Unknown lr_schedule"):
+            build_scheduler(opt, 10, 100, schedule="step")
 
 
 # ---------------------------------------------------------------------------

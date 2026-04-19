@@ -84,6 +84,10 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     warmup_steps: int = 1000
     total_steps: int = 100_000
+    # LR schedule: ``"cosine"`` (default) or ``"wsd"`` (warmup-stable-decay).
+    lr_schedule: str = "cosine"
+    # WSD decay-phase length. Used only when ``lr_schedule == "wsd"``.
+    decay_steps: int = 10_000
 
     # Batch
     batch_size: int = 256
