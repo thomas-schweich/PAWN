@@ -153,6 +153,10 @@ LR schedule: `--lr-schedule {cosine,wsd,constant,one_cycle}`. Default `cosine`.
 - `constant` — linear warmup → hold peak indefinitely. Pair with `--patience` to actually stop.
 - `one_cycle` — Smith (2018) one-cycle: ramp from `peak/25` → `peak` over `--warmup-frac` of steps (try 0.3), then cosine-decay to `peak/10000`.
 
+Legal-move handling (defaults match pre-existing behavior):
+- `--disable-legal-mask` — drop the `-inf` hard mask on illegal logits and compute CE over the full 1,980-token vocabulary (same as pretraining). Useful for probing whether the adapter is leaning on the mask.
+- `--illegal-penalty λ` — adds `λ · E[P_illegal]` to the loss (mean softmax mass on illegal tokens). Only valid together with `--disable-legal-mask` — under the hard mask this term is analytically zero. Eval reports `illegal_pred_rate` / `illegal_prob_mass` in this regime.
+
 ### Common CLI Patterns
 
 - `--sdpa-math` — force MATH SDPA backend (debugging escape hatch; not required anymore on ROCm)

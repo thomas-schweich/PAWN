@@ -205,6 +205,37 @@ class AdapterConfig(BaseRunConfig):
     epochs: int = 50
     val_every: int = 1
 
+    # Legality handling ---------------------------------------------------
+    # By default, adapter training masks illegal moves to -inf before
+    # cross-entropy. Set ``disable_legal_mask=True`` to compute the loss
+    # over the full vocabulary — matching pretraining, where the model
+    # has to learn legality from scratch. This tests whether the
+    # backbone's legality understanding survives adapter finetuning.
+    disable_legal_mask: bool = False
+    # Additional penalty (lambda) on probability mass assigned to
+    # illegal moves. Added to the loss as ``illegal_penalty *
+    # mean_illegal_prob_mass``. Only meaningful when
+    # ``disable_legal_mask=True`` (otherwise illegal probability mass
+    # is zero by construction). Higher values push the model harder to
+    # keep its own legality signal intact.
+    illegal_penalty: float = 0.0
+
+    @model_validator(mode="after")
+    def _check_legality_flags(self) -> "AdapterConfig":
+        if self.illegal_penalty < 0:
+            raise ValueError(
+                f"illegal_penalty must be >= 0, got {self.illegal_penalty}"
+            )
+        if self.illegal_penalty > 0 and not self.disable_legal_mask:
+            raise ValueError(
+                "illegal_penalty > 0 has no effect while legal masking is "
+                "active (all illegal logits are -inf, so illegal prob mass "
+                "is zero by construction). Pass disable_legal_mask=True to "
+                "let the model assign probability to illegal moves and be "
+                "penalized for it."
+            )
+        return self
+
 
 class CotrainVariant(BaseModel):
     """Per-variant spec within a co-training run.

@@ -149,7 +149,14 @@ All adapter wrappers expose `forward_hidden()` (returns `(B, T, d_model)`) and `
 
 ### Legal masking via Rust engine
 
-Evaluation uses `LegalMaskBuilder` to replay games through the Rust chess engine and produce per-position legal move masks. These are scattered into a pre-allocated GPU buffer as sparse indices, avoiding dense `(B, T, V)` boolean masks.
+Training and evaluation use `LegalMaskBuilder` to replay games through the Rust chess engine and produce per-position legal move masks. These are scattered into a pre-allocated GPU buffer as sparse indices, avoiding dense `(B, T, V)` boolean masks.
+
+By default the loss is computed over legal moves only (illegal logits masked to `-inf` before cross-entropy). Two CLI flags tune this:
+
+- `--disable-legal-mask` — train without the hard mask, so the CE runs over the full 1,980-token vocabulary the same way pretraining does. Useful when you want to measure whether the adapter preserves the backbone's rule-tracking or is leaning on the mask as a crutch.
+- `--illegal-penalty λ` — when masking is disabled, add `λ · E[P_illegal]` (the expected softmax mass assigned to illegal moves, averaged over scored positions) to the loss. Illegal moves are then strictly worse than legal-but-wrong moves without being forbidden outright.
+
+Two new per-eval metrics fall out: `illegal_pred_rate` (fraction of argmax picks that are illegal) and `illegal_prob_mass` (softmax mass on illegal tokens). Both are analytically zero under the hard mask and are skipped entirely in that path to avoid a numerically unstable softmax over all-`-inf` rows.
 
 ### DataLoader worker safety
 
@@ -166,7 +173,7 @@ Each adapter exposes three helpers:
 
 ## Results Summary
 
-All results on the v1.0.0 `pawn-base` backbone (8 layers, d_model=512, 1,980-token vocab, 512-token context, no outcome prefix) trained via behavioral cloning on Lichess games with legal-move-masked cross-entropy loss. Every run streams one pass through 2M games filtered to Elo 1800-1900 with `min_ply=10`, bs=128 (bs=96 for dim=512 to fit activation memory on a 21 GB card), `lr=3e-4`, bf16 AMP, flash SDPA + `torch.compile`. FiLM and Hybrid remain in the codebase but were not part of this sweep.
+All results on the v1.0.0 `pawn-base` backbone (8 layers, d_model=512, 1,980-token vocab, 512-token context, no outcome prefix) trained via behavioral cloning on Lichess games with the default legal-move-masked cross-entropy loss (`--disable-legal-mask` / `--illegal-penalty` had not yet been added when this sweep ran). Every run streams one pass through 2M games filtered to Elo 1800-1900 with `min_ply=10`, bs=128 (bs=96 for dim=512 to fit activation memory on a 21 GB card), `lr=3e-4`, bf16 AMP, flash SDPA + `torch.compile`. FiLM and Hybrid remain in the codebase but were not part of this sweep.
 
 ### Phase 2 v2 sweep (2M games, 1800-1900 Elo, one pass)
 

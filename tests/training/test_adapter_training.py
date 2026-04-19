@@ -16,6 +16,7 @@ import torch.nn as nn
 from pawn.adapter_training import (
     STRATEGIES,
     build_scheduler,
+    compute_adapter_loss,
     constant_warmup_schedule,
     cosine_warmup_schedule,
     load_backbone,
@@ -486,8 +487,11 @@ class TestSparseForward:
         ids = torch.zeros(B, T, dtype=torch.long, device=cpu_device)
         msk = torch.ones(B, T, dtype=torch.bool, device=cpu_device)
         legal_mask = torch.ones(B, T, V, dtype=torch.bool, device=cpu_device)
-        out = sparse_forward(model, ids, msk, legal_mask, None, cpu_device)
+        out, legal = sparse_forward(
+            model, ids, msk, legal_mask, None, cpu_device
+        )
         assert out.shape == (B * T, V)
+        assert legal.shape == (B * T, V)
 
     def test_masks_illegal_with_neg_inf(self, cpu_device):
         B, T, V, D = 1, 2, 4, 2
@@ -497,7 +501,9 @@ class TestSparseForward:
         legal_mask = torch.zeros(B, T, V, dtype=torch.bool, device=cpu_device)
         # Allow only index 1
         legal_mask[..., 1] = True
-        out = sparse_forward(model, ids, msk, legal_mask, None, cpu_device)
+        out, _ = sparse_forward(
+            model, ids, msk, legal_mask, None, cpu_device
+        )
         # Indices 0,2,3 masked -> -inf
         assert torch.isinf(out[:, 0]).all()
         assert torch.isinf(out[:, 2]).all()
@@ -512,7 +518,9 @@ class TestSparseForward:
         ids = torch.zeros(B, T, dtype=torch.long, device=cpu_device)
         msk = torch.ones(B, T, dtype=torch.bool, device=cpu_device)
         legal_mask = torch.ones(B, T, V, dtype=torch.bool, device=cpu_device)
-        out = sparse_forward(model, ids, msk, legal_mask, None, cpu_device)
+        out, _ = sparse_forward(
+            model, ids, msk, legal_mask, None, cpu_device
+        )
         assert out.dtype == torch.float32
 
     def test_respects_loss_mask(self, cpu_device):
@@ -522,9 +530,146 @@ class TestSparseForward:
         ids = torch.zeros(B, T, dtype=torch.long, device=cpu_device)
         msk = torch.tensor([[True, False, True, False]], device=cpu_device)
         legal_mask = torch.ones(B, T, V, dtype=torch.bool, device=cpu_device)
-        out = sparse_forward(model, ids, msk, legal_mask, None, cpu_device)
+        out, legal = sparse_forward(
+            model, ids, msk, legal_mask, None, cpu_device
+        )
         # 2 positions pass the mask
         assert out.shape == (2, V)
+        assert legal.shape == (2, V)
+
+    def test_disable_legal_mask_keeps_illegal_logits_finite(self, cpu_device):
+        """With apply_legal_mask=False, illegal logits are NOT filled with -inf."""
+        B, T, V, D = 1, 2, 4, 2
+        model = _StubWrapper(D, V, T).to(cpu_device)
+        ids = torch.zeros(B, T, dtype=torch.long, device=cpu_device)
+        msk = torch.ones(B, T, dtype=torch.bool, device=cpu_device)
+        legal_mask = torch.zeros(B, T, V, dtype=torch.bool, device=cpu_device)
+        legal_mask[..., 1] = True
+        out, legal = sparse_forward(
+            model, ids, msk, legal_mask, None, cpu_device,
+            apply_legal_mask=False,
+        )
+        # No -inf anywhere: the model is allowed to assign probability
+        # to illegal moves and is expected to learn the distinction.
+        assert torch.isfinite(out).all()
+        # Legality tensor still reports which positions were legal.
+        assert (legal[:, 1]).all()
+        assert (~legal[:, 0]).all() and (~legal[:, 2]).all() and (~legal[:, 3]).all()
+
+
+class TestComputeAdapterLoss:
+    def _setup(self, cpu_device):
+        # Two positions, 4 vocab, target = legal index 1.
+        # Logits put half the mass on an illegal index to exercise the
+        # penalty term.
+        V = 4
+        logits = torch.tensor(
+            [[0.0, 0.0, 10.0, 0.0], [0.0, 10.0, 0.0, 0.0]],
+            device=cpu_device,
+        )
+        targets = torch.tensor([1, 1], device=cpu_device)
+        legal = torch.zeros(2, V, dtype=torch.bool, device=cpu_device)
+        legal[:, 1] = True  # only index 1 is legal
+        return logits, targets, legal
+
+    def test_penalty_zero_equals_plain_cross_entropy(self, cpu_device):
+        logits, targets, legal = self._setup(cpu_device)
+        loss = compute_adapter_loss(
+            logits, targets, legal, illegal_penalty=0.0
+        )
+        expected = nn.functional.cross_entropy(logits, targets)
+        assert torch.allclose(loss, expected)
+
+    def test_penalty_increases_loss_when_illegal_mass_present(self, cpu_device):
+        logits, targets, legal = self._setup(cpu_device)
+        base = compute_adapter_loss(
+            logits, targets, legal, illegal_penalty=0.0
+        )
+        penalized = compute_adapter_loss(
+            logits, targets, legal, illegal_penalty=1.0
+        )
+        assert penalized > base
+        # The penalty term equals lambda * mean(sum_probs_over_illegal).
+        probs = torch.softmax(logits, dim=-1)
+        illegal_mass = (probs * (~legal).float()).sum(dim=-1).mean()
+        assert torch.allclose(penalized - base, illegal_mass)
+
+    def test_penalty_scales_linearly_with_lambda(self, cpu_device):
+        logits, targets, legal = self._setup(cpu_device)
+        base = compute_adapter_loss(logits, targets, legal, illegal_penalty=0.0)
+        half = compute_adapter_loss(logits, targets, legal, illegal_penalty=0.5)
+        one = compute_adapter_loss(logits, targets, legal, illegal_penalty=1.0)
+        # Linear in lambda: (one - base) ≈ 2 * (half - base).
+        assert torch.allclose(one - base, 2 * (half - base))
+
+    def test_penalty_no_op_when_logits_are_masked_to_neg_inf(self, cpu_device):
+        """If the mask was already applied, illegal prob mass is 0, so the penalty
+        term must contribute nothing regardless of lambda."""
+        logits, targets, legal = self._setup(cpu_device)
+        logits = logits.clone()
+        logits.masked_fill_(~legal, float("-inf"))
+        base = compute_adapter_loss(logits, targets, legal, illegal_penalty=0.0)
+        penalized = compute_adapter_loss(
+            logits, targets, legal, illegal_penalty=10.0
+        )
+        assert torch.allclose(base, penalized)
+
+
+class TestAdapterConfigLegalityValidator:
+    def test_defaults(self):
+        from pawn.run_config import AdapterConfig
+
+        cfg = AdapterConfig(strategy="lora", local_checkpoints=True)
+        assert cfg.disable_legal_mask is False
+        assert cfg.illegal_penalty == 0.0
+
+    def test_penalty_without_disable_is_rejected(self):
+        from pydantic import ValidationError
+
+        from pawn.run_config import AdapterConfig
+
+        with pytest.raises(ValidationError, match="illegal_penalty"):
+            AdapterConfig(
+                strategy="lora",
+                local_checkpoints=True,
+                illegal_penalty=0.5,
+            )
+
+    def test_negative_penalty_is_rejected(self):
+        from pydantic import ValidationError
+
+        from pawn.run_config import AdapterConfig
+
+        with pytest.raises(ValidationError, match="illegal_penalty"):
+            AdapterConfig(
+                strategy="lora",
+                local_checkpoints=True,
+                disable_legal_mask=True,
+                illegal_penalty=-0.1,
+            )
+
+    def test_disable_without_penalty_ok(self):
+        from pawn.run_config import AdapterConfig
+
+        cfg = AdapterConfig(
+            strategy="lora",
+            local_checkpoints=True,
+            disable_legal_mask=True,
+        )
+        assert cfg.disable_legal_mask is True
+        assert cfg.illegal_penalty == 0.0
+
+    def test_disable_with_positive_penalty_ok(self):
+        from pawn.run_config import AdapterConfig
+
+        cfg = AdapterConfig(
+            strategy="lora",
+            local_checkpoints=True,
+            disable_legal_mask=True,
+            illegal_penalty=2.0,
+        )
+        assert cfg.disable_legal_mask is True
+        assert cfg.illegal_penalty == 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -600,9 +745,18 @@ class TestEvaluate:
         loader = [batch]
 
         metrics = evaluate(model, loader, mask_builder, cpu_device)
-        assert set(metrics.keys()) == {"loss", "top1_accuracy", "top5_accuracy"}
+        assert set(metrics.keys()) == {
+            "loss",
+            "top1_accuracy",
+            "top5_accuracy",
+            "illegal_pred_rate",
+            "illegal_prob_mass",
+        }
         assert 0.0 <= metrics["top1_accuracy"] <= 1.0
         assert 0.0 <= metrics["top5_accuracy"] <= 1.0
+        # All moves are legal in this fixture → illegal metrics are 0.
+        assert metrics["illegal_pred_rate"] == 0.0
+        assert metrics["illegal_prob_mass"] == 0.0
 
     def test_precomputed_indices_path(self, cpu_device):
         """Passing precomputed_indices triggers mask_builder.scatter with the cached tensor."""
@@ -628,7 +782,7 @@ class TestEvaluate:
         mask_builder.scatter.assert_called_once()
         args, _ = mask_builder.scatter.call_args
         assert torch.equal(args[0], cached_idx)
-        assert set(metrics.keys()) == {"loss", "top1_accuracy", "top5_accuracy"}
+        assert {"loss", "top1_accuracy", "top5_accuracy"} <= set(metrics.keys())
 
     def test_zero_valid_positions_skipped(self, cpu_device):
         """A batch with loss_mask all False contributes nothing."""
@@ -651,7 +805,187 @@ class TestEvaluate:
         }
         metrics = evaluate(model, [batch], mask_builder, cpu_device)
         # All positions skipped -> total_positions == 0 -> zeros returned
-        assert metrics == {"loss": 0.0, "top1_accuracy": 0.0, "top5_accuracy": 0.0}
+        assert metrics == {
+            "loss": 0.0,
+            "top1_accuracy": 0.0,
+            "top5_accuracy": 0.0,
+            "illegal_pred_rate": 0.0,
+            "illegal_prob_mass": 0.0,
+        }
+
+    def test_apply_legal_mask_false_tracks_illegal_metrics(self, cpu_device):
+        """When masking is off and the model argmaxes onto illegal tokens,
+        the metrics must reflect that — not silently stay zero.
+
+        This is the one path the default evaluate fixture doesn't cover:
+        previously illegal_pred_rate and illegal_prob_mass were 0 because
+        every logit went through the -inf hard mask and thus every argmax
+        was legal by construction.
+        """
+        from pawn.adapter_training import evaluate
+
+        # Hand-built wrapper whose project_head returns logits we fully
+        # control, so we can force the argmax onto an illegal index.
+        # V must be >= 5 since evaluate() computes top-5 accuracy.
+        B, T, V = 2, 1, 8
+
+        class _FixedLogits(nn.Module):
+            def __init__(self, logits: torch.Tensor):
+                super().__init__()
+                # (B, T, V): we just forward this every call.
+                self._logits = logits
+
+            def forward_hidden(self, ids: torch.Tensor) -> torch.Tensor:
+                # dummy, never read
+                return torch.zeros(
+                    ids.shape[0], ids.shape[1], 1, device=ids.device
+                )
+
+            def project_head(self, x: torch.Tensor) -> torch.Tensor:
+                # x is (N, 1) — ignore, just fan out the precomputed
+                # logits in the same flat shape evaluate() expects.
+                return self._logits.reshape(-1, V)
+
+        # Row 0: peak at illegal idx 2. Row 1: peak at legal idx 1.
+        logits = torch.zeros(B, T, V, device=cpu_device)
+        logits[0, 0, 2] = 5.0
+        logits[1, 0, 1] = 10.0
+        model = _FixedLogits(logits)
+
+        # Legal mask allows only index 1.
+        legal_mask = torch.zeros(
+            B, T, V, dtype=torch.bool, device=cpu_device
+        )
+        legal_mask[..., 1] = True
+
+        mask_builder = MagicMock()
+        mask_builder.scatter.return_value = legal_mask
+
+        # Target is the one legal index; the model's argmax on row 0
+        # lands on illegal index 2, on row 1 it lands on legal index 1.
+        batch = {
+            "input_ids": torch.zeros(B, T, dtype=torch.long),
+            "targets": torch.tensor([[1], [1]], device=cpu_device),
+            "loss_mask": torch.ones(B, T, dtype=torch.bool),
+            "legal_indices": torch.zeros(B, T, dtype=torch.long),
+        }
+
+        metrics = evaluate(
+            model, [batch], mask_builder, cpu_device,
+            apply_legal_mask=False,
+        )
+        # One of two positions argmaxed onto an illegal index.
+        assert metrics["illegal_pred_rate"] == pytest.approx(0.5)
+        # Illegal prob mass is positive (row 0 puts >99% on idx 2; row 1
+        # puts ~all on idx 1, which is legal). Expected: (softmax row0
+        # mass on idx 0/2/3) + (row 1 mass on idx 0/2/3), averaged over
+        # 2 positions.
+        probs = torch.softmax(logits.reshape(-1, V), dim=-1)
+        expected_mass = (
+            probs.masked_fill(legal_mask.reshape(-1, V), 0.0)
+            .sum(dim=-1)
+            .mean()
+            .item()
+        )
+        assert metrics["illegal_prob_mass"] == pytest.approx(
+            expected_mass, rel=1e-5
+        )
+        assert metrics["illegal_prob_mass"] > 0.0
+
+    def test_apply_legal_mask_true_skips_illegal_softmax(self, cpu_device):
+        """With hard masking on, a row with zero legal moves used to NaN
+        the softmax-based illegal_prob_mass metric. The guard short-
+        circuits and returns analytically-zero metrics instead."""
+        from pawn.adapter_training import evaluate
+
+        # V must be >= 5 for the top-5 step in evaluate().
+        B, T, V, D = 1, 1, 8, 2
+        model = _StubWrapper(D, V, T).to(cpu_device)
+
+        # Pathological: the single position has *no* legal moves. The
+        # invariant "every loss-mask position has at least one legal
+        # move" is normally enforced upstream, but the metric block
+        # must never NaN if that invariant ever cracks.
+        legal_mask = torch.zeros(
+            B, T, V, dtype=torch.bool, device=cpu_device
+        )
+        mask_builder = MagicMock()
+        mask_builder.scatter.return_value = legal_mask
+
+        batch = {
+            "input_ids": torch.zeros(B, T, dtype=torch.long),
+            "targets": torch.zeros(B, T, dtype=torch.long),
+            "loss_mask": torch.ones(B, T, dtype=torch.bool),
+            "legal_indices": torch.zeros(B, T, dtype=torch.long),
+        }
+
+        metrics = evaluate(
+            model, [batch], mask_builder, cpu_device,
+            apply_legal_mask=True,
+        )
+        # Must be exactly zero, not NaN.
+        assert metrics["illegal_pred_rate"] == 0.0
+        assert metrics["illegal_prob_mass"] == 0.0
+        assert not math.isnan(metrics["illegal_pred_rate"])
+        assert not math.isnan(metrics["illegal_prob_mass"])
+
+
+class TestBuildConfigJsonLegality:
+    """build_config_json must surface disable_legal_mask + illegal_penalty."""
+
+    def test_round_trip_default_values(self):
+        import argparse
+
+        from pawn.adapter_training import build_config_json
+
+        args = argparse.Namespace(
+            strategy="lora",
+            checkpoint="thomas-schweich/pawn-base",
+            pgn="thomas-schweich/pawn-lichess-full",
+            elo_min=None, elo_max=None, max_games=None, val_games=0,
+            total_steps=None, eval_interval=None, epochs=1,
+            batch_size=1, lr=0.0, warmup_frac=0.0, weight_decay=0.0,
+            max_grad_norm=0.0, amp_dtype="none", patience=None,
+            adapter_layers=None,
+            bottleneck_dim=None, no_adapt_attn=False, no_adapt_ffn=False,
+            lora_rank=4, lora_targets="qv", lora_ffn=False,
+            density=None, sparse_targets=None, sparse_ffn=False,
+            use_output_film=False,
+            rosa_mode=None, rosa_warmup_steps=0, mask_samples=0, grad_alpha=1,
+            d_model=None, n_layers=None, n_heads=None,
+            unfreeze_layers=None,
+            disable_legal_mask=False, illegal_penalty=0.0,
+        )
+        cfg = build_config_json(args, param_count=0)
+        assert cfg["disable_legal_mask"] is False
+        assert cfg["illegal_penalty"] == 0.0
+
+    def test_round_trip_nondefault_values(self):
+        import argparse
+
+        from pawn.adapter_training import build_config_json
+
+        args = argparse.Namespace(
+            strategy="lora",
+            checkpoint="thomas-schweich/pawn-base",
+            pgn="thomas-schweich/pawn-lichess-full",
+            elo_min=None, elo_max=None, max_games=None, val_games=0,
+            total_steps=None, eval_interval=None, epochs=1,
+            batch_size=1, lr=0.0, warmup_frac=0.0, weight_decay=0.0,
+            max_grad_norm=0.0, amp_dtype="none", patience=None,
+            adapter_layers=None,
+            bottleneck_dim=None, no_adapt_attn=False, no_adapt_ffn=False,
+            lora_rank=4, lora_targets="qv", lora_ffn=False,
+            density=None, sparse_targets=None, sparse_ffn=False,
+            use_output_film=False,
+            rosa_mode=None, rosa_warmup_steps=0, mask_samples=0, grad_alpha=1,
+            d_model=None, n_layers=None, n_heads=None,
+            unfreeze_layers=None,
+            disable_legal_mask=True, illegal_penalty=0.75,
+        )
+        cfg = build_config_json(args, param_count=0)
+        assert cfg["disable_legal_mask"] is True
+        assert cfg["illegal_penalty"] == 0.75
 
 
 # ---------------------------------------------------------------------------
