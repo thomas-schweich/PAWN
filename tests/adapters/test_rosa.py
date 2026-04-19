@@ -429,3 +429,52 @@ class TestGenerateGradientMasks:
             # sparse_enabled and requires_grad should be restored to original state
             assert not module.sparse_enabled
             assert not module.delta.requires_grad
+
+    def test_honors_disable_legal_mask_and_illegal_penalty(self, toy_backbone):
+        """Phase 2 mask generation must accept the two legality flags and
+        still produce well-shaped masks at the target density.
+
+        This is a smoke test — it doesn't claim the masks are
+        *different* from the default, only that the code path runs and
+        the invariants (shape, density, restored module state) still
+        hold when the gradient loss is computed over the unmasked
+        logits plus an illegal-mass penalty.
+        """
+        model = RoSACLM(toy_backbone, rank=4, attn_targets="qv")
+        d_model = CLMConfig.toy().d_model
+        density = 0.05
+
+        # Deterministic data so we're not chasing nondeterminism.
+        torch.manual_seed(0)
+        batches = []
+        for _ in range(3):
+            batches.append({
+                "input_ids": torch.randint(0, 1968, (2, 16)),
+                "targets": torch.randint(0, 1968, (2, 16)),
+                "loss_mask": torch.ones(2, 16, dtype=torch.bool),
+            })
+
+        masks = generate_gradient_masks(
+            model, batches, SimpleMaskBuilder(),
+            density=density, alpha=2,
+            device="cpu", use_amp=False, max_batches=3,
+            apply_legal_mask=False,
+            illegal_penalty=5.0,
+        )
+        rosa_keys = [k for k, _ in model._rosa_modules()]
+        assert set(masks.keys()) == set(rosa_keys)
+        for key, mask in masks.items():
+            assert mask.shape == (d_model, d_model)
+            assert mask.dtype == torch.bool
+            actual_density = mask.float().mean().item()
+            assert abs(actual_density - density) < 0.02, (
+                f"{key}: expected density ~{density}, got {actual_density}"
+            )
+
+        # State must be restored — same invariant as the default path.
+        for _, module in model._rosa_modules():
+            assert torch.allclose(
+                module.delta, torch.zeros_like(module.delta)
+            )
+            assert not module.sparse_enabled
+            assert not module.delta.requires_grad

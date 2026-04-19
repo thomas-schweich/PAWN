@@ -671,11 +671,16 @@ def generate_gradient_masks(
         if valid_targets.shape[0] == 0:
             continue
 
+        # Shared helper avoids duplicating the softmax/masked-sum
+        # formulation and keeps the illegal-mass semantics aligned
+        # with the adapter training loop.
+        from pawn.adapter_training import illegal_probability_mass
+
         loss = F.cross_entropy(valid_logits, valid_targets)
         if illegal_penalty > 0:
-            probs = torch.softmax(valid_logits, dim=-1)
-            illegal_prob = (probs * (~valid_legal).float()).sum(dim=-1).mean()
-            loss = loss + illegal_penalty * illegal_prob
+            loss = loss + illegal_penalty * illegal_probability_mass(
+                valid_logits, valid_legal
+            )
         loss.backward()
 
         # Accumulate |grad|^alpha

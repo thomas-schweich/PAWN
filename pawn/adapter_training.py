@@ -252,6 +252,25 @@ def sparse_forward(
     return valid_logits, valid_legal
 
 
+def illegal_probability_mass(
+    valid_logits: torch.Tensor,
+    valid_legal: torch.Tensor,
+) -> torch.Tensor:
+    """Mean (over positions) of the softmax mass landing on illegal moves.
+
+    Returns a scalar tensor on the same device as the inputs.
+
+    .. warning::
+       If ``valid_logits`` has been masked with ``-inf`` at every
+       position in a row (all-illegal), ``torch.softmax`` produces NaN.
+       Callers that apply the hard legal mask upstream should
+       short-circuit instead of calling this — the answer is
+       analytically zero and the softmax is undefined.
+    """
+    probs = torch.softmax(valid_logits, dim=-1)
+    return probs.masked_fill(valid_legal, 0.0).sum(dim=-1).mean()
+
+
 def compute_adapter_loss(
     valid_logits: torch.Tensor,
     valid_targets: torch.Tensor,
@@ -269,9 +288,9 @@ def compute_adapter_loss(
     """
     loss = F.cross_entropy(valid_logits, valid_targets)
     if illegal_penalty > 0:
-        probs = torch.softmax(valid_logits, dim=-1)
-        illegal_prob = (probs * (~valid_legal).float()).sum(dim=-1).mean()
-        loss = loss + illegal_penalty * illegal_prob
+        loss = loss + illegal_penalty * illegal_probability_mass(
+            valid_logits, valid_legal
+        )
     return loss
 
 
@@ -290,9 +309,19 @@ def evaluate(
     total_loss = 0.0
     total_top1 = 0.0
     total_top5 = 0.0
-    total_illegal_pred = 0.0
-    total_illegal_mass = 0.0
     total_positions = 0
+
+    # Legality diagnostics. When the hard mask is applied upstream,
+    # illegal logits are ``-inf``: the argmax is always legal and the
+    # softmax mass on illegal positions is analytically zero. We
+    # short-circuit that path both to avoid wasted work and because
+    # ``softmax`` over an all-``-inf`` row (possible if a position has
+    # zero legal moves) would NaN and poison the metric. When the mask
+    # is off we track the metrics on-GPU and sync once at the end —
+    # the training loop already does this for speed on ROCm.
+    track_illegal = not apply_legal_mask
+    illegal_pred_count = torch.zeros((), device=device)
+    illegal_mass_sum = torch.zeros((), device=device)
 
     for i, batch in enumerate(dataloader):
         ids = batch["input_ids"].to(device, non_blocking=True)
@@ -333,19 +362,20 @@ def evaluate(
             .item()
         )
 
-        # Legality diagnostics. When the mask is applied, illegal
-        # logits are -inf, so both rates are zero — the metric still
-        # gets logged for uniformity.
-        pred_legal = valid_legal.gather(1, preds.unsqueeze(-1)).squeeze(-1)
-        illegal_pred_rate = (~pred_legal).float().mean().item()
-        probs = torch.softmax(valid_logits, dim=-1)
-        illegal_mass = (probs * (~valid_legal).float()).sum(dim=-1).mean().item()
+        if track_illegal:
+            pred_legal = valid_legal.gather(1, preds.unsqueeze(-1)).squeeze(-1)
+            illegal_pred_count += (~pred_legal).sum()
+            # ``illegal_probability_mass`` returns the per-batch mean;
+            # re-weight by ``n_pos`` so the final division by
+            # ``total_positions`` gives a correct overall mean even
+            # when batches have different sizes.
+            illegal_mass_sum += illegal_probability_mass(
+                valid_logits, valid_legal
+            ) * n_pos
 
         total_loss += loss.item() * n_pos
         total_top1 += top1 * n_pos
         total_top5 += top5_acc * n_pos
-        total_illegal_pred += illegal_pred_rate * n_pos
-        total_illegal_mass += illegal_mass * n_pos
         total_positions += n_pos
 
     if total_positions == 0:
@@ -356,12 +386,21 @@ def evaluate(
             "illegal_pred_rate": 0.0,
             "illegal_prob_mass": 0.0,
         }
+
+    if track_illegal:
+        illegal_pred_rate = (illegal_pred_count / total_positions).item()
+        illegal_prob_mass = (illegal_mass_sum / total_positions).item()
+    else:
+        # Analytically zero under hard masking; see note above.
+        illegal_pred_rate = 0.0
+        illegal_prob_mass = 0.0
+
     return {
         "loss": total_loss / total_positions,
         "top1_accuracy": total_top1 / total_positions,
         "top5_accuracy": total_top5 / total_positions,
-        "illegal_pred_rate": total_illegal_pred / total_positions,
-        "illegal_prob_mass": total_illegal_mass / total_positions,
+        "illegal_pred_rate": illegal_pred_rate,
+        "illegal_prob_mass": illegal_prob_mass,
     }
 
 

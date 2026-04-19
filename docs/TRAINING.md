@@ -112,7 +112,7 @@ uv run python scripts/train.py --run-type adapter --strategy bottleneck \
 - **LR schedule**: cosine with 5% warmup
 - **Min ply**: 10 (games shorter than 10 plies are skipped)
 - **Max games**: 12,000 train + 2,000 validation
-- **Legal masking**: move legality enforced via the Rust engine at every position
+- **Legal masking**: by default, illegal-move logits are filled with `-inf` before cross-entropy so the loss sees only legal moves. Disable with `--disable-legal-mask` to train under the same full-vocabulary loss used for pretraining, optionally paired with `--illegal-penalty λ` to add `λ · E[P_illegal]` to the loss — a softer legality signal that forces the adapter to preserve the backbone's own rule-tracking ability rather than lean on a hard mask.
 
 ### Resuming adapter training
 

@@ -813,6 +813,180 @@ class TestEvaluate:
             "illegal_prob_mass": 0.0,
         }
 
+    def test_apply_legal_mask_false_tracks_illegal_metrics(self, cpu_device):
+        """When masking is off and the model argmaxes onto illegal tokens,
+        the metrics must reflect that — not silently stay zero.
+
+        This is the one path the default evaluate fixture doesn't cover:
+        previously illegal_pred_rate and illegal_prob_mass were 0 because
+        every logit went through the -inf hard mask and thus every argmax
+        was legal by construction.
+        """
+        from pawn.adapter_training import evaluate
+
+        # Hand-built wrapper whose project_head returns logits we fully
+        # control, so we can force the argmax onto an illegal index.
+        # V must be >= 5 since evaluate() computes top-5 accuracy.
+        B, T, V = 2, 1, 8
+
+        class _FixedLogits(nn.Module):
+            def __init__(self, logits: torch.Tensor):
+                super().__init__()
+                # (B, T, V): we just forward this every call.
+                self._logits = logits
+
+            def forward_hidden(self, ids: torch.Tensor) -> torch.Tensor:
+                # dummy, never read
+                return torch.zeros(
+                    ids.shape[0], ids.shape[1], 1, device=ids.device
+                )
+
+            def project_head(self, x: torch.Tensor) -> torch.Tensor:
+                # x is (N, 1) — ignore, just fan out the precomputed
+                # logits in the same flat shape evaluate() expects.
+                return self._logits.reshape(-1, V)
+
+        # Row 0: peak at illegal idx 2. Row 1: peak at legal idx 1.
+        logits = torch.zeros(B, T, V, device=cpu_device)
+        logits[0, 0, 2] = 5.0
+        logits[1, 0, 1] = 10.0
+        model = _FixedLogits(logits)
+
+        # Legal mask allows only index 1.
+        legal_mask = torch.zeros(
+            B, T, V, dtype=torch.bool, device=cpu_device
+        )
+        legal_mask[..., 1] = True
+
+        mask_builder = MagicMock()
+        mask_builder.scatter.return_value = legal_mask
+
+        # Target is the one legal index; the model's argmax on row 0
+        # lands on illegal index 2, on row 1 it lands on legal index 1.
+        batch = {
+            "input_ids": torch.zeros(B, T, dtype=torch.long),
+            "targets": torch.tensor([[1], [1]], device=cpu_device),
+            "loss_mask": torch.ones(B, T, dtype=torch.bool),
+            "legal_indices": torch.zeros(B, T, dtype=torch.long),
+        }
+
+        metrics = evaluate(
+            model, [batch], mask_builder, cpu_device,
+            apply_legal_mask=False,
+        )
+        # One of two positions argmaxed onto an illegal index.
+        assert metrics["illegal_pred_rate"] == pytest.approx(0.5)
+        # Illegal prob mass is positive (row 0 puts >99% on idx 2; row 1
+        # puts ~all on idx 1, which is legal). Expected: (softmax row0
+        # mass on idx 0/2/3) + (row 1 mass on idx 0/2/3), averaged over
+        # 2 positions.
+        probs = torch.softmax(logits.reshape(-1, V), dim=-1)
+        expected_mass = (
+            probs.masked_fill(legal_mask.reshape(-1, V), 0.0)
+            .sum(dim=-1)
+            .mean()
+            .item()
+        )
+        assert metrics["illegal_prob_mass"] == pytest.approx(
+            expected_mass, rel=1e-5
+        )
+        assert metrics["illegal_prob_mass"] > 0.0
+
+    def test_apply_legal_mask_true_skips_illegal_softmax(self, cpu_device):
+        """With hard masking on, a row with zero legal moves used to NaN
+        the softmax-based illegal_prob_mass metric. The guard short-
+        circuits and returns analytically-zero metrics instead."""
+        from pawn.adapter_training import evaluate
+
+        # V must be >= 5 for the top-5 step in evaluate().
+        B, T, V, D = 1, 1, 8, 2
+        model = _StubWrapper(D, V, T).to(cpu_device)
+
+        # Pathological: the single position has *no* legal moves. The
+        # invariant "every loss-mask position has at least one legal
+        # move" is normally enforced upstream, but the metric block
+        # must never NaN if that invariant ever cracks.
+        legal_mask = torch.zeros(
+            B, T, V, dtype=torch.bool, device=cpu_device
+        )
+        mask_builder = MagicMock()
+        mask_builder.scatter.return_value = legal_mask
+
+        batch = {
+            "input_ids": torch.zeros(B, T, dtype=torch.long),
+            "targets": torch.zeros(B, T, dtype=torch.long),
+            "loss_mask": torch.ones(B, T, dtype=torch.bool),
+            "legal_indices": torch.zeros(B, T, dtype=torch.long),
+        }
+
+        metrics = evaluate(
+            model, [batch], mask_builder, cpu_device,
+            apply_legal_mask=True,
+        )
+        # Must be exactly zero, not NaN.
+        assert metrics["illegal_pred_rate"] == 0.0
+        assert metrics["illegal_prob_mass"] == 0.0
+        assert not math.isnan(metrics["illegal_pred_rate"])
+        assert not math.isnan(metrics["illegal_prob_mass"])
+
+
+class TestBuildConfigJsonLegality:
+    """build_config_json must surface disable_legal_mask + illegal_penalty."""
+
+    def test_round_trip_default_values(self):
+        import argparse
+
+        from pawn.adapter_training import build_config_json
+
+        args = argparse.Namespace(
+            strategy="lora",
+            checkpoint="thomas-schweich/pawn-base",
+            pgn="thomas-schweich/pawn-lichess-full",
+            elo_min=None, elo_max=None, max_games=None, val_games=0,
+            total_steps=None, eval_interval=None, epochs=1,
+            batch_size=1, lr=0.0, warmup_frac=0.0, weight_decay=0.0,
+            max_grad_norm=0.0, amp_dtype="none", patience=None,
+            adapter_layers=None,
+            bottleneck_dim=None, no_adapt_attn=False, no_adapt_ffn=False,
+            lora_rank=4, lora_targets="qv", lora_ffn=False,
+            density=None, sparse_targets=None, sparse_ffn=False,
+            use_output_film=False,
+            rosa_mode=None, rosa_warmup_steps=0, mask_samples=0, grad_alpha=1,
+            d_model=None, n_layers=None, n_heads=None,
+            unfreeze_layers=None,
+            disable_legal_mask=False, illegal_penalty=0.0,
+        )
+        cfg = build_config_json(args, param_count=0)
+        assert cfg["disable_legal_mask"] is False
+        assert cfg["illegal_penalty"] == 0.0
+
+    def test_round_trip_nondefault_values(self):
+        import argparse
+
+        from pawn.adapter_training import build_config_json
+
+        args = argparse.Namespace(
+            strategy="lora",
+            checkpoint="thomas-schweich/pawn-base",
+            pgn="thomas-schweich/pawn-lichess-full",
+            elo_min=None, elo_max=None, max_games=None, val_games=0,
+            total_steps=None, eval_interval=None, epochs=1,
+            batch_size=1, lr=0.0, warmup_frac=0.0, weight_decay=0.0,
+            max_grad_norm=0.0, amp_dtype="none", patience=None,
+            adapter_layers=None,
+            bottleneck_dim=None, no_adapt_attn=False, no_adapt_ffn=False,
+            lora_rank=4, lora_targets="qv", lora_ffn=False,
+            density=None, sparse_targets=None, sparse_ffn=False,
+            use_output_film=False,
+            rosa_mode=None, rosa_warmup_steps=0, mask_samples=0, grad_alpha=1,
+            d_model=None, n_layers=None, n_heads=None,
+            unfreeze_layers=None,
+            disable_legal_mask=True, illegal_penalty=0.75,
+        )
+        cfg = build_config_json(args, param_count=0)
+        assert cfg["disable_legal_mask"] is True
+        assert cfg["illegal_penalty"] == 0.75
+
 
 # ---------------------------------------------------------------------------
 # Comparison: cosine_warmup_schedule vs CosineWithWarmup
