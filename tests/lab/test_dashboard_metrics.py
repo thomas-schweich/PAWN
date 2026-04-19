@@ -14,8 +14,12 @@ from pawn.dashboard.metrics import (
     detect_run_type,
     get_run_hostname,
     get_run_meta,
+    list_trials,
     load_metrics,
+    load_notes,
     load_runs,
+    notes_path,
+    save_notes,
 )
 
 
@@ -85,6 +89,45 @@ class TestLoadRuns:
         result = load_runs(tmp_path, max_age_hours=0)
         assert result == ["newest", "middle", "oldest"]
 
+    def test_discovers_nested_trials(self, tmp_path):
+        _write_run(tmp_path, "trial_0001/run_a", [{"type": "config"}])
+        _write_run(tmp_path, "trial_0001/run_b", [{"type": "config"}])
+        _write_run(tmp_path, "trial_0002/run_c", [{"type": "config"}])
+        result = load_runs(tmp_path, max_age_hours=0)
+        assert set(result) == {"trial_0001/run_a", "trial_0001/run_b", "trial_0002/run_c"}
+
+    def test_mixes_flat_and_nested(self, tmp_path):
+        _write_run(tmp_path, "flat_run", [{"type": "config"}])
+        _write_run(tmp_path, "trial_0001/nested_run", [{"type": "config"}])
+        result = load_runs(tmp_path, max_age_hours=0)
+        assert set(result) == {"flat_run", "trial_0001/nested_run"}
+
+    def test_checkpoints_subdir_does_not_trigger_false_discovery(self, tmp_path):
+        # A normal run has a checkpoints/ dir sitting alongside metrics.jsonl;
+        # it should never be treated as its own run.
+        _write_run(tmp_path, "run_a", [{"type": "config"}])
+        (tmp_path / "run_a" / "checkpoints").mkdir()
+        (tmp_path / "run_a" / "checkpoints" / "model.bin").write_bytes(b"x")
+        result = load_runs(tmp_path, max_age_hours=0)
+        assert result == ["run_a"]
+
+
+class TestListTrials:
+    def test_empty_dir_returns_empty(self, tmp_path):
+        assert list_trials(tmp_path) == []
+
+    def test_flat_runs_only_returns_empty(self, tmp_path):
+        _write_run(tmp_path, "run_a", [{"type": "config"}])
+        _write_run(tmp_path, "run_b", [{"type": "config"}])
+        assert list_trials(tmp_path) == []
+
+    def test_returns_trial_dirs_sorted_newest_first(self, tmp_path):
+        now = time.time()
+        _write_run(tmp_path, "trial_0001/run_a", [{"type": "config"}], mtime=now - 500)
+        _write_run(tmp_path, "trial_0002/run_b", [{"type": "config"}], mtime=now - 50)
+        _write_run(tmp_path, "trial_0003/run_c", [{"type": "config"}], mtime=now)
+        assert list_trials(tmp_path) == ["trial_0003", "trial_0002", "trial_0001"]
+
 
 # =====================================================================
 # get_run_meta / get_run_hostname
@@ -135,6 +178,54 @@ class TestGetRunMeta:
 # =====================================================================
 # load_metrics
 # =====================================================================
+
+
+class TestLoadMetricsNested:
+    def test_load_metrics_round_trips_nested_path(self, tmp_path):
+        _write_run(tmp_path, "trial_0001/run_x", [
+            {"type": "config", "variant": "base"},
+            {"type": "train", "step": 0},
+        ])
+        m = load_metrics(tmp_path, "trial_0001/run_x")
+        assert len(m["train"]) == 1
+        assert m["config"][0]["variant"] == "base"
+
+    def test_get_run_meta_round_trips_nested_path(self, tmp_path):
+        _write_run(tmp_path, "trial_0001/run_x", [
+            {"type": "config", "hostname": "h", "slug": "s", "variant": "v"},
+        ])
+        meta = get_run_meta(tmp_path, "trial_0001/run_x")
+        assert meta == {"hostname": "h", "slug": "s", "variant": "v"}
+
+
+class TestNotes:
+    def test_notes_path_for_flat_run(self, tmp_path):
+        path = notes_path(tmp_path, "run_a")
+        assert path == tmp_path / "run_a" / "notes.md"
+
+    def test_notes_path_for_nested_trial(self, tmp_path):
+        # Trial-scoped notes: every run under trial_0001 shares this file.
+        assert notes_path(tmp_path, "trial_0001/run_a") == tmp_path / "trial_0001" / "notes.md"
+        assert notes_path(tmp_path, "trial_0001/run_b") == tmp_path / "trial_0001" / "notes.md"
+
+    def test_load_notes_missing_returns_empty(self, tmp_path):
+        assert load_notes(tmp_path, "run_a") == ""
+
+    def test_save_then_load_round_trips(self, tmp_path):
+        _write_run(tmp_path, "run_a", [{"type": "config"}])
+        save_notes(tmp_path, "run_a", "Hello world.")
+        assert load_notes(tmp_path, "run_a") == "Hello world."
+
+    def test_save_creates_parent_dir(self, tmp_path):
+        # No run dir yet — save must still work (e.g. trial exists, run not discovered yet).
+        save_notes(tmp_path, "trial_0001/run_a", "notes")
+        assert (tmp_path / "trial_0001" / "notes.md").read_text() == "notes"
+
+    def test_trial_notes_shared_across_runs(self, tmp_path):
+        _write_run(tmp_path, "trial_0001/run_a", [{"type": "config"}])
+        _write_run(tmp_path, "trial_0001/run_b", [{"type": "config"}])
+        save_notes(tmp_path, "trial_0001/run_a", "shared notes")
+        assert load_notes(tmp_path, "trial_0001/run_b") == "shared notes"
 
 
 class TestLoadMetrics:

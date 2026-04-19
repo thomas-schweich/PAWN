@@ -298,6 +298,43 @@ def _aggregate_cotrain_metrics(trial: Trial) -> None:
             break
 
 
+def fit_power_law(xs: list[float], ys: list[float]) -> dict[str, float] | None:
+    """Fit ``y = A * x^b`` via OLS on ``(log x, log y)``.
+
+    Points with ``x <= 0`` or ``y <= 0`` are dropped — ``log`` is undefined
+    there. Returns ``None`` if fewer than 3 usable points remain or the
+    log-x series has zero variance (fit is undetermined).
+
+    The returned dict carries the raw fit parameters (``exponent`` = b,
+    ``prefactor`` = A) plus the scale-invariant summary statistic
+    ``x_ratio_to_halve = 2^(-1/b)`` — how many times the x-value must
+    multiply to halve y. For a decaying series (b < 0) this is > 1; for
+    b >= 0 the key is omitted because y is not decaying.
+    """
+    pts = [(x, y) for x, y in zip(xs, ys) if x > 0 and y > 0]
+    if len(pts) < 3:
+        return None
+    log_xs = [math.log(x) for x, _ in pts]
+    log_ys = [math.log(y) for _, y in pts]
+    n = len(pts)
+    mean_lx = sum(log_xs) / n
+    mean_ly = sum(log_ys) / n
+    num = sum((lx - mean_lx) * (ly - mean_ly) for lx, ly in zip(log_xs, log_ys))
+    den = sum((lx - mean_lx) ** 2 for lx in log_xs)
+    if den <= 0:
+        return None
+    exponent = num / den
+    log_prefactor = mean_ly - exponent * mean_lx
+    result: dict[str, float] = {
+        "exponent": exponent,
+        "prefactor": math.exp(log_prefactor),
+        "n_points": float(n),
+    }
+    if exponent < 0:
+        result["x_ratio_to_halve"] = 2.0 ** (-1.0 / exponent)
+    return result
+
+
 def _read_val_forfeit_summary(metrics_path: Path) -> dict[str, Any] | None:
     """Scan a single metrics.jsonl for forfeit / game-completion stats.
 
@@ -357,51 +394,39 @@ def _read_val_forfeit_summary(metrics_path: Path) -> dict[str, Any] | None:
     n = len(steps)
     if n >= 4:
         half = n // 2
-        xs = steps[half:]
-        ys = forfeit_rates[half:]
-        # Only fit on strictly positive forfeit rates
-        pos = [(x, y) for x, y in zip(xs, ys) if y > 0]
-        if len(pos) >= 3:
-            xs_f = [float(x) for x, _ in pos]
-            ys_log = [math.log(y) for _, y in pos]
-            n_pts = len(xs_f)
-            mean_x = sum(xs_f) / n_pts
-            mean_y = sum(ys_log) / n_pts
-            num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs_f, ys_log))
-            den = sum((x - mean_x) ** 2 for x in xs_f)
-            if den > 0:
-                slope = num / den
-                half_life = math.log(2) / abs(slope) if slope != 0 else None
-                summary["forfeit_fit"] = {
-                    "slope_per_step": slope,
-                    "half_life_steps": half_life,
-                    "n_points": n_pts,
-                    "current_forfeit": forfeit_rates[-1],
-                }
+        xs = [float(x) for x in steps[half:]]
+        ys = [float(y) for y in forfeit_rates[half:]]
+        fit = fit_power_law(xs, ys)
+        if fit is not None:
+            fit["n_points"] = int(fit["n_points"])
+            fit["current_forfeit"] = forfeit_rates[-1]
+            summary["forfeit_fit"] = fit
 
     return summary
 
 
 def read_pretrain_val_summary(trial: Trial) -> dict[str, Any] | None:
     """Scan the trial's metrics.jsonl for the latest pretraining val record
-    and compute a log-linear fit on forfeit rate over the most recent half
+    and compute a power-law fit on forfeit rate over the most recent half
     of the history.
 
     Returns a dict with:
         latest: the latest val record's key fields (game_completion_rate,
             avg_plies_completed, forfeit min/max/median, legal, late_legal,
             val_loss, step)
-        forfeit_fit: {slope_per_step, half_life_steps, n_points,
-            current_forfeit} computed from the most recent half of the
-            (step, forfeit_rate) series — matches the dashboard's
-            log-linear fit. The OLS itself is restricted to strictly
-            positive forfeit rates (log(0) would blow up), but
-            `current_forfeit` is always the last observed forfeit rate
-            from the full series — including 0.0 if the most recent eval
-            had no forfeits. Omitted if fewer than 4 val records have
-            game_completion_rate (not a pretraining run or too early),
-            or if fewer than 3 positive-forfeit points land in the
-            half-window.
+        forfeit_fit: {exponent, prefactor, x_ratio_to_halve, n_points,
+            current_forfeit} — OLS on ``(log step, log forfeit_rate)``
+            over the most recent half of the series. Matches the
+            dashboard's log-log fit. ``exponent`` is the power-law b
+            (negative = decaying), ``prefactor`` is A in
+            ``forfeit = A * step^b``, and ``x_ratio_to_halve`` is the
+            multiplicative step ratio needed to halve the forfeit rate
+            (only set when b < 0). ``current_forfeit`` is the last
+            observed forfeit rate from the full series — including 0.0
+            if the most recent eval had no forfeits. Omitted if fewer
+            than 4 val records have game_completion_rate (not a
+            pretraining run or too early), or if fewer than 3
+            positive-forfeit points land in the half-window.
 
     Returns None if no val records are available.
     """
@@ -411,7 +436,7 @@ def read_pretrain_val_summary(trial: Trial) -> dict[str, Any] | None:
 
 
 def read_cotrain_val_summary(trial: Trial) -> dict[str, Any] | None:
-    """Per-variant forfeit / log-linear summary for a cotrain trial.
+    """Per-variant forfeit / power-law summary for a cotrain trial.
 
     Returns ``{"variants": {name: summary, ...}}`` where each variant
     summary matches the shape of :func:`read_pretrain_val_summary` —

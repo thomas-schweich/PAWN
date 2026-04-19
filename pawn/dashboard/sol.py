@@ -16,7 +16,16 @@ from pathlib import Path
 import solara
 
 from . import charts, theme
-from .metrics import detect_run_type, get_run_meta, load_metrics, load_runs, sync_hf_metrics
+from .metrics import (
+    detect_run_type,
+    get_run_meta,
+    list_trials,
+    load_metrics,
+    load_notes,
+    load_runs,
+    save_notes,
+    sync_hf_metrics,
+)
 
 # ---------------------------------------------------------------------------
 # Global reactive state
@@ -29,11 +38,19 @@ _default_log_dir = Path(
     )
 )
 
+ALL_TRIALS = "(all)"
+
 log_dir = solara.reactive(_default_log_dir)
+selected_trial = solara.reactive(ALL_TRIALS)
 selected_run = solara.reactive("")
+compare_run = solara.reactive("")
 metrics_tick = solara.reactive(0)
 runner_output = solara.reactive("")
 runner_pid = solara.reactive(0)
+# Per-chart axis-log overrides. Keyed by a stable chart id (the title text);
+# values are ``(x_log, y_log)`` tuples. Missing keys mean "use the chart's
+# built-in default" (log-log for loss/perplexity, linear for accuracy, etc.).
+chart_axis_overrides: solara.Reactive[dict[str, tuple[bool, bool]]] = solara.reactive({})
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -309,6 +326,44 @@ html, body,
   white-space: pre-wrap;
   line-height: 1.55;
 }}
+.pawn-axis-toggles {{
+  display: inline-flex;
+  gap: 4px;
+  margin-left: auto;
+  align-items: center;
+}}
+.pawn-chart-head {{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}}
+.pawn-chart-head .pawn-desc {{ margin: 0; }}
+.pawn-axis-btn.v-btn {{
+  min-width: 0 !important;
+  height: 22px !important;
+  padding: 0 9px !important;
+  border-radius: 6px !important;
+  font-family: {theme.FONT_MONO};
+  font-size: 10.5px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0.03em !important;
+  color: var(--pawn-text-muted) !important;
+  background: rgba(148,163,184,0.06) !important;
+  border: 1px solid var(--pawn-border) !important;
+  text-transform: none !important;
+  box-shadow: none !important;
+  transition: all 120ms ease;
+}}
+.pawn-axis-btn.v-btn:hover {{
+  color: var(--pawn-text) !important;
+  border-color: var(--pawn-border-strong) !important;
+}}
+.pawn-axis-btn.v-btn.active {{
+  color: {theme.SKY} !important;
+  background: color-mix(in srgb, {theme.SKY} 14%, transparent) !important;
+  border-color: color-mix(in srgb, {theme.SKY} 45%, transparent) !important;
+}}
 .pawn-cmd-preview {{
   background: #07090f;
   border: 1px solid var(--pawn-border);
@@ -326,6 +381,61 @@ html, body,
 @solara.component
 def InjectStyle():
     solara.Style(GLOBAL_CSS)
+
+
+# ---------------------------------------------------------------------------
+# Plotly autoresize shim
+# ---------------------------------------------------------------------------
+#
+# ``solara.FigurePlotly`` ships figures with ``autosize=True`` but plotly only
+# honours that at the initial mount. When a chart is later placed in a wider
+# container (e.g. because we filter an empty sibling card and the row collapses
+# from two columns to one), plotly keeps its SVG pinned at the original 700px
+# default — visually half-width even though the card spans the row. This
+# script observes every ``.js-plotly-plot`` element with a ``ResizeObserver``
+# and calls ``Plotly.Plots.resize(el)`` whenever the container's width changes,
+# plus a ``MutationObserver`` to pick up charts added after the first render.
+
+_PLOTLY_RESIZE_SHIM = """
+(() => {
+  if (window.__pawnPlotlyResizeShim) return;
+  window.__pawnPlotlyResizeShim = true;
+
+  const attach = (el) => {
+    if (!el || el.__pawnResizeAttached) return;
+    el.__pawnResizeAttached = true;
+    const ro = new ResizeObserver(() => {
+      if (window.Plotly && window.Plotly.Plots && document.contains(el)) {
+        try { window.Plotly.Plots.resize(el); } catch (_) { /* noop */ }
+      }
+    });
+    ro.observe(el);
+  };
+
+  const scan = (root) => {
+    const matches = (root.querySelectorAll
+      ? root.querySelectorAll('.js-plotly-plot')
+      : []);
+    matches.forEach(attach);
+    if (root.classList && root.classList.contains('js-plotly-plot')) attach(root);
+  };
+
+  scan(document);
+  const mo = new MutationObserver((muts) => {
+    for (const m of muts) {
+      for (const n of m.addedNodes) {
+        if (n.nodeType === 1) scan(n);
+      }
+    }
+  });
+  mo.observe(document.body, { childList: true, subtree: true });
+})();
+"""
+
+
+@solara.component
+def InjectPlotlyResizeShim():
+    solara.HTML(tag="script", unsafe_innerHTML=_PLOTLY_RESIZE_SHIM)
 
 
 # ---------------------------------------------------------------------------
@@ -530,42 +640,90 @@ def KpiRow(run_type: str, train: list[dict], val: list[dict]):
 # ---------------------------------------------------------------------------
 
 
+def _label_for_run(log_dir_path: Path, run_name: str) -> str:
+    """Decorate a run's relative path with its slug/variant/hostname."""
+    meta = get_run_meta(log_dir_path, run_name)
+    parts = []
+    if meta.get("slug"):
+        parts.append(meta["slug"])
+    if meta.get("variant"):
+        parts.append(meta["variant"])
+    if meta.get("hostname"):
+        parts.append(f"@ {meta['hostname']}")
+    return f"{run_name} ({' / '.join(parts)})" if parts else run_name
+
+
+def _runs_for_trial(all_runs: list[str], trial: str) -> list[str]:
+    if trial == ALL_TRIALS:
+        return all_runs
+    prefix = f"{trial}/"
+    return [r for r in all_runs if r.startswith(prefix) or r == trial]
+
+
 @solara.component
 def RunSelector(auto_refresh: bool = False, on_auto_refresh=None,
                 interval: float = 10.0, on_interval=None):
-    show_all, set_show_all = solara.use_state(False)
+    # Default "All" on when the 1-hour window is empty — otherwise the user
+    # sees a populated trial dropdown but an empty run list, and selecting a
+    # trial appears to do nothing.
+    initial_show_all = not bool(load_runs(log_dir.value, max_age_hours=1.0))
+    show_all, set_show_all = solara.use_state(initial_show_all)
 
     def _load():
         hours = 0 if show_all else 1.0
         raw = load_runs(log_dir.value, max_age_hours=hours)
-        labeled = []
-        label_to_name = {}
-        for name in raw:
-            meta = get_run_meta(log_dir.value, name)
-            parts = []
-            if meta.get("slug"):
-                parts.append(meta["slug"])
-            if meta.get("variant"):
-                parts.append(meta["variant"])
-            if meta.get("hostname"):
-                parts.append(f"@ {meta['hostname']}")
-            label = f"{name} ({' / '.join(parts)})" if parts else name
-            labeled.append(label)
-            label_to_name[label] = name
-        return labeled, label_to_name
+        trials = list_trials(log_dir.value)
+        return raw, trials
 
-    labeled, label_to_name = solara.use_memo(
+    all_runs, trials = solara.use_memo(
         _load,
         dependencies=[log_dir.value, metrics_tick.value, show_all],
     )
+
+    trial_values = [ALL_TRIALS, *trials] if trials else [ALL_TRIALS]
+    if selected_trial.value not in trial_values:
+        selected_trial.set(ALL_TRIALS)
+
+    filtered_runs = _runs_for_trial(all_runs, selected_trial.value)
+
+    label_to_name: dict[str, str] = {}
+    labeled: list[str] = []
+    for name in filtered_runs:
+        label = _label_for_run(log_dir.value, name)
+        labeled.append(label)
+        label_to_name[label] = name
     name_to_label = {v: k for k, v in label_to_name.items()}
     current_label = name_to_label.get(selected_run.value, "")
 
     if labeled and (not current_label or current_label not in labeled):
         selected_run.set(label_to_name[labeled[0]])
+    elif not labeled and selected_run.value:
+        selected_run.set("")
+
+    # Comparison selector: anything in the full recent-run list, plus "(none)".
+    NONE = "(none)"
+    compare_label_to_name: dict[str, str] = {NONE: ""}
+    compare_labels = [NONE]
+    for name in all_runs:
+        if name == selected_run.value:
+            continue
+        label = _label_for_run(log_dir.value, name)
+        compare_labels.append(label)
+        compare_label_to_name[label] = name
+    compare_name_to_label = {v: k for k, v in compare_label_to_name.items()}
+    current_compare_label = compare_name_to_label.get(compare_run.value, NONE)
+    if current_compare_label not in compare_labels:
+        compare_run.set("")
+        current_compare_label = NONE
 
     def on_select(label):
         selected_run.set(label_to_name.get(label, label))
+
+    def on_select_compare(label):
+        compare_run.set(compare_label_to_name.get(label, ""))
+
+    def on_select_trial(t):
+        selected_trial.set(t)
 
     def _sync_hf():
         synced = sync_hf_metrics(log_dir.value)
@@ -574,6 +732,12 @@ def RunSelector(auto_refresh: bool = False, on_auto_refresh=None,
         metrics_tick.set(metrics_tick.value + 1)
 
     with solara.Div(classes=["pawn-controls"]):
+        if trials:
+            solara.Select(
+                label="Trial", value=selected_trial.value, values=trial_values,
+                on_value=on_select_trial,
+                style={"min-width": "180px"},
+            )
         if labeled:
             solara.Select(
                 label="Run", value=current_label, values=labeled, on_value=on_select,
@@ -582,6 +746,11 @@ def RunSelector(auto_refresh: bool = False, on_auto_refresh=None,
         else:
             msg = "No recent runs (try 'All')" if not show_all else f"No runs in {log_dir.value}"
             solara.Info(msg)
+        solara.Select(
+            label="Compare", value=current_compare_label, values=compare_labels,
+            on_value=on_select_compare,
+            style={"min-width": "280px"},
+        )
         solara.Button(
             "Refresh",
             on_click=lambda: metrics_tick.set(metrics_tick.value + 1),
@@ -599,6 +768,73 @@ def RunSelector(auto_refresh: bool = False, on_auto_refresh=None,
                     on_value=lambda v: on_interval(float(v.rstrip("s"))),
                     values=["5s", "10s", "30s", "60s"],
                     style={"max-width": "90px"},
+                )
+
+
+@solara.component
+def NotesEditor():
+    """Read/write a markdown notes file scoped to the current run's trial."""
+    # Hooks must be called unconditionally (rules of hooks). We render nothing
+    # when no run is selected, but the state slots still need to exist.
+    run = selected_run.value
+    saved, set_saved = solara.use_state("")
+    draft, set_draft = solara.use_state("")
+    status, set_status = solara.use_state("")
+
+    def _reload():
+        if not run:
+            return None
+        text = load_notes(log_dir.value, run)
+        set_saved(text)
+        set_draft(text)
+        set_status("")
+        return None
+
+    solara.use_memo(_reload, dependencies=[log_dir.value, run, metrics_tick.value])
+
+    if not run:
+        return
+
+    def _save():
+        path = save_notes(log_dir.value, run, draft)
+        set_saved(draft)
+        set_status(f"Saved · {path}")
+
+    def _discard():
+        set_draft(saved)
+        set_status("Discarded")
+
+    dirty = draft != saved
+    from .metrics import notes_path
+    target = notes_path(log_dir.value, run)
+
+    with solara.Div(classes=["pawn-card"], style={"margin-bottom": "18px"}):
+        solara.HTML(
+            tag="div",
+            unsafe_innerHTML=(
+                '<div class="pawn-desc" style="font-size:13px;color:var(--pawn-text);'
+                'font-weight:600;letter-spacing:0.02em;">Trial Notes</div>'
+                f'<div class="pawn-desc" style="margin-bottom:8px;">{target}</div>'
+            ),
+        )
+        solara.InputTextArea(
+            label="", value=draft, on_value=set_draft, rows=6,
+        )
+        with solara.Row(gap="8px"):
+            solara.Button(
+                "Save", on_click=_save, disabled=not dirty, color="primary",
+                icon_name="mdi-content-save",
+            )
+            solara.Button(
+                "Discard", on_click=_discard, disabled=not dirty, text=True,
+                icon_name="mdi-restore",
+            )
+            if status:
+                solara.HTML(
+                    tag="div",
+                    unsafe_innerHTML=(
+                        f'<div class="pawn-desc" style="margin-left:8px;align-self:center;">{status}</div>'
+                    ),
                 )
 
 
@@ -729,12 +965,67 @@ _DEFAULT_DESCRIPTIONS = {
 }
 
 
+def _chart_title_text(fig) -> str:
+    """Extract the plain-text title from a plotly figure.
+
+    Chart builders wrap titles in ``<b>…</b>``; strip the markup so the
+    title can double as a stable reactive-state key.
+    """
+    layout = getattr(fig, "layout", None)
+    if layout is None:
+        return ""
+    title = getattr(layout, "title", None)
+    text = getattr(title, "text", "") if title is not None else ""
+    if not text:
+        return ""
+    import re as _re
+    return _re.sub(r"<[^>]+>", "", text).strip()
+
+
 @solara.component
 def ChartCard(chart, description: str = ""):
-    """A card wrapper that shows the description above the chart."""
+    """A card wrapper that shows the description above the chart and renders
+    per-axis log-scale toggle pills. Toggle state is keyed by the chart's
+    title so it survives re-renders (including live auto-refresh ticks)."""
+    chart_id = _chart_title_text(chart) or description or id(chart)
+
+    default_x, default_y = charts.current_axis_log(chart)
+    override = chart_axis_overrides.value.get(chart_id)
+    x_log, y_log = override if override is not None else (default_x, default_y)
+    if override is not None:
+        # FigurePlotly caches the figure by object identity; mutating the
+        # same instance after override doesn't trigger a re-render. Hand it
+        # a fresh Figure built from the current one with the axis types
+        # replaced.
+        import plotly.graph_objects as _go
+        chart = _go.Figure(chart)
+        charts.apply_axis_log(chart, x_log, y_log)
+
+    def _set_axes(new_x: bool, new_y: bool):
+        chart_axis_overrides.set(
+            {**chart_axis_overrides.value, chart_id: (new_x, new_y)}
+        )
+
     with solara.Div(classes=["pawn-card"]):
-        if description:
-            solara.HTML(tag="div", unsafe_innerHTML=f'<div class="pawn-desc">{description}</div>')
+        with solara.Div(classes=["pawn-chart-head"]):
+            if description:
+                solara.HTML(
+                    tag="div",
+                    unsafe_innerHTML=f'<div class="pawn-desc">{description}</div>',
+                )
+            with solara.Div(classes=["pawn-axis-toggles"]):
+                solara.Button(
+                    "log X",
+                    on_click=lambda: _set_axes(not x_log, y_log),
+                    classes=["pawn-axis-btn", *(["active"] if x_log else [])],
+                    text=True,
+                )
+                solara.Button(
+                    "log Y",
+                    on_click=lambda: _set_axes(x_log, not y_log),
+                    classes=["pawn-axis-btn", *(["active"] if y_log else [])],
+                    text=True,
+                )
         solara.FigurePlotly(chart)
 
 
@@ -743,20 +1034,36 @@ def Section(title: str):
     solara.HTML(tag="div", unsafe_innerHTML=f'<div class="pawn-section-title">{title}</div>')
 
 
-def _row(items: list):
-    """Two-column row of chart cards, gracefully handling odd counts."""
-    ratio = [1] * max(len(items), 1)
+def _row(items: list[tuple]):
+    """Render a row of chart cards, dropping any whose figure has no data.
+
+    ``items`` is a list of ``(fig, description)`` tuples. Empty figures
+    (e.g. end-of-epoch metrics not yet written for a mid-epoch run) are
+    filtered out so the user doesn't see a blank plot card. When only one
+    card survives, we render it directly (no ``Columns`` wrapper) so it
+    unambiguously spans the full row width.
+    """
+    live = [(fig, desc) for fig, desc in items if not charts.is_empty_chart(fig)]
+    if not live:
+        return
+    if len(live) == 1:
+        fig, desc = live[0]
+        ChartCard(fig, desc)
+        return
+    ratio = [1] * len(live)
     with solara.Columns(ratio):
-        for item in items:
-            item()
+        for fig, desc in live:
+            ChartCard(fig, desc)
 
 
 @solara.component
-def MetricsCharts(data: dict | None = None):
+def MetricsCharts(data: dict | None = None, compare: dict | None = None):
     if not selected_run.value:
         return
     if data is None:
         data = {}
+    if compare is None:
+        compare = {}
 
     configs = data.get("config", [])
     config = configs[-1] if configs else {}
@@ -764,149 +1071,186 @@ def MetricsCharts(data: dict | None = None):
     train = data.get("train", [])
     val = data.get("val", [])
     batch = data.get("batch", [])
-    x_key = "epoch" if run_type in ("bc", "film", "lora", "hybrid", "sparse", "bottleneck", "rosa") else "step"
+    # Prefer `step` whenever records carry unique step values. Adapter runs
+    # historically keyed charts on `epoch`, but the modern single-epoch
+    # adapter trainer emits one record per step with `epoch` pinned at 0
+    # — collapsing every chart onto one x-bucket.
+    def _has_varying(records: list[dict], key: str) -> bool:
+        seen = set()
+        for r in records:
+            v = r.get(key)
+            if v is not None:
+                seen.add(v)
+                if len(seen) > 1:
+                    return True
+        return False
+
+    if _has_varying(train, "step"):
+        x_key = "step"
+    elif run_type in ("bc", "film", "lora", "hybrid", "sparse", "bottleneck", "rosa"):
+        x_key = "epoch"
+    else:
+        x_key = "step"
+
+    c_train = compare.get("train", []) or None
+    c_val = compare.get("val", []) or None
+    c_batch = compare.get("batch", []) or None
 
     descs = _CHART_DESCRIPTIONS.get(run_type, {})
 
     def desc(key: str) -> str:
         return descs.get(key, _DEFAULT_DESCRIPTIONS.get(key, ""))
 
-    def card(fig, description: str):
-        def _render():
-            ChartCard(fig, description)
-        return _render
+    def card(fig, description: str) -> tuple:
+        """Adapter that keeps ``_row`` callsites unchanged across the refactor
+        from thunks to ``(fig, desc)`` tuples."""
+        return (fig, description)
 
     if run_type == "hybrid":
         Section("Training")
         _row([
-            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
-            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+            card(charts.loss_chart(train, x_key, run_type, compare_records=c_train), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type, compare_records=c_train), desc("accuracy")),
         ])
         Section("LoRA Adaptation")
         _row([
-            card(charts.lora_layer_chart(train, x_key), desc("lora_layer")),
-            card(charts.lora_proj_chart(train, x_key), desc("lora_proj")),
+            card(charts.lora_layer_chart(train, x_key, compare_records=c_train), desc("lora_layer")),
+            card(charts.lora_proj_chart(train, x_key, compare_records=c_train), desc("lora_proj")),
         ])
         Section("FiLM Modulation")
         _row([
-            card(charts.film_weight_chart(train, x_key), desc("film_gamma")),
-            card(charts.film_beta_chart(train, x_key), desc("film_beta")),
+            card(charts.film_weight_chart(train, x_key, compare_records=c_train), desc("film_gamma")),
+            card(charts.film_beta_chart(train, x_key, compare_records=c_train), desc("film_beta")),
         ])
         Section("Optimizer & Runtime")
         _row([
-            card(charts.lr_chart(train, batch, x_key), desc("lr")),
-            card(charts.time_chart(train, x_key, run_type), desc("time")),
+            card(charts.lr_chart(train, batch, x_key,
+                                 compare_train_records=c_train,
+                                 compare_batch_records=c_batch), desc("lr")),
+            card(charts.time_chart(train, x_key, run_type, compare_records=c_train), desc("time")),
         ])
     elif run_type == "rosa":
         Section("Training")
         _row([
-            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
-            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+            card(charts.loss_chart(train, x_key, run_type, compare_records=c_train), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type, compare_records=c_train), desc("accuracy")),
         ])
         Section("Adapter Diagnostics")
         _row([
-            card(charts.sparse_delta_chart(train, x_key), desc("sparse_delta")),
-            card(charts.bottleneck_up_chart(train, x_key), desc("adapter_up")),
+            card(charts.sparse_delta_chart(train, x_key, compare_records=c_train), desc("sparse_delta")),
+            card(charts.bottleneck_up_chart(train, x_key, compare_records=c_train), desc("adapter_up")),
         ])
         Section("Optimizer & Runtime")
         _row([
-            card(charts.lr_chart(train, batch, x_key), desc("lr")),
-            card(charts.time_chart(train, x_key, run_type), desc("time")),
+            card(charts.lr_chart(train, batch, x_key,
+                                 compare_train_records=c_train,
+                                 compare_batch_records=c_batch), desc("lr")),
+            card(charts.time_chart(train, x_key, run_type, compare_records=c_train), desc("time")),
         ])
         _row([
-            card(charts.gpu_chart(train, x_key), desc("gpu")),
-            card(charts.patience_chart(val, x_key), desc("patience")),
+            card(charts.gpu_chart(train, x_key, compare_records=c_train), desc("gpu")),
+            card(charts.patience_chart(val, x_key, compare_records=c_val), desc("patience")),
         ])
     elif run_type == "sparse":
         Section("Training")
         _row([
-            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
-            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+            card(charts.loss_chart(train, x_key, run_type, compare_records=c_train), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type, compare_records=c_train), desc("accuracy")),
         ])
         Section("Adapter Diagnostics")
         _row([
-            card(charts.sparse_delta_chart(train, x_key), desc("sparse_delta")),
-            card(charts.time_chart(train, x_key, run_type), desc("time")),
+            card(charts.sparse_delta_chart(train, x_key, compare_records=c_train), desc("sparse_delta")),
+            card(charts.time_chart(train, x_key, run_type, compare_records=c_train), desc("time")),
         ])
     elif run_type == "bottleneck":
         Section("Training")
         _row([
-            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
-            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+            card(charts.loss_chart(train, x_key, run_type, compare_records=c_train), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type, compare_records=c_train), desc("accuracy")),
         ])
         Section("Adapter Diagnostics")
         _row([
-            card(charts.bottleneck_up_chart(train, x_key), desc("adapter_up")),
-            card(charts.lr_chart(train, batch, x_key), desc("lr")),
+            card(charts.bottleneck_up_chart(train, x_key, compare_records=c_train), desc("adapter_up")),
+            card(charts.lr_chart(train, batch, x_key,
+                                 compare_train_records=c_train,
+                                 compare_batch_records=c_batch), desc("lr")),
         ])
         Section("Runtime")
         _row([
-            card(charts.gpu_chart(train, x_key), desc("gpu")),
-            card(charts.time_chart(train, x_key, run_type), desc("time")),
+            card(charts.gpu_chart(train, x_key, compare_records=c_train), desc("gpu")),
+            card(charts.time_chart(train, x_key, run_type, compare_records=c_train), desc("time")),
         ])
     elif run_type == "tiny":
         Section("Training")
         _row([
-            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
-            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+            card(charts.loss_chart(train, x_key, run_type, compare_records=c_train), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type, compare_records=c_train), desc("accuracy")),
         ])
         Section("Optimizer & Runtime")
         _row([
-            card(charts.lr_chart(train, batch, x_key), desc("lr")),
-            card(charts.gpu_chart(train, x_key), desc("gpu")),
+            card(charts.lr_chart(train, batch, x_key,
+                                 compare_train_records=c_train,
+                                 compare_batch_records=c_batch), desc("lr")),
+            card(charts.gpu_chart(train, x_key, compare_records=c_train), desc("gpu")),
         ])
         _row([
-            card(charts.time_chart(train, x_key, run_type), desc("time")),
+            card(charts.time_chart(train, x_key, run_type, compare_records=c_train), desc("time")),
         ])
     elif run_type == "lora":
         Section("Training")
         _row([
-            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
-            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+            card(charts.loss_chart(train, x_key, run_type, compare_records=c_train), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type, compare_records=c_train), desc("accuracy")),
         ])
         Section("LoRA Adaptation")
         _row([
-            card(charts.lora_layer_chart(train, x_key), desc("lora_layer")),
-            card(charts.lora_proj_chart(train, x_key), desc("lora_proj")),
+            card(charts.lora_layer_chart(train, x_key, compare_records=c_train), desc("lora_layer")),
+            card(charts.lora_proj_chart(train, x_key, compare_records=c_train), desc("lora_proj")),
         ])
         Section("Optimizer & Runtime")
         _row([
-            card(charts.lr_chart(train, batch, x_key), desc("lr")),
-            card(charts.time_chart(train, x_key, run_type), desc("time")),
+            card(charts.lr_chart(train, batch, x_key,
+                                 compare_train_records=c_train,
+                                 compare_batch_records=c_batch), desc("lr")),
+            card(charts.time_chart(train, x_key, run_type, compare_records=c_train), desc("time")),
         ])
     elif run_type == "film":
         Section("Training")
         _row([
-            card(charts.loss_chart(train, x_key, run_type), desc("loss")),
-            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+            card(charts.loss_chart(train, x_key, run_type, compare_records=c_train), desc("loss")),
+            card(charts.accuracy_chart(train, x_key, run_type, compare_records=c_train), desc("accuracy")),
         ])
         Section("FiLM Modulation")
         _row([
-            card(charts.film_weight_chart(train, x_key), desc("film_gamma")),
-            card(charts.film_beta_chart(train, x_key), desc("film_beta")),
+            card(charts.film_weight_chart(train, x_key, compare_records=c_train), desc("film_gamma")),
+            card(charts.film_beta_chart(train, x_key, compare_records=c_train), desc("film_beta")),
         ])
         Section("Optimizer & Runtime")
         _row([
-            card(charts.lr_chart(train, batch, x_key), desc("lr")),
-            card(charts.time_chart(train, x_key, run_type), desc("time")),
+            card(charts.lr_chart(train, batch, x_key,
+                                 compare_train_records=c_train,
+                                 compare_batch_records=c_batch), desc("lr")),
+            card(charts.time_chart(train, x_key, run_type, compare_records=c_train), desc("time")),
         ])
     else:
         # Pretraining default
         Section("Training")
         _row([
             card(
-                charts.loss_chart(train, x_key, run_type, val_records=val),
-                desc("loss") + " Val loss overlaid on train; log scale.",
+                charts.loss_chart(train, x_key, run_type, val_records=val,
+                                  compare_records=c_train, compare_val_records=c_val),
+                desc("loss") + " Val loss overlaid on train; log-log scale, "
+                "with a dashed power-law fit (y = A·x^b) on the last half of each series.",
             ),
-            card(charts.accuracy_chart(train, x_key, run_type), desc("accuracy")),
+            card(charts.accuracy_chart(train, x_key, run_type, compare_records=c_train), desc("accuracy")),
         ])
         Section("Validation")
         _row([
             card(
-                charts.perplexity_chart(val, x_key),
-                "Validation perplexity on held-out games (log scale).",
+                charts.perplexity_chart(val, x_key, compare_records=c_val),
+                "Validation perplexity on held-out games (log-log scale).",
             ),
-            card(charts.val_accuracy_chart(val, x_key, run_type), desc("val_accuracy")),
+            card(charts.val_accuracy_chart(val, x_key, run_type, compare_records=c_val), desc("val_accuracy")),
         ])
         patience = config.get("training", {}).get("patience", 10)
         if isinstance(patience, str):
@@ -917,25 +1261,29 @@ def MetricsCharts(data: dict | None = None):
         if val:
             Section("Game Integrity & Stopping")
             error_desc = (
-                "Log-scale error rates — illegal (per-position), late illegal "
+                "Log-log error rates — illegal (per-position), late illegal "
                 "(per-position, plies ≥ context/2), and forfeit (per-game, any illegal). "
-                "Dashed = log-linear fit on the last half of the series; slope → "
-                "half-life. Lower is better."
+                "Dashed = power-law fit y = A·x^b on the last half of the series; "
+                "exponent b is the log-log slope, and halve@×N is the multiplicative "
+                "step ratio needed to halve the rate. Lower is better."
             )
             patience_desc = _DEFAULT_DESCRIPTIONS["patience"]
             _row([
-                card(charts.error_rate_chart(val, x_key, fit=True), error_desc),
-                card(charts.patience_chart(val, x_key, patience_limit=patience), patience_desc),
+                card(charts.error_rate_chart(val, x_key, fit=True, compare_records=c_val), error_desc),
+                card(charts.patience_chart(val, x_key, patience_limit=patience,
+                                           compare_records=c_val), patience_desc),
             ])
         Section("Optimizer")
         _row([
-            card(charts.lr_chart(train, batch, x_key), desc("lr")),
-            card(charts.grad_chart(train, x_key), desc("grad_norm")),
+            card(charts.lr_chart(train, batch, x_key,
+                                 compare_train_records=c_train,
+                                 compare_batch_records=c_batch), desc("lr")),
+            card(charts.grad_chart(train, x_key, compare_records=c_train), desc("grad_norm")),
         ])
         Section("Runtime")
         _row([
-            card(charts.gpu_chart(train, x_key), desc("gpu")),
-            card(charts.time_chart(train, x_key, run_type), desc("time")),
+            card(charts.gpu_chart(train, x_key, compare_records=c_train), desc("gpu")),
+            card(charts.time_chart(train, x_key, run_type, compare_records=c_train), desc("time")),
         ])
 
 
@@ -986,6 +1334,10 @@ def Dashboard(log_dir_override: Path | None = None):
         lambda: load_metrics(log_dir.value, selected_run.value) if selected_run.value else {},
         dependencies=[selected_run.value, metrics_tick.value],
     )
+    compare_data = solara.use_memo(
+        lambda: load_metrics(log_dir.value, compare_run.value) if compare_run.value else {},
+        dependencies=[compare_run.value, metrics_tick.value],
+    )
     configs = data.get("config", []) if data else []
     config = configs[-1] if configs else {}
     run_type = detect_run_type(config) if config else ""
@@ -1003,7 +1355,8 @@ def Dashboard(log_dir_override: Path | None = None):
     if train or val:
         KpiRow(run_type, train, val)
     ConfigSummary(data=data)
-    MetricsCharts(data=data)
+    NotesEditor()
+    MetricsCharts(data=data, compare=compare_data)
 
 
 # ---------------------------------------------------------------------------
@@ -1167,6 +1520,7 @@ def Page():
     solara.use_effect(lambda: setattr(solara.lab.theme, "dark", True), [])
 
     InjectStyle()
+    InjectPlotlyResizeShim()
 
     tab, set_tab = solara.use_state(0)
 

@@ -108,6 +108,7 @@ AXIS_LINE = "rgba(148,163,184,0.22)"
 
 PLOTLY_LAYOUT: dict = dict(
     template="plotly_dark",
+    autosize=True,
     height=360,
     margin=dict(l=58, r=18, t=56, b=96),
     paper_bgcolor="rgba(0,0,0,0)",
