@@ -173,13 +173,18 @@ class ConstantWithWarmup:
         self._apply_lr(0)
 
     def _apply_lr(self, step: int) -> None:
-        lr_scale = step / max(1, self.warmup_steps) if step < self.warmup_steps else 1.0
+        lr_scale = self._compute_lr_scale(step)
         for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
             pg["lr"] = base_lr * lr_scale
 
     def step(self) -> None:
         self._step += 1
         self._apply_lr(self._step)
+
+    def _compute_lr_scale(self, step: int) -> float:
+        if step < self.warmup_steps:
+            return step / max(1, self.warmup_steps)
+        return 1.0
 
     def get_lr(self) -> float:
         return self.optimizer.param_groups[0]["lr"]
