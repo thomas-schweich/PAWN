@@ -608,7 +608,7 @@ class TrialRunner:
                                         "density", "d_model", "n_layers", "batch_size")},
                 }
                 # For pretraining runs, surface game-completion metrics and
-                # the log-linear forfeit-rate fit (matches the dashboard chart).
+                # the power-law forfeit-rate fit (matches the dashboard chart).
                 if cfg.get("run_type") == "pretrain":
                     pretrain = read_pretrain_val_summary(t)
                     if pretrain:

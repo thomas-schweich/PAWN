@@ -11,6 +11,7 @@ import pytest
 
 from pawn.lab.monitor import (
     check_health,
+    fit_power_law,
     is_alive,
     read_cotrain_val_summary,
     read_metrics,
@@ -550,21 +551,21 @@ class TestReadPretrainValSummary:
         assert "forfeit_fit" not in summary
 
     def test_returns_fit_on_known_series(self, tmp_path):
-        """Construct a known exponential decay and verify OLS recovers it.
+        """Construct a known power-law decay and verify log-log OLS recovers it.
 
-        We pick forfeit_rate(step) = exp(-k * step + b) so log(forfeit) is
-        exactly linear in step with slope -k. The fit uses the second half
-        of the history.
+        We pick forfeit_rate(step) = A * step^b so log(forfeit) is exactly
+        linear in log(step) with slope b. The fit uses the second half of
+        the history.
         """
         run_dir = tmp_path / "run_x"
-        k = 1e-5  # half-life = ln(2)/k ~= 69314 steps
-        b = math.log(0.5)  # forfeit(0) = 0.5
+        exponent = -0.8  # forfeit ∝ step^-0.8
+        prefactor = 100.0  # large enough that forfeit stays < 1 over the window
 
         records = []
         n = 20
         for i in range(n):
             step = (i + 1) * 1000
-            forfeit = math.exp(-k * step + b)
+            forfeit = prefactor * (step ** exponent)
             gc = 1.0 - forfeit
             records.append(_val_record(step, gc))
 
@@ -576,12 +577,14 @@ class TestReadPretrainValSummary:
         assert summary is not None
         assert "forfeit_fit" in summary
         fit = summary["forfeit_fit"]
-        assert fit["slope_per_step"] == pytest.approx(-k, rel=1e-6)
-        assert fit["half_life_steps"] == pytest.approx(math.log(2) / k, rel=1e-6)
+        assert fit["exponent"] == pytest.approx(exponent, rel=1e-6)
+        assert fit["prefactor"] == pytest.approx(prefactor, rel=1e-6)
+        # x_ratio_to_halve = 2^(-1/b); with b = -0.8 that's 2^1.25 ≈ 2.378
+        assert fit["x_ratio_to_halve"] == pytest.approx(2.0 ** (-1.0 / exponent), rel=1e-6)
         # Second half of n=20 → 10 points
         assert fit["n_points"] == 10
         # current_forfeit is the last overall series value, not the fit window's
-        expected_current = math.exp(-k * (n * 1000) + b)
+        expected_current = prefactor * ((n * 1000) ** exponent)
         assert fit["current_forfeit"] == pytest.approx(expected_current)
 
     def test_all_zero_forfeit_omits_fit(self, tmp_path):
@@ -676,13 +679,14 @@ class TestReadCotrainValSummary:
         """Each variant's metrics.jsonl yields an independent forfeit summary."""
         trial = _make_trial()
         trial.variants = {}
-        k = {"small": 5e-6, "base": 1e-5, "large": 2e-5}
-        for name, rate in k.items():
+        exponents = {"small": -0.4, "base": -0.6, "large": -0.9}
+        prefactor = 50.0
+        for name, exponent in exponents.items():
             run_dir = tmp_path / f"run_{name}"
             records = []
             for i in range(1, 21):
                 step = i * 1000
-                forfeit = math.exp(-rate * step + math.log(0.5))
+                forfeit = prefactor * (step ** exponent)
                 records.append(_val_record(step, 1.0 - forfeit))
             _write_metrics_file(run_dir / "metrics.jsonl", records)
             trial.variants[name] = {
@@ -693,11 +697,12 @@ class TestReadCotrainValSummary:
         summary = read_cotrain_val_summary(trial)
         assert summary is not None
         assert set(summary["variants"].keys()) == {"small", "base", "large"}
-        for name, want_slope in k.items():
+        for name, want_exponent in exponents.items():
             v = summary["variants"][name]
             assert "latest" in v
             assert "forfeit_fit" in v
-            assert v["forfeit_fit"]["slope_per_step"] == pytest.approx(-want_slope, rel=1e-6)
+            assert v["forfeit_fit"]["exponent"] == pytest.approx(want_exponent, rel=1e-6)
+            assert v["forfeit_fit"]["prefactor"] == pytest.approx(prefactor, rel=1e-6)
             assert v["forfeit_fit"]["n_points"] == 10
 
     def test_partial_variants_surface_what_is_ready(self, tmp_path):
@@ -719,3 +724,49 @@ class TestReadCotrainValSummary:
         assert summary is not None
         # Only `small` had game_completion records.
         assert list(summary["variants"].keys()) == ["small"]
+
+
+# =====================================================================
+# fit_power_law
+# =====================================================================
+
+
+class TestFitPowerLaw:
+    def test_recovers_known_exponent_and_prefactor(self):
+        # y = 3.5 * x^-1.2
+        prefactor, exponent = 3.5, -1.2
+        xs = [float(x) for x in range(1, 30)]
+        ys = [prefactor * (x ** exponent) for x in xs]
+        fit = fit_power_law(xs, ys)
+        assert fit is not None
+        assert fit["exponent"] == pytest.approx(exponent, rel=1e-10)
+        assert fit["prefactor"] == pytest.approx(prefactor, rel=1e-10)
+        # Decaying → ratio > 1
+        assert fit["x_ratio_to_halve"] == pytest.approx(2.0 ** (-1.0 / exponent), rel=1e-10)
+        assert fit["n_points"] == float(len(xs))
+
+    def test_omits_ratio_for_non_decaying_exponent(self):
+        # y = x^+0.5 → growing; halving is meaningless.
+        xs = [float(x) for x in range(1, 10)]
+        ys = [x ** 0.5 for x in xs]
+        fit = fit_power_law(xs, ys)
+        assert fit is not None
+        assert fit["exponent"] == pytest.approx(0.5, rel=1e-10)
+        assert "x_ratio_to_halve" not in fit
+
+    def test_drops_nonpositive_inputs(self):
+        xs = [0.0, 1.0, 2.0, 4.0, 8.0]
+        ys = [-1.0, 1.0, 0.5, 0.25, 0.125]  # first point dropped (y < 0)
+        fit = fit_power_law(xs, ys)
+        assert fit is not None
+        assert fit["n_points"] == 4.0
+
+    def test_returns_none_when_too_few_points(self):
+        assert fit_power_law([1.0, 2.0], [1.0, 0.5]) is None
+        # After dropping non-positives, only 2 remain
+        assert fit_power_law([0.0, 1.0, -1.0, 2.0], [1.0, 0.5, 0.25, 0.125]) is None
+
+    def test_returns_none_when_log_x_has_zero_variance(self):
+        # All xs equal → log-x variance is zero
+        fit = fit_power_law([2.0, 2.0, 2.0], [1.0, 1.5, 2.0])
+        assert fit is None

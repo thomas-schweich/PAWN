@@ -304,7 +304,7 @@ class ModelSlot:
         avg["val/perplexity"] = math.exp(min(avg["val/loss"], 20.0))
 
         # Forfeit-ply / game-completion stats — same surface as pretraining
-        # so the lab MCP server can fit a log-linear trend from each variant's
+        # so the lab MCP server can fit a power-law trend from each variant's
         # metrics.jsonl.
         avg.update(eval_game_completion_metrics(
             self.model, val_data,

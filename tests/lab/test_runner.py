@@ -337,18 +337,18 @@ class TestStatus:
 
     def test_status_attaches_pretrain_block_for_pretrain_runs(self, tmp_path):
         """Running pretrain trials get a `pretrain` block with latest val
-        metrics and the log-linear forfeit fit."""
+        metrics and the power-law forfeit fit."""
         import json
-        import math
         runner = TrialRunner(workspace=str(tmp_path))
         run_dir = tmp_path / "run_x"
         run_dir.mkdir()
-        # Enough val records with known exponential forfeit decay for a fit.
-        k = 1e-5
+        # Enough val records with a known power-law forfeit decay for a fit.
+        exponent = -0.7
+        prefactor = 20.0
         records = []
         for i in range(1, 13):
             step = i * 1000
-            forfeit = math.exp(-k * step + math.log(0.5))
+            forfeit = prefactor * (step ** exponent)
             records.append({
                 "type": "val", "step": step, "val/loss": 3.0,
                 "val/game_completion_rate": 1.0 - forfeit,
@@ -378,7 +378,8 @@ class TestStatus:
         assert "latest" in pretrain
         assert pretrain["latest"]["step"] == 12_000
         assert "forfeit_fit" in pretrain
-        assert pretrain["forfeit_fit"]["slope_per_step"] == pytest.approx(-k, rel=1e-6)
+        assert pretrain["forfeit_fit"]["exponent"] == pytest.approx(exponent, rel=1e-6)
+        assert pretrain["forfeit_fit"]["prefactor"] == pytest.approx(prefactor, rel=1e-6)
 
     def test_status_omits_pretrain_block_for_adapter_runs(self, tmp_path):
         """Adapter runs don't get a pretrain block even if they log val records."""
