@@ -15,9 +15,9 @@ The model comes in three sizes, all trained from scratch on random chess games g
 
 | Variant | d_model | Layers | Heads | Params | Top-1 | Legal rate | Game completion | Download |
 |---------|---------|--------|-------|--------|-------|------------|-----------------|----------|
-| **PAWN-Small** | 256 | 8 | 4 | 8.94M | 8.54% | 99.7451% | 52.34% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-small) |
-| **PAWN (Base)** | 512 | 8 | 8 | 34.65M | 8.57% | 99.9962% | 98.97% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
-| **PAWN-Large** | 640 | 10 | 8 | 66.91M | 8.63% | 99.9990% | 99.76% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
+| **PAWN-Small** | 256 | 8 | 4 | 8.94M | 8.54% | 99.7451% | 52.34% | [![thomas-schweich/pawn-small on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-small) |
+| **PAWN (Base)** | 512 | 8 | 8 | 34.65M | 8.57% | 99.9962% | 98.97% | [![thomas-schweich/pawn-base on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
+| **PAWN-Large** | 640 | 10 | 8 | 66.91M | 8.63% | 99.9990% | 99.76% | [![thomas-schweich/pawn-large on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
 
 *Metrics measured on a 2,048-game validation set of random games. **Game completion** is the ability to choose a legal move in every position throughout a random game. It is the primary signal that separates capacity between sizes. The number given above is non-autoregressive. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate)*
 
@@ -112,9 +112,7 @@ Hybrid (LoRA+FiLM) and [FiLM](https://arxiv.org/abs/1709.07871) remain in the co
 
 ### Datasets
 
-The "Lichess Full" dataset below was filtered to matches between players rated 1800-1900 and truncated to 1-10 million games, depending on adapter type and size (some smaller adapters saturate too rapidly to benefit from more games). But I parsed all ~300 million games and converted them to UCI as well as PAWN's training format (a) to make future experiments easier and (b) since others might find the pre-converted raw UCI helpful for other projects. And because the Rust engine is super fast anyways. I also kept the SAN notation and metadata from the original PGNs.
-
-The "Stockfish nodes=1" 
+The "Lichess Full" dataset below was filtered to matches between players rated 1800-1900 and truncated to 1-10 million games, depending on adapter type and size (some smaller adapters saturate too rapidly to benefit from more games). But I parsed all ~300 million games and converted them to UCI as well as PAWN's training format (a) to make future experiments easier and (b) since others might find the pre-converted raw UCI helpful for other projects. And because the Rust engine is super fast anyway. I also kept the SAN notation and metadata from the original PGNs.
 
 | Dataset | Games | Description | Link |
 |---------|-------|-------------|------|
