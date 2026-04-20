@@ -812,6 +812,21 @@ class TestFindBestAdapterStep:
         assert result == 2000
         assert isinstance(result, int)
 
+    def test_skips_malformed_json_lines(self, tmp_path):
+        """A truncated or corrupted line shouldn't abort the whole scan.
+
+        This can happen after a crash mid-write or if the file is still
+        being flushed from an earlier training process.
+        """
+        metrics = tmp_path / "metrics.jsonl"
+        metrics.write_text(
+            '{"type":"train","step":1000,"val_loss":2.5}\n'
+            '{"type":"train","step":2000,"val_\n'  # truncated partway
+            'totally not json at all\n'
+            '{"type":"train","step":3000,"val_loss":2.2}\n'
+        )
+        assert find_best_adapter_step(metrics) == 3000
+
 
 # ---------------------------------------------------------------------------
 # load_backbone_weights

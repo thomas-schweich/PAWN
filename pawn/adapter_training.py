@@ -1175,8 +1175,8 @@ def train(
         nonlocal _shutdown
         _shutdown = True
 
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
+    old_term = signal.signal(signal.SIGTERM, _handle_signal)
+    old_int = signal.signal(signal.SIGINT, _handle_signal)
 
     ckpt_dir = logger.run_dir / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
@@ -1357,7 +1357,8 @@ def train(
                 )
                 try:
                     report = weight_report_fn()
-                except Exception:
+                except Exception as e:
+                    print(f"WARNING: weight_report_fn failed: {e}", flush=True)
                     report = {}
                 logger.log_train(
                     step=global_step,
@@ -1370,14 +1371,12 @@ def train(
                     val_illegal_prob_mass=val_metrics["illegal_prob_mass"],
                     **report,
                 )
-                # Save checkpoint when: (a) new best val_loss, or (b) this
-                # step is a ``checkpoint_interval`` boundary. Both cases use
-                # ``val_metrics`` from the eval that just ran, so the
-                # metadata in ``training_state.json`` is always fresh. If
-                # ``checkpoint_interval`` isn't a multiple of
-                # ``eval_interval`` the intermediate interval steps are
-                # intentionally skipped — there's no fresh val_metrics to
-                # associate with them.
+                # Saves triggered by the eval that just ran get fresh
+                # ``val_metrics`` in ``training_state.json``. Non-eval-aligned
+                # checkpoint_interval boundaries are handled in a separate
+                # block below so users can request sub-eval-frequency saves
+                # for LR-probing workflows (e.g. ``checkpoint_interval=500``
+                # with ``eval_interval=2000``).
                 new_best = val_metrics["loss"] < best_val_loss
                 at_interval = global_step % args.checkpoint_interval == 0
                 if new_best:
@@ -1398,6 +1397,21 @@ def train(
                     )
                     break
                 model.train()
+
+            # Out-of-eval-block interval saves for the
+            # ``checkpoint_interval < eval_interval`` case. The embedded
+            # ``val_metrics`` is from the most recent eval (possibly from
+            # earlier in training) so metadata may be stale — the model
+            # weights, optimizer state, and scheduler step at
+            # ``step_{global_step:08d}/`` are always current. Callers that
+            # need authoritative per-step val stats should cross-reference
+            # ``metrics.jsonl``. Idempotent: no-op when the step already
+            # has a checkpoint from the eval-aligned path above.
+            elif (
+                args.checkpoint_interval
+                and global_step % args.checkpoint_interval == 0
+            ):
+                _save_step_checkpoint(val_metrics, epoch)
 
             if step_limit and global_step >= step_limit:
                 break
@@ -1420,7 +1434,8 @@ def train(
 
         try:
             report = weight_report_fn()
-        except Exception:
+        except Exception as e:
+            print(f"WARNING: weight_report_fn failed: {e}", flush=True)
             report = {}
         logger.log_train(
             step=global_step,
@@ -1477,6 +1492,13 @@ def train(
     # there's no separate existence check needed here.
     if global_step > initial_step:
         _save_step_checkpoint(val_metrics, epoch)
+
+    # Restore the caller's signal handlers before draining the HF pusher.
+    # ``hf_pusher.wait()`` can block for seconds-to-minutes on a slow
+    # upload; handing SIGINT/SIGTERM back first lets a second Ctrl-C/TERM
+    # actually interrupt instead of getting swallowed by our latch.
+    signal.signal(signal.SIGTERM, old_term)
+    signal.signal(signal.SIGINT, old_int)
 
     # Drain the background HF pusher before returning so pending uploads
     # aren't lost when the process exits. This is a no-op when hf_repo

@@ -681,7 +681,13 @@ def find_best_adapter_step(metrics_path: str | Path) -> int | None:
     best_step: int | None = None
     with open(metrics_path) as f:
         for line in f:
-            record = json.loads(line)
+            # Tolerate malformed lines (truncated writes, partial flushes)
+            # — skip rather than abort the whole scan. Matches the posture
+            # of ``push_checkpoint_to_hf``'s metrics-truncation reader.
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             # Adapter eval records live under type="train" with val_loss.
             val_loss = record.get("val_loss")
             if val_loss is None:
