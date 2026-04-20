@@ -1359,24 +1359,34 @@ def train(
                     val_illegal_prob_mass=val_metrics["illegal_prob_mass"],
                     **report,
                 )
-                if val_metrics["loss"] < best_val_loss:
+                # Save checkpoint when: (a) new best val_loss, or (b) this
+                # step is a ``checkpoint_interval`` boundary. Both cases use
+                # ``val_metrics`` from the eval that just ran, so the
+                # metadata in ``training_state.json`` is always fresh. If
+                # ``checkpoint_interval`` isn't a multiple of
+                # ``eval_interval`` the intermediate interval steps are
+                # intentionally skipped — there's no fresh val_metrics to
+                # associate with them.
+                new_best = val_metrics["loss"] < best_val_loss
+                at_interval = global_step % args.checkpoint_interval == 0
+                if new_best:
                     best_val_loss = val_metrics["loss"]
                     patience_counter = 0
                 else:
                     patience_counter += 1
-                    if args.patience is not None and patience_counter >= args.patience:
-                        print(
-                            f"\n  Early stopping at step {global_step} "
-                            f"(patience={args.patience})"
-                        )
-                        break
+                if new_best or at_interval:
+                    _save_step_checkpoint(val_metrics, epoch)
+                if (
+                    not new_best
+                    and args.patience is not None
+                    and patience_counter >= args.patience
+                ):
+                    print(
+                        f"\n  Early stopping at step {global_step} "
+                        f"(patience={args.patience})"
+                    )
+                    break
                 model.train()
-
-            if (
-                args.checkpoint_interval
-                and global_step % args.checkpoint_interval == 0
-            ):
-                _save_step_checkpoint(val_metrics, epoch)
 
             if step_limit and global_step >= step_limit:
                 break
