@@ -1217,8 +1217,15 @@ def train(
         (adapter records use ``type="train"`` with a ``val_loss`` kwarg —
         the pretraining helper ``scripts/export_hf_repo.find_best_step``
         filters on ``type="val"`` and does not apply).
+
+        Idempotent: if ``step_path`` already exists (e.g. the same step
+        was already saved by the interval hook and the training loop is
+        now at termination), this is a no-op. Callers can invoke freely
+        without a preflight ``exists()`` check.
         """
         step_path = ckpt_dir / f"step_{global_step:08d}"
+        if step_path.exists():
+            return
         save_adapter_checkpoint(
             step_path,
             state_dict_fn(),
@@ -1462,13 +1469,12 @@ def train(
             print("Shutdown requested, saving checkpoint...")
             break
 
-    # Final checkpoint — only write if this session actually trained and
-    # the current step hasn't already been saved by the interval/epoch
-    # hooks above. On resume-past-end the loop doesn't execute, so
-    # ``val_metrics`` still holds the baseline eval; saving it as the
-    # final state would be misleading.
-    final_path = ckpt_dir / f"step_{global_step:08d}"
-    if global_step > initial_step and not final_path.exists():
+    # Final checkpoint — only write if this session actually trained. On
+    # resume-past-end the loop doesn't execute, so ``val_metrics`` still
+    # holds the baseline eval; saving it as the final state would be
+    # misleading. ``_save_step_checkpoint`` itself is idempotent, so
+    # there's no separate existence check needed here.
+    if global_step > initial_step:
         _save_step_checkpoint(val_metrics, epoch)
 
     return best_val_loss, val_metrics
