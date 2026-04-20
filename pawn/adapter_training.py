@@ -1120,6 +1120,13 @@ def train(
         patience_counter = ckpt.get("patience_counter", 0)
         del ckpt
 
+    # Record the step we enter the loop at so the final save can tell
+    # whether any training happened this session. On resume-past-end
+    # (epoch budget exhausted on a prior run) the loop body never
+    # executes and ``val_metrics`` would otherwise hold the baseline
+    # eval — writing that as the final state would be misleading.
+    initial_step = global_step
+
     # Baseline eval
     if not args.resume:
         print("\nBaseline (before training):")
@@ -1442,10 +1449,13 @@ def train(
             print("Shutdown requested, saving checkpoint...")
             break
 
-    # Final checkpoint — only write if this step hasn't already been saved
-    # by the interval/epoch hooks above.
+    # Final checkpoint — only write if this session actually trained and
+    # the current step hasn't already been saved by the interval/epoch
+    # hooks above. On resume-past-end the loop doesn't execute, so
+    # ``val_metrics`` still holds the baseline eval; saving it as the
+    # final state would be misleading.
     final_path = ckpt_dir / f"step_{global_step:08d}"
-    if not final_path.exists():
+    if global_step > initial_step and not final_path.exists():
         _save_step_checkpoint(val_metrics, epoch)
 
     return best_val_loss, val_metrics
