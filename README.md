@@ -2,7 +2,7 @@
 
 A small causal transformer trained on random chess games that learns legal moves, board state representations, and game dynamics purely from random legal move sequences absent any form of strategic play.
 
-I've found PAWN to be a viable testbed for finetuning and augmentation methods at small scale. Since it is entirely unopinionated, it's a blank slate ready to be adapted, augmented, and finetuned into arbitrary player models with unique playstyles.
+I've found PAWN to be a viable testbed for finetuning and augmentation methods at small scales. Since it is entirely unopinionated, it's a blank slate ready to be adapted, augmented, and finetuned into arbitrary player models with unique playstyles.
 
 Finetuning PAWN has proven significantly more parameter-efficient than training new models from scratch and requires minimal compute resources.
 
@@ -15,15 +15,15 @@ The model comes in three sizes, all trained from scratch on random chess games g
 
 | Variant | d_model | Layers | Heads | Params | Top-1 | Legal rate | Game completion | Download |
 |---------|---------|--------|-------|--------|-------|------------|-----------------|----------|
-| **PAWN-Small** | 256 | 8 | 4 | 8.94M | 8.54% | 99.7451% | 52.34% | [![thomas-schweich/pawn-small on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-small) |
-| **PAWN (Base)** | 512 | 8 | 8 | 34.65M | 8.57% | 99.9962% | 98.97% | [![thomas-schweich/pawn-base on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
-| **PAWN-Large** | 640 | 10 | 8 | 66.91M | 8.63% | 99.9990% | 99.76% | [![thomas-schweich/pawn-large on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
+| **PAWN-Small** | 256 | 8 | 4 | 8.94M | 8.54% | 99.7451% | 52.34% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-small) |
+| **PAWN (Base)** | 512 | 8 | 8 | 34.65M | 8.57% | 99.9962% | 98.97% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
+| **PAWN-Large** | 640 | 10 | 8 | 66.91M | 8.63% | 99.9990% | 99.76% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
 
-*Metrics measured on a 2,048-game validation set of random games. **Game completion** is the ability to choose a legal move in every position throughout a random game. It is the primary signal that separates capacity between sizes. The number given above is non-autoregressive. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate)*
+*Metrics measured on a 2,048-game validation set of random games. **Game completion** is the ability to choose a legal move in every position throughout a random game. It is the primary signal that separates capacity between sizes. The number given above is non-autoregressive. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate).*
 
 All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), factored move embeddings, and a vocabulary covering:
 
-- 1,968 move actions (the searchless_chess vocabulary, one entry per legally-reachable (src, dst[, promotion]) tuple),
+- 1,968 move actions (the `searchless_chess` vocabulary, one entry per legally-reachable (src, dst[, promotion]) tuple),
 - 11 game-outcome tokens (pretraining outcomes: `WHITE_CHECKMATES`, `BLACK_CHECKMATES`, `STALEMATE`, `DRAW_BY_RULE`, `PLY_LIMIT`; Lichess-specific outcomes: `WHITE_RESIGNS`, `BLACK_RESIGNS`, `DRAW_BY_AGREEMENT`, `WHITE_WINS_ON_TIME`, `BLACK_WINS_ON_TIME`, `DRAW_BY_TIME`),
 - and a single PAD token — 1,980 tokens total.
 
@@ -97,7 +97,7 @@ Full probe results including diagnostics are on each variant's [HuggingFace mode
 
 <sub>More info: [docs/ADAPTERS.md](docs/ADAPTERS.md)</sub>
 
-PAWN ships with six adapter implementations for fine-tuning the frozen backbone on human game data. Numbers below are from the v1.0.0 `pawn-base` backbone trained on 2M Lichess games at 1800-1900 Elo, one pass.
+PAWN ships with six adapter implementations for finetuning the frozen backbone on human game data. Numbers below are from the v1.0.0 `pawn-base` backbone trained on 2M Lichess games at 1800-1900 Elo, one pass.
 
 | Method | Params | Val top-1 (1800-1900 Elo) | Description |
 |--------|-------:|--------------------------:|-------------|
