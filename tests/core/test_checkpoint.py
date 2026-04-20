@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -959,6 +960,128 @@ class TestHfPushMocked:
             ckpt_path, repo_id="user/repo", branch="run/test", step=1,
         )
         fake_api.upload_file.assert_not_called()
+
+
+@pytest.mark.unit
+class TestBackgroundCheckpointPusher:
+    def test_submit_returns_immediately(self, tmp_path, mocker):
+        """``submit`` queues work to a background thread; the caller does
+        not block on ``upload_folder`` duration."""
+        from pawn.checkpoint import BackgroundCheckpointPusher
+
+        ckpt_path = tmp_path / "step_00000001"
+        ckpt_path.mkdir()
+
+        import threading
+        release = threading.Event()
+
+        def slow_upload_folder(*args, **kwargs):
+            # Simulate a slow HF upload.
+            release.wait(timeout=5.0)
+
+        fake_api = mocker.MagicMock()
+        fake_api.upload_folder.side_effect = slow_upload_folder
+        mocker.patch("huggingface_hub.HfApi", return_value=fake_api)
+
+        pusher = BackgroundCheckpointPusher()
+        try:
+            t0 = time.monotonic()
+            pusher.submit(ckpt_path, "user/repo", "run/test", step=1)
+            submit_elapsed = time.monotonic() - t0
+            # Submit must return well before the (blocked) upload finishes.
+            assert submit_elapsed < 0.5
+        finally:
+            release.set()
+            pusher.wait()
+
+        fake_api.upload_folder.assert_called_once()
+
+    def test_serializes_concurrent_submits(self, tmp_path, mocker):
+        """Two submits in quick succession run one-at-a-time, not concurrently."""
+        from pawn.checkpoint import BackgroundCheckpointPusher
+
+        import threading
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def tracking_upload_folder(*args, **kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+
+        fake_api = mocker.MagicMock()
+        fake_api.upload_folder.side_effect = tracking_upload_folder
+        mocker.patch("huggingface_hub.HfApi", return_value=fake_api)
+
+        for i in (1, 2):
+            (tmp_path / f"step_{i:08d}").mkdir()
+
+        pusher = BackgroundCheckpointPusher()
+        pusher.submit(tmp_path / "step_00000001", "user/repo", "run/test", step=1)
+        pusher.submit(tmp_path / "step_00000002", "user/repo", "run/test", step=2)
+        pusher.wait()
+
+        assert fake_api.upload_folder.call_count == 2
+        assert peak == 1, f"pusher ran {peak} uploads concurrently (expected 1)"
+
+    def test_wait_drains_pending_push(self, tmp_path, mocker):
+        """``wait()`` blocks until the queued push actually completes."""
+        from pawn.checkpoint import BackgroundCheckpointPusher
+
+        (tmp_path / "step_00000001").mkdir()
+        completed = [False]
+
+        def mark_complete(*args, **kwargs):
+            time.sleep(0.05)
+            completed[0] = True
+
+        fake_api = mocker.MagicMock()
+        fake_api.upload_folder.side_effect = mark_complete
+        mocker.patch("huggingface_hub.HfApi", return_value=fake_api)
+
+        pusher = BackgroundCheckpointPusher()
+        pusher.submit(tmp_path / "step_00000001", "user/repo", "run/test", step=1)
+        assert not completed[0]  # not done yet
+        pusher.wait()
+        assert completed[0], "wait() returned before the push completed"
+
+    def test_submit_failure_is_logged_not_raised(self, tmp_path, mocker, capsys):
+        """A failed push logs a warning but doesn't propagate, matching the
+        prior inline behavior. Training continues regardless of HF status."""
+        from pawn.checkpoint import BackgroundCheckpointPusher
+
+        (tmp_path / "step_00000001").mkdir()
+
+        fake_api = mocker.MagicMock()
+        fake_api.upload_folder.side_effect = RuntimeError("simulated network error")
+        mocker.patch("huggingface_hub.HfApi", return_value=fake_api)
+
+        pusher = BackgroundCheckpointPusher()
+        pusher.submit(tmp_path / "step_00000001", "user/repo", "run/test", step=1)
+        pusher.wait()  # should not raise
+
+        captured = capsys.readouterr()
+        assert "HF push failed" in captured.out
+        assert "simulated network error" in captured.out
+
+    def test_wait_with_no_submits_is_noop(self, tmp_path, mocker):
+        """Callers can construct the pusher unconditionally and ``wait()``
+        at shutdown; when ``hf_repo`` was None and nothing was submitted,
+        this is a clean no-op."""
+        from pawn.checkpoint import BackgroundCheckpointPusher
+
+        fake_api = mocker.MagicMock()
+        mocker.patch("huggingface_hub.HfApi", return_value=fake_api)
+
+        pusher = BackgroundCheckpointPusher()
+        pusher.wait()  # should not hang, raise, or call the HF API
+
+        fake_api.upload_folder.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

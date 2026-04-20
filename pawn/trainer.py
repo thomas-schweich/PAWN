@@ -661,6 +661,12 @@ class CLMTrainer:
         if self.hf_repo:
             self.hf_branch = f"run/{os.path.basename(self.run_dir)}"
 
+        # Background pusher for HF uploads. Constructed unconditionally so
+        # the shutdown path can ``wait()`` without a ``hf_repo`` guard; the
+        # pool never sees work when ``hf_repo`` is None.
+        from pawn.checkpoint import BackgroundCheckpointPusher
+        self._hf_pusher = BackgroundCheckpointPusher(thread_name_prefix="hf-pretrain")
+
         self._model = PAWNCLM(model_cfg).to(self.device)
         self.model = self._model
         param_count = sum(p.numel() for p in self._model.parameters())
@@ -1096,6 +1102,9 @@ class CLMTrainer:
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGINT, old_int)
 
+        # Drain the background HF pusher before exiting so a final
+        # save on shutdown/end isn't lost. No-op when hf_repo is None.
+        self._hf_pusher.wait()
         self.logger.close()
 
     def save_checkpoint(self, path: str | None = None):
@@ -1128,16 +1137,10 @@ class CLMTrainer:
         print(f"Checkpoint saved: {path}")
 
         if self.hf_repo and self.hf_branch:
-            from pawn.checkpoint import push_checkpoint_to_hf
-            try:
-                push_checkpoint_to_hf(
-                    path, self.hf_repo, self.hf_branch,
-                    metrics_path=self._jsonl_path,
-                    step=self.global_step,
-                )
-                print(f"Pushed to HF: {self.hf_repo}@{self.hf_branch}")
-            except Exception as e:
-                print(f"WARNING: HF push failed: {e}")
+            self._hf_pusher.submit(
+                path, self.hf_repo, self.hf_branch,
+                step=self.global_step, metrics_path=self._jsonl_path,
+            )
 
     def load_checkpoint(self, path: str):
         from pawn.checkpoint import load_pretrain_checkpoint

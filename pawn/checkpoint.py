@@ -699,6 +699,74 @@ def find_best_adapter_step(metrics_path: str | Path) -> int | None:
 # HuggingFace push
 # ---------------------------------------------------------------------------
 
+
+class BackgroundCheckpointPusher:
+    """Serialized background HF pushes for a single run.
+
+    A HF branch can't be concurrently updated (``upload_folder`` creates
+    a commit, so two parallel uploads would race on the branch head), so
+    this helper runs pushes on a single-worker pool and blocks the
+    submitter on the previous future before accepting a new push.
+    Failures are logged (``print``) and swallowed, matching the prior
+    inline behavior.
+
+    Usage::
+
+        pusher = BackgroundCheckpointPusher()
+        ...
+        pusher.submit(path, "user/repo", "run/slug", step=1000)
+        ...
+        pusher.wait()   # before exit — ensures the last push lands
+
+    The helper is a no-op when ``hf_repo`` is ``None`` — callers can
+    construct it unconditionally and skip the ``submit`` call.
+    """
+
+    def __init__(self, thread_name_prefix: str = "hf-push") -> None:
+        from concurrent.futures import Future, ThreadPoolExecutor
+
+        self._pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=thread_name_prefix,
+        )
+        self._future: Future[None] | None = None
+
+    def submit(
+        self,
+        checkpoint_path: str | Path,
+        repo_id: str,
+        branch: str,
+        *,
+        step: int,
+        metrics_path: str | Path | None = None,
+        log_prefix: str = "",
+    ) -> None:
+        """Queue a push. Blocks on the previous push if one is in flight."""
+        if self._future is not None:
+            # Don't let uploads stack up against the same branch head.
+            self._future.result()
+        ckpt_path = str(checkpoint_path)
+        mpath = str(metrics_path) if metrics_path is not None else None
+
+        def _push() -> None:
+            try:
+                push_checkpoint_to_hf(
+                    ckpt_path, repo_id, branch,
+                    metrics_path=mpath, step=step,
+                )
+                print(f"{log_prefix}Pushed to HF: {repo_id}@{branch}")
+            except Exception as e:
+                print(f"{log_prefix}WARNING: HF push failed: {e}")
+
+        self._future = self._pool.submit(_push)
+
+    def wait(self) -> None:
+        """Block until all pending pushes finish and release the pool."""
+        if self._future is not None:
+            self._future.result()
+            self._future = None
+        self._pool.shutdown(wait=True)
+
+
 def push_checkpoint_to_hf(
     checkpoint_path: str | Path,
     repo_id: str,

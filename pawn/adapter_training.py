@@ -1182,6 +1182,12 @@ def train(
     ckpt_dir.mkdir(exist_ok=True)
     hf_branch = f"run/{logger.run_dir.name}" if args.hf_repo else None
 
+    # Background pusher for HF uploads. Construct eagerly even without an
+    # ``hf_repo`` so the shutdown path can ``wait()`` unconditionally; the
+    # pool never sees work in that case.
+    from pawn.checkpoint import BackgroundCheckpointPusher
+    hf_pusher = BackgroundCheckpointPusher(thread_name_prefix="hf-adapter")
+
     eval_interval = args.eval_interval
     step_limit = args.total_steps
     pause_step = args.pause_after_steps
@@ -1242,17 +1248,12 @@ def train(
             },
         )
         if args.hf_repo and hf_branch:
-            from pawn.checkpoint import push_checkpoint_to_hf
-
-            try:
-                push_checkpoint_to_hf(
-                    step_path,
-                    args.hf_repo,
-                    hf_branch,
-                    step=global_step,
-                )
-            except Exception as e:
-                print(f"WARNING: HF push failed: {e}")
+            hf_pusher.submit(
+                step_path,
+                args.hf_repo,
+                hf_branch,
+                step=global_step,
+            )
 
     epoch = start_epoch  # default if loop doesn't execute (resume past end)
     for epoch in range(start_epoch, args.epochs):
@@ -1476,5 +1477,10 @@ def train(
     # there's no separate existence check needed here.
     if global_step > initial_step:
         _save_step_checkpoint(val_metrics, epoch)
+
+    # Drain the background HF pusher before returning so pending uploads
+    # aren't lost when the process exits. This is a no-op when hf_repo
+    # was unset.
+    hf_pusher.wait()
 
     return best_val_loss, val_metrics
