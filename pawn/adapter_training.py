@@ -1213,7 +1213,10 @@ def train(
         Matches ``pawn.trainer.Trainer.save_checkpoint``: one
         ``step_{global_step:08d}/`` directory per save, never overwritten.
         Downstream tools discover the best-by-val-loss step via
-        ``metrics.jsonl``. See ``scripts/export_hf_repo.find_best_step``.
+        ``metrics.jsonl``; see ``pawn.checkpoint.find_best_adapter_step``
+        (adapter records use ``type="train"`` with a ``val_loss`` kwarg —
+        the pretraining helper ``scripts/export_hf_repo.find_best_step``
+        filters on ``type="val"`` and does not apply).
         """
         step_path = ckpt_dir / f"step_{global_step:08d}"
         save_adapter_checkpoint(

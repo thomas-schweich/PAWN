@@ -660,6 +660,42 @@ def _load_from_hf_repo(
 
 
 # ---------------------------------------------------------------------------
+# Best-step discovery
+# ---------------------------------------------------------------------------
+
+def find_best_adapter_step(metrics_path: str | Path) -> int | None:
+    """Find the step with lowest ``val_loss`` in an adapter ``metrics.jsonl``.
+
+    Adapter training writes one record per eval under ``type="train"`` with
+    ``val_loss`` / ``val_top1`` / ... as kwargs (see
+    ``pawn.adapter_training.train``'s eval block and
+    ``pawn.logging.MetricsLogger.log_train``). The pretraining counterpart
+    lives in ``scripts/export_hf_repo.find_best_step`` and looks for
+    ``type="val"`` with ``val/loss``; that function does not apply here.
+
+    Returns the step of the record with the lowest finite ``val_loss``, or
+    ``None`` if no eval records were found.
+    """
+    metrics_path = Path(metrics_path)
+    best_loss = float("inf")
+    best_step: int | None = None
+    with open(metrics_path) as f:
+        for line in f:
+            record = json.loads(line)
+            # Adapter eval records live under type="train" with val_loss.
+            val_loss = record.get("val_loss")
+            if val_loss is None:
+                continue
+            step = record.get("step")
+            if step is None:
+                continue
+            if val_loss < best_loss:
+                best_loss = float(val_loss)
+                best_step = int(step)
+    return best_step
+
+
+# ---------------------------------------------------------------------------
 # HuggingFace push
 # ---------------------------------------------------------------------------
 
