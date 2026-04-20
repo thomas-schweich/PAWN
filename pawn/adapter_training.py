@@ -1120,6 +1120,13 @@ def train(
         patience_counter = ckpt.get("patience_counter", 0)
         del ckpt
 
+    # Record the step we enter the loop at so the final save can tell
+    # whether any training happened this session. On resume-past-end
+    # (epoch budget exhausted on a prior run) the loop body never
+    # executes and ``val_metrics`` would otherwise hold the baseline
+    # eval — writing that as the final state would be misleading.
+    initial_step = global_step
+
     # Baseline eval
     if not args.resume:
         print("\nBaseline (before training):")
@@ -1168,12 +1175,18 @@ def train(
         nonlocal _shutdown
         _shutdown = True
 
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
+    old_term = signal.signal(signal.SIGTERM, _handle_signal)
+    old_int = signal.signal(signal.SIGINT, _handle_signal)
 
     ckpt_dir = logger.run_dir / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
     hf_branch = f"run/{logger.run_dir.name}" if args.hf_repo else None
+
+    # Background pusher for HF uploads. Construct eagerly even without an
+    # ``hf_repo`` so the shutdown path can ``wait()`` unconditionally; the
+    # pool never sees work in that case.
+    from pawn.checkpoint import BackgroundCheckpointPusher
+    hf_pusher = BackgroundCheckpointPusher(thread_name_prefix="hf-adapter")
 
     eval_interval = args.eval_interval
     step_limit = args.total_steps
@@ -1200,9 +1213,27 @@ def train(
             illegal_penalty=illegal_penalty,
         )
 
-    def _save_best(vm: dict[str, float], ep: int) -> None:
+    def _save_step_checkpoint(vm: dict[str, float], ep: int) -> None:
+        """Save a step-tagged adapter checkpoint.
+
+        Matches ``pawn.trainer.Trainer.save_checkpoint``: one
+        ``step_{global_step:08d}/`` directory per save, never overwritten.
+        Downstream tools discover the best-by-val-loss step via
+        ``metrics.jsonl``; see ``pawn.checkpoint.find_best_adapter_step``
+        (adapter records use ``type="train"`` with a ``val_loss`` kwarg —
+        the pretraining helper ``scripts/export_hf_repo.find_best_step``
+        filters on ``type="val"`` and does not apply).
+
+        Idempotent: if ``step_path`` already exists (e.g. the same step
+        was already saved by the interval hook and the training loop is
+        now at termination), this is a no-op. Callers can invoke freely
+        without a preflight ``exists()`` check.
+        """
+        step_path = ckpt_dir / f"step_{global_step:08d}"
+        if step_path.exists():
+            return
         save_adapter_checkpoint(
-            ckpt_dir / "best",
+            step_path,
             state_dict_fn(),
             config=build_config_json(args, param_count),
             epoch=ep,
@@ -1217,17 +1248,12 @@ def train(
             },
         )
         if args.hf_repo and hf_branch:
-            from pawn.checkpoint import push_checkpoint_to_hf
-
-            try:
-                push_checkpoint_to_hf(
-                    ckpt_dir / "best",
-                    args.hf_repo,
-                    hf_branch,
-                    step=global_step,
-                )
-            except Exception as e:
-                print(f"WARNING: HF push failed: {e}")
+            hf_pusher.submit(
+                step_path,
+                args.hf_repo,
+                hf_branch,
+                step=global_step,
+            )
 
     epoch = start_epoch  # default if loop doesn't execute (resume past end)
     for epoch in range(start_epoch, args.epochs):
@@ -1311,6 +1337,13 @@ def train(
                     f"top1={avg_top1:.4%} lr={lr:.2e}",
                     flush=True,
                 )
+                logger.log_train(
+                    step=global_step,
+                    epoch=epoch,
+                    lr=lr,
+                    train_loss=avg_loss,
+                    train_top1=avg_top1,
+                )
                 log_positions = 0
 
             if eval_interval and global_step % eval_interval == 0:
@@ -1322,6 +1355,11 @@ def train(
                     f"val_top5={val_metrics['top5_accuracy']:.4%} "
                     f"illegal_pred={val_metrics['illegal_pred_rate']:.2%}"
                 )
+                try:
+                    report = weight_report_fn()
+                except Exception as e:
+                    print(f"WARNING: weight_report_fn failed: {e}", flush=True)
+                    report = {}
                 logger.log_train(
                     step=global_step,
                     epoch=epoch,
@@ -1331,20 +1369,49 @@ def train(
                     val_top5=val_metrics["top5_accuracy"],
                     val_illegal_pred_rate=val_metrics["illegal_pred_rate"],
                     val_illegal_prob_mass=val_metrics["illegal_prob_mass"],
+                    **report,
                 )
-                if val_metrics["loss"] < best_val_loss:
+                # Saves triggered by the eval that just ran get fresh
+                # ``val_metrics`` in ``training_state.json``. Non-eval-aligned
+                # checkpoint_interval boundaries are handled in a separate
+                # block below so users can request sub-eval-frequency saves
+                # for LR-probing workflows (e.g. ``checkpoint_interval=500``
+                # with ``eval_interval=2000``).
+                new_best = val_metrics["loss"] < best_val_loss
+                at_interval = global_step % args.checkpoint_interval == 0
+                if new_best:
                     best_val_loss = val_metrics["loss"]
                     patience_counter = 0
-                    _save_best(val_metrics, epoch)
                 else:
                     patience_counter += 1
-                    if args.patience is not None and patience_counter >= args.patience:
-                        print(
-                            f"\n  Early stopping at step {global_step} "
-                            f"(patience={args.patience})"
-                        )
-                        break
+                if new_best or at_interval:
+                    _save_step_checkpoint(val_metrics, epoch)
+                if (
+                    not new_best
+                    and args.patience is not None
+                    and patience_counter >= args.patience
+                ):
+                    print(
+                        f"\n  Early stopping at step {global_step} "
+                        f"(patience={args.patience})"
+                    )
+                    break
                 model.train()
+
+            # Out-of-eval-block interval saves for the
+            # ``checkpoint_interval < eval_interval`` case. The embedded
+            # ``val_metrics`` is from the most recent eval (possibly from
+            # earlier in training) so metadata may be stale — the model
+            # weights, optimizer state, and scheduler step at
+            # ``step_{global_step:08d}/`` are always current. Callers that
+            # need authoritative per-step val stats should cross-reference
+            # ``metrics.jsonl``. Idempotent: no-op when the step already
+            # has a checkpoint from the eval-aligned path above.
+            elif (
+                args.checkpoint_interval
+                and global_step % args.checkpoint_interval == 0
+            ):
+                _save_step_checkpoint(val_metrics, epoch)
 
             if step_limit and global_step >= step_limit:
                 break
@@ -1367,7 +1434,8 @@ def train(
 
         try:
             report = weight_report_fn()
-        except Exception:
+        except Exception as e:
+            print(f"WARNING: weight_report_fn failed: {e}", flush=True)
             report = {}
         logger.log_train(
             step=global_step,
@@ -1395,7 +1463,6 @@ def train(
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 patience_counter = 0
-                _save_best(val_metrics, epoch)
             else:
                 patience_counter += 1
                 if args.patience is not None and patience_counter >= args.patience:
@@ -1404,6 +1471,7 @@ def train(
                         f"(patience={args.patience})"
                     )
                     break
+            _save_step_checkpoint(val_metrics, epoch)
 
         if eval_interval and args.patience is not None and patience_counter >= args.patience:
             break  # step-based early stopping triggered inside batch loop
@@ -1417,21 +1485,24 @@ def train(
             print("Shutdown requested, saving checkpoint...")
             break
 
-    # Final checkpoint
-    save_adapter_checkpoint(
-        ckpt_dir / "final",
-        state_dict_fn(),
-        config=build_config_json(args, param_count),
-        epoch=epoch,
-        step=global_step,
-        val_metrics=val_metrics,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        extra={
-            "best_val_loss": best_val_loss,
-            "patience_counter": patience_counter,
-        },
-    )
+    # Final checkpoint — only write if this session actually trained. On
+    # resume-past-end the loop doesn't execute, so ``val_metrics`` still
+    # holds the baseline eval; saving it as the final state would be
+    # misleading. ``_save_step_checkpoint`` itself is idempotent, so
+    # there's no separate existence check needed here.
+    if global_step > initial_step:
+        _save_step_checkpoint(val_metrics, epoch)
+
+    # Restore the caller's signal handlers before draining the HF pusher.
+    # ``hf_pusher.wait()`` can block for seconds-to-minutes on a slow
+    # upload; handing SIGINT/SIGTERM back first lets a second Ctrl-C/TERM
+    # actually interrupt instead of getting swallowed by our latch.
+    signal.signal(signal.SIGTERM, old_term)
+    signal.signal(signal.SIGINT, old_int)
+
+    # Drain the background HF pusher before returning so pending uploads
+    # aren't lost when the process exits. This is a no-op when hf_repo
+    # was unset.
+    hf_pusher.wait()
 
     return best_val_loss, val_metrics

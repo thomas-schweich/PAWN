@@ -4,7 +4,7 @@
 Usage:
     uv run --extra rocm python scripts/eval_vs_stockfish.py \\
         --checkpoint thomas-schweich/pawn-base \\
-        --adapter-checkpoint runs/logs/trial_0022/bottleneck_.../checkpoints/best \\
+        --adapter-checkpoint runs/logs/trial_0022/bottleneck_.../checkpoints/step_00020000 \\
         --stockfish ~/bin/stockfish --stockfish-elo 1320 \\
         --games 100 --movetime-ms 1 \\
         --output runs/eval/stockfish_vs_dim512.json

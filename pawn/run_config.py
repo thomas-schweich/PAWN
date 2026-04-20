@@ -204,6 +204,7 @@ class AdapterConfig(BaseRunConfig):
     # Adapter training specific -------------------------------------------
     epochs: int = 50
     val_every: int = 1
+    checkpoint_interval: int = 5000
 
     # Legality handling ---------------------------------------------------
     # By default, adapter training masks illegal moves to -inf before

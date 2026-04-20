@@ -144,6 +144,10 @@ class TestAdapterConfig:
         assert cfg.checkpoint == "thomas-schweich/pawn-base"
         assert cfg.pgn == "thomas-schweich/pawn-lichess-full"
 
+    def test_default_checkpoint_interval(self):
+        cfg = AdapterConfig(local_checkpoints=True, strategy="lora")
+        assert cfg.checkpoint_interval == 5000
+
     def test_lora_targets_valid(self):
         for tgt in ("qkvo", "qv", "qkv"):
             cfg = AdapterConfig.model_validate({

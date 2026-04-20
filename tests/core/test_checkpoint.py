@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,7 @@ from pawn.checkpoint import (
     _unflatten_optimizer_state,
     _verify_complete_sentinel,
     _write_complete_sentinel,
+    find_best_adapter_step,
     get_prepend_outcome,
     load_adapter_checkpoint,
     load_backbone_weights,
@@ -653,6 +655,179 @@ class TestAdapterCheckpoint:
             load_adapter_checkpoint(ckpt_path)
 
 
+@pytest.mark.integration
+class TestAdapterStepTaggedLayout:
+    """Pin down the ``step_{global_step:08d}/`` naming convention.
+
+    The actual save-decision logic lives inside a closure in
+    ``pawn.adapter_training.train`` and is exercised end-to-end by lab
+    runs. These tests nail down the storage-layer contract that the
+    closure relies on: distinct steps land in distinct directories,
+    each is independently loadable, and the caller can preflight
+    existence to implement idempotent save.
+    """
+
+    def _save_one(self, path, step):
+        save_adapter_checkpoint(
+            path,
+            {"down.weight": torch.randn(8, 64)},
+            config={"checkpoint_type": "bottleneck"},
+            epoch=0,
+            step=step,
+            val_metrics={"loss": 3.0 - step * 0.001},
+        )
+
+    def test_different_steps_produce_distinct_directories(self, tmp_path):
+        ckpt_dir = tmp_path / "checkpoints"
+        ckpt_dir.mkdir()
+        for step in (1000, 2000, 5000):
+            self._save_one(ckpt_dir / f"step_{step:08d}", step)
+
+        saved = sorted(p.name for p in ckpt_dir.iterdir())
+        assert saved == ["step_00001000", "step_00002000", "step_00005000"]
+
+        # Each is independently loadable and integrity-checked.
+        for step in (1000, 2000, 5000):
+            loaded = load_adapter_checkpoint(ckpt_dir / f"step_{step:08d}")
+            assert loaded["step"] == step
+
+    def test_preflight_existence_supports_idempotent_save(self, tmp_path):
+        """``_save_step_checkpoint`` returns early when the target already
+        exists so callers can invoke it unconditionally at end-of-training."""
+        step_path = tmp_path / "step_00001000"
+        self._save_one(step_path, 1000)
+        assert step_path.exists()
+
+        # The caller's idempotent guard: if the path exists, skip the save.
+        # This is the contract the final-save block at the tail of
+        # ``train`` relies on.
+        def maybe_save():
+            if step_path.exists():
+                return
+            self._save_one(step_path, 1000)  # pragma: no cover
+        maybe_save()  # should be a no-op
+
+        # File mtimes confirm nothing was rewritten.
+        original_mtimes = {
+            f.name: f.stat().st_mtime_ns
+            for f in step_path.iterdir()
+        }
+        maybe_save()
+        for f in step_path.iterdir():
+            assert f.stat().st_mtime_ns == original_mtimes[f.name]
+
+    def test_step_width_padding(self, tmp_path):
+        """8-digit zero-padded steps sort lexicographically.
+
+        This is what ``sorted(... glob("step_*"))`` in ``export_hf_repo``
+        and similar tools depend on for "pick the latest" semantics.
+        """
+        ckpt_dir = tmp_path / "checkpoints"
+        ckpt_dir.mkdir()
+        for step in (100, 1000, 10000, 100000):
+            self._save_one(ckpt_dir / f"step_{step:08d}", step)
+
+        # Lex sort on the filesystem == numeric sort on the step.
+        sorted_by_name = sorted(p.name for p in ckpt_dir.iterdir())
+        sorted_by_step = sorted(
+            (p.name for p in ckpt_dir.iterdir()),
+            key=lambda n: int(n.replace("step_", "")),
+        )
+        assert sorted_by_name == sorted_by_step
+
+
+# ---------------------------------------------------------------------------
+# find_best_adapter_step
+# ---------------------------------------------------------------------------
+
+
+def _write_metrics_jsonl(path, records):
+    with open(path, "w") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+
+class TestFindBestAdapterStep:
+    def test_basic_selects_lowest_val_loss(self, tmp_path):
+        metrics = tmp_path / "metrics.jsonl"
+        _write_metrics_jsonl(metrics, [
+            {"type": "train", "step": 1000, "val_loss": 2.50},
+            {"type": "train", "step": 2000, "val_loss": 2.40},
+            {"type": "train", "step": 3000, "val_loss": 2.35},
+            {"type": "train", "step": 4000, "val_loss": 2.38},
+        ])
+        assert find_best_adapter_step(metrics) == 3000
+
+    def test_ignores_records_without_val_loss(self, tmp_path):
+        """log_interval records carry only train_loss/train_top1 — skip them."""
+        metrics = tmp_path / "metrics.jsonl"
+        _write_metrics_jsonl(metrics, [
+            {"type": "train", "step": 100, "train_loss": 2.9, "train_top1": 0.3},
+            {"type": "train", "step": 200, "train_loss": 2.8, "train_top1": 0.32},
+            {"type": "train", "step": 1000, "val_loss": 2.40},
+            {"type": "train", "step": 1100, "train_loss": 2.5, "train_top1": 0.42},
+            {"type": "train", "step": 2000, "val_loss": 2.35},
+        ])
+        assert find_best_adapter_step(metrics) == 2000
+
+    def test_returns_none_on_no_val_records(self, tmp_path):
+        metrics = tmp_path / "metrics.jsonl"
+        _write_metrics_jsonl(metrics, [
+            {"type": "train", "step": 100, "train_loss": 2.9},
+            {"type": "train", "step": 200, "train_loss": 2.8},
+        ])
+        assert find_best_adapter_step(metrics) is None
+
+    def test_returns_none_on_empty_file(self, tmp_path):
+        metrics = tmp_path / "metrics.jsonl"
+        metrics.touch()
+        assert find_best_adapter_step(metrics) is None
+
+    def test_first_occurrence_wins_on_tie(self, tmp_path):
+        """With a strict ``<`` comparison, the earliest step of a tied val_loss
+        is retained — deterministic and matches the pretrain helper."""
+        metrics = tmp_path / "metrics.jsonl"
+        _write_metrics_jsonl(metrics, [
+            {"type": "train", "step": 1000, "val_loss": 2.5},
+            {"type": "train", "step": 2000, "val_loss": 2.3},
+            {"type": "train", "step": 3000, "val_loss": 2.3},
+        ])
+        assert find_best_adapter_step(metrics) == 2000
+
+    def test_skips_records_without_step(self, tmp_path):
+        metrics = tmp_path / "metrics.jsonl"
+        _write_metrics_jsonl(metrics, [
+            {"type": "config", "val_loss": 1.0},  # no step field
+            {"type": "train", "step": 1000, "val_loss": 2.5},
+        ])
+        assert find_best_adapter_step(metrics) == 1000
+
+    def test_handles_float_and_int_step_values(self, tmp_path):
+        metrics = tmp_path / "metrics.jsonl"
+        _write_metrics_jsonl(metrics, [
+            {"type": "train", "step": 1000, "val_loss": 2.5},
+            {"type": "train", "step": 2000.0, "val_loss": 2.0},  # float step
+        ])
+        result = find_best_adapter_step(metrics)
+        assert result == 2000
+        assert isinstance(result, int)
+
+    def test_skips_malformed_json_lines(self, tmp_path):
+        """A truncated or corrupted line shouldn't abort the whole scan.
+
+        This can happen after a crash mid-write or if the file is still
+        being flushed from an earlier training process.
+        """
+        metrics = tmp_path / "metrics.jsonl"
+        metrics.write_text(
+            '{"type":"train","step":1000,"val_loss":2.5}\n'
+            '{"type":"train","step":2000,"val_\n'  # truncated partway
+            'totally not json at all\n'
+            '{"type":"train","step":3000,"val_loss":2.2}\n'
+        )
+        assert find_best_adapter_step(metrics) == 3000
+
+
 # ---------------------------------------------------------------------------
 # load_backbone_weights
 # ---------------------------------------------------------------------------
@@ -800,6 +975,128 @@ class TestHfPushMocked:
             ckpt_path, repo_id="user/repo", branch="run/test", step=1,
         )
         fake_api.upload_file.assert_not_called()
+
+
+@pytest.mark.unit
+class TestBackgroundCheckpointPusher:
+    def test_submit_returns_immediately(self, tmp_path, mocker):
+        """``submit`` queues work to a background thread; the caller does
+        not block on ``upload_folder`` duration."""
+        from pawn.checkpoint import BackgroundCheckpointPusher
+
+        ckpt_path = tmp_path / "step_00000001"
+        ckpt_path.mkdir()
+
+        import threading
+        release = threading.Event()
+
+        def slow_upload_folder(*args, **kwargs):
+            # Simulate a slow HF upload.
+            release.wait(timeout=5.0)
+
+        fake_api = mocker.MagicMock()
+        fake_api.upload_folder.side_effect = slow_upload_folder
+        mocker.patch("huggingface_hub.HfApi", return_value=fake_api)
+
+        pusher = BackgroundCheckpointPusher()
+        try:
+            t0 = time.monotonic()
+            pusher.submit(ckpt_path, "user/repo", "run/test", step=1)
+            submit_elapsed = time.monotonic() - t0
+            # Submit must return well before the (blocked) upload finishes.
+            assert submit_elapsed < 0.5
+        finally:
+            release.set()
+            pusher.wait()
+
+        fake_api.upload_folder.assert_called_once()
+
+    def test_serializes_concurrent_submits(self, tmp_path, mocker):
+        """Two submits in quick succession run one-at-a-time, not concurrently."""
+        from pawn.checkpoint import BackgroundCheckpointPusher
+
+        import threading
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def tracking_upload_folder(*args, **kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+
+        fake_api = mocker.MagicMock()
+        fake_api.upload_folder.side_effect = tracking_upload_folder
+        mocker.patch("huggingface_hub.HfApi", return_value=fake_api)
+
+        for i in (1, 2):
+            (tmp_path / f"step_{i:08d}").mkdir()
+
+        pusher = BackgroundCheckpointPusher()
+        pusher.submit(tmp_path / "step_00000001", "user/repo", "run/test", step=1)
+        pusher.submit(tmp_path / "step_00000002", "user/repo", "run/test", step=2)
+        pusher.wait()
+
+        assert fake_api.upload_folder.call_count == 2
+        assert peak == 1, f"pusher ran {peak} uploads concurrently (expected 1)"
+
+    def test_wait_drains_pending_push(self, tmp_path, mocker):
+        """``wait()`` blocks until the queued push actually completes."""
+        from pawn.checkpoint import BackgroundCheckpointPusher
+
+        (tmp_path / "step_00000001").mkdir()
+        completed = [False]
+
+        def mark_complete(*args, **kwargs):
+            time.sleep(0.05)
+            completed[0] = True
+
+        fake_api = mocker.MagicMock()
+        fake_api.upload_folder.side_effect = mark_complete
+        mocker.patch("huggingface_hub.HfApi", return_value=fake_api)
+
+        pusher = BackgroundCheckpointPusher()
+        pusher.submit(tmp_path / "step_00000001", "user/repo", "run/test", step=1)
+        assert not completed[0]  # not done yet
+        pusher.wait()
+        assert completed[0], "wait() returned before the push completed"
+
+    def test_submit_failure_is_logged_not_raised(self, tmp_path, mocker, capsys):
+        """A failed push logs a warning but doesn't propagate, matching the
+        prior inline behavior. Training continues regardless of HF status."""
+        from pawn.checkpoint import BackgroundCheckpointPusher
+
+        (tmp_path / "step_00000001").mkdir()
+
+        fake_api = mocker.MagicMock()
+        fake_api.upload_folder.side_effect = RuntimeError("simulated network error")
+        mocker.patch("huggingface_hub.HfApi", return_value=fake_api)
+
+        pusher = BackgroundCheckpointPusher()
+        pusher.submit(tmp_path / "step_00000001", "user/repo", "run/test", step=1)
+        pusher.wait()  # should not raise
+
+        captured = capsys.readouterr()
+        assert "HF push failed" in captured.out
+        assert "simulated network error" in captured.out
+
+    def test_wait_with_no_submits_is_noop(self, tmp_path, mocker):
+        """Callers can construct the pusher unconditionally and ``wait()``
+        at shutdown; when ``hf_repo`` was None and nothing was submitted,
+        this is a clean no-op."""
+        from pawn.checkpoint import BackgroundCheckpointPusher
+
+        fake_api = mocker.MagicMock()
+        mocker.patch("huggingface_hub.HfApi", return_value=fake_api)
+
+        pusher = BackgroundCheckpointPusher()
+        pusher.wait()  # should not hang, raise, or call the HF API
+
+        fake_api.upload_folder.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

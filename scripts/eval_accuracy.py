@@ -13,9 +13,13 @@ and optionally per-ply accuracy.
 Usage:
     uv run python scripts/eval_accuracy.py \
         --checkpoint thomas-schweich/pawn-base \
-        --adapter-checkpoint logs/run_*/checkpoints/best \
+        --adapter-checkpoint logs/run_*/checkpoints/step_00104000 \
         --pgn thomas-schweich/pawn-lichess-full \
         --min-eval-ply 10
+
+Adapter checkpoints are saved at ``step_{global_step:08d}/`` — matching
+the pretraining layout. Pick the best step by scanning ``metrics.jsonl``
+for the lowest ``val_loss`` record, or simply use the final step.
 """
 
 from __future__ import annotations

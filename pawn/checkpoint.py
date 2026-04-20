@@ -660,8 +660,118 @@ def _load_from_hf_repo(
 
 
 # ---------------------------------------------------------------------------
+# Best-step discovery
+# ---------------------------------------------------------------------------
+
+def find_best_adapter_step(metrics_path: str | Path) -> int | None:
+    """Find the step with lowest ``val_loss`` in an adapter ``metrics.jsonl``.
+
+    Adapter training writes one record per eval under ``type="train"`` with
+    ``val_loss`` / ``val_top1`` / ... as kwargs (see
+    ``pawn.adapter_training.train``'s eval block and
+    ``pawn.logging.MetricsLogger.log_train``). The pretraining counterpart
+    lives in ``scripts/export_hf_repo.find_best_step`` and looks for
+    ``type="val"`` with ``val/loss``; that function does not apply here.
+
+    Returns the step of the record with the lowest finite ``val_loss``, or
+    ``None`` if no eval records were found.
+    """
+    metrics_path = Path(metrics_path)
+    best_loss = float("inf")
+    best_step: int | None = None
+    with open(metrics_path) as f:
+        for line in f:
+            # Tolerate malformed lines (truncated writes, partial flushes)
+            # — skip rather than abort the whole scan. Matches the posture
+            # of ``push_checkpoint_to_hf``'s metrics-truncation reader.
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # Adapter eval records live under type="train" with val_loss.
+            val_loss = record.get("val_loss")
+            if val_loss is None:
+                continue
+            step = record.get("step")
+            if step is None:
+                continue
+            if val_loss < best_loss:
+                best_loss = float(val_loss)
+                best_step = int(step)
+    return best_step
+
+
+# ---------------------------------------------------------------------------
 # HuggingFace push
 # ---------------------------------------------------------------------------
+
+
+class BackgroundCheckpointPusher:
+    """Serialized background HF pushes for a single run.
+
+    A HF branch can't be concurrently updated (``upload_folder`` creates
+    a commit, so two parallel uploads would race on the branch head), so
+    this helper runs pushes on a single-worker pool and blocks the
+    submitter on the previous future before accepting a new push.
+    Failures are logged (``print``) and swallowed, matching the prior
+    inline behavior.
+
+    Usage::
+
+        pusher = BackgroundCheckpointPusher()
+        ...
+        pusher.submit(path, "user/repo", "run/slug", step=1000)
+        ...
+        pusher.wait()   # before exit — ensures the last push lands
+
+    The helper is a no-op when ``hf_repo`` is ``None`` — callers can
+    construct it unconditionally and skip the ``submit`` call.
+    """
+
+    def __init__(self, thread_name_prefix: str = "hf-push") -> None:
+        from concurrent.futures import Future, ThreadPoolExecutor
+
+        self._pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=thread_name_prefix,
+        )
+        self._future: Future[None] | None = None
+
+    def submit(
+        self,
+        checkpoint_path: str | Path,
+        repo_id: str,
+        branch: str,
+        *,
+        step: int,
+        metrics_path: str | Path | None = None,
+        log_prefix: str = "",
+    ) -> None:
+        """Queue a push. Blocks on the previous push if one is in flight."""
+        if self._future is not None:
+            # Don't let uploads stack up against the same branch head.
+            self._future.result()
+        ckpt_path = str(checkpoint_path)
+        mpath = str(metrics_path) if metrics_path is not None else None
+
+        def _push() -> None:
+            try:
+                push_checkpoint_to_hf(
+                    ckpt_path, repo_id, branch,
+                    metrics_path=mpath, step=step,
+                )
+                print(f"{log_prefix}Pushed to HF: {repo_id}@{branch}")
+            except Exception as e:
+                print(f"{log_prefix}WARNING: HF push failed: {e}")
+
+        self._future = self._pool.submit(_push)
+
+    def wait(self) -> None:
+        """Block until all pending pushes finish and release the pool."""
+        if self._future is not None:
+            self._future.result()
+            self._future = None
+        self._pool.shutdown(wait=True)
+
 
 def push_checkpoint_to_hf(
     checkpoint_path: str | Path,
