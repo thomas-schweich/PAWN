@@ -1319,6 +1319,13 @@ def train(
                     f"top1={avg_top1:.4%} lr={lr:.2e}",
                     flush=True,
                 )
+                logger.log_train(
+                    step=global_step,
+                    epoch=epoch,
+                    lr=lr,
+                    train_loss=avg_loss,
+                    train_top1=avg_top1,
+                )
                 log_positions = 0
 
             if eval_interval and global_step % eval_interval == 0:
@@ -1330,6 +1337,10 @@ def train(
                     f"val_top5={val_metrics['top5_accuracy']:.4%} "
                     f"illegal_pred={val_metrics['illegal_pred_rate']:.2%}"
                 )
+                try:
+                    report = weight_report_fn()
+                except Exception:
+                    report = {}
                 logger.log_train(
                     step=global_step,
                     epoch=epoch,
@@ -1339,6 +1350,7 @@ def train(
                     val_top5=val_metrics["top5_accuracy"],
                     val_illegal_pred_rate=val_metrics["illegal_pred_rate"],
                     val_illegal_prob_mass=val_metrics["illegal_prob_mass"],
+                    **report,
                 )
                 if val_metrics["loss"] < best_val_loss:
                     best_val_loss = val_metrics["loss"]
