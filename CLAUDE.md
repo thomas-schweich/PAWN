@@ -182,7 +182,7 @@ Trains linear probes on frozen hidden states to measure internal representations
 uv run python scripts/eval_accuracy.py \
     --checkpoint thomas-schweich/pawn-base \
     --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
-    --adapter-checkpoint logs/run_*/checkpoints/best
+    --adapter-checkpoint logs/run_*/checkpoints/step_00020000
 ```
 
 MAIA-compatible evaluation with per-phase and per-ply accuracy. Args: `--min-eval-ply 10`, `--max-games 50000`, `--per-ply`.

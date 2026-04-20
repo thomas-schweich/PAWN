@@ -120,7 +120,7 @@ uv run python scripts/train.py --run-type adapter --strategy bottleneck \
 uv run python scripts/train.py --run-type adapter --strategy bottleneck \
     --checkpoint thomas-schweich/pawn-base \
     --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
-    --resume logs/bottleneck_20260315_120000/checkpoints/best --local-checkpoints
+    --resume logs/bottleneck_20260315_120000/checkpoints/step_00020000 --local-checkpoints
 ```
 
 ### Selective layer placement

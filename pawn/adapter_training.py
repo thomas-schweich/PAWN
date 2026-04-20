@@ -1200,9 +1200,17 @@ def train(
             illegal_penalty=illegal_penalty,
         )
 
-    def _save_best(vm: dict[str, float], ep: int) -> None:
+    def _save_step_checkpoint(vm: dict[str, float], ep: int) -> None:
+        """Save a step-tagged adapter checkpoint.
+
+        Matches ``pawn.trainer.Trainer.save_checkpoint``: one
+        ``step_{global_step:08d}/`` directory per save, never overwritten.
+        Downstream tools discover the best-by-val-loss step via
+        ``metrics.jsonl``. See ``scripts/export_hf_repo.find_best_step``.
+        """
+        step_path = ckpt_dir / f"step_{global_step:08d}"
         save_adapter_checkpoint(
-            ckpt_dir / "best",
+            step_path,
             state_dict_fn(),
             config=build_config_json(args, param_count),
             epoch=ep,
@@ -1221,7 +1229,7 @@ def train(
 
             try:
                 push_checkpoint_to_hf(
-                    ckpt_dir / "best",
+                    step_path,
                     args.hf_repo,
                     hf_branch,
                     step=global_step,
@@ -1335,7 +1343,6 @@ def train(
                 if val_metrics["loss"] < best_val_loss:
                     best_val_loss = val_metrics["loss"]
                     patience_counter = 0
-                    _save_best(val_metrics, epoch)
                 else:
                     patience_counter += 1
                     if args.patience is not None and patience_counter >= args.patience:
@@ -1345,6 +1352,12 @@ def train(
                         )
                         break
                 model.train()
+
+            if (
+                args.checkpoint_interval
+                and global_step % args.checkpoint_interval == 0
+            ):
+                _save_step_checkpoint(val_metrics, epoch)
 
             if step_limit and global_step >= step_limit:
                 break
@@ -1395,7 +1408,6 @@ def train(
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 patience_counter = 0
-                _save_best(val_metrics, epoch)
             else:
                 patience_counter += 1
                 if args.patience is not None and patience_counter >= args.patience:
@@ -1404,6 +1416,7 @@ def train(
                         f"(patience={args.patience})"
                     )
                     break
+            _save_step_checkpoint(val_metrics, epoch)
 
         if eval_interval and args.patience is not None and patience_counter >= args.patience:
             break  # step-based early stopping triggered inside batch loop
@@ -1417,21 +1430,10 @@ def train(
             print("Shutdown requested, saving checkpoint...")
             break
 
-    # Final checkpoint
-    save_adapter_checkpoint(
-        ckpt_dir / "final",
-        state_dict_fn(),
-        config=build_config_json(args, param_count),
-        epoch=epoch,
-        step=global_step,
-        val_metrics=val_metrics,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        extra={
-            "best_val_loss": best_val_loss,
-            "patience_counter": patience_counter,
-        },
-    )
+    # Final checkpoint — only write if this step hasn't already been saved
+    # by the interval/epoch hooks above.
+    final_path = ckpt_dir / f"step_{global_step:08d}"
+    if not final_path.exists():
+        _save_step_checkpoint(val_metrics, epoch)
 
     return best_val_loss, val_metrics
