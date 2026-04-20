@@ -6,12 +6,12 @@ I've found PAWN to be a viable testbed for finetuning and augmentation methods a
 
 Finetuning PAWN has proven significantly more parameter-efficient than training new models from scratch and requires minimal compute resources.
 
-Feel free to use PAWN in your own experiments. PAWN is developed as a personal project by a single developer and his imaginary friend (Claude) and has not been published or audited — treat the numbers below as a single-developer snapshot rather than peer-reviewed results. If you spot a bug or inaccuracy, please help out by creating an issue or PR.
+Feel free to use PAWN in your own experiments. PAWN is developed as a personal project by a single developer and his imaginary friend (Claude) and has not been published or audited. If you spot a bug or inaccuracy, please help out by creating an issue or PR.
 
 
 ## Model Variants
 
-Three sizes, all trained from scratch on random chess games generated on-the-fly by a Rust engine. The published v1.0.0 weights were trained together for 200K steps at batch size 256 on a single B200 — all three variants see the same random-game batches each step, with one forward/backward pass per variant in sequence on the same GPU (see [cotrain config](configs/cotrain_three_variants.json)). The numbers below come from the best 5K-cadence checkpoint by val loss (step 195,000 ≈ 49.9M sequences) for all three variants:
+The model comes sizes, all trained from scratch on random chess games generated on-the-fly by a Rust engine. The v1.0.0 weights were trained together for 200K steps at batch size 256 on a single B200 — all three variants see the same random-game batches each step, with one forward/backward pass per variant in sequence on the same GPU (see [cotrain config](configs/cotrain_three_variants.json)). The numbers below come from the best 5K-cadence checkpoint by val loss (step 195,000 ≈ 49.9M sequences) for all three variants:
 
 | Variant | d_model | Layers | Heads | Params | Top-1 | Legal rate | Game completion | Download |
 |---------|---------|--------|-------|--------|-------|------------|-----------------|----------|
@@ -19,7 +19,7 @@ Three sizes, all trained from scratch on random chess games generated on-the-fly
 | **PAWN (Base)** | 512 | 8 | 8 | 34.65M | 8.57% | 99.9962% | 98.97% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-base) |
 | **PAWN-Large** | 640 | 10 | 8 | 66.91M | 8.63% | 99.9990% | 99.76% | [![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-sm-dark.svg)](https://huggingface.co/thomas-schweich/pawn-large) |
 
-*Metrics measured on a 2,048-game validation set of fresh random games. **Game completion** is non-autoregressive: each ply sees the true history, so predictions are independent and autoregressive completion has not yet been measured. It is the main signal that separates capacity between sizes — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate).*
+*Metrics measured on a 2,048-game validation set of random games. **Game completion** is the ability to choose a legal move in every position throughout a random game. It is the primary signal that separates capacity between sizes. The number given above is non-autoregressive. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate)*
 
 All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), factored move embeddings, and a vocabulary covering:
 
@@ -27,12 +27,7 @@ All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.0
 - 11 game-outcome tokens (pretraining outcomes: `WHITE_CHECKMATES`, `BLACK_CHECKMATES`, `STALEMATE`, `DRAW_BY_RULE`, `PLY_LIMIT`; Lichess-specific outcomes: `WHITE_RESIGNS`, `BLACK_RESIGNS`, `DRAW_BY_AGREEMENT`, `WHITE_WINS_ON_TIME`, `BLACK_WINS_ON_TIME`, `DRAW_BY_TIME`),
 - and a single PAD token — 1,980 tokens total.
 
-PAWN learns to avoid impossible moves like `a1a1` and `b1a5` since they don't appear in its training examples (and now don't appear in the action vocabulary either).
-
-> [!note]
-> A previous generation of PAWN backbones (`pawn-{small,base,large}-legacy`) used a 4,278-token coordinate vocabulary, a 256-token context window, and outcome conditioning. They are still available on HuggingFace, and the `pre-vocab-transition` git tag marks the last commit before the vocabulary transition — it will load and work with the old checkpoints. See [docs/LEGACY.md](docs/LEGACY.md) for background on what changed and why.
-
-Tokens are coordinate pairs (UCI notation) with no piece type or side-to-move information — `e2e4` means the same token whether it's a pawn double-push or a rook move. The model learns to track piece placement, movement rules, and game state entirely from observation, which can be isolated via [linear probes](https://arxiv.org/abs/1610.01644) (Alain & Bengio, 2016).
+Tokens are coordinate pairs (UCI notation) with no piece type or side-to-move information — `e2e4` means the same token whether it's a pawn double-push or a rook move. The model learns to track piece placement, movement rules, and game state entirely from observation, which can be isolated via [linear probes](https://arxiv.org/abs/1610.01644).
 
 ## Quickstart
 
@@ -76,17 +71,6 @@ uv run python scripts/eval_probes.py --log-dir logs --device cuda
 uv run python -m pawn.dashboard --log-dir logs  # real-time monitoring
 ```
 
-## Datasets
-
-For adapter training (behavioral cloning), not pretraining. PAWN is pretrained on random games generated on-the-fly — it never sees human or engine games.
-
-| Dataset | Games | Description | Link |
-|---------|-------|-------------|------|
-| Lichess Full | 286M train + 9.3M val + 9.0M test | Rated games from Q1 2025 (all Elos), holdout from Jan 2026 | [pawn-lichess-full](https://huggingface.co/datasets/thomas-schweich/pawn-lichess-full) |
-| Stockfish nodes=1 | 900K train + 50K val + 50K test | NNUE self-play, 1 node/move | [stockfish-nodes1](https://huggingface.co/datasets/thomas-schweich/stockfish-nodes1) |
-
-All datasets use pre-tokenized `list[int16]` move sequences (`tokens` column). The Lichess dataset also includes raw `san`/`uci` strings, clock annotations, Elo ratings, and full game metadata. Datasets load directly from HuggingFace via Polars lazy scan with predicate pushdown.
-
 ## Architecture
 
 <sub>More info: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)</sub>
@@ -109,8 +93,6 @@ Despite training exclusively on random games, PAWN develops rich internal repres
 
 Full probe results including diagnostics are on each variant's [HuggingFace model card](https://huggingface.co/thomas-schweich/pawn-base).
 
-All three variants sit at ~101–102% of the [theoretical top-1 ceiling](docs/ACCURACY_CEILING.md) (`E[1/N_legal] = 8.43%`, 95% CI [8.41%, 8.45%]), essentially saturating the metric. **Game completion rate is the only headline metric that meaningfully separates sizes** — see the [model variant table](#model-variants) above.
-
 ## Adapter Methods
 
 <sub>More info: [docs/ADAPTERS.md](docs/ADAPTERS.md)</sub>
@@ -127,6 +109,19 @@ PAWN ships with six adapter implementations for fine-tuning the frozen backbone 
 | **Sparse** density=0.015 qkvo | 126K | 29.18% | Random binary mask on frozen weights |
 
 Hybrid (LoRA+FiLM) and [FiLM](https://arxiv.org/abs/1709.07871) remain in the codebase but aren't in the current sweep. See [docs/ADAPTERS.md](docs/ADAPTERS.md) for full methodology and Pareto discussion.
+
+### Datasets
+
+The "Lichess Full" dataset below was filtered to matches between players rated 1800-1900 and truncated to 1-10 million games, depending on adapter type and size (some smaller adapters saturate too rapidly to benefit from more games). But I parsed all ~300 million games and converted them to UCI as well as PAWN's training format (a) to make future experiments easier and (b) since others might find the pre-converted raw UCI helpful for other projects. And because the Rust engine is super fast anyways. I also kept the SAN notation and metadata from the original PGNs.
+
+The "Stockfish nodes=1" 
+
+| Dataset | Games | Description | Link |
+|---------|-------|-------------|------|
+| Lichess Full | 286M train + 9.3M val + 9.0M test | Rated games from Q1 2025 (all Elos), holdout from Jan 2026 | [pawn-lichess-full](https://huggingface.co/datasets/thomas-schweich/pawn-lichess-full) |
+| Stockfish nodes=1 | 900K train + 50K val + 50K test | NNUE self-play, 1 node/move | [stockfish-nodes1](https://huggingface.co/datasets/thomas-schweich/stockfish-nodes1) |
+
+All datasets use pre-tokenized `list[int16]` move sequences (`tokens` column). The Lichess dataset also includes raw `san`/`uci` strings, clock annotations, Elo ratings, and full game metadata. Datasets load directly from HuggingFace via Polars lazy scan. Predicate pushdown makes it so that only the subset of data you select is actually downloaded.
 
 ## Repository Structure
 
@@ -162,8 +157,6 @@ The engine generates training data on-the-fly via `chess_engine.generate_random_
 - [Adapters](docs/ADAPTERS.md) -- adapter methods, results, quick start
 - [Accuracy Ceiling](docs/ACCURACY_CEILING.md) -- theoretical limits for random game prediction
 - [Legacy Architecture](docs/LEGACY.md) -- the v0.x backbones, why they were retired, and how to load them
-
-\*None of the existing experiments use FiLM to condition on anything. The existing FiLM experiments ask the question, 'how does FiLM perform when all parameters are learned'.
 
 ## Acknowledgments
 
