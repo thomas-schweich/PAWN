@@ -639,6 +639,48 @@ class TestInfiniteSchedule:
                 decay_steps=10, total_steps=50, stable_lr_ratio=0.1,
             )
 
+    def test_warmup_steps_zero_starts_at_peak(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = InfiniteSchedule(
+            opt, warmup_steps=0, cooldown_steps=10,
+            decay_steps=10, total_steps=50, stable_lr_ratio=0.1,
+        )
+        # With no warmup, step 0 should already be at peak (start of cooldown).
+        assert sched.get_lr() == pytest.approx(peak)
+
+    def test_cooldown_steps_zero_jumps_to_stable(self):
+        """cooldown_steps=0 skips the peak→stable interpolation entirely."""
+        peak = 1.0
+        stable = 0.2
+        opt = _make_optimizer(lr=peak)
+        sched = InfiniteSchedule(
+            opt, warmup_steps=5, cooldown_steps=0,
+            decay_steps=10, total_steps=50, stable_lr_ratio=stable,
+        )
+        # At step == warmup_steps, cooldown_end == warmup_steps, so we drop
+        # straight to the stable plateau.
+        for _ in range(5):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(stable, rel=1e-6)
+        for _ in range(10):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(stable, rel=1e-6)
+
+    def test_decay_steps_zero_holds_stable_to_end(self):
+        """decay_steps=0 means no final decay — stable holds to total_steps."""
+        peak = 1.0
+        stable = 0.3
+        opt = _make_optimizer(lr=peak)
+        sched = InfiniteSchedule(
+            opt, warmup_steps=5, cooldown_steps=5,
+            decay_steps=0, total_steps=50, stable_lr_ratio=stable,
+        )
+        # Walk up through the schedule and sample points near the tail.
+        for _ in range(49):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(stable, rel=1e-6)
+
     def test_overlapping_phases_clips_stable(self):
         """When warmup + cooldown + decay > total_steps, the stable
         phase is squeezed to zero and final_decay_start falls back to
@@ -696,6 +738,21 @@ class TestInfiniteScheduleAdapterVariant:
         for _ in range(20):
             sched.step()
         assert opt.param_groups[0]["lr"] == pytest.approx(0.25, rel=1e-6)
+
+    def test_min_lr_ratio_respected_in_adapter_variant(self):
+        """Adapter variant honors min_lr_ratio at the end of final decay."""
+        from pawn.adapter_training import infinite_schedule
+
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = infinite_schedule(
+            opt, warmup_steps=5, cooldown_steps=5,
+            decay_steps=10, total_steps=50, stable_lr_ratio=0.2,
+            min_lr_ratio=0.05,
+        )
+        for _ in range(500):  # step well past total_steps
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(peak * 0.05, rel=1e-6)
 
     def test_build_scheduler_infinite_requires_cooldown(self):
         from pawn.adapter_training import build_scheduler
