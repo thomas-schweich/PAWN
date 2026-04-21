@@ -85,15 +85,26 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     warmup_steps: int = 1000
     total_steps: int = 100_000
-    # LR schedule: ``"cosine"`` (default), ``"wsd"``, ``"constant"``, or
-    # ``"one_cycle"``. See ``pawn.trainer`` for the class implementations
-    # and ``pawn.run_config.BaseRunConfig.lr_schedule`` for semantics.
-    lr_schedule: Literal["cosine", "wsd", "constant", "one_cycle"] = "cosine"
-    # WSD decay-phase length. Used only when ``lr_schedule == "wsd"``.
+    # LR schedule: ``"cosine"`` (default), ``"wsd"``, ``"constant"``,
+    # ``"one_cycle"``, or ``"infinite"``. See ``pawn.trainer`` for the
+    # class implementations and ``pawn.run_config.BaseRunConfig.lr_schedule``
+    # for semantics.
+    lr_schedule: Literal[
+        "cosine", "wsd", "constant", "one_cycle", "infinite"
+    ] = "cosine"
+    # WSD / infinite final-decay-phase length (in steps). Used when
+    # ``lr_schedule`` is ``"wsd"`` or ``"infinite"`` (ignored otherwise).
     decay_steps: int = 10_000
-    # WSD decay curve: ``"linear"`` or ``"cosine"``. Ignored for
-    # non-WSD schedules.
+    # Decay-phase curve shape for WSD's single decay and for the final
+    # decay of the ``"infinite"`` schedule: ``"linear"`` or ``"cosine"``.
+    # Ignored for schedules without a final decay.
     wsd_decay_shape: Literal["linear", "cosine"] = "linear"
+    # Infinite-schedule cooldown length (peak → stable_lr_ratio via
+    # cosine). Ignored unless ``lr_schedule == "infinite"``.
+    cooldown_steps: int = 20_000
+    # Infinite-schedule stable plateau LR, as a fraction of peak LR.
+    # Ignored unless ``lr_schedule == "infinite"``.
+    stable_lr_ratio: float = 0.1
 
     # Batch
     batch_size: int = 256

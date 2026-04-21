@@ -150,10 +150,11 @@ Common adapter args: `--epochs 50`, `--batch-size 64`, `--lr 3e-4`, `--patience 
 
 Adapter checkpoints are written to `logs/run_*/checkpoints/step_{global_step:08d}/` (matching the pretraining layout — never overwritten). A save fires whenever val hits a new best, whenever the step is a `--checkpoint-interval` multiple, or at termination (step limit, patience, shutdown). To find the best step from a run's `metrics.jsonl`, use `pawn.checkpoint.find_best_adapter_step`.
 
-LR schedule: `--lr-schedule {cosine,wsd,constant,one_cycle}`. Default `cosine`.
+LR schedule: `--lr-schedule {cosine,wsd,constant,one_cycle,infinite}`. Default `cosine`.
 - `wsd` — Warmup-Stable-Decay. Holds peak LR for `1 - warmup_frac - decay_frac` of training, then decays over the last `--decay-frac` (default 0.1). `--wsd-decay-shape {linear,cosine}` controls the tail curve.
 - `constant` — linear warmup → hold peak indefinitely. Pair with `--patience` to actually stop.
 - `one_cycle` — Smith (2018) one-cycle: ramp from `peak/25` → `peak` over `--warmup-frac` of steps (try 0.3), then cosine-decay to `peak/10000`.
+- `infinite` — warmup → cosine cooldown to `--stable-lr-ratio` (default 0.1) × peak over `--cooldown-frac` of steps (default 0.2) → flat stable plateau → final decay to 0 over the last `--decay-frac` of steps (default 0.1, shape set by `--wsd-decay-shape`). The stable-plateau LR depends only on `--stable-lr-ratio`, not on `total_steps`, so any checkpoint taken during the plateau is a valid resumption point — extend `total_steps` on resume and the plateau simply lasts longer before the final decay kicks in. Useful when you don't want to commit to a total-step count upfront. See Hägele et al. (2024) arXiv:2405.18392.
 
 Legal-move handling (defaults match pre-existing behavior):
 - `--disable-legal-mask` — drop the `-inf` hard mask on illegal logits and compute CE over the full 1,980-token vocabulary (same as pretraining). Useful for probing whether the adapter is leaning on the mask.

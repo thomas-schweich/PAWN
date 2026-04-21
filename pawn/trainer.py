@@ -198,6 +198,135 @@ class ConstantWithWarmup:
         self._apply_lr(self._step)
 
 
+class InfiniteSchedule:
+    """Infinite / restart-friendly LR schedule.
+
+    Four phases:
+        [0, warmup_steps)                          – linear 0 → 1
+        [warmup_steps, cooldown_end)               – cosine 1 → stable_lr_ratio
+        [cooldown_end, final_decay_start)          – flat stable_lr_ratio
+        [final_decay_start, total_steps]           – stable_lr_ratio → min_lr_ratio
+
+    ``cooldown_end = warmup_steps + cooldown_steps``.
+    ``final_decay_start = total_steps - decay_steps``.
+
+    The key property: during the stable phase the LR depends only on
+    ``stable_lr_ratio`` and not on ``total_steps``. That makes any
+    checkpoint taken during the stable phase a valid resumption point —
+    extend ``total_steps`` in the resumed run and the stable phase
+    simply lasts longer before the final decay kicks in. This is
+    tailored to open-ended training where you only commit to the final
+    decay once you decide to stop.
+
+    ``final_decay_shape`` selects the final-decay curve (``"linear"`` or
+    ``"cosine"``). The peak→stable cooldown is always cosine.
+
+    References:
+        Zhai et al. (2022) "Scaling Vision Transformers"
+        (the original "cooldown → constant → cooldown" shape).
+        Hägele et al. (2024) "Scaling Laws and Compute-Optimal Training
+        Beyond Fixed Training Durations" arXiv:2405.18392.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_steps: int,
+        cooldown_steps: int,
+        decay_steps: int,
+        total_steps: int,
+        stable_lr_ratio: float = 0.1,
+        # ``min_lr_ratio`` is intentionally internal-only: there is no
+        # ``TrainingConfig`` / ``BaseRunConfig`` field or CLI flag
+        # exposing it, so production runs always hit the 0.0 default.
+        # Kept on the constructor for tests and for direct callers that
+        # want a non-zero final-decay floor.
+        min_lr_ratio: float = 0.0,
+        # Default matches ``TrainingConfig.wsd_decay_shape`` ("linear"),
+        # which is what ``CLMTrainer`` passes through the config path.
+        # Keeping the default aligned avoids surprising a direct
+        # instantiator with a different final-decay curve than they'd
+        # get via ``--lr-schedule infinite``.
+        final_decay_shape: str = "linear",
+    ):
+        if final_decay_shape not in ("linear", "cosine"):
+            raise ValueError(
+                f"Unknown final_decay_shape: {final_decay_shape!r} "
+                "(expected 'linear' or 'cosine')"
+            )
+        if not 0.0 <= stable_lr_ratio <= 1.0:
+            raise ValueError(
+                f"stable_lr_ratio must be in [0, 1], got {stable_lr_ratio}"
+            )
+        if not 0.0 <= min_lr_ratio <= stable_lr_ratio:
+            raise ValueError(
+                f"min_lr_ratio ({min_lr_ratio}) must be in "
+                f"[0, stable_lr_ratio={stable_lr_ratio}]"
+            )
+        if cooldown_steps < 0 or decay_steps < 0:
+            raise ValueError(
+                "cooldown_steps and decay_steps must be non-negative, "
+                f"got {cooldown_steps}, {decay_steps}"
+            )
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.cooldown_steps = cooldown_steps
+        self.decay_steps = decay_steps
+        self.total_steps = total_steps
+        self.stable_lr_ratio = stable_lr_ratio
+        self.min_lr_ratio = min_lr_ratio
+        self.final_decay_shape = final_decay_shape
+        self._cooldown_end = warmup_steps + cooldown_steps
+        self._final_decay_start = max(
+            self._cooldown_end, total_steps - decay_steps
+        )
+        self._cooldown_window = max(cooldown_steps, 1)
+        self._final_window = max(total_steps - self._final_decay_start, 1)
+        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+        self._step = 0
+        self._apply_lr(0)
+
+    def _apply_lr(self, step: int) -> None:
+        lr_scale = self._compute_lr_scale(step)
+        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
+            pg["lr"] = base_lr * lr_scale
+
+    def step(self) -> None:
+        self._step += 1
+        self._apply_lr(self._step)
+
+    def _compute_lr_scale(self, step: int) -> float:
+        if step < self.warmup_steps:
+            return step / max(1, self.warmup_steps)
+        if step < self._cooldown_end:
+            progress = (step - self.warmup_steps) / self._cooldown_window
+            # Cosine fall from 1.0 to stable_lr_ratio.
+            return self.stable_lr_ratio + (1.0 - self.stable_lr_ratio) * 0.5 * (
+                1.0 + math.cos(math.pi * progress)
+            )
+        if step < self._final_decay_start:
+            return self.stable_lr_ratio
+        progress = min(
+            (step - self._final_decay_start) / self._final_window, 1.0
+        )
+        span = self.stable_lr_ratio - self.min_lr_ratio
+        if self.final_decay_shape == "linear":
+            return self.min_lr_ratio + span * (1.0 - progress)
+        return self.min_lr_ratio + span * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    def get_lr(self) -> float:
+        return self.optimizer.param_groups[0]["lr"]
+
+    def state_dict(self) -> dict[str, int]:
+        return {"step": self._step}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self._step = state["step"]
+        self._apply_lr(self._step)
+
+
 class OneCycle:
     """Smith (2018) one-cycle schedule with cosine annealing.
 
@@ -691,6 +820,16 @@ class CLMTrainer:
                 decay_steps=train_cfg.decay_steps,
                 total_steps=train_cfg.total_steps,
                 decay_shape=train_cfg.wsd_decay_shape,
+            )
+        elif train_cfg.lr_schedule == "infinite":
+            self.scheduler = InfiniteSchedule(
+                self.optimizer,
+                warmup_steps=train_cfg.warmup_steps,
+                cooldown_steps=train_cfg.cooldown_steps,
+                decay_steps=train_cfg.decay_steps,
+                total_steps=train_cfg.total_steps,
+                stable_lr_ratio=train_cfg.stable_lr_ratio,
+                final_decay_shape=train_cfg.wsd_decay_shape,
             )
         elif train_cfg.lr_schedule == "constant":
             self.scheduler = ConstantWithWarmup(
