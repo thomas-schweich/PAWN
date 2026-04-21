@@ -236,8 +236,18 @@ class InfiniteSchedule:
         decay_steps: int,
         total_steps: int,
         stable_lr_ratio: float = 0.1,
+        # ``min_lr_ratio`` is intentionally internal-only: there is no
+        # ``TrainingConfig`` / ``BaseRunConfig`` field or CLI flag
+        # exposing it, so production runs always hit the 0.0 default.
+        # Kept on the constructor for tests and for direct callers that
+        # want a non-zero final-decay floor.
         min_lr_ratio: float = 0.0,
-        final_decay_shape: str = "cosine",
+        # Default matches ``TrainingConfig.wsd_decay_shape`` ("linear"),
+        # which is what ``CLMTrainer`` passes through the config path.
+        # Keeping the default aligned avoids surprising a direct
+        # instantiator with a different final-decay curve than they'd
+        # get via ``--lr-schedule infinite``.
+        final_decay_shape: str = "linear",
     ):
         if final_decay_shape not in ("linear", "cosine"):
             raise ValueError(

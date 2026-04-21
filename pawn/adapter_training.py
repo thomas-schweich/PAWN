@@ -158,8 +158,15 @@ def infinite_schedule(
     decay_steps: int,
     total_steps: int,
     stable_lr_ratio: float = 0.1,
+    # ``min_lr_ratio`` has no CLI / config path and is pinned to 0.0 in
+    # production. Kept on the signature for tests and direct callers
+    # that want a non-zero final-decay floor.
     min_lr_ratio: float = 0.0,
-    final_decay_shape: str = "cosine",
+    # Default aligns with ``BaseRunConfig.wsd_decay_shape`` ("linear"),
+    # which is what ``build_scheduler`` threads through the config
+    # path. Direct instantiation otherwise silently diverges from the
+    # ``--lr-schedule infinite`` behaviour.
+    final_decay_shape: str = "linear",
 ) -> torch.optim.lr_scheduler.LambdaLR:
     """Infinite / restart-friendly LR schedule.
 

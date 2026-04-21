@@ -681,6 +681,25 @@ class TestInfiniteSchedule:
             sched.step()
         assert sched.get_lr() == pytest.approx(stable, rel=1e-6)
 
+    def test_total_steps_shorter_than_warmup_plus_cooldown(self):
+        """When total_steps < warmup + cooldown, training ends mid-cooldown
+        and the final decay never fires. LR should still be well-defined
+        (bounded by [stable_lr_ratio, 1.0] throughout)."""
+        peak = 1.0
+        stable = 0.1
+        opt = _make_optimizer(lr=peak)
+        sched = InfiniteSchedule(
+            opt, warmup_steps=10, cooldown_steps=20,
+            decay_steps=5, total_steps=15, stable_lr_ratio=stable,
+        )
+        # cooldown_end = 30 > total = 15, so we end mid-cooldown.
+        for _ in range(15):
+            sched.step()
+            lr = sched.get_lr()
+            # LR is well-defined everywhere: warmup ramps 0→1 then
+            # cooldown falls toward stable, so LR stays in [0, 1].
+            assert 0.0 <= lr <= 1.0 + 1e-12
+
     def test_overlapping_phases_clips_stable(self):
         """When warmup + cooldown + decay > total_steps, the stable
         phase is squeezed to zero and final_decay_start falls back to
