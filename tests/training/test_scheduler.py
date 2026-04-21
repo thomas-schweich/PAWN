@@ -12,7 +12,13 @@ import math
 import pytest
 import torch
 
-from pawn.trainer import ConstantWithWarmup, CosineWithWarmup, OneCycle, WSDSchedule
+from pawn.trainer import (
+    ConstantWithWarmup,
+    CosineWithWarmup,
+    InfiniteSchedule,
+    OneCycle,
+    WSDSchedule,
+)
 
 
 def _make_optimizer(lr: float = 1e-3, n_groups: int = 1) -> torch.optim.Optimizer:
@@ -413,3 +419,290 @@ class TestOneCycle:
         sched2 = OneCycle(_make_optimizer(lr=peak), 30, 100)
         sched2.load_state_dict(state)
         assert sched2.get_lr() == pytest.approx(before)
+
+
+class TestInfiniteSchedule:
+    """Warmup → cosine cooldown to stable → flat → final decay."""
+
+    def test_step_zero_is_zero(self):
+        opt = _make_optimizer(lr=1.0)
+        InfiniteSchedule(
+            opt, warmup_steps=10, cooldown_steps=20,
+            decay_steps=30, total_steps=200, stable_lr_ratio=0.1,
+        )
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.0)
+
+    def test_warmup_linear(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = InfiniteSchedule(
+            opt, warmup_steps=10, cooldown_steps=20,
+            decay_steps=30, total_steps=200, stable_lr_ratio=0.1,
+        )
+        sched.step()
+        assert sched.get_lr() == pytest.approx(0.1)
+        for _ in range(9):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(peak)
+
+    def test_cooldown_is_cosine_to_stable(self):
+        peak = 1.0
+        stable = 0.1
+        opt = _make_optimizer(lr=peak)
+        sched = InfiniteSchedule(
+            opt, warmup_steps=10, cooldown_steps=20,
+            decay_steps=30, total_steps=200, stable_lr_ratio=stable,
+        )
+        # After warmup (step 10): at peak.
+        for _ in range(10):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(peak)
+        # Midway through cooldown (step 10 + 10 = 20): cos(pi/2) = 0,
+        # scale = stable + (1-stable) * 0.5 = 0.1 + 0.45 = 0.55.
+        for _ in range(10):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(0.55, rel=1e-6)
+        # End of cooldown (step 30): at stable.
+        for _ in range(10):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(stable, rel=1e-6)
+
+    def test_stable_phase_holds_flat(self):
+        peak = 1.0
+        stable = 0.1
+        opt = _make_optimizer(lr=peak)
+        sched = InfiniteSchedule(
+            opt, warmup_steps=10, cooldown_steps=20,
+            decay_steps=30, total_steps=200, stable_lr_ratio=stable,
+        )
+        # Warmup + cooldown = 30, final_decay starts at 200 - 30 = 170.
+        # Stable span: [30, 170).
+        for _ in range(30):
+            sched.step()
+        # Sample several steps across the stable plateau.
+        for s in (35, 80, 100, 150, 169):
+            while sched._step < s:
+                sched.step()
+            assert sched.get_lr() == pytest.approx(stable, rel=1e-6)
+
+    def test_final_decay_cosine_to_zero(self):
+        peak = 1.0
+        stable = 0.1
+        opt = _make_optimizer(lr=peak)
+        sched = InfiniteSchedule(
+            opt, warmup_steps=10, cooldown_steps=20,
+            decay_steps=30, total_steps=200, stable_lr_ratio=stable,
+            final_decay_shape="cosine",
+        )
+        # Step to final_decay_start = 170.
+        for _ in range(170):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(stable, rel=1e-6)
+        # Midway through final decay (step 185): cos(pi/2) = 0,
+        # scale = 0 + (stable - 0) * 0.5 = 0.05.
+        for _ in range(15):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(0.05, rel=1e-6)
+        # End (step 200): 0.
+        for _ in range(15):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(0.0, abs=1e-10)
+
+    def test_final_decay_linear_shape(self):
+        peak = 1.0
+        stable = 0.2
+        opt = _make_optimizer(lr=peak)
+        sched = InfiniteSchedule(
+            opt, warmup_steps=5, cooldown_steps=5,
+            decay_steps=10, total_steps=50, stable_lr_ratio=stable,
+            final_decay_shape="linear",
+        )
+        # final_decay_start = 40.
+        for _ in range(40):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(stable, rel=1e-6)
+        # Halfway through linear decay (step 45): stable * 0.5.
+        for _ in range(5):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(stable * 0.5, rel=1e-6)
+        # End (step 50): 0.
+        for _ in range(5):
+            sched.step()
+        assert sched.get_lr() == pytest.approx(0.0, abs=1e-10)
+
+    def test_resume_extension_keeps_stable_lr(self):
+        """Key invariant: stable-phase LR is independent of total_steps.
+
+        If you checkpoint mid-stable and resume with a larger
+        total_steps, the LR at the resumption step must be unchanged.
+        """
+        peak = 1.0
+        stable = 0.15
+        opt_a = _make_optimizer(lr=peak)
+        sched_a = InfiniteSchedule(
+            opt_a, warmup_steps=10, cooldown_steps=20,
+            decay_steps=30, total_steps=200, stable_lr_ratio=stable,
+        )
+        for _ in range(100):  # mid-stable (stable spans [30, 170))
+            sched_a.step()
+        lr_a = sched_a.get_lr()
+        assert lr_a == pytest.approx(stable)
+
+        # Same settings, but total_steps doubled — resume at step 100.
+        opt_b = _make_optimizer(lr=peak)
+        sched_b = InfiniteSchedule(
+            opt_b, warmup_steps=10, cooldown_steps=20,
+            decay_steps=30, total_steps=400, stable_lr_ratio=stable,
+        )
+        sched_b.load_state_dict({"step": 100})
+        assert sched_b.get_lr() == pytest.approx(lr_a, rel=1e-10)
+
+    def test_state_dict_roundtrip(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = InfiniteSchedule(
+            opt, warmup_steps=10, cooldown_steps=20,
+            decay_steps=30, total_steps=200, stable_lr_ratio=0.1,
+        )
+        for _ in range(75):
+            sched.step()
+        before = sched.get_lr()
+        state = sched.state_dict()
+        sched2 = InfiniteSchedule(
+            _make_optimizer(lr=peak), warmup_steps=10, cooldown_steps=20,
+            decay_steps=30, total_steps=200, stable_lr_ratio=0.1,
+        )
+        sched2.load_state_dict(state)
+        assert sched2.get_lr() == pytest.approx(before)
+        assert sched2._step == 75
+
+    def test_beyond_total_clamps_at_min(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = InfiniteSchedule(
+            opt, warmup_steps=5, cooldown_steps=5,
+            decay_steps=10, total_steps=50, stable_lr_ratio=0.2,
+            min_lr_ratio=0.05,
+        )
+        for _ in range(500):  # over-step by 10x
+            sched.step()
+        assert sched.get_lr() == pytest.approx(peak * 0.05, rel=1e-6)
+
+    def test_cooldown_is_monotone_decreasing(self):
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        sched = InfiniteSchedule(
+            opt, warmup_steps=10, cooldown_steps=40,
+            decay_steps=20, total_steps=200, stable_lr_ratio=0.1,
+        )
+        # Advance through warmup.
+        for _ in range(10):
+            sched.step()
+        prev = sched.get_lr()
+        for _ in range(40):
+            sched.step()
+            cur = sched.get_lr()
+            assert cur <= prev + 1e-12
+            prev = cur
+
+    def test_unknown_final_decay_shape_raises(self):
+        opt = _make_optimizer()
+        with pytest.raises(ValueError, match="final_decay_shape"):
+            InfiniteSchedule(
+                opt, warmup_steps=5, cooldown_steps=5,
+                decay_steps=10, total_steps=50, stable_lr_ratio=0.1,
+                final_decay_shape="exponential",
+            )
+
+    def test_stable_lr_ratio_out_of_range_raises(self):
+        opt = _make_optimizer()
+        with pytest.raises(ValueError, match="stable_lr_ratio"):
+            InfiniteSchedule(
+                opt, warmup_steps=5, cooldown_steps=5,
+                decay_steps=10, total_steps=50, stable_lr_ratio=1.5,
+            )
+
+    def test_min_lr_ratio_above_stable_raises(self):
+        opt = _make_optimizer()
+        with pytest.raises(ValueError, match="min_lr_ratio"):
+            InfiniteSchedule(
+                opt, warmup_steps=5, cooldown_steps=5,
+                decay_steps=10, total_steps=50, stable_lr_ratio=0.1,
+                min_lr_ratio=0.2,
+            )
+
+    def test_negative_cooldown_steps_raises(self):
+        opt = _make_optimizer()
+        with pytest.raises(ValueError, match="non-negative"):
+            InfiniteSchedule(
+                opt, warmup_steps=5, cooldown_steps=-1,
+                decay_steps=10, total_steps=50, stable_lr_ratio=0.1,
+            )
+
+    def test_overlapping_phases_clips_stable(self):
+        """When warmup + cooldown + decay > total_steps, the stable
+        phase is squeezed to zero and final_decay_start falls back to
+        cooldown_end. LR must stay in the well-defined range."""
+        peak = 1.0
+        opt = _make_optimizer(lr=peak)
+        # warmup 10 + cooldown 20 = 30; decay 30; total 40 → overlap.
+        sched = InfiniteSchedule(
+            opt, warmup_steps=10, cooldown_steps=20,
+            decay_steps=30, total_steps=40, stable_lr_ratio=0.2,
+        )
+        for _ in range(40):
+            sched.step()
+        # Final step should be at min (default 0).
+        assert sched.get_lr() == pytest.approx(0.0, abs=1e-10)
+
+
+class TestInfiniteScheduleAdapterVariant:
+    """Mirror tests for the LambdaLR variant used in adapter training."""
+
+    def test_shape_matches_class_variant(self):
+        from pawn.adapter_training import infinite_schedule
+
+        peak = 1.0
+        opt_fn = _make_optimizer(lr=peak)
+        fn_sched = infinite_schedule(
+            opt_fn, warmup_steps=10, cooldown_steps=20,
+            decay_steps=30, total_steps=200, stable_lr_ratio=0.1,
+        )
+        opt_cls = _make_optimizer(lr=peak)
+        cls_sched = InfiniteSchedule(
+            opt_cls, warmup_steps=10, cooldown_steps=20,
+            decay_steps=30, total_steps=200, stable_lr_ratio=0.1,
+        )
+        # Compare LR trajectories across key phase boundaries.
+        for target in (0, 5, 10, 20, 30, 100, 170, 185, 200):
+            while fn_sched.last_epoch < target:
+                fn_sched.step()
+            while cls_sched._step < target:
+                cls_sched.step()
+            assert opt_fn.param_groups[0]["lr"] == pytest.approx(
+                cls_sched.get_lr(), rel=1e-6, abs=1e-10
+            )
+
+    def test_build_scheduler_dispatch(self):
+        from pawn.adapter_training import build_scheduler
+
+        opt = _make_optimizer(lr=1.0)
+        sched = build_scheduler(
+            opt, warmup_steps=5, total_steps=50,
+            schedule="infinite", decay_steps=10, cooldown_steps=10,
+            stable_lr_ratio=0.25,
+        )
+        # Drive it to the stable plateau and check LR.
+        for _ in range(20):
+            sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.25, rel=1e-6)
+
+    def test_build_scheduler_infinite_requires_cooldown(self):
+        from pawn.adapter_training import build_scheduler
+
+        opt = _make_optimizer(lr=1.0)
+        with pytest.raises(ValueError, match="cooldown_steps"):
+            build_scheduler(
+                opt, warmup_steps=5, total_steps=50,
+                schedule="infinite", decay_steps=10,
+            )
