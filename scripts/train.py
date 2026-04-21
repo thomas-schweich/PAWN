@@ -217,9 +217,14 @@ def run_pretrain(config: PretrainConfig) -> None:
         train_cfg.warmup_steps = int(config.warmup_frac * train_cfg.total_steps)
     train_cfg.max_grad_norm = config.max_grad_norm
     train_cfg.lr_schedule = config.lr_schedule
-    if config.lr_schedule == "wsd":
+    if config.lr_schedule in ("wsd", "infinite"):
         train_cfg.decay_steps = int(config.decay_frac * train_cfg.total_steps)
         train_cfg.wsd_decay_shape = config.wsd_decay_shape
+    if config.lr_schedule == "infinite":
+        train_cfg.cooldown_steps = int(
+            config.cooldown_frac * train_cfg.total_steps
+        )
+        train_cfg.stable_lr_ratio = config.stable_lr_ratio
     train_cfg.discard_ply_limit = config.discard_ply_limit
     train_cfg.prepend_outcome = config.prepend_outcome
     train_cfg.mate_boost = config.mate_boost

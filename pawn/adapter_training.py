@@ -151,6 +151,79 @@ def constant_warmup_schedule(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def infinite_schedule(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    cooldown_steps: int,
+    decay_steps: int,
+    total_steps: int,
+    stable_lr_ratio: float = 0.1,
+    min_lr_ratio: float = 0.0,
+    final_decay_shape: str = "cosine",
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Infinite / restart-friendly LR schedule.
+
+    Four phases:
+        [0, warmup_steps)                                     – 0 → 1
+        [warmup_steps, warmup+cooldown)                       – cosine 1 → stable
+        [warmup+cooldown, total_steps - decay_steps)          – flat stable
+        [total_steps - decay_steps, total_steps]              – stable → min
+
+    The stable-phase LR depends only on ``stable_lr_ratio`` (not on
+    ``total_steps``), so any checkpoint taken during that phase can be
+    resumed with an extended ``total_steps`` without any LR
+    discontinuity — the plateau simply lasts longer before the final
+    decay kicks in. See Hägele et al. (2024) arXiv:2405.18392.
+
+    ``final_decay_shape`` selects the final-decay curve (``"linear"`` or
+    ``"cosine"``). The peak→stable cooldown is always cosine.
+    """
+    if final_decay_shape not in ("linear", "cosine"):
+        raise ValueError(
+            f"Unknown infinite final_decay_shape: {final_decay_shape!r} "
+            "(expected 'linear' or 'cosine')"
+        )
+    if not 0.0 <= stable_lr_ratio <= 1.0:
+        raise ValueError(
+            f"stable_lr_ratio must be in [0, 1], got {stable_lr_ratio}"
+        )
+    if not 0.0 <= min_lr_ratio <= stable_lr_ratio:
+        raise ValueError(
+            f"min_lr_ratio ({min_lr_ratio}) must be in "
+            f"[0, stable_lr_ratio={stable_lr_ratio}]"
+        )
+    if cooldown_steps < 0 or decay_steps < 0:
+        raise ValueError(
+            "cooldown_steps and decay_steps must be non-negative, "
+            f"got {cooldown_steps}, {decay_steps}"
+        )
+    cooldown_end = warmup_steps + cooldown_steps
+    final_decay_start = max(cooldown_end, total_steps - decay_steps)
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        if step < cooldown_end:
+            progress = (step - warmup_steps) / max(cooldown_steps, 1)
+            return stable_lr_ratio + (1.0 - stable_lr_ratio) * 0.5 * (
+                1.0 + math.cos(math.pi * progress)
+            )
+        if step < final_decay_start:
+            return stable_lr_ratio
+        progress = min(
+            (step - final_decay_start) / max(total_steps - final_decay_start, 1),
+            1.0,
+        )
+        span = stable_lr_ratio - min_lr_ratio
+        if final_decay_shape == "linear":
+            return min_lr_ratio + span * (1.0 - progress)
+        return min_lr_ratio + span * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def one_cycle_schedule(
     optimizer: torch.optim.Optimizer,
     peak_step: int,
@@ -199,14 +272,19 @@ def build_scheduler(
     schedule: str = "cosine",
     decay_steps: int | None = None,
     wsd_decay_shape: str = "linear",
+    cooldown_steps: int | None = None,
+    stable_lr_ratio: float = 0.1,
 ) -> torch.optim.lr_scheduler.LambdaLR:
     """Dispatch one of the supported LR schedules by name.
 
     Supported schedules: ``"cosine"``, ``"wsd"``, ``"constant"``,
-    ``"one_cycle"``. See the individual scheduler docstrings for
-    parameter meaning. ``warmup_steps`` is reused as the ramp-up for
-    ``one_cycle`` — set it to ~0.3 * total_steps for the canonical
-    Smith shape.
+    ``"one_cycle"``, ``"infinite"``. See the individual scheduler
+    docstrings for parameter meaning. ``warmup_steps`` is reused as the
+    ramp-up for ``one_cycle`` — set it to ~0.3 * total_steps for the
+    canonical Smith shape. ``infinite`` additionally requires
+    ``cooldown_steps`` (peak→stable cosine window) and ``decay_steps``
+    (final stable→0 window); ``wsd_decay_shape`` selects the final
+    decay curve.
     """
     if schedule == "cosine":
         return cosine_warmup_schedule(optimizer, warmup_steps, total_steps)
@@ -221,6 +299,16 @@ def build_scheduler(
         return constant_warmup_schedule(optimizer, warmup_steps)
     if schedule == "one_cycle":
         return one_cycle_schedule(optimizer, warmup_steps, total_steps)
+    if schedule == "infinite":
+        if decay_steps is None or cooldown_steps is None:
+            raise ValueError(
+                "infinite schedule requires both decay_steps and cooldown_steps"
+            )
+        return infinite_schedule(
+            optimizer, warmup_steps, cooldown_steps, decay_steps, total_steps,
+            stable_lr_ratio=stable_lr_ratio,
+            final_decay_shape=wsd_decay_shape,
+        )
     raise ValueError(f"Unknown lr_schedule: {schedule!r}")
 
 
@@ -1092,11 +1180,22 @@ def train(
     warmup_steps = args.warmup_steps if args.warmup_steps is not None else int(args.warmup_frac * total_steps)
     schedule = getattr(args, "lr_schedule", "cosine")
     decay_frac = getattr(args, "decay_frac", 0.1)
-    decay_steps = int(decay_frac * total_steps) if schedule == "wsd" else None
+    decay_steps = (
+        int(decay_frac * total_steps)
+        if schedule in ("wsd", "infinite")
+        else None
+    )
+    cooldown_steps = (
+        int(getattr(args, "cooldown_frac", 0.2) * total_steps)
+        if schedule == "infinite"
+        else None
+    )
     scheduler = build_scheduler(
         optimizer, warmup_steps, total_steps,
         schedule=schedule, decay_steps=decay_steps,
         wsd_decay_shape=getattr(args, "wsd_decay_shape", "linear"),
+        cooldown_steps=cooldown_steps,
+        stable_lr_ratio=float(getattr(args, "stable_lr_ratio", 0.1)),
     )
     # GradScaler is only needed for fp16 (underflow risk). bf16 has
     # fp32-range exponents and the scaler just adds per-step overhead.

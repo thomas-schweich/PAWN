@@ -50,14 +50,38 @@ class BaseRunConfig(BaseModel):
     #   ``"one_cycle"`` — Smith (2018) one-cycle: ramp up from
     #                     peak/25 → peak over ``warmup_frac`` of steps,
     #                     then cosine-decay to peak/10000 over the rest.
-    lr_schedule: Literal["cosine", "wsd", "constant", "one_cycle"] = "cosine"
-    # Fraction of ``total_steps`` used for the WSD decay phase. Ignored
-    # when ``lr_schedule`` is not "wsd". The stable phase gets
-    # ``1 - warmup_frac - decay_frac`` of the schedule.
+    #   ``"infinite"``  — warmup → cosine cooldown to
+    #                     ``stable_lr_ratio * peak`` over ``cooldown_frac``
+    #                     of steps → flat stable plateau → final decay
+    #                     to 0 over the last ``decay_frac`` of steps.
+    #                     The stable-phase LR is independent of
+    #                     ``total_steps``, so any checkpoint in that
+    #                     phase is a valid resumption point: extend
+    #                     ``total_steps`` on resume and the plateau
+    #                     simply lasts longer. See Hägele et al. (2024)
+    #                     arXiv:2405.18392.
+    lr_schedule: Literal[
+        "cosine", "wsd", "constant", "one_cycle", "infinite"
+    ] = "cosine"
+    # Fraction of ``total_steps`` used for the WSD decay phase (and
+    # reused for the final decay of the ``"infinite"`` schedule).
+    # Ignored for schedules without a final decay. For WSD the stable
+    # phase gets ``1 - warmup_frac - decay_frac``; for "infinite" the
+    # stable plateau gets ``1 - warmup_frac - cooldown_frac - decay_frac``.
     decay_frac: float = 0.1
-    # WSD decay-phase curve: ``"linear"`` (default) or ``"cosine"`` for
-    # a half-cosine fall. Ignored for non-WSD schedules.
+    # Decay-phase curve: ``"linear"`` (default) or ``"cosine"`` for a
+    # half-cosine fall. Used for WSD's single decay and for the final
+    # decay of ``"infinite"``. Ignored otherwise. (Historical name
+    # retained for backwards compatibility; applies beyond WSD now.)
     wsd_decay_shape: Literal["linear", "cosine"] = "linear"
+    # Fraction of ``total_steps`` used for the ``"infinite"`` schedule's
+    # peak → stable cosine cooldown. Ignored unless
+    # ``lr_schedule == "infinite"``.
+    cooldown_frac: float = 0.2
+    # Stable plateau LR for the ``"infinite"`` schedule, expressed as a
+    # fraction of the peak LR. Ignored unless
+    # ``lr_schedule == "infinite"``.
+    stable_lr_ratio: float = 0.1
     max_grad_norm: float = 1.0
     patience: int | None = None
     eval_interval: int | None = None
