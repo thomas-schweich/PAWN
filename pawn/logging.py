@@ -37,7 +37,12 @@ except ImportError:
 _git_info: dict[str, str | None] | None = None
 
 
-def _get_git_info() -> dict[str, str | None]:
+def get_git_info() -> dict[str, str | None]:
+    """Return ``{"git_hash": ..., "git_tag": ...}`` for the current working tree.
+
+    Honors ``PAWN_GIT_HASH`` / ``PAWN_GIT_TAG`` env vars (set on runpod images
+    where the container is built outside a git checkout). Result is cached.
+    """
     global _git_info
     if _git_info is not None:
         return _git_info
@@ -63,6 +68,9 @@ def _get_git_info() -> dict[str, str | None]:
 
     _git_info = {"git_hash": git_hash, "git_tag": git_tag}
     return _git_info
+
+
+_get_git_info = get_git_info
 
 
 # ---------------------------------------------------------------------------

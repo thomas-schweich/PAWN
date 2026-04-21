@@ -267,6 +267,8 @@ def run_pretrain(config: PretrainConfig) -> None:
         train_cfg, model_cfg, hf_repo=config.hf_repo,
         patience=config.patience,
         legality_late_ply=config.legality_late_ply,
+        run_config=config.model_dump(),
+        wandb_tags=[f"variant:{config.variant}"],
     )
 
     if config.resume:
@@ -315,6 +317,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         prepare_lichess_dataset,
     )
     from pawn.logging import MetricsLogger
+    from pawn.wandb_utils import finish_wandb, init_wandb
 
     # Build an argparse.Namespace so existing functions work unchanged.
     args = argparse.Namespace(**config.model_dump())
@@ -470,38 +473,6 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
                 if k not in ("strategy", "param_count")
             },
         )
-        rosa_warmup(
-            model,
-            train_loader,
-            mask_builder,
-            args,
-            device,
-            amp_dtype,
-            logger,
-        )
-        masks = rosa_mask_generation(
-            model,
-            train_loader,
-            mask_builder,
-            args,
-            device,
-            amp_dtype,
-            logger,
-        )
-        print(f"\n=== RoSA Phase 3: {args.rosa_mode} training ===", flush=True)
-        (
-            model,
-            trainable_params,
-            param_count,
-            state_dict_fn,
-            weight_report_fn,
-        ) = rosa_build_phase3(model, masks, args, device)
-        print(f"Trainable params: {param_count:,}", flush=True)
-        # RoSA logs its config once with param_count=0 before Phase 3,
-        # because the Phase 3 adapter model hasn't been built yet. Re-log
-        # now so the lab monitor (which reads ``param_count`` from
-        # metrics.jsonl) picks up the real trainable-param count.
-        logger.log_config(run_type=args.strategy, param_count=param_count)
     else:
         logger.log_config(
             run_type=args.strategy,
@@ -512,32 +483,90 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
             },
         )
 
-    # Write config JSON
-    config_dict = build_config_json(args, param_count)
-    config_path = out_dir / "config.json"
-    with open(config_path, "w") as f:
-        json_mod.dump(config_dict, f, indent=2)
-    print(f"Config written to {config_path}")
-
-    # Train
-    best_val_loss, final_metrics = train(
-        model,
-        trainable_params,
-        train_loader,
-        val_loader,
-        mask_builder,
-        val_legal_indices,
-        logger,
-        args,
-        device,
-        amp_dtype,
-        gpu_cfg,
-        state_dict_fn,
-        weight_report_fn,
-        param_count,
+    # W&B init happens after ``log_config`` so the logger's git/slug/hostname
+    # are computed once and we reuse them. One run per invocation; resumed
+    # jobs join their siblings via ``group=<slug>``.
+    wandb_run = init_wandb(
+        enabled=config.wandb,
+        project="pawn",
+        logger=logger,
+        run_type="adapter",
+        config=config.model_dump(),
+        group=logger.slug,
+        job_type=f"adapter-{args.strategy}",
+        tags=[f"strategy:{args.strategy}"],
     )
 
-    logger.close()
+    wandb_exit_code = 0
+    try:
+        if args.strategy == "rosa":
+            rosa_warmup(
+                model,
+                train_loader,
+                mask_builder,
+                args,
+                device,
+                amp_dtype,
+                logger,
+                wandb_run=wandb_run,
+            )
+            masks = rosa_mask_generation(
+                model,
+                train_loader,
+                mask_builder,
+                args,
+                device,
+                amp_dtype,
+                logger,
+                wandb_run=wandb_run,
+            )
+            print(f"\n=== RoSA Phase 3: {args.rosa_mode} training ===", flush=True)
+            (
+                model,
+                trainable_params,
+                param_count,
+                state_dict_fn,
+                weight_report_fn,
+            ) = rosa_build_phase3(model, masks, args, device)
+            print(f"Trainable params: {param_count:,}", flush=True)
+            # RoSA logs its config once with param_count=0 before Phase 3,
+            # because the Phase 3 adapter model hasn't been built yet. Re-log
+            # now so the lab monitor (which reads ``param_count`` from
+            # metrics.jsonl) picks up the real trainable-param count.
+            logger.log_config(run_type=args.strategy, param_count=param_count)
+
+        # Write config JSON
+        config_dict = build_config_json(args, param_count)
+        config_path = out_dir / "config.json"
+        with open(config_path, "w") as f:
+            json_mod.dump(config_dict, f, indent=2)
+        print(f"Config written to {config_path}")
+
+        # Train
+        best_val_loss, final_metrics = train(
+            model,
+            trainable_params,
+            train_loader,
+            val_loader,
+            mask_builder,
+            val_legal_indices,
+            logger,
+            args,
+            device,
+            amp_dtype,
+            gpu_cfg,
+            state_dict_fn,
+            weight_report_fn,
+            param_count,
+            wandb_run=wandb_run,
+        )
+    except BaseException:
+        wandb_exit_code = 1
+        raise
+    finally:
+        finish_wandb(wandb_run, exit_code=wandb_exit_code)
+        logger.close()
+
     print(f"\nDone. Best val_loss={best_val_loss:.4f}")
     print(f"Checkpoints saved to {out_dir}")
 

@@ -6,11 +6,22 @@ Only genuinely cross-partition fixtures live here.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Iterator
 
 import pytest
+
+
+# ---------------------------------------------------------------------------
+# W&B: default to disabled mode so tests never hit the network.
+# Individual tests override via monkeypatch to exercise specific modes.
+# ---------------------------------------------------------------------------
+
+os.environ.setdefault("PAWN_WANDB_MODE", "disabled")
+os.environ.setdefault("WANDB_SILENT", "true")
+os.environ.setdefault("WANDB_MODE", "disabled")
 
 
 # ---------------------------------------------------------------------------
