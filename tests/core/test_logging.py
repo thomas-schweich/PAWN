@@ -15,7 +15,7 @@ import pytest
 from pawn.logging import (
     MetricsLogger,
     _sanitize,
-    _get_git_info,
+    get_git_info,
     random_slug,
     _ADJECTIVES,
     _ANIMALS,
@@ -447,16 +447,16 @@ class TestGitInfo:
         # Reset cache to ensure fresh call
         import pawn.logging as pl
         pl._git_info = None
-        info = _get_git_info()
+        info = get_git_info()
         assert "git_hash" in info
         assert "git_tag" in info
 
     def test_cached_after_first_call(self):
         import pawn.logging as pl
         pl._git_info = None
-        first = _get_git_info()
+        first = get_git_info()
         # Change env vars — cached value should remain
-        second = _get_git_info()
+        second = get_git_info()
         assert first is second
 
     def test_env_var_override(self, monkeypatch):
@@ -464,7 +464,7 @@ class TestGitInfo:
         pl._git_info = None
         monkeypatch.setenv("PAWN_GIT_HASH", "deadbeef")
         monkeypatch.setenv("PAWN_GIT_TAG", "v1.0")
-        info = _get_git_info()
+        info = get_git_info()
         assert info["git_hash"] == "deadbeef"
         assert info["git_tag"] == "v1.0"
         pl._git_info = None  # reset for other tests

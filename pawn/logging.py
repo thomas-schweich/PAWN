@@ -70,9 +70,6 @@ def get_git_info() -> dict[str, str | None]:
     return _git_info
 
 
-_get_git_info = get_git_info
-
-
 # ---------------------------------------------------------------------------
 # Slug generator
 # ---------------------------------------------------------------------------
@@ -198,7 +195,7 @@ class MetricsLogger:
         record["slug"] = self.slug
         record["hostname"] = socket.gethostname()
         record["timestamp"] = datetime.now().isoformat()
-        record.update(_get_git_info())
+        record.update(get_git_info())
         self._write(record)
 
     # -----------------------------------------------------------------------
@@ -210,7 +207,7 @@ class MetricsLogger:
         data: dict[str, object] = {}
         data.update(kwargs)
         data["slug"] = self.slug
-        data.update(_get_git_info())
+        data.update(get_git_info())
         path = self.run_dir / "config.json"
         with open(path, "w") as f:
             json.dump(data, f, indent=2, default=_json_default)

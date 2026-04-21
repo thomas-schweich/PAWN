@@ -550,6 +550,7 @@ def _build_variant_configs(
     train_cfg.prepend_outcome = shared.prepend_outcome
     train_cfg.mate_boost = shared.mate_boost
     train_cfg.use_wandb = shared.wandb
+    train_cfg.wandb_project = shared.wandb_project
     train_cfg.use_amp = shared.amp_dtype != "none"
     train_cfg.max_ply = model_cfg.max_seq_len
     train_cfg.weight_decay = shared.weight_decay

@@ -231,6 +231,7 @@ def run_pretrain(config: PretrainConfig) -> None:
     if config.log_dir:
         train_cfg.log_dir = config.log_dir
     train_cfg.use_wandb = config.wandb
+    train_cfg.wandb_project = config.wandb_project
     train_cfg.use_amp = config.amp_dtype != "none"
 
     if not torch.cuda.is_available() and config.device == "cuda":
@@ -488,7 +489,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
     # jobs join their siblings via ``group=<slug>``.
     wandb_run = init_wandb(
         enabled=config.wandb,
-        project="pawn",
+        project=config.wandb_project,
         logger=logger,
         run_type="adapter",
         config=config.model_dump(),

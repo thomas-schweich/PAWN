@@ -28,7 +28,7 @@ from typing import Any, Literal, Mapping
 
 import torch
 import wandb
-from wandb.sdk.wandb_run import Run
+from wandb import Run
 
 from pawn.logging import MetricsLogger, get_git_info
 
@@ -95,6 +95,15 @@ def init_wandb(
     env_mode = os.environ.get("PAWN_WANDB_MODE")
     if env_mode == "online" or env_mode == "offline" or env_mode == "disabled":
         mode = env_mode
+    elif env_mode is not None and env_mode != "":
+        # Fail loud on a typo like "ONLINE" or "dryrun" — silently
+        # ignoring it would be confusing during debugging.
+        print(
+            f"WARNING: PAWN_WANDB_MODE={env_mode!r} is not a recognized "
+            "value (expected 'online', 'offline', or 'disabled'). "
+            "Falling back to wandb's default mode.",
+            file=sys.stderr,
+        )
 
     repro = _reproducibility_config(logger)
     full_config: dict[str, Any] = {**dict(config), **repro, "run_type": run_type}
@@ -123,10 +132,15 @@ def init_wandb(
         mode=mode,
         reinit=True,
     )
-    # wandb.init's declared return type is broader than Run; in practice it
-    # returns a Run (or a RunDisabled that quacks the same). Narrow for
-    # pyright without masking a genuine None.
-    assert run is not None
+    # wandb.init's stub declares ``Run | None``, but in practice it either
+    # returns a Run (online/offline) or a RunDisabled that quacks the same
+    # (disabled mode) — never None. The narrowing check is defense in depth
+    # against a future stub/behavior change.
+    if run is None:
+        raise RuntimeError(
+            "wandb.init() unexpectedly returned None; aborting to avoid "
+            "silently running without metrics logging."
+        )
     return run
 
 

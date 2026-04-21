@@ -82,6 +82,7 @@ class BaseRunConfig(BaseModel):
     local_checkpoints: bool = False
     resume: str | None = None
     wandb: bool = False
+    wandb_project: str = "pawn"
     cache_dir: str | None = None
 
     @model_validator(mode="after")

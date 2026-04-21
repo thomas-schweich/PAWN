@@ -35,7 +35,7 @@ from pawn.lichess_data import (
     LegalMaskBuilder,
     compute_legal_indices,
 )
-from wandb.sdk.wandb_run import Run as WandbRun
+from wandb import Run as WandbRun
 
 from pawn.logging import MetricsLogger
 from pawn.model import PAWNCLM
@@ -840,6 +840,9 @@ def rosa_mask_generation(
         f"({100 * total_active / total_elements:.2f}%)",
         flush=True,
     )
+    # Log at the warmup-step boundary so the rosa/* timeline aligns with
+    # the Phase 1 warmup loss curve rather than auto-incrementing to an
+    # arbitrary position.
     log_metrics(
         wandb_run,
         {
@@ -848,6 +851,7 @@ def rosa_mask_generation(
             "rosa/total_active_params": total_active,
             "rosa/total_params": total_elements,
         },
+        step=getattr(args, "rosa_warmup_steps", 0),
     )
     return masks
 
