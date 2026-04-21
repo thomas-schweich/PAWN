@@ -166,7 +166,7 @@ Legal-move handling (defaults match pre-existing behavior):
 - `--no-amp` — disable mixed precision
 - `--num-workers N` — DataLoader workers (default: 8 for adapters, 4 for pretraining)
 - `--device {cuda|cpu}` — device selection
-- `--wandb` — enable Weights & Biases logging
+- `--wandb` — enable Weights & Biases metrics logging (pretrain, cotrain, and adapter). Each process invocation creates a fresh run — no W&B state is persisted to checkpoints, so pause/resume is unaffected. Cotrain slots in a single invocation share `group=cotrain-<slug>` so variants cluster together. Resumed runs are independent runs; link them in the UI by filtering on the shared `git:<hash>` tag or the same HF branch URL. Set `PAWN_WANDB_MODE=disabled` to force offline behavior (CI / no network). Project name defaults to `pawn`; override via `WANDB_PROJECT` env var or `TrainingConfig.wandb_project`.
 
 ## Evaluation & Metrics
 

@@ -35,8 +35,11 @@ from pawn.lichess_data import (
     LegalMaskBuilder,
     compute_legal_indices,
 )
+from wandb import Run as WandbRun
+
 from pawn.logging import MetricsLogger
 from pawn.model import PAWNCLM
+from pawn.wandb_utils import log_metrics
 
 STRATEGIES = [
     "bottleneck",
@@ -705,6 +708,7 @@ def rosa_warmup(
     device: str,
     amp_dtype: torch.dtype | None,
     logger: MetricsLogger,
+    wandb_run: WandbRun | None = None,
 ) -> int:
     """Phase 1: Train LoRA-only for warmup_steps."""
     lr = args.lr
@@ -782,6 +786,11 @@ def rosa_warmup(
                     f"  Warmup step {step}/{args.rosa_warmup_steps} | loss={avg:.4f}",
                     flush=True,
                 )
+                log_metrics(
+                    wandb_run,
+                    {"rosa/warmup_loss": avg, "rosa/phase": 1},
+                    step=step,
+                )
 
     print(
         f"  Warm-up complete (avg loss={total_loss / max(n_positions, 1):.4f})"
@@ -797,6 +806,7 @@ def rosa_mask_generation(
     device: str,
     amp_dtype: torch.dtype | None,
     logger: MetricsLogger,
+    wandb_run: WandbRun | None = None,
 ) -> dict[str, torch.Tensor]:
     """Phase 2: Generate gradient-informed sparse masks."""
     from pawn.adapters.rosa import generate_gradient_masks
@@ -829,6 +839,19 @@ def rosa_mask_generation(
         f"  Total: {total_active:,.0f} / {total_elements:,} "
         f"({100 * total_active / total_elements:.2f}%)",
         flush=True,
+    )
+    # Log at the warmup-step boundary so the rosa/* timeline aligns with
+    # the Phase 1 warmup loss curve rather than auto-incrementing to an
+    # arbitrary position.
+    log_metrics(
+        wandb_run,
+        {
+            "rosa/phase": 2,
+            "rosa/mask_density": total_active / max(total_elements, 1),
+            "rosa/total_active_params": total_active,
+            "rosa/total_params": total_elements,
+        },
+        step=getattr(args, "rosa_warmup_steps", 0),
     )
     return masks
 
@@ -1036,6 +1059,7 @@ def train(
     state_dict_fn: Any,
     weight_report_fn: Any,
     param_count: int,
+    wandb_run: WandbRun | None = None,
 ) -> tuple[float, dict[str, Any]]:
     """Unified training loop for all strategies."""
     from pawn import model as model_module
@@ -1144,17 +1168,18 @@ def train(
             f"  loss={baseline['loss']:.4f}, top1={baseline['top1_accuracy']:.4%}, "
             f"top5={baseline['top5_accuracy']:.4%}"
         )
-        logger.log_train(
-            step=0,
-            epoch=-1,
-            train_loss=baseline["loss"],
-            train_top1=baseline["top1_accuracy"],
-            val_loss=baseline["loss"],
-            val_top1=baseline["top1_accuracy"],
-            val_top5=baseline["top5_accuracy"],
-            val_illegal_pred_rate=baseline["illegal_pred_rate"],
-            val_illegal_prob_mass=baseline["illegal_prob_mass"],
-        )
+        baseline_record: dict[str, Any] = {
+            "epoch": -1,
+            "train_loss": baseline["loss"],
+            "train_top1": baseline["top1_accuracy"],
+            "val_loss": baseline["loss"],
+            "val_top1": baseline["top1_accuracy"],
+            "val_top5": baseline["top5_accuracy"],
+            "val_illegal_pred_rate": baseline["illegal_pred_rate"],
+            "val_illegal_prob_mass": baseline["illegal_prob_mass"],
+        }
+        logger.log_train(step=0, **baseline_record)
+        log_metrics(wandb_run, baseline_record, step=0)
         val_metrics = baseline
     else:
         val_metrics = evaluate(
@@ -1344,6 +1369,15 @@ def train(
                     train_loss=avg_loss,
                     train_top1=avg_top1,
                 )
+                log_metrics(
+                    wandb_run,
+                    {
+                        "train/loss": avg_loss,
+                        "train/top1": avg_top1,
+                        "train/lr": lr,
+                    },
+                    step=global_step,
+                )
                 log_positions = 0
 
             if eval_interval and global_step % eval_interval == 0:
@@ -1360,17 +1394,18 @@ def train(
                 except Exception as e:
                     print(f"WARNING: weight_report_fn failed: {e}", flush=True)
                     report = {}
-                logger.log_train(
-                    step=global_step,
-                    epoch=epoch,
-                    lr=optimizer.param_groups[0]["lr"],
-                    val_loss=val_metrics["loss"],
-                    val_top1=val_metrics["top1_accuracy"],
-                    val_top5=val_metrics["top5_accuracy"],
-                    val_illegal_pred_rate=val_metrics["illegal_pred_rate"],
-                    val_illegal_prob_mass=val_metrics["illegal_prob_mass"],
+                eval_record: dict[str, Any] = {
+                    "epoch": epoch,
+                    "lr": optimizer.param_groups[0]["lr"],
+                    "val_loss": val_metrics["loss"],
+                    "val_top1": val_metrics["top1_accuracy"],
+                    "val_top5": val_metrics["top5_accuracy"],
+                    "val_illegal_pred_rate": val_metrics["illegal_pred_rate"],
+                    "val_illegal_prob_mass": val_metrics["illegal_prob_mass"],
                     **report,
-                )
+                }
+                logger.log_train(step=global_step, **eval_record)
+                log_metrics(wandb_run, eval_record, step=global_step)
                 # Saves triggered by the eval that just ran get fresh
                 # ``val_metrics`` in ``training_state.json``. Non-eval-aligned
                 # checkpoint_interval boundaries are handled in a separate
@@ -1437,20 +1472,21 @@ def train(
         except Exception as e:
             print(f"WARNING: weight_report_fn failed: {e}", flush=True)
             report = {}
-        logger.log_train(
-            step=global_step,
-            epoch=epoch,
-            lr=optimizer.param_groups[0]["lr"],
-            train_loss=train_loss,
-            train_top1=train_top1,
-            val_loss=val_metrics["loss"],
-            val_top1=val_metrics["top1_accuracy"],
-            val_top5=val_metrics["top5_accuracy"],
-            val_illegal_pred_rate=val_metrics.get("illegal_pred_rate", 0.0),
-            val_illegal_prob_mass=val_metrics.get("illegal_prob_mass", 0.0),
-            epoch_time_s=dt,
+        epoch_record: dict[str, Any] = {
+            "epoch": epoch,
+            "lr": optimizer.param_groups[0]["lr"],
+            "train_loss": train_loss,
+            "train_top1": train_top1,
+            "val_loss": val_metrics["loss"],
+            "val_top1": val_metrics["top1_accuracy"],
+            "val_top5": val_metrics["top5_accuracy"],
+            "val_illegal_pred_rate": val_metrics.get("illegal_pred_rate", 0.0),
+            "val_illegal_prob_mass": val_metrics.get("illegal_prob_mass", 0.0),
+            "epoch_time_s": dt,
             **report,
-        )
+        }
+        logger.log_train(step=global_step, **epoch_record)
+        log_metrics(wandb_run, epoch_record, step=global_step)
 
         print(
             f"  Epoch {epoch:3d} | "

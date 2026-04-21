@@ -35,6 +35,7 @@ from pawn.trainer import (
     compute_legal_move_rate_from_preds,
     eval_game_completion_metrics,
 )
+from pawn.wandb_utils import finish_wandb, init_wandb, log_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +56,8 @@ class ModelSlot:
         shm_checkpoints: bool = False,
         slug: str = "",
         resume_path: str | None = None,
+        wandb_group: str | None = None,
+        run_config: dict[str, object] | None = None,
     ):
         self.name = name
         self.slug = slug
@@ -138,6 +141,25 @@ class ModelSlot:
             formulation="clm",
             multi_model=True,
             variant=name,
+        )
+
+        # W&B (metrics-only; one run per slot, all sharing ``wandb_group``
+        # so the UI can overlay variants).
+        wandb_config: dict[str, object] = (
+            dict(run_config)
+            if run_config is not None
+            else {"model": model_cfg.__dict__, "training": train_cfg.__dict__}
+        )
+        wandb_config["variant"] = name
+        self.wandb_run = init_wandb(
+            enabled=train_cfg.use_wandb,
+            project=train_cfg.wandb_project,
+            logger=self.logger,
+            run_type="cotrain",
+            config=wandb_config,
+            group=wandb_group,
+            job_type=f"cotrain-{name}",
+            tags=[f"variant:{name}"],
         )
 
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -316,10 +338,11 @@ class ModelSlot:
 
         return avg
 
-    def close(self):
+    def close(self, wandb_exit_code: int = 0) -> None:
         self.wait_for_push()
         self._hf_push_pool.shutdown(wait=True)
         self.logger.close()
+        finish_wandb(self.wandb_run, exit_code=wandb_exit_code)
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +550,7 @@ def _build_variant_configs(
     train_cfg.prepend_outcome = shared.prepend_outcome
     train_cfg.mate_boost = shared.mate_boost
     train_cfg.use_wandb = shared.wandb
+    train_cfg.wandb_project = shared.wandb_project
     train_cfg.use_amp = shared.amp_dtype != "none"
     train_cfg.max_ply = model_cfg.max_seq_len
     train_cfg.weight_decay = shared.weight_decay
@@ -602,6 +626,8 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     # Build slots (now uses the corrected config.prepend_outcome, so each
     # slot's TrainingConfig and config.json reflect the actual sequence
     # format).
+    wandb_group = f"cotrain-{slug}"
+    shared_run_config = config.model_dump()
     slots: list[ModelSlot] = []
     for variant_spec in config.variants:
         model_cfg, train_cfg = _build_variant_configs(
@@ -612,6 +638,8 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
             variant_spec.name, model_cfg, train_cfg, device, hf_repo,
             shm_checkpoints=config.shm_checkpoints, slug=slug,
             resume_path=variant_spec.resume,
+            wandb_group=wandb_group,
+            run_config=shared_run_config,
         ))
 
     # Verify all resumed slots agree on global_step
@@ -689,116 +717,142 @@ def run_cotrain(config: CotrainConfig) -> list[ModelSlot]:
     eval_interval = slots[0].train_cfg.eval_interval
     checkpoint_interval = config.checkpoint_interval
 
-    for batch in loader:
-        # Forward + backward + optimizer step per model so CUDA can overlap
-        # Adam updates (memory-bound) with the next model's forward (compute-bound)
-        all_metrics: dict[str, dict[str, torch.Tensor]] = {}
-        all_grad_norms: dict[str, float] = {}
-        for slot in active_slots:
-            metrics = slot.train_step(batch)
-            all_metrics[slot.name] = metrics
-            gn = slot.optimizer_step()
-            all_grad_norms[slot.name] = gn
-
-        global_step += 1
-        for slot in slots:
-            slot.global_step = global_step
-
-        step_time = time.time() - step_start
-        games_per_sec = config.batch_size / step_time
-
-        # Logging — .item() sync only at log intervals
-        if global_step % log_interval == 0:
-            active_names = ", ".join(s.name for s in active_slots)
-            print(f"step {global_step:>7d} | {games_per_sec:.0f} g/s | {step_time:.2f}s | active: {active_names}", flush=True)
+    wandb_exit_code = 0
+    try:
+        for batch in loader:
+            # Forward + backward + optimizer step per model so CUDA can overlap
+            # Adam updates (memory-bound) with the next model's forward (compute-bound)
+            all_metrics: dict[str, dict[str, torch.Tensor]] = {}
+            all_grad_norms: dict[str, float] = {}
             for slot in active_slots:
-                m = all_metrics[slot.name]
-                loss_val = m['loss'].item()
-                acc_val = m['accuracy'].item()
-                gn = all_grad_norms[slot.name]
-                lr = slot.scheduler.get_lr()
-                print(f"  {slot.name:>5s}: loss {loss_val:.4f} | acc {acc_val:.3f} | "
-                      f"lr {lr:.2e} | gn {gn:.2f}", flush=True)
+                metrics = slot.train_step(batch)
+                all_metrics[slot.name] = metrics
+                gn = slot.optimizer_step()
+                all_grad_norms[slot.name] = gn
 
-                slot.logger.log_train(
-                    step=global_step,
-                    lr=lr, grad_norm=gn,
-                    step_time=step_time, games_per_sec=games_per_sec,
-                    **{"train/loss": loss_val, "train/accuracy": acc_val},
-                )
+            global_step += 1
+            for slot in slots:
+                slot.global_step = global_step
 
-        # Eval
-        if global_step % eval_interval == 0:
-            for slot in active_slots:
-                val_metrics = slot.evaluate(val_data)
-                print(f"  {slot.name:>5s} val: loss {val_metrics['val/loss']:.4f} | "
-                      f"acc {val_metrics['val/accuracy']:.3f}", flush=True)
-                # Track best for eval, /dev/shm cleanup, and patience
-                vl = val_metrics["val/loss"]
-                if vl < slot.best_val_loss:
-                    slot.best_val_loss = vl
-                    slot.best_val_step = global_step
-                    slot.patience_counter = 0
-                else:
-                    slot.patience_counter += 1
+            step_time = time.time() - step_start
+            games_per_sec = config.batch_size / step_time
 
-                slot.logger.log_val(
-                    step=global_step,
-                    patience=slot.patience_counter,
-                    best_val_loss=slot.best_val_loss,
-                    best_val_step=slot.best_val_step,
-                    **val_metrics,
-                )
+            # Logging — .item() sync only at log intervals
+            if global_step % log_interval == 0:
+                active_names = ", ".join(s.name for s in active_slots)
+                print(f"step {global_step:>7d} | {games_per_sec:.0f} g/s | {step_time:.2f}s | active: {active_names}", flush=True)
+                for slot in active_slots:
+                    m = all_metrics[slot.name]
+                    loss_val = m['loss'].item()
+                    acc_val = m['accuracy'].item()
+                    gn = all_grad_norms[slot.name]
+                    lr = slot.scheduler.get_lr()
+                    print(f"  {slot.name:>5s}: loss {loss_val:.4f} | acc {acc_val:.3f} | "
+                          f"lr {lr:.2e} | gn {gn:.2f}", flush=True)
 
-                # Per-model early stopping
-                if patience > 0 and slot.patience_counter >= patience:
-                    print(f"  [{slot.name}] Early stopping — no improvement "
-                          f"for {patience} evals (best step {slot.best_val_step})")
-                    slot.stopped = True
+                    slot.logger.log_train(
+                        step=global_step,
+                        lr=lr, grad_norm=gn,
+                        step_time=step_time, games_per_sec=games_per_sec,
+                        **{"train/loss": loss_val, "train/accuracy": acc_val},
+                    )
+                    log_metrics(
+                        slot.wandb_run,
+                        {
+                            "train/loss": loss_val, "train/accuracy": acc_val,
+                            "train/lr": lr, "train/grad_norm": gn,
+                            "train/step_time": step_time,
+                            "train/games_per_sec": games_per_sec,
+                        },
+                        step=global_step,
+                    )
+
+            # Eval
+            if global_step % eval_interval == 0:
+                for slot in active_slots:
+                    val_metrics = slot.evaluate(val_data)
+                    print(f"  {slot.name:>5s} val: loss {val_metrics['val/loss']:.4f} | "
+                          f"acc {val_metrics['val/accuracy']:.3f}", flush=True)
+                    # Track best for eval, /dev/shm cleanup, and patience
+                    vl = val_metrics["val/loss"]
+                    if vl < slot.best_val_loss:
+                        slot.best_val_loss = vl
+                        slot.best_val_step = global_step
+                        slot.patience_counter = 0
+                    else:
+                        slot.patience_counter += 1
+
+                    slot.logger.log_val(
+                        step=global_step,
+                        patience=slot.patience_counter,
+                        best_val_loss=slot.best_val_loss,
+                        best_val_step=slot.best_val_step,
+                        **val_metrics,
+                    )
+                    log_metrics(
+                        slot.wandb_run,
+                        {
+                            **val_metrics,
+                            "patience": slot.patience_counter,
+                            "best_val_loss": slot.best_val_loss,
+                            "best_val_step": slot.best_val_step,
+                        },
+                        step=global_step,
+                    )
+
+                    # Per-model early stopping
+                    if patience > 0 and slot.patience_counter >= patience:
+                        print(f"  [{slot.name}] Early stopping — no improvement "
+                              f"for {patience} evals (best step {slot.best_val_step})")
+                        slot.stopped = True
+                        slot.save_checkpoint()
+
+                active_slots = [s for s in active_slots if not s.stopped]
+
+                # Push metrics to HF after eval (lightweight, background)
+                for slot in slots:
+                    slot.push_metrics_to_hf()
+
+                if not active_slots:
+                    print(f"\nAll models stopped at step {global_step}")
+                    break
+
+            # Checkpoint
+            if global_step % checkpoint_interval == 0:
+                for slot in active_slots:
                     slot.save_checkpoint()
 
-            active_slots = [s for s in active_slots if not s.stopped]
-
-            # Push metrics to HF after eval (lightweight, background)
-            for slot in slots:
-                slot.push_metrics_to_hf()
-
-            if not active_slots:
-                print(f"\nAll models stopped at step {global_step}")
+            # Done?
+            if global_step >= total_steps:
+                print(f"\nTraining complete at step {global_step}")
+                for slot in active_slots:
+                    slot.save_checkpoint()
                 break
 
-        # Checkpoint
-        if global_step % checkpoint_interval == 0:
-            for slot in active_slots:
-                slot.save_checkpoint()
+            # Pause
+            if config.pause_after_steps and global_step >= config.pause_after_steps:
+                print(f"\nPause requested at step {global_step}, saving checkpoints...")
+                for slot in active_slots:
+                    slot.save_checkpoint()
+                break
 
-        # Done?
-        if global_step >= total_steps:
-            print(f"\nTraining complete at step {global_step}")
-            for slot in active_slots:
-                slot.save_checkpoint()
-            break
+            # Graceful shutdown
+            if _shutdown_requested:
+                print(f"\nShutdown requested (signal {_shutdown_signal}), "
+                      f"saving checkpoints at step {global_step}...")
+                for slot in active_slots:
+                    slot.save_checkpoint()
+                break
 
-        # Pause
-        if config.pause_after_steps and global_step >= config.pause_after_steps:
-            print(f"\nPause requested at step {global_step}, saving checkpoints...")
-            for slot in active_slots:
-                slot.save_checkpoint()
-            break
-
-        # Graceful shutdown
-        if _shutdown_requested:
-            print(f"\nShutdown requested (signal {_shutdown_signal}), "
-                  f"saving checkpoints at step {global_step}...")
-            for slot in active_slots:
-                slot.save_checkpoint()
-            break
-
-        step_start = time.time()
-
-    # Cleanup
-    for slot in slots:
-        slot.close()
+            step_start = time.time()
+    except BaseException:
+        wandb_exit_code = 1
+        raise
+    finally:
+        # Cleanup — runs on normal exit, break, or exception so W&B
+        # runs finish cleanly and the HF push pools drain.
+        for slot in slots:
+            slot.close(wandb_exit_code=wandb_exit_code)
 
     print("\nAll done.")
 

@@ -37,7 +37,12 @@ except ImportError:
 _git_info: dict[str, str | None] | None = None
 
 
-def _get_git_info() -> dict[str, str | None]:
+def get_git_info() -> dict[str, str | None]:
+    """Return ``{"git_hash": ..., "git_tag": ...}`` for the current working tree.
+
+    Honors ``PAWN_GIT_HASH`` / ``PAWN_GIT_TAG`` env vars (set on runpod images
+    where the container is built outside a git checkout). Result is cached.
+    """
     global _git_info
     if _git_info is not None:
         return _git_info
@@ -190,7 +195,7 @@ class MetricsLogger:
         record["slug"] = self.slug
         record["hostname"] = socket.gethostname()
         record["timestamp"] = datetime.now().isoformat()
-        record.update(_get_git_info())
+        record.update(get_git_info())
         self._write(record)
 
     # -----------------------------------------------------------------------
@@ -202,7 +207,7 @@ class MetricsLogger:
         data: dict[str, object] = {}
         data.update(kwargs)
         data["slug"] = self.slug
-        data.update(_get_git_info())
+        data.update(get_git_info())
         path = self.run_dir / "config.json"
         with open(path, "w") as f:
             json.dump(data, f, indent=2, default=_json_default)

@@ -68,6 +68,51 @@ uv run python scripts/train.py --variant base --accumulation-steps 4
 uv run python scripts/train.py --variant base --wandb
 ```
 
+### Observability (W&B)
+
+`--wandb` streams training metrics to Weights & Biases. The integration is
+metrics-only — checkpoints still go to HuggingFace, and no W&B state is
+persisted to the checkpoint, so pause/resume is unaffected (Option A).
+
+What lands in `wandb.config`:
+
+- The full `RunConfig` dump (user-level CLI knobs).
+- Reproducibility metadata: `slug`, `git_hash`, `git_tag`, `hostname`,
+  `command_line`, `run_dir`, `python_version`, `torch_version`,
+  `gpu_name`, `cuda_version` / `hip_version`.
+
+Run organization:
+
+- **Name** matches `logger.run_dir.name` so the W&B run cross-references
+  the local run directory and any HF branch.
+- **Group** within a single invocation: pretrain/adapter runs use the
+  run slug; cotrain slots share `group=cotrain-<slug>` so all variants
+  of one cotrain process cluster together in the UI. Resumed runs are
+  independent W&B runs — to correlate pre- and post-resume curves,
+  filter by the shared `git:<hash8>` tag or the matching HF branch URL.
+- **Tags** include `git:<hash8>`, `run_type:<pretrain|adapter|cotrain>`,
+  and for adapters `strategy:<name>`, for pretrain `variant:<name>`.
+
+Environment variables:
+
+- `WANDB_PROJECT` — override the default project name `pawn`. Takes
+  precedence over `TrainingConfig.wandb_project`.
+- `WANDB_API_KEY` — authentication (not touched by PAWN).
+- `PAWN_WANDB_MODE=disabled` — force offline/disabled mode (CI, no
+  network, unit tests). Values `online` / `offline` / `disabled` are
+  honored at init time.
+
+Adapter-specific metrics forwarded:
+
+- Training: `train/loss`, `train/top1`, `train/lr` every `log_interval`.
+- Eval: `val_loss`, `val_top1`, `val_top5`, `val_illegal_pred_rate`,
+  `val_illegal_prob_mass`, plus every adapter-specific entry produced
+  by the strategy's weight-report function. FiLM emits
+  `hidden_<i>/gamma_dev` and `hidden_<i>/beta_norm` per layer; LoRA
+  emits `layer<i>.<proj>.A` and `layer<i>.<proj>.B` norms.
+- RoSA: `rosa/warmup_loss` and `rosa/phase` during Phase 1;
+  `rosa/mask_density`, `rosa/total_active_params` after Phase 2.
+
 ## Adapter Training (Behavioral Cloning)
 
 Adapter training freezes the pretrained PAWN backbone and trains lightweight adapter modules on Lichess games to predict human moves.

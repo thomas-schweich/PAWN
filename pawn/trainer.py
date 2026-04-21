@@ -30,6 +30,7 @@ from pawn.data import (
     create_validation_set,
 )
 from pawn.logging import MetricsLogger
+from pawn.wandb_utils import finish_wandb, init_wandb, log_metrics
 
 from pawn.data_utils import unpack_grid
 
@@ -631,6 +632,8 @@ class CLMTrainer:
         hf_repo: str | None = None,
         patience: int | None = None,
         legality_late_ply: int | None = None,
+        run_config: dict[str, object] | None = None,
+        wandb_tags: list[str] | None = None,
     ):
         self.cfg = train_cfg
         self.model_cfg = model_cfg
@@ -638,6 +641,8 @@ class CLMTrainer:
         self.global_step = 0
         self.hf_repo = hf_repo
         self.hf_branch: str | None = None
+        self._run_config = run_config
+        self._wandb_tags = wandb_tags
 
         # Compound early stopping state
         self.patience = patience
@@ -719,21 +724,25 @@ class CLMTrainer:
             prepend_outcome=train_cfg.prepend_outcome,
         )
 
-        # W&B
-        self.wandb_run = None
-        if train_cfg.use_wandb:
-            try:
-                import wandb
-
-                self.wandb_run = wandb.init(
-                    project=train_cfg.wandb_project,
-                    config={
-                        "model": model_cfg.__dict__,
-                        "training": train_cfg.__dict__,
-                    },
-                )
-            except (ImportError, Exception) as e:
-                print(f"W&B init failed: {e}. Continuing without W&B.")
+        # W&B (metrics-only; a fresh run per process invocation, Option A).
+        # ``run_config`` is the full user-level RunConfig dump so W&B sees
+        # the CLI-facing knobs — falling back to model+training dicts if the
+        # caller didn't pass one.
+        wandb_config: dict[str, object] = (
+            dict(run_config)
+            if run_config is not None
+            else {"model": model_cfg.__dict__, "training": train_cfg.__dict__}
+        )
+        self.wandb_run = init_wandb(
+            enabled=train_cfg.use_wandb,
+            project=train_cfg.wandb_project,
+            logger=self.logger,
+            run_type="pretrain",
+            config=wandb_config,
+            group=self.logger.slug,
+            job_type="pretrain",
+            tags=wandb_tags,
+        )
 
         # torch.compile
         self._compiled = False
@@ -959,153 +968,166 @@ class CLMTrainer:
         print(f"Starting training from step {self.global_step}", flush=True)
         print(f"JSONL log: {self._jsonl_path}", flush=True)
 
-        for batch in loader:
-            metrics = self.train_step(batch)
-            accum_count += 1
+        wandb_exit_code = 0
+        try:
+            for batch in loader:
+                metrics = self.train_step(batch)
+                accum_count += 1
 
-            if accum_count >= self.cfg.accumulation_steps:
-                grad_norm = self.optimizer_step()
-                accum_count = 0
-                self.global_step += 1
+                if accum_count >= self.cfg.accumulation_steps:
+                    grad_norm = self.optimizer_step()
+                    accum_count = 0
+                    self.global_step += 1
 
-                step_time = time.time() - step_start
-                games_per_sec = games_per_step / step_time
+                    step_time = time.time() - step_start
+                    games_per_sec = games_per_step / step_time
 
-                if self.global_step % self.cfg.log_interval == 0:
-                    # .item() sync only at log intervals (metrics are tensors here)
-                    loss_val = metrics['loss'].item()
-                    acc_val = metrics['accuracy'].item()
-                    lr = self.scheduler.get_lr()
+                    if self.global_step % self.cfg.log_interval == 0:
+                        # .item() sync only at log intervals (metrics are tensors here)
+                        loss_val = metrics['loss'].item()
+                        acc_val = metrics['accuracy'].item()
+                        lr = self.scheduler.get_lr()
 
-                    print(
-                        f"step {self.global_step:>7d} | "
-                        f"loss {loss_val:.4f} | "
-                        f"acc {acc_val:.3f} | "
-                        f"lr {lr:.2e} | "
-                        f"gn {grad_norm:.2f} | "
-                        f"{games_per_sec:.0f} g/s | "
-                        f"{step_time:.2f}s",
-                        flush=True,
-                    )
-
-                    self.logger.log_train(
-                        step=self.global_step,
-                        lr=lr, grad_norm=grad_norm,
-                        step_time=step_time, games_per_sec=games_per_sec,
-                        **{"train/loss": loss_val, "train/accuracy": acc_val},  # type: ignore[arg-type]
-                    )
-
-                    if self.wandb_run:
-                        self.wandb_run.log({
-                            "train/loss": loss_val, "train/accuracy": acc_val,
-                            "train/lr": lr, "train/grad_norm": grad_norm,
-                            "train/step_time": step_time, "train/games_per_sec": games_per_sec,
-                        }, step=self.global_step)
-
-                if self.global_step % self.cfg.eval_interval == 0:
-                    val_metrics = self.evaluate()
-                    val_msg = (
-                        f"  val: loss {val_metrics['val/loss']:.4f} | "
-                        f"acc {val_metrics['val/accuracy']:.3f} | "
-                        f"top5 {val_metrics.get('val/top5_accuracy', 0):.3f} | "
-                        f"ppl {val_metrics.get('val/perplexity', 0):.1f}"
-                    )
-                    if "val/legal_move_rate" in val_metrics:
-                        val_msg += f" | legal {val_metrics['val/legal_move_rate']:.3f}"
-                    if "val/late_legal_move_rate" in val_metrics:
-                        val_msg += f" | late_legal {val_metrics['val/late_legal_move_rate']:.3f}"
-                    if "val/game_completion_rate" in val_metrics:
-                        val_msg += (
-                            f" | complete {val_metrics['val/game_completion_rate']:.3f}"
-                            f" | avg_ply {val_metrics['val/avg_plies_completed']:.0f}"
+                        print(
+                            f"step {self.global_step:>7d} | "
+                            f"loss {loss_val:.4f} | "
+                            f"acc {acc_val:.3f} | "
+                            f"lr {lr:.2e} | "
+                            f"gn {grad_norm:.2f} | "
+                            f"{games_per_sec:.0f} g/s | "
+                            f"{step_time:.2f}s",
+                            flush=True,
                         )
-                        if "val/min_forfeit_ply" in val_metrics:
+
+                        self.logger.log_train(
+                            step=self.global_step,
+                            lr=lr, grad_norm=grad_norm,
+                            step_time=step_time, games_per_sec=games_per_sec,
+                            **{"train/loss": loss_val, "train/accuracy": acc_val},  # type: ignore[arg-type]
+                        )
+
+                        log_metrics(
+                            self.wandb_run,
+                            {
+                                "train/loss": loss_val, "train/accuracy": acc_val,
+                                "train/lr": lr, "train/grad_norm": grad_norm,
+                                "train/step_time": step_time,
+                                "train/games_per_sec": games_per_sec,
+                            },
+                            step=self.global_step,
+                        )
+
+                    if self.global_step % self.cfg.eval_interval == 0:
+                        val_metrics = self.evaluate()
+                        val_msg = (
+                            f"  val: loss {val_metrics['val/loss']:.4f} | "
+                            f"acc {val_metrics['val/accuracy']:.3f} | "
+                            f"top5 {val_metrics.get('val/top5_accuracy', 0):.3f} | "
+                            f"ppl {val_metrics.get('val/perplexity', 0):.1f}"
+                        )
+                        if "val/legal_move_rate" in val_metrics:
+                            val_msg += f" | legal {val_metrics['val/legal_move_rate']:.3f}"
+                        if "val/late_legal_move_rate" in val_metrics:
+                            val_msg += f" | late_legal {val_metrics['val/late_legal_move_rate']:.3f}"
+                        if "val/game_completion_rate" in val_metrics:
                             val_msg += (
-                                f" | forfeit [{val_metrics['val/min_forfeit_ply']:.0f}"
-                                f"-{val_metrics['val/max_forfeit_ply']:.0f}"
-                                f" med {val_metrics['val/median_forfeit_ply']:.0f}]"
+                                f" | complete {val_metrics['val/game_completion_rate']:.3f}"
+                                f" | avg_ply {val_metrics['val/avg_plies_completed']:.0f}"
                             )
+                            if "val/min_forfeit_ply" in val_metrics:
+                                val_msg += (
+                                    f" | forfeit [{val_metrics['val/min_forfeit_ply']:.0f}"
+                                    f"-{val_metrics['val/max_forfeit_ply']:.0f}"
+                                    f" med {val_metrics['val/median_forfeit_ply']:.0f}]"
+                                )
 
-                    # Compound early stopping
-                    extra_log: dict[str, object] = {}
-                    if self.patience is not None:
-                        val_loss = val_metrics["val/loss"]
-                        late_legality = val_metrics.get("val/late_legal_move_rate", 0.0)
-                        game_completion = val_metrics.get("val/game_completion_rate", 0.0)
-                        avg_plies = val_metrics.get("val/avg_plies_completed", 0.0)
+                        # Compound early stopping
+                        extra_log: dict[str, object] = {}
+                        if self.patience is not None:
+                            val_loss = val_metrics["val/loss"]
+                            late_legality = val_metrics.get("val/late_legal_move_rate", 0.0)
+                            game_completion = val_metrics.get("val/game_completion_rate", 0.0)
+                            avg_plies = val_metrics.get("val/avg_plies_completed", 0.0)
 
-                        improved = False
-                        if val_loss < self.best_val_loss:
-                            self.best_val_loss = val_loss
-                            improved = True
-                        if late_legality > self.best_late_legality:
-                            self.best_late_legality = late_legality
-                            improved = True
-                        if game_completion > self.best_game_completion:
-                            self.best_game_completion = game_completion
-                            improved = True
-                        if avg_plies > self.best_avg_plies_completed:
-                            self.best_avg_plies_completed = avg_plies
-                            improved = True
+                            improved = False
+                            if val_loss < self.best_val_loss:
+                                self.best_val_loss = val_loss
+                                improved = True
+                            if late_legality > self.best_late_legality:
+                                self.best_late_legality = late_legality
+                                improved = True
+                            if game_completion > self.best_game_completion:
+                                self.best_game_completion = game_completion
+                                improved = True
+                            if avg_plies > self.best_avg_plies_completed:
+                                self.best_avg_plies_completed = avg_plies
+                                improved = True
 
-                        if improved:
-                            self.patience_counter = 0
-                        else:
-                            self.patience_counter += 1
+                            if improved:
+                                self.patience_counter = 0
+                            else:
+                                self.patience_counter += 1
 
-                        val_msg += f" | pat {self.patience_counter}/{self.patience}"
-                        extra_log = {
-                            "patience_counter": self.patience_counter,
-                            "best_val_loss": self.best_val_loss,
-                            "best_late_legality": self.best_late_legality,
-                            "best_game_completion": self.best_game_completion,
-                            "best_avg_plies_completed": self.best_avg_plies_completed,
-                        }
+                            val_msg += f" | pat {self.patience_counter}/{self.patience}"
+                            extra_log = {
+                                "patience_counter": self.patience_counter,
+                                "best_val_loss": self.best_val_loss,
+                                "best_late_legality": self.best_late_legality,
+                                "best_game_completion": self.best_game_completion,
+                                "best_avg_plies_completed": self.best_avg_plies_completed,
+                            }
 
-                    print(val_msg, flush=True)
+                        print(val_msg, flush=True)
 
-                    self.logger.log_val(step=self.global_step, **val_metrics, **extra_log)  # type: ignore[arg-type]
+                        self.logger.log_val(step=self.global_step, **val_metrics, **extra_log)  # type: ignore[arg-type]
 
-                    if self.wandb_run:
-                        self.wandb_run.log({**val_metrics, **extra_log}, step=self.global_step)
+                        log_metrics(
+                            self.wandb_run,
+                            {**val_metrics, **extra_log},
+                            step=self.global_step,
+                        )
 
-                if self.global_step % self.cfg.checkpoint_interval == 0:
-                    self.save_checkpoint()
+                    if self.global_step % self.cfg.checkpoint_interval == 0:
+                        self.save_checkpoint()
 
-                if self.global_step >= self.cfg.total_steps:
-                    print(f"Training complete at step {self.global_step}")
-                    self.save_checkpoint()
-                    break
+                    if self.global_step >= self.cfg.total_steps:
+                        print(f"Training complete at step {self.global_step}")
+                        self.save_checkpoint()
+                        break
 
-                if (self.patience is not None
-                        and self.patience_counter >= self.patience):
-                    print(f"\nEarly stopping at step {self.global_step} "
-                          f"(no improvement for {self.patience} evals)")
-                    self.save_checkpoint()
-                    break
+                    if (self.patience is not None
+                            and self.patience_counter >= self.patience):
+                        print(f"\nEarly stopping at step {self.global_step} "
+                              f"(no improvement for {self.patience} evals)")
+                        self.save_checkpoint()
+                        break
 
-                if (self.cfg.pause_after_steps
-                        and self.global_step >= self.cfg.pause_after_steps):
-                    print(f"\n  Paused at step {self.global_step} "
-                          f"(pause_after_steps={self.cfg.pause_after_steps})")
-                    self.save_checkpoint()
-                    break
+                    if (self.cfg.pause_after_steps
+                            and self.global_step >= self.cfg.pause_after_steps):
+                        print(f"\n  Paused at step {self.global_step} "
+                              f"(pause_after_steps={self.cfg.pause_after_steps})")
+                        self.save_checkpoint()
+                        break
 
-                if _shutdown_requested:
-                    print(f"\nShutdown requested (signal {_shutdown_signal}), "
-                          f"saving checkpoint at step {self.global_step}...")
-                    self.save_checkpoint()
-                    break
+                    if _shutdown_requested:
+                        print(f"\nShutdown requested (signal {_shutdown_signal}), "
+                              f"saving checkpoint at step {self.global_step}...")
+                        self.save_checkpoint()
+                        break
 
-                step_start = time.time()
+                    step_start = time.time()
+        except BaseException:
+            wandb_exit_code = 1
+            raise
+        finally:
+            signal.signal(signal.SIGTERM, old_term)
+            signal.signal(signal.SIGINT, old_int)
 
-        signal.signal(signal.SIGTERM, old_term)
-        signal.signal(signal.SIGINT, old_int)
-
-        # Drain the background HF pusher before exiting so a final
-        # save on shutdown/end isn't lost. No-op when hf_repo is None.
-        self._hf_pusher.wait()
-        self.logger.close()
+            # Drain the background HF pusher before exiting so a final
+            # save on shutdown/end isn't lost. No-op when hf_repo is None.
+            self._hf_pusher.wait()
+            self.logger.close()
+            finish_wandb(self.wandb_run, exit_code=wandb_exit_code)
 
     def save_checkpoint(self, path: str | None = None):
         from pawn.checkpoint import save_pretrain_checkpoint
