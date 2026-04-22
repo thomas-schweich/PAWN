@@ -447,13 +447,7 @@ class TestShardedDataset:
 
 
 class TestResumeDeterminism:
-    """The streaming dataset must be bit-identical across restarts so a
-    resumed training run produces the same gradient trajectory as a
-    continuous one. Determinism comes from seeding both the shard shuffle
-    and the shuffle-buffer permutation with ``seed + epoch`` at every
-    ``__iter__`` call — no global RNG state leakage, no wall-clock
-    dependence.
-    """
+    """Dataset must be bit-identical across restarts for correct resume."""
 
     @pytest.fixture
     def local_shard_dir(self, tmp_path):

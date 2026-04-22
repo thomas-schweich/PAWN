@@ -551,6 +551,10 @@ def load_adapter_checkpoint(
         "val_metrics": ts.get("val_metrics", {}),
         "best_val_loss": ts.get("best_val_loss"),
         "patience_counter": ts.get("patience_counter"),
+        # ``steps_per_epoch`` persists the save-time value so resume can
+        # fast-forward exactly, independent of any runtime estimate.
+        # ``None`` for checkpoints written before this field existed.
+        "steps_per_epoch": ts.get("steps_per_epoch"),
     }
 
     if (path / "optimizer.safetensors").exists() and "optimizer_meta" in ts:

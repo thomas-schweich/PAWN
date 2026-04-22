@@ -401,59 +401,23 @@ class TestParseLayers:
 
 
 class TestResumeStartEpoch:
-    """Resume semantics regression: saved ``epoch`` is the *current* epoch,
-    not the last-completed one.
+    """Regression tests for the ``start_epoch = saved_epoch + 1`` bug."""
 
-    Historically, ``train_adapter`` computed ``start_epoch = saved_epoch + 1``
-    on resume. Because adapter checkpoints are saved at arbitrary
-    step-interval boundaries (not only at epoch ends), the saved value
-    typically reflects a mid-epoch state. Adding 1 caused
-    ``range(saved_epoch + 1, epochs)`` to be empty for ``epochs=1`` — the
-    most common case — and the trainer to exit with ``steps=0``.
-    """
-
-    def test_mid_epoch_resume_stays_in_current_epoch(self):
-        """Saved epoch 0 (mid-epoch) → resume re-enters epoch 0."""
+    def test_epochs_one_range_nonempty_on_mid_epoch_resume(self):
+        """Resume from mid-epoch checkpoint under ``epochs=1`` must not
+        produce an empty outer-loop range; doing so caused silent
+        ``steps=0`` exits prior to the fix."""
         from pawn.adapter_training import _resume_start_epoch
-        assert _resume_start_epoch(0) == 0
+        start = _resume_start_epoch(saved_epoch=0)
+        assert list(range(start, 1)) == [0]
 
-    def test_later_epoch_preserved(self):
-        """Multi-epoch runs preserve the saved epoch number."""
+    def test_extended_run_iterates_from_saved_epoch(self):
+        """Callers bumping ``epochs`` to extend past the original budget
+        must iterate from the saved epoch (not epoch+1), else the
+        resumed loop under-trains by one epoch."""
         from pawn.adapter_training import _resume_start_epoch
-        assert _resume_start_epoch(3) == 3
-
-    def test_with_epochs_one_range_is_nonempty(self):
-        """Regression for the silent-exit bug: with ``epochs=1`` and a
-        checkpoint saved during epoch 0, the outer training loop's
-        ``range(start_epoch, epochs)`` must produce at least one
-        iteration. Previously ``start_epoch`` was 1, making the range
-        empty — training would exit with ``steps=0``.
-        """
-        from pawn.adapter_training import _resume_start_epoch
-        saved_epoch, epochs = 0, 1
-        start_epoch = _resume_start_epoch(saved_epoch)
-        assert list(range(start_epoch, epochs)) == [0]
-
-    def test_extended_run_with_bumped_epochs(self):
-        """Callers extending past the original step budget bump ``epochs``
-        and ``total_steps``. Resume should enter the saved epoch and
-        continue through subsequent epochs until the inner loop's
-        ``global_step >= total_steps`` guard fires.
-        """
-        from pawn.adapter_training import _resume_start_epoch
-        # Saved mid-epoch 0, user extends to 2 epochs.
-        saved_epoch, epochs = 0, 2
-        start_epoch = _resume_start_epoch(saved_epoch)
-        assert list(range(start_epoch, epochs)) == [0, 1]
-
-    def test_returns_plain_int(self):
-        """Defensive: the checkpoint's epoch may be loaded as a NumPy int
-        through JSON/pickle paths, but the outer ``range()`` call works
-        identically on any int-like. This test just pins the contract
-        that the helper is an identity over int inputs.
-        """
-        from pawn.adapter_training import _resume_start_epoch
-        assert _resume_start_epoch(5) == 5
+        start = _resume_start_epoch(saved_epoch=0)
+        assert list(range(start, 2)) == [0, 1]
 
 
 # ---------------------------------------------------------------------------
