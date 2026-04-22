@@ -21,6 +21,7 @@ import gc
 import math
 import signal
 import time
+from collections.abc import Iterator
 from typing import Any, Iterable
 
 import numpy as np
@@ -506,6 +507,28 @@ def parse_layers(s: str | None) -> tuple[int, ...] | None:
     if s is None:
         return None
     return tuple(int(x) for x in s.split(","))
+
+
+def _resume_start_epoch(saved_epoch: int) -> int:
+    """Re-enter the saved epoch (not +1): step-interval checkpoints are mid-epoch."""
+    return saved_epoch
+
+
+def _fast_forward_loader(
+    loader_iter: Iterator[Any], n_batches: int,
+) -> int:
+    """Discard the first ``n_batches`` items; returns count actually consumed.
+
+    O(n_batches) — runs the full preprocessing pipeline for each skipped batch.
+    """
+    consumed = 0
+    for _ in range(n_batches):
+        try:
+            next(loader_iter)
+        except StopIteration:
+            return consumed
+        consumed += 1
+    return consumed
 
 
 def precompute_val_masks(
@@ -1171,18 +1194,20 @@ def train(
         weight_decay=args.weight_decay,
     )
 
-    # Compute total steps
+    # ``steps_per_epoch`` is captured separately for resume fast-forward.
     streaming = hasattr(train_loader.dataset, "shard_files")
-    if args.total_steps:
-        total_steps = args.total_steps
-    elif streaming:
+    if streaming:
         est_games = min(
             args.max_games or 1_000_000,
             len(train_loader.dataset.shard_files) * 60_000,  # type: ignore[union-attr]
         )
-        total_steps = args.epochs * (est_games // args.batch_size)
+        steps_per_epoch = est_games // args.batch_size
     else:
-        total_steps = args.epochs * len(train_loader)
+        steps_per_epoch = len(train_loader)
+    if args.total_steps:
+        total_steps = args.total_steps
+    else:
+        total_steps = args.epochs * steps_per_epoch
 
     warmup_steps = args.warmup_steps if args.warmup_steps is not None else int(args.warmup_frac * total_steps)
     schedule = getattr(args, "lr_schedule", "cosine")
@@ -1244,10 +1269,15 @@ def train(
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         if scaler and ckpt.get("scaler_state_dict"):
             scaler.load_state_dict(ckpt["scaler_state_dict"])
-        start_epoch = ckpt.get("epoch", -1) + 1
+        start_epoch = _resume_start_epoch(ckpt.get("epoch", 0))
         global_step = ckpt.get("step", 0)
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         patience_counter = ckpt.get("patience_counter", 0)
+        # Prefer the save-time ``steps_per_epoch`` so fast-forward is exact
+        # even when the runtime estimate drifts (shard sizes ≠ 60K, etc.).
+        saved_spe = ckpt.get("steps_per_epoch")
+        if saved_spe is not None:
+            steps_per_epoch = int(saved_spe)
         del ckpt
 
     # Record the step we enter the loop at so the final save can tell
@@ -1376,6 +1406,7 @@ def train(
             extra={
                 "best_val_loss": best_val_loss,
                 "patience_counter": patience_counter,
+                "steps_per_epoch": steps_per_epoch,
             },
         )
         if args.hf_repo and hf_branch:
@@ -1385,6 +1416,21 @@ def train(
                 hf_branch,
                 step=global_step,
             )
+
+    # Fast-forward the loader on resume: streaming dataset is deterministic
+    # per (seed+epoch) so skipping reproduces continuous-training state.
+    resume_skip = (
+        global_step - start_epoch * steps_per_epoch
+        if args.resume
+        else 0
+    )
+    if resume_skip < 0:
+        raise ValueError(
+            f"Resume inconsistency: global_step={global_step} < "
+            f"start_epoch * steps_per_epoch = "
+            f"{start_epoch} * {steps_per_epoch}. "
+            f"Checkpoint likely written with different max_games/batch_size/num_workers."
+        )
 
     epoch = start_epoch  # default if loop doesn't execute (resume past end)
     for epoch in range(start_epoch, args.epochs):
@@ -1407,7 +1453,28 @@ def train(
         log_positions = 0
         t0 = time.time()
 
-        for batch in train_loader:
+        # Explicit iterator so the resume path can fast-forward it.
+        loader_iter = iter(train_loader)
+        if epoch == start_epoch and resume_skip > 0:
+            print(
+                f"  Fast-forwarding DataLoader by {resume_skip:,} batches "
+                f"to resume at step {global_step:,}...",
+                flush=True,
+            )
+            consumed = _fast_forward_loader(loader_iter, resume_skip)
+            if consumed < resume_skip:
+                raise RuntimeError(
+                    f"Resume inconsistency: DataLoader exhausted after "
+                    f"{consumed:,} batches while fast-forwarding to "
+                    f"{resume_skip:,}. The streaming dataset is producing "
+                    f"fewer batches per epoch than the checkpoint was "
+                    f"written against — likely because ``max_games``, "
+                    f"``batch_size``, or ``num_workers`` differs from the "
+                    f"original run."
+                )
+            resume_skip = 0  # only the resumed epoch skips; later epochs iterate in full
+
+        for batch in loader_iter:
             ids = batch["input_ids"].to(device, non_blocking=True)
             tgt = batch["targets"].to(device, non_blocking=True)
             msk = batch["loss_mask"].to(device, non_blocking=True)

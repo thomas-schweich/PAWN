@@ -610,9 +610,25 @@ class TestAdapterCheckpoint:
         assert loaded["step"] == 1000
         assert loaded["val_metrics"]["loss"] == 3.14
         assert loaded["best_val_loss"] == 3.10
+        # ``steps_per_epoch`` is optional; old checkpoints omit it.
+        assert loaded["steps_per_epoch"] is None
 
         for k in adapter_weights:
             torch.testing.assert_close(adapter_weights[k], loaded["adapter_state_dict"][k])
+
+    def test_steps_per_epoch_round_trips(self, tmp_path):
+        """``steps_per_epoch`` flows through ``extra`` → training_state → loader."""
+        adapter_weights = {"down.weight": torch.randn(8, 64)}
+        ckpt_path = tmp_path / "step_00001000"
+        save_adapter_checkpoint(
+            ckpt_path, adapter_weights,
+            config={"checkpoint_type": "bottleneck"},
+            epoch=0, step=1000,
+            val_metrics={"loss": 3.0},
+            extra={"steps_per_epoch": 104166},
+        )
+        loaded = load_adapter_checkpoint(ckpt_path)
+        assert loaded["steps_per_epoch"] == 104166
 
     def test_has_complete_sentinel(self, tmp_path):
         adapter_weights = {"down.weight": torch.randn(8, 64)}
