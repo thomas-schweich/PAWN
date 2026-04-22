@@ -21,6 +21,7 @@ import gc
 import math
 import signal
 import time
+from collections.abc import Iterator
 from typing import Any, Iterable
 
 import numpy as np
@@ -506,6 +507,57 @@ def parse_layers(s: str | None) -> tuple[int, ...] | None:
     if s is None:
         return None
     return tuple(int(x) for x in s.split(","))
+
+
+def _resume_start_epoch(saved_epoch: int) -> int:
+    """Return the epoch the outer training loop should re-enter on resume.
+
+    Adapter checkpoints are saved at arbitrary step-interval boundaries
+    (see ``--checkpoint-interval``), so the saved ``epoch`` typically
+    reflects a *mid-epoch* state rather than a completed epoch. The
+    outer ``for epoch in range(start_epoch, args.epochs):`` loop must
+    re-enter the saved epoch so the inner batch loop — whose
+    ``global_step >= total_steps`` guard is the authoritative stopping
+    criterion — can run the remaining steps.
+
+    Historically this was ``saved_epoch + 1``, which assumed every
+    checkpoint lived on an epoch boundary. Under the step-tagged
+    checkpoint layout that assumption is false: a mid-epoch resume with
+    ``epochs=1`` produces ``range(1, 1)`` — an empty loop — and
+    ``train_adapter`` silently exits with ``steps=0``. The fix is to
+    treat the saved epoch as the *current* epoch rather than the *last
+    completed* one; if the epoch was in fact completed, the inner
+    loop's ``global_step >= total_steps`` break fires on the first
+    iteration so the outer loop does zero additional work regardless.
+    """
+    return saved_epoch
+
+
+def _fast_forward_loader(
+    loader_iter: Iterator[Any], n_batches: int,
+) -> int:
+    """Discard the first ``n_batches`` items from a DataLoader iterator.
+
+    Returns the number of batches actually consumed (may be less than
+    ``n_batches`` if the iterator exhausts first; indicates a
+    misconfigured resume — ``steps_per_epoch`` inferred at resume time
+    disagrees with the checkpoint's step count).
+
+    Used to make resume bit-identical to continuous training: given the
+    streaming dataset's per-epoch deterministic seeding
+    (``seed + epoch``) and fixed round-robin worker partitioning,
+    consuming ``global_step % steps_per_epoch`` batches on resume puts
+    the iterator in the exact state it would have been had training
+    continued uninterrupted.
+    """
+    consumed = 0
+    for _ in range(n_batches):
+        try:
+            next(loader_iter)
+        except StopIteration:
+            return consumed
+        consumed += 1
+    return consumed
 
 
 def precompute_val_masks(
@@ -1171,18 +1223,27 @@ def train(
         weight_decay=args.weight_decay,
     )
 
-    # Compute total steps
+    # Compute total steps and per-epoch step count. ``steps_per_epoch``
+    # is captured explicitly (not just the product) so the resume path
+    # can fast-forward the DataLoader by ``global_step %
+    # steps_per_epoch`` batches — making resume bit-identical to
+    # continuous training. The formula here must match what was used
+    # when the checkpoint was originally saved; resume with different
+    # ``max_games``, ``batch_size``, or ``num_workers`` will desync the
+    # iterator and is not supported.
     streaming = hasattr(train_loader.dataset, "shard_files")
-    if args.total_steps:
-        total_steps = args.total_steps
-    elif streaming:
+    if streaming:
         est_games = min(
             args.max_games or 1_000_000,
             len(train_loader.dataset.shard_files) * 60_000,  # type: ignore[union-attr]
         )
-        total_steps = args.epochs * (est_games // args.batch_size)
+        steps_per_epoch = est_games // args.batch_size
     else:
-        total_steps = args.epochs * len(train_loader)
+        steps_per_epoch = len(train_loader)
+    if args.total_steps:
+        total_steps = args.total_steps
+    else:
+        total_steps = args.epochs * steps_per_epoch
 
     warmup_steps = args.warmup_steps if args.warmup_steps is not None else int(args.warmup_frac * total_steps)
     schedule = getattr(args, "lr_schedule", "cosine")
@@ -1244,7 +1305,7 @@ def train(
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         if scaler and ckpt.get("scaler_state_dict"):
             scaler.load_state_dict(ckpt["scaler_state_dict"])
-        start_epoch = ckpt.get("epoch", -1) + 1
+        start_epoch = _resume_start_epoch(ckpt.get("epoch", 0))
         global_step = ckpt.get("step", 0)
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         patience_counter = ckpt.get("patience_counter", 0)
@@ -1386,6 +1447,26 @@ def train(
                 step=global_step,
             )
 
+    # On resume, fast-forward the DataLoader past the batches already
+    # consumed in the current epoch so iteration picks up exactly where
+    # it left off. The streaming ``ShardedLichessDataset`` seeds both
+    # its shard shuffle and shuffle-buffer RNGs with ``seed + epoch``,
+    # and DataLoader workers partition shards deterministically by id,
+    # so consuming and discarding ``resume_skip`` batches reproduces
+    # the iterator state of an uninterrupted run bit-for-bit.
+    resume_skip = (
+        global_step - start_epoch * steps_per_epoch
+        if args.resume
+        else 0
+    )
+    if resume_skip < 0:
+        raise ValueError(
+            f"Resume inconsistency: global_step={global_step} < "
+            f"start_epoch * steps_per_epoch = "
+            f"{start_epoch} * {steps_per_epoch}. "
+            f"Checkpoint likely written with a different epoch/step budget."
+        )
+
     epoch = start_epoch  # default if loop doesn't execute (resume past end)
     for epoch in range(start_epoch, args.epochs):
         if hasattr(train_loader.dataset, "set_epoch"):
@@ -1407,7 +1488,31 @@ def train(
         log_positions = 0
         t0 = time.time()
 
-        for batch in train_loader:
+        # Wrap the DataLoader in an iterator so resumes can fast-forward
+        # past already-consumed batches. For non-resumed epochs (or
+        # epochs after the resumed one), ``resume_skip`` is 0 and this
+        # is a no-op.
+        loader_iter = iter(train_loader)
+        if epoch == start_epoch and resume_skip > 0:
+            print(
+                f"  Fast-forwarding DataLoader by {resume_skip:,} batches "
+                f"to resume at step {global_step:,}...",
+                flush=True,
+            )
+            consumed = _fast_forward_loader(loader_iter, resume_skip)
+            if consumed < resume_skip:
+                raise RuntimeError(
+                    f"Resume inconsistency: DataLoader exhausted after "
+                    f"{consumed:,} batches while fast-forwarding to "
+                    f"{resume_skip:,}. The streaming dataset is producing "
+                    f"fewer batches per epoch than the checkpoint was "
+                    f"written against — likely because ``max_games``, "
+                    f"``batch_size``, or ``num_workers`` differs from the "
+                    f"original run."
+                )
+            resume_skip = 0  # only the resumed epoch skips; later epochs iterate in full
+
+        for batch in loader_iter:
             ids = batch["input_ids"].to(device, non_blocking=True)
             tgt = batch["targets"].to(device, non_blocking=True)
             msk = batch["loss_mask"].to(device, non_blocking=True)

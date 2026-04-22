@@ -446,6 +446,128 @@ class TestShardedDataset:
 # ---------------------------------------------------------------------------
 
 
+class TestResumeDeterminism:
+    """The streaming dataset must be bit-identical across restarts so a
+    resumed training run produces the same gradient trajectory as a
+    continuous one. Determinism comes from seeding both the shard shuffle
+    and the shuffle-buffer permutation with ``seed + epoch`` at every
+    ``__iter__`` call — no global RNG state leakage, no wall-clock
+    dependence.
+    """
+
+    @pytest.fixture
+    def local_shard_dir(self, tmp_path):
+        # Multiple shards + enough games to exercise buffer flushes.
+        data_dir = tmp_path / "data"
+        _write_test_shard(data_dir / "train-00000.parquet", n_games=20, game_length=8)
+        _write_test_shard(data_dir / "train-00001.parquet", n_games=20, game_length=8)
+        _write_test_shard(data_dir / "train-00002.parquet", n_games=20, game_length=8)
+        return str(tmp_path)
+
+    @pytest.mark.integration
+    def test_two_fresh_iterations_match(self, local_shard_dir):
+        """Two independently-constructed datasets with identical seed +
+        epoch produce byte-identical item sequences. This is the load-
+        bearing invariant for resume — without it, fast-forwarding the
+        iterator can't reproduce continuous-training state.
+        """
+        items_a = []
+        ds_a = ShardedLichessDataset(
+            local_shard_dir, split="train",
+            min_ply=0, max_ply=16,
+            shuffle_shards=True, shuffle_buffer=8, seed=123,
+        )
+        ds_a.set_epoch(2)
+        for item in ds_a:
+            items_a.append(item)
+
+        items_b = []
+        ds_b = ShardedLichessDataset(
+            local_shard_dir, split="train",
+            min_ply=0, max_ply=16,
+            shuffle_shards=True, shuffle_buffer=8, seed=123,
+        )
+        ds_b.set_epoch(2)
+        for item in ds_b:
+            items_b.append(item)
+
+        assert len(items_a) == len(items_b) == 60
+        for a, b in zip(items_a, items_b, strict=True):
+            assert torch.equal(a["input_ids"], b["input_ids"])
+            assert torch.equal(a["targets"], b["targets"])
+            assert torch.equal(a["loss_mask"], b["loss_mask"])
+            assert np.array_equal(a["move_ids"], b["move_ids"])
+            assert a["game_length"] == b["game_length"]
+
+    @pytest.mark.integration
+    def test_skip_matches_continuous(self, local_shard_dir):
+        """Fast-forwarding ``K`` items on a fresh iterator produces the
+        same subsequent items as a continuous iteration starting from
+        index 0. Direct regression test for
+        ``_fast_forward_loader`` correctness.
+        """
+        ds_cont = ShardedLichessDataset(
+            local_shard_dir, split="train",
+            min_ply=0, max_ply=16,
+            shuffle_shards=True, shuffle_buffer=8, seed=7,
+        )
+        ds_cont.set_epoch(0)
+        continuous = list(ds_cont)
+
+        ds_skip = ShardedLichessDataset(
+            local_shard_dir, split="train",
+            min_ply=0, max_ply=16,
+            shuffle_shards=True, shuffle_buffer=8, seed=7,
+        )
+        ds_skip.set_epoch(0)
+        skip_iter = iter(ds_skip)
+        K = 15
+        for _ in range(K):
+            next(skip_iter)
+        resumed = list(skip_iter)
+
+        # Skipped iterator's remaining items == continuous[K:]
+        assert len(resumed) == len(continuous) - K
+        for cont_item, res_item in zip(
+            continuous[K:], resumed, strict=True,
+        ):
+            assert torch.equal(cont_item["input_ids"], res_item["input_ids"])
+            assert torch.equal(cont_item["targets"], res_item["targets"])
+            assert torch.equal(cont_item["loss_mask"], res_item["loss_mask"])
+
+    @pytest.mark.integration
+    def test_different_epochs_differ(self, local_shard_dir):
+        """Sanity: epoch N+1 produces a different permutation than epoch
+        N. Without this, ``set_epoch`` would be a no-op and the
+        ``seed + epoch`` determinism contract would hide a bug where
+        shuffles never actually varied.
+        """
+        ds0 = ShardedLichessDataset(
+            local_shard_dir, split="train",
+            min_ply=0, max_ply=16,
+            shuffle_shards=True, shuffle_buffer=8, seed=7,
+        )
+        ds0.set_epoch(0)
+        items0 = list(ds0)
+
+        ds1 = ShardedLichessDataset(
+            local_shard_dir, split="train",
+            min_ply=0, max_ply=16,
+            shuffle_shards=True, shuffle_buffer=8, seed=7,
+        )
+        ds1.set_epoch(1)
+        items1 = list(ds1)
+
+        assert len(items0) == len(items1)
+        # At least one position should differ (not a strict inequality
+        # check because a degenerate shuffle could match by accident).
+        differs = any(
+            not torch.equal(a["input_ids"], b["input_ids"])
+            for a, b in zip(items0, items1, strict=True)
+        )
+        assert differs, "epoch 0 and epoch 1 produced identical orderings"
+
+
 class TestPrefetchShards:
     @pytest.mark.integration
     def test_local_path_bypasses_prefetch(self, tmp_path):
