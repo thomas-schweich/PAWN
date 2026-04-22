@@ -10,7 +10,6 @@
 set -euo pipefail
 
 SESSION="claude"
-SELF=$(readlink -f "$0")
 
 if [ "$(id -u)" -eq 0 ]; then
     for path in /opt/pawn /workspace; do
@@ -18,7 +17,9 @@ if [ "$(id -u)" -eq 0 ]; then
             chown -R pawn:pawn "$path"
         fi
     done
-    exec su - pawn -c "exec '$SELF'"
+    # Path is fixed by the Dockerfile COPY of deploy/claude-dev.sh, so
+    # hard-code it here rather than interpolating $0 into a quoted -c string.
+    exec su - pawn -c 'exec /usr/local/bin/claude-dev'
 fi
 
 # `su -` resets PATH from /etc/login.defs, so /opt/pawn/.venv/bin (where
