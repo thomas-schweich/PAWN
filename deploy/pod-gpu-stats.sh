@@ -24,7 +24,11 @@ if command -v rocm-smi >/dev/null 2>&1; then
         vu=$(jq -r 'to_entries[0].value["VRAM Total Used Memory (B)"] // empty' <<<"$json")
         vt=$(jq -r 'to_entries[0].value["VRAM Total Memory (B)"] // empty' <<<"$json")
         if [ -n "$util" ] && [ -n "$vu" ] && [ -n "$vt" ]; then
-            printf '%d%% %dG/%dG\n' "$util" "$((vu / 1024 / 1024 / 1024))" "$((vt / 1024 / 1024 / 1024))"
+            # rocm-smi may return a float ("45.0") for GPU use; strip any
+            # decimal before printf '%d' to avoid a warning / zero on some
+            # locales. nvidia-smi --nounits always returns integers so the
+            # first branch doesn't need the strip.
+            printf '%d%% %dG/%dG\n' "${util%%.*}" "$((vu / 1024 / 1024 / 1024))" "$((vt / 1024 / 1024 / 1024))"
             exit 0
         fi
     fi

@@ -240,12 +240,17 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 # tmux-cpu — sources the #{cpu_percentage} / #{ram_percentage} format
 # vars used by ~/.tmux.conf. tmux-cpu has no release tags so pin to a
-# commit SHA for reproducibility.
+# commit SHA for reproducibility. Using `git fetch --depth 1 <sha>` so
+# the clone stays shallow regardless of whether the SHA is still at
+# HEAD (GitHub's uploadpack.allowReachableSHA1InWant supports this).
 ARG TMUX_CPU_SHA=bcb110d754ab2417de824c464730c412a3eb2769
-RUN git clone https://github.com/tmux-plugins/tmux-cpu.git \
-        /home/pawn/.config/tmux/plugins/tmux-cpu \
-    && git -C /home/pawn/.config/tmux/plugins/tmux-cpu checkout "${TMUX_CPU_SHA}" \
-    && rm -rf /home/pawn/.config/tmux/plugins/tmux-cpu/.git
+RUN plugin_dir=/home/pawn/.config/tmux/plugins/tmux-cpu \
+    && mkdir -p "$plugin_dir" \
+    && git -C "$plugin_dir" init -q \
+    && git -C "$plugin_dir" remote add origin https://github.com/tmux-plugins/tmux-cpu.git \
+    && git -C "$plugin_dir" fetch --depth 1 origin "${TMUX_CPU_SHA}" \
+    && git -C "$plugin_dir" checkout -q FETCH_HEAD \
+    && rm -rf "$plugin_dir/.git"
 
 # Expose claude system-wide so both root and pawn find it on PATH without
 # relying on .bashrc aliases (which don't fire in non-interactive shells).
