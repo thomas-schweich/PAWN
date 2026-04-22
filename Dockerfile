@@ -238,13 +238,14 @@ RUN curl -fsSL https://claude.ai/install.sh | bash && \
            find /home/pawn -name claude 2>/dev/null; exit 1; }; }
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
-# Catppuccin tmux plugin — loaded by ~/.tmux.conf at startup
-ARG CATPPUCCIN_TMUX_VERSION=v2.3.0
-RUN mkdir -p /home/pawn/.config/tmux/plugins/catppuccin \
-    && git clone --depth 1 --branch "${CATPPUCCIN_TMUX_VERSION}" \
-        https://github.com/catppuccin/tmux.git \
-        /home/pawn/.config/tmux/plugins/catppuccin/tmux \
-    && rm -rf /home/pawn/.config/tmux/plugins/catppuccin/tmux/.git
+# tmux-cpu — sources the #{cpu_percentage} / #{ram_percentage} format
+# vars used by ~/.tmux.conf. tmux-cpu has no release tags so pin to a
+# commit SHA for reproducibility.
+ARG TMUX_CPU_SHA=bcb110d754ab2417de824c464730c412a3eb2769
+RUN git clone https://github.com/tmux-plugins/tmux-cpu.git \
+        /home/pawn/.config/tmux/plugins/tmux-cpu \
+    && git -C /home/pawn/.config/tmux/plugins/tmux-cpu checkout "${TMUX_CPU_SHA}" \
+    && rm -rf /home/pawn/.config/tmux/plugins/tmux-cpu/.git
 
 # Expose claude system-wide so both root and pawn find it on PATH without
 # relying on .bashrc aliases (which don't fire in non-interactive shells).
@@ -258,6 +259,10 @@ RUN set -e; \
 # Convenience script: chown mounted paths, verify HF/W&B auth, drop into
 # claude tmux session. Source in deploy/claude-dev.sh.
 COPY --chmod=755 deploy/claude-dev.sh /usr/local/bin/claude-dev
+
+# GPU stats for the tmux status bar — nvidia-smi or rocm-smi, empty
+# output on CPU-only hosts so the bar stays clean.
+COPY --chmod=755 deploy/pod-gpu-stats.sh /usr/local/bin/pod-gpu-stats
 
 # External binaries last (same rationale as deps-common)
 COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
