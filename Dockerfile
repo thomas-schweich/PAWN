@@ -31,6 +31,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && chmod +x /usr/local/bin/caddy \
     && rm -rf /var/lib/apt/lists/*
 
+# ── tmux: build from source ──────────────────────────────────────────
+# Debian's packaged tmux lags the releases we need for the custom mouse
+# click targets in deploy/.tmux.conf (`bind -T root MouseDown1Status {...}`
+# brace control mode, `#[range=user|...]` status ranges, `mouse_status_range`
+# format). 3.6a is the latest stable.
+FROM python:3.12-slim AS tmux-build
+ARG TMUX_VERSION=3.6a
+ARG TMUX_SHA256=b6d8d9c76585db8ef5fa00d4931902fa4b8cbe8166f528f44fc403961a3f3759
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl pkg-config bison \
+        libevent-dev libncurses-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL "https://github.com/tmux/tmux/releases/download/${TMUX_VERSION}/tmux-${TMUX_VERSION}.tar.gz" \
+        -o /tmp/tmux.tar.gz \
+    && echo "${TMUX_SHA256}  /tmp/tmux.tar.gz" | sha256sum -c \
+    && tar -xzf /tmp/tmux.tar.gz -C /tmp \
+    && cd "/tmp/tmux-${TMUX_VERSION}" \
+    && ./configure --prefix=/usr/local \
+    && make -j"$(nproc)" \
+    && make install \
+    && strip /usr/local/bin/tmux
+
+
 # ── Builder: compile Rust engine wheel ───────────────────────────────
 FROM python:3.12-slim AS builder
 
@@ -152,7 +175,8 @@ CMD ["/opt/pawn/deploy/entrypoint.sh"]
 FROM python:3.12-slim AS dev-common
 
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
-        openssh-server tini tmux ripgrep jq curl git \
+        openssh-server tini ripgrep jq curl git \
+        libevent-core-2.1-7 libncursesw6 \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 
@@ -214,6 +238,14 @@ RUN curl -fsSL https://claude.ai/install.sh | bash && \
            find /home/pawn -name claude 2>/dev/null; exit 1; }; }
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
+# Catppuccin tmux plugin — loaded by ~/.tmux.conf at startup
+ARG CATPPUCCIN_TMUX_VERSION=v2.3.0
+RUN mkdir -p /home/pawn/.config/tmux/plugins/catppuccin \
+    && git clone --depth 1 --branch "${CATPPUCCIN_TMUX_VERSION}" \
+        https://github.com/catppuccin/tmux.git \
+        /home/pawn/.config/tmux/plugins/catppuccin/tmux \
+    && rm -rf /home/pawn/.config/tmux/plugins/catppuccin/tmux/.git
+
 # Expose claude system-wide so both root and pawn find it on PATH without
 # relying on .bashrc aliases (which don't fire in non-interactive shells).
 USER root
@@ -223,24 +255,18 @@ RUN set -e; \
     done; \
     test -x /usr/local/bin/claude
 
-# Convenience script: drop into pawn user with claude in a tmux session
-COPY --chmod=755 <<'CLAUDE_DEV' /usr/local/bin/claude-dev
-#!/usr/bin/env bash
-set -euo pipefail
-SESSION="claude"
-exec su - pawn -c "
-    if tmux has-session -t $SESSION 2>/dev/null; then
-        exec tmux attach -t $SESSION
-    fi
-    tmux new-session -d -s $SESSION -c /opt/pawn
-    tmux send-keys -t $SESSION 'cd /opt/pawn && claude --dangerously-skip-permissions' Enter
-    exec tmux attach -t $SESSION
-"
-CLAUDE_DEV
+# Convenience script: chown mounted paths, verify HF/W&B auth, drop into
+# claude tmux session. Source in deploy/claude-dev.sh.
+COPY --chmod=755 deploy/claude-dev.sh /usr/local/bin/claude-dev
 
 # External binaries last (same rationale as deps-common)
 COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
+COPY --from=tmux-build /usr/local/bin/tmux /usr/local/bin/tmux
 COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
+
+# User tmux config — placed last so edits don't invalidate the heavier
+# layers above (claude install, rustup, catppuccin clone).
+COPY --chown=pawn:pawn deploy/.tmux.conf /home/pawn/.tmux.conf
 
 
 # ═══════════════════════════════════════════════════════════════════════
