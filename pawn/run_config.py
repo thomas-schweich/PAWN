@@ -263,6 +263,137 @@ class AdapterConfig(BaseRunConfig):
         return self
 
 
+class DistillConfig(BaseRunConfig):
+    """Knowledge distillation: train a student PAWN model against a frozen teacher.
+
+    The teacher is loaded from any HuggingFace repo or local checkpoint
+    directory (``teacher_checkpoint``); the student is built from the
+    standard ``variant`` presets or an explicit ``custom`` arch — same
+    knobs as :class:`PretrainConfig`. The data pipeline is the
+    pretraining one (random games via the Rust engine), so this is
+    effectively offline distillation: the teacher never sees the
+    student's outputs and we never accumulate target tensors to disk.
+
+    Loss = ``alpha * CE(student, ground_truth)
+            + (1 - alpha) * T**2 * KL(softmax(student/T), softmax(teacher/T))``
+
+    where ``T`` is the temperature (Hinton et al. 2015,
+    arXiv:1503.02531). ``alpha`` defaults to 0.5; set ``alpha=0`` for
+    pure soft-target distillation, ``alpha=1`` for pure CE (which is
+    just regular pretraining and pointless to run through this path).
+
+    See ``docs/TRAINING.md`` and ``pawn/distill.py`` for the full
+    runtime details.
+    """
+
+    run_type: Literal["distill"] = "distill"
+
+    # Teacher --------------------------------------------------------------
+    # HF repo id (e.g. "thomas-schweich/pawn-base") or local checkpoint
+    # directory. Teacher arch is read from its saved config.json.
+    teacher_checkpoint: str
+
+    # Student --------------------------------------------------------------
+    variant: Literal["toy", "small", "base", "large", "custom"] = "small"
+    d_model: int | None = None
+    n_layers: int | None = None
+    n_heads: int | None = None
+    d_ff: int | None = None
+    max_seq_len: int = 512
+
+    # Distillation knobs ---------------------------------------------------
+    # Softmax temperature applied to both teacher and student logits before
+    # the KL term. Higher T flattens the teacher distribution and
+    # propagates more "dark knowledge" about non-target classes.
+    temperature: float = 4.0
+    # Mixing coefficient: ``alpha * CE + (1 - alpha) * T**2 * KL``.
+    # ``alpha = 0`` is pure soft-target distillation (no ground-truth
+    # signal — useful when the teacher is treated as oracle). ``alpha =
+    # 1`` reduces this run to standard pretraining; the validator
+    # rejects that as a configuration error.
+    alpha: float = 0.5
+    # KL direction: ``"forward"`` = ``KL(teacher || student)`` (the
+    # classic Hinton form, scaled by ``T**2``). ``"reverse"`` =
+    # ``KL(student || teacher)`` (mode-seeking; sometimes preferred for
+    # generation tasks). ``"jsd"`` = symmetric Jensen-Shannon (the
+    # average of forward + reverse against their mixture).
+    kd_direction: Literal["forward", "reverse", "jsd"] = "forward"
+    # Optional: only distill over the teacher's top-k logits per
+    # position (the rest get zero teacher mass). Truncates the dark
+    # knowledge but cuts memory and dampens noise from very-low-prob
+    # teacher classes. ``None`` means full vocabulary.
+    top_k_teacher: int | None = None
+    # Optional auxiliary hidden-state matching loss (MSE between
+    # teacher and student final hidden states at loss-mask positions,
+    # with a learned linear projection if ``d_model`` differs). The
+    # weight is added to the total loss — set to 0 to disable.
+    hidden_loss_weight: float = 0.0
+
+    # Pretrain-style training fields --------------------------------------
+    accumulation_steps: int = 1
+    checkpoint_interval: int = 5000
+    val_games: int = 512  # override BaseRunConfig's 50K — distill uses on-the-fly data
+    legality_late_ply: int | None = None  # defaults to max_seq_len // 2 at runtime
+
+    @model_validator(mode="after")
+    def _check_distill(self) -> "DistillConfig":
+        if not 0.0 <= self.alpha <= 1.0:
+            raise ValueError(
+                f"alpha must be in [0, 1], got {self.alpha}"
+            )
+        if self.alpha == 1.0:
+            raise ValueError(
+                "alpha=1.0 reduces this run to plain pretraining "
+                "(no teacher signal). Use --run-type pretrain instead."
+            )
+        if self.temperature <= 0:
+            raise ValueError(
+                f"temperature must be > 0, got {self.temperature}"
+            )
+        if self.top_k_teacher is not None and self.top_k_teacher <= 0:
+            raise ValueError(
+                f"top_k_teacher must be > 0 or None, got {self.top_k_teacher}"
+            )
+        if self.hidden_loss_weight < 0:
+            raise ValueError(
+                f"hidden_loss_weight must be >= 0, got {self.hidden_loss_weight}"
+            )
+        if self.variant == "custom":
+            missing = [
+                n for n, v in (
+                    ("d_model", self.d_model),
+                    ("n_layers", self.n_layers),
+                    ("n_heads", self.n_heads),
+                    ("d_ff", self.d_ff),
+                )
+                if v is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"variant='custom' requires {', '.join(missing)} "
+                    "to be set explicitly"
+                )
+            assert self.d_model is not None
+            assert self.n_heads is not None
+            assert self.n_layers is not None
+            assert self.d_ff is not None
+            if self.d_model <= 0 or self.n_heads <= 0 or self.n_layers <= 0 or self.d_ff <= 0:
+                raise ValueError(
+                    f"variant='custom' requires positive d_model/n_heads/"
+                    f"n_layers/d_ff, got d_model={self.d_model}, "
+                    f"n_heads={self.n_heads}, n_layers={self.n_layers}, "
+                    f"d_ff={self.d_ff}"
+                )
+            if self.d_model % self.n_heads != 0:
+                raise ValueError(
+                    f"variant='custom' requires d_model ({self.d_model}) "
+                    f"to be divisible by n_heads ({self.n_heads}); otherwise "
+                    "attention head_dim is non-integer and the model crashes "
+                    "at first forward"
+                )
+        return self
+
+
 class CotrainVariant(BaseModel):
     """Per-variant spec within a co-training run.
 
@@ -373,7 +504,7 @@ class CotrainConfig(BaseRunConfig):
 
 
 RunConfig = Annotated[
-    Union[PretrainConfig, AdapterConfig, CotrainConfig],
+    Union[PretrainConfig, AdapterConfig, CotrainConfig, DistillConfig],
     Field(discriminator="run_type"),
 ]
 """Discriminated union of all run config types."""

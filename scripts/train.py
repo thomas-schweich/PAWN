@@ -18,6 +18,11 @@ Usage:
     python3 scripts/train.py --run-type adapter --strategy lora \\
         --checkpoint thomas-schweich/pawn-base \\
         --pgn thomas-schweich/pawn-lichess-full --local-checkpoints
+
+    # Pure CLI — distillation (small student, base teacher)
+    python3 scripts/train.py --run-type distill --variant small \\
+        --teacher-checkpoint thomas-schweich/pawn-base \\
+        --temperature 4.0 --alpha 0.5 --local-checkpoints
 """
 
 from __future__ import annotations
@@ -30,7 +35,12 @@ from typing import Any
 import torch.multiprocessing as mp
 from pydantic import TypeAdapter
 
-from pawn.run_config import AdapterConfig, CotrainConfig, PretrainConfig
+from pawn.run_config import (
+    AdapterConfig,
+    CotrainConfig,
+    DistillConfig,
+    PretrainConfig,
+)
 
 
 # -----------------------------------------------------------------------
@@ -580,6 +590,162 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------
+# Distillation
+# -----------------------------------------------------------------------
+
+
+def run_distill(config: DistillConfig) -> None:
+    """Bridge :class:`DistillConfig` into a :class:`DistillTrainer` run.
+
+    The student inherits PAWN's standard CLM data pipeline (random
+    games on the fly via the Rust engine) and the parent's LR schedule
+    / checkpoint / W&B integration. The teacher is loaded once,
+    frozen, and used at every step to produce soft targets.
+    """
+    import torch
+
+    from pawn.checkpoint import (
+        get_prepend_outcome,
+        read_checkpoint_metadata,
+    )
+    from pawn.config import TrainingConfig
+    from pawn.distill import DistillTrainer, build_student_config
+
+    # Pull the teacher's saved training_config so we know which
+    # sequence format (prepend_outcome) the data pipeline must use to
+    # match what the teacher saw at training time. A mismatch here
+    # would silently feed the teacher tokens it never trained against,
+    # which is the worst kind of bug to debug after the run.
+    try:
+        teacher_meta = read_checkpoint_metadata(config.teacher_checkpoint)
+    except FileNotFoundError:
+        teacher_meta = None
+
+    teacher_prepend: bool | None = None
+    if teacher_meta is not None:
+        try:
+            teacher_prepend = get_prepend_outcome(
+                teacher_meta.get("training_config")
+            )
+        except ValueError:
+            teacher_prepend = None
+
+    if teacher_prepend is not None and teacher_prepend != config.prepend_outcome:
+        if "prepend_outcome" in config.model_fields_set:
+            print(
+                f"WARNING: teacher was trained with prepend_outcome="
+                f"{teacher_prepend}, but the run config explicitly sets "
+                f"prepend_outcome={config.prepend_outcome}. Trusting the "
+                "explicit setting; verify this is what you want."
+            )
+        else:
+            print(
+                f"Teacher was trained with prepend_outcome="
+                f"{teacher_prepend}; overriding student "
+                f"prepend_outcome={config.prepend_outcome} → "
+                f"{teacher_prepend} to match."
+            )
+            config = config.model_copy(
+                update={"prepend_outcome": teacher_prepend}
+            )
+
+    student_cfg = build_student_config(
+        variant=config.variant,
+        d_model=config.d_model,
+        n_layers=config.n_layers,
+        n_heads=config.n_heads,
+        d_ff=config.d_ff,
+        max_seq_len=config.max_seq_len,
+    )
+
+    train_cfg = (
+        TrainingConfig.toy() if config.variant == "toy" else TrainingConfig()
+    )
+    train_cfg.device = config.device
+    if config.total_steps is not None:
+        train_cfg.total_steps = config.total_steps
+    train_cfg.batch_size = config.batch_size
+    train_cfg.num_workers = config.num_workers
+    train_cfg.accumulation_steps = config.accumulation_steps
+    train_cfg.lr = config.lr
+    train_cfg.weight_decay = config.weight_decay
+    if config.warmup_steps is not None:
+        train_cfg.warmup_steps = config.warmup_steps
+    elif config.total_steps is not None:
+        train_cfg.warmup_steps = int(config.warmup_frac * config.total_steps)
+    else:
+        train_cfg.warmup_steps = int(config.warmup_frac * train_cfg.total_steps)
+    train_cfg.max_grad_norm = config.max_grad_norm
+    train_cfg.lr_schedule = config.lr_schedule
+    if config.lr_schedule in ("wsd", "infinite"):
+        train_cfg.decay_steps = int(config.decay_frac * train_cfg.total_steps)
+        train_cfg.wsd_decay_shape = config.wsd_decay_shape
+    if config.lr_schedule == "infinite":
+        train_cfg.cooldown_steps = int(
+            config.cooldown_frac * train_cfg.total_steps
+        )
+        train_cfg.stable_lr_ratio = config.stable_lr_ratio
+    train_cfg.discard_ply_limit = config.discard_ply_limit
+    train_cfg.prepend_outcome = config.prepend_outcome
+    train_cfg.mate_boost = config.mate_boost
+    train_cfg.log_interval = config.log_interval
+    if config.eval_interval is not None:
+        train_cfg.eval_interval = config.eval_interval
+    train_cfg.checkpoint_interval = config.checkpoint_interval
+    train_cfg.pause_after_steps = config.pause_after_steps
+    if config.log_dir:
+        train_cfg.log_dir = config.log_dir
+    train_cfg.use_wandb = config.wandb
+    train_cfg.wandb_project = config.wandb_project
+    train_cfg.use_amp = config.amp_dtype != "none"
+    train_cfg.max_ply = config.max_seq_len
+    train_cfg.val_games = config.val_games
+
+    if not torch.cuda.is_available() and config.device == "cuda":
+        if config.variant == "toy":
+            train_cfg.device = "cpu"
+            print("CUDA not available, falling back to CPU (toy mode)")
+        else:
+            _die(
+                "CUDA is required for distillation training. "
+                "Use --variant toy for CPU-based testing."
+            )
+
+    print(f"Student config: {student_cfg}")
+    print(f"Training config: {train_cfg}")
+
+    trainer = DistillTrainer(
+        train_cfg,
+        student_cfg,
+        teacher_checkpoint=config.teacher_checkpoint,
+        temperature=config.temperature,
+        alpha=config.alpha,
+        kd_direction=config.kd_direction,
+        top_k_teacher=config.top_k_teacher,
+        hidden_loss_weight=config.hidden_loss_weight,
+        hf_repo=config.hf_repo,
+        patience=config.patience,
+        legality_late_ply=config.legality_late_ply,
+        run_config=config.model_dump(),
+        wandb_tags=[
+            f"variant:{config.variant}",
+            f"distill:{config.kd_direction}",
+        ],
+    )
+
+    if config.resume:
+        meta = trainer.load_checkpoint(config.resume)
+        loaded_vs = (meta or {}).get("model_config", {}).get("vocab_size")
+        if loaded_vs and loaded_vs != student_cfg.vocab_size:
+            _die(
+                f"Checkpoint vocab_size={loaded_vs} doesn't match "
+                f"student vocab_size={student_cfg.vocab_size}."
+            )
+
+    trainer.train()
+
+
+# -----------------------------------------------------------------------
 # Entry point
 # -----------------------------------------------------------------------
 
@@ -588,9 +754,10 @@ def main() -> None:
     raw = _parse_cli()
 
     run_type = raw.get("run_type")
-    if run_type not in ("pretrain", "adapter", "cotrain"):
+    if run_type not in ("pretrain", "adapter", "cotrain", "distill"):
         _die(
-            f"run_type must be 'pretrain', 'adapter', or 'cotrain', got {run_type!r}. "
+            f"run_type must be 'pretrain', 'adapter', 'cotrain', or "
+            f"'distill', got {run_type!r}. "
             "Specify via --run-type or in the JSON config."
         )
 
@@ -598,6 +765,7 @@ def main() -> None:
         "pretrain": PretrainConfig,
         "adapter": AdapterConfig,
         "cotrain": CotrainConfig,
+        "distill": DistillConfig,
     }[run_type]  # type: ignore[index]  # narrowed by `not in` check above
     ta = TypeAdapter(config_cls)
     config = ta.validate_python(raw)
@@ -609,6 +777,8 @@ def main() -> None:
     elif isinstance(config, CotrainConfig):
         from pawn.cotrain import run_cotrain
         run_cotrain(config)
+    elif isinstance(config, DistillConfig):
+        run_distill(config)
     else:
         _die(f"Unknown run_type: {run_type}")
 

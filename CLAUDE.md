@@ -123,6 +123,31 @@ uv run python scripts/train.py --variant base --resume checkpoints/step_00050000
 - `publish_results: true` — push `eval_results.json` to HF (requires `hf_repo`)
 - `patience: N` — per-variant early stopping patience (eval intervals without improvement)
 
+### Distillation
+
+Distill a frozen teacher (any HF repo or local checkpoint) into a smaller student. The student sees the same on-the-fly random-game batches as pretraining; the teacher provides soft targets every step. Loss is `alpha * CE(student, ground_truth) + (1 - alpha) * T**2 * KL(softmax(teacher/T), softmax(student/T))` (Hinton et al., 2015).
+
+```bash
+# Distill base → small with default knobs
+uv run python scripts/train.py --run-type distill --variant small \
+    --teacher-checkpoint thomas-schweich/pawn-base \
+    --temperature 4.0 --alpha 0.5 --local-checkpoints
+
+# JSON config (configs/distill_small_from_base.json) for full reproducibility
+uv run python scripts/train.py --config configs/distill_small_from_base.json
+```
+
+Key knobs (all on `DistillConfig` in `pawn/run_config.py`):
+- `--teacher-checkpoint` — HF repo id or local checkpoint dir (required)
+- `--variant {toy|small|base|large|custom}` — student arch (default `small`)
+- `--temperature` — softmax temperature for both teacher and student logits (default `4.0`)
+- `--alpha` — mixing coefficient: `alpha * CE + (1 - alpha) * KL`. `alpha=0` is pure soft-target distillation; `alpha=1` is rejected (just use pretrain)
+- `--kd-direction {forward|reverse|jsd}` — KL direction. `forward` = `KL(teacher || student)` (Hinton form, default), `reverse` = mode-seeking, `jsd` = symmetric Jensen-Shannon
+- `--top-k-teacher N` — restrict KL to the teacher's top-k logits per position (cuts memory; useful for very large vocabs — for PAWN's 1,980-vocab usually leave at `None`)
+- `--hidden-loss-weight λ` — additional MSE between teacher and student final hidden states (a learned linear projector handles `d_model` mismatch). `0.0` disables it (default)
+
+The teacher's `prepend_outcome` setting is auto-detected from its saved `training_config` and the student is forced to match — passing an explicit conflicting `prepend_outcome` prints a warning. The student's `vocab_size` and `max_seq_len` must be compatible with the teacher's (both checked at construction).
+
 ### Adapter Training
 
 All adapter strategies dispatch through the unified `scripts/train.py` with `--run-type adapter --strategy STRATEGY`. They freeze the backbone and train only adapter parameters. Both `--checkpoint PATH` and `--pgn PATH` are required.

@@ -1123,8 +1123,19 @@ class CLMTrainer:
 
                     if self.global_step % self.cfg.log_interval == 0:
                         # .item() sync only at log intervals (metrics are tensors here)
-                        loss_val = metrics['loss'].item()
-                        acc_val = metrics['accuracy'].item()
+                        # ``train_step`` may return additional GPU-tensor
+                        # metrics (distillation reports ce_loss / kd_loss
+                        # / teacher_agreement); surface them all under
+                        # ``train/<key>`` so the dashboard and W&B see
+                        # the full set without needing to know about
+                        # subclasses.
+                        train_log: dict[str, float] = {}
+                        for k, v in metrics.items():
+                            train_log[f"train/{k}"] = (
+                                v.item() if isinstance(v, torch.Tensor) else float(v)
+                            )
+                        loss_val = train_log["train/loss"]
+                        acc_val = train_log["train/accuracy"]
                         lr = self.scheduler.get_lr()
 
                         print(
@@ -1142,13 +1153,13 @@ class CLMTrainer:
                             step=self.global_step,
                             lr=lr, grad_norm=grad_norm,
                             step_time=step_time, games_per_sec=games_per_sec,
-                            **{"train/loss": loss_val, "train/accuracy": acc_val},  # type: ignore[arg-type]
+                            **train_log,  # type: ignore[arg-type]
                         )
 
                         log_metrics(
                             self.wandb_run,
                             {
-                                "train/loss": loss_val, "train/accuracy": acc_val,
+                                **train_log,
                                 "train/lr": lr, "train/grad_norm": grad_norm,
                                 "train/step_time": step_time,
                                 "train/games_per_sec": games_per_sec,

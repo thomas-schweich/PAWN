@@ -1,0 +1,18 @@
+{
+  "run_type": "distill",
+  "teacher_checkpoint": "thomas-schweich/pawn-base",
+  "variant": "small",
+  "temperature": 4.0,
+  "alpha": 0.5,
+  "kd_direction": "forward",
+  "top_k_teacher": null,
+  "hidden_loss_weight": 0.0,
+  "max_seq_len": 512,
+  "total_steps": 100000,
+  "batch_size": 256,
+  "lr": 3.0e-4,
+  "warmup_frac": 0.05,
+  "lr_schedule": "cosine",
+  "checkpoint_interval": 5000,
+  "local_checkpoints": true
+}
