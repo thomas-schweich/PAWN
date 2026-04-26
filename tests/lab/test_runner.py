@@ -764,3 +764,130 @@ class TestMonitorExitCode:
              patch("asyncio.sleep", new_callable=AsyncMock):
             asyncio.run(runner._monitor(t.trial_id))
         assert runner.trials[t.trial_id].status == "failed"
+
+
+# =====================================================================
+# audit
+# =====================================================================
+
+
+def _make_completed_trial(
+    runner: TrialRunner,
+    *,
+    trial_id: int = 0,
+    schedule_health: dict | None = None,
+    write_complete_sentinel: bool = True,
+    hf_repo: str | None = None,
+) -> Trial:
+    run_dir = runner.log_dir / f"trial_{trial_id:04d}" / "run_x"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if schedule_health is not None:
+        (run_dir / "schedule_health.json").write_text(
+            json.dumps(schedule_health)
+        )
+    ckpt_dir = run_dir / "checkpoints" / "step_00001000"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    (ckpt_dir / "model.safetensors").write_bytes(b"")
+    if write_complete_sentinel:
+        (ckpt_dir / ".complete").write_text("{}")
+
+    config = {"run_type": "adapter", "strategy": "bottleneck"}
+    if hf_repo:
+        config["hf_repo"] = hf_repo
+    t = Trial(
+        trial_id=trial_id,
+        strategy="bottleneck",
+        params=config,
+        config=config,
+        cli_command=[],
+        status="completed",
+        run_dir=str(run_dir),
+        log_path="",
+    )
+    runner.trials[trial_id] = t
+    return t
+
+
+class TestAudit:
+    def test_completed_trial_passes_when_health_matches(self, tmp_path):
+        runner = TrialRunner(workspace=str(tmp_path))
+        _make_completed_trial(
+            runner,
+            schedule_health={
+                "planned_total_steps": 1000,
+                "actual_total_steps": 1000,
+                "reason_for_stop": "completed",
+                "actual_final_lr": 0.0,
+            },
+        )
+        result = runner.audit()
+        assert result["any_failure"] is False
+        row = result["trials"][0]
+        assert row["checks"]["schedule_complete"]["pass"] is True
+        assert row["checks"]["checkpoint_complete"]["pass"] is True
+
+    def test_step_mismatch_flags_schedule_failure(self, tmp_path):
+        runner = TrialRunner(workspace=str(tmp_path))
+        _make_completed_trial(
+            runner,
+            schedule_health={
+                "planned_total_steps": 1000,
+                "actual_total_steps": 950,
+                "reason_for_stop": "completed",
+                "actual_final_lr": 1.5e-4,
+            },
+        )
+        result = runner.audit()
+        assert result["any_failure"] is True
+        sc = result["trials"][0]["checks"]["schedule_complete"]
+        assert sc["pass"] is False
+        assert sc["actual_total_steps"] == 950
+        assert sc["planned_total_steps"] == 1000
+
+    def test_missing_schedule_health_is_null(self, tmp_path):
+        runner = TrialRunner(workspace=str(tmp_path))
+        _make_completed_trial(runner, schedule_health=None)
+        result = runner.audit()
+        assert result["trials"][0]["checks"]["schedule_complete"]["pass"] is None
+
+    def test_missing_complete_sentinel_fails(self, tmp_path):
+        runner = TrialRunner(workspace=str(tmp_path))
+        _make_completed_trial(
+            runner,
+            schedule_health={
+                "planned_total_steps": 100, "actual_total_steps": 100,
+            },
+            write_complete_sentinel=False,
+        )
+        result = runner.audit()
+        assert result["any_failure"] is True
+        cc = result["trials"][0]["checks"]["checkpoint_complete"]
+        assert cc["pass"] is False
+
+    def test_running_trials_are_skipped(self, tmp_path):
+        runner = TrialRunner(workspace=str(tmp_path))
+        _make_completed_trial(
+            runner,
+            schedule_health={
+                "planned_total_steps": 100, "actual_total_steps": 100,
+            },
+        )
+        # Mutate to running.
+        runner.trials[0].status = "running"
+        result = runner.audit()
+        assert result["trials"] == []
+
+    def test_check_hf_off_by_default(self, tmp_path):
+        runner = TrialRunner(workspace=str(tmp_path))
+        _make_completed_trial(
+            runner,
+            schedule_health={
+                "planned_total_steps": 100, "actual_total_steps": 100,
+            },
+            hf_repo="someuser/somerepo",
+        )
+        result = runner.audit()
+        ch = result["trials"][0]["checks"]["checkpoint_on_hf"]
+        # Off by default: pass is None with skip reason.
+        assert ch["pass"] is None
+        assert "check_hf=True" in ch["reason"]

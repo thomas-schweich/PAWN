@@ -99,6 +99,10 @@ class TrialRunner:
         # Async
         self._monitor_tasks: dict[int, asyncio.Task[None]] = {}
         self._metrics_offsets: dict[int, int] = {}
+        # Rolling (step, elapsed) window per trial (or per cotrain
+        # variant) for stable throughput estimation. See
+        # ``pawn.lab.monitor._update_sps_window``.
+        self._sps_windows: dict[Any, list[tuple[int, float]]] = {}
 
         self._ensure_dirs()
         self._gpus_discovered = False
@@ -439,14 +443,14 @@ class TrialRunner:
                         exit_code = code
                         break
 
-                read_metrics(trial, self.log_dir, self._metrics_offsets)
+                read_metrics(trial, self.log_dir, self._metrics_offsets, self._sps_windows)
                 issue = check_health(trial)
                 if issue:
                     log.warning("Trial %d health issue: %s", trial_id, issue)
                     self._emit("health_warning", trial_id, {"issue": issue})
 
             # Process exited — final metrics read
-            read_metrics(trial, self.log_dir, self._metrics_offsets)
+            read_metrics(trial, self.log_dir, self._metrics_offsets, self._sps_windows)
 
             if trial.status == "killed":
                 # Wait for the process to actually exit before releasing GPU.
@@ -461,7 +465,7 @@ class TrialRunner:
                         await asyncio.sleep(1.0)
                 if trial.gpu_id is not None:
                     self._release_gpu(trial.gpu_id)
-                read_metrics(trial, self.log_dir, self._metrics_offsets)
+                read_metrics(trial, self.log_dir, self._metrics_offsets, self._sps_windows)
                 self._save_state()
             elif exit_code == 0:
                 self._complete(trial_id)
@@ -534,7 +538,7 @@ class TrialRunner:
             except ProcessLookupError:
                 pass
         # Final metrics read before marking killed
-        read_metrics(trial, self.log_dir, self._metrics_offsets)
+        read_metrics(trial, self.log_dir, self._metrics_offsets, self._sps_windows)
         trial.status = "killed"
         trial.end_time = time.time()
         self._emit("trial_killed", trial_id)
@@ -742,6 +746,161 @@ class TrialRunner:
         return {"ok": True}
 
     # =======================================================================
+    # Audit
+    # =======================================================================
+
+    def audit(
+        self,
+        trial_id: int | None = None,
+        *,
+        check_hf: bool = False,
+    ) -> dict[str, Any]:
+        """Per-trial pass/fail on completion invariants.
+
+        Without arguments: audits every trial. With ``trial_id``: audits
+        just that one. Skips ``running`` and ``queued`` trials.
+
+        Invariants per trial:
+          - ``schedule_complete``: ``schedule_health.json`` says
+            ``actual_total_steps == planned_total_steps``. Equality, not
+            tolerance — partial decay reports as a failure.
+          - ``checkpoint_complete``: latest ``step_*`` directory has its
+            ``.complete`` SHA-256 sentinel.
+          - ``checkpoint_on_hf`` (when ``check_hf=True`` and the trial
+            has an ``hf_repo`` configured): the latest local checkpoint
+            directory name appears in ``list_repo_files`` for the
+            run's branch. Off by default — the HF API call is the
+            slow path.
+        """
+        trials = (
+            [self.trials[trial_id]]
+            if trial_id is not None and trial_id in self.trials
+            else list(self.trials.values())
+        )
+        rows: list[dict[str, Any]] = []
+        for t in trials:
+            if t.status in ("running", "queued"):
+                continue
+            row = self._audit_trial(t, check_hf=check_hf)
+            rows.append(row)
+
+        any_fail = any(
+            any(c.get("pass") is False for c in r["checks"].values())
+            for r in rows
+        )
+        return {"trials": rows, "any_failure": any_fail}
+
+    def _audit_trial(
+        self, trial: Trial, *, check_hf: bool,
+    ) -> dict[str, Any]:
+        checks: dict[str, dict[str, Any]] = {}
+
+        # 1. schedule_complete via schedule_health.json
+        if trial.run_dir:
+            health_path = Path(trial.run_dir) / "schedule_health.json"
+            if health_path.exists():
+                try:
+                    h = json.loads(health_path.read_text())
+                    planned = int(h.get("planned_total_steps", 0))
+                    actual = int(h.get("actual_total_steps", 0))
+                    checks["schedule_complete"] = {
+                        "pass": planned == actual and planned > 0,
+                        "planned_total_steps": planned,
+                        "actual_total_steps": actual,
+                        "reason_for_stop": h.get("reason_for_stop"),
+                        "actual_final_lr": h.get("actual_final_lr"),
+                    }
+                except (OSError, ValueError, json.JSONDecodeError) as e:
+                    checks["schedule_complete"] = {
+                        "pass": None,
+                        "reason": f"schedule_health.json unreadable: {e}",
+                    }
+            else:
+                checks["schedule_complete"] = {
+                    "pass": None,
+                    "reason": "schedule_health.json absent (older trainer or pre-init crash)",
+                }
+        else:
+            checks["schedule_complete"] = {
+                "pass": None,
+                "reason": "no run_dir",
+            }
+
+        # 2. checkpoint_complete via .complete sentinel on latest step_*
+        latest_ckpt: Path | None = None
+        if trial.run_dir:
+            ckpt_base = Path(trial.run_dir) / "checkpoints"
+            if ckpt_base.exists():
+                step_dirs = sorted(ckpt_base.glob("step_*"))
+                if step_dirs:
+                    latest_ckpt = step_dirs[-1]
+        if latest_ckpt is None:
+            checks["checkpoint_complete"] = {
+                "pass": None,
+                "reason": "no step_* checkpoint found",
+            }
+        else:
+            sentinel_ok = (latest_ckpt / ".complete").exists()
+            checks["checkpoint_complete"] = {
+                "pass": sentinel_ok,
+                "checkpoint": latest_ckpt.name,
+                "path": str(latest_ckpt),
+            }
+
+        # 3. checkpoint_on_hf (opt-in: HF API call is the slow path)
+        hf_repo = (trial.config or {}).get("hf_repo")
+        if not hf_repo:
+            checks["checkpoint_on_hf"] = {
+                "pass": None, "reason": "hf_repo not configured",
+            }
+        elif not check_hf:
+            checks["checkpoint_on_hf"] = {
+                "pass": None,
+                "reason": "skipped (call audit with check_hf=True to verify)",
+            }
+        elif latest_ckpt is None:
+            checks["checkpoint_on_hf"] = {
+                "pass": None, "reason": "no local checkpoint to compare",
+            }
+        else:
+            checks["checkpoint_on_hf"] = self._audit_hf(
+                hf_repo, trial.run_dir, latest_ckpt.name
+            )
+
+        return {
+            "trial_id": trial.trial_id,
+            "strategy": trial.strategy,
+            "status": trial.status,
+            "checks": checks,
+        }
+
+    @staticmethod
+    def _audit_hf(
+        hf_repo: str, run_dir: str | None, ckpt_name: str,
+    ) -> dict[str, Any]:
+        try:
+            from huggingface_hub import HfApi
+        except ImportError as e:
+            return {"pass": None, "reason": f"huggingface_hub unavailable: {e}"}
+        try:
+            api = HfApi()
+            branch = (
+                f"run/{Path(run_dir).name}" if run_dir else "main"
+            )
+            files = api.list_repo_files(
+                hf_repo, repo_type="model", revision=branch
+            )
+            present = any(f"{ckpt_name}/" in f"/{f}" for f in files)
+            return {
+                "pass": present,
+                "branch": branch,
+                "checkpoint": ckpt_name,
+                "n_files_on_branch": len(files),
+            }
+        except Exception as e:
+            return {"pass": None, "reason": f"HF list failed: {e}"}
+
+    # =======================================================================
     # Progress log
     # =======================================================================
 
@@ -844,7 +1003,7 @@ class TrialRunner:
                     self._assign_gpu(trial_id, trial.gpu_id)
             else:
                 log.warning("Trial %d (PID %d) no longer running", trial_id, trial.pid)
-                read_metrics(trial, self.log_dir, self._metrics_offsets)
+                read_metrics(trial, self.log_dir, self._metrics_offsets, self._sps_windows)
                 trial.end_time = time.time()
                 if trial.best_val_loss is not None:
                     trial.status = "completed"

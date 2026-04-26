@@ -291,3 +291,31 @@ class TestLabSchema:
         # JSON Schema has a `properties` key
         assert "properties" in result["pretrain"]
         assert "properties" in result["adapter"]
+
+
+# =====================================================================
+# lab_audit
+# =====================================================================
+
+
+class TestLabAudit:
+    def test_empty_lab_no_failures(self, ctx):
+        from pawn.lab.server import lab_audit
+
+        result = asyncio.run(lab_audit(ctx))
+        assert result == {"trials": [], "any_failure": False}
+
+    def test_passes_through_trial_id_and_check_hf(self, ctx, runner):
+        from pawn.lab.server import lab_audit
+
+        # Wire a trial through the runner so audit has something to read.
+        runner.trials[0] = Trial(
+            trial_id=0, strategy="bottleneck", params={},
+            cli_command=[], status="completed",
+        )
+
+        with patch.object(
+            runner, "audit", wraps=runner.audit
+        ) as wrapped:
+            asyncio.run(lab_audit(ctx, trial_id=0, check_hf=True))
+        wrapped.assert_called_once_with(trial_id=0, check_hf=True)

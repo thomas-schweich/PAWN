@@ -38,10 +38,46 @@ def is_alive(pid: int) -> tuple[bool, int | None]:
         return True, None  # exists but can't signal
 
 
+_SPS_WINDOW_MAX = 10
+
+
+def _update_sps_window(
+    window: list[tuple[int, float]],
+    step: int,
+    elapsed: float,
+) -> float:
+    """Append ``(step, elapsed)`` to ``window`` and recompute sps.
+
+    Uses the difference between the oldest and newest entries in the
+    window (at least two entries needed). The window caps at
+    ``_SPS_WINDOW_MAX`` entries — that's ``≥ 5 × log_interval`` steps
+    of history at typical settings, enough to dampen the per-record
+    quantization that the old per-step ``1 / step_time`` reading had.
+    Falls back to ``cumulative_step / cumulative_elapsed`` for the
+    very first record (no window-internal Δ available yet).
+    """
+    if elapsed <= 0:
+        return 0.0
+    if not window or window[-1][0] != step:
+        window.append((step, elapsed))
+    if len(window) > _SPS_WINDOW_MAX:
+        del window[0]
+    if len(window) >= 2:
+        ds = window[-1][0] - window[0][0]
+        dt = window[-1][1] - window[0][1]
+        if dt > 0 and ds > 0:
+            return ds / dt
+    # Single-point fallback so the very first read isn't 0.
+    if step > 0:
+        return step / elapsed
+    return 0.0
+
+
 def read_metrics(
     trial: Trial,
     log_dir: Path,
     offsets: dict,
+    sps_windows: dict | None = None,
 ) -> None:
     """Read new lines from the trial's metrics.jsonl, updating trial in-place.
 
@@ -51,19 +87,24 @@ def read_metrics(
 
     ``offsets`` keys are ``int`` (trial_id) for single-variant trials, or
     ``(trial_id, variant_name)`` for cotrain per-variant files.
+    ``sps_windows`` (when provided) is the same-keyed structure used to
+    compute throughput from a rolling window of ``(step, elapsed)``
+    pairs in ``metrics.jsonl`` instead of per-record ``step_time``,
+    which quantizes against ``log_interval``.
     """
     is_cotrain = (trial.config or {}).get("run_type") == "cotrain"
 
     if is_cotrain:
-        _read_cotrain_metrics(trial, log_dir, offsets)
+        _read_cotrain_metrics(trial, log_dir, offsets, sps_windows)
     else:
-        _read_single_metrics(trial, log_dir, offsets)
+        _read_single_metrics(trial, log_dir, offsets, sps_windows)
 
 
 def _read_single_metrics(
     trial: Trial,
     log_dir: Path,
     offsets: dict,
+    sps_windows: dict | None,
 ) -> None:
     """Read metrics for a single-variant (pretrain/adapter) trial."""
     # Find run dir if not yet discovered — pick the most recent
@@ -111,12 +152,22 @@ def _read_single_metrics(
             loss = rec.get("train/loss") or rec.get("train_loss")
             if loss is not None:
                 trial.last_train_loss = loss
-            # Step rate: prefer step_time, fall back to elapsed/step
-            st = rec.get("step_time")
-            if st and st > 0:
-                trial.steps_per_sec = 1.0 / st
-            elif rec.get("elapsed") and trial.current_step > 0:
-                trial.steps_per_sec = trial.current_step / rec["elapsed"]
+            # Step rate: rolling window over the last ``_SPS_WINDOW_MAX``
+            # train records' (step, elapsed) pairs. The previous
+            # ``1 / step_time`` read had ``log_interval``-scale
+            # quantization noise that inflated sps by up to ~30× and
+            # produced ETAs off by an order of magnitude. ``elapsed`` is
+            # always present in train records written by
+            # ``MetricsLogger``.
+            elapsed = rec.get("elapsed")
+            if elapsed is not None and sps_windows is not None:
+                win = sps_windows.setdefault(trial.trial_id, [])
+                trial.steps_per_sec = _update_sps_window(
+                    win, int(trial.current_step), float(elapsed)
+                )
+            elif elapsed and trial.current_step > 0:
+                # Older callers without sps_windows: cumulative average.
+                trial.steps_per_sec = trial.current_step / elapsed
             train_acc = rec.get("train/accuracy") or rec.get("train_top1")
             if train_acc is not None:
                 trial.last_train_acc = train_acc
@@ -142,6 +193,7 @@ def _read_cotrain_metrics(
     trial: Trial,
     log_dir: Path,
     offsets: dict,
+    sps_windows: dict | None,
 ) -> None:
     """Read metrics for a cotrain trial (multiple per-variant JSONL files)."""
     trial_log_dir = log_dir / f"trial_{trial.trial_id:04d}"
@@ -220,11 +272,16 @@ def _read_cotrain_metrics(
                 train_acc = rec.get("train/accuracy") or rec.get("train_top1")
                 if train_acc is not None:
                     vs["last_train_acc"] = train_acc
-                st = rec.get("step_time")
-                if st and st > 0:
-                    vs["steps_per_sec"] = 1.0 / st
-                elif rec.get("elapsed") and vs["current_step"] > 0:
-                    vs["steps_per_sec"] = vs["current_step"] / rec["elapsed"]
+                elapsed = rec.get("elapsed")
+                if elapsed is not None and sps_windows is not None:
+                    win = sps_windows.setdefault(
+                        (trial.trial_id, variant_name), []
+                    )
+                    vs["steps_per_sec"] = _update_sps_window(
+                        win, int(vs["current_step"]), float(elapsed)
+                    )
+                elif elapsed and vs["current_step"] > 0:
+                    vs["steps_per_sec"] = vs["current_step"] / elapsed
 
             elif rtype == "val":
                 vl = rec.get("val/loss") or rec.get("val_loss") or rec.get("loss")
