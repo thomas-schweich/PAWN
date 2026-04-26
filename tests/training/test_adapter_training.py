@@ -396,31 +396,6 @@ class TestParseLayers:
 
 
 # ---------------------------------------------------------------------------
-# _resume_start_epoch
-# ---------------------------------------------------------------------------
-
-
-class TestResumeStartEpoch:
-    """Regression tests for the ``start_epoch = saved_epoch + 1`` bug."""
-
-    def test_epochs_one_range_nonempty_on_mid_epoch_resume(self):
-        """Resume from mid-epoch checkpoint under ``epochs=1`` must not
-        produce an empty outer-loop range; doing so caused silent
-        ``steps=0`` exits prior to the fix."""
-        from pawn.adapter_training import _resume_start_epoch
-        start = _resume_start_epoch(saved_epoch=0)
-        assert list(range(start, 1)) == [0]
-
-    def test_extended_run_iterates_from_saved_epoch(self):
-        """Callers bumping ``epochs`` to extend past the original budget
-        must iterate from the saved epoch (not epoch+1), else the
-        resumed loop under-trains by one epoch."""
-        from pawn.adapter_training import _resume_start_epoch
-        start = _resume_start_epoch(saved_epoch=0)
-        assert list(range(start, 2)) == [0, 1]
-
-
-# ---------------------------------------------------------------------------
 # load_backbone
 # ---------------------------------------------------------------------------
 
