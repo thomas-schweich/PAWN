@@ -18,6 +18,7 @@ Strategies:
 from __future__ import annotations
 
 import gc
+import json
 import math
 import signal
 import time
@@ -506,6 +507,72 @@ def parse_layers(s: str | None) -> tuple[int, ...] | None:
     if s is None:
         return None
     return tuple(int(x) for x in s.split(","))
+
+
+_SCHEDULES_THAT_REACH_ZERO = ("cosine", "wsd", "infinite", "one_cycle")
+
+
+def write_schedule_health(
+    run_dir: Any,
+    *,
+    schedule: str,
+    planned_total_steps: int,
+    actual_total_steps: int,
+    lr_peak: float,
+    actual_final_lr: float,
+    reason_for_stop: str,
+) -> dict[str, Any]:
+    """Write ``schedule_health.json`` and return its contents.
+
+    Records whether training reached the planned end of the LR schedule.
+    The "loud" path — ``actual_total_steps != planned_total_steps`` on a
+    schedule that should reach zero — also prints a red banner to
+    stderr/stdout so a post-hoc reader doesn't have to find the file
+    themselves. ``reason_for_stop`` of ``"completed"`` plus a step
+    mismatch is the structural-bug signal: with cache-first that
+    combination should not occur, and a future regression that brings
+    it back will surface here.
+    """
+    from pathlib import Path
+
+    run_dir = Path(run_dir)
+    should_reach_zero = schedule in _SCHEDULES_THAT_REACH_ZERO
+    completion_ratio = (
+        actual_total_steps / planned_total_steps
+        if planned_total_steps > 0
+        else 0.0
+    )
+    health: dict[str, Any] = {
+        "format_version": 1,
+        "schedule": schedule,
+        "should_reach_zero": should_reach_zero,
+        "planned_total_steps": int(planned_total_steps),
+        "actual_total_steps": int(actual_total_steps),
+        "completion_ratio": completion_ratio,
+        "lr_peak": float(lr_peak),
+        "actual_final_lr": float(actual_final_lr),
+        "reason_for_stop": reason_for_stop,
+    }
+    (run_dir / "schedule_health.json").write_text(
+        json.dumps(health, indent=2)
+    )
+
+    if (
+        actual_total_steps != planned_total_steps
+        and should_reach_zero
+        and reason_for_stop in ("completed", "step_limit")
+    ):
+        print(
+            "\033[31m"
+            f"WARNING: schedule did not run to completion: "
+            f"actual_total_steps={actual_total_steps} != "
+            f"planned_total_steps={planned_total_steps}. "
+            f"Final LR={actual_final_lr:.3e} "
+            f"(peak={lr_peak:.3e}). reason={reason_for_stop}.\033[0m",
+            flush=True,
+        )
+
+    return health
 
 
 def precompute_val_masks(
@@ -1362,6 +1429,10 @@ def train(
     eval_interval = args.eval_interval
     step_limit = args.total_steps
     pause_step = args.pause_after_steps
+    # Tracks why the training loop exited; ``schedule_health.json``
+    # records this so post-hoc audits can distinguish "ran to
+    # completion" from SIGTERM, patience, or pause boundaries.
+    stop_reason = "completed"
 
     print(f"\nTraining for up to {args.epochs} epochs ({total_steps} steps)")
     print(
@@ -1610,6 +1681,7 @@ def train(
                         f"\n  Early stopping at step {global_step} "
                         f"(patience={args.patience})"
                     )
+                    stop_reason = "patience"
                     break
                 model.train()
 
@@ -1629,10 +1701,13 @@ def train(
                 _save_step_checkpoint(val_metrics, epoch)
 
             if step_limit and global_step >= step_limit:
+                stop_reason = "step_limit"
                 break
             if pause_step and global_step >= pause_step:
+                stop_reason = "paused"
                 break
             if _shutdown:
+                stop_reason = "sigterm"
                 break
 
         dt = time.time() - t0
@@ -1686,19 +1761,25 @@ def train(
                         f"\n  Early stopping at epoch {epoch} "
                         f"(patience={args.patience})"
                     )
+                    stop_reason = "patience"
                     break
             _save_step_checkpoint(val_metrics, epoch)
 
         if eval_interval and args.patience is not None and patience_counter >= args.patience:
-            break  # step-based early stopping triggered inside batch loop
+            # ``stop_reason`` was already set to ``"patience"`` inside
+            # the batch loop's eval block.
+            break
         if step_limit and global_step >= step_limit:
             print(f"\n  Reached step limit ({step_limit})")
+            stop_reason = "step_limit"
             break
         if pause_step and global_step >= pause_step:
             print(f"\n  Paused at step {global_step} (pause_after_steps={pause_step})")
+            stop_reason = "paused"
             break
         if _shutdown:
             print("Shutdown requested, saving checkpoint...")
+            stop_reason = "sigterm"
             break
 
     # Final checkpoint — only write if this session actually trained. On
@@ -1720,5 +1801,22 @@ def train(
     # aren't lost when the process exits. This is a no-op when hf_repo
     # was unset.
     hf_pusher.wait()
+
+    # Write ``schedule_health.json`` next to ``metrics.jsonl`` so
+    # post-hoc audits can distinguish "ran to completion" from
+    # "stopped early with LR mid-decay". On cache-first the
+    # ``actual_total_steps != planned_total_steps`` case only happens
+    # for SIGTERM / patience / pause / explicit step_limit; the silent
+    # truncation that motivated this file (streaming `steps_per_epoch`
+    # estimate drift) is no longer reachable.
+    write_schedule_health(
+        logger.run_dir,
+        schedule=getattr(args, "lr_schedule", "cosine"),
+        planned_total_steps=int(total_steps),
+        actual_total_steps=int(global_step),
+        lr_peak=float(args.lr),
+        actual_final_lr=float(optimizer.param_groups[0]["lr"]),
+        reason_for_stop=stop_reason,
+    )
 
     return best_val_loss, val_metrics

@@ -1232,6 +1232,7 @@ class CLMTrainer:
                     if self.global_step >= self.cfg.total_steps:
                         print(f"Training complete at step {self.global_step}")
                         self.save_checkpoint()
+                        stop_reason = "completed"
                         break
 
                     if (self.patience is not None
@@ -1239,6 +1240,7 @@ class CLMTrainer:
                         print(f"\nEarly stopping at step {self.global_step} "
                               f"(no improvement for {self.patience} evals)")
                         self.save_checkpoint()
+                        stop_reason = "patience"
                         break
 
                     if (self.cfg.pause_after_steps
@@ -1246,25 +1248,50 @@ class CLMTrainer:
                         print(f"\n  Paused at step {self.global_step} "
                               f"(pause_after_steps={self.cfg.pause_after_steps})")
                         self.save_checkpoint()
+                        stop_reason = "paused"
                         break
 
                     if _shutdown_requested:
                         print(f"\nShutdown requested (signal {_shutdown_signal}), "
                               f"saving checkpoint at step {self.global_step}...")
                         self.save_checkpoint()
+                        stop_reason = "sigterm"
                         break
 
                     step_start = time.time()
+            else:
+                # Loop fell off the DataLoader without hitting any of
+                # the explicit ``break`` paths — for an infinite-stream
+                # ``CLMDataset`` this is unreachable, but ``stop_reason``
+                # has to be initialized for the finally block.
+                stop_reason = "loader_exhausted"
         except BaseException:
             wandb_exit_code = 1
+            stop_reason = "exception"
             raise
         finally:
+            # Initialize ``stop_reason`` if the try block didn't even
+            # enter the for-loop (e.g. exception before first batch).
+            stop_reason = locals().get("stop_reason", "exception")
             signal.signal(signal.SIGTERM, old_term)
             signal.signal(signal.SIGINT, old_int)
 
             # Drain the background HF pusher before exiting so a final
             # save on shutdown/end isn't lost. No-op when hf_repo is None.
             self._hf_pusher.wait()
+
+            from pawn.adapter_training import write_schedule_health
+
+            write_schedule_health(
+                self.logger.run_dir,
+                schedule=self.cfg.lr_schedule,
+                planned_total_steps=int(self.cfg.total_steps),
+                actual_total_steps=int(self.global_step),
+                lr_peak=float(self.cfg.lr),
+                actual_final_lr=float(self.scheduler.get_lr()),
+                reason_for_stop=stop_reason,
+            )
+
             self.logger.close()
             finish_wandb(self.wandb_run, exit_code=wandb_exit_code)
 
