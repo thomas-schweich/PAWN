@@ -171,6 +171,20 @@ Total DataLoader workers across all processes should stay under `nproc - 4`. Mon
 
 If `lab_status` shows all GPUs idle and no more trials to launch, **immediately warn the user** that the pod is burning money. Report what completed and the final results. Do not stop the pod yourself — the user may want to inspect results.
 
+### Pre-Shutdown Gate
+
+Before telling the user "the pod is safe to stop", verify the durable state explicitly — don't trust narrative ("sync done"). For each completed trial:
+
+1. Call `lab_audit(check_hf=True)` and require pass on every `checkpoint_on_hf` invariant. This is the actual `list_repo_files` diff against local `step_*` dirs.
+2. Confirm any running trials are accounted for in `ps aux | grep python.*train` — that the lab server's state matches reality.
+3. Confirm the run notes (`runs/lab-notes.md`) and any in-progress reports are on the bucket.
+
+Only then is shutdown safe.
+
+### HF Bucket I/O
+
+When syncing to a bucket, always use the `hf://buckets/<namespace>/<name>[/subpath]` URL form via `hf sync`. The `hf upload --repo-type bucket` form is rejected by the current CLI and silently exits 0 — don't fall back to `--repo-type dataset` either, that's a separate repo type with no Xet-native dedup. For cron-driven syncs, wrap with `scripts/sync_to_bucket.sh` so 403/401/429 in the API output exits non-zero (raw `hf sync` swallows those into a 0 exit).
+
 ---
 
 ## Your Role at Each Check-In
@@ -179,23 +193,30 @@ You are the decision-maker. Your job at each check-in is **expert judgment**:
 
 1. **Review events.** Call `lab_events` to see what completed or failed since last check.
 
-2. **Check running trials.** Call `lab_log` for each running trial to see real-time progress (step, train loss, LR). Only call `lab_status` if events indicate a state change.
+2. **Audit completed trials.** For every `trial_completed` event, call `lab_audit(trial_id=<id>)` and surface any non-pass invariant immediately. The audit checks:
+   - `schedule_complete`: did the LR schedule reach the planned `total_steps`? Equality, not tolerance — partial decay fails.
+   - `checkpoint_complete`: does the latest `step_*` directory have its `.complete` SHA-256 sentinel?
+   - `checkpoint_on_hf` (call with `check_hf=True` periodically): does the latest local checkpoint name appear on the run's HF branch?
 
-3. **Annotate completed trials.** For each newly completed trial, call `lab_notes` with your assessment:
+   Treat any `pass: false` as a real signal — don't move on until the user has acknowledged it.
+
+3. **Check running trials.** Call `lab_log` for each running trial to see real-time progress (step, train loss, LR). Only call `lab_status` if events indicate a state change. `lab_status.eta` is now computed from a rolling `metrics.jsonl` window and is reliable to quote directly; the older 20–30× quantization artifact is gone.
+
+4. **Annotate completed trials.** For each newly completed trial, call `lab_notes` with your assessment:
    - Is this on the Pareto front?
    - Did it beat expectations? Disappoint?
    - What does it tell us about this strategy/param range?
 
-4. **Strategic decisions.** Based on accumulated results:
+5. **Strategic decisions.** Based on accumulated results:
    - What should the next trial be? `lab_results` returns Optuna suggestions alongside the results table — use them as a starting point when they're in-range.
    - Should we change phase? (exploration → exploitation → validation)
    - Should we kill any running trials that look unpromising?
    - Are there obvious gaps in coverage?
    - Should the check-in interval change? (see [Check-In Intervals](#check-in-intervals))
 
-5. **Update lab notes.** Append a timestamped entry to `runs/lab-notes.md`. Include what completed, what's running, what you learned, and what's next. This is the primary handoff mechanism for continuation agents.
+6. **Update lab notes.** Append a timestamped entry to `runs/lab-notes.md`. Include what completed, what's running, what you learned, and what's next. This is the primary handoff mechanism for continuation agents.
 
-6. **Check for idle GPUs.** If GPUs are idle and there's more work to do, launch or resume.
+7. **Check for idle GPUs.** If GPUs are idle and there's more work to do, launch or resume.
 
 ---
 
