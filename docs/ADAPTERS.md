@@ -98,8 +98,9 @@ In retrospective modes, warm-up LoRA weights are saved as a checkpoint for analy
 - `mask_samples` -- batches for gradient accumulation (default: 32)
 - `grad_alpha` -- gradient exponent: 1=mean magnitude, 2=Fisher diagonal (default: 2)
 - `bottleneck_dim` -- bottleneck dimension for retro-bottleneck mode (default: 8)
+- `n_hidden` -- extra `Linear(bn,bn)+GELU` stages between `down` and `up` inside each Houlsby adapter, for retro-bottleneck mode (default: 0 reproduces the standard two-layer block)
 
-**Param count:** Depends on mode and configuration. In `rosa` mode: `n_lora_params + density * total_weight_elements`. In `retro-sparse`: `density * total_weight_elements`. In `retro-bottleneck`: sparse params + `2 * n_positions * n_layers * 2 * d_model * bottleneck_dim`.
+**Param count:** Depends on mode and configuration. In `rosa` mode: `n_lora_params + density * total_weight_elements`. In `retro-sparse`: `density * total_weight_elements`. In `retro-bottleneck`: sparse params + `n_positions * n_layers * (2 * d_model * bottleneck_dim + n_hidden * bottleneck_dim^2)`.
 
 ## Sparse
 
