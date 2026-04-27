@@ -1393,13 +1393,24 @@ def train(
     from pawn.checkpoint import save_adapter_checkpoint
 
     # Set SDPA backend (escape hatch for ROCm flash attn debugging). The
-    # full-step ``torch.compile`` wrap below replaces the per-call
-    # ``forward_hidden`` compile that ``apply_gpu_config`` used to do —
-    # we still need the side effect of pinning ``SDPA_BACKEND`` before
-    # any compile traces, since compiled code captures the backend at
-    # trace time.
+    # full-step ``torch.compile`` wrap below covers the train hot loop;
+    # we additionally compile ``model.forward_hidden`` directly so
+    # ``evaluate()`` and ``rosa_warmup()`` (which call ``sparse_forward``
+    # → ``model.forward_hidden`` directly) keep their kernel-launch
+    # reduction. Without this, removing the old per-call compile would
+    # silently regress those paths whenever ``use_compile=True``.
+    # ``SDPA_BACKEND`` must be pinned before any compile traces, since
+    # compiled code captures the backend at trace time.
     if gpu_cfg.get("sdpa_backend") is not None:
         model_module.SDPA_BACKEND = gpu_cfg["sdpa_backend"]
+    if gpu_cfg.get("use_compile", False):
+        # Wrap the bound method in place. The train hot loop calls
+        # ``model.forward_hidden`` *inside* its own compiled step, where
+        # dynamo will inline this without re-tracing; eval / RoSA paths
+        # use this wrapper directly.
+        model.forward_hidden = torch.compile(  # type: ignore[attr-defined]
+            model.forward_hidden  # type: ignore[attr-defined]
+        )
 
     optimizer = torch.optim.AdamW(
         trainable_params,
