@@ -994,6 +994,106 @@ class TestHfPushMocked:
 
 
 @pytest.mark.unit
+class TestPushCheckpointToBucket:
+    def _make_ckpt(self, tmp_path):
+        ckpt = tmp_path / "step_00000010"
+        ckpt.mkdir()
+        (ckpt / "model.safetensors").write_bytes(b"\0" * 32)
+        (ckpt / "training_state.json").write_text("{}")
+        from pawn.checkpoint import _write_complete_sentinel
+
+        _write_complete_sentinel(ckpt)
+        return ckpt
+
+    def test_calls_hf_sync_with_url_form(self, tmp_path, mocker):
+        from pawn.checkpoint import push_checkpoint_to_bucket
+
+        ckpt = self._make_ckpt(tmp_path)
+        run = mocker.patch("subprocess.run", return_value=mocker.MagicMock(
+            returncode=0, stdout="ok", stderr=""
+        ))
+        push_checkpoint_to_bucket(
+            ckpt, bucket="user/my-bucket", run_slug="adapter_xyz", step=10,
+        )
+        cmd = run.call_args.args[0]
+        assert cmd[:2] == ["hf", "sync"]
+        # The sync targets the run's directory under the bucket.
+        assert cmd[3] == "hf://buckets/user/my-bucket/logs/adapter_xyz"
+
+    def test_accepts_full_bucket_url(self, tmp_path, mocker):
+        from pawn.checkpoint import push_checkpoint_to_bucket
+
+        ckpt = self._make_ckpt(tmp_path)
+        run = mocker.patch("subprocess.run", return_value=mocker.MagicMock(
+            returncode=0, stdout="", stderr=""
+        ))
+        push_checkpoint_to_bucket(
+            ckpt,
+            bucket="hf://buckets/user/my-bucket/sub/path",
+            run_slug="run_a", step=1,
+        )
+        cmd = run.call_args.args[0]
+        assert cmd[3] == "hf://buckets/user/my-bucket/sub/path/logs/run_a"
+
+    def test_nonzero_exit_raises(self, tmp_path, mocker):
+        from pawn.checkpoint import push_checkpoint_to_bucket
+
+        ckpt = self._make_ckpt(tmp_path)
+        mocker.patch("subprocess.run", return_value=mocker.MagicMock(
+            returncode=2, stdout="", stderr="boom"
+        ))
+        with pytest.raises(RuntimeError, match="hf sync exited 2"):
+            push_checkpoint_to_bucket(
+                ckpt, bucket="u/b", run_slug="r", step=0,
+            )
+
+    def test_403_in_output_raises_even_on_zero_exit(self, tmp_path, mocker):
+        """``hf sync`` exits 0 even when individual blob uploads return
+        403/401/429 — re-grep the output and surface those as failures."""
+        from pawn.checkpoint import push_checkpoint_to_bucket
+
+        ckpt = self._make_ckpt(tmp_path)
+        mocker.patch("subprocess.run", return_value=mocker.MagicMock(
+            returncode=0,
+            stdout="",
+            stderr="ERROR: 403 Forbidden: storage limit reached",
+        ))
+        with pytest.raises(RuntimeError, match="auth / quota / rate-limit"):
+            push_checkpoint_to_bucket(
+                ckpt, bucket="u/b", run_slug="r", step=0,
+            )
+
+    def test_metrics_jsonl_truncated_at_step(self, tmp_path, mocker):
+        from pawn.checkpoint import push_checkpoint_to_bucket
+
+        ckpt = self._make_ckpt(tmp_path)
+        metrics = tmp_path / "metrics.jsonl"
+        metrics.write_text(
+            '{"type":"train","step":1}\n'
+            '{"type":"train","step":2}\n'
+            '{"type":"train","step":3}\n'
+            '{"type":"train","step":4}\n'
+        )
+
+        captured: dict = {}
+
+        def fake_run(cmd, capture_output, text):
+            staging = Path(cmd[2])
+            captured["staged"] = (staging / "metrics.jsonl").read_text()
+            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+
+        mocker.patch("subprocess.run", side_effect=fake_run)
+        push_checkpoint_to_bucket(
+            ckpt, bucket="u/b", run_slug="r",
+            metrics_path=metrics, step=2,
+        )
+        # Truncated at step 2 inclusive.
+        assert "step\":1" in captured["staged"]
+        assert "step\":2" in captured["staged"]
+        assert "step\":3" not in captured["staged"]
+
+
+@pytest.mark.unit
 class TestBackgroundCheckpointPusher:
     def test_submit_returns_immediately(self, tmp_path, mocker):
         """``submit`` queues work to a background thread; the caller does

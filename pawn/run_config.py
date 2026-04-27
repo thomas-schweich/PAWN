@@ -104,6 +104,12 @@ class BaseRunConfig(BaseModel):
     # IO ------------------------------------------------------------------
     log_dir: str | None = None
     hf_repo: str | None = None
+    # Optional bucket-path autosave alongside (or instead of) the
+    # model-repo branch push. Accepts ``<namespace>/<bucket-name>`` or a
+    # full ``hf://buckets/<ns>/<name>[/subpath]`` URL. Files land at
+    # ``<bucket>/logs/<run_slug>/{checkpoints/...,metrics.jsonl}``.
+    # Mutually compatible with ``hf_repo``: the trainer pushes to both.
+    hf_bucket: str | None = None
     local_checkpoints: bool = False
     resume: str | None = None
     wandb: bool = False
@@ -116,9 +122,13 @@ class BaseRunConfig(BaseModel):
             raise ValueError(
                 "--hf-repo and --local-checkpoints are mutually exclusive"
             )
-        if not self.hf_repo and not self.local_checkpoints:
+        if (
+            not self.hf_repo
+            and not self.local_checkpoints
+            and not self.hf_bucket
+        ):
             raise ValueError(
-                "One of --hf-repo or --local-checkpoints is required"
+                "One of --hf-repo, --hf-bucket, or --local-checkpoints is required"
             )
         return self
 

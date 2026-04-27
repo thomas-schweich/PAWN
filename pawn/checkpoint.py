@@ -769,6 +769,44 @@ class BackgroundCheckpointPusher:
 
         self._future = self._pool.submit(_push)
 
+    def submit_bucket(
+        self,
+        checkpoint_path: str | Path,
+        bucket: str,
+        *,
+        run_slug: str,
+        step: int,
+        metrics_path: str | Path | None = None,
+        log_prefix: str = "",
+    ) -> None:
+        """Queue a push to an HF bucket path.
+
+        ``bucket`` accepts either ``<namespace>/<bucket-name>`` or the
+        full ``hf://buckets/<namespace>/<bucket-name>[/<subpath>]`` URL.
+        Files land at ``<bucket>/logs/<run_slug>/checkpoints/step_NNNN/``
+        plus ``<bucket>/logs/<run_slug>/metrics.jsonl`` (when supplied).
+        Bucket sync goes through ``hf sync`` because the
+        ``HfApi.upload_folder(repo_type="bucket")`` path is not
+        supported as of the current ``huggingface_hub`` — see the
+        ``manage-pod`` skill's HF Bucket I/O note.
+        """
+        if self._future is not None:
+            self._future.result()
+        ckpt_path = str(checkpoint_path)
+        mpath = str(metrics_path) if metrics_path is not None else None
+
+        def _push() -> None:
+            try:
+                push_checkpoint_to_bucket(
+                    ckpt_path, bucket, run_slug=run_slug,
+                    metrics_path=mpath, step=step,
+                )
+                print(f"{log_prefix}Pushed to bucket: {bucket} (run/{run_slug})")
+            except Exception as e:
+                print(f"{log_prefix}WARNING: bucket push failed: {e}")
+
+        self._future = self._pool.submit(_push)
+
     def wait(self) -> None:
         """Block until all pending pushes finish and release the pool."""
         if self._future is not None:
@@ -844,3 +882,95 @@ def push_checkpoint_to_hf(
                 )
             finally:
                 os.unlink(tmp_path)
+
+
+def push_checkpoint_to_bucket(
+    checkpoint_path: str | Path,
+    bucket: str,
+    *,
+    run_slug: str,
+    metrics_path: str | Path | None = None,
+    step: int = 0,
+) -> None:
+    """Push a checkpoint to an HF bucket path via ``hf sync``.
+
+    ``bucket`` accepts either ``<namespace>/<bucket-name>`` or a full
+    ``hf://buckets/<namespace>/<bucket-name>[/<subpath>]`` URL. Files
+    land at ``<bucket-url>/logs/<run_slug>/checkpoints/<step_dir>/``
+    plus ``<bucket-url>/logs/<run_slug>/metrics.jsonl`` (when given).
+
+    Why ``hf sync`` (and not ``HfApi.upload_folder(repo_type="bucket")``):
+    as of 2026-04, the ``hf upload`` / ``upload_folder`` paths reject
+    ``repo_type="bucket"`` and silently exit 0 — the only working
+    bucket I/O is the ``hf://buckets/...`` URL via ``hf sync``.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    checkpoint_path = Path(checkpoint_path)
+    bucket_url = (
+        bucket
+        if bucket.startswith("hf://buckets/")
+        else f"hf://buckets/{bucket.lstrip('/')}"
+    )
+    base = bucket_url.rstrip("/")
+    run_root = f"{base}/logs/{run_slug}"
+
+    # Stage the checkpoint directory under a temp tree shaped like the
+    # target. ``hf sync`` operates on a local tree → remote URL pair, so
+    # we mirror the on-bucket layout locally first. This is cheap (the
+    # checkpoint files are already on disk; we only create symlinks
+    # when the FS supports them, otherwise copy).
+    with tempfile.TemporaryDirectory() as staging:
+        staging_path = Path(staging)
+        ckpt_target = (
+            staging_path / "checkpoints" / checkpoint_path.name
+        )
+        ckpt_target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(checkpoint_path.resolve(), ckpt_target)
+        except OSError:
+            shutil.copytree(checkpoint_path, ckpt_target)
+
+        if metrics_path is not None and Path(metrics_path).exists():
+            # Match push_checkpoint_to_hf's "truncate at the current
+            # step" behavior so the bucket copy never gets ahead of
+            # the checkpoint it sits beside.
+            truncated_lines = []
+            with open(metrics_path) as f:
+                for line in f:
+                    truncated_lines.append(line)
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        record.get("type") in ("train", "val")
+                        and record.get("step", 0) >= step
+                    ):
+                        break
+            (staging_path / "metrics.jsonl").write_text(
+                "".join(truncated_lines)
+            )
+
+        result = subprocess.run(
+            ["hf", "sync", str(staging_path), run_root],
+            capture_output=True, text=True,
+        )
+        combined = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"hf sync exited {result.returncode}; "
+                f"output:\n{combined.strip()}"
+            )
+        # ``hf sync`` exits 0 even on per-blob 403/401/429 — re-grep the
+        # combined output for those signals so the trainer's wrapper
+        # ``_push`` catches them as failures instead of silence.
+        import re
+
+        if re.search(r"\b(403|401|429)\b|Forbidden|Unauthorized|RateLimit", combined):
+            raise RuntimeError(
+                "hf sync reported auth / quota / rate-limit signals "
+                f"despite exit 0:\n{combined.strip()}"
+            )

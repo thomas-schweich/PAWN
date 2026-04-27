@@ -1425,6 +1425,12 @@ def train(
     # pool never sees work in that case.
     from pawn.checkpoint import BackgroundCheckpointPusher
     hf_pusher = BackgroundCheckpointPusher(thread_name_prefix="hf-adapter")
+    # Bucket pushes go on a separate single-worker pool so a slow
+    # bucket sync doesn't block the model-repo branch push (and vice
+    # versa). Both are no-ops when the corresponding config field is
+    # unset; constructing eagerly lets the shutdown path
+    # ``.wait()`` unconditionally.
+    bucket_pusher = BackgroundCheckpointPusher(thread_name_prefix="hf-bucket")
 
     eval_interval = args.eval_interval
     step_limit = args.total_steps
@@ -1497,6 +1503,19 @@ def train(
                 args.hf_repo,
                 hf_branch,
                 step=global_step,
+                metrics_path=str(logger.metrics_path),
+            )
+        # Bucket push runs in parallel with the model-repo branch push
+        # (when both are set). The bucket path is a self-contained
+        # snapshot — checkpoint dir + a copy of metrics.jsonl — under
+        # ``logs/<run_slug>/`` inside the bucket.
+        if getattr(args, "hf_bucket", None):
+            bucket_pusher.submit_bucket(
+                step_path,
+                args.hf_bucket,
+                run_slug=logger.run_dir.name,
+                step=global_step,
+                metrics_path=str(logger.metrics_path),
             )
 
     # Resume: ``global_step`` is canonical. ``start_epoch`` and
@@ -1801,6 +1820,7 @@ def train(
     # aren't lost when the process exits. This is a no-op when hf_repo
     # was unset.
     hf_pusher.wait()
+    bucket_pusher.wait()
 
     # Write ``schedule_health.json`` next to ``metrics.jsonl`` so
     # post-hoc audits can distinguish "ran to completion" from
