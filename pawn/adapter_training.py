@@ -512,6 +512,33 @@ def parse_layers(s: str | None) -> tuple[int, ...] | None:
 _SCHEDULES_THAT_REACH_ZERO = ("cosine", "wsd", "infinite", "one_cycle")
 
 
+def resume_state(global_step: int, steps_per_epoch: int) -> tuple[int, int]:
+    """Derive ``(start_epoch, skip_batches)`` from a saved ``global_step``.
+
+    With cache-first the canonical resume state is ``global_step``: the
+    trainer enters epoch ``global_step // steps_per_epoch`` and asks the
+    sampler to skip the first ``global_step % steps_per_epoch`` batches.
+    No FF iteration; the seeded permutation slices to the right tail.
+
+    Edge cases this codifies:
+      - ``global_step == 0``: fresh run, ``start_epoch=0, skip=0``.
+      - exact epoch boundary (e.g. just finished epoch 2 with
+        ``steps_per_epoch=1000``, ``global_step=2000``):
+        ``start_epoch=2, skip=0`` so the next loop iteration is epoch 2
+        (which the for-range will skip past if epochs<=2 — that's the
+        ``resume_no_op`` case handled at the schedule_health write).
+      - mid-epoch (e.g. ``global_step=2500, steps_per_epoch=1000``):
+        ``start_epoch=2, skip=500`` to enter epoch 2 partway through.
+    """
+    if steps_per_epoch <= 0:
+        raise ValueError(
+            f"steps_per_epoch must be > 0, got {steps_per_epoch}"
+        )
+    if global_step < 0:
+        raise ValueError(f"global_step must be >= 0, got {global_step}")
+    return global_step // steps_per_epoch, global_step % steps_per_epoch
+
+
 def write_schedule_health(
     run_dir: Any,
     *,
@@ -825,7 +852,13 @@ def _build_specialized_clm(
     n = sum(p.numel() for p in params)
 
     def state_dict_fn() -> dict[str, torch.Tensor]:
-        return model.state_dict()
+        # ``SpecializedCLM`` ties ``lm_head.weight`` to ``embed.weight``;
+        # safetensors rejects shared storage, so drop the tied duplicate.
+        # The tying is restored automatically at load time because the
+        # constructor re-establishes it before ``load_state_dict``.
+        sd = dict(model.state_dict())
+        sd.pop("lm_head.weight", None)
+        return sd
 
     def weight_report_fn() -> dict[str, Any]:
         return {}
@@ -1347,9 +1380,10 @@ def train(
         # ``epoch`` and ``skip_batches`` are derived from ``global_step``
         # and ``steps_per_epoch`` (no FF iteration needed). The saved
         # ``epoch`` field is informational; the canonical state is
-        # ``global_step``.
-        start_epoch = global_step // steps_per_epoch
-        resume_skip_batches = global_step % steps_per_epoch
+        # ``global_step``. See :func:`resume_state` for the contract.
+        start_epoch, resume_skip_batches = resume_state(
+            global_step, steps_per_epoch
+        )
         # Honor a saved ``data_seed`` if present so the per-epoch
         # permutation matches the original run.
         saved_data_seed = ckpt.get("data_seed")

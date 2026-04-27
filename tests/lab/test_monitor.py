@@ -798,3 +798,47 @@ class TestFitPowerLaw:
         # All xs equal → log-x variance is zero
         fit = fit_power_law([2.0, 2.0, 2.0], [1.0, 1.5, 2.0])
         assert fit is None
+
+
+# ---------------------------------------------------------------------------
+# _update_sps_window — coverage for cap, duplicate-step guard, elapsed<=0
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateSpsWindow:
+    @pytest.mark.unit
+    def test_window_caps_at_max(self):
+        from pawn.lab.monitor import _SPS_WINDOW_MAX, _update_sps_window
+
+        window: list[tuple[int, float]] = []
+        # Append 1.5x the max; the oldest should evict.
+        for i in range(_SPS_WINDOW_MAX + 5):
+            _update_sps_window(window, step=i * 100, elapsed=i * 10.0)
+        assert len(window) == _SPS_WINDOW_MAX
+        # Oldest retained should be step 5*100 = 500 (we appended 0..14
+        # and dropped 0..4 over the cap).
+        assert window[0][0] == 500
+        assert window[-1][0] == (_SPS_WINDOW_MAX + 4) * 100
+
+    @pytest.mark.unit
+    def test_duplicate_step_not_appended(self):
+        from pawn.lab.monitor import _update_sps_window
+
+        window: list[tuple[int, float]] = []
+        _update_sps_window(window, step=100, elapsed=10.0)
+        _update_sps_window(window, step=100, elapsed=11.0)  # same step, later elapsed
+        # Window should still have one entry (the duplicate-step guard
+        # avoids inflating the window with repeated reads of the same
+        # log line).
+        assert len(window) == 1
+        assert window[0] == (100, 10.0)
+
+    @pytest.mark.unit
+    def test_nonpositive_elapsed_returns_zero(self):
+        from pawn.lab.monitor import _update_sps_window
+
+        window: list[tuple[int, float]] = []
+        assert _update_sps_window(window, step=100, elapsed=0.0) == 0.0
+        assert _update_sps_window(window, step=100, elapsed=-1.0) == 0.0
+        # Window unchanged.
+        assert window == []

@@ -218,6 +218,7 @@ def load_model(
         n_layers = int(adapter_config["n_layers"])
         n_heads = int(adapter_config["n_heads"])
         d_ff = adapter_config.get("d_ff") or d_model * 4
+        max_seq_len = int(adapter_config.get("max_seq_len") or 512)
         vocab_size = CLMConfig().vocab_size
         model = SpecializedCLM(
             vocab_size=vocab_size,
@@ -225,10 +226,15 @@ def load_model(
             n_layers=n_layers,
             n_heads=n_heads,
             d_ff=d_ff,
+            max_seq_len=max_seq_len,
         ).to(device)
-        # The saved adapter_state_dict for spec_clm is the full model
-        # state; load_state_dict accepts it directly.
-        model.load_state_dict(adapter_weights)
+        # ``SpecializedCLM`` ties ``lm_head.weight`` to ``embed.weight``
+        # in its constructor, so the saved state dict (per
+        # ``_build_specialized_clm.state_dict_fn``) deliberately drops
+        # the tied duplicate to satisfy safetensors. Loading with
+        # ``strict=False`` accepts the missing key — the tying carries
+        # ``embed.weight`` over automatically.
+        model.load_state_dict(adapter_weights, strict=False)
 
     elif adapter_type == "lora":
         from pawn.adapters.lora import LoRACLM

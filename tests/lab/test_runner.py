@@ -891,3 +891,63 @@ class TestAudit:
         # Off by default: pass is None with skip reason.
         assert ch["pass"] is None
         assert "check_hf=True" in ch["reason"]
+
+    def test_check_hf_pass_when_listed(self, tmp_path):
+        """``check_hf=True`` lists the run's branch and passes when the
+        latest local checkpoint name appears."""
+        runner = TrialRunner(workspace=str(tmp_path))
+        _make_completed_trial(
+            runner,
+            schedule_health={
+                "planned_total_steps": 100, "actual_total_steps": 100,
+            },
+            hf_repo="user/repo",
+        )
+        fake_api = MagicMock()
+        fake_api.list_repo_files.return_value = [
+            "checkpoints/step_00001000/model.safetensors",
+            "checkpoints/step_00001000/training_state.json",
+            "metrics.jsonl",
+        ]
+        with patch("huggingface_hub.HfApi", return_value=fake_api):
+            result = runner.audit(check_hf=True)
+        ch = result["trials"][0]["checks"]["checkpoint_on_hf"]
+        assert ch["pass"] is True
+        assert ch["checkpoint"] == "step_00001000"
+
+    def test_check_hf_fail_when_missing(self, tmp_path):
+        runner = TrialRunner(workspace=str(tmp_path))
+        _make_completed_trial(
+            runner,
+            schedule_health={
+                "planned_total_steps": 100, "actual_total_steps": 100,
+            },
+            hf_repo="user/repo",
+        )
+        fake_api = MagicMock()
+        fake_api.list_repo_files.return_value = ["metrics.jsonl"]
+        with patch("huggingface_hub.HfApi", return_value=fake_api):
+            result = runner.audit(check_hf=True)
+        assert result["any_failure"] is True
+        ch = result["trials"][0]["checks"]["checkpoint_on_hf"]
+        assert ch["pass"] is False
+
+    def test_check_hf_api_error_returns_null(self, tmp_path):
+        """API failures should report ``pass=None`` (couldn't verify)
+        rather than ``False`` — distinguishes 'missing' from
+        'couldn't tell'."""
+        runner = TrialRunner(workspace=str(tmp_path))
+        _make_completed_trial(
+            runner,
+            schedule_health={
+                "planned_total_steps": 100, "actual_total_steps": 100,
+            },
+            hf_repo="user/repo",
+        )
+        fake_api = MagicMock()
+        fake_api.list_repo_files.side_effect = ConnectionError("boom")
+        with patch("huggingface_hub.HfApi", return_value=fake_api):
+            result = runner.audit(check_hf=True)
+        ch = result["trials"][0]["checks"]["checkpoint_on_hf"]
+        assert ch["pass"] is None
+        assert "HF list failed" in ch["reason"]

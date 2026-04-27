@@ -1098,3 +1098,56 @@ class TestWriteScheduleHealth:
         assert h["should_reach_zero"] is False
         assert "WARNING" not in capsys.readouterr().out
 
+
+
+# ---------------------------------------------------------------------------
+# resume_state
+# ---------------------------------------------------------------------------
+
+
+class TestResumeState:
+    @pytest.mark.unit
+    def test_fresh_run(self):
+        from pawn.adapter_training import resume_state
+
+        assert resume_state(0, 1000) == (0, 0)
+
+    @pytest.mark.unit
+    def test_exact_epoch_boundary(self):
+        """End-of-epoch save: ``global_step`` lands on a clean
+        boundary, so the next loop iteration starts the next epoch
+        with no skip."""
+        from pawn.adapter_training import resume_state
+
+        assert resume_state(1000, 1000) == (1, 0)
+        assert resume_state(2000, 1000) == (2, 0)
+
+    @pytest.mark.unit
+    def test_mid_epoch(self):
+        """Mid-epoch save (e.g. SIGTERM): re-enter the in-progress
+        epoch and skip the consumed prefix."""
+        from pawn.adapter_training import resume_state
+
+        assert resume_state(1500, 1000) == (1, 500)
+        assert resume_state(2500, 1000) == (2, 500)
+
+    @pytest.mark.unit
+    def test_past_end(self):
+        """Resume on a checkpoint already past ``epochs * steps_per_epoch``
+        is the no-op case — start_epoch is computed honestly; the
+        trainer's epoch loop just iterates an empty range."""
+        from pawn.adapter_training import resume_state
+
+        # epochs=3 × spe=1000 = 3000, save at 3000 → start=3.
+        assert resume_state(3000, 1000) == (3, 0)
+        # Can technically go further (extension scenario).
+        assert resume_state(4500, 1000) == (4, 500)
+
+    @pytest.mark.unit
+    def test_validates_inputs(self):
+        from pawn.adapter_training import resume_state
+
+        with pytest.raises(ValueError, match="steps_per_epoch"):
+            resume_state(100, 0)
+        with pytest.raises(ValueError, match="global_step"):
+            resume_state(-1, 100)

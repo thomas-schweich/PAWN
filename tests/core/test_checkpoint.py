@@ -1063,6 +1063,42 @@ class TestPushCheckpointToBucket:
                 ckpt, bucket="u/b", run_slug="r", step=0,
             )
 
+    @pytest.mark.parametrize("signal_text", [
+        "ERROR: 401 Unauthorized",
+        "Status code: 429 (rate limited)",
+        "{'error': 'Forbidden'}",
+        "Unauthorized: please log in",
+        "RateLimit: try again later",
+    ])
+    def test_each_auth_pattern_raises(self, tmp_path, mocker, signal_text):
+        """Cover every alternation in the auth/quota regex, not just 403."""
+        from pawn.checkpoint import push_checkpoint_to_bucket
+
+        ckpt = self._make_ckpt(tmp_path)
+        mocker.patch("subprocess.run", return_value=mocker.MagicMock(
+            returncode=0, stdout="", stderr=signal_text,
+        ))
+        with pytest.raises(RuntimeError, match="auth / quota / rate-limit"):
+            push_checkpoint_to_bucket(
+                ckpt, bucket="u/b", run_slug="r", step=0,
+            )
+
+    def test_symlink_oserror_falls_back_to_copytree(self, tmp_path, mocker):
+        """On filesystems without symlink support (or restricted Linux
+        sandboxes), the staging path falls back to a full copytree."""
+        from pawn.checkpoint import push_checkpoint_to_bucket
+
+        ckpt = self._make_ckpt(tmp_path)
+        mocker.patch("os.symlink", side_effect=OSError("symlink unsupported"))
+        copytree_spy = mocker.patch("shutil.copytree")
+        mocker.patch("subprocess.run", return_value=mocker.MagicMock(
+            returncode=0, stdout="", stderr=""
+        ))
+        push_checkpoint_to_bucket(
+            ckpt, bucket="u/b", run_slug="r", step=0,
+        )
+        copytree_spy.assert_called_once()
+
     def test_metrics_jsonl_truncated_at_step(self, tmp_path, mocker):
         from pawn.checkpoint import push_checkpoint_to_bucket
 
