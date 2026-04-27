@@ -18,11 +18,12 @@ The up-projection is zero-initialized, so the model starts identical to the froz
 
 **Key parameters:**
 - `bottleneck_dim` -- hidden dimension of the bottleneck (default: 8)
+- `n_hidden` -- extra `Linear(bn,bn)+GELU` stages between `down` and `up` (default: 0 reproduces the standard two-layer Houlsby block)
 - `adapt_attn` / `adapt_ffn` -- which sublayers to adapt (default: both)
 - `layers` -- which transformer layers to adapt (default: all)
 - `attn_layers` / `ffn_layers` -- per-sublayer layer selection overrides
 
-**Param count:** `n_positions * n_layers * 2 * d_model * bottleneck_dim` where n_positions is 2 (attn + ffn) by default (e.g. `2 * 8 * 2 * 512 * 8 = 131K` at dim=8, both positions, all 8 layers).
+**Param count:** `n_positions * n_layers * (2 * d_model * bottleneck_dim + n_hidden * bottleneck_dim^2)` where n_positions is 2 (attn + ffn) by default (e.g. `2 * 8 * (2 * 512 * 8 + 0) = 131K` at dim=8, n_hidden=0, both positions, all 8 layers; n_hidden=2 adds `2 * 8 * 2 * 8^2 = 2,048` → 133K).
 
 Best performer at low parameter budgets. The GELU nonlinearity and full-rank projections provide the most expressive per-parameter adaptation.
 
@@ -97,8 +98,9 @@ In retrospective modes, warm-up LoRA weights are saved as a checkpoint for analy
 - `mask_samples` -- batches for gradient accumulation (default: 32)
 - `grad_alpha` -- gradient exponent: 1=mean magnitude, 2=Fisher diagonal (default: 2)
 - `bottleneck_dim` -- bottleneck dimension for retro-bottleneck mode (default: 8)
+- `n_hidden` -- extra `Linear(bn,bn)+GELU` stages between `down` and `up` inside each Houlsby adapter, for retro-bottleneck mode (default: 0 reproduces the standard two-layer block)
 
-**Param count:** Depends on mode and configuration. In `rosa` mode: `n_lora_params + density * total_weight_elements`. In `retro-sparse`: `density * total_weight_elements`. In `retro-bottleneck`: sparse params + `2 * n_positions * n_layers * 2 * d_model * bottleneck_dim`.
+**Param count:** Depends on mode and configuration. In `rosa` mode: `n_lora_params + density * total_weight_elements`. In `retro-sparse`: `density * total_weight_elements`. In `retro-bottleneck`: sparse params + `n_positions * n_layers * (2 * d_model * bottleneck_dim + n_hidden * bottleneck_dim^2)`.
 
 ## Sparse
 

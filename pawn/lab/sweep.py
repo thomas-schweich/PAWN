@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pawn.sweep import BOTTLENECK_N_HIDDEN_CHOICES
+
 
 def builtin_distributions(strategy: str) -> dict[str, Any]:
     """Return Optuna distributions for a PAWN adapter strategy."""
@@ -26,6 +28,7 @@ def builtin_distributions(strategy: str) -> dict[str, Any]:
         },
         "bottleneck": {**common,
             "bottleneck_dim": Cat([4, 8, 16, 32, 64, 128, 256]),
+            "bottleneck_n_hidden": Cat(list(BOTTLENECK_N_HIDDEN_CHOICES)),
             "no_adapt_attn": Cat([True, False]),
             "no_adapt_ffn": Cat([True, False]),
         },
@@ -61,7 +64,11 @@ def builtin_distributions(strategy: str) -> dict[str, Any]:
     }
     spaces["rosa"] = rosa_common
     spaces["retro-sparse"] = rosa_common
-    spaces["retro-bottleneck"] = {**rosa_common, "bottleneck_dim": Cat([4, 8, 16])}
+    spaces["retro-bottleneck"] = {
+        **rosa_common,
+        "bottleneck_dim": Cat([4, 8, 16]),
+        "bottleneck_n_hidden": Cat(list(BOTTLENECK_N_HIDDEN_CHOICES)),
+    }
     spaces["pretrain"] = {
         "lr": Float(1e-5, 1e-3, log=True),
         "batch_size": Cat([64, 128, 256]),

@@ -302,6 +302,7 @@ def load_model(
             adapt_attn=adapter_config.get("adapt_attn", True),
             adapt_ffn=adapter_config.get("adapt_ffn", True),
             layers=_layer_tuple(adapter_config.get("adapter_layers")),
+            n_hidden=adapter_config.get("bottleneck_n_hidden", 0),
         ).to(device)
         model.load_adapter_state_dict(adapter_weights)
 
@@ -336,6 +337,7 @@ def load_model(
                 adapt_attn=adapter_config.get("adapt_attn", True),
                 adapt_ffn=adapter_config.get("adapt_ffn", True),
                 layers=_layer_tuple(adapter_config.get("adapter_layers")),
+                n_hidden=adapter_config.get("bottleneck_n_hidden", 0),
             ).to(device)
             model.load_adapter_state_dict(adapter_weights)
         elif adapter_type == "retro_sparse":

@@ -609,6 +609,7 @@ class TrialRunner:
                     "params": t.actual_param_count, "pid": t.pid, "gpu": t.gpu_id,
                     "key_hp": {k: v for k, v in cfg.items()
                                if k in ("lr", "lora_rank", "bottleneck_dim",
+                                        "bottleneck_n_hidden",
                                         "density", "d_model", "n_layers", "batch_size")},
                 }
                 # For pretraining runs, surface game-completion metrics and
@@ -653,7 +654,8 @@ class TrialRunner:
                 "status": t.status, "notes": t.notes, "tags": t.tags,
                 "wall_time": _format_duration(elapsed),
                 "key_hp": {k: v for k, v in cfg.items()
-                           if k in ("lr", "lora_rank", "bottleneck_dim", "density",
+                           if k in ("lr", "lora_rank", "bottleneck_dim",
+                                    "bottleneck_n_hidden", "density",
                                     "d_model", "n_layers", "batch_size")},
             })
         # Pareto front: trials not dominated on (param_count, val_loss).

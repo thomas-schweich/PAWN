@@ -240,3 +240,126 @@ class TestBottleneckCLMConfig:
     def test_cfg_property(self, toy_backbone, toy_clm_config):
         model = BottleneckCLM(toy_backbone, bottleneck_dim=4)
         assert model.cfg is toy_clm_config
+
+
+class TestMultiLayerBottleneck:
+    def test_n_hidden_zero_param_count_matches_baseline(self):
+        a0 = BottleneckAdapter(d_model=64, bottleneck_dim=8, n_hidden=0)
+        baseline = BottleneckAdapter(d_model=64, bottleneck_dim=8)
+        assert sum(p.numel() for p in a0.parameters()) == sum(
+            p.numel() for p in baseline.parameters()
+        )
+
+    def test_n_hidden_zero_matches_baseline_forward(self):
+        torch.manual_seed(0)
+        a0 = BottleneckAdapter(d_model=64, bottleneck_dim=8, n_hidden=0)
+        torch.manual_seed(0)
+        baseline = BottleneckAdapter(d_model=64, bottleneck_dim=8)
+        x = torch.randn(2, 5, 64)
+        # Both zero-init at up, both Kaiming at down — and seed is the same,
+        # so down weights are bit-identical.
+        torch.testing.assert_close(a0(x), baseline(x))
+
+    def test_identity_at_init_with_hidden(self):
+        for k in (1, 2, 3):
+            adapter = BottleneckAdapter(d_model=32, bottleneck_dim=4, n_hidden=k)
+            x = torch.randn(2, 7, 32)
+            torch.testing.assert_close(adapter(x), x)
+
+    def test_param_count_with_hidden(self):
+        d_model, bn, k = 64, 8, 2
+        adapter = BottleneckAdapter(d_model=d_model, bottleneck_dim=bn, n_hidden=k)
+        total = sum(p.numel() for p in adapter.parameters())
+        # 2*d*bn (down + up) + k * bn^2 (hidden)
+        assert total == 2 * d_model * bn + k * bn * bn
+
+    def test_negative_n_hidden_rejected(self):
+        with pytest.raises(ValueError):
+            BottleneckAdapter(d_model=32, bottleneck_dim=4, n_hidden=-1)
+
+    def test_clm_param_count_formula(self, toy_backbone, toy_clm_config):
+        bn, k = 8, 2
+        model = BottleneckCLM(toy_backbone, bottleneck_dim=bn, n_hidden=k)
+        total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        # 2 positions per layer (attn + ffn), full param count formula.
+        per_adapter = 2 * toy_clm_config.d_model * bn + k * bn * bn
+        expected = 2 * toy_clm_config.n_layers * per_adapter
+        assert total == expected
+
+    def test_clm_zero_init_identity_with_hidden(
+        self, toy_backbone, toy_input_ids, toy_attention_mask,
+    ):
+        with torch.no_grad():
+            bare_logits, _ = toy_backbone(toy_input_ids, toy_attention_mask)
+        model = BottleneckCLM(toy_backbone, bottleneck_dim=4, n_hidden=2)
+        with torch.no_grad():
+            adapted_logits = model(toy_input_ids, toy_attention_mask)
+        torch.testing.assert_close(adapted_logits, bare_logits, atol=1e-5, rtol=1e-5)
+
+    def test_hidden_layers_receive_gradient(
+        self, toy_backbone, toy_input_ids, toy_clm_config,
+    ):
+        model = BottleneckCLM(toy_backbone, bottleneck_dim=4, n_hidden=2)
+        # Break out of zero-init so signal can flow back through hidden.
+        for a in model.attn_adapters:
+            if isinstance(a, BottleneckAdapter):
+                a.up.weight.data.normal_(0.0, 0.01)
+        targets = torch.randint(0, toy_clm_config.vocab_size, toy_input_ids.shape)
+        logits = model(toy_input_ids)
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)), targets.view(-1),
+        )
+        loss.backward()
+        # Every hidden Linear must have a real gradient.
+        seen = 0
+        for adapters in (model.attn_adapters, model.ffn_adapters):
+            for a in adapters:
+                if not isinstance(a, BottleneckAdapter):
+                    continue
+                for layer in a.hidden:
+                    assert layer.weight.grad is not None
+                    seen += 1
+        assert seen > 0
+
+    def test_state_dict_roundtrip_with_hidden(
+        self, toy_backbone, toy_backbone_fresh,
+        toy_input_ids, toy_attention_mask,
+    ):
+        model = BottleneckCLM(toy_backbone, bottleneck_dim=4, n_hidden=2)
+        for a in list(model.attn_adapters) + list(model.ffn_adapters):
+            if isinstance(a, BottleneckAdapter):
+                a.down.weight.data.normal_(0.0, 0.5)
+                for layer in a.hidden:
+                    assert isinstance(layer, torch.nn.Linear)
+                    layer.weight.data.normal_(0.0, 0.5)
+                a.up.weight.data.normal_(0.0, 0.01)
+        state = model.adapter_state_dict()
+        # Hidden weights must be in the persisted state.
+        assert any("hidden" in k for k in state)
+
+        fresh = BottleneckCLM(toy_backbone_fresh, bottleneck_dim=4, n_hidden=2)
+        fresh.load_adapter_state_dict(state)
+        with torch.no_grad():
+            out1 = model(toy_input_ids, toy_attention_mask)
+            out2 = fresh(toy_input_ids, toy_attention_mask)
+        torch.testing.assert_close(out1, out2, atol=1e-6, rtol=1e-6)
+
+    def test_weight_report_includes_hidden(self, toy_backbone):
+        model = BottleneckCLM(toy_backbone, bottleneck_dim=4, n_hidden=2)
+        report = model.adapter_weight_report()
+        assert any("hidden0" in k for k in report)
+        assert any("hidden1" in k for k in report)
+
+    def test_retro_bottleneck_smoke_with_hidden(
+        self, toy_backbone, toy_input_ids, toy_attention_mask,
+    ):
+        from pawn.adapters.rosa import RetroBottleneckCLM
+
+        model = RetroBottleneckCLM(toy_backbone, bottleneck_dim=4, n_hidden=1)
+        with torch.no_grad():
+            logits = model(toy_input_ids, toy_attention_mask)
+        assert logits.shape[:2] == toy_input_ids.shape
+        # Identity at init: hidden present but up.weight=0 still nullifies.
+        with torch.no_grad():
+            bare, _ = toy_backbone(toy_input_ids, toy_attention_mask)
+        torch.testing.assert_close(logits, bare, atol=1e-5, rtol=1e-5)
