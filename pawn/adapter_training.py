@@ -336,16 +336,21 @@ def build_compiled_step(
     """Build a (possibly compiled) per-step function for the hot loop.
 
     Returns a callable ``step(ids, msk, legal_mask, targets) -> (loss,
-    top1_sum, n_pos)``. Combines the backbone forward, sparse logit
-    projection, optional legal-mask, cross-entropy, and top-1 count
-    into a single graph that ``torch.compile(mode="reduce-overhead")``
-    can fuse and CUDA-graph-capture per (B, T) shape.
+    top1_sum)``. Combines the backbone forward, sparse logit projection,
+    optional legal-mask, cross-entropy, and top-1 count into a single
+    graph that ``torch.compile(mode="reduce-overhead")`` can fuse and
+    CUDA-graph-capture per (B, T) shape.
 
     The data-dependent ``hidden[msk]`` filter forces a graph break at
     that point — cudagraph trees fall back to eager for the masked
     section and resume capture for the loss tail. The bulk of kernel-
     launch overhead lives in the backbone forward (8 layers ×
     {LayerNorm, attn, FFN}), which is fully captured.
+
+    Compiled graphs are not checkpointed: resuming a run re-traces
+    from scratch and may select different kernels than the original
+    pass. For bit-identical loss across resumes, set
+    ``CUDNN_DETERMINISTIC=1`` in the environment.
     """
     use_amp = amp_dtype is not None
 

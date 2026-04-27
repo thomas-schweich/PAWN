@@ -251,9 +251,12 @@ class AdapterConfig(BaseRunConfig):
     # bucket_size)``, clamped to ``max_seq_len``. With ``bucket_size=64``
     # and ``max_seq_len=512`` the compiled step graph cache holds at
     # most 8 entries (64, 128, ..., 512), and typical 60-120-ply
-    # Lichess games stop paying full-width attention cost. Must divide
-    # ``max_seq_len`` (validator-checked in
-    # :class:`BucketedLegalMaskCollate`).
+    # Lichess games stop paying full-width attention cost. Off-grid
+    # ``max_seq_len`` (e.g. 300) is permitted — the cap-clamped top
+    # bucket adds one extra graph entry. **Must remain constant
+    # across resumes**: different bucket sizes change batch composition
+    # (which game ends up the longest in a batch) and break loss
+    # reproducibility.
     bucket_size: int = 64
 
     # Data sizing ---------------------------------------------------------
