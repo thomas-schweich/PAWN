@@ -16,6 +16,7 @@ from pawn.lichess_data import (
     LegalMaskBuilder,
     LegalMaskCollate,
     compute_legal_indices,
+    bucket_grid,
     round_up_to_bucket,
 )
 
@@ -78,7 +79,7 @@ class TestLegalMaskBuilder:
         builder = LegalMaskBuilder(batch_size=B, seq_len=max_ply, vocab_size=vocab, device="cpu"
         )
         indices = torch.zeros(0, dtype=torch.long)
-        mask = builder.scatter(indices, B)
+        mask = builder.scatter(indices, B, builder.T)
         # Default pure-moves: T == max_ply (no outcome slot)
         assert mask.shape == (B, max_ply, vocab)
         assert mask.dtype == torch.bool
@@ -94,7 +95,7 @@ class TestLegalMaskBuilder:
             prepend_outcome=True,
         )
         indices = torch.zeros(0, dtype=torch.long)
-        mask = builder.scatter(indices, B)
+        mask = builder.scatter(indices, B, builder.T)
         # Both modes use the same total tensor width. prepend_outcome=True
         # consumes slot 0 for the outcome; pure-moves uses all `seq_len`
         # slots for moves.
@@ -110,7 +111,7 @@ class TestLegalMaskBuilder:
         )
         # Indices point into the flat (B*T*V) buffer where T == seq_len.
         indices = torch.tensor([5, 10, 100], dtype=torch.long)
-        mask = builder.scatter(indices, B)
+        mask = builder.scatter(indices, B, builder.T)
         flat = mask.view(-1)
         assert flat[5].item()
         assert flat[10].item()
@@ -127,9 +128,9 @@ class TestLegalMaskBuilder:
         builder = LegalMaskBuilder(batch_size=B, seq_len=max_ply, vocab_size=vocab, device="cpu"
         )
         indices_a = torch.tensor([5, 10, 100], dtype=torch.long)
-        mask_a = builder.scatter(indices_a, B).clone()
+        mask_a = builder.scatter(indices_a, B, builder.T).clone()
         indices_b = torch.tensor([3, 7], dtype=torch.long)
-        mask_b = builder.scatter(indices_b, B)
+        mask_b = builder.scatter(indices_b, B, builder.T)
         # mask_b should not include 5, 10, 100 from the previous call
         flat_b = mask_b.view(-1)
         assert not flat_b[5].item()
@@ -144,7 +145,7 @@ class TestLegalMaskBuilder:
         )
         indices = torch.zeros(0, dtype=torch.long)
         with pytest.raises(ValueError, match="exceeds builder capacity"):
-            builder.scatter(indices, B=99)
+            builder.scatter(indices, B=99, T=builder.T)
 
     @pytest.mark.integration
     def test_scatter_partial_b(self):
@@ -152,7 +153,7 @@ class TestLegalMaskBuilder:
         builder = LegalMaskBuilder(batch_size=8, seq_len=4, vocab_size=16, device="cpu"
         )
         indices = torch.tensor([1], dtype=torch.long)
-        mask = builder.scatter(indices, B=3)
+        mask = builder.scatter(indices, B=3, T=builder.T)
         assert mask.shape[0] == 3
 
     @pytest.mark.integration
@@ -316,6 +317,7 @@ class TestLegalMaskCollate:
         ]
         batch = collate(items)
         direct = compute_legal_indices(move_ids, gl, seq_len=seq_len)
+        assert "legal_indices" in batch
         assert np.array_equal(batch["legal_indices"].numpy(), direct)
 
 
@@ -347,6 +349,37 @@ class TestRoundUpToBucket:
     def test_bucket_size_zero_returns_clamped_n(self):
         assert round_up_to_bucket(80, 0, 512) == 80
         assert round_up_to_bucket(1000, 0, 512) == 512
+
+
+class TestBucketGrid:
+    @pytest.mark.unit
+    def test_aligned_cap(self):
+        # bucket_size=64, cap=512: every multiple of 64 from 64..512.
+        assert bucket_grid(64, 512) == [64, 128, 192, 256, 320, 384, 448, 512]
+
+    @pytest.mark.unit
+    def test_unaligned_cap_appends_cap(self):
+        # cap is not a multiple of bucket_size: extra entry at cap.
+        assert bucket_grid(64, 300) == [64, 128, 192, 256, 300]
+
+    @pytest.mark.unit
+    def test_cap_smaller_than_bucket(self):
+        # Degenerate config: still returns at least the cap.
+        assert bucket_grid(64, 32) == [32]
+
+    @pytest.mark.unit
+    def test_bucket_size_zero_collapses(self):
+        assert bucket_grid(0, 512) == [512]
+        assert bucket_grid(-1, 128) == [128]
+
+    @pytest.mark.unit
+    def test_round_up_outputs_are_subset_of_grid(self):
+        # The grid enumerates every distinct value round_up_to_bucket
+        # can return for a given (bucket_size, cap).
+        bs, cap = 64, 300
+        grid = set(bucket_grid(bs, cap))
+        for n in range(1, cap + 50):
+            assert round_up_to_bucket(n, bs, cap) in grid
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +439,9 @@ class TestBucketedLegalMaskCollate:
             seq_len=T,
             vocab_size=1968,
         )
+        # ``legal_indices`` is NotRequired (omitted when
+        # ``skip_legal_indices`` is set); the default collate emits it.
+        assert "legal_indices" in batch
         assert np.array_equal(batch["legal_indices"].numpy(), direct)
 
     @pytest.mark.integration

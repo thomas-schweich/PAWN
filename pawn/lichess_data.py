@@ -10,6 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, TypedDict
 
+from typing_extensions import NotRequired
+
 import numpy as np
 import polars as pl
 import torch
@@ -20,15 +22,14 @@ import chess_engine as engine
 from pawn.config import PAD_TOKEN
 
 
-class BucketedBatchDict(TypedDict, total=False):
+class BucketedBatchDict(TypedDict):
     """Output schema of :class:`BucketedLegalMaskCollate`.
 
-    ``legal_indices`` is conditionally present: omitted when the
-    collate's ``skip_legal_indices`` flag is set (e.g. on the val
-    loader after :func:`pawn.adapter_training.precompute_val_masks`
-    has cached them upstream). All other keys are always populated;
-    ``total=False`` only relaxes the runtime-required set so consumers
-    can branch on ``"legal_indices" in batch``.
+    All keys except ``legal_indices`` are always populated.
+    ``legal_indices`` is omitted when the collate's
+    ``skip_legal_indices`` flag is set (e.g. on the val loader after
+    :func:`pawn.adapter_training.precompute_val_masks` has cached them
+    upstream); consumers branch on ``"legal_indices" in batch``.
     """
 
     input_ids: torch.Tensor       # (B, T_actual) long
@@ -37,9 +38,11 @@ class BucketedBatchDict(TypedDict, total=False):
     move_ids: torch.Tensor        # (B, max_ply) int16
     game_length: torch.Tensor     # (B,) int64
     T_actual: int                 # bucketed per-batch sequence width
-    legal_indices: torch.Tensor   # (n,) int64 — flat sparse indices into
-                                  # the (B, T_actual, vocab_size) mask
-                                  # buffer, when present
+    legal_indices: NotRequired[torch.Tensor]  # (n,) int64 — flat sparse
+                                              # indices into the
+                                              # (B, T_actual, vocab_size)
+                                              # mask buffer; absent when
+                                              # ``skip_legal_indices`` is set
 
 
 def round_up_to_bucket(n: int, bucket_size: int, cap: int) -> int:
@@ -53,6 +56,25 @@ def round_up_to_bucket(n: int, bucket_size: int, cap: int) -> int:
         return min(max(n, 1), cap)
     rounded = ((max(n, 1) + bucket_size - 1) // bucket_size) * bucket_size
     return min(rounded, cap)
+
+
+def bucket_grid(bucket_size: int, cap: int) -> list[int]:
+    """Enumerate the distinct ``T`` values :func:`round_up_to_bucket` can emit.
+
+    With ``bucket_size=64, cap=512`` returns ``[64, 128, ..., 512]`` (8
+    entries). When ``cap`` is not a multiple of ``bucket_size`` the
+    final entry is ``cap`` itself (e.g. ``bucket_size=64, cap=300`` →
+    ``[64, 128, 192, 256, 300]``). ``bucket_size <= 0`` collapses to
+    ``[cap]``. Used by the compiled-step pre-warm loop so each shape's
+    dynamo trace + cudagraph capture cost is paid before training
+    starts rather than lazily on the first batch that hits each bucket.
+    """
+    if bucket_size <= 0:
+        return [max(cap, 1)]
+    grid = list(range(bucket_size, cap + 1, bucket_size))
+    if not grid or grid[-1] != cap:
+        grid.append(cap)
+    return grid
 
 
 # ---------------------------------------------------------------------------
@@ -195,28 +217,29 @@ class LegalMaskBuilder:
         self,
         legal_indices: torch.Tensor,
         B: int,
-        T: int | None = None,
+        T: int,
     ) -> torch.Tensor:
         """Scatter pre-computed CPU indices into a fresh GPU mask buffer.
 
         Allocates a ``(B, T, V)`` bool tensor and scatters the supplied
         flat indices into it. ``T`` is the per-batch tensor width that
-        the indices were computed against; when ``None`` it defaults to
-        ``self.T``. The caching allocator reuses freed buffers across
-        steps, so the per-call cost is dominated by the ``zero_()``
-        memset.
+        the indices were computed against — required, because under the
+        bucketed collate every batch has its own ``T_actual`` and
+        silently defaulting to ``self.T`` (the model's full seq_len)
+        would over-allocate. Legacy fixed-T callers pass ``T=builder.T``
+        explicitly. The caching allocator reuses freed buffers across
+        steps, so per-call cost is dominated by the ``zero_()`` memset.
         """
         if B > self._max_batch:
             raise ValueError(
                 f"B={B} exceeds builder capacity batch_size={self._max_batch}"
             )
-        T_eff = self.T if T is None else T
-        if T_eff > self.T:
+        if T > self.T:
             raise ValueError(
-                f"scatter T={T_eff} exceeds builder seq_len={self.T}"
+                f"scatter T={T} exceeds builder seq_len={self.T}"
             )
         mask_view = torch.zeros(
-            B, T_eff, self.vocab_size,
+            B, T, self.vocab_size,
             dtype=torch.bool, device=self.device,
         )
         n = legal_indices.shape[0]
@@ -251,7 +274,7 @@ class LegalMaskBuilder:
             prepend_outcome=self.prepend_outcome,
         )
 
-        return self.scatter(torch.from_numpy(indices), B)
+        return self.scatter(torch.from_numpy(indices), B, self.T)
 
 
 class LegalMaskCollate:

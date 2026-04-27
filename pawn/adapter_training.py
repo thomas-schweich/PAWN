@@ -22,7 +22,7 @@ import json
 import math
 import signal
 import time
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, NamedTuple
 
 import numpy as np
 import torch
@@ -419,6 +419,57 @@ def build_compiled_step(
     return _step
 
 
+def warmup_compiled_step(
+    step_fn: CompiledStep,
+    *,
+    optimizer: torch.optim.Optimizer,
+    bucket_widths: list[int],
+    batch_size: int,
+    vocab_size: int,
+    device: str,
+) -> None:
+    """Pre-trace + capture the compiled step at every bucket shape.
+
+    First invocation at each new ``(B, T)`` shape pays the dynamo trace
+    + cudagraph capture cost (often >1 s per bucket). Doing this at
+    train start flattens the early-step latency curve so the loop runs
+    at steady-state sps from step 0 instead of paying compile bursts on
+    the first batch that hits each bucket.
+
+    Forward + backward are exercised so both the forward graph and its
+    paired backward graph are captured. Gradients are zeroed after
+    each call so no parameter update leaks into the real run; this
+    must run *before* the training loop's optimizer.step() invocations.
+
+    The dummy batch uses an all-ones legal mask and pads only the back
+    half — this guarantees ≥1 valid loss-mask position per row (CE over
+    zero rows is undefined) and ≥1 legal token per position (softmax
+    over an all-``-inf`` row would NaN under the hard mask).
+    """
+    if not bucket_widths:
+        return
+    print(
+        f"  Pre-warming compiled step at {len(bucket_widths)} bucket(s): "
+        f"{bucket_widths}",
+        flush=True,
+    )
+    t0 = time.time()
+    for T in bucket_widths:
+        ids = torch.zeros(batch_size, T, dtype=torch.long, device=device)
+        tgt = torch.zeros(batch_size, T, dtype=torch.long, device=device)
+        msk = torch.zeros(batch_size, T, dtype=torch.bool, device=device)
+        msk[:, : max(1, T // 2)] = True
+        legal = torch.ones(
+            batch_size, T, vocab_size, dtype=torch.bool, device=device
+        )
+        loss, _ = step_fn(ids, msk, legal, tgt)
+        loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"  Pre-warm done in {time.time() - t0:.1f}s", flush=True)
+
+
 def sparse_forward(
     model: nn.Module,
     ids: torch.Tensor,
@@ -499,7 +550,7 @@ def evaluate(
     mask_builder: LegalMaskBuilder,
     device: str,
     amp_dtype: torch.dtype | None = None,
-    precomputed_indices: list[torch.Tensor | tuple[int, torch.Tensor]] | None = None,
+    precomputed_indices: list[PrecomputedMask] | None = None,
     apply_legal_mask: bool = True,
     illegal_penalty: float = 0.0,
 ) -> dict[str, float]:
@@ -529,18 +580,13 @@ def evaluate(
         # the input width when the legacy fixed-T collate is in use.
         T_batch = int(batch.get("T_actual", ids.shape[1]))
         if precomputed_indices is not None:
-            # Precomputed indices may be either a flat tensor (legacy
-            # fixed-T path) or a (T, indices) tuple from
-            # :func:`precompute_val_masks` under bucketing.
             entry = precomputed_indices[i]
-            if isinstance(entry, tuple):
-                T_b, idx_b = entry
-                legal_mask = mask_builder.scatter(idx_b, ids.shape[0], T=T_b)
-            else:
-                legal_mask = mask_builder.scatter(entry, ids.shape[0])
+            legal_mask = mask_builder.scatter(
+                entry.indices, ids.shape[0], entry.T_actual,
+            )
         elif "legal_indices" in batch:
             legal_mask = mask_builder.scatter(
-                batch["legal_indices"], ids.shape[0], T=T_batch,
+                batch["legal_indices"], ids.shape[0], T_batch,
             )
         else:
             legal_mask = mask_builder(batch)
@@ -710,28 +756,41 @@ def write_schedule_health(
     return health
 
 
+class PrecomputedMask(NamedTuple):
+    """Cached legal-mask indices for one val batch.
+
+    ``T_actual`` is the per-batch tensor width that ``indices`` was
+    computed against — under :class:`BucketedLegalMaskCollate` this
+    varies per batch; under the legacy fixed-T collate it equals
+    ``mask_builder.T`` for every entry. ``indices`` is the flat sparse
+    representation passed to :meth:`LegalMaskBuilder.scatter`.
+    """
+
+    T_actual: int
+    indices: torch.Tensor
+
+
 def precompute_val_masks(
     val_loader: DataLoader[Any],
     mask_builder: LegalMaskBuilder,
     vocab_size: int,
-) -> list[torch.Tensor | tuple[int, torch.Tensor]]:
+) -> list[PrecomputedMask]:
     """Precompute legal-mask indices for the val set.
 
     With :class:`BucketedLegalMaskCollate` the val loader emits a
     per-batch ``T_actual`` and ``legal_indices`` is already on the
     batch — pass them through verbatim so :func:`evaluate` can scatter
     at the right shape. Without bucketing we fall back to the legacy
-    path (fixed ``mask_builder.T`` for every batch) and store flat
-    tensors.
+    path: each entry's ``T_actual`` is ``mask_builder.T`` (the fixed
+    full seq_len).
     """
-    indices: list[torch.Tensor | tuple[int, torch.Tensor]] = []
+    out: list[PrecomputedMask] = []
     for batch in val_loader:
         if "legal_indices" in batch and "T_actual" in batch:
             idx_t = batch["legal_indices"]
             if not isinstance(idx_t, torch.Tensor):
                 idx_t = torch.from_numpy(idx_t)
-            T_b = int(batch["T_actual"])
-            indices.append((T_b, idx_t.pin_memory()))
+            out.append(PrecomputedMask(int(batch["T_actual"]), idx_t.pin_memory()))
             continue
         move_ids = batch["move_ids"]
         if isinstance(move_ids, torch.Tensor):
@@ -744,8 +803,8 @@ def precompute_val_masks(
             vocab_size,
             prepend_outcome=mask_builder.prepend_outcome,
         )
-        indices.append(torch.from_numpy(idx).pin_memory())
-    return indices
+        out.append(PrecomputedMask(mask_builder.T, torch.from_numpy(idx).pin_memory()))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1394,7 +1453,7 @@ def train(
     train_loader: DataLoader[Any],
     val_loader: DataLoader[Any],
     mask_builder: LegalMaskBuilder,
-    val_legal_indices: list[torch.Tensor | tuple[int, torch.Tensor]],
+    val_legal_indices: list[PrecomputedMask],
     logger: MetricsLogger,
     args: Any,
     device: str,
@@ -1496,6 +1555,30 @@ def train(
         amp_dtype=amp_dtype,
         use_compile=bool(gpu_cfg.get("use_compile", False)),
     )
+
+    # Pre-trace every bucket shape so the dynamo + cudagraph capture
+    # cost is paid before the first training batch. Only meaningful
+    # when compile is on and the loader uses ``BucketedLegalMaskCollate``
+    # (the legacy fixed-T collate emits a single shape, which would
+    # also be primed by the first real batch — pre-warming there would
+    # save at most one compile burst). Must run before the resume
+    # block's checkpoint-load: the optimizer state restored from a
+    # checkpoint is preserved by the ``zero_grad`` calls (they only
+    # touch ``.grad``, not the AdamW moments), but it's cleaner to
+    # warm with a fresh optimizer.
+    from pawn.lichess_data import BucketedLegalMaskCollate, bucket_grid
+    if gpu_cfg.get("use_compile", False):
+        collate = train_loader.collate_fn
+        if isinstance(collate, BucketedLegalMaskCollate):
+            widths = bucket_grid(collate.bucket_size, collate.seq_len)
+            warmup_compiled_step(
+                step_fn,
+                optimizer=optimizer,
+                bucket_widths=widths,
+                batch_size=int(args.batch_size),
+                vocab_size=int(collate.vocab_size),
+                device=device,
+            )
 
     # Resume
     start_epoch = 0
@@ -1778,21 +1861,10 @@ def train(
             msk = batch["loss_mask"].to(device, non_blocking=True)
             T_batch = int(batch.get("T_actual", ids.shape[1]))
             legal_mask = mask_builder.scatter(
-                batch["legal_indices"], ids.shape[0], T=T_batch,
+                batch["legal_indices"], ids.shape[0], T_batch,
             )
 
             loss, top1_sum = step_fn(ids, msk, legal_mask, tgt)
-
-            # Detach + clone before any post-step work. Under
-            # ``mode="reduce-overhead"`` cudagraph trees, the tensors
-            # returned from a compiled step alias the graph's static
-            # output buffers; the next ``step_fn`` call overwrites
-            # them. ``loss.backward()`` consumes ``loss`` before the
-            # next call (safe), but the diagnostic accumulators below
-            # would otherwise read stale values once the next step
-            # runs. Cloning into private storage decouples them.
-            loss_for_log = loss.detach().clone()
-            top1_sum = top1_sum.clone()
 
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
@@ -1811,10 +1883,17 @@ def train(
                 optimizer.step()
             scheduler.step()
 
-            # Position count from the loss mask itself — keeps things on
-            # GPU and avoids any per-step sync.
+            # Diagnostic accumulators. ``loss`` and ``top1_sum`` alias
+            # the compiled step's static output buffers under cudagraph
+            # trees; the buffers are reclaimed at the *next* step's
+            # ``mark_step_begin``. All reads queued here run on the same
+            # CUDA stream as that next launch, so stream ordering
+            # guarantees these accumulators see the current step's
+            # values — no defensive ``.clone()`` needed. (Vocab-shaped
+            # outputs would still be unsafe for downstream autograd
+            # consumption, which is why the graph returns scalars.)
             n_pos_t = msk.sum()
-            loss_sum = loss_for_log * n_pos_t.to(loss_for_log.dtype)
+            loss_sum = loss.detach() * n_pos_t.to(loss.dtype)
             epoch_loss_t += loss_sum
             epoch_top1_t += top1_sum
             epoch_positions_t += n_pos_t

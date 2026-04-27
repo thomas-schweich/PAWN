@@ -648,7 +648,9 @@ class InProcessRoSAObjective:
                 ids = batch["input_ids"].to(device, non_blocking=True)
                 tgt = batch["targets"].to(device, non_blocking=True)
                 msk = batch["loss_mask"].to(device, non_blocking=True)
-                legal_mask = mask_builder.scatter(batch["legal_indices"], ids.shape[0])
+                legal_mask = mask_builder.scatter(
+                    batch["legal_indices"], ids.shape[0], mask_builder.T
+                )
 
                 with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                     hidden = warmup_model.forward_hidden(ids, msk)
@@ -748,7 +750,9 @@ class InProcessRoSAObjective:
                 ids = batch["input_ids"].to(device, non_blocking=True)
                 tgt = batch["targets"].to(device, non_blocking=True)
                 msk = batch["loss_mask"].to(device, non_blocking=True)
-                legal_mask = mask_builder.scatter(batch["legal_indices"], ids.shape[0])
+                legal_mask = mask_builder.scatter(
+                    batch["legal_indices"], ids.shape[0], mask_builder.T
+                )
 
                 with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                     hidden = model.forward_hidden(ids, msk)
@@ -783,7 +787,9 @@ class InProcessRoSAObjective:
                     tgt = batch["targets"].to(device, non_blocking=True)
                     msk = batch["loss_mask"].to(device, non_blocking=True)
                     lm = self._mask_builder.scatter(
-                        self._val_legal_indices[i], ids.shape[0],
+                        self._val_legal_indices[i],
+                        ids.shape[0],
+                        self._mask_builder.T,
                     )
                     with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                         hidden = model.forward_hidden(ids, msk)

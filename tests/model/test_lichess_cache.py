@@ -9,10 +9,13 @@ import polars as pl
 import pytest
 import torch
 
+from typing import cast
+
 from pawn.config import OUTCOME_TOKEN_BASE
 from pawn.lichess_cache import (
     IndexedLichessDataset,
     LichessTokenCache,
+    PackedItem,
     SeededEpochSampler,
     _derive_key,
     _load_cache,
@@ -193,7 +196,9 @@ class TestIndexedLichessDataset:
         )
 
         assert len(ds) == 3
-        sample = ds[0]
+        # ``lazy_pack=False`` (default) returns ``PackedItem``; cast for
+        # the type checker since ``__getitem__``'s return is the union.
+        sample = cast(PackedItem, ds[0])
         assert sample["input_ids"].shape == (16,)
         assert sample["targets"].shape == (16,)
         assert sample["loss_mask"].shape == (16,)
@@ -250,7 +255,7 @@ class TestIndexedLichessDataset:
             max_ply=8,
             prepend_outcome=True,
         )
-        sample = ds[0]
+        sample = cast(PackedItem, ds[0])
         # Outcome at slot 0 (in [1969, 1979]).
         outcome = int(sample["input_ids"][0].item())
         assert OUTCOME_TOKEN_BASE <= outcome < OUTCOME_TOKEN_BASE + 11

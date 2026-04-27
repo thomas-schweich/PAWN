@@ -7,6 +7,7 @@ These are unit tests; full training loops are covered by higher-level integratio
 from __future__ import annotations
 
 import math
+from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -762,7 +763,7 @@ class TestEvaluate:
 
     def test_precomputed_indices_path(self, cpu_device):
         """Passing precomputed_indices triggers mask_builder.scatter with the cached tensor."""
-        from pawn.adapter_training import evaluate
+        from pawn.adapter_training import PrecomputedMask, evaluate
 
         B, T, V, D = 1, 2, 8, 4
         model = _StubWrapper(D, V, T).to(cpu_device)
@@ -778,12 +779,13 @@ class TestEvaluate:
         cached_idx = torch.zeros(B, T, dtype=torch.long)
         metrics = evaluate(
             model, [batch], mask_builder, cpu_device,
-            precomputed_indices=[cached_idx],
+            precomputed_indices=[PrecomputedMask(T, cached_idx)],
         )
-        # scatter was called with the precomputed tensor
+        # scatter was called with the precomputed tensor and T_actual
         mask_builder.scatter.assert_called_once()
         args, _ = mask_builder.scatter.call_args
         assert torch.equal(args[0], cached_idx)
+        assert args[2] == T
         assert {"loss", "top1_accuracy", "top5_accuracy"} <= set(metrics.keys())
 
     def test_zero_valid_positions_skipped(self, cpu_device):
@@ -1387,6 +1389,65 @@ class TestBuildCompiledStep:
             assert torch.isfinite(loss).item()
 
 
+class TestWarmupCompiledStep:
+    """Eager-mode tests for ``warmup_compiled_step``. Validates the
+    dummy-batch construction and the loop's invariants (zeroed grads,
+    no parameter drift, every bucket exercised). The compile-and-
+    capture behavior is a CUDA-only side effect of ``step_fn``; it's
+    out of scope here."""
+
+    def test_runs_one_step_per_bucket(self, cpu_device):
+        from pawn.adapter_training import (
+            build_compiled_step,
+            warmup_compiled_step,
+        )
+
+        V, D, B = 4, 2, 2
+        # Use a wider model T-axis so multiple bucket widths fit.
+        model = _StubWrapper(D, V, T=64).to(cpu_device)
+        step = build_compiled_step(
+            model,
+            apply_legal_mask=True,
+            illegal_penalty=0.0,
+            amp_dtype=None,
+            use_compile=False,
+        )
+        optim = torch.optim.SGD(model.parameters(), lr=1e-3)
+        # Snapshot params; warmup zeros grads after each call so no
+        # ``optim.step`` ever runs and parameters must be unchanged.
+        before = {n: p.detach().clone() for n, p in model.named_parameters()}
+        warmup_compiled_step(
+            step,
+            optimizer=optim,
+            bucket_widths=[8, 16, 32],
+            batch_size=B,
+            vocab_size=V,
+            device=cpu_device,
+        )
+        for n, p in model.named_parameters():
+            assert torch.equal(before[n], p), f"parameter {n} drifted during warmup"
+            # Grads zeroed (set_to_none=True).
+            assert p.grad is None
+
+    def test_empty_bucket_list_is_noop(self, cpu_device):
+        from pawn.adapter_training import (
+            build_compiled_step,
+            warmup_compiled_step,
+        )
+
+        model = _StubWrapper(2, 4, T=8).to(cpu_device)
+        step = build_compiled_step(
+            model, apply_legal_mask=True, illegal_penalty=0.0,
+            amp_dtype=None, use_compile=False,
+        )
+        optim = torch.optim.SGD(model.parameters(), lr=1e-3)
+        # Must not raise on the empty list; nothing to do.
+        warmup_compiled_step(
+            step, optimizer=optim, bucket_widths=[], batch_size=2,
+            vocab_size=4, device=cpu_device,
+        )
+
+
 # ---------------------------------------------------------------------------
 # LegalMaskBuilder dynamic-T paths
 # ---------------------------------------------------------------------------
@@ -1394,9 +1455,10 @@ class TestBuildCompiledStep:
 
 class TestLegalMaskBuilderDynamicT:
     """Coverage for the per-batch-T path on
-    :meth:`LegalMaskBuilder.scatter`. The static path (T=None) is
-    covered by :class:`TestLegalMaskBuilder` in test_lichess_data.py;
-    here we focus on the bucketed-collate scenarios."""
+    :meth:`LegalMaskBuilder.scatter`. The fixed-seq_len path is
+    covered by :class:`TestLegalMaskBuilder` in test_lichess_data.py
+    (callers pass ``T=builder.T`` explicitly there); here we focus on
+    the bucketed-collate scenarios where T varies per batch."""
 
     def test_scatter_T_smaller_than_self_T(self):
         from pawn.lichess_data import LegalMaskBuilder
@@ -1443,14 +1505,15 @@ class TestLegalMaskBuilderDynamicT:
         # did, the test only checks logical independence).
         assert m1.data_ptr() != m2.data_ptr() or m1.shape != m2.shape
 
-    def test_scatter_T_none_defaults_to_self_T(self):
+    def test_scatter_T_required(self):
+        """``T`` is a required positional/kwarg parameter — no default."""
         from pawn.lichess_data import LegalMaskBuilder
 
         builder = LegalMaskBuilder(
             batch_size=2, seq_len=8, vocab_size=4, device="cpu"
         )
-        m = builder.scatter(torch.tensor([3], dtype=torch.long), B=1)
-        assert m.shape == (1, 8, 4)
+        with pytest.raises(TypeError):
+            builder.scatter(torch.tensor([3], dtype=torch.long), 1)  # type: ignore[call-arg]
 
 
 # ---------------------------------------------------------------------------
@@ -1462,10 +1525,10 @@ class TestBucketedLegalMaskCollateEdgeCases:
     """Coverage for the degenerate / boundary inputs not exercised in
     test_lichess_data.py's main happy-path tests."""
 
-    def _build(self, **kw):
+    def _build(self, **kw: Any) -> Any:
         from pawn.lichess_data import BucketedLegalMaskCollate
 
-        defaults = dict(
+        defaults: dict[str, Any] = dict(
             seq_len=128, bucket_size=64, vocab_size=1980,
             prepend_outcome=False,
         )
@@ -1549,4 +1612,5 @@ class TestBucketedLegalMaskCollateEdgeCases:
             vocab_size=1980,
             prepend_outcome=True,
         )
+        assert "legal_indices" in batch
         assert np.array_equal(batch["legal_indices"].numpy(), direct)
