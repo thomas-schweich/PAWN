@@ -379,10 +379,12 @@ class RetroBottleneckCLM(nn.Module):
         adapt_attn: bool = True,
         adapt_ffn: bool = True,
         layers: tuple[int, ...] | None = None,
+        n_hidden: int = 0,
     ):
         super().__init__()
         self.backbone = backbone
         self.bottleneck_dim = bottleneck_dim
+        self.n_hidden = n_hidden
         cfg = backbone.cfg
         n_layers = len(backbone.layers)
         adapted = set(layers if layers is not None else range(n_layers))
@@ -396,11 +398,15 @@ class RetroBottleneckCLM(nn.Module):
         self.ffn_adapters = nn.ModuleList()
         for i in range(n_layers):
             if i in adapted and adapt_attn:
-                self.attn_adapters.append(BottleneckAdapter(cfg.d_model, bottleneck_dim))
+                self.attn_adapters.append(
+                    BottleneckAdapter(cfg.d_model, bottleneck_dim, n_hidden=n_hidden)
+                )
             else:
                 self.attn_adapters.append(nn.Identity())
             if i in adapted and adapt_ffn:
-                self.ffn_adapters.append(BottleneckAdapter(cfg.d_model, bottleneck_dim))
+                self.ffn_adapters.append(
+                    BottleneckAdapter(cfg.d_model, bottleneck_dim, n_hidden=n_hidden)
+                )
             else:
                 self.ffn_adapters.append(nn.Identity())
 

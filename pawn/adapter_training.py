@@ -681,6 +681,7 @@ def _build_bottleneck(
         adapt_attn=not args.no_adapt_attn,
         adapt_ffn=not args.no_adapt_ffn,
         layers=layers,
+        n_hidden=getattr(args, "bottleneck_n_hidden", 0),
     ).to(device)
     params = model.adapter_parameters()
     n = sum(p.numel() for p in params)
@@ -1126,6 +1127,7 @@ def rosa_build_phase3(
     model = RetroBottleneckCLM(
         sparse_model.backbone,
         bottleneck_dim=dim,
+        n_hidden=getattr(args, "bottleneck_n_hidden", 0),
     ).to(device)
     params = model.adapter_parameters()
     n = sum(p.numel() for p in params)
@@ -1180,6 +1182,17 @@ def build_config_json(args: Any, param_count: int) -> dict[str, Any]:
         # Bottleneck
         "bottleneck_dim": args.bottleneck_dim
         if args.strategy in ("bottleneck", "rosa")
+        else None,
+        # Only ``retro-bottleneck`` (and the plain ``bottleneck`` strategy)
+        # actually instantiates Houlsby MLPs; ``retro-sparse`` and joint
+        # ``rosa`` don't, so persisting the field there would be a misleading
+        # artifact in saved configs.
+        "bottleneck_n_hidden": getattr(args, "bottleneck_n_hidden", 0)
+        if args.strategy == "bottleneck"
+        or (
+            args.strategy == "rosa"
+            and getattr(args, "rosa_mode", None) == "retro-bottleneck"
+        )
         else None,
         "adapt_attn": (not args.no_adapt_attn)
         if args.strategy == "bottleneck"

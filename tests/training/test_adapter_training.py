@@ -988,6 +988,91 @@ class TestBuildConfigJsonLegality:
         assert cfg["illegal_penalty"] == 0.75
 
 
+def _bottleneck_args(**overrides):
+    """Helper: build a minimally-populated argparse.Namespace for build_config_json."""
+    import argparse
+
+    base = dict(
+        strategy="bottleneck",
+        checkpoint="thomas-schweich/pawn-base",
+        pgn="thomas-schweich/pawn-lichess-full",
+        elo_min=None, elo_max=None, max_games=None, val_games=0,
+        total_steps=None, eval_interval=None, epochs=1,
+        batch_size=1, lr=0.0, warmup_frac=0.0, weight_decay=0.0,
+        max_grad_norm=0.0, amp_dtype="none", patience=None,
+        adapter_layers=None,
+        bottleneck_dim=8, bottleneck_n_hidden=0,
+        no_adapt_attn=False, no_adapt_ffn=False,
+        lora_rank=None, lora_targets=None, lora_ffn=False,
+        density=None, sparse_targets=None, sparse_ffn=False,
+        use_output_film=False,
+        rosa_mode=None, rosa_warmup_steps=0, mask_samples=0, grad_alpha=1,
+        d_model=None, n_layers=None, n_heads=None,
+        unfreeze_layers=None,
+        disable_legal_mask=False, illegal_penalty=0.0,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+class TestBuildConfigJsonBottleneckNHidden:
+    """``bottleneck_n_hidden`` must round-trip into the persisted config
+    only for strategies that actually instantiate Houlsby MLPs."""
+
+    def test_emitted_for_bottleneck(self):
+        from pawn.adapter_training import build_config_json
+
+        cfg = build_config_json(
+            _bottleneck_args(strategy="bottleneck", bottleneck_n_hidden=2),
+            param_count=0,
+        )
+        assert cfg["bottleneck_n_hidden"] == 2
+
+    def test_emitted_for_retro_bottleneck(self):
+        from pawn.adapter_training import build_config_json
+
+        cfg = build_config_json(
+            _bottleneck_args(
+                strategy="rosa", rosa_mode="retro-bottleneck",
+                bottleneck_n_hidden=1,
+            ),
+            param_count=0,
+        )
+        assert cfg["bottleneck_n_hidden"] == 1
+
+    def test_null_for_retro_sparse(self):
+        from pawn.adapter_training import build_config_json
+
+        cfg = build_config_json(
+            _bottleneck_args(
+                strategy="rosa", rosa_mode="retro-sparse",
+                bottleneck_n_hidden=2,
+            ),
+            param_count=0,
+        )
+        assert cfg["bottleneck_n_hidden"] is None
+
+    def test_null_for_joint_rosa(self):
+        from pawn.adapter_training import build_config_json
+
+        cfg = build_config_json(
+            _bottleneck_args(
+                strategy="rosa", rosa_mode=None, bottleneck_n_hidden=2,
+            ),
+            param_count=0,
+        )
+        assert cfg["bottleneck_n_hidden"] is None
+
+    def test_null_for_lora(self):
+        from pawn.adapter_training import build_config_json
+
+        cfg = build_config_json(
+            _bottleneck_args(strategy="lora", bottleneck_n_hidden=0),
+            param_count=0,
+        )
+        assert cfg["bottleneck_n_hidden"] is None
+
+
 # ---------------------------------------------------------------------------
 # Comparison: cosine_warmup_schedule vs CosineWithWarmup
 # ---------------------------------------------------------------------------

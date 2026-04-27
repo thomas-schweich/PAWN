@@ -142,7 +142,7 @@ Adapter training is **cache-first**: the first run with a given (Elo, `min_ply`)
 
 | `--strategy` value  | Adapter | Key args | Typical params |
 |---------------------|---------|----------|----------------|
-| `bottleneck`        | Houlsby MLP | `--bottleneck-dim 8` | ~131K |
+| `bottleneck`        | Houlsby MLP | `--bottleneck-dim 8 --bottleneck-n-hidden 0` | ~131K |
 | `lora`              | Low-rank attention | `--lora-rank 4 --lora-targets qkvo` | ~65K |
 | `film`              | Channel-wise affine | `--no-output-film` | ~17K |
 | `sparse`            | Binary mask | `--density 0.01 --sparse-targets qkvo` | ~503K-2.7M |

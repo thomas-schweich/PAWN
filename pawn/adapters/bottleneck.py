@@ -8,10 +8,24 @@ the FFN sublayer within each transformer block, following `Houlsby et al.,
     x = x + up(gelu(down(x)))
 
 The up-projection is zero-initialized so the model starts identical to
-the frozen backbone. bottleneck_dim controls the parameter budget.
+the frozen backbone. ``bottleneck_dim`` controls the parameter budget.
 
-Total trainable params (bottleneck_dim=8, both positions, 8 layers):
-    2 × 8 × 2 × 512 × 8 = 131,072
+``n_hidden`` adds extra ``Linear(bn, bn)`` stages with GELU between
+``down`` and ``up`` so the adapter MLP can be deeper than the standard
+two-layer Houlsby block:
+
+    h = down(x)
+    for i in range(n_hidden):
+        h = hidden[i](gelu(h))
+    x = x + up(gelu(h))
+
+Identity-at-init still holds for any ``n_hidden`` because ``up.weight``
+is zero. Per-adapter param count (no bias anywhere):
+    2 · d_model · bn + n_hidden · bn²
+
+Total trainable params (bottleneck_dim=8, n_hidden=0, both positions,
+8 layers): 2 × 8 × 2 × 512 × 8 = 131,072. With n_hidden=2: add
+8 × 2 × 2 × 8² = 2,048 → 133,120.
 """
 
 import torch
@@ -23,16 +37,28 @@ from pawn.model import PAWNCLM
 
 
 class BottleneckAdapter(nn.Module):
-    """Residual bottleneck: x + up(gelu(down(x)))."""
+    """Residual bottleneck: ``x + up(gelu(... hidden(gelu(down(x))) ...))``.
 
-    def __init__(self, d_model: int, bottleneck_dim: int):
+    ``n_hidden=0`` reproduces the standard two-layer Houlsby adapter.
+    """
+
+    def __init__(self, d_model: int, bottleneck_dim: int, n_hidden: int = 0):
         super().__init__()
+        if n_hidden < 0:
+            raise ValueError(f"n_hidden must be >= 0, got {n_hidden}")
         self.down = nn.Linear(d_model, bottleneck_dim, bias=False)
+        self.hidden = nn.ModuleList(
+            [nn.Linear(bottleneck_dim, bottleneck_dim, bias=False)
+             for _ in range(n_hidden)]
+        )
         self.up = nn.Linear(bottleneck_dim, d_model, bias=False)
         nn.init.zeros_(self.up.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.up(F.gelu(self.down(x)))
+        h = self.down(x)
+        for layer in self.hidden:
+            h = layer(F.gelu(h))
+        return x + self.up(F.gelu(h))
 
 
 class BottleneckCLM(nn.Module):
@@ -51,10 +77,12 @@ class BottleneckCLM(nn.Module):
         layers: tuple[int, ...] | None = None,
         attn_layers: tuple[int, ...] | None = None,
         ffn_layers: tuple[int, ...] | None = None,
+        n_hidden: int = 0,
     ):
         super().__init__()
         self.backbone = backbone
         self.bottleneck_dim = bottleneck_dim
+        self.n_hidden = n_hidden
         self.adapt_attn = adapt_attn
         self.adapt_ffn = adapt_ffn
         cfg = backbone.cfg
@@ -87,11 +115,15 @@ class BottleneckCLM(nn.Module):
         self.ffn_adapters = nn.ModuleList()
         for i in range(n_layers):
             if i in self._attn_set:
-                self.attn_adapters.append(BottleneckAdapter(cfg.d_model, bottleneck_dim))
+                self.attn_adapters.append(
+                    BottleneckAdapter(cfg.d_model, bottleneck_dim, n_hidden=n_hidden)
+                )
             else:
                 self.attn_adapters.append(nn.Identity())
             if i in self._ffn_set:
-                self.ffn_adapters.append(BottleneckAdapter(cfg.d_model, bottleneck_dim))
+                self.ffn_adapters.append(
+                    BottleneckAdapter(cfg.d_model, bottleneck_dim, n_hidden=n_hidden)
+                )
             else:
                 self.ffn_adapters.append(nn.Identity())
 
@@ -222,12 +254,16 @@ class BottleneckCLM(nn.Module):
         """Per-layer adapter weight norms for monitoring."""
         report = {}
         for i in range(len(self.backbone.layers)):
-            a = self.attn_adapters[i]
-            if isinstance(a, BottleneckAdapter):
-                report[f"adapter/layer{i}.attn.down"] = a.down.weight.data.norm().item()
-                report[f"adapter/layer{i}.attn.up"] = a.up.weight.data.norm().item()
-            a = self.ffn_adapters[i]
-            if isinstance(a, BottleneckAdapter):
-                report[f"adapter/layer{i}.ffn.down"] = a.down.weight.data.norm().item()
-                report[f"adapter/layer{i}.ffn.up"] = a.up.weight.data.norm().item()
+            for pos, adapters in (("attn", self.attn_adapters),
+                                  ("ffn", self.ffn_adapters)):
+                a = adapters[i]
+                if not isinstance(a, BottleneckAdapter):
+                    continue
+                report[f"adapter/layer{i}.{pos}.down"] = a.down.weight.data.norm().item()
+                for k, layer in enumerate(a.hidden):
+                    assert isinstance(layer, nn.Linear)
+                    report[f"adapter/layer{i}.{pos}.hidden{k}"] = (
+                        layer.weight.data.norm().item()
+                    )
+                report[f"adapter/layer{i}.{pos}.up"] = a.up.weight.data.norm().item()
         return report

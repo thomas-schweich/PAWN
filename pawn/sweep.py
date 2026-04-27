@@ -40,6 +40,11 @@ except ImportError:
 # Search spaces per adapter type
 # ---------------------------------------------------------------------------
 
+# Shared across pawn/sweep.py and pawn/lab/sweep.py so the n_hidden axis
+# stays in sync between the Optuna and lab-runner sweep frontends.
+BOTTLENECK_N_HIDDEN_CHOICES: tuple[int, ...] = (0, 1, 2)
+
+
 def suggest_common(trial: "optuna.trial.BaseTrial") -> dict:
     """Hyperparameters shared across all adapter types."""
     return {
@@ -64,6 +69,9 @@ def suggest_bottleneck(trial: "optuna.trial.BaseTrial") -> dict:
     """Bottleneck adapter hyperparameters."""
     params = suggest_common(trial)
     params["bottleneck_dim"] = trial.suggest_categorical("bottleneck_dim", [4, 8, 16, 32, 64, 128])
+    params["bottleneck_n_hidden"] = trial.suggest_categorical(
+        "bottleneck_n_hidden", list(BOTTLENECK_N_HIDDEN_CHOICES)
+    )
     params["no_adapt_attn"] = trial.suggest_categorical("no_adapt_attn", [True, False])
     params["no_adapt_ffn"] = trial.suggest_categorical("no_adapt_ffn", [True, False])
     return params
@@ -174,6 +182,9 @@ def suggest_retro_bottleneck(trial: "optuna.trial.BaseTrial") -> dict:
     params = _suggest_rosa_common(trial)
     params["rosa_mode"] = "retro-bottleneck"
     params["bottleneck_dim"] = trial.suggest_categorical("bottleneck_dim", [4, 8, 16])
+    params["bottleneck_n_hidden"] = trial.suggest_categorical(
+        "bottleneck_n_hidden", list(BOTTLENECK_N_HIDDEN_CHOICES)
+    )
     return params
 
 
@@ -583,6 +594,7 @@ class InProcessRoSAObjective:
         warmup_frac = params["warmup_frac"]
         patience = params["patience"]
         bottleneck_dim = params.get("bottleneck_dim", 8)
+        bottleneck_n_hidden = int(params.get("bottleneck_n_hidden", 0))
 
         vocab_size = self._cfg.vocab_size
         use_amp = self._use_amp
@@ -701,6 +713,7 @@ class InProcessRoSAObjective:
             else:  # retro-bottleneck
                 model = RetroBottleneckCLM(
                     sparse_model.backbone, bottleneck_dim=bottleneck_dim,
+                    n_hidden=bottleneck_n_hidden,
                 ).to(device)
                 adapter_params = model.adapter_parameters()
 

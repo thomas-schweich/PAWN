@@ -95,12 +95,14 @@ class TestSuggestBottleneck:
         params = {
             **_COMMON_PARAMS,
             "bottleneck_dim": 16,
+            "bottleneck_n_hidden": 2,
             "no_adapt_attn": False,
             "no_adapt_ffn": False,
         }
         trial = optuna.trial.FixedTrial(params)
         out = suggest_bottleneck(trial)
         assert out["bottleneck_dim"] == 16
+        assert out["bottleneck_n_hidden"] == 2
         assert out["no_adapt_attn"] is False
         assert out["no_adapt_ffn"] is False
 
@@ -108,6 +110,7 @@ class TestSuggestBottleneck:
         params = {
             **_COMMON_PARAMS,
             "bottleneck_dim": 8,
+            "bottleneck_n_hidden": 0,
             "no_adapt_attn": True,
             "no_adapt_ffn": True,
         }
@@ -229,11 +232,14 @@ class TestSuggestRetroSparse:
 
 class TestSuggestRetroBottleneck:
     def test_has_mode_retro_bottleneck(self):
-        params = {**_ROSA_PARAMS, "bottleneck_dim": 8}
+        params = {
+            **_ROSA_PARAMS, "bottleneck_dim": 8, "bottleneck_n_hidden": 1,
+        }
         trial = optuna.trial.FixedTrial(params)
         out = suggest_retro_bottleneck(trial)
         assert out["rosa_mode"] == "retro-bottleneck"
         assert out["bottleneck_dim"] == 8
+        assert out["bottleneck_n_hidden"] == 1
 
 
 # ---------------------------------------------------------------------------

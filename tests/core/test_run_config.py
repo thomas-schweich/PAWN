@@ -707,6 +707,24 @@ class TestSerialization:
         cfg2 = AdapterConfig(**data)
         assert cfg == cfg2
 
+    def test_bottleneck_n_hidden_default_zero(self):
+        cfg = AdapterConfig(
+            local_checkpoints=True, strategy="bottleneck", bottleneck_dim=8,
+        )
+        assert cfg.bottleneck_n_hidden == 0
+
+    def test_bottleneck_n_hidden_roundtrip(self):
+        cfg = AdapterConfig(
+            local_checkpoints=True,
+            strategy="bottleneck",
+            bottleneck_dim=8,
+            bottleneck_n_hidden=2,
+        )
+        data = cfg.model_dump()
+        cfg2 = AdapterConfig(**data)
+        assert cfg == cfg2
+        assert cfg2.bottleneck_n_hidden == 2
+
     def test_pretrain_json_string_roundtrip(self):
         cfg = PretrainConfig(local_checkpoints=True, variant="large")
         s = cfg.model_dump_json()

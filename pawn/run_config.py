@@ -207,6 +207,10 @@ class AdapterConfig(BaseRunConfig):
 
     # Bottleneck component ------------------------------------------------
     bottleneck_dim: int | None = None
+    # Extra hidden Linear+GELU stages between ``down`` and ``up`` inside
+    # each Houlsby adapter MLP. ``0`` reproduces the standard two-layer
+    # block. Adds ``n_hidden · bottleneck_dim²`` params per adapter.
+    bottleneck_n_hidden: int = 0
     no_adapt_attn: bool = False
     no_adapt_ffn: bool = False
 
