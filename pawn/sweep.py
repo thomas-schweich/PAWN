@@ -619,7 +619,7 @@ class InProcessRoSAObjective:
 
         # Ensure mask builder capacity matches train batch size
         mask_builder = self._mask_builder
-        if batch_size > mask_builder._mask_gpu.shape[0]:
+        if batch_size > mask_builder._max_batch:
             from pawn.lichess_data import LegalMaskBuilder
             mask_builder = LegalMaskBuilder(
                 batch_size, seq_len=self._seq_len, vocab_size=vocab_size,

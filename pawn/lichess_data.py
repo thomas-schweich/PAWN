@@ -107,11 +107,20 @@ class LegalMaskBuilder:
 
     Calls engine.compute_legal_token_masks_sparse which replays games and
     returns flat i64 indices (~2 MB) instead of a dense bool mask (~70 MB).
-    Indices are transferred to GPU and scattered into a pre-allocated buffer.
+    Indices are transferred to GPU and scattered into a fresh ``(B, T, V)``
+    bool tensor per call. The caching allocator reuses freed buffers
+    across steps, so per-call allocation cost is dominated by the
+    ``zero_()`` memset; pre-allocation no longer pulls its weight under
+    bucketed collates where ``T`` varies per batch.
+
+    The reusable ``_idx_buf`` (a long index staging buffer) is still
+    pre-allocated — it's small (~32 MB at default size) and avoids a
+    per-batch H2D copy in the common case.
 
     Two usage modes:
-      1. ``scatter(indices, B)`` — fast GPU-only path for pre-computed indices
-         (from ``LegalMaskCollate`` or precomputation).
+      1. ``scatter(indices, B, T=...)`` — fast GPU-only path for
+         pre-computed indices (from ``LegalMaskCollate`` /
+         ``BucketedLegalMaskCollate`` / precomputation).
       2. ``__call__(batch)`` — legacy path that computes indices inline.
     """
 
@@ -120,6 +129,9 @@ class LegalMaskBuilder:
                  prepend_outcome: bool = False):
         """
         Args:
+            batch_size: maximum batch size accepted by ``scatter``. No
+                tensor of this size is pre-allocated; the value is only
+                used as a capacity check.
             seq_len: total tensor width matching the model's ``max_seq_len``.
                 In outcome-prefixed mode the outcome slot lives inside this
                 budget; in pure-moves mode all ``seq_len`` slots hold moves.
@@ -134,11 +146,11 @@ class LegalMaskBuilder:
         self.prepend_outcome = prepend_outcome
         self.T = seq_len
         self.device = device
+        self._max_batch = int(batch_size)
 
-        # Pre-allocated GPU output buffer
-        self._mask_gpu = torch.zeros(batch_size, self.T, vocab_size,
-                                     dtype=torch.bool, device=device)
         # Pre-allocated GPU index buffer to avoid per-batch allocation
+        # for the indices staging copy. The output mask buffer is *not*
+        # pre-allocated — see class docstring.
         self._idx_buf = torch.empty(max_index_buf, dtype=torch.long, device=device)
 
     def scatter(
@@ -147,37 +159,28 @@ class LegalMaskBuilder:
         B: int,
         T: int | None = None,
     ) -> torch.Tensor:
-        """Scatter pre-computed CPU indices into the GPU mask buffer.
+        """Scatter pre-computed CPU indices into a fresh GPU mask buffer.
 
-        Uses a pre-allocated index buffer to avoid per-batch GPU allocation.
-        Falls back to a fresh allocation if the buffer is too small.
-
-        ``T`` is the per-batch tensor width that the indices were computed
-        against. When ``None`` or equal to ``self.T``, scatters into the
-        pre-allocated ``(B, self.T, V)`` buffer (the static-shape fast
-        path). When given a smaller ``T`` (e.g. from
-        :class:`BucketedLegalMaskCollate`), allocates a fresh
-        ``(B, T, V)`` zero tensor — the indices' stride is ``T * V`` so
-        the pre-allocated buffer can't be reused at a smaller T. Memory
-        is reclaimed by the caching allocator across calls, so the per-
-        bucket allocation is effectively a memset.
+        Allocates a ``(B, T, V)`` bool tensor and scatters the supplied
+        flat indices into it. ``T`` is the per-batch tensor width that
+        the indices were computed against; when ``None`` it defaults to
+        ``self.T``. The caching allocator reuses freed buffers across
+        steps, so the per-call cost is dominated by the ``zero_()``
+        memset.
         """
-        if B > self._mask_gpu.shape[0]:
+        if B > self._max_batch:
             raise ValueError(
-                f"B={B} exceeds pre-allocated batch_size={self._mask_gpu.shape[0]}"
+                f"B={B} exceeds builder capacity batch_size={self._max_batch}"
             )
-        if T is None or T == self.T:
-            mask_view = self._mask_gpu[:B]
-            mask_view.zero_()
-        else:
-            if T > self.T:
-                raise ValueError(
-                    f"scatter T={T} exceeds builder seq_len={self.T}"
-                )
-            mask_view = torch.zeros(
-                B, T, self.vocab_size,
-                dtype=torch.bool, device=self.device,
+        T_eff = self.T if T is None else T
+        if T_eff > self.T:
+            raise ValueError(
+                f"scatter T={T_eff} exceeds builder seq_len={self.T}"
             )
+        mask_view = torch.zeros(
+            B, T_eff, self.vocab_size,
+            dtype=torch.bool, device=self.device,
+        )
         n = legal_indices.shape[0]
         if n > 0:
             if n <= self._idx_buf.shape[0]:

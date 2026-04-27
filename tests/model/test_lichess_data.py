@@ -143,7 +143,7 @@ class TestLegalMaskBuilder:
         builder = LegalMaskBuilder(batch_size=4, seq_len=8, vocab_size=16, device="cpu"
         )
         indices = torch.zeros(0, dtype=torch.long)
-        with pytest.raises(ValueError, match="exceeds pre-allocated"):
+        with pytest.raises(ValueError, match="exceeds builder capacity"):
             builder.scatter(indices, B=99)
 
     @pytest.mark.integration
