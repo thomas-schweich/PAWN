@@ -203,7 +203,7 @@ Practical implication: if you're training to convergence, let the schedule compl
 
 ### Schedule-completion sentinel
 
-Every adapter and pretrain run writes `schedule_health.json` next to `metrics.jsonl` at exit. Fields: `planned_total_steps`, `actual_total_steps`, `completion_ratio`, `lr_peak`, `actual_final_lr`, `reason_for_stop` (one of `completed`, `step_limit`, `patience`, `paused`, `sigterm`, `loader_exhausted`, `exception`).
+Every adapter and pretrain run writes `schedule_health.json` next to `metrics.jsonl` at exit. Fields: `format_version`, `schedule` (the `lr_schedule` value used), `should_reach_zero` (true when the schedule decays to 0 — `cosine`, `wsd`, `infinite`, `one_cycle`), `planned_total_steps`, `actual_total_steps`, `completion_ratio`, `lr_peak`, `actual_final_lr`, `reason_for_stop` (one of `completed`, `step_limit`, `patience`, `paused`, `sigterm`, `resume_no_op`, `loader_exhausted`, `exception`).
 
 The combination `actual_total_steps != planned_total_steps` AND `reason_for_stop == "completed"` is the structural-bug signal: the loop fell off the end without hitting an early-exit, yet the step counts disagree. With cache-first that's unreachable, but the trainer prints a red banner if it ever happens — useful as a regression tripwire. SIGTERM, patience, and pause are normal early exits and write the file without warning.
 
