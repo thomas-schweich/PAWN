@@ -467,13 +467,15 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
 
     # Resolve / persist ``data_seed`` so the per-epoch shuffle is
     # reproducible and resumable. A run that doesn't set one explicitly
-    # gets a wall-clock seed at start; the resolved value is written
-    # back to ``args`` so ``build_config_json`` and the trainer's
-    # checkpoint extras both see the same number.
+    # gets an OS-RNG seed at start; the resolved value is written back
+    # to ``args`` so ``build_config_json`` and the trainer's checkpoint
+    # extras both see the same number. ``SystemRandom`` (rather than
+    # wall-clock seconds) avoids collisions when a sweep launches
+    # multiple trials in the same second.
     if args.data_seed is None:
-        import time as _time
+        import secrets as _secrets
 
-        args.data_seed = int(_time.time()) & 0x7FFFFFFF
+        args.data_seed = _secrets.randbits(31)
     # Stash the resolved sizing on args for downstream consumers
     # (build_config_json, train, build checkpoint extras).
     args.steps_per_epoch = steps_per_epoch
