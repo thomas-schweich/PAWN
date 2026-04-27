@@ -246,6 +246,16 @@ class AdapterConfig(BaseRunConfig):
     val_every: int = 1
     checkpoint_interval: int = 5000
 
+    # Bucketed dynamic padding --------------------------------------------
+    # Per-batch ``T = round_up(max(game_length) + outcome_offset,
+    # bucket_size)``, clamped to ``max_seq_len``. With ``bucket_size=64``
+    # and ``max_seq_len=512`` the compiled step graph cache holds at
+    # most 8 entries (64, 128, ..., 512), and typical 60-120-ply
+    # Lichess games stop paying full-width attention cost. Must divide
+    # ``max_seq_len`` (validator-checked in
+    # :class:`BucketedLegalMaskCollate`).
+    bucket_size: int = 64
+
     # Data sizing ---------------------------------------------------------
     # ``steps_per_epoch`` is the canonical way to size an adapter run.
     # ``"all"`` resolves at runtime to ``n_train // (batch_size *

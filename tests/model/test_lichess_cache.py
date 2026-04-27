@@ -201,6 +201,40 @@ class TestIndexedLichessDataset:
         assert sample["game_length"] == 4
 
     @pytest.mark.integration
+    def test_lazy_pack_returns_raw_inputs(self, tmp_path) -> None:
+        """``lazy_pack=True`` skips per-sample packing and returns the
+        raw move row + ``game_length`` + ``outcome_token`` for the
+        bucketed collate to pack at a per-batch ``T``."""
+        shard = tmp_path / "data" / "train-00000.parquet"
+        _write_shard(shard, n_games=3, game_length=4)
+        cache = prepare_lichess_cached(
+            str(shard), min_ply=0, cache_dir=str(tmp_path / "cache")
+        )
+        cache_path = tmp_path / "cache" / _derive_key(
+            str(shard), "train", None, None, 0
+        )
+        ds = IndexedLichessDataset(
+            cache_dir=cache_path,
+            indices=torch.arange(cache.n_games),
+            max_ply=16,
+            prepend_outcome=False,
+            lazy_pack=True,
+        )
+        sample = ds[0]
+        # No pre-packed tensors — the bucketed collate handles those.
+        assert "input_ids" not in sample
+        assert "targets" not in sample
+        assert "loss_mask" not in sample
+        # Raw fields the collate needs.
+        assert sample["move_ids"].shape == (16,)
+        assert sample["game_length"] == 4
+        assert isinstance(sample["outcome_token"], int)
+        # Outcome token in valid range (PAD or any of the 11 outcomes).
+        assert (
+            OUTCOME_TOKEN_BASE <= sample["outcome_token"] < OUTCOME_TOKEN_BASE + 11
+        )
+
+    @pytest.mark.integration
     def test_outcome_prepend_packing(self, tmp_path) -> None:
         shard = tmp_path / "data" / "train-00000.parquet"
         _write_shard(shard, n_games=2, game_length=3)

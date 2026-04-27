@@ -322,7 +322,9 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         prepare_lichess_cached,
         split_has_files,
     )
-    from pawn.lichess_data import LegalMaskBuilder, LegalMaskCollate
+    from pawn.lichess_data import (
+        BucketedLegalMaskCollate, LegalMaskBuilder,
+    )
     from pawn.logging import MetricsLogger
     from pawn.wandb_utils import finish_wandb, init_wandb
 
@@ -489,16 +491,23 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         indices=train_indices,
         max_ply=seq_len,
         prepend_outcome=config.prepend_outcome,
+        lazy_pack=True,
     )
     val_ds = IndexedLichessDataset(
         cache_dir=val_indices_cache_dir,
         indices=val_indices,
         max_ply=seq_len,
         prepend_outcome=config.prepend_outcome,
+        lazy_pack=True,
     )
 
-    collate = LegalMaskCollate(
-        seq_len=seq_len, vocab_size=vocab_size,
+    # Bucketed dynamic padding: per-batch ``T`` rounds up to a multiple
+    # of ``bucket_size`` so the compiled step graph cache stays bounded
+    # while typical 60-120-ply Lichess games no longer pay full-width
+    # attention cost.
+    bucket_size = int(getattr(config, "bucket_size", 64))
+    collate = BucketedLegalMaskCollate(
+        seq_len=seq_len, bucket_size=bucket_size, vocab_size=vocab_size,
         prepend_outcome=config.prepend_outcome,
     )
     n_workers = args.num_workers
@@ -525,6 +534,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         shuffle=False,
         num_workers=0,
         pin_memory=True,
+        collate_fn=collate,
     )
     mask_builder = LegalMaskBuilder(
         args.batch_size, seq_len=seq_len, vocab_size=vocab_size, device=device,

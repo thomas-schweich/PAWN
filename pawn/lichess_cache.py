@@ -423,8 +423,15 @@ class IndexedLichessDataset(torch.utils.data.Dataset):
     which is fine for the precompute-val-masks pass.
 
     ``__getitem__`` mirrors :class:`pawn.lichess_data.LichessDataset`'s
-    return shape so the same :class:`pawn.lichess_data.LegalMaskCollate`
-    works without modification.
+    return shape (with ``lazy_pack=False``, the default) so the same
+    :class:`pawn.lichess_data.LegalMaskCollate` works without
+    modification.
+
+    With ``lazy_pack=True`` the dataset returns only the raw token row
+    plus ``game_length`` and ``outcome_token``; packing happens in
+    :class:`pawn.lichess_data.BucketedLegalMaskCollate` at a per-batch
+    ``T``. This keeps padded attention cost proportional to the actual
+    games in each batch instead of the model's full context window.
 
     Performance per sample (typical adapter training, batch=128 on
     GPU): the per-batch bottleneck is ``compute_legal_indices`` in the
@@ -439,6 +446,7 @@ class IndexedLichessDataset(torch.utils.data.Dataset):
         indices: torch.Tensor,
         max_ply: int,
         prepend_outcome: bool = False,
+        lazy_pack: bool = False,
     ):
         from pawn.data import pack_clm_sequences  # local: avoids cycle
 
@@ -449,6 +457,7 @@ class IndexedLichessDataset(torch.utils.data.Dataset):
         self.indices = indices
         self.max_ply = int(max_ply)
         self.prepend_outcome = bool(prepend_outcome)
+        self.lazy_pack = bool(lazy_pack)
         self._effective_max_moves = (
             self.max_ply - 1 if self.prepend_outcome else self.max_ply
         )
@@ -490,17 +499,26 @@ class IndexedLichessDataset(torch.utils.data.Dataset):
         gl_full = e - s
         gl = min(gl_full, self._effective_max_moves)
 
-        # ``pack_clm_sequences`` operates on a (B, max_ply) numpy array.
-        # We assemble a single-row buffer here. ``np.zeros`` is allocated
-        # afresh per call so the worker's PyTorch DataLoader can pin and
-        # transfer it without aliasing into the mmap.
+        # Raw move row buffer. ``np.zeros`` is allocated afresh per call
+        # so the worker's PyTorch DataLoader can pin and transfer it
+        # without aliasing into the mmap.
         move_ids_row = np.zeros(self._effective_max_moves, dtype=np.int16)
         if gl > 0:
             move_ids_row[:gl] = (
                 cache.tokens_flat[s : s + gl].numpy().astype(np.int16, copy=False)
             )
-
         outcome = int(cache.outcome_tokens[gi].item())
+
+        if self.lazy_pack:
+            # BucketedLegalMaskCollate consumes these directly; packing
+            # plus legal-mask Rust replay happen in the collate at a
+            # per-batch ``T``.
+            return {
+                "move_ids": move_ids_row,
+                "game_length": gl,
+                "outcome_token": outcome,
+            }
+
         outcome_t = torch.tensor([outcome], dtype=torch.long)
         packed = self._pack(
             move_ids_row[None, :],

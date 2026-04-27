@@ -12,9 +12,11 @@ import torch
 import chess_engine as engine
 
 from pawn.lichess_data import (
+    BucketedLegalMaskCollate,
     LegalMaskBuilder,
     LegalMaskCollate,
     compute_legal_indices,
+    round_up_to_bucket,
 )
 
 
@@ -315,3 +317,125 @@ class TestLegalMaskCollate:
         batch = collate(items)
         direct = compute_legal_indices(move_ids, gl, seq_len=seq_len)
         assert np.array_equal(batch["legal_indices"].numpy(), direct)
+
+
+# ---------------------------------------------------------------------------
+# round_up_to_bucket
+# ---------------------------------------------------------------------------
+
+
+class TestRoundUpToBucket:
+    @pytest.mark.unit
+    def test_rounds_up_to_next_multiple(self):
+        assert round_up_to_bucket(80, 64, 512) == 128
+        assert round_up_to_bucket(127, 64, 512) == 128
+        assert round_up_to_bucket(64, 64, 512) == 64
+
+    @pytest.mark.unit
+    def test_clamps_to_cap(self):
+        assert round_up_to_bucket(500, 64, 512) == 512
+        assert round_up_to_bucket(513, 64, 512) == 512
+
+    @pytest.mark.unit
+    def test_zero_or_negative_rounds_to_one_bucket(self):
+        # Empty / degenerate batch still gets a valid T so the
+        # downstream tensor allocation doesn't crash on shape (B, 0, V).
+        assert round_up_to_bucket(0, 64, 512) == 64
+        assert round_up_to_bucket(-1, 64, 512) == 64
+
+    @pytest.mark.unit
+    def test_bucket_size_zero_returns_clamped_n(self):
+        assert round_up_to_bucket(80, 0, 512) == 80
+        assert round_up_to_bucket(1000, 0, 512) == 512
+
+
+# ---------------------------------------------------------------------------
+# BucketedLegalMaskCollate
+# ---------------------------------------------------------------------------
+
+
+class TestBucketedLegalMaskCollate:
+    @pytest.mark.integration
+    def test_packs_at_bucketed_T(self):
+        """T_actual rounds up the longest game in the batch to bucket_size."""
+        B = 4
+        max_ply = 60
+        move_ids, gl, _tc = engine.generate_random_games(B, max_ply, seed=42)
+        collate = BucketedLegalMaskCollate(
+            seq_len=512, bucket_size=64, vocab_size=1968,
+        )
+        items = [
+            {
+                "move_ids": np.asarray(move_ids[i], dtype=np.int16),
+                "game_length": int(gl[i]),
+                "outcome_token": 1969,
+            }
+            for i in range(B)
+        ]
+        batch = collate(items)
+        T = batch["T_actual"]
+        assert T % 64 == 0
+        assert T >= int(np.asarray(gl).max())
+        assert batch["input_ids"].shape == (B, T)
+        assert batch["targets"].shape == (B, T)
+        assert batch["loss_mask"].shape == (B, T)
+
+    @pytest.mark.integration
+    def test_indices_align_with_per_batch_T(self):
+        """``legal_indices`` use stride T = T_actual, not seq_len."""
+        B = 4
+        move_ids, gl, _tc = engine.generate_random_games(B, 50, seed=42)
+        collate = BucketedLegalMaskCollate(
+            seq_len=512, bucket_size=64, vocab_size=1968,
+        )
+        items = [
+            {
+                "move_ids": np.asarray(move_ids[i], dtype=np.int16),
+                "game_length": int(gl[i]),
+                "outcome_token": 1969,
+            }
+            for i in range(B)
+        ]
+        batch = collate(items)
+        T = batch["T_actual"]
+        # Direct compute at the same T must match the collated indices.
+        direct = compute_legal_indices(
+            np.stack([items[i]["move_ids"] for i in range(B)], axis=0),
+            np.asarray([items[i]["game_length"] for i in range(B)],
+                       dtype=np.int16),
+            seq_len=T,
+            vocab_size=1968,
+        )
+        assert np.array_equal(batch["legal_indices"].numpy(), direct)
+
+    @pytest.mark.unit
+    def test_seq_len_must_be_multiple_of_bucket_size(self):
+        with pytest.raises(ValueError, match="multiple of bucket_size"):
+            BucketedLegalMaskCollate(seq_len=200, bucket_size=64, vocab_size=1968)
+
+    @pytest.mark.unit
+    def test_bucket_size_zero_rejected(self):
+        with pytest.raises(ValueError, match="bucket_size must be > 0"):
+            BucketedLegalMaskCollate(seq_len=64, bucket_size=0, vocab_size=1968)
+
+    @pytest.mark.integration
+    def test_full_batch_clamps_at_seq_len(self):
+        """A batch with games at the cap pads to ``seq_len``, not above."""
+        B = 2
+        seq_len = 64
+        move_ids, gl, _tc = engine.generate_random_games(B, seq_len, seed=42)
+        # Force one game to fill the budget exactly.
+        gl[0] = seq_len
+        collate = BucketedLegalMaskCollate(
+            seq_len=seq_len, bucket_size=16, vocab_size=1968,
+        )
+        items = [
+            {
+                "move_ids": np.asarray(move_ids[i], dtype=np.int16),
+                "game_length": int(gl[i]),
+                "outcome_token": 1969,
+            }
+            for i in range(B)
+        ]
+        batch = collate(items)
+        assert batch["T_actual"] == seq_len
