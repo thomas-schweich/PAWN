@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -740,6 +741,33 @@ class BackgroundCheckpointPusher:
         )
         self._future: Future[None] | None = None
 
+    def _submit_serialized(
+        self,
+        thunk: "Callable[[], None]",
+        success_msg: str,
+        failure_label: str,
+        log_prefix: str,
+    ) -> None:
+        """Block on the previous future, then queue ``thunk``.
+
+        All push paths share the same shape: wait for the previous
+        upload (so two concurrent uploads don't race on the same branch
+        head or bucket subtree), submit the new one, log success or
+        failure. Centralizing it keeps the submit / submit_bucket
+        bodies focused on what's different — the underlying push call.
+        """
+        if self._future is not None:
+            self._future.result()
+
+        def _push() -> None:
+            try:
+                thunk()
+                print(f"{log_prefix}{success_msg}")
+            except Exception as e:
+                print(f"{log_prefix}WARNING: {failure_label} push failed: {e}")
+
+        self._future = self._pool.submit(_push)
+
     def submit(
         self,
         checkpoint_path: str | Path,
@@ -751,23 +779,21 @@ class BackgroundCheckpointPusher:
         log_prefix: str = "",
     ) -> None:
         """Queue a push. Blocks on the previous push if one is in flight."""
-        if self._future is not None:
-            # Don't let uploads stack up against the same branch head.
-            self._future.result()
         ckpt_path = str(checkpoint_path)
         mpath = str(metrics_path) if metrics_path is not None else None
 
-        def _push() -> None:
-            try:
-                push_checkpoint_to_hf(
-                    ckpt_path, repo_id, branch,
-                    metrics_path=mpath, step=step,
-                )
-                print(f"{log_prefix}Pushed to HF: {repo_id}@{branch}")
-            except Exception as e:
-                print(f"{log_prefix}WARNING: HF push failed: {e}")
+        def thunk() -> None:
+            push_checkpoint_to_hf(
+                ckpt_path, repo_id, branch,
+                metrics_path=mpath, step=step,
+            )
 
-        self._future = self._pool.submit(_push)
+        self._submit_serialized(
+            thunk,
+            success_msg=f"Pushed to HF: {repo_id}@{branch}",
+            failure_label="HF",
+            log_prefix=log_prefix,
+        )
 
     def submit_bucket(
         self,
@@ -790,22 +816,21 @@ class BackgroundCheckpointPusher:
         supported as of the current ``huggingface_hub`` — see the
         ``manage-pod`` skill's HF Bucket I/O note.
         """
-        if self._future is not None:
-            self._future.result()
         ckpt_path = str(checkpoint_path)
         mpath = str(metrics_path) if metrics_path is not None else None
 
-        def _push() -> None:
-            try:
-                push_checkpoint_to_bucket(
-                    ckpt_path, bucket, run_slug=run_slug,
-                    metrics_path=mpath, step=step,
-                )
-                print(f"{log_prefix}Pushed to bucket: {bucket} (run/{run_slug})")
-            except Exception as e:
-                print(f"{log_prefix}WARNING: bucket push failed: {e}")
+        def thunk() -> None:
+            push_checkpoint_to_bucket(
+                ckpt_path, bucket, run_slug=run_slug,
+                metrics_path=mpath, step=step,
+            )
 
-        self._future = self._pool.submit(_push)
+        self._submit_serialized(
+            thunk,
+            success_msg=f"Pushed to bucket: {bucket} (run/{run_slug})",
+            failure_label="bucket",
+            log_prefix=log_prefix,
+        )
 
     def wait(self) -> None:
         """Block until all pending pushes finish and release the pool."""

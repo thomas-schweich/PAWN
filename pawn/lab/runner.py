@@ -790,10 +790,28 @@ class TrialRunner:
         )
         return {"trials": rows, "any_failure": any_fail}
 
+    @staticmethod
+    def _check(
+        ok: bool | None, *, reason: str | None = None, **details: Any,
+    ) -> dict[str, Any]:
+        """Construct a single audit-check entry.
+
+        Centralizes the ``{pass: bool|None, ...}`` shape so callers
+        don't repeat the dict scaffolding. ``reason`` is omitted from
+        the result when ``None`` so passing checks don't carry an
+        empty-reason field.
+        """
+        out: dict[str, Any] = {"pass": ok}
+        if reason is not None:
+            out["reason"] = reason
+        out.update(details)
+        return out
+
     def _audit_trial(
         self, trial: Trial, *, check_hf: bool,
     ) -> dict[str, Any]:
         checks: dict[str, dict[str, Any]] = {}
+        check = self._check
 
         # 1. schedule_complete via schedule_health.json
         if trial.run_dir:
@@ -803,28 +821,24 @@ class TrialRunner:
                     h = json.loads(health_path.read_text())
                     planned = int(h.get("planned_total_steps", 0))
                     actual = int(h.get("actual_total_steps", 0))
-                    checks["schedule_complete"] = {
-                        "pass": planned == actual and planned > 0,
-                        "planned_total_steps": planned,
-                        "actual_total_steps": actual,
-                        "reason_for_stop": h.get("reason_for_stop"),
-                        "actual_final_lr": h.get("actual_final_lr"),
-                    }
+                    checks["schedule_complete"] = check(
+                        planned == actual and planned > 0,
+                        planned_total_steps=planned,
+                        actual_total_steps=actual,
+                        reason_for_stop=h.get("reason_for_stop"),
+                        actual_final_lr=h.get("actual_final_lr"),
+                    )
                 except (OSError, ValueError, json.JSONDecodeError) as e:
-                    checks["schedule_complete"] = {
-                        "pass": None,
-                        "reason": f"schedule_health.json unreadable: {e}",
-                    }
+                    checks["schedule_complete"] = check(
+                        None, reason=f"schedule_health.json unreadable: {e}",
+                    )
             else:
-                checks["schedule_complete"] = {
-                    "pass": None,
-                    "reason": "schedule_health.json absent (older trainer or pre-init crash)",
-                }
+                checks["schedule_complete"] = check(
+                    None,
+                    reason="schedule_health.json absent (older trainer or pre-init crash)",
+                )
         else:
-            checks["schedule_complete"] = {
-                "pass": None,
-                "reason": "no run_dir",
-            }
+            checks["schedule_complete"] = check(None, reason="no run_dir")
 
         # 2. checkpoint_complete via .complete sentinel on latest step_*
         latest_ckpt: Path | None = None
@@ -835,33 +849,31 @@ class TrialRunner:
                 if step_dirs:
                     latest_ckpt = step_dirs[-1]
         if latest_ckpt is None:
-            checks["checkpoint_complete"] = {
-                "pass": None,
-                "reason": "no step_* checkpoint found",
-            }
+            checks["checkpoint_complete"] = check(
+                None, reason="no step_* checkpoint found",
+            )
         else:
-            sentinel_ok = (latest_ckpt / ".complete").exists()
-            checks["checkpoint_complete"] = {
-                "pass": sentinel_ok,
-                "checkpoint": latest_ckpt.name,
-                "path": str(latest_ckpt),
-            }
+            checks["checkpoint_complete"] = check(
+                (latest_ckpt / ".complete").exists(),
+                checkpoint=latest_ckpt.name,
+                path=str(latest_ckpt),
+            )
 
         # 3. checkpoint_on_hf (opt-in: HF API call is the slow path)
         hf_repo = (trial.config or {}).get("hf_repo")
         if not hf_repo:
-            checks["checkpoint_on_hf"] = {
-                "pass": None, "reason": "hf_repo not configured",
-            }
+            checks["checkpoint_on_hf"] = check(
+                None, reason="hf_repo not configured",
+            )
         elif not check_hf:
-            checks["checkpoint_on_hf"] = {
-                "pass": None,
-                "reason": "skipped (call audit with check_hf=True to verify)",
-            }
+            checks["checkpoint_on_hf"] = check(
+                None,
+                reason="skipped (call audit with check_hf=True to verify)",
+            )
         elif latest_ckpt is None:
-            checks["checkpoint_on_hf"] = {
-                "pass": None, "reason": "no local checkpoint to compare",
-            }
+            checks["checkpoint_on_hf"] = check(
+                None, reason="no local checkpoint to compare",
+            )
         else:
             checks["checkpoint_on_hf"] = self._audit_hf(
                 hf_repo, trial.run_dir, latest_ckpt.name

@@ -289,6 +289,28 @@ class TestAdapterConfig:
                 "steps_per_epoch": 1000, "max_games": 5_000,
             })
 
+    @pytest.mark.parametrize(
+        "value, expected, expected_type",
+        [
+            (5, 5, int),                  # plain int
+            ("5", 5, int),                # string-typed int → coerced to int
+            ("all", "all", str),          # the literal sentinel
+            (None, None, type(None)),
+        ],
+    )
+    def test_steps_per_epoch_union_parsing(
+        self, value, expected, expected_type,
+    ):
+        """Lock in pydantic's smart-union behavior for the
+        ``int | Literal["all"] | None`` field. ``"5"`` must coerce to
+        int (not match the literal), and ``"all"`` must stay a string."""
+        cfg = AdapterConfig.model_validate({
+            "local_checkpoints": True, "strategy": "lora",
+            "steps_per_epoch": value,
+        })
+        assert cfg.steps_per_epoch == expected
+        assert type(cfg.steps_per_epoch) is expected_type
+
 
 # ---------------------------------------------------------------------------
 # CotrainConfig
