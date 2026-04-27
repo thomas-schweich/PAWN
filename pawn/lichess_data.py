@@ -8,7 +8,7 @@ training (not precomputed) to keep memory independent of dataset size.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 import polars as pl
@@ -18,6 +18,28 @@ import torch.utils.data
 import chess_engine as engine
 
 from pawn.config import PAD_TOKEN
+
+
+class BucketedBatchDict(TypedDict, total=False):
+    """Output schema of :class:`BucketedLegalMaskCollate`.
+
+    ``legal_indices`` is conditionally present: omitted when the
+    collate's ``skip_legal_indices`` flag is set (e.g. on the val
+    loader after :func:`pawn.adapter_training.precompute_val_masks`
+    has cached them upstream). All other keys are always populated;
+    ``total=False`` only relaxes the runtime-required set so consumers
+    can branch on ``"legal_indices" in batch``.
+    """
+
+    input_ids: torch.Tensor       # (B, T_actual) long
+    targets: torch.Tensor         # (B, T_actual) long
+    loss_mask: torch.Tensor       # (B, T_actual) bool
+    move_ids: torch.Tensor        # (B, max_ply) int16
+    game_length: torch.Tensor     # (B,) int64
+    T_actual: int                 # bucketed per-batch sequence width
+    legal_indices: torch.Tensor   # (n,) int64 — flat sparse indices into
+                                  # the (B, T_actual, vocab_size) mask
+                                  # buffer, when present
 
 
 def round_up_to_bucket(n: int, bucket_size: int, cap: int) -> int:
@@ -293,7 +315,7 @@ class BucketedLegalMaskCollate:
         # are consumed exactly once).
         self.skip_legal_indices: bool = False
 
-    def __call__(self, items: list[dict[str, Any]]) -> dict[str, Any]:
+    def __call__(self, items: list[dict[str, Any]]) -> BucketedBatchDict:
         from pawn.data import pack_clm_sequences
 
         # Stack raw inputs. Keeping ``move_ids`` as int16 (its storage
@@ -320,7 +342,7 @@ class BucketedLegalMaskCollate:
             prepend_outcome=self.prepend_outcome,
         )
 
-        out: dict[str, Any] = {
+        out: BucketedBatchDict = {
             "input_ids": packed["input_ids"],
             "targets": packed["targets"],
             "loss_mask": packed["loss_mask"],

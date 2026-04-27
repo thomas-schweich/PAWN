@@ -28,11 +28,34 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
+
+
+class LazyPackItem(TypedDict):
+    """Per-sample output of :class:`IndexedLichessDataset` with
+    ``lazy_pack=True``. Consumed by
+    :class:`pawn.lichess_data.BucketedLegalMaskCollate`, which packs
+    at a per-batch ``T``.
+    """
+
+    move_ids: np.ndarray      # int16, (effective_max_moves,) zero-padded
+    game_length: int
+    outcome_token: int
+
+
+class PackedItem(TypedDict):
+    """Per-sample output of :class:`IndexedLichessDataset` with the
+    legacy fixed-T packing path (``lazy_pack=False``)."""
+
+    input_ids: torch.Tensor   # (max_ply,) long
+    targets: torch.Tensor     # (max_ply,) long
+    loss_mask: torch.Tensor   # (max_ply,) bool
+    move_ids: np.ndarray      # int16, (effective_max_moves,)
+    game_length: int
 
 from pawn.checkpoint import (
     CheckpointIntegrityError,
@@ -491,7 +514,7 @@ class IndexedLichessDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return int(self.indices.shape[0])
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
+    def __getitem__(self, idx: int) -> LazyPackItem | PackedItem:
         cache = self._ensure_cache()
         gi = int(self.indices[idx].item())
         s = int(cache.offsets[gi].item())
@@ -513,11 +536,12 @@ class IndexedLichessDataset(torch.utils.data.Dataset):
             # BucketedLegalMaskCollate consumes these directly; packing
             # plus legal-mask Rust replay happen in the collate at a
             # per-batch ``T``.
-            return {
+            lazy: LazyPackItem = {
                 "move_ids": move_ids_row,
                 "game_length": gl,
                 "outcome_token": outcome,
             }
+            return lazy
 
         outcome_t = torch.tensor([outcome], dtype=torch.long)
         packed = self._pack(
@@ -528,13 +552,14 @@ class IndexedLichessDataset(torch.utils.data.Dataset):
             prepend_outcome=self.prepend_outcome,
         )
 
-        return {
+        full: PackedItem = {
             "input_ids": packed["input_ids"][0],
             "targets": packed["targets"][0],
             "loss_mask": packed["loss_mask"][0],
             "move_ids": move_ids_row,
             "game_length": gl,
         }
+        return full
 
 
 # ---------------------------------------------------------------------------
