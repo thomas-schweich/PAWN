@@ -1755,6 +1755,17 @@ def train(
 
             loss, top1_sum = step_fn(ids, msk, legal_mask, tgt)
 
+            # Detach + clone before any post-step work. Under
+            # ``mode="reduce-overhead"`` cudagraph trees, the tensors
+            # returned from a compiled step alias the graph's static
+            # output buffers; the next ``step_fn`` call overwrites
+            # them. ``loss.backward()`` consumes ``loss`` before the
+            # next call (safe), but the diagnostic accumulators below
+            # would otherwise read stale values once the next step
+            # runs. Cloning into private storage decouples them.
+            loss_for_log = loss.detach().clone()
+            top1_sum = top1_sum.clone()
+
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -1773,12 +1784,9 @@ def train(
             scheduler.step()
 
             # Position count from the loss mask itself — keeps things on
-            # GPU and avoids any per-step sync. The compiled ``step_fn``
-            # returns may alias cudagraph buffers; cloning into the
-            # epoch / log accumulators decouples them so subsequent
-            # steps don't overwrite the stored stats.
+            # GPU and avoids any per-step sync.
             n_pos_t = msk.sum()
-            loss_sum = loss.detach() * n_pos_t.to(loss.dtype)
+            loss_sum = loss_for_log * n_pos_t.to(loss_for_log.dtype)
             epoch_loss_t += loss_sum
             epoch_top1_t += top1_sum
             epoch_positions_t += n_pos_t
