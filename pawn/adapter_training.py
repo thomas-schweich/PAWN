@@ -384,11 +384,17 @@ def build_compiled_step(
         # specialize one graph per shape rather than emitting a single
         # symbol-shape graph that defeats the cudagraph win.
         import torch._dynamo as _dynamo
-        # 8 buckets × the few apply_legal_mask / scaler combinations a
-        # run actually exercises is well under 64; bumping the cache
-        # limit avoids a "recompile limit hit" silent fallback.
+        # Cache budget: one graph per distinct (B, T) shape. With a
+        # fixed batch size and bucket_size=64, that's 8 entries (or 9
+        # when ``seq_len`` is off-grid and the cap-clamped bucket adds
+        # one more). ``apply_legal_mask`` / ``illegal_penalty`` /
+        # ``amp_dtype`` are baked into the closure as constants and
+        # don't multiply the cache (a single run only ever uses one
+        # regime). 128 leaves comfortable headroom for variable-batch-
+        # size workflows (e.g. sweeps) without risking a silent
+        # "recompile limit hit" fallback.
         _dynamo.config.cache_size_limit = max(
-            _dynamo.config.cache_size_limit, 64
+            _dynamo.config.cache_size_limit, 128
         )
         compiled = torch.compile(_step, mode="reduce-overhead", dynamic=False)
 

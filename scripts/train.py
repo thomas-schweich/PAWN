@@ -505,9 +505,8 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
     # of ``bucket_size`` so the compiled step graph cache stays bounded
     # while typical 60-120-ply Lichess games no longer pay full-width
     # attention cost.
-    bucket_size = int(getattr(config, "bucket_size", 64))
     collate = BucketedLegalMaskCollate(
-        seq_len=seq_len, bucket_size=bucket_size, vocab_size=vocab_size,
+        seq_len=seq_len, bucket_size=config.bucket_size, vocab_size=vocab_size,
         prepend_outcome=config.prepend_outcome,
     )
     n_workers = args.num_workers

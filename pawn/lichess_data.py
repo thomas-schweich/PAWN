@@ -121,6 +121,22 @@ def compute_legal_indices(
                 count=full_length.size,
             )
             indices = np.concatenate([indices, pad_indices])
+
+    # Defensive bounds check after the shift / PAD-fix steps. By this
+    # point every index must land inside the ``(B, seq_len, vocab_size)``
+    # mask buffer; an out-of-bounds value would scatter into the wrong
+    # row at runtime and silently corrupt the legality mask. Cheap to
+    # verify and catches any future Rust-engine regression at the
+    # source rather than as a CUDA scatter fault.
+    if indices.size > 0:
+        B = move_ids.shape[0]
+        upper = B * seq_len * vocab_size
+        if not (indices < upper).all():
+            bad = int(indices.max())
+            raise AssertionError(
+                f"legal indices out of bounds after shift: max={bad}, "
+                f"limit={upper} (B={B}, seq_len={seq_len}, V={vocab_size})"
+            )
     return indices
 
 

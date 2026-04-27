@@ -418,8 +418,13 @@ class TestBucketedLegalMaskCollate:
         # Force the longest game to fill the budget so we exercise the
         # cap-clamp (the off-grid bucket).
         gl[0] = seq_len
+        # Use full vocab_size=1980 (action + PAD + outcomes) so the
+        # full-length-fix path's PAD slot lands inside the mask buffer,
+        # matching production. vocab_size=1968 (action-only) is fine
+        # for non-full-length tests but underflows when the PAD-legal
+        # entry is added at slot 1968.
         collate = BucketedLegalMaskCollate(
-            seq_len=seq_len, bucket_size=64, vocab_size=1968,
+            seq_len=seq_len, bucket_size=64, vocab_size=1980,
         )
         items = [
             {
@@ -446,8 +451,11 @@ class TestBucketedLegalMaskCollate:
         move_ids, gl, _tc = engine.generate_random_games(B, seq_len, seed=42)
         # Force one game to fill the budget exactly.
         gl[0] = seq_len
+        # Use full vocab=1980 so the full-length-fix's PAD-legal slot
+        # at index 1968 lands inside the mask buffer (see comment on
+        # ``test_off_grid_seq_len_clamps_at_seq_len`` for context).
         collate = BucketedLegalMaskCollate(
-            seq_len=seq_len, bucket_size=16, vocab_size=1968,
+            seq_len=seq_len, bucket_size=16, vocab_size=1980,
         )
         items = [
             {
