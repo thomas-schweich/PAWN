@@ -22,7 +22,7 @@ import json
 import math
 import signal
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import torch
@@ -319,6 +319,12 @@ def build_scheduler(
     raise ValueError(f"Unknown lr_schedule: {schedule!r}")
 
 
+CompiledStep = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor],
+]
+
+
 def build_compiled_step(
     model: nn.Module,
     *,
@@ -326,7 +332,7 @@ def build_compiled_step(
     illegal_penalty: float,
     amp_dtype: torch.dtype | None,
     use_compile: bool,
-) -> Any:
+) -> CompiledStep:
     """Build a (possibly compiled) per-step function for the hot loop.
 
     Returns a callable ``step(ids, msk, legal_mask, targets) -> (loss,
@@ -482,7 +488,7 @@ def evaluate(
     mask_builder: LegalMaskBuilder,
     device: str,
     amp_dtype: torch.dtype | None = None,
-    precomputed_indices: list[torch.Tensor] | None = None,
+    precomputed_indices: list[torch.Tensor | tuple[int, torch.Tensor]] | None = None,
     apply_legal_mask: bool = True,
     illegal_penalty: float = 0.0,
 ) -> dict[str, float]:
@@ -1377,7 +1383,7 @@ def train(
     train_loader: DataLoader[Any],
     val_loader: DataLoader[Any],
     mask_builder: LegalMaskBuilder,
-    val_legal_indices: list[torch.Tensor],
+    val_legal_indices: list[torch.Tensor | tuple[int, torch.Tensor]],
     logger: MetricsLogger,
     args: Any,
     device: str,
