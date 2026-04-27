@@ -117,6 +117,57 @@ def _derive_key(
 
 
 # ---------------------------------------------------------------------------
+# Probe — does a split have any parquet shards we could load?
+# ---------------------------------------------------------------------------
+
+def split_has_files(repo_or_path: str | Path, split: str) -> bool:
+    """Check whether ``split`` has parquet shards available.
+
+    For HF repos this lists repo files once and checks for paths
+    containing ``/<split>-`` ending in ``.parquet``. For a local single
+    ``.parquet`` file there's no split semantics — return True only for
+    ``split == "train"``. For local directories / globs we match the
+    filesystem.
+
+    Cheap probe (one HF ``list_repo_files`` call); the right guard
+    before attempting to build a validation cache. ``_scan_parquet``'s
+    own "fall back to all parquet files" branch would silently load
+    the wrong shards if a split had no files.
+    """
+    s = str(repo_or_path)
+
+    if s.endswith(".parquet") and Path(s).exists():
+        # Single file has no split semantics; only "train" makes sense.
+        return split == "train"
+
+    if "/" in s and not Path(s).exists():
+        try:
+            from huggingface_hub import HfApi
+
+            files = HfApi().list_repo_files(s, repo_type="dataset")
+        except Exception:
+            return False
+        marker = f"/{split}-"
+        return any(
+            f.endswith(".parquet") and marker in f"/{f}"
+            for f in files
+        )
+
+    # Local directory or glob pattern.
+    p = Path(s)
+    if p.is_dir():
+        return any(p.glob(f"data/{split}-*.parquet")) or any(
+            p.glob(f"{split}-*.parquet")
+        )
+    # Glob pattern: substitute the asterisk for ``<split>-*`` and check.
+    if "*" in s:
+        import glob as _glob
+
+        return bool(_glob.glob(s.replace("*", f"{split}-*", 1)))
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 
@@ -398,7 +449,10 @@ class IndexedLichessDataset(torch.utils.data.Dataset):
 
         meta = json.loads((self.cache_dir / "meta.json").read_text())
         self._n_games_total = int(meta["n_games"])
-        if int(indices.max().item()) >= self._n_games_total:
+        # ``indices.max()`` raises on an empty tensor; an empty index
+        # set is a legitimate (if degenerate) case — e.g. a val carve
+        # when the cache is too small — so just skip the bounds check.
+        if indices.numel() > 0 and int(indices.max().item()) >= self._n_games_total:
             raise ValueError(
                 f"index {int(indices.max().item())} out of range "
                 f"for cache with {self._n_games_total} games"

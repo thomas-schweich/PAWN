@@ -505,10 +505,19 @@ def main():
     # Auto-detect the backbone's training-time sequence format so the
     # data layout matches what the model saw. `--prepend-outcome` forces
     # the flag when the checkpoint metadata is missing or ambiguous.
+    # specialized_clm runs don't carry a backbone, so there's no
+    # metadata to read — just default to pure-moves unless the user
+    # forced the flag explicitly.
     from pawn.checkpoint import get_prepend_outcome, read_checkpoint_metadata
     if args.prepend_outcome:
         prepend_outcome = True
         print("  prepend_outcome: True (forced by --prepend-outcome)")
+    elif args.checkpoint is None:
+        prepend_outcome = False
+        print(
+            "  prepend_outcome: False "
+            "(no backbone checkpoint; standalone model)"
+        )
     else:
         try:
             saved = read_checkpoint_metadata(args.checkpoint)

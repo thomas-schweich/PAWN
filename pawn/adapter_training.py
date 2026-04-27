@@ -1829,6 +1829,14 @@ def train(
     # for SIGTERM / patience / pause / explicit step_limit; the silent
     # truncation that motivated this file (streaming `steps_per_epoch`
     # estimate drift) is no longer reachable.
+    #
+    # Special case: resume-past-end (loop never executed because
+    # ``start_epoch >= args.epochs``). The default ``stop_reason``
+    # initializer is ``"completed"``, which combined with the unchanged
+    # ``global_step`` would trip the structural-bug banner — but
+    # there's no bug here, the run is simply already done.
+    if global_step == initial_step and stop_reason == "completed":
+        stop_reason = "resume_no_op"
     write_schedule_health(
         logger.run_dir,
         schedule=getattr(args, "lr_schedule", "cosine"),

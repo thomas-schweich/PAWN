@@ -815,6 +815,40 @@ class BackgroundCheckpointPusher:
         self._pool.shutdown(wait=True)
 
 
+def truncate_metrics_jsonl(metrics_path: str | Path, step: int) -> str:
+    """Return the prefix of ``metrics_path`` covering steps ``<= step``.
+
+    The boundary semantics are inclusive on the target step: every train
+    or val record at exactly ``step`` is kept, and the loop stops on the
+    first train/val record whose ``step > step``. This keeps train+val
+    pairs at the boundary together (val often follows train at the same
+    global_step). Records without a ``type in {"train", "val"}`` field
+    (config rows, custom debug rows) and malformed JSON lines are
+    passed through verbatim — they don't gate the boundary check.
+    """
+    out: list[str] = []
+    target = int(step)
+    with open(metrics_path) as f:
+        for line in f:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # Pass malformed lines through; don't let one bad row
+                # truncate the whole file.
+                out.append(line)
+                continue
+            if (
+                record.get("type") in ("train", "val")
+                and int(record.get("step", 0)) > target
+            ):
+                # First record beyond the target — stop *before* it so
+                # multiple records at the target step (e.g. a train then
+                # a val record at the same step) all make it in.
+                break
+            out.append(line)
+    return "".join(out)
+
+
 def push_checkpoint_to_hf(
     checkpoint_path: str | Path,
     repo_id: str,
@@ -855,20 +889,10 @@ def push_checkpoint_to_hf(
         metrics_path = Path(metrics_path)
         if metrics_path.exists():
             import tempfile
-            # Truncate metrics to current step
-            truncated_lines = []
-            with open(metrics_path) as f:
-                for line in f:
-                    truncated_lines.append(line)
-                    try:
-                        record = json.loads(line)
-                        if record.get("type") in ("train", "val") and record.get("step", 0) >= step:
-                            break
-                    except json.JSONDecodeError:
-                        continue
 
+            truncated_text = truncate_metrics_jsonl(metrics_path, step)
             with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tmp:
-                tmp.writelines(truncated_lines)
+                tmp.write(truncated_text)
                 tmp_path = tmp.name
 
             try:
@@ -937,21 +961,8 @@ def push_checkpoint_to_bucket(
             # Match push_checkpoint_to_hf's "truncate at the current
             # step" behavior so the bucket copy never gets ahead of
             # the checkpoint it sits beside.
-            truncated_lines = []
-            with open(metrics_path) as f:
-                for line in f:
-                    truncated_lines.append(line)
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if (
-                        record.get("type") in ("train", "val")
-                        and record.get("step", 0) >= step
-                    ):
-                        break
             (staging_path / "metrics.jsonl").write_text(
-                "".join(truncated_lines)
+                truncate_metrics_jsonl(metrics_path, step)
             )
 
         result = subprocess.run(

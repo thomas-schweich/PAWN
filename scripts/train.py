@@ -320,6 +320,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         IndexedLichessDataset,
         SeededEpochSampler,
         prepare_lichess_cached,
+        split_has_files,
     )
     from pawn.lichess_data import LegalMaskBuilder, LegalMaskCollate
     from pawn.logging import MetricsLogger
@@ -386,7 +387,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
     seq_len = cfg_obj.max_seq_len if cfg_obj is not None else 256
 
     print(f"\nPreparing data: {args.pgn}")
-    cache = prepare_lichess_cached(
+    train_cache = prepare_lichess_cached(
         args.pgn,
         split="train",
         elo_min=args.elo_min,
@@ -394,14 +395,48 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         min_ply=args.min_ply,
         cache_dir=args.cache_dir,
     )
-    n_total = cache.n_games
-    n_val = min(args.val_games, n_total // 5)
-    n_train = n_total - n_val
-    if n_train <= 0:
-        _die(
-            f"After holding out {n_val} val games, no train games remain "
-            f"(cache n_games={n_total}). Reduce val_games or widen the "
-            "Elo / min_ply filters."
+
+    # Use the dataset's own ``validation`` split when available — that's
+    # the canonical held-out set the dataset author curated. Otherwise
+    # carve val out of the tail of the train cache (the only option for
+    # single-parquet local files or repos without a validation split).
+    if split_has_files(args.pgn, "validation"):
+        val_cache = prepare_lichess_cached(
+            args.pgn,
+            split="validation",
+            elo_min=args.elo_min,
+            elo_max=args.elo_max,
+            min_ply=args.min_ply,
+            cache_dir=args.cache_dir,
+        )
+        n_train = train_cache.n_games
+        n_val = min(args.val_games, val_cache.n_games)
+        train_indices = torch.arange(n_train, dtype=torch.int64)
+        val_indices_cache_dir = val_cache.cache_dir
+        val_indices = torch.arange(n_val, dtype=torch.int64)
+        print(
+            f"  Train split: {n_train:,} games, "
+            f"Val split: {val_cache.n_games:,} games "
+            f"(using first {n_val:,} for eval)"
+        )
+    else:
+        # Carve val from the tail of the train cache.
+        n_total = train_cache.n_games
+        n_val = min(args.val_games, n_total // 5)
+        n_train = n_total - n_val
+        if n_train <= 0:
+            _die(
+                f"After holding out {n_val} val games, no train games remain "
+                f"(cache n_games={n_total}). Reduce val_games or widen the "
+                "Elo / min_ply filters."
+            )
+        train_indices = torch.arange(n_train, dtype=torch.int64)
+        val_indices_cache_dir = train_cache.cache_dir
+        val_indices = torch.arange(n_train, n_total, dtype=torch.int64)
+        print(
+            f"  Train: {n_train:,} games, "
+            f"Val: {n_val:,} games (carved from train tail; "
+            "no separate validation split in dataset)"
         )
 
     # Resolve ``steps_per_epoch``. The canonical input is
@@ -448,14 +483,14 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
     )
 
     train_ds = IndexedLichessDataset(
-        cache_dir=cache.cache_dir,
-        indices=torch.arange(n_train, dtype=torch.int64),
+        cache_dir=train_cache.cache_dir,
+        indices=train_indices,
         max_ply=seq_len,
         prepend_outcome=config.prepend_outcome,
     )
     val_ds = IndexedLichessDataset(
-        cache_dir=cache.cache_dir,
-        indices=torch.arange(n_train, n_total, dtype=torch.int64),
+        cache_dir=val_indices_cache_dir,
+        indices=val_indices,
         max_ply=seq_len,
         prepend_outcome=config.prepend_outcome,
     )
