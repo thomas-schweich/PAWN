@@ -334,6 +334,12 @@ def _load_cache(cache_dir: Path) -> LichessTokenCache:
         dtype=torch.int16,
     )
 
+    # ``safetensors.torch.load_file`` is also mmap-backed on Linux/macOS
+    # — the returned tensors share memory with the file rather than
+    # copying it into RSS. A 16M-game cache produces a ~128 MB offsets
+    # array and a ~32 MB outcomes array; neither pins resident memory,
+    # and spawn workers share the OS page cache the same way as
+    # ``tokens_flat.bin``.
     index = load_file(str(cache_dir / "index.safetensors"))
     offsets = index["offsets"]
     outcome_tokens = index["outcome_tokens"]

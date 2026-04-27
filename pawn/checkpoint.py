@@ -825,6 +825,14 @@ def truncate_metrics_jsonl(metrics_path: str | Path, step: int) -> str:
     global_step). Records without a ``type in {"train", "val"}`` field
     (config rows, custom debug rows) and malformed JSON lines are
     passed through verbatim — they don't gate the boundary check.
+
+    The full-file scan per push is intentional. At default settings
+    (``log_interval=100``, ``eval_interval=5000``,
+    ``checkpoint_interval=5000``) the metrics file is < 1 MB at every
+    checkpoint and the scan is bounded by sequential disk reads — well
+    inside microseconds. A running-cursor optimization would only matter
+    at very high checkpoint frequency or extremely long runs; if you hit
+    that regime, replace this helper with a stateful reader.
     """
     out: list[str] = []
     target = int(step)
