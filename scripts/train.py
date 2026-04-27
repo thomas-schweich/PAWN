@@ -548,6 +548,13 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
     print(
         f"  Precomputed legal masks for {len(val_legal_indices)} val batches"
     )
+    # The val loader runs the same collate on every eval pass; once
+    # the indices are cached upstream, the in-collate Rust replay is
+    # redundant (``evaluate`` consumes ``precomputed_indices`` and
+    # ignores ``batch["legal_indices"]`` when both are present). Flip
+    # the collate's skip flag so subsequent eval iterations only do
+    # the (much cheaper) pack step.
+    collate.skip_legal_indices = True
 
     # Log config & handle RoSA multi-phase
     if args.strategy == "rosa":

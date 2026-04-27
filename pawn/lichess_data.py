@@ -283,6 +283,14 @@ class BucketedLegalMaskCollate:
         self.bucket_size = bucket_size
         self.vocab_size = vocab_size
         self.prepend_outcome = prepend_outcome
+        # When the val loader's indices are precomputed and cached
+        # upstream (see ``precompute_val_masks``), the per-batch
+        # ``compute_legal_indices`` call is pure waste — the eval loop
+        # ignores the collate's indices and uses the cache instead.
+        # Callers flip this to ``True`` after precompute completes; on
+        # the train loader it stays ``False`` (every batch's indices
+        # are consumed exactly once).
+        self.skip_legal_indices: bool = False
 
     def __call__(self, items: list[dict[str, Any]]) -> dict[str, Any]:
         from pawn.data import pack_clm_sequences
@@ -310,20 +318,22 @@ class BucketedLegalMaskCollate:
             move_ids, game_lengths, outcome_tokens, T_padded,
             prepend_outcome=self.prepend_outcome,
         )
-        indices = compute_legal_indices(
-            move_ids, game_lengths, T_padded, self.vocab_size,
-            prepend_outcome=self.prepend_outcome,
-        )
 
-        return {
+        out: dict[str, Any] = {
             "input_ids": packed["input_ids"],
             "targets": packed["targets"],
             "loss_mask": packed["loss_mask"],
             "move_ids": torch.from_numpy(move_ids),
             "game_length": torch.from_numpy(game_lengths.astype(np.int64)),
-            "legal_indices": torch.from_numpy(indices),
             "T_actual": T_padded,
         }
+        if not self.skip_legal_indices:
+            indices = compute_legal_indices(
+                move_ids, game_lengths, T_padded, self.vocab_size,
+                prepend_outcome=self.prepend_outcome,
+            )
+            out["legal_indices"] = torch.from_numpy(indices)
+        return out
 
 
 # ---------------------------------------------------------------------------
