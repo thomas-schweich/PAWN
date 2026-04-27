@@ -132,8 +132,13 @@ All adapter strategies dispatch through the unified `scripts/train.py` with `--r
 uv run python scripts/train.py --run-type adapter --strategy lora \
     --checkpoint thomas-schweich/pawn-base \
     --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
+    --steps-per-epoch all --epochs 1 \
     --lora-rank 4 --lr 3e-4 --local-checkpoints
 ```
+
+Adapter training is **cache-first**: the first run with a given (Elo, `min_ply`) combination filters and tokenizes the dataset to disk under `$HF_HOME/pawn-lichess-cache/<key>/` (or `$PAWN_DATA_CACHE/<key>/`); subsequent runs mmap that cache. Filter parameters bake into the cache key — different (Elo, `min_ply`) combinations produce different caches. `max_ply` and `prepend_outcome` only affect packing and apply at access time, so the cache is invariant to them.
+
+`--steps-per-epoch` is the canonical way to size an adapter run. Pass an integer or `"all"` (resolves to `n_train_games // batch_size` once the cache materializes; the resolved integer is what gets written to `run_config.json`). The legacy `--max-games` is accepted as `steps_per_epoch = max_games // batch_size` with a deprecation warning.
 
 | `--strategy` value  | Adapter | Key args | Typical params |
 |---------------------|---------|----------|----------------|
@@ -146,7 +151,7 @@ uv run python scripts/train.py --run-type adapter --strategy lora \
 | `specialized_clm`   | From-scratch standalone transformer (no backbone) | `--d-model 84 --n-layers 2` | ~524K |
 | `unfreeze`          | Fine-tune top N backbone layers | `--unfreeze-layers 6,7` | varies |
 
-Common adapter args: `--epochs 50`, `--batch-size 64`, `--lr 3e-4`, `--patience 10`, `--val-every 1`, `--max-games 12000`, `--min-ply 10`, `--checkpoint-interval 5000`
+Common adapter args: `--epochs 50`, `--batch-size 64`, `--lr 3e-4`, `--patience 10`, `--val-every 1`, `--steps-per-epoch all`, `--min-ply 10`, `--checkpoint-interval 5000`
 
 Adapter checkpoints are written to `logs/run_*/checkpoints/step_{global_step:08d}/` (matching the pretraining layout — never overwritten). A save fires whenever val hits a new best, whenever the step is a `--checkpoint-interval` multiple, or at termination (step limit, patience, shutdown). To find the best step from a run's `metrics.jsonl`, use `pawn.checkpoint.find_best_adapter_step`.
 
@@ -382,6 +387,11 @@ Supports all adapter types + architecture search. GPU affinity assigns `CUDA_VIS
 
 ## Key Patterns & Gotchas
 
+- **Adapter training is cache-first.** First run with a given (Elo, `min_ply`) combination filters and tokenizes the dataset to disk; subsequent runs mmap the cache. Both LR-schedule sizing and resume use exact step counts derived from `steps_per_epoch` — no shard-count estimate, no fast-forward iteration through the data pipeline. The legacy streaming path is gone.
+- **`steps_per_epoch` is canonical for adapters.** `"all"` resolves to `n_train_games // batch_size` once the cache materializes. `max_games` is deprecated and converts to `steps_per_epoch = max_games // batch_size` with a warning.
+- **`schedule_health.json`** is written next to `metrics.jsonl` at trainer exit (both adapter and pretrain). Records `{planned_total_steps, actual_total_steps, reason_for_stop, lr_peak, actual_final_lr}`. The combination `actual != planned` AND `reason_for_stop == "completed"` is a structural-bug signal and prints a red banner.
+- **Bucket I/O uses `hf://buckets/<ns>/<name>` URLs via `hf sync`.** Never `hf upload --repo-type bucket` — the current CLI rejects bucket type and silently exits 0. For cron-driven syncs that need to fail loudly on auth/quota, use `scripts/sync_to_bucket.sh`.
+- **fp16 AMP overflows on ceiling-scale adapters.** Use `--amp-dtype bfloat16` for adapter training and eval; bf16 has fp32-range exponents. fp16 produces NaN-corrupted accuracy (~9%) on backbones with adapter activations exceeding fp16 range. `eval_accuracy.py`'s `--amp-dtype` defaults to `none` (fp32) for safety.
 - **DataLoader workers must use `multiprocessing_context='spawn'`** — the Rust engine uses rayon, and fork after rayon init causes deadlocks.
 - **`SDPA_BACKEND` must be set before `torch.compile()`** — compiled code captures the backend at trace time. `apply_gpu_config()` handles this.
 - **ROCm works**: Previously the flash-attention backward on ROCm hit a stride mismatch when combined with `torch.compile` + AMP. We worked around it by forcing RoPE outputs to be contiguous before SDPA in `pawn.model.Attention.forward` — flash is now the default on AMD too. `--sdpa-math` remains available as a debugging escape hatch but is no longer required. Everything else — training, eval, adapters, data loading — works identically on ROCm and CUDA. **Do not assume bugs are ROCm-specific.** Every other time something has failed on AMD it turned out to be a bug in our code (wrong torch version installed, stale lockfile, missing dependency, etc.), not a ROCm issue.

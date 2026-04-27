@@ -97,18 +97,21 @@ Full probe results including diagnostics are on each variant's [HuggingFace mode
 
 <sub>More info: [docs/ADAPTERS.md](docs/ADAPTERS.md)</sub>
 
-PAWN ships with six adapter implementations for finetuning the frozen backbone on human game data. Numbers below are from the v1.0.0 `pawn-base` backbone trained on 2M Lichess games at 1800-1900 Elo, one pass.
+PAWN ships with several adapter implementations for finetuning the frozen backbone on human game data. The table below is the current Pareto frontier across param budgets, all on Lichess games filtered to Elo 1800-1900 with both players in band (≈16 M games per epoch). Top entries use the `pawn-large` backbone with bottleneck adapters concentrated on the top 4 of 10 layers, which generalizes the layer-placement finding (top-4 ≈ 40% of depth wins on every backbone size tested).
 
-| Method | Params | Val top-1 (1800-1900 Elo) | Description |
-|--------|-------:|--------------------------:|-------------|
-| **[Bottleneck](https://arxiv.org/abs/1902.00751)** dim=512 | 8.4M | **46.14%** | Houlsby-style residual MLP adapters |
-| **Bottleneck** dim=64 | 1.05M | 41.56% | |
-| **Bottleneck** dim=32 | 524K | 39.82% | |
-| **[LoRA](https://arxiv.org/abs/2106.09685)** rank=16 qkvo | 524K | 35.62% | Low-rank attention projection adapters |
-| **[RoSA](https://arxiv.org/abs/2401.04679)** retro-sparse d=0.01 | 84K | 30.45% | Gradient-informed sparse mask from LoRA warmup |
-| **Sparse** density=0.015 qkvo | 126K | 29.18% | Random binary mask on frozen weights |
+| Method | Backbone | Params | Val top-1 (1800-1900 Elo) | Description |
+|--------|----------|-------:|--------------------------:|-------------|
+| **[Bottleneck](https://arxiv.org/abs/1902.00751)** dim=2500 top-4 (2 ep) | pawn-large | 25.6M | **52.37%** | Houlsby-style; current ceiling on this dataset |
+| **Combo** retro-bn dim=1280 top-4 + d=0.05 sparse (1.4 ep) | pawn-large | 13.93M | 51.16% | Gradient-informed sparse + bottleneck |
+| **Bottleneck** dim=1024 top-4 (2 ep) | pawn-base | 8.4M | 51.03% | Top-4 placement closes the backbone-size gap with extension |
+| **Bottleneck** dim=2580 top-4 (1 ep) | pawn-large | 26.4M | 50.76% | Decomposition test — pure bottleneck baseline for the combo |
+| **Bottleneck** dim=2500 top-4 (1 ep) | pawn-large | 25.6M | 50.74% | One-epoch ceiling; +1.6 pp from 2 epochs of training |
+| **Bottleneck** dim=640 dist (1 ep) | pawn-large | 16.4M | 49.88% | All-layer distributed placement |
+| **Bottleneck** dim=1024 top-4 (1 ep) | pawn-base | 8.4M | 49.23% | Top-4 +0.7 pp over distributed at the same param count |
+| **[LoRA](https://arxiv.org/abs/2106.09685)** rank=16 qkvo | pawn-base | 524K | 35.62% | Low-rank attention projection adapters |
+| **[RoSA](https://arxiv.org/abs/2401.04679)** retro-sparse d=0.01 | pawn-base | 84K | 30.45% | Gradient-informed sparse mask from LoRA warmup |
 
-Hybrid (LoRA+FiLM) and [FiLM](https://arxiv.org/abs/1709.07871) remain in the codebase but aren't in the current sweep. See [docs/ADAPTERS.md](docs/ADAPTERS.md) for full methodology and Pareto discussion.
+Hybrid (LoRA+FiLM) and [FiLM](https://arxiv.org/abs/1709.07871) remain in the codebase but aren't on the current frontier. See [docs/ADAPTERS.md](docs/ADAPTERS.md) for the full methodology — backbone-size H2H, layer-placement ladder, adapter-vs-from-scratch matched-budget comparison, and decay-shape analysis.
 
 ### Datasets
 

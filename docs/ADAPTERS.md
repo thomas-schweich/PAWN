@@ -173,31 +173,86 @@ Each adapter exposes three helpers:
 
 ## Results Summary
 
-All results on the v1.0.0 `pawn-base` backbone (8 layers, d_model=512, 1,980-token vocab, 512-token context, no outcome prefix) trained via behavioral cloning on Lichess games with the default legal-move-masked cross-entropy loss (`--disable-legal-mask` / `--illegal-penalty` had not yet been added when this sweep ran). Every run streams one pass through 2M games filtered to Elo 1800-1900 with `min_ply=10`, bs=128 (bs=96 for dim=512 to fit activation memory on a 21 GB card), `lr=3e-4`, bf16 AMP, flash SDPA + `torch.compile`. FiLM and Hybrid remain in the codebase but were not part of this sweep.
+All results below use Lichess games filtered to Elo 1800-1900 with both players in band and `min_ply=10` (≈16.2 M games per epoch). Default settings: bs=128, bf16 AMP, flash SDPA + `torch.compile`, infinite LR schedule (`warmup_frac=0.05`, `cooldown_frac=0.4`, `stable_lr_ratio=0.75`, `decay_frac=0.1`, `wsd_decay_shape=cosine`), peak LR 4e-4 for bottleneck families and 3e-4 for retro-bottleneck and specialized_clm. "1 ep" rows train on one full pass; "2 ep" rows do an honest two passes with the LR decay completing in the tail of epoch 2.
 
-### Phase 2 v2 sweep (2M games, 1800-1900 Elo, one pass)
+### Pareto frontier across param budgets
 
-| Method | Params | Val top-1 | Val top-5 | Val loss | Wall |
-|--------|-------:|----------:|----------:|---------:|------|
-| Sparse (density=0.015, qkvo, random mask) | 126K | 29.18% | 61.38% | 2.495 | 1h27m |
-| RoSA retro-sparse (density=0.01, grad mask) | 84K | **30.45%** | 63.15% | 2.438 | 1h28m |
-| LoRA (rank=16, qkvo) | 524K | 35.62% | 70.33% | 2.206 | 1h36m |
-| Bottleneck (dim=32, attn+ffn, all layers) | 524K | **39.82%** | 76.07% | 2.013 | 1h30m |
-| Bottleneck (dim=64) | 1.05M | **41.56%** | 78.07% | 1.942 | 1h28m |
-| Bottleneck (dim=512, bs=96) | 8.4M | **46.14%** | 82.88% | 1.751 | 1h44m |
+| Method | Backbone | Params | Epochs | Val top-1 | Notes |
+|--------|----------|-------:|:------:|----------:|-------|
+| Sparse density=0.015 qkvo random mask | pawn-base | 126K | 1 | 29.18% | random binary mask baseline |
+| RoSA retro-sparse density=0.01 qkvo | pawn-base | 84K | 1 | **30.45%** | gradient-informed sparse mask, smaller and better |
+| Retro-sparse density=0.05 | pawn-base | 419K | 1 | 36.99% | pure-sparse scaling |
+| LoRA rank=16 qkvo | pawn-base | 524K | 1 | 35.62% | low-rank attention |
+| Bottleneck dim=32 all layers | pawn-base | 524K | 1 | **39.82%** | beats LoRA at matched params |
+| Bottleneck dim=64 | pawn-base | 1.05M | 1 | 41.56% | |
+| Retro-bottleneck (composition-matched) | pawn-large | 2.35M | 1 | **46.14%** | bdim=82, density=0.0153 — clean H2H against pawn-base |
+| Retro-bottleneck dim=160 d=0.02 | pawn-large | 4.43M | 1 | 47.47% | |
+| Bottleneck dim=512 dist | pawn-base | 8.4M | 1 | 48.51% | |
+| Bottleneck dim=1024 top-4 | pawn-base | 8.4M | 1 | **49.23%** | top-4 placement +0.7 pp over distributed at matched params |
+| Bottleneck dim=512 dist | pawn-large | 13.1M | 1 | 49.93% | |
+| Bottleneck dim=1280 top-4 | pawn-large | 13.1M | 1 | 50.12% | top-4 generalizes to large |
+| Combo: retro-bn dim=1280 top-4 + d=0.05 sparse | pawn-large | 13.93M | 1 | **50.60%** | combo +0.5 pp over pure bottleneck at matched params |
+| Bottleneck dim=640 dist | pawn-large | 16.4M | 1 | 49.88% | |
+| Bottleneck dim=1024 top-4 | pawn-base | 8.4M | 2 | **51.03%** | extension closes the backbone-size gap to 1-ep large |
+| Combo at 13.93M, max_games=14M | pawn-large | 13.93M | 1.4 | **51.16%** | matches 26.4M combo at half the params |
+| Combo: retro-bn dim=2500 top-4 + d=0.05 sparse | pawn-large | 26.4M | 1 | 51.18% | |
+| Bottleneck dim=1024 dist | pawn-large | 25.6M | 1 | 50.39% | |
+| Bottleneck dim=2500 top-4 | pawn-large | 25.6M | 1 | 50.74% | top-4 +0.35 pp over distributed at ceiling scale |
+| Bottleneck dim=2580 top-4 (decomp test) | pawn-large | 26.4M | 1 | 50.76% | within noise of T29 — extra bottleneck params add ~nothing, isolating the combo's sparse contribution |
+| Bottleneck dim=2500 top-4 | pawn-large | 25.6M | 2 | **52.37%** 🥇 | current ceiling on this dataset |
 
-Pareto-optimal points are in bold.
+Pareto-optimal points (best val top-1 at their param budget × epoch tier) are in bold.
+
+### Backbone size at matched adapter capacity
+
+Holding params equal across `pawn-base` (8 layers, d=512) and `pawn-large` (10 layers, d=640):
+
+| Family | Params | base | large | Δ |
+|--------|-------:|-----:|------:|--:|
+| Bottleneck distributed | 16.4M | 49.52% | 49.88% | **+0.36** |
+| Retro-bottleneck (composition-matched, see note) | 2.35M | 45.91% | 46.14% | **+0.23** |
+| Retro-bottleneck | 4.4M | 47.10% | 47.47% | **+0.37** |
+
+`pawn-large` wins consistently by 0.2–0.4 pp once parameters are matched. **Composition matters for multi-component adapters**: an earlier 2.35M H2H landed at a tie because density was matched (0.03) but composition wasn't — at fixed density, the larger backbone gets more sparse and less bottleneck. Matching the bottleneck and sparse param counts separately recovers the small backbone-size advantage at every scale tested.
+
+### Layer placement (matched 8.4M, base, distributed budget)
+
+| Placement | Layers | Val top-1 | Δ from top-4 |
+|-----------|--------|----------:|-------------:|
+| top-4 | 4,5,6,7 | **49.23%** | — |
+| top-2 | 6,7 | 48.63% | −0.60 |
+| distributed (all 8) | 0–7 | 48.51% | −0.72 |
+| mid-4 | 2,3,4,5 | 47.46% | −1.77 |
+| bottom-4 | 0,1,2,3 | 45.85% | −3.38 |
+| top-1 | 7 | 44.11% | −5.12 |
+
+**Top-4 (≈40% of depth) is the sweet spot.** Concentrating the same parameter budget on the top half of the backbone gains ~0.7 pp over uniform distribution; over-concentrating onto a single layer drops 5 pp. The same pattern holds on `pawn-large` (top-4 of 10 = layers 6–9), where it adds +0.19 pp over distributed at 13.1 M and +0.35 pp at 25.6 M.
+
+### Adapter vs. from-scratch transformer (matched budget)
+
+`specialized_clm` is a standalone decoder-only transformer trained on the same Lichess data without a frozen backbone, sized to match adapter param counts. The matched-2-epoch comparison is the apples-to-apples one — most of the apparent adapter advantage at the 1-epoch frontier was the dedicated side being undertrained.
+
+| Params | Dedicated 1ep | Adapter 1ep | Δ | Dedicated 2ep | Adapter 2ep | Δ (matched) |
+|-------:|--------------:|------------:|--:|--------------:|------------:|------------:|
+| 420K | 33.66% | 36.99% (retro-sparse) | +3.3 | — | — | — |
+| 4.55M | 40.09% | 47.47% (retro-bn large) | +7.4 | 43.24% | — | — |
+| 7.84M | 42.10% | 49.23% (bottleneck top-4 base) | +7.1 | — | — | — |
+| 16.75M | 43.94% | 49.88% (bottleneck large dist) | +5.9 | — | — | — |
+| 25.85M | 44.81% | 50.74% (bottleneck large top-4) | +5.9 | 48.97% | 52.37% | **+3.4** |
+
+At ~25 M with both sides trained for 2 full epochs, the adapter wins by **~3 pp**, not the 6 pp the 1-epoch ladder suggested. The frozen backbone genuinely helps, but more of the early-epoch gap was undertraining than was generally appreciated.
 
 ### Takeaways
 
-- **Bottleneck dominates at matched parameter budgets.** At 524K, bottleneck dim=32 (39.82%) beats LoRA rank=16 qkvo (35.62%) by 4.2pp — the gap is structural and does not close under more data (consistent with the earlier 12K-game phase-1 sweep, where the same ordering held).
-- **Gradient-informed masks beat random masks.** RoSA retro-sparse (84K) beats random-mask sparse (126K) by 1.27pp at a third fewer trainable parameters. The 3-phase training overhead (LoRA warmup → mask generation → sparse-only training) pays for itself cleanly.
-- **Bottleneck hasn't saturated.** 16× params (dim=32 → dim=512) gave +6.32pp, and the last 8× step (dim=64 → dim=512) contributed +4.58pp on its own. The sweep didn't reach the point of diminishing returns.
-- **The legacy v0.x adapter sweep (which used `prepend_outcome=True` plus a coarser 4,278-token vocab and 256-token context) is preserved in git history at tag `pre-vocab-transition`.** Direct comparison with those numbers is apples-to-oranges because the backbone architecture, vocabulary, and training schedule all changed; use the table above as the canonical reference for v1.0.0.
+- **Bottleneck dominates at matched parameter budgets.** At 524K, bottleneck dim=32 beats LoRA rank=16 qkvo by 4.2 pp — the gap is structural across the whole budget range.
+- **Gradient-informed masks beat random masks.** RoSA retro-sparse (84K) beats random-mask sparse (126K) by 1.27 pp at fewer trainable parameters. The 3-phase training overhead (LoRA warmup → mask generation → sparse-only training) pays for itself.
+- **Combo (top-4 bottleneck + qkvo sparse) adds orthogonal capacity.** Decomposition test at 26.4 M: pure bottleneck dim=2580 lands at 50.76% (within 0.02 pp of the dim=2500 baseline), so the +0.42 pp T43-over-T51 gain is the genuine contribution of the gradient-informed sparse component, not a param-count effect.
+- **Top-4 layer placement scales.** Sweet spot at ~40% of depth on every backbone tested.
+- **2-epoch extension closes the backbone-size gap.** `pawn-base` top-4 at 8.4 M with two epochs (51.03%) beats `pawn-large` distributed at 13.1 M with one epoch (49.93%). For tight param budgets, training longer on the smaller backbone is competitive.
 
-### Backbone leverage (legacy reference)
+### Vs. the legacy v0.x sweep
 
-For historical context, the legacy v0.x sweep measured a standalone tiny transformer (no backbone, trained from scratch) at 524K params and 30.9% top-1 vs. a 524K bottleneck on the frozen legacy backbone at 42.2%. The v1.0.0 bottleneck dim=32 (524K trainable) lands at 39.82% on 2M games; we haven't yet re-run the from-scratch baseline on the v1.0.0 data pipeline (1,980-vocab, 512-ctx, no outcome prefix) to directly quantify the frozen-backbone lift under current conditions, so the ~9pp implied by subtracting the two eras is indicative rather than a like-for-like measurement. A matched from-scratch 524K standalone on the current data is on the to-do list.
+The legacy v0.x adapter sweep (preserved in git at tag `pre-vocab-transition`) used a coarser ~60 K-token vocabulary, `prepend_outcome=True`, and a 256-token context. Direct comparison with the table above is apples-to-oranges because the backbone architecture, vocabulary, and training schedule all changed during the v1.0.0 transition. Use the current results as the canonical reference.
 
 ---
 
