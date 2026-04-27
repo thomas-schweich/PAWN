@@ -270,15 +270,13 @@ class BucketedLegalMaskCollate:
     ):
         if bucket_size <= 0:
             raise ValueError(f"bucket_size must be > 0, got {bucket_size}")
-        if seq_len % bucket_size != 0 and seq_len > bucket_size:
-            # Non-multiple seq_len: the topmost bucket would clamp to
-            # seq_len, mixing one off-bucket-size graph in with the
-            # rounded ones. Refuse rather than surprise the compile path.
-            raise ValueError(
-                f"seq_len ({seq_len}) must be a multiple of bucket_size "
-                f"({bucket_size}); otherwise the cap-clamped bucket is "
-                "off-grid and torch.compile traces an extra graph."
-            )
+        # When ``seq_len`` is not a multiple of ``bucket_size`` the
+        # cap-clamped top bucket is off-grid (e.g. seq_len=300,
+        # bucket_size=64 → buckets {64, 128, 192, 256, 300} instead of
+        # {64, 128, 192, 256}). torch.compile traces one extra graph
+        # for that shape; that's a small cache-pressure cost, not a
+        # correctness issue. Permitted so legacy ``max_seq_len`` values
+        # like 255 / 300 keep working without a forced migration.
         self.seq_len = seq_len
         self.bucket_size = bucket_size
         self.vocab_size = vocab_size

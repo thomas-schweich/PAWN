@@ -408,10 +408,30 @@ class TestBucketedLegalMaskCollate:
         )
         assert np.array_equal(batch["legal_indices"].numpy(), direct)
 
-    @pytest.mark.unit
-    def test_seq_len_must_be_multiple_of_bucket_size(self):
-        with pytest.raises(ValueError, match="multiple of bucket_size"):
-            BucketedLegalMaskCollate(seq_len=200, bucket_size=64, vocab_size=1968)
+    @pytest.mark.integration
+    def test_off_grid_seq_len_clamps_at_seq_len(self):
+        """Non-multiple seq_len is allowed: the top bucket clamps to
+        seq_len and contributes one extra graph cache entry."""
+        B = 4
+        seq_len = 200  # not a multiple of bucket_size=64
+        move_ids, gl, _tc = engine.generate_random_games(B, seq_len, seed=42)
+        # Force the longest game to fill the budget so we exercise the
+        # cap-clamp (the off-grid bucket).
+        gl[0] = seq_len
+        collate = BucketedLegalMaskCollate(
+            seq_len=seq_len, bucket_size=64, vocab_size=1968,
+        )
+        items = [
+            {
+                "move_ids": np.asarray(move_ids[i], dtype=np.int16),
+                "game_length": int(gl[i]),
+                "outcome_token": 1969,
+            }
+            for i in range(B)
+        ]
+        batch = collate(items)
+        assert batch["T_actual"] == seq_len  # off-grid cap clamp
+        assert batch["input_ids"].shape == (B, seq_len)
 
     @pytest.mark.unit
     def test_bucket_size_zero_rejected(self):
