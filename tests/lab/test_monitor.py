@@ -130,21 +130,49 @@ class TestReadMetrics:
         assert trial.total_steps == 250
 
     def test_parses_train_record(self, tmp_path):
+        # ``steps_per_sec`` is computed from a rolling window over
+        # ``elapsed`` rather than per-record ``step_time`` (the old
+        # path inflated sps by ~30× via log_interval-scale quantization).
+        # Single train record → cumulative-rate fallback.
         log_dir = tmp_path / "logs"
         metrics_path = log_dir / "trial_0000" / "run_x" / "metrics.jsonl"
         _write_metrics_file(metrics_path, [
-            {"type": "train", "step": 50, "train/loss": 2.5, "step_time": 0.1,
-             "train/accuracy": 0.3},
+            {"type": "train", "step": 50, "elapsed": 5.0,
+             "train/loss": 2.5, "train/accuracy": 0.3},
         ])
 
         trial = _make_trial(0)
         offsets: dict[int, int] = {}
-        read_metrics(trial, log_dir, offsets)
+        sps_windows: dict = {}
+        read_metrics(trial, log_dir, offsets, sps_windows)
 
         assert trial.current_step == 50
         assert trial.last_train_loss == pytest.approx(2.5)
-        assert trial.steps_per_sec == pytest.approx(10.0)  # 1/0.1
+        # 50 steps in 5s → 10 sps via the cumulative fallback.
+        assert trial.steps_per_sec == pytest.approx(10.0)
         assert trial.last_train_acc == pytest.approx(0.3)
+
+    def test_steps_per_sec_uses_window_delta(self, tmp_path):
+        """Two-plus train records → window difference, not per-record
+        ``1 / step_time``. This is the fix for the lab_status sps bug
+        where log_interval-scale quantization inflated readings ~30×."""
+        log_dir = tmp_path / "logs"
+        metrics_path = log_dir / "trial_0000" / "run_x" / "metrics.jsonl"
+        _write_metrics_file(metrics_path, [
+            {"type": "train", "step": 100, "elapsed": 20.0,
+             "train/loss": 2.0, "step_time": 0.05},
+            {"type": "train", "step": 200, "elapsed": 40.0,
+             "train/loss": 1.9, "step_time": 0.05},
+        ])
+
+        trial = _make_trial(0)
+        offsets: dict[int, int] = {}
+        sps_windows: dict = {}
+        read_metrics(trial, log_dir, offsets, sps_windows)
+
+        # (200 - 100) / (40 - 20) = 5 sps. The misleading
+        # ``1 / step_time = 20`` reading is gone.
+        assert trial.steps_per_sec == pytest.approx(5.0)
 
     def test_parses_train_record_train_loss_alt_key(self, tmp_path):
         log_dir = tmp_path / "logs"
@@ -770,3 +798,47 @@ class TestFitPowerLaw:
         # All xs equal → log-x variance is zero
         fit = fit_power_law([2.0, 2.0, 2.0], [1.0, 1.5, 2.0])
         assert fit is None
+
+
+# ---------------------------------------------------------------------------
+# _update_sps_window — coverage for cap, duplicate-step guard, elapsed<=0
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateSpsWindow:
+    @pytest.mark.unit
+    def test_window_caps_at_max(self):
+        from pawn.lab.monitor import _SPS_WINDOW_MAX, _update_sps_window
+
+        window: list[tuple[int, float]] = []
+        # Append 1.5x the max; the oldest should evict.
+        for i in range(_SPS_WINDOW_MAX + 5):
+            _update_sps_window(window, step=i * 100, elapsed=i * 10.0)
+        assert len(window) == _SPS_WINDOW_MAX
+        # Oldest retained should be step 5*100 = 500 (we appended 0..14
+        # and dropped 0..4 over the cap).
+        assert window[0][0] == 500
+        assert window[-1][0] == (_SPS_WINDOW_MAX + 4) * 100
+
+    @pytest.mark.unit
+    def test_duplicate_step_not_appended(self):
+        from pawn.lab.monitor import _update_sps_window
+
+        window: list[tuple[int, float]] = []
+        _update_sps_window(window, step=100, elapsed=10.0)
+        _update_sps_window(window, step=100, elapsed=11.0)  # same step, later elapsed
+        # Window should still have one entry (the duplicate-step guard
+        # avoids inflating the window with repeated reads of the same
+        # log line).
+        assert len(window) == 1
+        assert window[0] == (100, 10.0)
+
+    @pytest.mark.unit
+    def test_nonpositive_elapsed_returns_zero(self):
+        from pawn.lab.monitor import _update_sps_window
+
+        window: list[tuple[int, float]] = []
+        assert _update_sps_window(window, step=100, elapsed=0.0) == 0.0
+        assert _update_sps_window(window, step=100, elapsed=-1.0) == 0.0
+        # Window unchanged.
+        assert window == []

@@ -224,6 +224,93 @@ class TestAdapterConfig:
         assert cfg.epochs == 50
         assert cfg.val_every == 1
 
+    def test_steps_per_epoch_default_none(self):
+        cfg = AdapterConfig(local_checkpoints=True, strategy="lora")
+        assert cfg.steps_per_epoch is None
+        assert cfg.data_seed is None
+
+    def test_steps_per_epoch_int(self):
+        cfg = AdapterConfig(
+            local_checkpoints=True, strategy="lora", steps_per_epoch=12345,
+        )
+        assert cfg.steps_per_epoch == 12345
+
+    def test_steps_per_epoch_all_sentinel(self):
+        cfg = AdapterConfig(
+            local_checkpoints=True, strategy="lora", steps_per_epoch="all",
+        )
+        assert cfg.steps_per_epoch == "all"
+
+    def test_steps_per_epoch_invalid_string_rejected(self):
+        # Pydantic's union discriminator catches non-"all" strings at the
+        # field level (literal_error), before our validator runs.
+        with pytest.raises(ValidationError, match="Input should be 'all'"):
+            AdapterConfig.model_validate({
+                "local_checkpoints": True, "strategy": "lora",
+                "steps_per_epoch": "everything",
+            })
+
+    def test_steps_per_epoch_zero_rejected(self):
+        with pytest.raises(ValidationError, match="must be > 0"):
+            AdapterConfig.model_validate({
+                "local_checkpoints": True, "strategy": "lora",
+                "steps_per_epoch": 0,
+            })
+
+    def test_steps_per_epoch_negative_rejected(self):
+        with pytest.raises(ValidationError, match="must be > 0"):
+            AdapterConfig.model_validate({
+                "local_checkpoints": True, "strategy": "lora",
+                "steps_per_epoch": -1,
+            })
+
+    def test_max_games_emits_deprecation_warning(self):
+        import warnings as _w
+        with _w.catch_warnings(record=True) as recs:
+            _w.simplefilter("always")
+            AdapterConfig(
+                local_checkpoints=True, strategy="lora", max_games=1_000_000,
+            )
+        depr = [r for r in recs if issubclass(r.category, DeprecationWarning)]
+        assert any("steps_per_epoch" in str(r.message) for r in depr)
+
+    def test_default_max_games_does_not_warn(self):
+        import warnings as _w
+        with _w.catch_warnings(record=True) as recs:
+            _w.simplefilter("always")
+            AdapterConfig(local_checkpoints=True, strategy="lora")
+        depr = [r for r in recs if issubclass(r.category, DeprecationWarning)]
+        assert not depr
+
+    def test_both_steps_per_epoch_and_max_games_rejected(self):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            AdapterConfig.model_validate({
+                "local_checkpoints": True, "strategy": "lora",
+                "steps_per_epoch": 1000, "max_games": 5_000,
+            })
+
+    @pytest.mark.parametrize(
+        "value, expected, expected_type",
+        [
+            (5, 5, int),                  # plain int
+            ("5", 5, int),                # string-typed int → coerced to int
+            ("all", "all", str),          # the literal sentinel
+            (None, None, type(None)),
+        ],
+    )
+    def test_steps_per_epoch_union_parsing(
+        self, value, expected, expected_type,
+    ):
+        """Lock in pydantic's smart-union behavior for the
+        ``int | Literal["all"] | None`` field. ``"5"`` must coerce to
+        int (not match the literal), and ``"all"`` must stay a string."""
+        cfg = AdapterConfig.model_validate({
+            "local_checkpoints": True, "strategy": "lora",
+            "steps_per_epoch": value,
+        })
+        assert cfg.steps_per_epoch == expected
+        assert type(cfg.steps_per_epoch) is expected_type
+
 
 # ---------------------------------------------------------------------------
 # CotrainConfig

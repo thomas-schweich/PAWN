@@ -151,22 +151,61 @@ uv run python scripts/train.py --run-type adapter --strategy bottleneck \
 
 ### Adapter training defaults
 
+- **Sizing**: `--steps-per-epoch` is the canonical input. Pass an integer or `"all"` (resolves to `n_train_games // batch_size` once the cache materializes; the resolved integer is what gets written to `run_config.json`). The legacy `--max-games` is accepted as `steps_per_epoch = max_games // batch_size` with a deprecation warning.
 - **Epochs**: 50 (early stopping is opt-in via `--patience N`; default is no early stopping)
 - **Batch size**: 64
 - **Optimizer**: AdamW (lr=3e-4)
 - **LR schedule**: cosine with 5% warmup
 - **Min ply**: 10 (games shorter than 10 plies are skipped)
-- **Max games**: 12,000 train + 2,000 validation
+- **Val games**: 50 K held out from the cache before training (the adapter trainer reserves the last `val_games` games of the filtered cache for validation; `n_train = n_total − val_games`).
 - **Legal masking**: by default, illegal-move logits are filled with `-inf` before cross-entropy so the loss sees only legal moves. Disable with `--disable-legal-mask` to train under the same full-vocabulary loss used for pretraining, optionally paired with `--illegal-penalty λ` to add `λ · E[P_illegal]` to the loss — a softer legality signal that forces the adapter to preserve the backbone's own rule-tracking ability rather than lean on a hard mask.
 
-### Resuming adapter training
+### Cache-first data path
+
+Adapter training filters and tokenizes the dataset to disk before the first step, then mmaps the result. The cache key is `(repo_or_path, split, elo_min, elo_max, min_ply)` — different filter combinations produce different cache directories under `$HF_HOME/pawn-lichess-cache/<key>/` (or `$PAWN_DATA_CACHE/<key>/`; override with `--cache-dir PATH`). `max_ply` and `prepend_outcome` only affect packing and apply at access time, so the cache is invariant to them.
+
+The cache stores tokens in CSR form: a flat int16 buffer (`tokens_flat.bin`, mmap-backed) plus int64 offsets and per-game outcome tokens (`index.safetensors`). A `.complete` SHA-256 sentinel and `meta.json` complete the directory. Every load verifies the sentinel; corrupted caches rebuild on next launch.
+
+Building the cache is a one-time cost per (filter, dataset) combination — for a 16 M-game Elo slice, this runs in under a minute on a fast disk and produces a few GB of tokens. Subsequent runs that share the filter parameters reuse the cache and start the first batch within seconds. Multiple DataLoader workers re-mmap the same file independently, sharing physical pages via the OS page cache.
+
+### Resuming an adapter run
 
 ```bash
 uv run python scripts/train.py --run-type adapter --strategy bottleneck \
     --checkpoint thomas-schweich/pawn-base \
     --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
-    --resume logs/bottleneck_20260315_120000/checkpoints/step_00020000 --local-checkpoints
+    --steps-per-epoch all --epochs 2 \
+    --resume logs/bottleneck_20260315_120000/checkpoints/step_00020000 \
+    --local-checkpoints
 ```
+
+Resume is **index-based** under cache-first: `start_epoch = global_step // steps_per_epoch`, `skip_batches = global_step % steps_per_epoch`. The trainer's `SeededEpochSampler` regenerates the same permutation the original run was iterating (deterministic from `(data_seed, epoch)`) and slices off the consumed prefix — no fast-forward iteration through the data pipeline. `data_seed` is recorded in the checkpoint so resumes reproduce the per-epoch shuffle exactly.
+
+For the case where the original run completed on time but you want to extend training (e.g. add an epoch), pass the new `--epochs` value alongside `--resume`. The trainer derives the next epoch from `global_step` and continues. The LR schedule re-derives `total_steps = epochs × steps_per_epoch` against the new `epochs`; for `infinite` schedules this lets the stable plateau extend before the final decay kicks in (see "LR schedules" below).
+
+### LR schedules
+
+`--lr-schedule {cosine,wsd,constant,one_cycle,infinite}`. Default `cosine`.
+
+- **`cosine`** — warmup → cosine decay to 0 over the full schedule.
+- **`wsd`** — Warmup-Stable-Decay. Holds peak LR for the bulk of training, decays over the final `--decay-frac` (default 0.1) to 0. `--wsd-decay-shape {linear,cosine}` controls the tail curve.
+- **`constant`** — linear warmup → hold peak indefinitely. Pair with `--patience` to stop on val plateau, since this schedule never reaches 0 on its own.
+- **`one_cycle`** — Smith (2018) one-cycle: ramp from `peak/25` → `peak` over `--warmup-frac` of steps (try 0.3), then cosine-decay to `peak/10000`.
+- **`infinite`** — warmup → cosine cooldown to `--stable-lr-ratio` (default 0.1) × peak over `--cooldown-frac` of steps (default 0.2) → flat stable plateau → final decay to 0 over the last `--decay-frac` of steps (default 0.1, shape set by `--wsd-decay-shape`). The stable-plateau LR depends only on `--stable-lr-ratio`, not on `total_steps`, so any checkpoint taken during the plateau is a valid resumption point — extend `total_steps` on resume and the plateau simply lasts longer before the final decay kicks in. See Hägele et al. (2024) [arXiv:2405.18392](https://arxiv.org/abs/2405.18392).
+
+#### Decay-shape and decay-tail effects on this dataset
+
+At the 25.6 M / pawn-large top-4 ceiling configuration, **cosine and linear final-decay shapes land within 0.02 pp** (50.74% vs 50.72% at one-epoch ceiling, 50.60% vs 50.59% on the combo). The shape isn't a meaningful lever at this scale; what matters is that the decay tail actually fires.
+
+The decay tail itself contributes ~0.5–0.8 pp at this scale, characterized as `accuracy(post-decay) − accuracy(stable-plateau)`. Direct measurement on the combo run from a step-70K (pre-decay) checkpoint to the completed endpoint: 50.51% → 51.18% = +0.67 pp from the final 10% decay. This is a property of the schedule shape rather than a free "completion bonus" — running the same schedule longer in the stable plateau without firing the decay tail produces the plateau accuracy, not the post-decay one.
+
+Practical implication: if you're training to convergence, let the schedule complete. If you're using `infinite` for resume-friendliness, the stable-plateau accuracy is a valid intermediate result; the post-decay value is what you eventually fold into a Pareto comparison.
+
+### Schedule-completion sentinel
+
+Every adapter and pretrain run writes `schedule_health.json` next to `metrics.jsonl` at exit. Fields: `format_version`, `schedule` (the `lr_schedule` value used), `should_reach_zero` (true when the schedule decays to 0 — `cosine`, `wsd`, `infinite`, `one_cycle`), `planned_total_steps`, `actual_total_steps`, `completion_ratio`, `lr_peak`, `actual_final_lr`, `reason_for_stop` (one of `completed`, `step_limit`, `patience`, `paused`, `sigterm`, `resume_no_op`, `loader_exhausted`, `exception`).
+
+The combination `actual_total_steps != planned_total_steps` AND `reason_for_stop == "completed"` is the structural-bug signal: the loop fell off the end without hitting an early-exit, yet the step counts disagree. With cache-first that's unreachable, but the trainer prints a red banner if it ever happens — useful as a regression tripwire. SIGTERM, patience, and pause are normal early exits and write the file without warning.
 
 ### Selective layer placement
 
@@ -218,10 +257,10 @@ ssh root@<pod-ip> 'cd /workspace/pawn && bash deploy/setup.sh'
 The `pawn.gpu` module auto-detects your GPU and configures:
 
 - **torch.compile**: enabled on CUDA, uses inductor backend
-- **AMP**: fp16 automatic mixed precision on CUDA
+- **AMP**: bf16 automatic mixed precision on CUDA by default. fp16 is available via `--amp-dtype float16` but **overflows on ceiling-scale adapters** whose adapter activations exceed fp16's representable range — eval reports ~9% (random) instead of the real number. bf16 has fp32-range exponents and is safe across the param scales tested.
 - **SDPA backend**: flash attention on both NVIDIA and AMD. ROCm's flash-backward previously had stride mismatches with `torch.compile` + AMP; we work around it by making RoPE outputs contiguous before SDPA in `Attention.forward`. `--sdpa-math` remains a debugging escape hatch.
 
-No manual flags are needed in most cases. Override with `--no-compile`, `--no-amp`, or `--sdpa-math` if needed.
+No manual flags are needed in most cases. Override with `--no-compile`, `--amp-dtype none`, or `--sdpa-math` if needed.
 
 ## Monitoring
 

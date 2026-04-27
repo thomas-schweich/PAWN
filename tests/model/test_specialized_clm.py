@@ -155,3 +155,34 @@ class TestGradFlow:
         loss.backward()
         n_grad = sum(1 for p in model.parameters() if p.grad is not None)
         assert n_grad > 0
+
+
+class TestSpecializedCLMForward:
+    """Cover the new ``forward`` method that composes
+    ``forward_hidden`` + ``project_head`` so eval scripts can call
+    ``model(ids)`` uniformly across strategies."""
+
+    @pytest.mark.unit
+    def test_forward_returns_logits_shape(self):
+        model = _make_toy(vocab_size=64, d_model=32)
+        B, T = 3, 7
+        ids = torch.randint(0, 64, (B, T))
+        logits = model(ids)
+        assert logits.shape == (B, T, 64)
+
+    @pytest.mark.unit
+    def test_forward_dtype_matches_embedding(self):
+        model = _make_toy()
+        ids = torch.randint(0, 64, (2, 4))
+        logits = model(ids)
+        # Forward output dtype follows the embedding tensor (float32 by
+        # default at this scale).
+        assert logits.dtype == model.embed.weight.dtype
+
+    @pytest.mark.unit
+    def test_forward_matches_manual_composition(self):
+        model = _make_toy()
+        ids = torch.randint(0, 64, (2, 4))
+        composed = model.project_head(model.forward_hidden(ids))
+        forwarded = model(ids)
+        torch.testing.assert_close(forwarded, composed)

@@ -316,12 +316,13 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
     )
     from pawn.config import CLMConfig
     from pawn.gpu import configure_gpu
-    from pawn.lichess_data import (
-        LegalMaskBuilder,
-        LegalMaskCollate,
-        LichessDataset,
-        prepare_lichess_dataset,
+    from pawn.lichess_cache import (
+        IndexedLichessDataset,
+        SeededEpochSampler,
+        prepare_lichess_cached,
+        split_has_files,
     )
+    from pawn.lichess_data import LegalMaskBuilder, LegalMaskCollate
     from pawn.logging import MetricsLogger
     from pawn.wandb_utils import finish_wandb, init_wandb
 
@@ -379,70 +380,139 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
     if cfg_obj is not None:
         vocab_size = cfg_obj.vocab_size
 
-    # Prepare data. `seq_len` is the backbone's full context window; the
-    # legal-mask builder / collate / prepare_lichess_dataset all treat
-    # it as the total tensor width, so the outcome slot (if any) lives
-    # inside this budget.
+    # Prepare data. ``seq_len`` is the backbone's full context window;
+    # the legal-mask builder, collate, and packing path all treat it as
+    # the total tensor width — the outcome slot (if any) lives inside
+    # this budget.
     seq_len = cfg_obj.max_seq_len if cfg_obj is not None else 256
-    streaming = args.elo_min is not None or args.elo_max is not None
 
-    from pawn.shard_loader import ShardedLichessDataset, load_val_shards
+    print(f"\nPreparing data: {args.pgn}")
+    train_cache = prepare_lichess_cached(
+        args.pgn,
+        split="train",
+        elo_min=args.elo_min,
+        elo_max=args.elo_max,
+        min_ply=args.min_ply,
+        cache_dir=args.cache_dir,
+    )
 
-    if streaming:
-        print(
-            f"\nShard-parallel loading: {args.pgn} "
-            f"[{args.elo_min}, {args.elo_max})"
-        )
-        val_data = load_val_shards(
+    # Use the dataset's own ``validation`` split when available — that's
+    # the canonical held-out set the dataset author curated. Otherwise
+    # carve val out of the tail of the train cache (the only option for
+    # single-parquet local files or repos without a validation split).
+    if split_has_files(args.pgn, "validation"):
+        val_cache = prepare_lichess_cached(
             args.pgn,
+            split="validation",
             elo_min=args.elo_min,
             elo_max=args.elo_max,
             min_ply=args.min_ply,
-            max_ply=seq_len,
-            max_games=args.val_games,
             cache_dir=args.cache_dir,
-            prepend_outcome=config.prepend_outcome,
         )
-        val_ds = LichessDataset(val_data, start=0, end=val_data["n_games"])
-        train_ds = ShardedLichessDataset(
-            args.pgn,
-            elo_min=args.elo_min,
-            elo_max=args.elo_max,
-            min_ply=args.min_ply,
-            max_ply=seq_len,
-            max_games=args.max_games,
-            cache_dir=args.cache_dir,
-            prepend_outcome=config.prepend_outcome,
-        )
+        n_train = train_cache.n_games
+        n_val = min(args.val_games, val_cache.n_games)
+        train_indices = torch.arange(n_train, dtype=torch.int64)
+        val_indices_cache_dir = val_cache.cache_dir
+        val_indices = torch.arange(n_val, dtype=torch.int64)
         print(
-            f"  Val: {len(val_ds):,} games, "
-            f"Train: {len(train_ds.shard_files)} shards"
+            f"  Train split: {n_train:,} games, "
+            f"Val split: {val_cache.n_games:,} games "
+            f"(using first {n_val:,} for eval)"
         )
     else:
-        print(f"\nPreparing data: {args.pgn}")
-        data = prepare_lichess_dataset(
-            args.pgn,
-            max_ply=seq_len,
-            max_games=args.max_games or 1_000_000,
-            min_ply=args.min_ply,
-            prepend_outcome=config.prepend_outcome,
-        )
-        n_total = data["n_games"]
+        # Carve val from the tail of the train cache.
+        n_total = train_cache.n_games
         n_val = min(args.val_games, n_total // 5)
         n_train = n_total - n_val
-        print(f"  Train: {n_train} games, Val: {n_val} games")
-        train_ds = LichessDataset(data, start=0, end=n_train).share_memory()
-        val_ds = LichessDataset(data, start=n_train, end=n_total)
+        if n_train <= 0:
+            _die(
+                f"After holding out {n_val} val games, no train games remain "
+                f"(cache n_games={n_total}). Reduce val_games or widen the "
+                "Elo / min_ply filters."
+            )
+        train_indices = torch.arange(n_train, dtype=torch.int64)
+        val_indices_cache_dir = train_cache.cache_dir
+        val_indices = torch.arange(n_train, n_total, dtype=torch.int64)
+        print(
+            f"  Train: {n_train:,} games, "
+            f"Val: {n_val:,} games (carved from train tail; "
+            "no separate validation split in dataset)"
+        )
+
+    # Resolve ``steps_per_epoch``. The canonical input is
+    # ``args.steps_per_epoch`` (int or ``"all"``); ``args.max_games`` is
+    # a deprecated alias that converts to ``max_games // batch_size``.
+    if args.steps_per_epoch is not None:
+        if args.steps_per_epoch == "all":
+            steps_per_epoch = n_train // args.batch_size
+        else:
+            steps_per_epoch = int(args.steps_per_epoch)
+    elif args.max_games is not None:
+        steps_per_epoch = int(args.max_games) // args.batch_size
+    else:
+        _die(
+            "One of `steps_per_epoch` (int or 'all') or the deprecated "
+            "`max_games` is required."
+        )
+
+    if steps_per_epoch <= 0:
+        _die(f"Resolved steps_per_epoch={steps_per_epoch} <= 0")
+    if steps_per_epoch * args.batch_size > n_train:
+        _die(
+            f"steps_per_epoch={steps_per_epoch} × batch_size="
+            f"{args.batch_size} = {steps_per_epoch * args.batch_size} "
+            f"exceeds train pool n_train={n_train}. Reduce "
+            "steps_per_epoch or widen the cache."
+        )
+
+    # Resolve / persist ``data_seed`` so the per-epoch shuffle is
+    # reproducible and resumable. A run that doesn't set one explicitly
+    # gets an OS-RNG seed at start; the resolved value is written back
+    # to ``args`` so ``build_config_json`` and the trainer's checkpoint
+    # extras both see the same number. ``SystemRandom`` (rather than
+    # wall-clock seconds) avoids collisions when a sweep launches
+    # multiple trials in the same second.
+    if args.data_seed is None:
+        import secrets as _secrets
+
+        args.data_seed = _secrets.randbits(31)
+    # Stash the resolved sizing on args for downstream consumers
+    # (build_config_json, train, build checkpoint extras).
+    args.steps_per_epoch = steps_per_epoch
+    print(
+        f"  Train: {n_train:,} games, Val: {n_val:,} games, "
+        f"steps_per_epoch={steps_per_epoch:,}, data_seed={args.data_seed}"
+    )
+
+    train_ds = IndexedLichessDataset(
+        cache_dir=train_cache.cache_dir,
+        indices=train_indices,
+        max_ply=seq_len,
+        prepend_outcome=config.prepend_outcome,
+    )
+    val_ds = IndexedLichessDataset(
+        cache_dir=val_indices_cache_dir,
+        indices=val_indices,
+        max_ply=seq_len,
+        prepend_outcome=config.prepend_outcome,
+    )
 
     collate = LegalMaskCollate(
         seq_len=seq_len, vocab_size=vocab_size,
         prepend_outcome=config.prepend_outcome,
     )
     n_workers = args.num_workers
+    train_sampler = SeededEpochSampler(
+        n_samples=n_train,
+        base_seed=args.data_seed,
+        batch_size=args.batch_size,
+        drop_last=True,
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=not streaming,
+        sampler=train_sampler,
+        drop_last=True,
         num_workers=n_workers,
         pin_memory=True,
         persistent_workers=n_workers > 0,

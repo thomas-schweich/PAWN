@@ -9,6 +9,7 @@ JSON Schema is derived automatically — call
 
 from __future__ import annotations
 
+import warnings
 from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -103,6 +104,12 @@ class BaseRunConfig(BaseModel):
     # IO ------------------------------------------------------------------
     log_dir: str | None = None
     hf_repo: str | None = None
+    # Optional bucket-path autosave alongside (or instead of) the
+    # model-repo branch push. Accepts ``<namespace>/<bucket-name>`` or a
+    # full ``hf://buckets/<ns>/<name>[/subpath]`` URL. Files land at
+    # ``<bucket>/logs/<run_slug>/{checkpoints/...,metrics.jsonl}``.
+    # Mutually compatible with ``hf_repo``: the trainer pushes to both.
+    hf_bucket: str | None = None
     local_checkpoints: bool = False
     resume: str | None = None
     wandb: bool = False
@@ -115,9 +122,13 @@ class BaseRunConfig(BaseModel):
             raise ValueError(
                 "--hf-repo and --local-checkpoints are mutually exclusive"
             )
-        if not self.hf_repo and not self.local_checkpoints:
+        if (
+            not self.hf_repo
+            and not self.local_checkpoints
+            and not self.hf_bucket
+        ):
             raise ValueError(
-                "One of --hf-repo or --local-checkpoints is required"
+                "One of --hf-repo, --hf-bucket, or --local-checkpoints is required"
             )
         return self
 
@@ -231,6 +242,18 @@ class AdapterConfig(BaseRunConfig):
     val_every: int = 1
     checkpoint_interval: int = 5000
 
+    # Data sizing ---------------------------------------------------------
+    # ``steps_per_epoch`` is the canonical way to size an adapter run.
+    # ``"all"`` resolves at runtime to ``n_train // (batch_size *
+    # accumulation_steps)`` once the cache materializes; the resolved
+    # integer is what gets written to ``run_config.json`` so the saved
+    # config never holds the sentinel string.
+    steps_per_epoch: int | Literal["all"] | None = None
+    # Per-epoch shuffle seed. ``None`` lets the trainer pick at run start
+    # and persist into the checkpoint. Set explicitly for full
+    # reproducibility across machines.
+    data_seed: int | None = None
+
     # Legality handling ---------------------------------------------------
     # By default, adapter training masks illegal moves to -inf before
     # cross-entropy. Set ``disable_legal_mask=True`` to compute the loss
@@ -259,6 +282,42 @@ class AdapterConfig(BaseRunConfig):
                 "is zero by construction). Pass disable_legal_mask=True to "
                 "let the model assign probability to illegal moves and be "
                 "penalized for it."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_data_sizing(self) -> "AdapterConfig":
+        # ``"all"`` is the only legal string; positive ints; ``None``.
+        spe = self.steps_per_epoch
+        if isinstance(spe, str) and spe != "all":
+            raise ValueError(
+                f"steps_per_epoch must be a positive int or 'all', got {spe!r}"
+            )
+        if isinstance(spe, int) and spe <= 0:
+            raise ValueError(
+                f"steps_per_epoch must be > 0 when given as an int, got {spe}"
+            )
+        if spe is not None and self.max_games is not None:
+            raise ValueError(
+                "steps_per_epoch and max_games are mutually exclusive. "
+                "max_games is deprecated; pass steps_per_epoch (int or "
+                "'all') directly."
+            )
+        # Emit the deprecation warning only when the user actually set
+        # ``max_games`` (not when it inherits its ``None`` default), so
+        # that re-loading a saved config that wrote ``steps_per_epoch``
+        # is silent.
+        if (
+            self.max_games is not None
+            and "max_games" in self.model_fields_set
+        ):
+            warnings.warn(
+                "max_games is deprecated for adapter runs; pass "
+                "steps_per_epoch (int or 'all') instead. "
+                "max_games is interpreted as "
+                "`steps_per_epoch = max_games // batch_size`.",
+                DeprecationWarning,
+                stacklevel=2,
             )
         return self
 

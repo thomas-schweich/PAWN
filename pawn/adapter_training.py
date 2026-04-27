@@ -18,10 +18,10 @@ Strategies:
 from __future__ import annotations
 
 import gc
+import json
 import math
 import signal
 import time
-from collections.abc import Iterator
 from typing import Any, Iterable
 
 import numpy as np
@@ -509,26 +509,97 @@ def parse_layers(s: str | None) -> tuple[int, ...] | None:
     return tuple(int(x) for x in s.split(","))
 
 
-def _resume_start_epoch(saved_epoch: int) -> int:
-    """Re-enter the saved epoch (not +1): step-interval checkpoints are mid-epoch."""
-    return saved_epoch
+_SCHEDULES_THAT_REACH_ZERO = ("cosine", "wsd", "infinite", "one_cycle")
 
 
-def _fast_forward_loader(
-    loader_iter: Iterator[Any], n_batches: int,
-) -> int:
-    """Discard the first ``n_batches`` items; returns count actually consumed.
+def resume_state(global_step: int, steps_per_epoch: int) -> tuple[int, int]:
+    """Derive ``(start_epoch, skip_batches)`` from a saved ``global_step``.
 
-    O(n_batches) — runs the full preprocessing pipeline for each skipped batch.
+    With cache-first the canonical resume state is ``global_step``: the
+    trainer enters epoch ``global_step // steps_per_epoch`` and asks the
+    sampler to skip the first ``global_step % steps_per_epoch`` batches.
+    No FF iteration; the seeded permutation slices to the right tail.
+
+    Edge cases this codifies:
+      - ``global_step == 0``: fresh run, ``start_epoch=0, skip=0``.
+      - exact epoch boundary (e.g. just finished epoch 2 with
+        ``steps_per_epoch=1000``, ``global_step=2000``):
+        ``start_epoch=2, skip=0`` so the next loop iteration is epoch 2
+        (which the for-range will skip past if epochs<=2 — that's the
+        ``resume_no_op`` case handled at the schedule_health write).
+      - mid-epoch (e.g. ``global_step=2500, steps_per_epoch=1000``):
+        ``start_epoch=2, skip=500`` to enter epoch 2 partway through.
     """
-    consumed = 0
-    for _ in range(n_batches):
-        try:
-            next(loader_iter)
-        except StopIteration:
-            return consumed
-        consumed += 1
-    return consumed
+    if steps_per_epoch <= 0:
+        raise ValueError(
+            f"steps_per_epoch must be > 0, got {steps_per_epoch}"
+        )
+    if global_step < 0:
+        raise ValueError(f"global_step must be >= 0, got {global_step}")
+    return global_step // steps_per_epoch, global_step % steps_per_epoch
+
+
+def write_schedule_health(
+    run_dir: Any,
+    *,
+    schedule: str,
+    planned_total_steps: int,
+    actual_total_steps: int,
+    lr_peak: float,
+    actual_final_lr: float,
+    reason_for_stop: str,
+) -> dict[str, Any]:
+    """Write ``schedule_health.json`` and return its contents.
+
+    Records whether training reached the planned end of the LR schedule.
+    The "loud" path — ``actual_total_steps != planned_total_steps`` on a
+    schedule that should reach zero — also prints a red banner to
+    stderr/stdout so a post-hoc reader doesn't have to find the file
+    themselves. ``reason_for_stop`` of ``"completed"`` plus a step
+    mismatch is the structural-bug signal: with cache-first that
+    combination should not occur, and a future regression that brings
+    it back will surface here.
+    """
+    from pathlib import Path
+
+    run_dir = Path(run_dir)
+    should_reach_zero = schedule in _SCHEDULES_THAT_REACH_ZERO
+    completion_ratio = (
+        actual_total_steps / planned_total_steps
+        if planned_total_steps > 0
+        else 0.0
+    )
+    health: dict[str, Any] = {
+        "format_version": 1,
+        "schedule": schedule,
+        "should_reach_zero": should_reach_zero,
+        "planned_total_steps": int(planned_total_steps),
+        "actual_total_steps": int(actual_total_steps),
+        "completion_ratio": completion_ratio,
+        "lr_peak": float(lr_peak),
+        "actual_final_lr": float(actual_final_lr),
+        "reason_for_stop": reason_for_stop,
+    }
+    (run_dir / "schedule_health.json").write_text(
+        json.dumps(health, indent=2)
+    )
+
+    if (
+        actual_total_steps != planned_total_steps
+        and should_reach_zero
+        and reason_for_stop in ("completed", "step_limit")
+    ):
+        print(
+            "\033[31m"
+            f"WARNING: schedule did not run to completion: "
+            f"actual_total_steps={actual_total_steps} != "
+            f"planned_total_steps={planned_total_steps}. "
+            f"Final LR={actual_final_lr:.3e} "
+            f"(peak={lr_peak:.3e}). reason={reason_for_stop}.\033[0m",
+            flush=True,
+        )
+
+    return health
 
 
 def precompute_val_masks(
@@ -781,7 +852,13 @@ def _build_specialized_clm(
     n = sum(p.numel() for p in params)
 
     def state_dict_fn() -> dict[str, torch.Tensor]:
-        return model.state_dict()
+        # ``SpecializedCLM`` ties ``lm_head.weight`` to ``embed.weight``;
+        # safetensors rejects shared storage, so drop the tied duplicate.
+        # The tying is restored automatically at load time because the
+        # constructor re-establishes it before ``load_state_dict``.
+        sd = dict(model.state_dict())
+        sd.pop("lm_head.weight", None)
+        return sd
 
     def weight_report_fn() -> dict[str, Any]:
         return {}
@@ -1074,7 +1151,18 @@ def build_config_json(args: Any, param_count: int) -> dict[str, Any]:
         "pgn": args.pgn,
         "elo_min": args.elo_min,
         "elo_max": args.elo_max,
-        "max_games": args.max_games,
+        # Data sizing — ``steps_per_epoch`` is canonical (the ``"all"``
+        # sentinel is resolved before this is written). Legacy
+        # ``max_games`` is recorded only when present without a resolved
+        # ``steps_per_epoch`` so old saved configs don't lose that info,
+        # but new resolved configs omit it.
+        "steps_per_epoch": getattr(args, "steps_per_epoch", None),
+        "data_seed": getattr(args, "data_seed", None),
+        "max_games": (
+            args.max_games
+            if getattr(args, "steps_per_epoch", None) is None
+            else None
+        ),
         "val_games": args.val_games,
         # Training
         "total_steps": args.total_steps,
@@ -1194,18 +1282,23 @@ def train(
         weight_decay=args.weight_decay,
     )
 
-    # ``steps_per_epoch`` is captured separately for resume fast-forward.
-    streaming = hasattr(train_loader.dataset, "shard_files")
-    if streaming:
-        est_games = min(
-            args.max_games or 1_000_000,
-            len(train_loader.dataset.shard_files) * 60_000,  # type: ignore[union-attr]
-        )
-        steps_per_epoch = est_games // args.batch_size
-    else:
-        steps_per_epoch = len(train_loader)
+    # ``steps_per_epoch`` is canonical and exact: ``run_adapter`` resolves
+    # ``args.steps_per_epoch`` to an integer (or the legacy
+    # ``args.max_games // batch_size``) before constructing the loader.
+    # The DataLoader's length is therefore deterministic and the LR
+    # scheduler's ``total_steps`` matches the number of steps the loop
+    # will actually take.
+    steps_per_epoch = int(args.steps_per_epoch)
     if args.total_steps:
         total_steps = args.total_steps
+        expected = args.epochs * steps_per_epoch
+        if total_steps != expected:
+            raise ValueError(
+                f"total_steps={total_steps} != epochs × steps_per_epoch "
+                f"= {args.epochs} × {steps_per_epoch} = {expected}. "
+                "Set total_steps to match, or omit it and let it be "
+                "derived from epochs and steps_per_epoch."
+            )
     else:
         total_steps = args.epochs * steps_per_epoch
 
@@ -1269,15 +1362,33 @@ def train(
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         if scaler and ckpt.get("scaler_state_dict"):
             scaler.load_state_dict(ckpt["scaler_state_dict"])
-        start_epoch = _resume_start_epoch(ckpt.get("epoch", 0))
         global_step = ckpt.get("step", 0)
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         patience_counter = ckpt.get("patience_counter", 0)
-        # Prefer the save-time ``steps_per_epoch`` so fast-forward is exact
-        # even when the runtime estimate drifts (shard sizes ≠ 60K, etc.).
+        # ``steps_per_epoch`` is exact under cache-first; refuse to resume
+        # silently across a different sizing. (Catches max_games-vs-cache
+        # mismatches that would otherwise put the resumed run on a
+        # different LR trajectory than the original.)
         saved_spe = ckpt.get("steps_per_epoch")
-        if saved_spe is not None:
-            steps_per_epoch = int(saved_spe)
+        if saved_spe is not None and int(saved_spe) != steps_per_epoch:
+            raise ValueError(
+                f"Resume mismatch: checkpoint was saved with "
+                f"steps_per_epoch={saved_spe}, but the current run has "
+                f"steps_per_epoch={steps_per_epoch}. Use the same data "
+                "sizing on resume."
+            )
+        # ``epoch`` and ``skip_batches`` are derived from ``global_step``
+        # and ``steps_per_epoch`` (no FF iteration needed). The saved
+        # ``epoch`` field is informational; the canonical state is
+        # ``global_step``. See :func:`resume_state` for the contract.
+        start_epoch, resume_skip_batches = resume_state(
+            global_step, steps_per_epoch
+        )
+        # Honor a saved ``data_seed`` if present so the per-epoch
+        # permutation matches the original run.
+        saved_data_seed = ckpt.get("data_seed")
+        if saved_data_seed is not None:
+            args.data_seed = int(saved_data_seed)
         del ckpt
 
     # Record the step we enter the loop at so the final save can tell
@@ -1348,10 +1459,20 @@ def train(
     # pool never sees work in that case.
     from pawn.checkpoint import BackgroundCheckpointPusher
     hf_pusher = BackgroundCheckpointPusher(thread_name_prefix="hf-adapter")
+    # Bucket pushes go on a separate single-worker pool so a slow
+    # bucket sync doesn't block the model-repo branch push (and vice
+    # versa). Both are no-ops when the corresponding config field is
+    # unset; constructing eagerly lets the shutdown path
+    # ``.wait()`` unconditionally.
+    bucket_pusher = BackgroundCheckpointPusher(thread_name_prefix="hf-bucket")
 
     eval_interval = args.eval_interval
     step_limit = args.total_steps
     pause_step = args.pause_after_steps
+    # Tracks why the training loop exited; ``schedule_health.json``
+    # records this so post-hoc audits can distinguish "ran to
+    # completion" from SIGTERM, patience, or pause boundaries.
+    stop_reason = "completed"
 
     print(f"\nTraining for up to {args.epochs} epochs ({total_steps} steps)")
     print(
@@ -1407,6 +1528,7 @@ def train(
                 "best_val_loss": best_val_loss,
                 "patience_counter": patience_counter,
                 "steps_per_epoch": steps_per_epoch,
+                "data_seed": getattr(args, "data_seed", None),
             },
         )
         if args.hf_repo and hf_branch:
@@ -1415,27 +1537,51 @@ def train(
                 args.hf_repo,
                 hf_branch,
                 step=global_step,
+                metrics_path=str(logger.metrics_path),
+            )
+        # Bucket push runs in parallel with the model-repo branch push
+        # (when both are set). The bucket path is a self-contained
+        # snapshot — checkpoint dir + a copy of metrics.jsonl — under
+        # ``logs/<run_slug>/`` inside the bucket.
+        if getattr(args, "hf_bucket", None):
+            bucket_pusher.submit_bucket(
+                step_path,
+                args.hf_bucket,
+                run_slug=logger.run_dir.name,
+                step=global_step,
+                metrics_path=str(logger.metrics_path),
             )
 
-    # Fast-forward the loader on resume: streaming dataset is deterministic
-    # per (seed+epoch) so skipping reproduces continuous-training state.
-    resume_skip = (
-        global_step - start_epoch * steps_per_epoch
-        if args.resume
-        else 0
-    )
-    if resume_skip < 0:
-        raise ValueError(
-            f"Resume inconsistency: global_step={global_step} < "
-            f"start_epoch * steps_per_epoch = "
-            f"{start_epoch} * {steps_per_epoch}. "
-            f"Checkpoint likely written with different max_games/batch_size/num_workers."
+    # Resume: ``global_step`` is canonical. ``start_epoch`` and
+    # ``resume_skip_batches`` were derived from it above (or set to 0 / 0
+    # for fresh runs below). The :class:`SeededEpochSampler` consumes
+    # those via ``set_epoch(epoch, skip_batches=...)`` and produces the
+    # exact tail of the original epoch's permutation — no FF iteration.
+    if not args.resume:
+        resume_skip_batches = 0  # type: ignore[assignment]
+
+    # Bind the train sampler — :class:`SeededEpochSampler` is the
+    # contract here. The DataLoader exposes it via ``.sampler``.
+    from pawn.lichess_cache import SeededEpochSampler
+
+    sampler = train_loader.sampler
+    if not isinstance(sampler, SeededEpochSampler):
+        raise TypeError(
+            f"adapter trainer requires SeededEpochSampler, got "
+            f"{type(sampler).__name__}. Build the loader via "
+            "scripts/train.py:run_adapter so the sampler is wired in."
         )
 
     epoch = start_epoch  # default if loop doesn't execute (resume past end)
     for epoch in range(start_epoch, args.epochs):
-        if hasattr(train_loader.dataset, "set_epoch"):
-            train_loader.dataset.set_epoch(epoch)  # type: ignore[union-attr]
+        skip = resume_skip_batches if epoch == start_epoch else 0
+        sampler.set_epoch(epoch, skip_batches=skip)
+        if skip:
+            print(
+                f"  Resume: epoch {epoch}, skipping the first {skip:,} "
+                f"batches via deterministic permutation slice (no FF).",
+                flush=True,
+            )
         model.train()
         # Accumulate loss/top1 as GPU tensors so the training loop never
         # issues a ``.item()`` per step. Each ``.item()`` is a blocking
@@ -1453,26 +1599,11 @@ def train(
         log_positions = 0
         t0 = time.time()
 
-        # Explicit iterator so the resume path can fast-forward it.
+        # The sampler's permutation is set; iterating yields exactly the
+        # remaining-after-skip indices. Persistent workers (when enabled)
+        # are kept alive across epochs and pick up the new permutation
+        # on each ``iter(train_loader)``.
         loader_iter = iter(train_loader)
-        if epoch == start_epoch and resume_skip > 0:
-            print(
-                f"  Fast-forwarding DataLoader by {resume_skip:,} batches "
-                f"to resume at step {global_step:,}...",
-                flush=True,
-            )
-            consumed = _fast_forward_loader(loader_iter, resume_skip)
-            if consumed < resume_skip:
-                raise RuntimeError(
-                    f"Resume inconsistency: DataLoader exhausted after "
-                    f"{consumed:,} batches while fast-forwarding to "
-                    f"{resume_skip:,}. The streaming dataset is producing "
-                    f"fewer batches per epoch than the checkpoint was "
-                    f"written against — likely because ``max_games``, "
-                    f"``batch_size``, or ``num_workers`` differs from the "
-                    f"original run."
-                )
-            resume_skip = 0  # only the resumed epoch skips; later epochs iterate in full
 
         for batch in loader_iter:
             ids = batch["input_ids"].to(device, non_blocking=True)
@@ -1603,6 +1734,7 @@ def train(
                         f"\n  Early stopping at step {global_step} "
                         f"(patience={args.patience})"
                     )
+                    stop_reason = "patience"
                     break
                 model.train()
 
@@ -1622,10 +1754,13 @@ def train(
                 _save_step_checkpoint(val_metrics, epoch)
 
             if step_limit and global_step >= step_limit:
+                stop_reason = "step_limit"
                 break
             if pause_step and global_step >= pause_step:
+                stop_reason = "paused"
                 break
             if _shutdown:
+                stop_reason = "sigterm"
                 break
 
         dt = time.time() - t0
@@ -1679,19 +1814,25 @@ def train(
                         f"\n  Early stopping at epoch {epoch} "
                         f"(patience={args.patience})"
                     )
+                    stop_reason = "patience"
                     break
             _save_step_checkpoint(val_metrics, epoch)
 
         if eval_interval and args.patience is not None and patience_counter >= args.patience:
-            break  # step-based early stopping triggered inside batch loop
+            # ``stop_reason`` was already set to ``"patience"`` inside
+            # the batch loop's eval block.
+            break
         if step_limit and global_step >= step_limit:
             print(f"\n  Reached step limit ({step_limit})")
+            stop_reason = "step_limit"
             break
         if pause_step and global_step >= pause_step:
             print(f"\n  Paused at step {global_step} (pause_after_steps={pause_step})")
+            stop_reason = "paused"
             break
         if _shutdown:
             print("Shutdown requested, saving checkpoint...")
+            stop_reason = "sigterm"
             break
 
     # Final checkpoint — only write if this session actually trained. On
@@ -1713,5 +1854,31 @@ def train(
     # aren't lost when the process exits. This is a no-op when hf_repo
     # was unset.
     hf_pusher.wait()
+    bucket_pusher.wait()
+
+    # Write ``schedule_health.json`` next to ``metrics.jsonl`` so
+    # post-hoc audits can distinguish "ran to completion" from
+    # "stopped early with LR mid-decay". On cache-first the
+    # ``actual_total_steps != planned_total_steps`` case only happens
+    # for SIGTERM / patience / pause / explicit step_limit; the silent
+    # truncation that motivated this file (streaming `steps_per_epoch`
+    # estimate drift) is no longer reachable.
+    #
+    # Special case: resume-past-end (loop never executed because
+    # ``start_epoch >= args.epochs``). The default ``stop_reason``
+    # initializer is ``"completed"``, which combined with the unchanged
+    # ``global_step`` would trip the structural-bug banner — but
+    # there's no bug here, the run is simply already done.
+    if global_step == initial_step and stop_reason == "completed":
+        stop_reason = "resume_no_op"
+    write_schedule_health(
+        logger.run_dir,
+        schedule=getattr(args, "lr_schedule", "cosine"),
+        planned_total_steps=int(total_steps),
+        actual_total_steps=int(global_step),
+        lr_peak=float(args.lr),
+        actual_final_lr=float(optimizer.param_groups[0]["lr"]),
+        reason_for_stop=stop_reason,
+    )
 
     return best_val_loss, val_metrics

@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -740,6 +741,33 @@ class BackgroundCheckpointPusher:
         )
         self._future: Future[None] | None = None
 
+    def _submit_serialized(
+        self,
+        thunk: "Callable[[], None]",
+        success_msg: str,
+        failure_label: str,
+        log_prefix: str,
+    ) -> None:
+        """Block on the previous future, then queue ``thunk``.
+
+        All push paths share the same shape: wait for the previous
+        upload (so two concurrent uploads don't race on the same branch
+        head or bucket subtree), submit the new one, log success or
+        failure. Centralizing it keeps the submit / submit_bucket
+        bodies focused on what's different — the underlying push call.
+        """
+        if self._future is not None:
+            self._future.result()
+
+        def _push() -> None:
+            try:
+                thunk()
+                print(f"{log_prefix}{success_msg}")
+            except Exception as e:
+                print(f"{log_prefix}WARNING: {failure_label} push failed: {e}")
+
+        self._future = self._pool.submit(_push)
+
     def submit(
         self,
         checkpoint_path: str | Path,
@@ -751,23 +779,58 @@ class BackgroundCheckpointPusher:
         log_prefix: str = "",
     ) -> None:
         """Queue a push. Blocks on the previous push if one is in flight."""
-        if self._future is not None:
-            # Don't let uploads stack up against the same branch head.
-            self._future.result()
         ckpt_path = str(checkpoint_path)
         mpath = str(metrics_path) if metrics_path is not None else None
 
-        def _push() -> None:
-            try:
-                push_checkpoint_to_hf(
-                    ckpt_path, repo_id, branch,
-                    metrics_path=mpath, step=step,
-                )
-                print(f"{log_prefix}Pushed to HF: {repo_id}@{branch}")
-            except Exception as e:
-                print(f"{log_prefix}WARNING: HF push failed: {e}")
+        def thunk() -> None:
+            push_checkpoint_to_hf(
+                ckpt_path, repo_id, branch,
+                metrics_path=mpath, step=step,
+            )
 
-        self._future = self._pool.submit(_push)
+        self._submit_serialized(
+            thunk,
+            success_msg=f"Pushed to HF: {repo_id}@{branch}",
+            failure_label="HF",
+            log_prefix=log_prefix,
+        )
+
+    def submit_bucket(
+        self,
+        checkpoint_path: str | Path,
+        bucket: str,
+        *,
+        run_slug: str,
+        step: int,
+        metrics_path: str | Path | None = None,
+        log_prefix: str = "",
+    ) -> None:
+        """Queue a push to an HF bucket path.
+
+        ``bucket`` accepts either ``<namespace>/<bucket-name>`` or the
+        full ``hf://buckets/<namespace>/<bucket-name>[/<subpath>]`` URL.
+        Files land at ``<bucket>/logs/<run_slug>/checkpoints/step_NNNN/``
+        plus ``<bucket>/logs/<run_slug>/metrics.jsonl`` (when supplied).
+        Bucket sync goes through ``hf sync`` because the
+        ``HfApi.upload_folder(repo_type="bucket")`` path is not
+        supported as of the current ``huggingface_hub`` — see the
+        ``manage-pod`` skill's HF Bucket I/O note.
+        """
+        ckpt_path = str(checkpoint_path)
+        mpath = str(metrics_path) if metrics_path is not None else None
+
+        def thunk() -> None:
+            push_checkpoint_to_bucket(
+                ckpt_path, bucket, run_slug=run_slug,
+                metrics_path=mpath, step=step,
+            )
+
+        self._submit_serialized(
+            thunk,
+            success_msg=f"Pushed to bucket: {bucket} (run/{run_slug})",
+            failure_label="bucket",
+            log_prefix=log_prefix,
+        )
 
     def wait(self) -> None:
         """Block until all pending pushes finish and release the pool."""
@@ -775,6 +838,48 @@ class BackgroundCheckpointPusher:
             self._future.result()
             self._future = None
         self._pool.shutdown(wait=True)
+
+
+def truncate_metrics_jsonl(metrics_path: str | Path, step: int) -> str:
+    """Return the prefix of ``metrics_path`` covering steps ``<= step``.
+
+    The boundary semantics are inclusive on the target step: every train
+    or val record at exactly ``step`` is kept, and the loop stops on the
+    first train/val record whose ``step > step``. This keeps train+val
+    pairs at the boundary together (val often follows train at the same
+    global_step). Records without a ``type in {"train", "val"}`` field
+    (config rows, custom debug rows) and malformed JSON lines are
+    passed through verbatim — they don't gate the boundary check.
+
+    The full-file scan per push is intentional. At default settings
+    (``log_interval=100``, ``eval_interval=5000``,
+    ``checkpoint_interval=5000``) the metrics file is < 1 MB at every
+    checkpoint and the scan is bounded by sequential disk reads — well
+    inside microseconds. A running-cursor optimization would only matter
+    at very high checkpoint frequency or extremely long runs; if you hit
+    that regime, replace this helper with a stateful reader.
+    """
+    out: list[str] = []
+    target = int(step)
+    with open(metrics_path) as f:
+        for line in f:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # Pass malformed lines through; don't let one bad row
+                # truncate the whole file.
+                out.append(line)
+                continue
+            if (
+                record.get("type") in ("train", "val")
+                and int(record.get("step", 0)) > target
+            ):
+                # First record beyond the target — stop *before* it so
+                # multiple records at the target step (e.g. a train then
+                # a val record at the same step) all make it in.
+                break
+            out.append(line)
+    return "".join(out)
 
 
 def push_checkpoint_to_hf(
@@ -817,20 +922,10 @@ def push_checkpoint_to_hf(
         metrics_path = Path(metrics_path)
         if metrics_path.exists():
             import tempfile
-            # Truncate metrics to current step
-            truncated_lines = []
-            with open(metrics_path) as f:
-                for line in f:
-                    truncated_lines.append(line)
-                    try:
-                        record = json.loads(line)
-                        if record.get("type") in ("train", "val") and record.get("step", 0) >= step:
-                            break
-                    except json.JSONDecodeError:
-                        continue
 
+            truncated_text = truncate_metrics_jsonl(metrics_path, step)
             with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tmp:
-                tmp.writelines(truncated_lines)
+                tmp.write(truncated_text)
                 tmp_path = tmp.name
 
             try:
@@ -844,3 +939,82 @@ def push_checkpoint_to_hf(
                 )
             finally:
                 os.unlink(tmp_path)
+
+
+def push_checkpoint_to_bucket(
+    checkpoint_path: str | Path,
+    bucket: str,
+    *,
+    run_slug: str,
+    metrics_path: str | Path | None = None,
+    step: int = 0,
+) -> None:
+    """Push a checkpoint to an HF bucket path via ``hf sync``.
+
+    ``bucket`` accepts either ``<namespace>/<bucket-name>`` or a full
+    ``hf://buckets/<namespace>/<bucket-name>[/<subpath>]`` URL. Files
+    land at ``<bucket-url>/logs/<run_slug>/checkpoints/<step_dir>/``
+    plus ``<bucket-url>/logs/<run_slug>/metrics.jsonl`` (when given).
+
+    Why ``hf sync`` (and not ``HfApi.upload_folder(repo_type="bucket")``):
+    as of 2026-04, the ``hf upload`` / ``upload_folder`` paths reject
+    ``repo_type="bucket"`` and silently exit 0 — the only working
+    bucket I/O is the ``hf://buckets/...`` URL via ``hf sync``.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    checkpoint_path = Path(checkpoint_path)
+    bucket_url = (
+        bucket
+        if bucket.startswith("hf://buckets/")
+        else f"hf://buckets/{bucket.lstrip('/')}"
+    )
+    base = bucket_url.rstrip("/")
+    run_root = f"{base}/logs/{run_slug}"
+
+    # Stage the checkpoint directory under a temp tree shaped like the
+    # target. ``hf sync`` operates on a local tree → remote URL pair, so
+    # we mirror the on-bucket layout locally first. This is cheap (the
+    # checkpoint files are already on disk; we only create symlinks
+    # when the FS supports them, otherwise copy).
+    with tempfile.TemporaryDirectory() as staging:
+        staging_path = Path(staging)
+        ckpt_target = (
+            staging_path / "checkpoints" / checkpoint_path.name
+        )
+        ckpt_target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(checkpoint_path.resolve(), ckpt_target)
+        except OSError:
+            shutil.copytree(checkpoint_path, ckpt_target)
+
+        if metrics_path is not None and Path(metrics_path).exists():
+            # Match push_checkpoint_to_hf's "truncate at the current
+            # step" behavior so the bucket copy never gets ahead of
+            # the checkpoint it sits beside.
+            (staging_path / "metrics.jsonl").write_text(
+                truncate_metrics_jsonl(metrics_path, step)
+            )
+
+        result = subprocess.run(
+            ["hf", "sync", str(staging_path), run_root],
+            capture_output=True, text=True,
+        )
+        combined = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"hf sync exited {result.returncode}; "
+                f"output:\n{combined.strip()}"
+            )
+        # ``hf sync`` exits 0 even on per-blob 403/401/429 — re-grep the
+        # combined output for those signals so the trainer's wrapper
+        # ``_push`` catches them as failures instead of silence.
+        import re
+
+        if re.search(r"\b(403|401|429)\b|Forbidden|Unauthorized|RateLimit", combined):
+            raise RuntimeError(
+                "hf sync reported auth / quota / rate-limit signals "
+                f"despite exit 0:\n{combined.strip()}"
+            )

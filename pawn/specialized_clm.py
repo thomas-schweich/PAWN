@@ -89,7 +89,20 @@ class SpecializedCLM(nn.Module):
         rope_base: float = 10000.0,
     ):
         super().__init__()
+        from pawn.config import CLMConfig
+
         self.d_model = d_model
+        # Expose a ``cfg`` shaped like the backbone-based adapter wrappers
+        # so eval / generation utilities can read ``model.cfg.max_seq_len``
+        # / ``model.cfg.vocab_size`` uniformly across strategies.
+        self.cfg = CLMConfig(
+            vocab_size=vocab_size,
+            max_seq_len=max_seq_len,
+            d_model=d_model,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            d_ff=d_ff,
+        )
         pad_idx = PAD_TOKEN if vocab_size > PAD_TOKEN else None
         self.embed = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
         self.layers = nn.ModuleList([
@@ -121,3 +134,17 @@ class SpecializedCLM(nn.Module):
 
     def project_head(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Full forward pass returning ``(B, T, V)`` logits.
+
+        Mirrors the adapter CLMs' ``forward`` so eval scripts can call
+        ``model(ids)`` uniformly across strategies.
+        """
+        return self.project_head(
+            self.forward_hidden(input_ids, attention_mask)
+        )

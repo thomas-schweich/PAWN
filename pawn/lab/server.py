@@ -113,3 +113,22 @@ async def lab_schema(ctx: Context) -> dict[str, Any]:
         "adapter": AdapterConfig.model_json_schema(),
         "cotrain": CotrainConfig.model_json_schema(),
     }
+
+
+@mcp.tool
+async def lab_audit(
+    ctx: Context,
+    trial_id: int | None = None,
+    check_hf: bool = False,
+) -> dict[str, Any]:
+    """Per-trial pass/fail on completion invariants.
+
+    Without arguments: audits every non-running trial. With ``trial_id``: just that one. Returns ``{trials: [...], any_failure: bool}`` where each trial row carries a ``checks`` dict.
+
+    Invariants checked:
+      - ``schedule_complete``: ``schedule_health.json`` reports ``actual_total_steps == planned_total_steps`` (equality; partial decay fails).
+      - ``checkpoint_complete``: the latest ``step_*`` directory under the run dir has its ``.complete`` SHA-256 sentinel.
+      - ``checkpoint_on_hf`` (only when ``check_hf=True`` and the trial has an ``hf_repo``): the latest local checkpoint directory name is present on the run's branch via ``list_repo_files``. Off by default — the HF API call is the slow path.
+
+    Each check returns ``{pass: true|false|null, ...}`` where ``null`` means "not applicable" or "couldn't verify". Surface non-pass entries to the user immediately."""
+    return _runner(ctx).audit(trial_id=trial_id, check_hf=check_hf)

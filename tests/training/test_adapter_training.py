@@ -396,31 +396,6 @@ class TestParseLayers:
 
 
 # ---------------------------------------------------------------------------
-# _resume_start_epoch
-# ---------------------------------------------------------------------------
-
-
-class TestResumeStartEpoch:
-    """Regression tests for the ``start_epoch = saved_epoch + 1`` bug."""
-
-    def test_epochs_one_range_nonempty_on_mid_epoch_resume(self):
-        """Resume from mid-epoch checkpoint under ``epochs=1`` must not
-        produce an empty outer-loop range; doing so caused silent
-        ``steps=0`` exits prior to the fix."""
-        from pawn.adapter_training import _resume_start_epoch
-        start = _resume_start_epoch(saved_epoch=0)
-        assert list(range(start, 1)) == [0]
-
-    def test_extended_run_iterates_from_saved_epoch(self):
-        """Callers bumping ``epochs`` to extend past the original budget
-        must iterate from the saved epoch (not epoch+1), else the
-        resumed loop under-trains by one epoch."""
-        from pawn.adapter_training import _resume_start_epoch
-        start = _resume_start_epoch(saved_epoch=0)
-        assert list(range(start, 2)) == [0, 1]
-
-
-# ---------------------------------------------------------------------------
 # load_backbone
 # ---------------------------------------------------------------------------
 
@@ -1040,3 +1015,139 @@ class TestSchedulerEquivalence:
             assert lr_a == pytest.approx(lr_b, rel=1e-6, abs=1e-10)
             sched_a.step()
             sched_b.step()
+
+
+# ---------------------------------------------------------------------------
+# write_schedule_health
+# ---------------------------------------------------------------------------
+
+
+class TestWriteScheduleHealth:
+    @pytest.mark.unit
+    def test_completed_run_writes_clean_health(self, tmp_path, capsys):
+        from pawn.adapter_training import write_schedule_health
+
+        h = write_schedule_health(
+            tmp_path,
+            schedule="cosine",
+            planned_total_steps=1000,
+            actual_total_steps=1000,
+            lr_peak=3e-4,
+            actual_final_lr=0.0,
+            reason_for_stop="completed",
+        )
+        assert h["completion_ratio"] == 1.0
+        assert h["should_reach_zero"] is True
+        assert (tmp_path / "schedule_health.json").exists()
+        # No banner.
+        assert "WARNING: schedule did not run to completion" not in (
+            capsys.readouterr().out
+        )
+
+    @pytest.mark.unit
+    def test_step_mismatch_with_completed_reason_warns(self, tmp_path, capsys):
+        """The combination ``actual != planned`` AND
+        ``reason_for_stop == "completed"`` is the structural-bug signal —
+        with cache-first it should never happen, and we want a loud
+        red banner if it does."""
+        from pawn.adapter_training import write_schedule_health
+
+        write_schedule_health(
+            tmp_path,
+            schedule="cosine",
+            planned_total_steps=1000,
+            actual_total_steps=950,
+            lr_peak=3e-4,
+            actual_final_lr=2e-5,
+            reason_for_stop="completed",
+        )
+        out = capsys.readouterr().out
+        assert "WARNING: schedule did not run to completion" in out
+
+    @pytest.mark.unit
+    def test_sigterm_does_not_warn(self, tmp_path, capsys):
+        """SIGTERM is a legitimate early exit; no banner."""
+        from pawn.adapter_training import write_schedule_health
+
+        write_schedule_health(
+            tmp_path,
+            schedule="cosine",
+            planned_total_steps=1000,
+            actual_total_steps=500,
+            lr_peak=3e-4,
+            actual_final_lr=1.5e-4,
+            reason_for_stop="sigterm",
+        )
+        out = capsys.readouterr().out
+        assert "WARNING: schedule did not run to completion" not in out
+
+    @pytest.mark.unit
+    def test_constant_schedule_does_not_warn(self, tmp_path, capsys):
+        """``constant`` does not decay to 0; mismatch is normal."""
+        from pawn.adapter_training import write_schedule_health
+
+        h = write_schedule_health(
+            tmp_path,
+            schedule="constant",
+            planned_total_steps=1000,
+            actual_total_steps=900,
+            lr_peak=3e-4,
+            actual_final_lr=3e-4,
+            reason_for_stop="completed",
+        )
+        assert h["should_reach_zero"] is False
+        assert "WARNING" not in capsys.readouterr().out
+
+
+
+# ---------------------------------------------------------------------------
+# resume_state
+# ---------------------------------------------------------------------------
+
+
+class TestResumeState:
+    @pytest.mark.unit
+    def test_fresh_run(self):
+        from pawn.adapter_training import resume_state
+
+        assert resume_state(0, 1000) == (0, 0)
+
+    @pytest.mark.unit
+    def test_exact_epoch_boundary(self):
+        """End-of-epoch save: ``global_step`` lands on a clean
+        boundary, so the next loop iteration starts the next epoch
+        with no skip."""
+        from pawn.adapter_training import resume_state
+
+        assert resume_state(1000, 1000) == (1, 0)
+        assert resume_state(2000, 1000) == (2, 0)
+
+    @pytest.mark.unit
+    def test_mid_epoch(self):
+        """Mid-epoch save (e.g. SIGTERM): re-enter the in-progress
+        epoch and skip the consumed prefix."""
+        from pawn.adapter_training import resume_state
+
+        assert resume_state(1500, 1000) == (1, 500)
+        assert resume_state(2500, 1000) == (2, 500)
+
+    @pytest.mark.unit
+    def test_past_end(self):
+        """Resume on a checkpoint already past ``epochs * steps_per_epoch``
+        is the no-op case — start_epoch is computed honestly; the
+        trainer's epoch loop just iterates an empty range."""
+        from pawn.adapter_training import resume_state
+
+        # epochs=3 × spe=1000 = 3000, save at 3000 → start=3.
+        assert resume_state(3000, 1000) == (3, 0)
+        # Can technically go further (extension scenario).
+        assert resume_state(4500, 1000) == (4, 500)
+
+    @pytest.mark.unit
+    def test_validates_inputs(self):
+        from pawn.adapter_training import resume_state
+
+        with pytest.raises(ValueError, match="steps_per_epoch"):
+            resume_state(100, 0)
+        with pytest.raises(ValueError, match="global_step"):
+            resume_state(-1, 100)
