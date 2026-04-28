@@ -155,7 +155,7 @@ def compute_legal_indices(
         upper = B * seq_len * vocab_size
         if not (indices < upper).all():
             bad = int(indices.max())
-            raise AssertionError(
+            raise RuntimeError(
                 f"legal indices out of bounds after shift: max={bad}, "
                 f"limit={upper} (B={B}, seq_len={seq_len}, V={vocab_size})"
             )

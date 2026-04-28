@@ -351,6 +351,15 @@ def build_compiled_step(
     from scratch and may select different kernels than the original
     pass. For bit-identical loss across resumes, set
     ``CUDNN_DETERMINISTIC=1`` in the environment.
+
+    Global side-effect: when ``use_compile=True`` this raises
+    ``torch._dynamo.config.cache_size_limit`` to ``max(current, 128)``
+    process-wide. The bump is one-way (never lowers an explicit
+    higher setting) and only matters in shared-process scenarios
+    like in-process Optuna sweeps where multiple training trials
+    share a dynamo cache; if your sweep logic depends on a smaller
+    cache for its own compiled code, set the limit explicitly after
+    calling this.
     """
     use_amp = amp_dtype is not None
 
@@ -1905,14 +1914,18 @@ def train(
             if global_step % args.log_interval == 0:
                 # Sync only at the log boundary. ``log_positions`` may
                 # be 0 if the bucket happened to contain entirely empty
-                # rows — guard against the zero-division.
+                # rows — guard against the zero-division. Read the
+                # accumulators first, then zero them unconditionally so
+                # an empty window doesn't carry into the next interval
+                # and shift its averaging boundary.
                 log_pos = int(log_positions_t.item())
                 if log_pos > 0:
                     avg_loss = (log_loss_t / log_pos).item()
                     avg_top1 = (log_top1_t.float() / log_pos).item()
-                    log_loss_t.zero_()
-                    log_top1_t.zero_()
-                    log_positions_t.zero_()
+                log_loss_t.zero_()
+                log_top1_t.zero_()
+                log_positions_t.zero_()
+                if log_pos > 0:
                     lr = optimizer.param_groups[0]["lr"]
                     print(
                         f"  step {global_step:6d} | loss={avg_loss:.4f} "

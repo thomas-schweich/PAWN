@@ -505,7 +505,18 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
     # of ``bucket_size`` so the compiled step graph cache stays bounded
     # while typical 60-120-ply Lichess games no longer pay full-width
     # attention cost.
-    collate = BucketedLegalMaskCollate(
+    # Separate collate instances per loader. ``skip_legal_indices`` is
+    # flipped on ``val_collate`` after precompute (see below) so the
+    # val loader stops re-running the Rust replay on every eval pass;
+    # the train loader's ``train_collate`` always emits ``legal_indices``
+    # because the hot loop reads them every step. Sharing one instance
+    # would silently strip ``legal_indices`` from train batches and
+    # crash with ``KeyError`` on the first step.
+    train_collate = BucketedLegalMaskCollate(
+        seq_len=seq_len, bucket_size=config.bucket_size, vocab_size=vocab_size,
+        prepend_outcome=config.prepend_outcome,
+    )
+    val_collate = BucketedLegalMaskCollate(
         seq_len=seq_len, bucket_size=config.bucket_size, vocab_size=vocab_size,
         prepend_outcome=config.prepend_outcome,
     )
@@ -524,7 +535,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         num_workers=n_workers,
         pin_memory=True,
         persistent_workers=n_workers > 0,
-        collate_fn=collate,
+        collate_fn=train_collate,
         multiprocessing_context="spawn" if n_workers > 0 else None,
     )
     val_loader = DataLoader(
@@ -533,7 +544,7 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
         shuffle=False,
         num_workers=0,
         pin_memory=True,
-        collate_fn=collate,
+        collate_fn=val_collate,
     )
     mask_builder = LegalMaskBuilder(
         args.batch_size, seq_len=seq_len, vocab_size=vocab_size, device=device,
@@ -547,13 +558,13 @@ def run_adapter(config: AdapterConfig) -> tuple[float, dict[str, Any]]:
     print(
         f"  Precomputed legal masks for {len(val_legal_indices)} val batches"
     )
-    # The val loader runs the same collate on every eval pass; once
-    # the indices are cached upstream, the in-collate Rust replay is
-    # redundant (``evaluate`` consumes ``precomputed_indices`` and
-    # ignores ``batch["legal_indices"]`` when both are present). Flip
-    # the collate's skip flag so subsequent eval iterations only do
-    # the (much cheaper) pack step.
-    collate.skip_legal_indices = True
+    # Once the val indices are cached, the per-batch Rust replay on the
+    # val collate is redundant (``evaluate`` consumes
+    # ``precomputed_indices`` and ignores ``batch["legal_indices"]``
+    # when both are present). Flip the val-only flag so subsequent
+    # eval iterations only do the (much cheaper) pack step. The train
+    # collate is untouched.
+    val_collate.skip_legal_indices = True
 
     # Log config & handle RoSA multi-phase
     if args.strategy == "rosa":
