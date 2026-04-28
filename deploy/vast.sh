@@ -260,13 +260,28 @@ cmd_create() {
             echo "Inspect or delete it manually before retrying."
             exit 1
         fi
-        if vastai show instance "$stale_id" --raw 2>/dev/null | jq -e '.id // empty' >/dev/null 2>&1; then
+        # Probe vast.ai for the instance. We must distinguish three states:
+        #   (a) instance still exists      → refuse to overwrite
+        #   (b) instance confirmed gone    → safe to remove .env and proceed
+        #   (c) API unreachable / unknown  → REFUSE; assuming "gone" on a transient
+        #       outage or expired API key would orphan the original instance.
+        local probe_out probe_rc=0
+        probe_out=$(vastai show instance "$stale_id" --raw 2>&1) || probe_rc=$?
+        if [ "$probe_rc" -eq 0 ] && echo "$probe_out" | jq -e '.id // empty' >/dev/null 2>&1; then
             echo "Error: Instance config '$name' already exists at $VAST_DIR/$name.env (id=$stale_id)"
             echo "Delete it first ($0 delete $name) or pick a different name."
             exit 1
         fi
-        echo "Found stale config for '$name' (instance $stale_id no longer exists on vast.ai). Removing and proceeding..."
-        rm -f "$VAST_DIR/$name.env"
+        if echo "$probe_out" | grep -qiE 'not[[:space:]]*found|no[[:space:]]*such|does[[:space:]]*not[[:space:]]*exist|unknown[[:space:]]*instance|404'; then
+            echo "Found stale config for '$name' (instance $stale_id confirmed gone on vast.ai). Removing and proceeding..."
+            rm -f "$VAST_DIR/$name.env"
+        else
+            echo "Error: cannot determine state of instance $stale_id (vastai probe failed):" >&2
+            echo "$probe_out" | sed 's/^/  /' >&2
+            echo "Refusing to remove $VAST_DIR/$name.env on a transient/API failure." >&2
+            echo "Check `vastai user` / network, or remove the .env manually after verifying the instance is gone." >&2
+            exit 1
+        fi
     fi
 
     # Validate max_price as a positive decimal so it can't smuggle filter syntax.
@@ -346,8 +361,11 @@ cmd_create() {
     # print stdout on failure and only show the (usually-clean) stderr.
     local output stderr_file rc=0
     stderr_file=$(mktemp)
-    # Ensure the temp file is removed on any exit path (success, failure, SIGINT).
-    trap 'rm -f "$stderr_file"' EXIT
+    # Embed the literal path in the trap (double-quoted) so it's expanded at
+    # trap-set time. A single-quoted trap would defer expansion until script
+    # exit, by which point the local variable is gone — under `set -u` that
+    # crashes the cleanup with "unbound variable" and turns exit code into 1.
+    trap "rm -f '$stderr_file'" EXIT
     output=$(vastai "${create_args[@]}" --raw 2>"$stderr_file") || rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "Error: vastai create instance failed (exit $rc)." >&2
@@ -412,6 +430,11 @@ cmd_start() {
     load_instance_config "$name"
     echo "Starting instance '$name' ($INSTANCE_ID)..."
     vastai start instance "$INSTANCE_ID"
+    # Clear cached host/port: a resumed instance can come up on a different
+    # host/port. wait_for_instance_running rewrites the .env on success; on
+    # timeout the empty cache forces load_instance_config_with_endpoint to
+    # re-query later instead of using stale values.
+    save_instance_config "$name" "$INSTANCE_ID" "" "" "${INSTANCE_GPU:-unknown}"
     wait_for_instance_running "$INSTANCE_ID" "$name" || exit 1
 }
 
