@@ -619,7 +619,7 @@ class InProcessRoSAObjective:
 
         # Ensure mask builder capacity matches train batch size
         mask_builder = self._mask_builder
-        if batch_size > mask_builder._mask_gpu.shape[0]:
+        if batch_size > mask_builder._max_batch:
             from pawn.lichess_data import LegalMaskBuilder
             mask_builder = LegalMaskBuilder(
                 batch_size, seq_len=self._seq_len, vocab_size=vocab_size,
@@ -648,7 +648,9 @@ class InProcessRoSAObjective:
                 ids = batch["input_ids"].to(device, non_blocking=True)
                 tgt = batch["targets"].to(device, non_blocking=True)
                 msk = batch["loss_mask"].to(device, non_blocking=True)
-                legal_mask = mask_builder.scatter(batch["legal_indices"], ids.shape[0])
+                legal_mask = mask_builder.scatter(
+                    batch["legal_indices"], ids.shape[0], mask_builder.T
+                )
 
                 with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                     hidden = warmup_model.forward_hidden(ids, msk)
@@ -748,7 +750,9 @@ class InProcessRoSAObjective:
                 ids = batch["input_ids"].to(device, non_blocking=True)
                 tgt = batch["targets"].to(device, non_blocking=True)
                 msk = batch["loss_mask"].to(device, non_blocking=True)
-                legal_mask = mask_builder.scatter(batch["legal_indices"], ids.shape[0])
+                legal_mask = mask_builder.scatter(
+                    batch["legal_indices"], ids.shape[0], mask_builder.T
+                )
 
                 with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                     hidden = model.forward_hidden(ids, msk)
@@ -783,7 +787,9 @@ class InProcessRoSAObjective:
                     tgt = batch["targets"].to(device, non_blocking=True)
                     msk = batch["loss_mask"].to(device, non_blocking=True)
                     lm = self._mask_builder.scatter(
-                        self._val_legal_indices[i], ids.shape[0],
+                        self._val_legal_indices[i],
+                        ids.shape[0],
+                        self._mask_builder.T,
                     )
                     with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                         hidden = model.forward_hidden(ids, msk)

@@ -8,6 +8,9 @@ training (not precomputed) to keep memory independent of dataset size.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, TypedDict
+
+from typing_extensions import NotRequired
 
 import numpy as np
 import polars as pl
@@ -17,6 +20,61 @@ import torch.utils.data
 import chess_engine as engine
 
 from pawn.config import PAD_TOKEN
+
+
+class BucketedBatchDict(TypedDict):
+    """Output schema of :class:`BucketedLegalMaskCollate`.
+
+    All keys except ``legal_indices`` are always populated.
+    ``legal_indices`` is omitted when the collate's
+    ``skip_legal_indices`` flag is set (e.g. on the val loader after
+    :func:`pawn.adapter_training.precompute_val_masks` has cached them
+    upstream); consumers branch on ``"legal_indices" in batch``.
+    """
+
+    input_ids: torch.Tensor       # (B, T_actual) long
+    targets: torch.Tensor         # (B, T_actual) long
+    loss_mask: torch.Tensor       # (B, T_actual) bool
+    move_ids: torch.Tensor        # (B, max_ply) int16
+    game_length: torch.Tensor     # (B,) int64
+    T_actual: int                 # bucketed per-batch sequence width
+    legal_indices: NotRequired[torch.Tensor]  # (n,) int64 — flat sparse
+                                              # indices into the
+                                              # (B, T_actual, vocab_size)
+                                              # mask buffer; absent when
+                                              # ``skip_legal_indices`` is set
+
+
+def round_up_to_bucket(n: int, bucket_size: int, cap: int) -> int:
+    """Round ``n`` up to the next multiple of ``bucket_size``, clamped to ``cap``.
+
+    With ``bucket_size=64`` and ``cap=512`` this produces T ∈
+    {64, 128, 192, 256, 320, 384, 448, 512}. ``n <= 0`` rounds up to
+    ``bucket_size`` (a degenerate empty batch still gets a valid T).
+    """
+    if bucket_size <= 0:
+        return min(max(n, 1), cap)
+    rounded = ((max(n, 1) + bucket_size - 1) // bucket_size) * bucket_size
+    return min(rounded, cap)
+
+
+def bucket_grid(bucket_size: int, cap: int) -> list[int]:
+    """Enumerate the distinct ``T`` values :func:`round_up_to_bucket` can emit.
+
+    With ``bucket_size=64, cap=512`` returns ``[64, 128, ..., 512]`` (8
+    entries). When ``cap`` is not a multiple of ``bucket_size`` the
+    final entry is ``cap`` itself (e.g. ``bucket_size=64, cap=300`` →
+    ``[64, 128, 192, 256, 300]``). ``bucket_size <= 0`` collapses to
+    ``[cap]``. Used by the compiled-step pre-warm loop so each shape's
+    dynamo trace + cudagraph capture cost is paid before training
+    starts rather than lazily on the first batch that hits each bucket.
+    """
+    if bucket_size <= 0:
+        return [max(cap, 1)]
+    grid = list(range(bucket_size, cap + 1, bucket_size))
+    if not grid or grid[-1] != cap:
+        grid.append(cap)
+    return grid
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +143,22 @@ def compute_legal_indices(
                 count=full_length.size,
             )
             indices = np.concatenate([indices, pad_indices])
+
+    # Defensive bounds check after the shift / PAD-fix steps. By this
+    # point every index must land inside the ``(B, seq_len, vocab_size)``
+    # mask buffer; an out-of-bounds value would scatter into the wrong
+    # row at runtime and silently corrupt the legality mask. Cheap to
+    # verify and catches any future Rust-engine regression at the
+    # source rather than as a CUDA scatter fault.
+    if indices.size > 0:
+        B = move_ids.shape[0]
+        upper = B * seq_len * vocab_size
+        if not (indices < upper).all():
+            bad = int(indices.max())
+            raise RuntimeError(
+                f"legal indices out of bounds after shift: max={bad}, "
+                f"limit={upper} (B={B}, seq_len={seq_len}, V={vocab_size})"
+            )
     return indices
 
 
@@ -93,11 +167,20 @@ class LegalMaskBuilder:
 
     Calls engine.compute_legal_token_masks_sparse which replays games and
     returns flat i64 indices (~2 MB) instead of a dense bool mask (~70 MB).
-    Indices are transferred to GPU and scattered into a pre-allocated buffer.
+    Indices are transferred to GPU and scattered into a fresh ``(B, T, V)``
+    bool tensor per call. The caching allocator reuses freed buffers
+    across steps, so per-call allocation cost is dominated by the
+    ``zero_()`` memset; pre-allocation no longer pulls its weight under
+    bucketed collates where ``T`` varies per batch.
+
+    The reusable ``_idx_buf`` (a long index staging buffer) is still
+    pre-allocated — it's small (~32 MB at default size) and avoids a
+    per-batch H2D copy in the common case.
 
     Two usage modes:
-      1. ``scatter(indices, B)`` — fast GPU-only path for pre-computed indices
-         (from ``LegalMaskCollate`` or precomputation).
+      1. ``scatter(indices, B, T=...)`` — fast GPU-only path for
+         pre-computed indices (from ``LegalMaskCollate`` /
+         ``BucketedLegalMaskCollate`` / precomputation).
       2. ``__call__(batch)`` — legacy path that computes indices inline.
     """
 
@@ -106,6 +189,9 @@ class LegalMaskBuilder:
                  prepend_outcome: bool = False):
         """
         Args:
+            batch_size: maximum batch size accepted by ``scatter``. No
+                tensor of this size is pre-allocated; the value is only
+                used as a capacity check.
             seq_len: total tensor width matching the model's ``max_seq_len``.
                 In outcome-prefixed mode the outcome slot lives inside this
                 budget; in pure-moves mode all ``seq_len`` slots hold moves.
@@ -120,25 +206,42 @@ class LegalMaskBuilder:
         self.prepend_outcome = prepend_outcome
         self.T = seq_len
         self.device = device
+        self._max_batch = int(batch_size)
 
-        # Pre-allocated GPU output buffer
-        self._mask_gpu = torch.zeros(batch_size, self.T, vocab_size,
-                                     dtype=torch.bool, device=device)
         # Pre-allocated GPU index buffer to avoid per-batch allocation
+        # for the indices staging copy. The output mask buffer is *not*
+        # pre-allocated — see class docstring.
         self._idx_buf = torch.empty(max_index_buf, dtype=torch.long, device=device)
 
-    def scatter(self, legal_indices: torch.Tensor, B: int) -> torch.Tensor:
-        """Scatter pre-computed CPU indices into the GPU mask buffer.
+    def scatter(
+        self,
+        legal_indices: torch.Tensor,
+        B: int,
+        T: int,
+    ) -> torch.Tensor:
+        """Scatter pre-computed CPU indices into a fresh GPU mask buffer.
 
-        Uses a pre-allocated index buffer to avoid per-batch GPU allocation.
-        Falls back to a fresh allocation if the buffer is too small.
+        Allocates a ``(B, T, V)`` bool tensor and scatters the supplied
+        flat indices into it. ``T`` is the per-batch tensor width that
+        the indices were computed against — required, because under the
+        bucketed collate every batch has its own ``T_actual`` and
+        silently defaulting to ``self.T`` (the model's full seq_len)
+        would over-allocate. Legacy fixed-T callers pass ``T=builder.T``
+        explicitly. The caching allocator reuses freed buffers across
+        steps, so per-call cost is dominated by the ``zero_()`` memset.
         """
-        if B > self._mask_gpu.shape[0]:
+        if B > self._max_batch:
             raise ValueError(
-                f"B={B} exceeds pre-allocated batch_size={self._mask_gpu.shape[0]}"
+                f"B={B} exceeds builder capacity batch_size={self._max_batch}"
             )
-        mask_view = self._mask_gpu[:B]
-        mask_view.zero_()
+        if T > self.T:
+            raise ValueError(
+                f"scatter T={T} exceeds builder seq_len={self.T}"
+            )
+        mask_view = torch.zeros(
+            B, T, self.vocab_size,
+            dtype=torch.bool, device=self.device,
+        )
         n = legal_indices.shape[0]
         if n > 0:
             if n <= self._idx_buf.shape[0]:
@@ -171,7 +274,7 @@ class LegalMaskBuilder:
             prepend_outcome=self.prepend_outcome,
         )
 
-        return self.scatter(torch.from_numpy(indices), B)
+        return self.scatter(torch.from_numpy(indices), B, self.T)
 
 
 class LegalMaskCollate:
@@ -200,6 +303,99 @@ class LegalMaskCollate:
         )
         batch["legal_indices"] = torch.from_numpy(indices)
         return batch
+
+
+class BucketedLegalMaskCollate:
+    """Collate that packs sequences and legal masks at a per-batch ``T``.
+
+    Designed for ``IndexedLichessDataset(lazy_pack=True)`` — the dataset
+    yields raw ``move_ids`` (an ``int16`` array of length ``max_ply``,
+    zero-padded after the actual game) plus ``game_length`` and
+    ``outcome_token``. This collate computes::
+
+        T_eff    = max(game_lengths) + (1 if prepend_outcome else 0)
+        T_padded = round_up(T_eff, bucket_size)  clamped to seq_len
+
+    and runs both :func:`pawn.data.pack_clm_sequences` and
+    :func:`compute_legal_indices` at ``T_padded``. With ``bucket_size``
+    chosen so that only a small handful of distinct ``T`` values are
+    ever emitted, the downstream compiled step graph cache stays
+    bounded — the win is concentrated on the typical Lichess game
+    (~80 ply) which previously paid attention cost at ``seq_len=512``
+    and now pays it at ``T_padded=128``.
+    """
+
+    def __init__(
+        self,
+        seq_len: int,
+        bucket_size: int,
+        vocab_size: int = 1968,
+        prepend_outcome: bool = False,
+    ):
+        if bucket_size <= 0:
+            raise ValueError(f"bucket_size must be > 0, got {bucket_size}")
+        # When ``seq_len`` is not a multiple of ``bucket_size`` the
+        # cap-clamped top bucket is off-grid (e.g. seq_len=300,
+        # bucket_size=64 → buckets {64, 128, 192, 256, 300} instead of
+        # {64, 128, 192, 256}). torch.compile traces one extra graph
+        # for that shape; that's a small cache-pressure cost, not a
+        # correctness issue. Permitted so legacy ``max_seq_len`` values
+        # like 255 / 300 keep working without a forced migration.
+        self.seq_len = seq_len
+        self.bucket_size = bucket_size
+        self.vocab_size = vocab_size
+        self.prepend_outcome = prepend_outcome
+        # When the val loader's indices are precomputed and cached
+        # upstream (see ``precompute_val_masks``), the per-batch
+        # ``compute_legal_indices`` call is pure waste — the eval loop
+        # ignores the collate's indices and uses the cache instead.
+        # Callers flip this to ``True`` after precompute completes; on
+        # the train loader it stays ``False`` (every batch's indices
+        # are consumed exactly once).
+        self.skip_legal_indices: bool = False
+
+    def __call__(self, items: list[dict[str, Any]]) -> BucketedBatchDict:
+        from pawn.data import pack_clm_sequences
+
+        # Stack raw inputs. Keeping ``move_ids`` as int16 (its storage
+        # dtype on disk) avoids an extra cast in the worker; it's
+        # promoted inside ``pack_clm_sequences``.
+        move_ids = np.stack(
+            [np.asarray(it["move_ids"], dtype=np.int16) for it in items], axis=0
+        )
+        game_lengths = np.asarray(
+            [int(it["game_length"]) for it in items], dtype=np.int16
+        )
+        outcome_tokens = torch.tensor(
+            [int(it["outcome_token"]) for it in items], dtype=torch.long
+        )
+
+        max_len = int(game_lengths.max()) if len(game_lengths) > 0 else 0
+        offset = 1 if self.prepend_outcome else 0
+        T_padded = round_up_to_bucket(
+            max_len + offset, self.bucket_size, self.seq_len
+        )
+
+        packed = pack_clm_sequences(
+            move_ids, game_lengths, outcome_tokens, T_padded,
+            prepend_outcome=self.prepend_outcome,
+        )
+
+        out: BucketedBatchDict = {
+            "input_ids": packed["input_ids"],
+            "targets": packed["targets"],
+            "loss_mask": packed["loss_mask"],
+            "move_ids": torch.from_numpy(move_ids),
+            "game_length": torch.from_numpy(game_lengths.astype(np.int64)),
+            "T_actual": T_padded,
+        }
+        if not self.skip_legal_indices:
+            indices = compute_legal_indices(
+                move_ids, game_lengths, T_padded, self.vocab_size,
+                prepend_outcome=self.prepend_outcome,
+            )
+            out["legal_indices"] = torch.from_numpy(indices)
+        return out
 
 
 # ---------------------------------------------------------------------------

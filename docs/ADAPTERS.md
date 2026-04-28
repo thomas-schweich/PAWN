@@ -151,7 +151,7 @@ All adapter wrappers expose `forward_hidden()` (returns `(B, T, d_model)`) and `
 
 ### Legal masking via Rust engine
 
-Training and evaluation use `LegalMaskBuilder` to replay games through the Rust chess engine and produce per-position legal move masks. These are scattered into a pre-allocated GPU buffer as sparse indices, avoiding dense `(B, T, V)` boolean masks.
+Training and evaluation use `LegalMaskBuilder` to replay games through the Rust chess engine and produce per-position legal move masks. These are scattered into a per-batch GPU bool buffer as sparse indices, avoiding dense `(B, T, V)` materialization. The buffer is allocated fresh per call (the caching allocator handles reuse across steps) so it adapts to the per-batch `T` produced by `BucketedLegalMaskCollate`.
 
 By default the loss is computed over legal moves only (illegal logits masked to `-inf` before cross-entropy). Two CLI flags tune this:
 
@@ -160,9 +160,15 @@ By default the loss is computed over legal moves only (illegal logits masked to 
 
 Two new per-eval metrics fall out: `illegal_pred_rate` (fraction of argmax picks that are illegal) and `illegal_prob_mass` (softmax mass on illegal tokens). Both are analytically zero under the hard mask and are skipped entirely in that path to avoid a numerically unstable softmax over all-`-inf` rows.
 
+### Bucketed dynamic padding
+
+Adapter training uses `BucketedLegalMaskCollate` to pack each batch at a per-batch sequence width `T = round_up(max(game_length) + outcome_offset, bucket_size)`, clamped to `max_seq_len`. With `bucket_size=64` (the default) and `max_seq_len=512`, the compiled step graph cache holds at most ~8 distinct shapes and typical 60-120-ply Lichess games run at `T=128` instead of `T=512` — eliminating the wasted attention cost on padding. The `T_actual` field is exposed on each batch dict for downstream consumers.
+
+`bucket_size` is set via `AdapterConfig.bucket_size` (default 64). It must remain constant across resumes — different bucket sizes change batch composition and break loss reproducibility. `max_seq_len` need not be a multiple of `bucket_size`; off-grid configurations just add one extra graph cache entry for the cap-clamped bucket.
+
 ### DataLoader worker safety
 
-The chess engine uses rayon for internal parallelism. Python's default `fork` multiprocessing can deadlock if forked after rayon initializes its thread pool. All DataLoader usage must specify `multiprocessing_context='spawn'`. The `LegalMaskCollate` callable moves Rust replay work into spawned workers, and `LichessDataset.share_memory()` avoids per-worker copies of the dataset.
+The chess engine uses rayon for internal parallelism. Python's default `fork` multiprocessing can deadlock if forked after rayon initializes its thread pool. All DataLoader usage must specify `multiprocessing_context='spawn'`. The `BucketedLegalMaskCollate` (and legacy `LegalMaskCollate`) callable moves Rust replay work into spawned workers, and `LichessDataset.share_memory()` avoids per-worker copies of the dataset.
 
 ### Parameter management
 

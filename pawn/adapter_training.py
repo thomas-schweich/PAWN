@@ -22,7 +22,7 @@ import json
 import math
 import signal
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, NamedTuple
 
 import numpy as np
 import torch
@@ -31,7 +31,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from pawn.config import CLMConfig
-from pawn.gpu import apply_gpu_config
 from pawn.lichess_data import (
     LegalMaskBuilder,
     compute_legal_indices,
@@ -320,6 +319,166 @@ def build_scheduler(
     raise ValueError(f"Unknown lr_schedule: {schedule!r}")
 
 
+CompiledStep = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor],
+]
+
+
+def build_compiled_step(
+    model: nn.Module,
+    *,
+    apply_legal_mask: bool,
+    illegal_penalty: float,
+    amp_dtype: torch.dtype | None,
+    use_compile: bool,
+) -> CompiledStep:
+    """Build a (possibly compiled) per-step function for the hot loop.
+
+    Returns a callable ``step(ids, msk, legal_mask, targets) -> (loss,
+    top1_sum)``. Combines the backbone forward, sparse logit projection,
+    optional legal-mask, cross-entropy, and top-1 count into a single
+    graph that ``torch.compile(mode="reduce-overhead")`` can fuse and
+    CUDA-graph-capture per (B, T) shape.
+
+    The data-dependent ``hidden[msk]`` filter forces a graph break at
+    that point — cudagraph trees fall back to eager for the masked
+    section and resume capture for the loss tail. The bulk of kernel-
+    launch overhead lives in the backbone forward (8 layers ×
+    {LayerNorm, attn, FFN}), which is fully captured.
+
+    Compiled graphs are not checkpointed: resuming a run re-traces
+    from scratch and may select different kernels than the original
+    pass. For bit-identical loss across resumes, set
+    ``CUDNN_DETERMINISTIC=1`` in the environment.
+
+    Global side-effect: when ``use_compile=True`` this raises
+    ``torch._dynamo.config.cache_size_limit`` to ``max(current, 128)``
+    process-wide. The bump is one-way (never lowers an explicit
+    higher setting) and only matters in shared-process scenarios
+    like in-process Optuna sweeps where multiple training trials
+    share a dynamo cache; if your sweep logic depends on a smaller
+    cache for its own compiled code, set the limit explicitly after
+    calling this.
+    """
+    use_amp = amp_dtype is not None
+
+    def _step(
+        ids: torch.Tensor,
+        msk: torch.Tensor,
+        legal_mask: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            hidden = model.forward_hidden(ids)  # type: ignore[attr-defined]
+            valid_hidden = hidden[msk]
+            valid_logits = model.project_head(valid_hidden)  # type: ignore[attr-defined]
+        valid_legal = legal_mask[msk]
+        valid_logits = valid_logits.float()
+        if apply_legal_mask:
+            valid_logits = valid_logits.masked_fill(~valid_legal, float("-inf"))
+        valid_targets = targets[msk]
+        loss = F.cross_entropy(valid_logits, valid_targets)
+        if illegal_penalty > 0:
+            probs = torch.softmax(valid_logits, dim=-1)
+            illegal_mass = (
+                probs.masked_fill(valid_legal, 0.0).sum(dim=-1).mean()
+            )
+            loss = loss + illegal_penalty * illegal_mass
+        # Top-1 count stays inside the compiled graph so we don't
+        # spawn a separate kernel-launch chain for diagnostics.
+        preds = valid_logits.argmax(dim=-1)
+        top1_sum = (preds == valid_targets).sum()
+        return loss, top1_sum
+
+    if use_compile:
+        # ``reduce-overhead`` enables CUDA graph capture for the static-
+        # shape regions; the bucketed collate keeps the number of
+        # distinct (B, T) shapes small. ``dynamic=False`` lets inductor
+        # specialize one graph per shape rather than emitting a single
+        # symbol-shape graph that defeats the cudagraph win.
+        import torch._dynamo as _dynamo
+        # Cache budget: one graph per distinct (B, T) shape. With a
+        # fixed batch size and bucket_size=64, that's 8 entries (or 9
+        # when ``seq_len`` is off-grid and the cap-clamped bucket adds
+        # one more). ``apply_legal_mask`` / ``illegal_penalty`` /
+        # ``amp_dtype`` are baked into the closure as constants and
+        # don't multiply the cache (a single run only ever uses one
+        # regime). 128 leaves comfortable headroom for variable-batch-
+        # size workflows (e.g. sweeps) without risking a silent
+        # "recompile limit hit" fallback.
+        _dynamo.config.cache_size_limit = max(
+            _dynamo.config.cache_size_limit, 128
+        )
+        compiled = torch.compile(_step, mode="reduce-overhead", dynamic=False)
+
+        # ``hidden[msk]`` produces a data-dependent shape, so cudagraph
+        # trees splits the step into two captured subgraphs. Without an
+        # explicit step boundary the second-subgraph output buffer
+        # (``valid_logits``) gets overwritten by the next step's
+        # forward before ``backward`` can consume it. Marking the step
+        # boundary tells the cudagraph manager to start a new memory
+        # epoch on each call. The wrapper keeps this concern out of
+        # the train loop.
+        def _wrapped(ids, msk, legal_mask, targets):
+            torch.compiler.cudagraph_mark_step_begin()
+            return compiled(ids, msk, legal_mask, targets)
+
+        return _wrapped
+    return _step
+
+
+def warmup_compiled_step(
+    step_fn: CompiledStep,
+    *,
+    optimizer: torch.optim.Optimizer,
+    bucket_widths: list[int],
+    batch_size: int,
+    vocab_size: int,
+    device: str,
+) -> None:
+    """Pre-trace + capture the compiled step at every bucket shape.
+
+    First invocation at each new ``(B, T)`` shape pays the dynamo trace
+    + cudagraph capture cost (often >1 s per bucket). Doing this at
+    train start flattens the early-step latency curve so the loop runs
+    at steady-state sps from step 0 instead of paying compile bursts on
+    the first batch that hits each bucket.
+
+    Forward + backward are exercised so both the forward graph and its
+    paired backward graph are captured. Gradients are zeroed after
+    each call so no parameter update leaks into the real run; this
+    must run *before* the training loop's optimizer.step() invocations.
+
+    The dummy batch uses an all-ones legal mask and pads only the back
+    half — this guarantees ≥1 valid loss-mask position per row (CE over
+    zero rows is undefined) and ≥1 legal token per position (softmax
+    over an all-``-inf`` row would NaN under the hard mask).
+    """
+    if not bucket_widths:
+        return
+    print(
+        f"  Pre-warming compiled step at {len(bucket_widths)} bucket(s): "
+        f"{bucket_widths}",
+        flush=True,
+    )
+    t0 = time.time()
+    for T in bucket_widths:
+        ids = torch.zeros(batch_size, T, dtype=torch.long, device=device)
+        tgt = torch.zeros(batch_size, T, dtype=torch.long, device=device)
+        msk = torch.zeros(batch_size, T, dtype=torch.bool, device=device)
+        msk[:, : max(1, T // 2)] = True
+        legal = torch.ones(
+            batch_size, T, vocab_size, dtype=torch.bool, device=device
+        )
+        loss, _ = step_fn(ids, msk, legal, tgt)
+        loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"  Pre-warm done in {time.time() - t0:.1f}s", flush=True)
+
+
 def sparse_forward(
     model: nn.Module,
     ids: torch.Tensor,
@@ -400,7 +559,7 @@ def evaluate(
     mask_builder: LegalMaskBuilder,
     device: str,
     amp_dtype: torch.dtype | None = None,
-    precomputed_indices: list[torch.Tensor] | None = None,
+    precomputed_indices: list[PrecomputedMask] | None = None,
     apply_legal_mask: bool = True,
     illegal_penalty: float = 0.0,
 ) -> dict[str, float]:
@@ -426,13 +585,17 @@ def evaluate(
         ids = batch["input_ids"].to(device, non_blocking=True)
         tgt = batch["targets"].to(device, non_blocking=True)
         msk = batch["loss_mask"].to(device, non_blocking=True)
+        # Per-batch ``T`` from BucketedLegalMaskCollate; falls back to
+        # the input width when the legacy fixed-T collate is in use.
+        T_batch = int(batch.get("T_actual", ids.shape[1]))
         if precomputed_indices is not None:
+            entry = precomputed_indices[i]
             legal_mask = mask_builder.scatter(
-                precomputed_indices[i], ids.shape[0]
+                entry.indices, ids.shape[0], entry.T_actual,
             )
         elif "legal_indices" in batch:
             legal_mask = mask_builder.scatter(
-                batch["legal_indices"], ids.shape[0]
+                batch["legal_indices"], ids.shape[0], T_batch,
             )
         else:
             legal_mask = mask_builder(batch)
@@ -602,13 +765,42 @@ def write_schedule_health(
     return health
 
 
+class PrecomputedMask(NamedTuple):
+    """Cached legal-mask indices for one val batch.
+
+    ``T_actual`` is the per-batch tensor width that ``indices`` was
+    computed against — under :class:`BucketedLegalMaskCollate` this
+    varies per batch; under the legacy fixed-T collate it equals
+    ``mask_builder.T`` for every entry. ``indices`` is the flat sparse
+    representation passed to :meth:`LegalMaskBuilder.scatter`.
+    """
+
+    T_actual: int
+    indices: torch.Tensor
+
+
 def precompute_val_masks(
     val_loader: DataLoader[Any],
     mask_builder: LegalMaskBuilder,
     vocab_size: int,
-) -> list[torch.Tensor]:
-    indices: list[torch.Tensor] = []
+) -> list[PrecomputedMask]:
+    """Precompute legal-mask indices for the val set.
+
+    With :class:`BucketedLegalMaskCollate` the val loader emits a
+    per-batch ``T_actual`` and ``legal_indices`` is already on the
+    batch — pass them through verbatim so :func:`evaluate` can scatter
+    at the right shape. Without bucketing we fall back to the legacy
+    path: each entry's ``T_actual`` is ``mask_builder.T`` (the fixed
+    full seq_len).
+    """
+    out: list[PrecomputedMask] = []
     for batch in val_loader:
+        if "legal_indices" in batch and "T_actual" in batch:
+            idx_t = batch["legal_indices"]
+            if not isinstance(idx_t, torch.Tensor):
+                idx_t = torch.from_numpy(idx_t)
+            out.append(PrecomputedMask(int(batch["T_actual"]), idx_t.pin_memory()))
+            continue
         move_ids = batch["move_ids"]
         if isinstance(move_ids, torch.Tensor):
             move_ids = move_ids.numpy()
@@ -620,8 +812,8 @@ def precompute_val_masks(
             vocab_size,
             prepend_outcome=mask_builder.prepend_outcome,
         )
-        indices.append(torch.from_numpy(idx).pin_memory())
-    return indices
+        out.append(PrecomputedMask(mask_builder.T, torch.from_numpy(idx).pin_memory()))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -936,9 +1128,10 @@ def rosa_warmup(
             ids = batch["input_ids"].to(device, non_blocking=True)
             tgt = batch["targets"].to(device, non_blocking=True)
             msk = batch["loss_mask"].to(device, non_blocking=True)
+            T_batch = int(batch.get("T_actual", ids.shape[1]))
             if "legal_indices" in batch:
                 legal_mask = mask_builder.scatter(
-                    batch["legal_indices"], ids.shape[0]
+                    batch["legal_indices"], ids.shape[0], T=T_batch,
                 )
             else:
                 legal_mask = mask_builder(batch)
@@ -1269,7 +1462,7 @@ def train(
     train_loader: DataLoader[Any],
     val_loader: DataLoader[Any],
     mask_builder: LegalMaskBuilder,
-    val_legal_indices: list[torch.Tensor],
+    val_legal_indices: list[PrecomputedMask],
     logger: MetricsLogger,
     args: Any,
     device: str,
@@ -1284,10 +1477,25 @@ def train(
     from pawn import model as model_module
     from pawn.checkpoint import save_adapter_checkpoint
 
-    # Compile
-    model.forward_hidden = apply_gpu_config(  # type: ignore[attr-defined]
-        gpu_cfg, model_module, model.forward_hidden  # type: ignore[attr-defined]
-    )
+    # Set SDPA backend (escape hatch for ROCm flash attn debugging). The
+    # full-step ``torch.compile`` wrap below covers the train hot loop;
+    # we additionally compile ``model.forward_hidden`` directly so
+    # ``evaluate()`` and ``rosa_warmup()`` (which call ``sparse_forward``
+    # → ``model.forward_hidden`` directly) keep their kernel-launch
+    # reduction. Without this, removing the old per-call compile would
+    # silently regress those paths whenever ``use_compile=True``.
+    # ``SDPA_BACKEND`` must be pinned before any compile traces, since
+    # compiled code captures the backend at trace time.
+    if gpu_cfg.get("sdpa_backend") is not None:
+        model_module.SDPA_BACKEND = gpu_cfg["sdpa_backend"]
+    if gpu_cfg.get("use_compile", False):
+        # Wrap the bound method in place. The train hot loop calls
+        # ``model.forward_hidden`` *inside* its own compiled step, where
+        # dynamo will inline this without re-tracing; eval / RoSA paths
+        # use this wrapper directly.
+        model.forward_hidden = torch.compile(  # type: ignore[attr-defined]
+            model.forward_hidden  # type: ignore[attr-defined]
+        )
 
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -1344,6 +1552,42 @@ def train(
     # constructing a bare ``argparse.Namespace`` by hand).
     apply_legal_mask = not bool(getattr(args, "disable_legal_mask", False))
     illegal_penalty = float(getattr(args, "illegal_penalty", 0.0))
+
+    # Build the (possibly compiled) per-step function. Closes over
+    # ``apply_legal_mask`` / ``illegal_penalty`` / ``amp_dtype`` so
+    # dynamo specializes one graph per legality regime — which is fine,
+    # both flags are set at run start and don't change mid-run.
+    step_fn = build_compiled_step(
+        model,
+        apply_legal_mask=apply_legal_mask,
+        illegal_penalty=illegal_penalty,
+        amp_dtype=amp_dtype,
+        use_compile=bool(gpu_cfg.get("use_compile", False)),
+    )
+
+    # Pre-trace every bucket shape so the dynamo + cudagraph capture
+    # cost is paid before the first training batch. Only meaningful
+    # when compile is on and the loader uses ``BucketedLegalMaskCollate``
+    # (the legacy fixed-T collate emits a single shape, which would
+    # also be primed by the first real batch — pre-warming there would
+    # save at most one compile burst). Must run before the resume
+    # block's checkpoint-load: the optimizer state restored from a
+    # checkpoint is preserved by the ``zero_grad`` calls (they only
+    # touch ``.grad``, not the AdamW moments), but it's cleaner to
+    # warm with a fresh optimizer.
+    from pawn.lichess_data import BucketedLegalMaskCollate, bucket_grid
+    if gpu_cfg.get("use_compile", False):
+        collate = train_loader.collate_fn
+        if isinstance(collate, BucketedLegalMaskCollate):
+            widths = bucket_grid(collate.bucket_size, collate.seq_len)
+            warmup_compiled_step(
+                step_fn,
+                optimizer=optimizer,
+                bucket_widths=widths,
+                batch_size=int(args.batch_size),
+                vocab_size=int(collate.vocab_size),
+                device=device,
+            )
 
     # Resume
     start_epoch = 0
@@ -1596,20 +1840,22 @@ def train(
                 flush=True,
             )
         model.train()
-        # Accumulate loss/top1 as GPU tensors so the training loop never
-        # issues a ``.item()`` per step. Each ``.item()`` is a blocking
-        # host-device sync that prevents the GPU from running batch N+1
-        # while the CPU reads the scalar for batch N — on ROCm this shows
-        # up as ~30% GPU utilization even when the data pipeline is idle.
+        # Accumulate loss/top1/positions as GPU tensors so the training
+        # loop never issues a ``.item()`` per step. Each ``.item()`` is
+        # a blocking host-device sync that prevents the GPU from running
+        # batch N+1 while the CPU reads the scalar for batch N — on
+        # ROCm this shows up as ~30% GPU utilization even when the
+        # data pipeline is idle.
         epoch_loss_t = torch.zeros((), device=device)
-        # top-1 accumulators hold a count of correct predictions, so
-        # they're int64 to match ``(preds == targets).sum()``. Keeping
-        # the dtype explicit avoids a silent float32 cast on ``+=``.
+        # top-1 / position accumulators hold counts, so they're int64
+        # to match ``(preds == targets).sum()`` and ``msk.sum()``.
+        # Keeping the dtype explicit avoids a silent float32 cast on
+        # ``+=``.
         epoch_top1_t = torch.zeros((), device=device, dtype=torch.int64)
-        epoch_positions = 0
+        epoch_positions_t = torch.zeros((), device=device, dtype=torch.int64)
         log_loss_t = torch.zeros((), device=device)
         log_top1_t = torch.zeros((), device=device, dtype=torch.int64)
-        log_positions = 0
+        log_positions_t = torch.zeros((), device=device, dtype=torch.int64)
         t0 = time.time()
 
         # The sampler's permutation is set; iterating yields exactly the
@@ -1622,19 +1868,12 @@ def train(
             ids = batch["input_ids"].to(device, non_blocking=True)
             tgt = batch["targets"].to(device, non_blocking=True)
             msk = batch["loss_mask"].to(device, non_blocking=True)
+            T_batch = int(batch.get("T_actual", ids.shape[1]))
             legal_mask = mask_builder.scatter(
-                batch["legal_indices"], ids.shape[0]
+                batch["legal_indices"], ids.shape[0], T_batch,
             )
 
-            valid_logits, valid_legal = sparse_forward(
-                model, ids, msk, legal_mask, amp_dtype, device,
-                apply_legal_mask=apply_legal_mask,
-            )
-            valid_targets = tgt[msk]
-            loss = compute_adapter_loss(
-                valid_logits, valid_targets, valid_legal,
-                illegal_penalty=illegal_penalty,
-            )
+            loss, top1_sum = step_fn(ids, msk, legal_mask, tgt)
 
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
@@ -1653,49 +1892,62 @@ def train(
                 optimizer.step()
             scheduler.step()
 
-            # Stay on GPU: no ``.item()`` inside the hot loop.
-            with torch.no_grad():
-                preds = valid_logits.argmax(dim=-1)
-                top1_sum = (preds == valid_targets).sum()
-
-            n_pos = valid_targets.shape[0]
-            loss_sum = loss.detach() * n_pos
+            # Diagnostic accumulators. ``loss`` and ``top1_sum`` alias
+            # the compiled step's static output buffers under cudagraph
+            # trees; the buffers are reclaimed at the *next* step's
+            # ``mark_step_begin``. All reads queued here run on the same
+            # CUDA stream as that next launch, so stream ordering
+            # guarantees these accumulators see the current step's
+            # values — no defensive ``.clone()`` needed. (Vocab-shaped
+            # outputs would still be unsafe for downstream autograd
+            # consumption, which is why the graph returns scalars.)
+            n_pos_t = msk.sum()
+            loss_sum = loss.detach() * n_pos_t.to(loss.dtype)
             epoch_loss_t += loss_sum
             epoch_top1_t += top1_sum
-            epoch_positions += n_pos
+            epoch_positions_t += n_pos_t
             log_loss_t += loss_sum
             log_top1_t += top1_sum
-            log_positions += n_pos
+            log_positions_t += n_pos_t
             global_step += 1
 
-            if global_step % args.log_interval == 0 and log_positions > 0:
-                avg_loss = (log_loss_t / log_positions).item()
-                avg_top1 = (log_top1_t / log_positions).item()
+            if global_step % args.log_interval == 0:
+                # Sync only at the log boundary. ``log_positions`` may
+                # be 0 if the bucket happened to contain entirely empty
+                # rows — guard against the zero-division. Read the
+                # accumulators first, then zero them unconditionally so
+                # an empty window doesn't carry into the next interval
+                # and shift its averaging boundary.
+                log_pos = int(log_positions_t.item())
+                if log_pos > 0:
+                    avg_loss = (log_loss_t / log_pos).item()
+                    avg_top1 = (log_top1_t.float() / log_pos).item()
                 log_loss_t.zero_()
                 log_top1_t.zero_()
-                lr = optimizer.param_groups[0]["lr"]
-                print(
-                    f"  step {global_step:6d} | loss={avg_loss:.4f} "
-                    f"top1={avg_top1:.4%} lr={lr:.2e}",
-                    flush=True,
-                )
-                logger.log_train(
-                    step=global_step,
-                    epoch=epoch,
-                    lr=lr,
-                    train_loss=avg_loss,
-                    train_top1=avg_top1,
-                )
-                log_metrics(
-                    wandb_run,
-                    {
-                        "train/loss": avg_loss,
-                        "train/top1": avg_top1,
-                        "train/lr": lr,
-                    },
-                    step=global_step,
-                )
-                log_positions = 0
+                log_positions_t.zero_()
+                if log_pos > 0:
+                    lr = optimizer.param_groups[0]["lr"]
+                    print(
+                        f"  step {global_step:6d} | loss={avg_loss:.4f} "
+                        f"top1={avg_top1:.4%} lr={lr:.2e}",
+                        flush=True,
+                    )
+                    logger.log_train(
+                        step=global_step,
+                        epoch=epoch,
+                        lr=lr,
+                        train_loss=avg_loss,
+                        train_top1=avg_top1,
+                    )
+                    log_metrics(
+                        wandb_run,
+                        {
+                            "train/loss": avg_loss,
+                            "train/top1": avg_top1,
+                            "train/lr": lr,
+                        },
+                        step=global_step,
+                    )
 
             if eval_interval and global_step % eval_interval == 0:
                 val_metrics = _do_eval()
@@ -1778,9 +2030,9 @@ def train(
 
         dt = time.time() - t0
         # One sync at end of epoch to pull the accumulated totals.
-        denom = max(epoch_positions, 1)
+        denom = max(int(epoch_positions_t.item()), 1)
         train_loss = (epoch_loss_t / denom).item()
-        train_top1 = (epoch_top1_t / denom).item()
+        train_top1 = (epoch_top1_t.float() / denom).item()
 
         do_val = not eval_interval and (
             (epoch % args.val_every == 0) or (epoch == args.epochs - 1)

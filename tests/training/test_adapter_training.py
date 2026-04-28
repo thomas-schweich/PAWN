@@ -7,14 +7,17 @@ These are unit tests; full training loops are covered by higher-level integratio
 from __future__ import annotations
 
 import math
+from typing import Any
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 
 from pawn.adapter_training import (
     STRATEGIES,
+    build_compiled_step,
     build_scheduler,
     compute_adapter_loss,
     constant_warmup_schedule,
@@ -760,7 +763,7 @@ class TestEvaluate:
 
     def test_precomputed_indices_path(self, cpu_device):
         """Passing precomputed_indices triggers mask_builder.scatter with the cached tensor."""
-        from pawn.adapter_training import evaluate
+        from pawn.adapter_training import PrecomputedMask, evaluate
 
         B, T, V, D = 1, 2, 8, 4
         model = _StubWrapper(D, V, T).to(cpu_device)
@@ -776,12 +779,13 @@ class TestEvaluate:
         cached_idx = torch.zeros(B, T, dtype=torch.long)
         metrics = evaluate(
             model, [batch], mask_builder, cpu_device,
-            precomputed_indices=[cached_idx],
+            precomputed_indices=[PrecomputedMask(T, cached_idx)],
         )
-        # scatter was called with the precomputed tensor
+        # scatter was called with the precomputed tensor and T_actual
         mask_builder.scatter.assert_called_once()
         args, _ = mask_builder.scatter.call_args
         assert torch.equal(args[0], cached_idx)
+        assert args[2] == T
         assert {"loss", "top1_accuracy", "top5_accuracy"} <= set(metrics.keys())
 
     def test_zero_valid_positions_skipped(self, cpu_device):
@@ -1236,3 +1240,377 @@ class TestResumeState:
             resume_state(100, 0)
         with pytest.raises(ValueError, match="global_step"):
             resume_state(-1, 100)
+
+
+# ---------------------------------------------------------------------------
+# build_compiled_step (eager-mode coverage)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildCompiledStep:
+    """Eager-mode tests for ``build_compiled_step``. The compiled path
+    requires CUDA/ROCm and is exercised end-to-end by the smoke test
+    in the dev workflow; here we verify the closure logic, return
+    shapes/dtypes, and equivalence with ``sparse_forward`` +
+    ``compute_adapter_loss``."""
+
+    def _setup(self, cpu_device, V=4, B=2, T=3, D=2):
+        torch.manual_seed(0)
+        model = _StubWrapper(D, V, T).to(cpu_device)
+        ids = torch.zeros(B, T, dtype=torch.long, device=cpu_device)
+        msk = torch.tensor(
+            [[True, True, False], [True, False, True]], device=cpu_device
+        )
+        targets = torch.tensor(
+            [[1, 1, 0], [0, 0, 1]], dtype=torch.long, device=cpu_device
+        )
+        legal_mask = torch.zeros(B, T, V, dtype=torch.bool, device=cpu_device)
+        # Allow targets at every position so CE doesn't diverge.
+        legal_mask[..., 0] = True
+        legal_mask[..., 1] = True
+        return model, ids, msk, targets, legal_mask
+
+    def test_returns_loss_and_top1_shapes(self, cpu_device):
+        model, ids, msk, targets, legal_mask = self._setup(cpu_device)
+        step = build_compiled_step(
+            model,
+            apply_legal_mask=True,
+            illegal_penalty=0.0,
+            amp_dtype=None,
+            use_compile=False,
+        )
+        loss, top1 = step(ids, msk, legal_mask, targets)
+        assert loss.dim() == 0  # scalar
+        assert loss.dtype == torch.float32
+        assert top1.dim() == 0
+        # top-1 count ranges over [0, msk.sum()].
+        n_valid = int(msk.sum().item())
+        assert 0 <= int(top1.item()) <= n_valid
+
+    def test_eager_matches_sparse_forward_path(self, cpu_device):
+        """Eager step_fn must reproduce the legacy
+        ``sparse_forward + compute_adapter_loss`` numerics."""
+        model, ids, msk, targets, legal_mask = self._setup(cpu_device)
+
+        # Legacy path
+        valid_logits, valid_legal = sparse_forward(
+            model, ids, msk, legal_mask, None, cpu_device,
+            apply_legal_mask=True,
+        )
+        valid_targets = targets[msk]
+        legacy_loss = compute_adapter_loss(
+            valid_logits, valid_targets, valid_legal, illegal_penalty=0.0
+        )
+
+        # New path
+        step = build_compiled_step(
+            model,
+            apply_legal_mask=True,
+            illegal_penalty=0.0,
+            amp_dtype=None,
+            use_compile=False,
+        )
+        new_loss, _ = step(ids, msk, legal_mask, targets)
+
+        assert torch.allclose(legacy_loss, new_loss, atol=1e-6)
+
+    def test_apply_legal_mask_false_no_inf(self, cpu_device):
+        """With apply_legal_mask=False the loss runs over the full
+        vocabulary; logits stay finite."""
+        model, ids, msk, targets, legal_mask = self._setup(cpu_device)
+        step = build_compiled_step(
+            model,
+            apply_legal_mask=False,
+            illegal_penalty=0.0,
+            amp_dtype=None,
+            use_compile=False,
+        )
+        loss, _ = step(ids, msk, legal_mask, targets)
+        assert torch.isfinite(loss).item()
+
+    def test_illegal_penalty_increases_loss(self, cpu_device):
+        """illegal_penalty > 0 with apply_legal_mask=False adds
+        a non-negative term that grows with illegal probability mass."""
+        # Construct a setup where most mass is on illegal indices.
+        V = 4
+        D = 2
+        B = 1
+        T = 1
+        torch.manual_seed(0)
+        model = _StubWrapper(D, V, T).to(cpu_device)
+        # Force the head to output a known logit pattern. The stub's
+        # forward_hidden returns ones; replace lm_head weights so
+        # ``logits = head_weight @ ones = sum across rows``.
+        with torch.no_grad():
+            model.head.weight.zero_()
+            model.head.weight[2, :] = 5.0  # illegal index 2 dominates
+        ids = torch.zeros(B, T, dtype=torch.long, device=cpu_device)
+        msk = torch.ones(B, T, dtype=torch.bool, device=cpu_device)
+        targets = torch.tensor([[1]], dtype=torch.long, device=cpu_device)
+        legal_mask = torch.zeros(B, T, V, dtype=torch.bool, device=cpu_device)
+        legal_mask[..., 1] = True  # only target is legal
+
+        step_no_pen = build_compiled_step(
+            model,
+            apply_legal_mask=False,
+            illegal_penalty=0.0,
+            amp_dtype=None,
+            use_compile=False,
+        )
+        step_with_pen = build_compiled_step(
+            model,
+            apply_legal_mask=False,
+            illegal_penalty=1.0,
+            amp_dtype=None,
+            use_compile=False,
+        )
+        loss_no_pen, _ = step_no_pen(ids, msk, legal_mask, targets)
+        loss_with_pen, _ = step_with_pen(ids, msk, legal_mask, targets)
+        # Penalty term is non-negative; with most softmax mass on
+        # illegal index 2 it must be strictly positive.
+        assert (loss_with_pen - loss_no_pen).item() > 0
+
+    def test_use_compile_false_returns_bare_step(self, cpu_device):
+        """use_compile=False shouldn't add any wrapper overhead — the
+        returned callable should run end-to-end without a torch.compile
+        recompile path."""
+        model, ids, msk, targets, legal_mask = self._setup(cpu_device)
+        step = build_compiled_step(
+            model,
+            apply_legal_mask=True,
+            illegal_penalty=0.0,
+            amp_dtype=None,
+            use_compile=False,
+        )
+        # Call multiple times — must not raise (no cudagraph aliasing
+        # without compile, and no graph cache to overflow).
+        for _ in range(3):
+            loss, _ = step(ids, msk, legal_mask, targets)
+            assert torch.isfinite(loss).item()
+
+
+class TestWarmupCompiledStep:
+    """Eager-mode tests for ``warmup_compiled_step``. Validates the
+    dummy-batch construction and the loop's invariants (zeroed grads,
+    no parameter drift, every bucket exercised). The compile-and-
+    capture behavior is a CUDA-only side effect of ``step_fn``; it's
+    out of scope here."""
+
+    def test_runs_one_step_per_bucket(self, cpu_device):
+        from pawn.adapter_training import (
+            build_compiled_step,
+            warmup_compiled_step,
+        )
+
+        V, D, B = 4, 2, 2
+        # Use a wider model T-axis so multiple bucket widths fit.
+        model = _StubWrapper(D, V, T=64).to(cpu_device)
+        step = build_compiled_step(
+            model,
+            apply_legal_mask=True,
+            illegal_penalty=0.0,
+            amp_dtype=None,
+            use_compile=False,
+        )
+        optim = torch.optim.SGD(model.parameters(), lr=1e-3)
+        # Snapshot params; warmup zeros grads after each call so no
+        # ``optim.step`` ever runs and parameters must be unchanged.
+        before = {n: p.detach().clone() for n, p in model.named_parameters()}
+        warmup_compiled_step(
+            step,
+            optimizer=optim,
+            bucket_widths=[8, 16, 32],
+            batch_size=B,
+            vocab_size=V,
+            device=cpu_device,
+        )
+        for n, p in model.named_parameters():
+            assert torch.equal(before[n], p), f"parameter {n} drifted during warmup"
+            # Grads zeroed (set_to_none=True).
+            assert p.grad is None
+
+    def test_empty_bucket_list_is_noop(self, cpu_device):
+        from pawn.adapter_training import (
+            build_compiled_step,
+            warmup_compiled_step,
+        )
+
+        model = _StubWrapper(2, 4, T=8).to(cpu_device)
+        step = build_compiled_step(
+            model, apply_legal_mask=True, illegal_penalty=0.0,
+            amp_dtype=None, use_compile=False,
+        )
+        optim = torch.optim.SGD(model.parameters(), lr=1e-3)
+        # Must not raise on the empty list; nothing to do.
+        warmup_compiled_step(
+            step, optimizer=optim, bucket_widths=[], batch_size=2,
+            vocab_size=4, device=cpu_device,
+        )
+
+
+# ---------------------------------------------------------------------------
+# LegalMaskBuilder dynamic-T paths
+# ---------------------------------------------------------------------------
+
+
+class TestLegalMaskBuilderDynamicT:
+    """Coverage for the per-batch-T path on
+    :meth:`LegalMaskBuilder.scatter`. The fixed-seq_len path is
+    covered by :class:`TestLegalMaskBuilder` in test_lichess_data.py
+    (callers pass ``T=builder.T`` explicitly there); here we focus on
+    the bucketed-collate scenarios where T varies per batch."""
+
+    def test_scatter_T_smaller_than_self_T(self):
+        from pawn.lichess_data import LegalMaskBuilder
+
+        B, V = 2, 16
+        builder = LegalMaskBuilder(
+            batch_size=B, seq_len=64, vocab_size=V, device="cpu"
+        )
+        # Indices computed at T_padded=32, stride=32*16=512.
+        # Index 5 → (b=0, p=0, v=5); index 512+10 → (b=1, p=0, v=10).
+        indices = torch.tensor([5, 512 + 10], dtype=torch.long)
+        mask = builder.scatter(indices, B=B, T=32)
+        assert mask.shape == (B, 32, V)
+        assert mask[0, 0, 5].item()
+        assert mask[1, 0, 10].item()
+        # Total set bits should equal the number of unique indices.
+        assert mask.sum().item() == 2
+
+    def test_scatter_T_larger_than_self_T_raises(self):
+        from pawn.lichess_data import LegalMaskBuilder
+
+        builder = LegalMaskBuilder(
+            batch_size=4, seq_len=32, vocab_size=16, device="cpu"
+        )
+        with pytest.raises(ValueError, match="exceeds builder seq_len"):
+            builder.scatter(torch.zeros(0, dtype=torch.long), B=2, T=64)
+
+    def test_scatter_successive_T_values(self):
+        """Calling scatter with different T values across calls works
+        — each allocation is independent."""
+        from pawn.lichess_data import LegalMaskBuilder
+
+        builder = LegalMaskBuilder(
+            batch_size=2, seq_len=64, vocab_size=16, device="cpu"
+        )
+        m1 = builder.scatter(torch.tensor([5], dtype=torch.long), B=1, T=32)
+        m2 = builder.scatter(torch.tensor([10], dtype=torch.long), B=1, T=64)
+        assert m1.shape == (1, 32, 16)
+        assert m2.shape == (1, 64, 16)
+        assert m1.view(-1)[5].item()
+        assert m2.view(-1)[10].item()
+        # m1 must not share storage with m2 (different sizes → different
+        # caching-allocator buckets in the typical case; even if they
+        # did, the test only checks logical independence).
+        assert m1.data_ptr() != m2.data_ptr() or m1.shape != m2.shape
+
+    def test_scatter_T_required(self):
+        """``T`` is a required positional/kwarg parameter — no default."""
+        from pawn.lichess_data import LegalMaskBuilder
+
+        builder = LegalMaskBuilder(
+            batch_size=2, seq_len=8, vocab_size=4, device="cpu"
+        )
+        with pytest.raises(TypeError):
+            builder.scatter(torch.tensor([3], dtype=torch.long), 1)  # type: ignore[call-arg]
+
+
+# ---------------------------------------------------------------------------
+# BucketedLegalMaskCollate edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestBucketedLegalMaskCollateEdgeCases:
+    """Coverage for the degenerate / boundary inputs not exercised in
+    test_lichess_data.py's main happy-path tests."""
+
+    def _build(self, **kw: Any) -> Any:
+        from pawn.lichess_data import BucketedLegalMaskCollate
+
+        defaults: dict[str, Any] = dict(
+            seq_len=128, bucket_size=64, vocab_size=1980,
+            prepend_outcome=False,
+        )
+        defaults.update(kw)
+        return BucketedLegalMaskCollate(**defaults)
+
+    def test_skip_legal_indices_omits_key(self):
+        """When ``skip_legal_indices`` is set, the collate omits the
+        ``legal_indices`` key — ``evaluate`` consumes precomputed
+        indices upstream and the per-batch Rust replay would be waste."""
+        import chess_engine as engine
+
+        B = 2
+        move_ids, gl, _tc = engine.generate_random_games(B, 30, seed=42)
+        collate = self._build()
+        collate.skip_legal_indices = True
+        items = [
+            {
+                "move_ids": np.asarray(move_ids[i], dtype=np.int16),
+                "game_length": int(gl[i]),
+                "outcome_token": 1969,
+            }
+            for i in range(B)
+        ]
+        batch = collate(items)
+        assert "legal_indices" not in batch
+        # Pack tensors are still emitted.
+        assert "input_ids" in batch
+        assert "T_actual" in batch
+
+    def test_all_zero_length_games_pad_to_min_bucket(self):
+        """Degenerate batch with ``game_length == 0`` for every item
+        should still emit a valid ``T_actual = bucket_size`` (not 0)
+        so downstream tensor shapes remain well-formed."""
+        B = 3
+        max_ply = 16
+        items = [
+            {
+                "move_ids": np.zeros(max_ply, dtype=np.int16),
+                "game_length": 0,
+                "outcome_token": 1969,
+            }
+            for _ in range(B)
+        ]
+        collate = self._build(seq_len=64, bucket_size=16)
+        batch = collate(items)
+        assert batch["T_actual"] == 16
+        assert batch["input_ids"].shape == (B, 16)
+        # No real moves → all-PAD targets / loss_mask is all-False
+        # except for the position predicting the first PAD-after-no-move.
+        # The exact shape is what matters here; loss/legal are content-
+        # specific and covered by the equivalence tests upstream.
+
+    def test_indices_align_with_T_actual_under_outcome_prefix(self):
+        """``prepend_outcome=True`` adds 1 to the offset before
+        bucketing — confirm the resulting T_actual is consistent with
+        the indices' stride."""
+        import chess_engine as engine
+        from pawn.lichess_data import compute_legal_indices
+
+        B = 2
+        move_ids, gl, _tc = engine.generate_random_games(B, 30, seed=42)
+        collate = self._build(prepend_outcome=True)
+        items = [
+            {
+                "move_ids": np.asarray(move_ids[i], dtype=np.int16),
+                "game_length": int(gl[i]),
+                "outcome_token": 1969,
+            }
+            for i in range(B)
+        ]
+        batch = collate(items)
+        T = batch["T_actual"]
+        # Re-derive indices at the same T+prepend_outcome and assert
+        # equality with what the collate emitted.
+        direct = compute_legal_indices(
+            np.stack([items[i]["move_ids"] for i in range(B)], axis=0),
+            np.asarray([items[i]["game_length"] for i in range(B)],
+                       dtype=np.int16),
+            seq_len=T,
+            vocab_size=1980,
+            prepend_outcome=True,
+        )
+        assert "legal_indices" in batch
+        assert np.array_equal(batch["legal_indices"].numpy(), direct)
