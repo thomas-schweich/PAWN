@@ -103,9 +103,9 @@ list_local_instances() {
     local files=("$VAST_DIR"/*.env)
     for f in "${files[@]}"; do
         [ -f "$f" ] || continue
-        local n
-        n="$(basename "${f%.env}")"
-        ( source "$f"; echo "  $n  (id=$INSTANCE_ID, gpu=${INSTANCE_GPU:-unknown})" )
+        local n="$(basename "${f%.env}")"
+        source "$f"
+        echo "  $n  (id=$INSTANCE_ID, gpu=${INSTANCE_GPU:-unknown})"
     done
 }
 
@@ -118,14 +118,14 @@ instance_json() {
 # Pull SSH host/port from instance JSON. Echoes "host port" or empty on miss.
 extract_ssh_endpoint() {
     local json="$1"
-    local host port
-    host=$(echo "$json" | jq -r '.ssh_host // .public_ipaddr // empty' 2>/dev/null)
-    port=$(echo "$json" | jq -r '.ssh_port // empty' 2>/dev/null)
-    if [ -z "$port" ]; then
-        # Some instances expose 22/tcp via a forwarded port in `ports` map
-        port=$(echo "$json" | jq -r '.ports["22/tcp"][0].HostPort // empty' 2>/dev/null)
-    fi
-    if [ -n "$host" ] && [ -n "$port" ]; then
+    local row host port
+    row=$(echo "$json" | jq -r '
+        [(.ssh_host // .public_ipaddr // ""),
+         (.ssh_port // .ports["22/tcp"][0].HostPort // "")]
+        | @tsv' 2>/dev/null)
+    host="${row%%$'\t'*}"
+    port="${row#*$'\t'}"
+    if [ -n "$host" ] && [ -n "$port" ] && [[ "$port" =~ ^[0-9]+$ ]]; then
         echo "$host $port"
     fi
 }
@@ -211,8 +211,22 @@ cmd_create() {
     fi
 
     if [ -f "$VAST_DIR/$name.env" ]; then
-        echo "Error: Instance config '$name' already exists at $VAST_DIR/$name.env"
-        echo "Delete it first or pick a different name."
+        # Stale-config recovery: if the saved instance no longer exists on
+        # vast.ai, drop the stale .env and proceed. Otherwise refuse.
+        local stale_id=""
+        stale_id=$(grep -oE '^INSTANCE_ID=.*' "$VAST_DIR/$name.env" | cut -d= -f2-)
+        if [ -n "$stale_id" ] && vastai show instance "$stale_id" --raw &>/dev/null; then
+            echo "Error: Instance config '$name' already exists at $VAST_DIR/$name.env"
+            echo "Delete it first ($0 delete $name) or pick a different name."
+            exit 1
+        fi
+        echo "Found stale config for '$name' (instance $stale_id no longer exists). Removing and proceeding..."
+        rm -f "$VAST_DIR/$name.env"
+    fi
+
+    # Validate max_price as a positive decimal so it can't smuggle filter syntax.
+    if [ -n "$max_price" ] && ! [[ "$max_price" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "Error: --max-price must be a decimal number (e.g. 0.5), got: $max_price" >&2
         exit 1
     fi
 
@@ -227,9 +241,13 @@ cmd_create() {
         echo "Try relaxing constraints (--gpu, --max-price) or run: $0 search --gpu $gpu"
         exit 1
     fi
-    offer_id=$(echo "$offers" | jq -r '.[0].id')
-    offer_dph=$(echo "$offers" | jq -r '.[0].dph_total')
+    offer_id=$(echo "$offers" | jq -r '.[0].id // empty')
+    offer_dph=$(echo "$offers" | jq -r '.[0].dph_total // "?"')
     offer_dc=$(echo "$offers" | jq -r '.[0].geolocation // .[0].datacenter // "?"')
+    if [ -z "$offer_id" ]; then
+        echo "Error: top offer has no .id field — vastai response shape may have changed."
+        exit 1
+    fi
 
     echo "Creating instance '$name' from offer $offer_id..."
     echo "  GPU: ${count}x $gpu"
@@ -238,20 +256,26 @@ cmd_create() {
     echo "  Price: \$$offer_dph/hr  (${offer_dc})"
     echo ""
 
-    # vast.ai env-var format is docker-style: -e KEY=value pairs in a single string
-    local env_str=""
+    # Resolve PUBLIC_KEY from env or local key files.
+    local public_key="${PUBLIC_KEY:-}"
+    if [ -z "$public_key" ] && [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
+        public_key="$(cat "$HOME/.ssh/id_ed25519.pub")"
+    fi
+    if [ -z "$public_key" ] && [ -f "$HOME/.ssh/id_rsa.pub" ]; then
+        public_key="$(cat "$HOME/.ssh/id_rsa.pub")"
+    fi
+
+    # vast.ai's --env arg is a single string parsed shlex-style (docker-compatible).
+    # Public keys contain spaces and HF tokens may contain shell metachars, so each
+    # value MUST be shell-quoted before concatenation. printf %q produces output
+    # that round-trips through shell parsing.
+    local env_str="-p 22:22 -p 8888:8888"
     if [ -n "${HF_TOKEN:-}" ]; then
-        env_str="$env_str -e HF_TOKEN=$HF_TOKEN"
+        env_str+=" -e HF_TOKEN=$(printf '%q' "$HF_TOKEN")"
     fi
-    if [ -n "${PUBLIC_KEY:-}" ]; then
-        env_str="$env_str -e PUBLIC_KEY=$PUBLIC_KEY"
-    elif [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
-        env_str="$env_str -e PUBLIC_KEY=$(cat "$HOME/.ssh/id_ed25519.pub")"
-    elif [ -f "$HOME/.ssh/id_rsa.pub" ]; then
-        env_str="$env_str -e PUBLIC_KEY=$(cat "$HOME/.ssh/id_rsa.pub")"
+    if [ -n "$public_key" ]; then
+        env_str+=" -e PUBLIC_KEY=$(printf '%q' "$public_key")"
     fi
-    # Open port 8888 (dashboard) — vast.ai ports flag is part of --env on this CLI.
-    env_str="$env_str -p 22:22 -p 8888:8888"
 
     local create_args=(
         create instance "$offer_id"
@@ -263,21 +287,25 @@ cmd_create() {
     )
 
     local output
-    output=$(vastai "${create_args[@]}" --raw 2>&1)
-    echo "$output"
+    output=$(vastai "${create_args[@]}" --raw 2>&1) || {
+        echo "Error: vastai create instance failed:"
+        # Print stripped of any -e KEY=value lines so secrets don't echo.
+        echo "$output" | grep -v -E -i 'HF_TOKEN|PUBLIC_KEY' || true
+        exit 1
+    }
 
     local instance_id
     instance_id=$(echo "$output" | jq -r '.new_contract // empty' 2>/dev/null)
     if [ -z "$instance_id" ]; then
-        # Fall back to text parsing
-        instance_id=$(echo "$output" | grep -oP "'new_contract':\s*\K[0-9]+" | head -1 || true)
+        # Fall back to text parsing — accept both "new_contract" and 'new_contract'.
+        instance_id=$(echo "$output" | grep -oE '["'"'"']new_contract["'"'"'][[:space:]]*[:=][[:space:]]*[0-9]+' | grep -oE '[0-9]+$' | head -1 || true)
     fi
     if [ -z "$instance_id" ]; then
-        echo "Error: Could not extract instance ID from output."
+        echo "Error: Could not extract instance ID from vastai output."
         exit 1
     fi
     echo "Instance ID: $instance_id"
-    wait_for_instance_running "$instance_id" "$name"
+    wait_for_instance_running "$instance_id" "$name" || exit 1
 }
 
 cmd_search() {
@@ -298,7 +326,8 @@ cmd_search() {
     query=$(build_search_query "$gpu" "$count" "$disk" "$max_price" "$interruptible")
     echo "Query: $query"
     echo ""
-    vastai search offers "$query" -o "dph_total" | head -25
+    # awk (rather than head) reads all input so pipefail doesn't trip on SIGPIPE.
+    vastai search offers "$query" -o "dph_total" | awk 'NR<=25'
 }
 
 cmd_start() {
@@ -307,7 +336,7 @@ cmd_start() {
     load_instance_config "$name"
     echo "Starting instance '$name' ($INSTANCE_ID)..."
     vastai start instance "$INSTANCE_ID"
-    wait_for_instance_running "$INSTANCE_ID" "$name"
+    wait_for_instance_running "$INSTANCE_ID" "$name" || exit 1
 }
 
 cmd_stop() {
