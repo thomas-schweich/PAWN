@@ -99,6 +99,41 @@ load_instance_config() {
     source "$cfg"
 }
 
+# Re-query vast.ai for an instance's SSH endpoint and persist it to the .env.
+# Used when the cached host/port are empty (partial config from a wait-loop
+# timeout) — lets a slow-to-boot instance still be reachable later without
+# manual config editing or stop/start cycling.
+refresh_instance_endpoint() {
+    local name="$1"
+    require_tools vastai jq
+    local json endpoint host port gpu
+    json=$(instance_json "$INSTANCE_ID")
+    endpoint=$(extract_ssh_endpoint "$json")
+    if [ -z "$endpoint" ]; then
+        echo "Error: instance $INSTANCE_ID has no SSH endpoint yet." >&2
+        echo "Check vast.ai state: $0 status $name" >&2
+        return 1
+    fi
+    host="${endpoint% *}"
+    port="${endpoint#* }"
+    gpu=$(echo "$json" | jq -r '.gpu_name // "unknown"')
+    save_instance_config "$name" "$INSTANCE_ID" "$host" "$port" "$gpu"
+    INSTANCE_HOST="$host"
+    INSTANCE_PORT="$port"
+    INSTANCE_GPU="$gpu"
+}
+
+# Load config and ensure SSH endpoint is populated. Use for any command that
+# needs to ssh into the instance.
+load_instance_config_with_endpoint() {
+    local name="$1"
+    load_instance_config "$name"
+    if [ -z "${INSTANCE_HOST:-}" ] || [ -z "${INSTANCE_PORT:-}" ]; then
+        echo "SSH endpoint not cached for '$name' (likely a previous create/start timeout). Refreshing..."
+        refresh_instance_endpoint "$name" || exit 1
+    fi
+}
+
 list_local_instances() {
     local files=("$VAST_DIR"/*.env)
     for f in "${files[@]}"; do
@@ -175,7 +210,10 @@ build_search_query() {
         q="$q dph_total<=$max_price"
     fi
     if [ "$interruptible" = "1" ]; then
-        q="$q rentable=true"
+        # Filter for actual spot/preemptible capacity, not just on-demand offers
+        # from unverified hosts. The `interruptible=true` field is the offer
+        # marker for spot capacity on vast.ai.
+        q="$q rentable=true interruptible=true"
     else
         q="$q rentable=true verified=true"
     fi
@@ -241,11 +279,13 @@ cmd_create() {
     # logging in, so a missing key would create a billable orphan that can never
     # signal "ready". Fail fast instead.
     local public_key="${PUBLIC_KEY:-}"
-    if [ -z "$public_key" ] && [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
-        public_key="$(cat "$HOME/.ssh/id_ed25519.pub")"
+    # Use `cat … || true` so an unreadable ed25519 file doesn't abort the
+    # rsa fallback under `set -e`.
+    if [ -z "$public_key" ] && [ -r "$HOME/.ssh/id_ed25519.pub" ]; then
+        public_key="$(cat "$HOME/.ssh/id_ed25519.pub" || true)"
     fi
-    if [ -z "$public_key" ] && [ -f "$HOME/.ssh/id_rsa.pub" ]; then
-        public_key="$(cat "$HOME/.ssh/id_rsa.pub")"
+    if [ -z "$public_key" ] && [ -r "$HOME/.ssh/id_rsa.pub" ]; then
+        public_key="$(cat "$HOME/.ssh/id_rsa.pub" || true)"
     fi
     if [ -z "$public_key" ]; then
         echo "Error: No SSH public key available." >&2
@@ -306,15 +346,15 @@ cmd_create() {
     # print stdout on failure and only show the (usually-clean) stderr.
     local output stderr_file rc=0
     stderr_file=$(mktemp)
+    # Ensure the temp file is removed on any exit path (success, failure, SIGINT).
+    trap 'rm -f "$stderr_file"' EXIT
     output=$(vastai "${create_args[@]}" --raw 2>"$stderr_file") || rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "Error: vastai create instance failed (exit $rc)." >&2
         sed 's/^/  /' "$stderr_file" >&2
-        rm -f "$stderr_file"
         echo "(stdout suppressed because vastai echoes --env, which contains secrets)" >&2
         exit 1
     fi
-    rm -f "$stderr_file"
 
     local instance_id
     instance_id=$(echo "$output" | jq -r '.new_contract // empty' 2>/dev/null)
@@ -401,7 +441,7 @@ cmd_delete() {
 
 cmd_ssh() {
     local name="${1:?Usage: $0 ssh <name>}"
-    load_instance_config "$name"
+    load_instance_config_with_endpoint "$name"
     ssh $(ssh_opts) "root@$INSTANCE_HOST"
 }
 
@@ -423,14 +463,14 @@ cmd_status() {
 
 cmd_setup() {
     local name="${1:?Usage: $0 setup <name>}"
-    load_instance_config "$name"
+    load_instance_config_with_endpoint "$name"
     echo "Running setup on instance '$name'..."
     ssh $(ssh_opts) "root@$INSTANCE_HOST" "cd /workspace/pawn && bash deploy/setup.sh"
 }
 
 cmd_deploy() {
     local name="${1:?Usage: $0 deploy <name>}"
-    load_instance_config "$name"
+    load_instance_config_with_endpoint "$name"
 
     echo "=== Full deploy to '$name' ==="
 
@@ -467,7 +507,7 @@ cmd_launch() {
         exit 1
     fi
 
-    load_instance_config "$name"
+    load_instance_config_with_endpoint "$name"
 
     local script_name
     script_name=$(echo "$cmd" | grep -oP 'scripts/\K[^ ]+' | sed 's/\.py//' || echo "train")
