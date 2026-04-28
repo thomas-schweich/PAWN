@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+# Manage vast.ai GPU instances for PAWN experiments.
+#
+# Usage:
+#   vast.sh create <name> [--gpu <type>] [--count <n>] [--disk <gb>] [--max-price <$/hr>] [--interruptible]
+#   vast.sh start <name>
+#   vast.sh stop <name>
+#   vast.sh delete <name>
+#   vast.sh ssh <name>
+#   vast.sh list
+#   vast.sh search [--gpu <type>] [--count <n>] [--max-price <$/hr>]
+#   vast.sh status <name>
+#   vast.sh setup <name>          # Run setup.sh on the instance
+#   vast.sh deploy <name>         # Build, transfer, and setup in one step
+#   vast.sh launch <name> <cmd>   # Run a training command via nohup
+#
+# Instance configs are cached in ~/.config/pawn/vast/<name>.env
+# Requires: vastai (`pip install --user vastai`) and jq.
+# Auth: `vastai set api-key <KEY>` once, key from https://vast.ai/console/account
+#
+# GPU type shortcuts (mapped to vast.ai gpu_name values):
+#   a5000      -> "RTX_A5000"
+#   a40        -> "A40"
+#   a6000      -> "RTX_6000Ada"
+#   4090       -> "RTX_4090"
+#   5090       -> "RTX_5090"
+#   l40s       -> "L40S"
+#   a100-pcie  -> "A100_PCIE"
+#   a100-sxm   -> "A100_SXM4"
+#   h100       -> "H100_PCIE"
+#   h100-sxm   -> "H100_SXM"
+#   h200       -> "H200"
+#   3090       -> "RTX_3090"
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+VAST_DIR="$HOME/.config/pawn/vast"
+mkdir -p "$VAST_DIR"
+
+# Default instance settings
+DEFAULT_GPU="RTX_A5000"
+DEFAULT_DISK=100                       # vast.ai uses one disk (no separate volume)
+DEFAULT_IMAGE="thomasschweich/pawn:latest"
+DEFAULT_MAX_PRICE=""                   # empty = no cap
+
+# --- Helpers ---
+
+require_tools() {
+    for tool in "$@"; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo "Error: '$tool' is required but not installed." >&2
+            case "$tool" in
+                vastai) echo "  Install: pip install --user vastai" >&2 ;;
+                jq)     echo "  Install: apt-get install jq  (or brew install jq)" >&2 ;;
+            esac
+            exit 1
+        fi
+    done
+}
+
+gpu_shortcut() {
+    case "${1,,}" in
+        a5000)     echo "RTX_A5000" ;;
+        a40)       echo "A40" ;;
+        a6000)     echo "RTX_6000Ada" ;;
+        4090)      echo "RTX_4090" ;;
+        5090)      echo "RTX_5090" ;;
+        3090)      echo "RTX_3090" ;;
+        l40s)      echo "L40S" ;;
+        a100-pcie) echo "A100_PCIE" ;;
+        a100-sxm)  echo "A100_SXM4" ;;
+        a100)      echo "A100_PCIE" ;;
+        h100)      echo "H100_PCIE" ;;
+        h100-sxm)  echo "H100_SXM" ;;
+        h200)      echo "H200" ;;
+        *)         echo "$1" ;;       # passthrough for unknown values
+    esac
+}
+
+save_instance_config() {
+    local name="$1" instance_id="$2" host="$3" port="$4" gpu="$5"
+    cat > "$VAST_DIR/$name.env" << EOF
+INSTANCE_ID=$instance_id
+INSTANCE_HOST=$host
+INSTANCE_PORT=$port
+INSTANCE_GPU=$gpu
+EOF
+    echo "Saved instance config to $VAST_DIR/$name.env"
+}
+
+load_instance_config() {
+    local name="$1"
+    local cfg="$VAST_DIR/$name.env"
+    if [ ! -f "$cfg" ]; then
+        echo "Error: Instance '$name' not found. Available:" >&2
+        list_local_instances >&2
+        exit 1
+    fi
+    source "$cfg"
+}
+
+list_local_instances() {
+    local files=("$VAST_DIR"/*.env)
+    for f in "${files[@]}"; do
+        [ -f "$f" ] || continue
+        local n
+        n="$(basename "${f%.env}")"
+        ( source "$f"; echo "  $n  (id=$INSTANCE_ID, gpu=${INSTANCE_GPU:-unknown})" )
+    done
+}
+
+# Fetch raw JSON for a single instance.
+instance_json() {
+    local id="$1"
+    vastai show instance "$id" --raw 2>/dev/null
+}
+
+# Pull SSH host/port from instance JSON. Echoes "host port" or empty on miss.
+extract_ssh_endpoint() {
+    local json="$1"
+    local host port
+    host=$(echo "$json" | jq -r '.ssh_host // .public_ipaddr // empty' 2>/dev/null)
+    port=$(echo "$json" | jq -r '.ssh_port // empty' 2>/dev/null)
+    if [ -z "$port" ]; then
+        # Some instances expose 22/tcp via a forwarded port in `ports` map
+        port=$(echo "$json" | jq -r '.ports["22/tcp"][0].HostPort // empty' 2>/dev/null)
+    fi
+    if [ -n "$host" ] && [ -n "$port" ]; then
+        echo "$host $port"
+    fi
+}
+
+wait_for_instance_running() {
+    local instance_id="$1" name="$2"
+    echo -n "Waiting for instance to be ready"
+    for i in $(seq 1 90); do
+        local json status
+        json=$(instance_json "$instance_id" || true)
+        status=$(echo "$json" | jq -r '.actual_status // empty' 2>/dev/null)
+
+        if [ "$status" = "running" ]; then
+            local endpoint host port
+            endpoint=$(extract_ssh_endpoint "$json")
+            if [ -n "$endpoint" ]; then
+                host="${endpoint% *}"
+                port="${endpoint#* }"
+                if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+                       -p "$port" "root@$host" "echo ok" &>/dev/null; then
+                    echo " ready!"
+                    local gpu
+                    gpu=$(echo "$json" | jq -r '.gpu_name // "unknown"')
+                    save_instance_config "$name" "$instance_id" "$host" "$port" "$gpu"
+                    return 0
+                fi
+            fi
+        fi
+        echo -n "."
+        sleep 5
+    done
+    echo " timeout!"
+    echo "Instance may still be starting. Check: vastai show instance $instance_id"
+    return 1
+}
+
+ssh_opts() {
+    echo "-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p $INSTANCE_PORT"
+}
+
+# Build a vastai search-offers query string from flag values.
+# Vast.ai filter syntax: `gpu_name=RTX_4090 num_gpus=1 disk_space>=100 dph_total<=1.0 reliability>0.98`
+build_search_query() {
+    local gpu="$1" count="$2" disk="$3" max_price="$4" interruptible="$5"
+    local q="gpu_name=$gpu num_gpus=$count disk_space>=$disk reliability>0.98 inet_down>=200 cuda_vers>=12.0"
+    if [ -n "$max_price" ]; then
+        q="$q dph_total<=$max_price"
+    fi
+    if [ "$interruptible" = "1" ]; then
+        q="$q rentable=true"
+    else
+        q="$q rentable=true verified=true"
+    fi
+    echo "$q"
+}
+
+# --- Commands ---
+
+cmd_create() {
+    require_tools vastai jq
+
+    local name="" gpu="$DEFAULT_GPU" count=1
+    local disk="$DEFAULT_DISK" image="$DEFAULT_IMAGE"
+    local max_price="$DEFAULT_MAX_PRICE" interruptible=0
+
+    name="${1:-}"
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --gpu)           gpu="$(gpu_shortcut "$2")"; shift 2 ;;
+            --count)         count="$2"; shift 2 ;;
+            --disk)          disk="$2"; shift 2 ;;
+            --image)         image="$2"; shift 2 ;;
+            --max-price)     max_price="$2"; shift 2 ;;
+            --interruptible) interruptible=1; shift ;;
+            *)               echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    if [ -z "$name" ]; then
+        echo "Usage: $0 create <name> [--gpu <type>] [--count <n>] [--disk <gb>] [--max-price <\$/hr>] [--interruptible]"
+        exit 1
+    fi
+
+    if [ -f "$VAST_DIR/$name.env" ]; then
+        echo "Error: Instance config '$name' already exists at $VAST_DIR/$name.env"
+        echo "Delete it first or pick a different name."
+        exit 1
+    fi
+
+    # Find a cheap offer that matches.
+    local query
+    query=$(build_search_query "$gpu" "$count" "$disk" "$max_price" "$interruptible")
+    echo "Searching offers: $query"
+    local offers offer_id offer_dph offer_dc
+    offers=$(vastai search offers "$query" -o "dph_total" --raw 2>&1)
+    if ! echo "$offers" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+        echo "Error: no matching offers found."
+        echo "Try relaxing constraints (--gpu, --max-price) or run: $0 search --gpu $gpu"
+        exit 1
+    fi
+    offer_id=$(echo "$offers" | jq -r '.[0].id')
+    offer_dph=$(echo "$offers" | jq -r '.[0].dph_total')
+    offer_dc=$(echo "$offers" | jq -r '.[0].geolocation // .[0].datacenter // "?"')
+
+    echo "Creating instance '$name' from offer $offer_id..."
+    echo "  GPU: ${count}x $gpu"
+    echo "  Disk: ${disk}GB"
+    echo "  Image: $image"
+    echo "  Price: \$$offer_dph/hr  (${offer_dc})"
+    echo ""
+
+    # vast.ai env-var format is docker-style: -e KEY=value pairs in a single string
+    local env_str=""
+    if [ -n "${HF_TOKEN:-}" ]; then
+        env_str="$env_str -e HF_TOKEN=$HF_TOKEN"
+    fi
+    if [ -n "${PUBLIC_KEY:-}" ]; then
+        env_str="$env_str -e PUBLIC_KEY=$PUBLIC_KEY"
+    elif [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
+        env_str="$env_str -e PUBLIC_KEY=$(cat "$HOME/.ssh/id_ed25519.pub")"
+    elif [ -f "$HOME/.ssh/id_rsa.pub" ]; then
+        env_str="$env_str -e PUBLIC_KEY=$(cat "$HOME/.ssh/id_rsa.pub")"
+    fi
+    # Open port 8888 (dashboard) — vast.ai ports flag is part of --env on this CLI.
+    env_str="$env_str -p 22:22 -p 8888:8888"
+
+    local create_args=(
+        create instance "$offer_id"
+        --image "$image"
+        --disk "$disk"
+        --label "pawn-$name"
+        --ssh
+        --env "$env_str"
+    )
+
+    local output
+    output=$(vastai "${create_args[@]}" --raw 2>&1)
+    echo "$output"
+
+    local instance_id
+    instance_id=$(echo "$output" | jq -r '.new_contract // empty' 2>/dev/null)
+    if [ -z "$instance_id" ]; then
+        # Fall back to text parsing
+        instance_id=$(echo "$output" | grep -oP "'new_contract':\s*\K[0-9]+" | head -1 || true)
+    fi
+    if [ -z "$instance_id" ]; then
+        echo "Error: Could not extract instance ID from output."
+        exit 1
+    fi
+    echo "Instance ID: $instance_id"
+    wait_for_instance_running "$instance_id" "$name"
+}
+
+cmd_search() {
+    require_tools vastai jq
+    local gpu="$DEFAULT_GPU" count=1 disk="$DEFAULT_DISK"
+    local max_price="$DEFAULT_MAX_PRICE" interruptible=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --gpu)           gpu="$(gpu_shortcut "$2")"; shift 2 ;;
+            --count)         count="$2"; shift 2 ;;
+            --disk)          disk="$2"; shift 2 ;;
+            --max-price)     max_price="$2"; shift 2 ;;
+            --interruptible) interruptible=1; shift ;;
+            *)               echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+    local query
+    query=$(build_search_query "$gpu" "$count" "$disk" "$max_price" "$interruptible")
+    echo "Query: $query"
+    echo ""
+    vastai search offers "$query" -o "dph_total" | head -25
+}
+
+cmd_start() {
+    require_tools vastai jq
+    local name="${1:?Usage: $0 start <name>}"
+    load_instance_config "$name"
+    echo "Starting instance '$name' ($INSTANCE_ID)..."
+    vastai start instance "$INSTANCE_ID"
+    wait_for_instance_running "$INSTANCE_ID" "$name"
+}
+
+cmd_stop() {
+    require_tools vastai
+    local name="${1:?Usage: $0 stop <name>}"
+    load_instance_config "$name"
+    echo "Stopping instance '$name' ($INSTANCE_ID)..."
+    vastai stop instance "$INSTANCE_ID"
+    echo "Instance stopped. Disk preserved (still billed at storage rate)."
+    echo "Resume with: $0 start $name   |   Free with: $0 delete $name"
+}
+
+cmd_delete() {
+    require_tools vastai
+    local name="${1:?Usage: $0 delete <name>}"
+    load_instance_config "$name"
+    read -p "Destroy instance '$name' ($INSTANCE_ID)? This wipes the disk. [y/N] " confirm
+    if [ "${confirm,,}" != "y" ]; then
+        echo "Cancelled."
+        exit 0
+    fi
+    vastai destroy instance "$INSTANCE_ID"
+    rm -f "$VAST_DIR/$name.env"
+    echo "Instance destroyed and config removed."
+}
+
+cmd_ssh() {
+    local name="${1:?Usage: $0 ssh <name>}"
+    load_instance_config "$name"
+    ssh $(ssh_opts) "root@$INSTANCE_HOST"
+}
+
+cmd_list() {
+    require_tools vastai
+    echo "=== Remote instances (vastai) ==="
+    vastai show instances 2>/dev/null || echo "  (vastai not configured or no instances)"
+    echo ""
+    echo "=== Local instance configs ==="
+    list_local_instances
+}
+
+cmd_status() {
+    require_tools vastai
+    local name="${1:?Usage: $0 status <name>}"
+    load_instance_config "$name"
+    vastai show instance "$INSTANCE_ID"
+}
+
+cmd_setup() {
+    local name="${1:?Usage: $0 setup <name>}"
+    load_instance_config "$name"
+    echo "Running setup on instance '$name'..."
+    ssh $(ssh_opts) "root@$INSTANCE_HOST" "cd /workspace/pawn && bash deploy/setup.sh"
+}
+
+cmd_deploy() {
+    local name="${1:?Usage: $0 deploy <name>}"
+    load_instance_config "$name"
+
+    echo "=== Full deploy to '$name' ==="
+
+    echo "--- Step 1: Build deploy package ---"
+    bash "$REPO/deploy/build.sh"
+    echo ""
+
+    echo "--- Step 2: Transfer to instance ---"
+    ssh $(ssh_opts) "root@$INSTANCE_HOST" "command -v rsync &>/dev/null || (apt-get update -qq && apt-get install -y -qq rsync)" 2>/dev/null
+    rsync -avz --progress -e "ssh $(ssh_opts)" \
+        "$REPO/deploy/pawn-deploy/" "root@$INSTANCE_HOST:/workspace/pawn/"
+    echo ""
+
+    echo "--- Step 3: Run setup ---"
+    ssh $(ssh_opts) "root@$INSTANCE_HOST" "cd /workspace/pawn && bash deploy/setup.sh"
+    echo ""
+
+    echo "=== Deploy complete ==="
+}
+
+cmd_launch() {
+    local name="${1:?Usage: $0 launch <name> <command...>}"
+    shift
+    local cmd="$*"
+
+    if [ -z "$cmd" ]; then
+        echo "Usage: $0 launch <name> <command...>"
+        echo ""
+        echo "Examples:"
+        echo "  $0 launch exp1 scripts/train.py --variant base"
+        echo "  $0 launch exp1 scripts/train.py --run-type adapter --strategy bottleneck \\"
+        echo "      --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \\"
+        echo "      --elo-min 1800 --elo-max 1900 --bottleneck-dim 32"
+        exit 1
+    fi
+
+    load_instance_config "$name"
+
+    local script_name
+    script_name=$(echo "$cmd" | grep -oP 'scripts/\K[^ ]+' | sed 's/\.py//' || echo "train")
+
+    echo "Launching on '$name': $cmd"
+    ssh $(ssh_opts) "root@$INSTANCE_HOST" "cd /workspace/pawn && \
+        nohup uv run python $cmd \
+            --log-dir logs \
+            > logs/${script_name}.log 2>&1 & \
+        sleep 2 && \
+        echo 'PID: '\$(pgrep -f '$script_name' | head -1) && \
+        echo 'Log: logs/${script_name}.log'"
+}
+
+# --- Main ---
+
+case "${1:-}" in
+    create)  shift; cmd_create "$@" ;;
+    search)  shift; cmd_search "$@" ;;
+    start)   shift; cmd_start "$@" ;;
+    stop)    shift; cmd_stop "$@" ;;
+    delete)  shift; cmd_delete "$@" ;;
+    ssh)     shift; cmd_ssh "$@" ;;
+    list)    shift; cmd_list "$@" ;;
+    status)  shift; cmd_status "$@" ;;
+    setup)   shift; cmd_setup "$@" ;;
+    deploy)  shift; cmd_deploy "$@" ;;
+    launch)  shift; cmd_launch "$@" ;;
+    *)
+        echo "PAWN vast.ai Instance Manager"
+        echo ""
+        echo "Usage: $0 <command> [args...]"
+        echo ""
+        echo "Commands:"
+        echo "  create <name> [--gpu <type>] [--count <n>] [--disk <gb>] [--max-price <\$/hr>] [--interruptible]"
+        echo "                            Create a new instance from the cheapest matching offer"
+        echo "  search [--gpu <type>] [--count <n>] [--max-price <\$/hr>]"
+        echo "                            List matching offers without creating anything"
+        echo "  start  <name>             Resume a stopped instance"
+        echo "  stop   <name>             Pause an instance (disk preserved, storage billed)"
+        echo "  delete <name>             Destroy an instance and its disk"
+        echo "  ssh    <name>             SSH into an instance"
+        echo "  list                      List all instances"
+        echo "  status <name>             Get instance details"
+        echo "  setup  <name>             Run setup.sh on the instance"
+        echo "  deploy <name>             Build + transfer + setup (full deploy)"
+        echo "  launch <name> <cmd>       Run a training command via nohup"
+        echo ""
+        echo "GPU shortcuts: a5000, a40, a6000, 4090, 5090, 3090, l40s, a100, a100-pcie, a100-sxm, h100, h100-sxm, h200"
+        echo ""
+        echo "Examples:"
+        echo "  $0 search --gpu 4090 --max-price 0.5"
+        echo "  $0 create exp1 --gpu 4090 --max-price 0.5"
+        echo "  $0 create cheap1 --gpu 3090 --interruptible"
+        echo "  $0 deploy exp1"
+        echo "  $0 launch exp1 scripts/train.py --variant base"
+        echo "  $0 stop exp1"
+        echo ""
+        echo "Setup:"
+        echo "  pip install --user vastai"
+        echo "  vastai set api-key <KEY>   # from https://vast.ai/console/account"
+        ;;
+esac
