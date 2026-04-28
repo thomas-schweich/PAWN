@@ -251,8 +251,9 @@ cmd_create() {
     if [ -f "$VAST_DIR/$name.env" ]; then
         # Stale-config recovery: if the saved instance no longer exists on
         # vast.ai, drop the stale .env and proceed. Otherwise refuse.
+        # Pipefail+set-e would otherwise abort silently when grep matches nothing.
         local stale_id=""
-        stale_id=$(grep -oE '^INSTANCE_ID=.*' "$VAST_DIR/$name.env" | cut -d= -f2- | tr -d '"'\''')
+        stale_id=$(grep -oE '^INSTANCE_ID=.*' "$VAST_DIR/$name.env" 2>/dev/null | cut -d= -f2- | tr -d '"'\''' || true)
         # Refuse to proceed unless we can prove the saved instance is gone.
         # Empty / non-numeric stale_id means a corrupted .env we shouldn't silently overwrite.
         if ! [[ "$stale_id" =~ ^[0-9]+$ ]]; then
@@ -272,7 +273,12 @@ cmd_create() {
             echo "Delete it first ($0 delete $name) or pick a different name."
             exit 1
         fi
-        if echo "$probe_out" | grep -qiE 'not[[:space:]]*found|no[[:space:]]*such|does[[:space:]]*not[[:space:]]*exist|unknown[[:space:]]*instance|404'; then
+        # "Confirmed gone" requires both: vastai itself returned an error (rc!=0),
+        # AND the error text matches a known not-found marker. Without the rc
+        # gate, a clean `vastai show` response that happens to contain the
+        # string "not found" anywhere (e.g. in a description field) would
+        # incorrectly remove the .env.
+        if [ "$probe_rc" -ne 0 ] && echo "$probe_out" | grep -qiE 'not[[:space:]]*found|no[[:space:]]*such|does[[:space:]]*not[[:space:]]*exist|unknown[[:space:]]*instance|404'; then
             echo "Found stale config for '$name' (instance $stale_id confirmed gone on vast.ai). Removing and proceeding..."
             rm -f "$VAST_DIR/$name.env"
         else
@@ -313,8 +319,17 @@ cmd_create() {
     local query
     query=$(build_search_query "$gpu" "$count" "$disk" "$max_price" "$interruptible")
     echo "Searching offers: $query"
-    local offers offer_id offer_dph offer_dc
-    offers=$(vastai search offers "$query" -o "dph_total" --raw 2>&1)
+    local offers offer_id offer_dph offer_dc search_rc=0
+    # `set -e` would abort the script on a non-zero exit (missing API key,
+    # network down, rejected query) before we get a chance to print a useful
+    # error. Capture the rc explicitly.
+    offers=$(vastai search offers "$query" -o "dph_total" --raw 2>&1) || search_rc=$?
+    if [ "$search_rc" -ne 0 ]; then
+        echo "Error: vastai search offers failed (exit $search_rc):" >&2
+        echo "$offers" | sed 's/^/  /' >&2
+        echo "Check that 'vastai set api-key <KEY>' has been run and your network is up." >&2
+        exit 1
+    fi
     if ! echo "$offers" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
         echo "Error: no matching offers found."
         echo "Try relaxing constraints (--gpu, --max-price) or run: $0 search --gpu $gpu"
@@ -429,7 +444,11 @@ cmd_start() {
     local name="${1:?Usage: $0 start <name>}"
     load_instance_config "$name"
     echo "Starting instance '$name' ($INSTANCE_ID)..."
-    vastai start instance "$INSTANCE_ID"
+    if ! vastai start instance "$INSTANCE_ID"; then
+        echo "Error: vastai start instance $INSTANCE_ID failed." >&2
+        echo "The instance may have been deleted externally — check: $0 status $name" >&2
+        exit 1
+    fi
     # Clear cached host/port: a resumed instance can come up on a different
     # host/port. wait_for_instance_running rewrites the .env on success; on
     # timeout the empty cache forces load_instance_config_with_endpoint to
