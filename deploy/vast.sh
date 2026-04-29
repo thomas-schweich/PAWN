@@ -159,12 +159,17 @@ instance_json() {
 }
 
 # Pull SSH host/port from instance JSON. Echoes "host port" or empty on miss.
+# Prefers direct SSH (public_ipaddr + ports["22/tcp"][0].HostPort) over the
+# vast.ai proxy (ssh_host:ssh_port). The proxy reliably terminates connections
+# but doesn't always execute non-interactive commands sent over stdin —
+# stdin gets swallowed and only the welcome banner runs, so `vast.sh launch`
+# silently does nothing. Direct SSH avoids the proxy entirely.
 extract_ssh_endpoint() {
     local json="$1"
     local row host port
     row=$(echo "$json" | jq -r '
-        [(.ssh_host // .public_ipaddr // ""),
-         (.ssh_port // .ports["22/tcp"][0].HostPort // "")]
+        [(.public_ipaddr // .ssh_host // ""),
+         (.ports["22/tcp"][0].HostPort // .ssh_port // "")]
         | @tsv' 2>/dev/null)
     host="${row%%$'\t'*}"
     port="${row#*$'\t'}"
@@ -389,6 +394,14 @@ cmd_create() {
         --disk "$disk"
         --label "pawn-$name"
         --ssh
+        # `--direct` selects vast.ai's ssh_direct runtype rather than the
+        # default ssh_proxy. The proxy runs every connection through a
+        # relay shell that prints the motd and exits without executing
+        # commands sent over stdin or as ssh args — which silently breaks
+        # `vast.sh launch`, `setup`, and `deploy`. Hosts that don't
+        # support direct SSH simply fail to create here, which is much
+        # better than a "successful" create whose ssh doesn't work.
+        --direct
         --env "$env_str"
     )
 
