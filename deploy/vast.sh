@@ -50,13 +50,18 @@ require_tools() {
         if ! command -v "$tool" >/dev/null 2>&1; then
             echo "Error: '$tool' is required but not installed." >&2
             case "$tool" in
-                vastai) echo "  Install: pip install --user vastai" >&2 ;;
+                vastai) echo "  Install: uv tool install vastai  (or pip install --user vastai)" >&2 ;;
                 jq)     echo "  Install: apt-get install jq  (or brew install jq)" >&2 ;;
+                rg)     echo "  Install: apt-get install ripgrep  (or brew install ripgrep)" >&2 ;;
             esac
             exit 1
         fi
     done
 }
+
+# Tools every entry point needs (commands that hit no external CLI add their own
+# extras via require_tools as well).
+require_tools rg
 
 gpu_shortcut() {
     case "${1,,}" in
@@ -254,9 +259,10 @@ cmd_create() {
     if [ -f "$VAST_DIR/$name.env" ]; then
         # Stale-config recovery: if the saved instance no longer exists on
         # vast.ai, drop the stale .env and proceed. Otherwise refuse.
-        # Pipefail+set-e would otherwise abort silently when grep matches nothing.
+        # `|| true` because rg exits 1 on no match — set-e would otherwise abort
+        # silently before the explicit "missing or malformed" check below.
         local stale_id=""
-        stale_id=$(grep -oE '^INSTANCE_ID=.*' "$VAST_DIR/$name.env" 2>/dev/null | cut -d= -f2- | tr -d '"'\''' || true)
+        stale_id=$(rg -o '^INSTANCE_ID=(.*)$' -r '$1' "$VAST_DIR/$name.env" 2>/dev/null | tr -d '"'\''' || true)
         # Refuse to proceed unless we can prove the saved instance is gone.
         # Empty / non-numeric stale_id means a corrupted .env we shouldn't silently overwrite.
         if ! [[ "$stale_id" =~ ^[0-9]+$ ]]; then
@@ -281,7 +287,7 @@ cmd_create() {
         # gate, a clean `vastai show` response that happens to contain the
         # string "not found" anywhere (e.g. in a description field) would
         # incorrectly remove the .env.
-        if [ "$probe_rc" -ne 0 ] && echo "$probe_out" | grep -qiE 'not[[:space:]]*found|no[[:space:]]*such|does[[:space:]]*not[[:space:]]*exist|unknown[[:space:]]*instance|404'; then
+        if [ "$probe_rc" -ne 0 ] && echo "$probe_out" | rg -qi 'not\s*found|no\s*such|does\s*not\s*exist|unknown\s*instance|404'; then
             echo "Found stale config for '$name' (instance $stale_id confirmed gone on vast.ai). Removing and proceeding..."
             rm -f "$VAST_DIR/$name.env"
         else
@@ -396,7 +402,7 @@ cmd_create() {
     instance_id=$(echo "$output" | jq -r '.new_contract // empty' 2>/dev/null)
     if [ -z "$instance_id" ]; then
         # Fall back to text parsing — accept both "new_contract" and 'new_contract'.
-        instance_id=$(echo "$output" | grep -oE '["'"'"']new_contract["'"'"'][[:space:]]*[:=][[:space:]]*[0-9]+' | grep -oE '[0-9]+$' | head -1 || true)
+        instance_id=$(echo "$output" | rg -o '["'"'"']new_contract["'"'"']\s*[:=]\s*([0-9]+)' -r '$1' | head -1 || true)
     fi
     if [ -z "$instance_id" ]; then
         echo "Error: Could not extract instance ID from vastai output." >&2
@@ -576,7 +582,7 @@ cmd_launch() {
     load_instance_config_with_endpoint "$name"
 
     local script_name
-    script_name=$(echo "$cmd" | grep -oP 'scripts/\K[^ ]+' | sed 's/\.py//' || echo "train")
+    script_name=$(echo "$cmd" | rg -o 'scripts/([^ ]+)' -r '$1' | sed 's/\.py//' || echo "train")
 
     echo "Launching on '$name': $cmd"
     ssh $(ssh_opts) "root@$INSTANCE_HOST" "cd /workspace/pawn && \
