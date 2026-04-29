@@ -79,11 +79,14 @@ gpu_shortcut() {
 
 save_instance_config() {
     local name="$1" instance_id="$2" host="$3" port="$4" gpu="$5"
+    # Single-quote each value so values containing spaces (e.g.
+    # INSTANCE_GPU="RTX 3090" from vastai's display field) parse correctly
+    # when the .env is sourced. printf %q escapes embedded single quotes.
     cat > "$VAST_DIR/$name.env" << EOF
-INSTANCE_ID=$instance_id
-INSTANCE_HOST=$host
-INSTANCE_PORT=$port
-INSTANCE_GPU=$gpu
+INSTANCE_ID=$(printf %q "$instance_id")
+INSTANCE_HOST=$(printf %q "$host")
+INSTANCE_PORT=$(printf %q "$port")
+INSTANCE_GPU=$(printf %q "$gpu")
 EOF
     echo "Saved instance config to $VAST_DIR/$name.env"
 }
@@ -476,7 +479,14 @@ cmd_delete() {
         echo "Cancelled."
         exit 0
     fi
-    vastai destroy instance "$INSTANCE_ID"
+    # Pass -y so vastai doesn't prompt again (its own confirmation would
+    # silently abort under our non-interactive stdin and we'd remove the
+    # local .env while leaving a billable instance alive).
+    if ! vastai destroy instance -y "$INSTANCE_ID"; then
+        echo "Error: vastai destroy instance $INSTANCE_ID failed." >&2
+        echo "Local config preserved at $VAST_DIR/$name.env. Investigate before retrying." >&2
+        exit 1
+    fi
     rm -f "$VAST_DIR/$name.env"
     echo "Instance destroyed and config removed."
 }
