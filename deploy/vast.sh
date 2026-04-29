@@ -213,7 +213,13 @@ ssh_opts() {
 # Vast.ai filter syntax: `gpu_name=RTX_4090 num_gpus=1 disk_space>=100 dph_total<=1.0 reliability>0.98`
 build_search_query() {
     local gpu="$1" count="$2" disk="$3" max_price="$4" interruptible="$5"
-    local q="gpu_name=$gpu num_gpus=$count disk_space>=$disk reliability>0.98 inet_down>=200 cuda_vers>=12.0"
+    # No CUDA-version filter: the PyTorch cu128 wheels bundle their own
+    # runtime, so only the host driver matters (any modern verified host
+    # has it). vast.ai's `cuda_vers` field is null on many listings and
+    # `cuda_max_good` filtering misbehaves (>=12 returns nothing while
+    # >=13 returns dozens), so any threshold here just silently excludes
+    # otherwise-fine hosts.
+    local q="gpu_name=$gpu num_gpus=$count disk_space>=$disk reliability>0.98 inet_down>=200"
     if [ -n "$max_price" ]; then
         q="$q dph_total<=$max_price"
     fi
@@ -364,8 +370,14 @@ cmd_create() {
     # value MUST be shell-quoted before concatenation. printf %q produces output
     # that round-trips through shell parsing.
     local env_str="-p 22:22 -p 8888:8888"
-    if [ -n "${HF_TOKEN:-}" ]; then
-        env_str+=" -e HF_TOKEN=$(printf '%q' "$HF_TOKEN")"
+    # Resolve HF token: env var takes precedence; fall back to the
+    # huggingface CLI's saved token at ~/.cache/huggingface/token.
+    local hf_token="${HF_TOKEN:-}"
+    if [ -z "$hf_token" ] && [ -r "$HOME/.cache/huggingface/token" ]; then
+        hf_token="$(cat "$HOME/.cache/huggingface/token" || true)"
+    fi
+    if [ -n "$hf_token" ]; then
+        env_str+=" -e HF_TOKEN=$(printf '%q' "$hf_token")"
     fi
     if [ -n "$public_key" ]; then
         env_str+=" -e PUBLIC_KEY=$(printf '%q' "$public_key")"
