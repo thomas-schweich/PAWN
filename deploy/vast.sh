@@ -438,8 +438,18 @@ cmd_search() {
     query=$(build_search_query "$gpu" "$count" "$disk" "$max_price" "$interruptible")
     echo "Query: $query"
     echo ""
+    # Capture rc explicitly: under set -e, a bare pipeline failure (auth /
+    # network / rejected query) would abort silently before any diagnostic.
+    local out search_rc=0
+    out=$(vastai search offers "$query" -o "dph_total" 2>&1) || search_rc=$?
+    if [ "$search_rc" -ne 0 ]; then
+        echo "Error: vastai search offers failed (exit $search_rc):" >&2
+        echo "$out" | sed 's/^/  /' >&2
+        echo "Check that 'vastai set api-key <KEY>' has been run and your network is up." >&2
+        exit 1
+    fi
     # awk (rather than head) reads all input so pipefail doesn't trip on SIGPIPE.
-    vastai search offers "$query" -o "dph_total" | awk 'NR<=25'
+    echo "$out" | awk 'NR<=25'
 }
 
 cmd_start() {
@@ -465,7 +475,11 @@ cmd_stop() {
     local name="${1:?Usage: $0 stop <name>}"
     load_instance_config "$name"
     echo "Stopping instance '$name' ($INSTANCE_ID)..."
-    vastai stop instance "$INSTANCE_ID"
+    if ! vastai stop instance "$INSTANCE_ID"; then
+        echo "Error: vastai stop instance $INSTANCE_ID failed." >&2
+        echo "Check current state: $0 status $name" >&2
+        exit 1
+    fi
     echo "Instance stopped. Disk preserved (still billed at storage rate)."
     echo "Resume with: $0 start $name   |   Free with: $0 delete $name"
 }
