@@ -15,7 +15,7 @@
 #   pod.sh launch <name> <cmd>   # Run a training command via nohup
 #
 # Pod configs are cached in ~/.config/pawn/pods/<name>.env
-# Requires: runpodctl (wget -qO- cli.runpod.net | sudo bash)
+# Requires: runpodctl (curl -sSL https://cli.runpod.net | bash) and ripgrep (rg).
 #
 # GPU type shortcuts (mapped to runpodctl --gpu-id values):
 #   a5000      -> "NVIDIA RTX A5000"
@@ -33,6 +33,18 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 POD_DIR="$HOME/.config/pawn/pods"
 mkdir -p "$POD_DIR"
+
+require_tool() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "Error: '$1' is required but not installed." >&2
+        case "$1" in
+            runpodctl) echo "  Install: curl -sSL https://cli.runpod.net | bash" >&2 ;;
+            rg)        echo "  Install: apt-get install ripgrep  (or brew install ripgrep)" >&2 ;;
+        esac
+        exit 1
+    fi
+}
+require_tool rg
 
 # Default pod settings
 DEFAULT_GPU="NVIDIA RTX A5000"
@@ -61,11 +73,15 @@ gpu_shortcut() {
 
 save_pod_config() {
     local name="$1" pod_id="$2" host="$3" port="$4" gpu="$5"
+    # Single-quote each value so values containing spaces (e.g.
+    # POD_GPU="NVIDIA RTX A5000" from runpodctl's gpuDisplayName) parse
+    # correctly when the .env is sourced. printf %q escapes embedded
+    # single quotes.
     cat > "$POD_DIR/$name.env" << EOF
-POD_ID=$pod_id
-POD_HOST=$host
-POD_PORT=$port
-POD_GPU=$gpu
+POD_ID=$(printf %q "$pod_id")
+POD_HOST=$(printf %q "$host")
+POD_PORT=$(printf %q "$port")
+POD_GPU=$(printf %q "$gpu")
 EOF
     echo "Saved pod config to $POD_DIR/$name.env"
 }
@@ -95,19 +111,17 @@ wait_for_pod_running() {
     local pod_id="$1" name="$2"
     echo -n "Waiting for pod to be ready"
     for i in $(seq 1 60); do
-        if echo "$(runpodctl pod get "$pod_id" 2>/dev/null)" | grep -q '"gpuDisplayName"'; then
-            local ssh_info
-            ssh_info=$(runpodctl pod get "$pod_id" 2>/dev/null)
-            local host port
-            host=$(echo "$ssh_info" | grep -oP '"ip"\s*:\s*"\K[^"]+' || true)
-            port=$(echo "$ssh_info" | grep -oP '"publicPort"\s*:\s*\K\d+' || true)
+        local ssh_info host port gpu
+        ssh_info=$(runpodctl pod get "$pod_id" 2>/dev/null || true)
+        if echo "$ssh_info" | rg -q '"gpuDisplayName"'; then
+            host=$(echo "$ssh_info" | rg -o '"ip"\s*:\s*"([^"]+)"' -r '$1' | head -1 || true)
+            port=$(echo "$ssh_info" | rg -o '"publicPort"\s*:\s*([0-9]+)' -r '$1' | head -1 || true)
 
             if [ -n "$host" ] && [ -n "$port" ]; then
                 if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
                        -p "$port" "root@$host" "echo ok" &>/dev/null; then
                     echo " ready!"
-                    local gpu
-                    gpu=$(echo "$ssh_info" | grep -oP '"gpuDisplayName"\s*:\s*"\K[^"]+' || echo "unknown")
+                    gpu=$(echo "$ssh_info" | rg -o '"gpuDisplayName"\s*:\s*"([^"]+)"' -r '$1' | head -1 || echo "unknown")
                     save_pod_config "$name" "$pod_id" "$host" "$port" "$gpu"
                     return 0
                 fi
@@ -117,7 +131,7 @@ wait_for_pod_running() {
         sleep 5
     done
     echo " timeout!"
-    echo "Pod may still be starting. Check: runpodctl pod get $pod_id"
+    echo "Pod $pod_id may still be starting. Check: runpodctl pod get $pod_id"
     return 1
 }
 
@@ -174,7 +188,7 @@ cmd_create() {
     echo "$output"
 
     local pod_id
-    pod_id=$(echo "$output" | grep -oP '[a-z0-9]{20,}' | head -1 || true)
+    pod_id=$(echo "$output" | rg -o '[a-z0-9]{20,}' | head -1 || true)
 
     if [ -z "$pod_id" ]; then
         echo "Error: Could not extract pod ID from output"
@@ -182,22 +196,48 @@ cmd_create() {
     fi
 
     echo "Pod ID: $pod_id"
-    wait_for_pod_running "$pod_id" "$name"
+
+    # Persist a partial config NOW so a wait-loop timeout doesn't orphan a
+    # billable pod with no local handle. wait_for_pod_running overwrites
+    # this with the full config (host/port/gpu) on success.
+    save_pod_config "$name" "$pod_id" "" "" "$gpu"
+
+    if ! wait_for_pod_running "$pod_id" "$name"; then
+        echo "" >&2
+        echo "Pod $pod_id was created but never became reachable over SSH." >&2
+        echo "It is still running and accruing charges. Manage it with:" >&2
+        echo "  $0 status $name      # check runpod state" >&2
+        echo "  $0 stop $name        # pause (preserves volume)" >&2
+        echo "  $0 delete $name      # destroy" >&2
+        exit 1
+    fi
 }
 
 cmd_start() {
     local name="${1:?Usage: $0 start <name>}"
     load_pod_config "$name"
     echo "Starting pod '$name' ($POD_ID)..."
-    runpodctl pod start "$POD_ID"
-    wait_for_pod_running "$POD_ID" "$name"
+    if ! runpodctl pod start "$POD_ID"; then
+        echo "Error: runpodctl pod start $POD_ID failed." >&2
+        echo "The pod may have been deleted externally — check: $0 status $name" >&2
+        exit 1
+    fi
+    # Clear cached host/port: a resumed pod can come up on a different
+    # host/port. wait_for_pod_running rewrites the .env on success; on
+    # timeout the empty cache prevents stale endpoints from being reused.
+    save_pod_config "$name" "$POD_ID" "" "" "${POD_GPU:-unknown}"
+    wait_for_pod_running "$POD_ID" "$name" || exit 1
 }
 
 cmd_stop() {
     local name="${1:?Usage: $0 stop <name>}"
     load_pod_config "$name"
     echo "Stopping pod '$name' ($POD_ID)..."
-    runpodctl pod stop "$POD_ID"
+    if ! runpodctl pod stop "$POD_ID"; then
+        echo "Error: runpodctl pod stop $POD_ID failed." >&2
+        echo "Check current state: $0 status $name" >&2
+        exit 1
+    fi
     echo "Pod stopped. Volume data preserved. Resume with: $0 start $name"
 }
 
@@ -209,7 +249,11 @@ cmd_delete() {
         echo "Cancelled."
         exit 0
     fi
-    runpodctl pod delete "$POD_ID"
+    if ! runpodctl pod delete "$POD_ID"; then
+        echo "Error: runpodctl pod delete $POD_ID failed." >&2
+        echo "Local config preserved at $POD_DIR/$name.env. Investigate before retrying." >&2
+        exit 1
+    fi
     rm -f "$POD_DIR/$name.env"
     echo "Pod deleted and config removed."
 }
@@ -292,7 +336,7 @@ cmd_launch() {
     load_pod_config "$name"
 
     local script_name
-    script_name=$(echo "$cmd" | grep -oP 'scripts/\K[^ ]+' | sed 's/\.py//' || echo "train")
+    script_name=$(echo "$cmd" | rg -o 'scripts/([^ ]+)' -r '$1' | sed 's/\.py//' || echo "train")
 
     echo "Launching on '$name': $cmd"
     ssh $(ssh_opts) "root@$POD_HOST" "cd /workspace/pawn && \
