@@ -402,6 +402,15 @@ cmd_create() {
         # support direct SSH simply fail to create here, which is much
         # better than a "successful" create whose ssh doesn't work.
         --direct
+        # Disable vast.ai's auto-tmux wrapper. Every ssh session is
+        # otherwise launched inside `tmux new-session`, which fails with
+        # "tmux: command not found" on the runtime image (no tmux baked
+        # in) and kills the session before any user command runs —
+        # silently breaking non-interactive ssh / launch / setup /
+        # deploy. The documented opt-out is to touch
+        # ~/.no_auto_tmux on the pod. Belt-and-suspenders: do it for
+        # both /root and /home/pawn so the dev image also benefits.
+        --onstart-cmd 'touch /root/.no_auto_tmux 2>/dev/null; touch /home/pawn/.no_auto_tmux 2>/dev/null; chown pawn:pawn /home/pawn/.no_auto_tmux 2>/dev/null; true'
         --env "$env_str"
     )
 
