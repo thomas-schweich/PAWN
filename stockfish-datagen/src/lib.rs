@@ -2,5 +2,8 @@
 //! everything testable lives in modules so the binary stays a thin wrapper.
 
 pub mod config;
+pub mod game;
+pub mod outcome;
+pub mod sampler;
 pub mod seed;
 pub mod stockfish;

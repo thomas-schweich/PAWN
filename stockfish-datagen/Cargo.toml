@@ -14,7 +14,11 @@ name = "stockfish_datagen"
 path = "src/lib.rs"
 
 [dependencies]
-# Chess logic — vendored vocab + tokenization, depends on shakmaty.
+# Chess logic. We pull engine in for `uci_to_tokens_and_san` and the
+# searchless_chess vocab; engine has pyo3 + numpy as deps but with the
+# `extension-module` feature it never links libpython, so this binary
+# builds and runs as a pure Rust executable.
+chess_engine = { package = "ml-chess-engine-rs", path = "../engine" }
 shakmaty = "0.30"
 
 # RNG — same versions as engine for cross-crate consistency.

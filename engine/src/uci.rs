@@ -229,6 +229,40 @@ pub fn batch_uci_to_san(games: &[Vec<&str>]) -> Vec<(Vec<String>, usize)> {
         .collect()
 }
 
+/// Single-pass replay: UCI moves → (action tokens, SAN strings).
+///
+/// Walks the move list once, maintaining a single shakmaty board, and
+/// produces both the searchless_chess token IDs and the SAN strings (with
+/// check/mate suffixes) in lock-step. Stops at the first
+/// illegal/unparseable move; the returned `n_valid` is the number of moves
+/// successfully processed (== both vec lengths).
+///
+/// This is the canonical encoder used by `stockfish-datagen`. It exists
+/// because previously we replayed the game twice (once for tokens, once
+/// for SAN) — pointless, since both derive from the same move stream.
+pub fn uci_to_tokens_and_san(uci_moves: &[&str]) -> (Vec<u16>, Vec<String>, usize) {
+    let mut pos = Chess::default();
+    let mut tokens = Vec::with_capacity(uci_moves.len());
+    let mut san_moves = Vec::with_capacity(uci_moves.len());
+
+    for uci_str in uci_moves {
+        let m = match parse_uci_move(uci_str, &pos) {
+            Some(m) => m,
+            None => break,
+        };
+        let token = move_to_token(&m);
+        // SanPlus::from_move_and_play_unchecked needs to be called BEFORE
+        // we lose `m` (it consumes by value), so derive the token first.
+        let san_plus = SanPlus::from_move_and_play_unchecked(&mut pos, m);
+        tokens.push(token);
+        san_moves.push(san_plus.to_string());
+    }
+
+    let n = tokens.len();
+    debug_assert_eq!(n, san_moves.len(), "tokens and SAN must stay in lock-step");
+    (tokens, san_moves, n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +518,30 @@ mod tests {
             (vec!["d4".to_string(), "d5".to_string(), "c4".to_string()], 3),
         );
         assert_eq!(results[2], (vec!["Nf3".to_string(), "Nf6".to_string()], 2));
+    }
+
+    #[test]
+    fn test_uci_to_tokens_and_san_lockstep() {
+        // The combined function must agree exactly with the two separate paths.
+        let uci = vec!["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6", "e1g1", "f8c5"];
+        let (tokens_combined, san_combined, n) = uci_to_tokens_and_san(&uci);
+        assert_eq!(n, 8);
+
+        let (tokens_solo, n_t) = uci_moves_to_tokens(&uci, 256);
+        let (san_solo, n_s) = uci_to_san(&uci);
+        assert_eq!(n_t, 8);
+        assert_eq!(n_s, 8);
+        assert_eq!(tokens_combined, tokens_solo);
+        assert_eq!(san_combined, san_solo);
+    }
+
+    #[test]
+    fn test_uci_to_tokens_and_san_stops_on_invalid() {
+        let uci = vec!["e2e4", "z9z9", "g1f3"];
+        let (tokens, san, n) = uci_to_tokens_and_san(&uci);
+        assert_eq!(n, 1);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(san, vec!["e4"]);
     }
 
     #[test]
