@@ -4,6 +4,7 @@
 pub mod config;
 pub mod game;
 pub mod outcome;
+pub mod runner;
 pub mod sampler;
 pub mod seed;
 pub mod shard;

@@ -9,6 +9,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 use stockfish_datagen::config::RunConfig;
+use stockfish_datagen::runner::run_tier;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -51,10 +52,58 @@ fn real_main() -> anyhow::Result<()> {
             print_plan(&cfg);
             Ok(())
         }
-        Command::Run { config: _ } => {
-            anyhow::bail!("run is not implemented yet — coming in the next commit");
+        Command::Run { config } => {
+            let cfg = RunConfig::load(&config)
+                .with_context(|| format!("loading config {}", config.display()))?;
+            print_plan(&cfg);
+            std::fs::create_dir_all(&cfg.output_dir).with_context(|| {
+                format!("creating output dir {}", cfg.output_dir.display())
+            })?;
+
+            let t0 = std::time::Instant::now();
+            let mut totals = Totals::default();
+            for tier_index in 0..cfg.tiers.len() {
+                let tier_t0 = std::time::Instant::now();
+                let result = run_tier(&cfg, tier_index)
+                    .with_context(|| format!("tier {} failed", cfg.tiers[tier_index].name))?;
+                let elapsed = tier_t0.elapsed();
+                let rate = result.n_games_written as f64 / elapsed.as_secs_f64().max(1e-9);
+                eprintln!(
+                    "[{}] {}/{} games in {:.1}s ({:.1} games/s); {} shards, {} dropped",
+                    cfg.tiers[tier_index].name,
+                    result.n_games_written,
+                    cfg.tiers[tier_index].n_games,
+                    elapsed.as_secs_f64(),
+                    rate,
+                    result.shards.len(),
+                    result.n_games_dropped,
+                );
+                totals.games += result.n_games_written;
+                totals.dropped += result.n_games_dropped;
+                totals.shards += result.shards.len() as u64;
+            }
+
+            let total_elapsed = t0.elapsed();
+            eprintln!();
+            eprintln!("=== run complete ===");
+            eprintln!(
+                "wrote {} games ({} dropped) across {} shards in {:.1}m",
+                totals.games,
+                totals.dropped,
+                totals.shards,
+                total_elapsed.as_secs_f64() / 60.0,
+            );
+            eprintln!("output: {}", cfg.output_dir.display());
+            Ok(())
         }
     }
+}
+
+#[derive(Default)]
+struct Totals {
+    games: u64,
+    dropped: u64,
+    shards: u64,
 }
 
 fn print_plan(cfg: &RunConfig) {
