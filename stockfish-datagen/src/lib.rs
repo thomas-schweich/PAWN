@@ -6,4 +6,5 @@ pub mod game;
 pub mod outcome;
 pub mod sampler;
 pub mod seed;
+pub mod shard;
 pub mod stockfish;
