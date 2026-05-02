@@ -1,0 +1,47 @@
+[package]
+name = "stockfish-datagen"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Standalone Stockfish self-play data generator for PAWN training"
+
+[[bin]]
+name = "stockfish-datagen"
+path = "src/main.rs"
+
+[lib]
+name = "stockfish_datagen"
+path = "src/lib.rs"
+
+[dependencies]
+# Chess logic — vendored vocab + tokenization, depends on shakmaty.
+shakmaty = "0.30"
+
+# RNG — same versions as engine for cross-crate consistency.
+rand = "0.8"
+rand_chacha = "0.3"
+
+# Parquet writer.
+arrow = "53"
+parquet = { version = "53", features = ["zstd"] }
+
+# CLI / config.
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling.
+anyhow = "1"
+thiserror = "2"
+
+# Worker channels.
+crossbeam-channel = "0.5"
+
+# Hashing for config fingerprint + seed derivation.
+sha2 = "0.10"
+
+# Misc.
+once_cell = "1.19"
+
+[dev-dependencies]
+tempfile = "3"
