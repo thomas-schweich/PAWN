@@ -813,6 +813,24 @@ fn pgn_to_uci(py: Python<'_>, games: Vec<Vec<String>>) -> PyResult<Vec<Vec<Strin
     Ok(results.into_iter().map(|(uci, _)| uci).collect())
 }
 
+/// Convert a batch of UCI games to SAN strings (with check/mate suffixes).
+/// Each game is a list of UCI strings (e.g., ["e2e4", "e7e5", "g1f3"]).
+///
+/// Returns a list of lists of SAN strings. Each inner list is truncated at
+/// the first illegal/unparseable UCI move, mirroring `pgn_to_uci`.
+#[pyfunction]
+fn uci_to_san(py: Python<'_>, games: Vec<Vec<String>>) -> PyResult<Vec<Vec<String>>> {
+    let results = py.allow_threads(|| {
+        let refs: Vec<Vec<&str>> = games
+            .iter()
+            .map(|g| g.iter().map(|s| s.as_str()).collect())
+            .collect();
+        uci::batch_uci_to_san(&refs)
+    });
+
+    Ok(results.into_iter().map(|(san, _)| san).collect())
+}
+
 // ---------------------------------------------------------------------------
 // Enriched PGN parsing (for dataset construction)
 // ---------------------------------------------------------------------------
@@ -1628,6 +1646,7 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_uci_file, m)?)?;
     m.add_function(wrap_pyfunction!(uci_to_tokens, m)?)?;
     m.add_function(wrap_pyfunction!(pgn_to_uci, m)?)?;
+    m.add_function(wrap_pyfunction!(uci_to_san, m)?)?;
     m.add_function(wrap_pyfunction!(parse_pgn_enriched, m)?)?;
     m.add_function(wrap_pyfunction!(parse_pgn_lichess, m)?)?;
     m.add_function(wrap_pyfunction!(count_pgn_games_in_date_range, m)?)?;

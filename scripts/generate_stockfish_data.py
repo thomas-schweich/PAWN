@@ -5,17 +5,38 @@ Runs a pool of single-threaded Stockfish engines in parallel, one per core.
 Each worker writes an incremental Parquet shard to the output directory.
 After all workers finish, shards are merged into a single file.
 
-Output schema matches the Lichess dataset format:
-    uci (string)        — space-separated UCI moves
-    result (string)     — 1-0, 0-1, 1/2-1/2, or *
-    n_ply (int16)       — number of half-moves
-    nodes (int32)       — Stockfish node budget per move
-    worker_id (int16)   — worker index (for reproducibility)
-    seed (int32)        — worker RNG seed
+Output schema mirrors the columns of the Lichess dataset that apply to
+self-play games (no Elo, no clocks, no headers):
 
-Each tier uses MultiPV + softmax temperature sampling to produce diverse games
-from deterministic Stockfish search. Seeds are hardcoded per tier so runs are
-reproducible. Worker seeds are derived as tier_seed + worker_id.
+    tokens (List[Int16])    — searchless_chess action tokens (0..1967)
+    san (List[Utf8])        — SAN with check/mate suffixes
+    uci (List[Utf8])        — UCI move strings as Stockfish emitted them
+    game_length (UInt16)    — number of plies (== len of each list above)
+    outcome_token (UInt16)  — outcome in the 1969..1979 range (vocab.rs)
+    result (Utf8)           — 1-0 / 0-1 / 1/2-1/2
+
+Plus self-play-specific metadata:
+
+    nodes (Int32)           — Stockfish node budget per move
+    temperature (Float32)   — softmax temperature used for sampling
+    sample_plies (Int32)    — # of opening plies sampled before going top-1
+    worker_id (Int16)       — worker index (for reproducibility)
+    seed (Int32)            — worker RNG seed
+
+Token / SAN derivation goes through `chess_engine` (the Rust crate) — no
+Python chess library. UCI is what Stockfish prints; the engine
+re-derives tokens and SAN from those UCI strings, so all three columns
+agree by construction.
+
+Each tier uses MultiPV + softmax temperature sampling to produce diverse
+games from deterministic Stockfish search. All per-tier and per-worker
+RNG seeds are derived from a single ``--seed`` master via the hierarchy
+master → per-tier seed → per-worker seed (each level a fresh
+``random.Random(parent_seed).randrange(2**31)``). Per-tier derivation
+iterates the full TIERS list in declaration order, so collisions across
+tiers / workers are astronomically unlikely regardless of how many
+workers or games each tier uses, and ``--tier nodes_0128`` alone yields
+the same worker seeds as a full multi-tier run.
 
 Tiers (by node count):
     nodes_0001:   1 node   (near-random)
@@ -42,29 +63,67 @@ from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
 from pathlib import Path
 
+import chess_engine
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# Hardcoded, non-conflicting seeds per tier.  Worker i gets seed = tier_seed + i.
+DEFAULT_SEED = 42
+
 TIERS = [
-    {"name": "nodes_0001", "nodes": 1,    "games": 128_000, "seed": 10_000},
-    {"name": "nodes_0032", "nodes": 32,   "games": 128_000, "seed": 20_000},
-    {"name": "nodes_0128", "nodes": 128,  "games": 128_000, "seed": 30_000},
-    {"name": "nodes_0256", "nodes": 256,  "games": 128_000, "seed": 40_000},
-    {"name": "nodes_1024", "nodes": 1024, "games": 128_000, "seed": 50_000},
+    {"name": "nodes_0001", "nodes": 1,    "games": 128_000},
+    {"name": "nodes_0032", "nodes": 32,   "games": 128_000},
+    {"name": "nodes_0128", "nodes": 128,  "games": 128_000},
+    {"name": "nodes_0256", "nodes": 256,  "games": 128_000},
+    {"name": "nodes_1024", "nodes": 1024, "games": 128_000},
 ]
 
+
+def derive_tier_seeds(master_seed: int) -> dict[str, int]:
+    """Derive a per-tier seed deterministically from the master seed.
+
+    Always iterates the full TIERS list (in declaration order) so that
+    ``--tier X`` selects the same seed for tier X as a full multi-tier run,
+    independent of which other tiers were requested.
+    """
+    rng = random.Random(master_seed)
+    return {tier["name"]: rng.randrange(2**31) for tier in TIERS}
+
+
+def derive_worker_seeds(tier_seed: int, num_workers: int) -> list[int]:
+    """Derive worker seeds deterministically from a tier seed."""
+    rng = random.Random(tier_seed)
+    return [rng.randrange(2**31) for _ in range(num_workers)]
+
 MULTI_PV = 5        # candidates per move during opening
+OPENING_MULTI_PV = 20  # widen to all reasonable first moves at ply 0
+OPENING_PLIES = 1   # how many opening plies use OPENING_MULTI_PV
 TEMPERATURE = 1.0   # softmax temperature (higher = more random)
 SAMPLE_PLIES = 999  # use MultiPV+temperature for all plies by default
+MAX_PLY = 512       # matches the Lichess pipeline default
 
-FLUSH_EVERY = 5_000  # games per Parquet row group
+FLUSH_EVERY = 5_000  # games per Parquet row group / token+SAN conversion batch
+
+# Outcome token IDs — must match engine/src/vocab.rs. Duplicated here so this
+# script stays runnable in slim images that only have chess_engine + pyarrow.
+WHITE_CHECKMATES = 1969
+BLACK_CHECKMATES = 1970
+STALEMATE = 1971
+DRAW_BY_RULE = 1972
+PLY_LIMIT = 1973
 
 SCHEMA = pa.schema([
-    ('uci', pa.string()),
+    ('tokens', pa.list_(pa.int16())),
+    ('san', pa.list_(pa.string())),
+    ('uci', pa.list_(pa.string())),
+    ('game_length', pa.uint16()),
+    ('outcome_token', pa.uint16()),
     ('result', pa.string()),
-    ('n_ply', pa.int16()),
     ('nodes', pa.int32()),
+    ('temperature', pa.float32()),
+    ('sample_plies', pa.int32()),
+    ('multi_pv', pa.int32()),
+    ('opening_multi_pv', pa.int32()),
+    ('opening_plies', pa.int32()),
     ('worker_id', pa.int16()),
     ('seed', pa.int32()),
 ])
@@ -218,30 +277,68 @@ def softmax_sample(
     return candidates[-1][0]
 
 
+def classify_outcome(n_ply: int, terminal: str | None, max_ply: int) -> tuple[str, int]:
+    """Return (result, outcome_token) for a finished self-play game.
+
+    `terminal` is the engine's `last_terminal` after the loop exited:
+    "checkmate", "stalemate", or None. Self-play has no resign / agreement /
+    clock, so the only valid outcomes are the natural-termination subset
+    that pretraining already uses (WHITE/BLACK_CHECKMATES, STALEMATE,
+    DRAW_BY_RULE, PLY_LIMIT).
+    """
+    if n_ply >= max_ply:
+        return "1/2-1/2", PLY_LIMIT
+    if terminal == "checkmate":
+        # Side to move was checkmated, so the *previous* mover won.
+        if n_ply % 2 == 1:
+            return "1-0", WHITE_CHECKMATES
+        return "0-1", BLACK_CHECKMATES
+    if terminal == "stalemate":
+        return "1/2-1/2", STALEMATE
+    # No terminal info and we're under the ply cap — treat as draw-by-rule.
+    return "1/2-1/2", DRAW_BY_RULE
+
+
 def play_game(
     engine: StockfishEngine,
     nodes: int,
     rng: random.Random,
     temperature: float,
     multi_pv: int,
+    opening_multi_pv: int,
+    opening_plies: int,
     sample_plies: int,
-    max_ply: int = 500,
-) -> tuple[list[str], str]:
-    """Play one self-play game with temperature sampling. Returns (moves_uci, result)."""
+    max_ply: int = MAX_PLY,
+) -> tuple[list[str], str, int]:
+    """Play one self-play game with temperature sampling.
+
+    Three MultiPV phases:
+      1. plies [0, opening_plies)        → opening_multi_pv  (wide first move sampling)
+      2. plies [opening_plies, sample_plies) → multi_pv      (normal exploration)
+      3. plies [sample_plies, max_ply)   → 1                 (top-1, exploit)
+
+    Returns (moves_uci, result, outcome_token). Empty-game (no legal first
+    move) is reported as PLY_LIMIT to keep every emitted row classifiable;
+    the caller filters n_ply == 0 anyway.
+    """
     engine.new_game()
-    engine.set_multi_pv(multi_pv)
     moves: list[str] = []
-    switched = False
+    current_pv = -1  # force a set_multi_pv on the first ply
 
     for ply in range(max_ply):
-        # Switch to top-1 after the opening phase
-        if not switched and ply >= sample_plies:
-            engine.set_multi_pv(1)
-            switched = True
+        # Pick the right MultiPV bucket for this ply.
+        if ply < opening_plies:
+            target_pv = opening_multi_pv
+        elif ply < sample_plies:
+            target_pv = multi_pv
+        else:
+            target_pv = 1
+        if target_pv != current_pv:
+            engine.set_multi_pv(target_pv)
+            current_pv = target_pv
 
         cands = engine.candidates(moves, nodes)
-        if switched:
-            # Top-1 mode: just take the best move
+        if target_pv == 1:
             move = cands[0][0] if cands else None
         else:
             move = softmax_sample(cands, temperature, rng)
@@ -249,21 +346,55 @@ def play_game(
             break
         moves.append(move)
 
+    terminal = engine.last_terminal
     n = len(moves)
-    if n == 0:
-        return moves, "*"
+    result, outcome_token = classify_outcome(n, terminal, max_ply)
+    return moves, result, outcome_token
 
-    if n >= max_ply:
-        result = "1/2-1/2"
-    elif engine.last_terminal == "checkmate":
-        # Side to move was checkmated
-        result = "0-1" if n % 2 == 0 else "1-0"
-    elif engine.last_terminal == "stalemate":
-        result = "1/2-1/2"
-    else:
-        result = "*"
 
-    return moves, result
+def _flush_batch(
+    writer: pq.ParquetWriter,
+    uci_games: list[list[str]],
+    metas: list[dict],
+    max_ply: int,
+) -> None:
+    """Convert a batch of finished games to tokens + SAN and append to parquet.
+
+    Drops any game where the engine couldn't tokenize every UCI move (should
+    never happen for legal Stockfish output, but a single corrupt game
+    shouldn't sink the whole shard).
+    """
+    if not uci_games:
+        return
+    san_per_game = chess_engine.uci_to_san(uci_games)
+    tokens_arr, lens_arr = chess_engine.uci_to_tokens(uci_games, max_ply=max_ply)
+
+    rows: dict[str, list] = {name: [] for name in SCHEMA.names}
+    for i, meta in enumerate(metas):
+        n = int(lens_arr[i])
+        if n != len(uci_games[i]) or n == 0:
+            # Tokenization rejected a move (or game empty) — skip the row
+            # rather than emit mismatched columns.
+            continue
+        rows['tokens'].append(tokens_arr[i, :n].tolist())
+        rows['san'].append(san_per_game[i][:n])
+        rows['uci'].append(uci_games[i][:n])
+        rows['game_length'].append(n)
+        rows['outcome_token'].append(meta['outcome_token'])
+        rows['result'].append(meta['result'])
+        rows['nodes'].append(meta['nodes'])
+        rows['temperature'].append(meta['temperature'])
+        rows['sample_plies'].append(meta['sample_plies'])
+        rows['multi_pv'].append(meta['multi_pv'])
+        rows['opening_multi_pv'].append(meta['opening_multi_pv'])
+        rows['opening_plies'].append(meta['opening_plies'])
+        rows['worker_id'].append(meta['worker_id'])
+        rows['seed'].append(meta['seed'])
+
+    if not rows['tokens']:
+        return
+    table = pa.table(rows, schema=SCHEMA)
+    writer.write_table(table)
 
 
 def worker_generate(
@@ -275,7 +406,10 @@ def worker_generate(
     seed: int,
     temperature: float,
     multi_pv: int,
+    opening_multi_pv: int,
+    opening_plies: int,
     sample_plies: int,
+    max_ply: int,
     shard_path: str,
 ) -> tuple[int, int, float]:
     """Worker: play num_games, write Parquet shard incrementally.
@@ -283,32 +417,46 @@ def worker_generate(
     Returns (n_written, total_ply, elapsed).
     """
     rng = random.Random(seed)
-    engine = StockfishEngine(stockfish_path, hash_mb=hash_mb, multi_pv=multi_pv)
+    # Initial MultiPV doesn't matter; play_game sets it explicitly per ply.
+    engine = StockfishEngine(stockfish_path, hash_mb=hash_mb, multi_pv=max(multi_pv, opening_multi_pv))
     writer = pq.ParquetWriter(shard_path, SCHEMA, compression='zstd')
 
-    batch: dict[str, list] = {name: [] for name in SCHEMA.names}
+    pending_uci: list[list[str]] = []
+    pending_meta: list[dict] = []
     total_ply = 0
     n_written = 0
     t0 = time.perf_counter()
 
     for i in range(num_games):
-        moves, result = play_game(engine, nodes, rng, temperature, multi_pv, sample_plies)
+        moves, result, outcome_token = play_game(
+            engine, nodes, rng, temperature, multi_pv,
+            opening_multi_pv, opening_plies, sample_plies, max_ply,
+        )
         n_ply = len(moves)
+        if n_ply == 0:
+            # Stockfish refused to make a first move — extremely rare, skip.
+            continue
         total_ply += n_ply
 
-        batch['uci'].append(" ".join(moves))
-        batch['result'].append(result)
-        batch['n_ply'].append(n_ply)
-        batch['nodes'].append(nodes)
-        batch['worker_id'].append(worker_id)
-        batch['seed'].append(seed)
+        pending_uci.append(moves)
+        pending_meta.append({
+            'result': result,
+            'outcome_token': outcome_token,
+            'nodes': nodes,
+            'temperature': temperature,
+            'sample_plies': sample_plies,
+            'multi_pv': multi_pv,
+            'opening_multi_pv': opening_multi_pv,
+            'opening_plies': opening_plies,
+            'worker_id': worker_id,
+            'seed': seed,
+        })
         n_written += 1
 
-        # Flush batch to Parquet periodically
         if n_written % FLUSH_EVERY == 0:
-            table = pa.table(batch, schema=SCHEMA)
-            writer.write_table(table)
-            batch = {name: [] for name in SCHEMA.names}
+            _flush_batch(writer, pending_uci, pending_meta, max_ply)
+            pending_uci.clear()
+            pending_meta.clear()
 
             elapsed = time.perf_counter() - t0
             rate = n_written / elapsed
@@ -326,11 +474,7 @@ def worker_generate(
                 flush=True,
             )
 
-    # Flush remaining
-    if batch['uci']:
-        table = pa.table(batch, schema=SCHEMA)
-        writer.write_table(table)
-
+    _flush_batch(writer, pending_uci, pending_meta, max_ply)
     writer.close()
     elapsed = time.perf_counter() - t0
     engine.close()
@@ -341,15 +485,18 @@ def generate_tier(
     stockfish_path: str,
     output_dir: Path,
     tier: dict,
+    tier_seed: int,
     num_workers: int,
     hash_mb: int,
     temperature: float,
     multi_pv: int,
+    opening_multi_pv: int,
+    opening_plies: int,
     sample_plies: int,
+    max_ply: int,
 ):
     nodes = tier["nodes"]
     total_games = tier["games"]
-    tier_seed = tier["seed"]
     name = tier["name"]
 
     # Shard directory for worker output
@@ -360,12 +507,15 @@ def generate_tier(
     base = total_games // num_workers
     remainder = total_games % num_workers
     per_worker = [base + (1 if i < remainder else 0) for i in range(num_workers)]
+    worker_seeds = derive_worker_seeds(tier_seed, num_workers)
 
     print(f"\n{'=' * 60}")
     print(f"Generating {total_games:,} games: {name} (nodes={nodes})")
-    print(f"Workers: {num_workers}, games/worker: ~{base}")
-    print(f"MultiPV: {multi_pv} for first {sample_plies} plies, then top-1; temperature: {temperature}")
-    print(f"Seed base: {tier_seed} (workers {tier_seed}..{tier_seed + num_workers - 1})")
+    print(f"Workers: {num_workers}, games/worker: ~{base}, max_ply: {max_ply}")
+    print(f"MultiPV: {opening_multi_pv} for first {opening_plies} plies, "
+          f"{multi_pv} for next {sample_plies - opening_plies} plies, then top-1; "
+          f"temperature: {temperature}")
+    print(f"Tier seed: {tier_seed}  (worker seeds derived from it)")
     print(f"Output: {output_dir / f'{name}.parquet'}")
     print(f"{'=' * 60}")
 
@@ -381,10 +531,13 @@ def generate_tier(
                 per_worker[i],
                 hash_mb,
                 i,
-                tier_seed + i,
+                worker_seeds[i],
                 temperature,
                 multi_pv,
+                opening_multi_pv,
+                opening_plies,
                 sample_plies,
+                max_ply,
                 str(shard_dir / f"shard_{i:03d}.parquet"),
             )
             for i in range(num_workers)
@@ -454,8 +607,29 @@ def main():
         "--multi-pv", type=int, default=MULTI_PV, help="MultiPV candidates per move"
     )
     parser.add_argument(
+        "--opening-multi-pv", type=int, default=OPENING_MULTI_PV,
+        help="Wider MultiPV used only for the first --opening-plies moves "
+             "(broadens first-move coverage without slowing down the rest)",
+    )
+    parser.add_argument(
+        "--opening-plies", type=int, default=OPENING_PLIES,
+        help="Number of plies that use --opening-multi-pv before falling back to --multi-pv",
+    )
+    parser.add_argument(
         "--sample-plies", type=int, default=SAMPLE_PLIES,
         help="Use MultiPV+temperature for the first N plies, then top-1"
+    )
+    parser.add_argument(
+        "--max-ply", type=int, default=MAX_PLY,
+        help=f"Per-game ply cap (default {MAX_PLY}, matches the Lichess pipeline)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=DEFAULT_SEED,
+        help=(
+            f"Master RNG seed (default {DEFAULT_SEED}). All per-tier and "
+            "per-worker seeds are derived from this; the same --seed always "
+            "produces the same per-tier seeds regardless of --workers / --games."
+        ),
     )
     args = parser.parse_args()
 
@@ -476,12 +650,16 @@ def main():
             sys.exit(1)
         tiers = matched
 
+    tier_seeds = derive_tier_seeds(args.seed)
     for tier in tiers:
         if args.games is not None:
             tier = {**tier, "games": args.games}
         generate_tier(
-            sf_path, output_dir, tier, args.workers, args.hash,
-            args.temperature, args.multi_pv, args.sample_plies,
+            sf_path, output_dir, tier, tier_seeds[tier["name"]],
+            args.workers, args.hash,
+            args.temperature, args.multi_pv,
+            args.opening_multi_pv, args.opening_plies,
+            args.sample_plies, args.max_ply,
         )
 
     print(f"\nAll done. Files in {output_dir}/")

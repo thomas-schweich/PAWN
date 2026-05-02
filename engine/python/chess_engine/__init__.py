@@ -34,6 +34,7 @@ from chess_engine._engine import (
     parse_uci_file,
     uci_to_tokens,
     pgn_to_uci,
+    uci_to_san,
     # Engine self-play generation
     generate_engine_games_py as generate_engine_games,
     # Vocabulary
@@ -71,6 +72,7 @@ __all__ = [
     "parse_uci_file",
     "uci_to_tokens",
     "pgn_to_uci",
+    "uci_to_san",
     "generate_engine_games",
     "export_move_vocabulary",
     "PyGameState",
