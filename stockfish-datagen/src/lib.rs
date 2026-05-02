@@ -3,3 +3,4 @@
 
 pub mod config;
 pub mod seed;
+pub mod stockfish;
