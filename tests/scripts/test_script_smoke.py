@@ -41,6 +41,7 @@ ARGPARSE_SCRIPTS = [
     "benchmark.py",
     "benchmark_stockfish_nodes.py",
     "compute_theoretical_ceiling.py",
+    "datagen_with_hf_sync.py",
     "eval_accuracy.py",
     "eval_probes.py",
     "eval_vs_stockfish.py",
