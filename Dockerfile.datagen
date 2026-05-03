@@ -1,8 +1,24 @@
 # Chess Data Generation Container
 #
-# Lc0 v0.33-dev (CUDA) + generation scripts.
-# Optionally includes Stockfish 18 (--build-arg INCLUDE_STOCKFISH=1).
-# Produces UCI move sequences for PAWN training.
+# Stockfish 18 self-play data generator (the rust `stockfish-datagen`
+# binary) plus a Python orchestrator (`datagen_with_hf_sync.py`) that
+# wraps it with incremental upload to a HuggingFace dataset.
+#
+# Stockfish ships in the image by default (--build-arg INCLUDE_STOCKFISH=1).
+# Both the AVX2 and AVX-512 variants are downloaded (~112 MB each),
+# and a `/usr/local/bin/stockfish` wrapper picks the right one at
+# runtime based on /proc/cpuinfo flags. This eliminates the "wrong
+# binary on this pod" failure mode entirely — whatever pod we end
+# up on, a compatible Stockfish is already there. Override via
+# STOCKFISH_VARIANT={auto,avx2,avx512}; defaults to auto.
+# Set INCLUDE_STOCKFISH=0 to skip both binaries entirely (CI / sanity
+# builds where the rust binary is the only thing being verified).
+#
+# Lc0 was previously bundled here but was removed when we stopped
+# using it for active datagen — keeping the build infrastructure
+# (lc0-builder, network downloads, ~2GB of layers) wasn't worth the
+# maintenance cost. Add it back if/when an Lc0 workflow becomes
+# active again.
 #
 # Two targets:
 #   runtime  — minimal, runs the rust binary or the HF-sync orchestrator
@@ -11,23 +27,15 @@
 #              jq, numactl). Sshd runs as PID 1, so the pod stays alive
 #              indefinitely for manual benchmarking and run management.
 #
-# Build (runtime, Lc0 only — default):
-#   docker build --platform linux/amd64 --target runtime \
-#     -f Dockerfile.datagen -t pawn-datagen .
-#
-# Build (runtime, with Stockfish):
+# Build (runtime):
 #   docker build --platform linux/amd64 --target runtime \
 #     --build-arg INCLUDE_STOCKFISH=1 \
 #     -f Dockerfile.datagen -t pawn-datagen .
 #
-# Build (dev, with Stockfish — typical for stockfish-datagen workflows):
+# Build (dev — typical for stockfish-datagen workflows):
 #   docker build --platform linux/amd64 --target dev \
 #     --build-arg INCLUDE_STOCKFISH=1 \
 #     -f Dockerfile.datagen -t pawn-datagen:dev .
-#
-# Run (Lc0 — requires NVIDIA GPU):
-#   docker run --rm --gpus all -v $(pwd)/data:/out pawn-datagen \
-#     scripts/generate_lc0_data.py --output /out/lc0
 #
 # Run (dev — needs PUBLIC_KEY for SSH login, HF_TOKEN persisted to cache):
 #   docker run -d -p 22:22 \
@@ -36,35 +44,20 @@
 #     pawn-datagen:dev
 #
 # Pinned versions for reproducibility:
-#   Lc0 afaa5ab         https://github.com/LeelaChessZero/lc0 (v0.28.1-429-gafaa5ab)
 #   Stockfish 18        https://github.com/official-stockfish/Stockfish/releases/tag/sf_18
-#   Networks:
-#     t1-256x10-distilled-swa-2432500        sha256:bc27a6ca...
-#     t3-512x15x16h-distill-swa-2767500      sha256:78541c4a...
-#     BT4-1024x15x32h-swa-6147500-pt-332     sha256:e6ada9d6...
-
-# ── Build Lc0 from source ─────────────────────────────────────────────
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS lc0-builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git g++ python3-pip ninja-build pkg-config libopenblas-dev \
-    && pip3 install --break-system-packages meson \
-    && rm -rf /var/lib/apt/lists/*
-
-ARG LC0_COMMIT=afaa5ab
-RUN git clone --recurse-submodules https://github.com/LeelaChessZero/lc0.git /lc0 \
-    && cd /lc0 && git checkout ${LC0_COMMIT} \
-    && PATH=/usr/local/cuda/bin:$PATH ./build.sh
 
 # ── tmux: build from source ──────────────────────────────────────────
-# Same version + sha256 pin as the main Dockerfile's dev image, so both
-# inherit the brace-control-mode + range-status format-vars our
-# `deploy/.tmux.conf` relies on. Ubuntu's packaged tmux (3.4 on 24.04)
-# would technically work, but pinning to 3.6a here keeps the dev
-# experience identical across `Dockerfile` and `Dockerfile.datagen`.
-FROM python:3.12-slim AS tmux-build
+# Same version + sha256 pin as the main Dockerfile's dev image. Note
+# we build on ubuntu:24.04, NOT python:3.12-slim like the main image
+# does — the dev runtime here is on ubuntu:24.04-based CUDA runtime,
+# which uses libevent's t64 transition (libevent_core-2.1.so.7t64),
+# while debian bookworm still ships the legacy SONAME
+# (libevent_core-2.1.so.7). Building tmux on the matching base keeps
+# its SONAMEs in sync with the runtime libs in the dev stage.
+FROM ubuntu:24.04 AS tmux-build
 ARG TMUX_VERSION=3.6a
 ARG TMUX_SHA256=b6d8d9c76585db8ef5fa00d4931902fa4b8cbe8166f528f44fc403961a3f3759
+ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl pkg-config bison \
         libevent-dev libncurses-dev \
@@ -107,13 +100,19 @@ RUN cargo build --release -p stockfish-datagen \
     && strip target/release/stockfish-datagen
 
 # ── Runtime ────────────────────────────────────────────────────────────
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 AS runtime
+# Plain ubuntu:24.04 since this image is CPU-only — Stockfish doesn't
+# need CUDA, and the rust `stockfish-datagen` binary is statically
+# linked enough that even libopenblas isn't required. nvidia-smi (if
+# the pod actually has a GPU) is bind-mounted by the nvidia container
+# runtime via `docker run --gpus all`, so the dev image's tmux GPU
+# status segment still works without CUDA libs in the base.
+FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip curl libopenblas0 \
+        python3 python3-pip curl \
     && rm -rf /var/lib/apt/lists/*
 
 # huggingface_hub is needed by the datagen_with_hf_sync.py orchestrator —
@@ -124,50 +123,87 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip3 install --break-system-packages --no-cache-dir \
         "huggingface_hub>=0.24"
 
-# Stockfish 18 (opt-in: --build-arg INCLUDE_STOCKFISH=1)
-ARG INCLUDE_STOCKFISH=0
+# Stockfish 18: download both AVX2 + AVX-512 variants by default so
+# the image works on any modern x86 pod regardless of microarch. The
+# wrapper installed below picks the right one at runtime via
+# /proc/cpuinfo. Set --build-arg INCLUDE_STOCKFISH=0 to skip both.
+ARG INCLUDE_STOCKFISH=1
 RUN if [ "$INCLUDE_STOCKFISH" = "1" ]; then \
-        curl -L -o /tmp/sf.tar \
-            https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64-avx2.tar \
-        && tar xf /tmp/sf.tar -C /tmp \
-        && cp /tmp/stockfish/stockfish-ubuntu-x86-64-avx2 /usr/local/bin/stockfish \
-        && chmod +x /usr/local/bin/stockfish \
-        && rm -rf /tmp/sf.tar /tmp/stockfish \
-        && echo "quit" | stockfish | head -1 \
-        && mkdir -p /root/bin \
-        && ln -sf /usr/local/bin/stockfish /root/bin/stockfish; \
+        for variant in avx2 avx512; do \
+            curl -L -o /tmp/sf.tar \
+                "https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64-${variant}.tar" \
+            && tar xf /tmp/sf.tar -C /tmp \
+            && cp "/tmp/stockfish/stockfish-ubuntu-x86-64-${variant}" "/usr/local/bin/stockfish-${variant}" \
+            && chmod +x "/usr/local/bin/stockfish-${variant}" \
+            && rm -rf /tmp/sf.tar /tmp/stockfish; \
+        done; \
     fi
+
+# Wrapper: auto-detects CPU at runtime and execs the matching
+# Stockfish variant. STOCKFISH_VARIANT={auto,avx2,avx512} overrides.
+# Always installed (not gated on INCLUDE_STOCKFISH) so the path
+# `/usr/local/bin/stockfish` exists regardless; falls back with a
+# clear error if the requested variant binary is missing.
+#
+# Reproducibility: the two variants produce **bit-exact identical
+# bestmoves and NNUE evals** at every node count, multipv level, and
+# game length tested (100/100 positions verified locally — long opening
+# sequences up to 20 plies, deep nodes up to 8192, MultiPV up to 10,
+# close-score endgames). This is expected: NNUE uses int8 dot products
+# which are bit-exact regardless of vector width, and Stockfish 18's
+# accumulator updates are deterministic. So the runtime auto-pick is
+# safe across pods — the same dataset config produces the same games
+# whether the pod has AVX2 only or AVX-512+VNNI. We do NOT need to pin
+# the variant in `RunConfig`'s tier_fingerprint.
+RUN cat > /usr/local/bin/stockfish <<'EOF' && chmod +x /usr/local/bin/stockfish
+#!/bin/sh
+v=${STOCKFISH_VARIANT:-auto}
+case "$v" in
+    auto)
+        # avx512f is the lowest-common-denominator AVX-512 flag; if
+        # present, the avx512 build runs (and uses VNNI internally
+        # when avx512_vnni is also present, which it is on Zen 4+ /
+        # Sapphire Rapids+).
+        if grep -q '\bavx512f\b' /proc/cpuinfo 2>/dev/null; then
+            v=avx512
+        else
+            v=avx2
+        fi
+        ;;
+esac
+bin=/usr/local/bin/stockfish-$v
+if [ ! -x "$bin" ]; then
+    echo "stockfish: requested variant '$v' not installed at $bin" >&2
+    echo "           (image built with --build-arg INCLUDE_STOCKFISH=0?)" >&2
+    exit 127
+fi
+exec "$bin" "$@"
+EOF
+
 # The bundled `stockfish-datagen/examples/*.json` configs use
-# `~/bin/stockfish` for parity with local-dev. The image installs
-# Stockfish to `/usr/local/bin/stockfish`; the symlink above makes
-# `~/bin/stockfish` (== `/root/bin/stockfish` for the container's
-# default uid 0) resolve to it, so the bundled configs are runnable
-# as-shipped.
+# `~/bin/stockfish` for parity with local-dev. The wrapper above is
+# at `/usr/local/bin/stockfish`; symlink so `~/bin/stockfish`
+# (== `/root/bin/stockfish` for the container's default uid 0)
+# resolves to it.
+RUN mkdir -p /root/bin && ln -sf /usr/local/bin/stockfish /root/bin/stockfish
 
-# Lc0 binary
-COPY --from=lc0-builder /lc0/build/release/lc0 /usr/local/bin/lc0
+# Smoke-test the AVX2 binary on the build host (every modern build
+# host has AVX2). The AVX-512 binary is NOT tested at build time —
+# the build host might not have AVX-512, and that's fine; it'll be
+# tested at pod boot via stockfish-datagen's UCI handshake when
+# selected. The wrapper handles missing-variant errors loudly.
+RUN if [ -x /usr/local/bin/stockfish-avx2 ]; then \
+        echo "quit" | STOCKFISH_VARIANT=avx2 stockfish | head -1; \
+    fi
 
-# Lc0 networks (pinned by SHA256)
-RUN mkdir -p /opt/lc0_nets \
-    && curl -L -o /opt/lc0_nets/t1-256x10.pb.gz \
-        https://storage.lczero.org/files/networks-contrib/t1-256x10-distilled-swa-2432500.pb.gz \
-    && curl -L -o /opt/lc0_nets/t3-512x15.pb.gz \
-        https://storage.lczero.org/files/networks-contrib/t3-512x15x16h-distill-swa-2767500.pb.gz \
-    && curl -L -o /opt/lc0_nets/bt4-1024x15.pb.gz \
-        https://storage.lczero.org/files/networks-contrib/BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz \
-    && echo "bc27a6cae8ad36f2b9a80a6ad9dabb0d6fda25b1e7f481a79bc359e14f563406  /opt/lc0_nets/t1-256x10.pb.gz" | sha256sum -c \
-    && echo "78541c4abc0bc81e8145e1f9a4c35a934ebbefff70f11f33215751d55a886352  /opt/lc0_nets/t3-512x15.pb.gz" | sha256sum -c \
-    && echo "e6ada9d6c4a769bfab3aa0848d82caeb809aa45f83e6c605fc58a31d21bdd618  /opt/lc0_nets/bt4-1024x15.pb.gz" | sha256sum -c
-
-# Generation scripts. The Stockfish self-play generator is now a
-# standalone Rust binary (`stockfish-datagen`) built in `sfd-builder`
-# above and copied in below; the legacy Python script was removed in
-# favor of it. The Lc0 + benchmark scripts remain Python, and the
-# datagen_with_hf_sync.py orchestrator wraps the rust binary with
-# fire-and-forget HuggingFace dataset sync.
+# Generation scripts. The Stockfish self-play generator is the rust
+# `stockfish-datagen` binary (built in `sfd-builder` above, copied in
+# below). The Python orchestrator `datagen_with_hf_sync.py` wraps it
+# with HuggingFace dataset sync; `sweep_pod_workers.sh` is a quick
+# n_workers benchmark for pre-launch validation; the bare Stockfish
+# nodes benchmark is kept for ad-hoc perf debugging.
 WORKDIR /opt/datagen
 COPY scripts/benchmark_stockfish_nodes.py scripts/
-COPY scripts/generate_lc0_data.py scripts/
 COPY scripts/datagen_with_hf_sync.py scripts/
 COPY scripts/sweep_pod_workers.sh scripts/
 
@@ -180,8 +216,7 @@ COPY --from=sfd-builder /build/target/release/stockfish-datagen /usr/local/bin/s
 # without needing the source tree mounted.
 COPY stockfish-datagen/examples /opt/datagen/examples
 
-RUN lc0 --help 2>&1 | head -1 \
-    && stockfish-datagen --help 2>&1 | head -1 \
+RUN stockfish-datagen --help 2>&1 | head -1 \
     && python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)"
 
 # Dispatcher entrypoint:
@@ -189,13 +224,13 @@ RUN lc0 --help 2>&1 | head -1 \
 #     and DATAGEN_CONFIG are set (the fire-and-forget pod path).
 #   - if first arg ends in `.py`, run it via python3.
 #   - otherwise exec the command directly.
-# This lets all three modes work without --entrypoint overrides:
+# Three usage modes without --entrypoint overrides:
 #   # Pod fire-and-forget (env vars provide repo + config):
 #   docker run -e DATAGEN_HF_REPO=org/name -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_100m.json ... pawn-datagen
-#   # Lc0 generator:
-#   docker run ... pawn-datagen scripts/generate_lc0_data.py --output ...
 #   # Bare rust binary (no HF sync):
 #   docker run ... pawn-datagen stockfish-datagen run --config ...
+#   # Run a bundled Python helper:
+#   docker run ... pawn-datagen scripts/benchmark_stockfish_nodes.py ...
 RUN cat > /usr/local/bin/datagen-entrypoint <<'EOF'
 #!/bin/sh
 set -e
@@ -212,7 +247,6 @@ if [ $# -eq 0 ]; then
     echo "datagen: no command given. Examples:" >&2
     echo "  # fire-and-forget pod sync (set HF_TOKEN too):" >&2
     echo "  docker run -e DATAGEN_HF_REPO=org/name -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_100m.json pawn-datagen" >&2
-    echo "  docker run pawn-datagen scripts/generate_lc0_data.py --output ..." >&2
     echo "  docker run pawn-datagen stockfish-datagen run --config ..." >&2
     exit 64
 fi
@@ -241,9 +275,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server tini git \
         htop vim-tiny jq numactl util-linux \
         ca-certificates \
-        libevent-2.1-7t64 libncursesw6 \
+        libevent-2.1-7t64 libevent-core-2.1-7t64 libevent-pthreads-2.1-7t64 \
+        libncursesw6 \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
+# Note: libevent on Ubuntu 24.04 is split across multiple binary
+# packages — libevent-2.1-7t64 ships only the base lib; tmux also
+# needs libevent_core (libevent-core-2.1-7t64) and libevent_pthreads
+# (libevent-pthreads-2.1-7t64). Installing only the base package
+# leaves tmux unable to start with "libevent_core-2.1.so.7: cannot
+# open shared object file".
 
 # tmux from source (3.6a, sha256-pinned in `tmux-build` above) for parity
 # with the main dev image's status-bar features.
