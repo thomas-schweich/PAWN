@@ -57,7 +57,12 @@ pub fn run_tier(
     tier_index: usize,
 ) -> anyhow::Result<TierResult> {
     let tier = &cfg.tiers[tier_index];
-    let tier_dir = cfg.output_dir.join(&tier.name);
+    // `~/...` expansion mirrors what we do for stockfish_path, so configs
+    // that use `output_dir: "~/sf-data"` work the same way the Python
+    // sync orchestrator (which calls os.path.expanduser) interprets them.
+    // Without this, the rust binary would write to a literal `./~/sf-data`
+    // dir while the orchestrator watches `$HOME/sf-data`, breaking sync.
+    let tier_dir = expand_tilde(&cfg.output_dir).join(&tier.name);
     std::fs::create_dir_all(&tier_dir)
         .with_context(|| format!("creating tier dir {}", tier_dir.display()))?;
 
