@@ -44,8 +44,10 @@ pub enum GameError {
     UnexpectedNoneBestmove,
 }
 
-/// Number of times `current_hash` appears in `history` (including itself if
-/// the caller has already pushed it). The caller maintains the convention.
+/// Number of times `current_hash` appears in `history`. The caller is
+/// expected to push the current position into `history` before calling,
+/// so a return value of `>= 3` means the third occurrence has been seen
+/// (the FIDE 3-fold threshold).
 fn count_repetitions(history: &[u64], current_hash: u64) -> usize {
     history.iter().filter(|&&h| h == current_hash).count()
 }
@@ -118,7 +120,10 @@ pub fn play_game<R: Rng + ?Sized>(
 
     for ply in 0..max_ply {
         let cur_hash = *history.last().unwrap();
-        if let Some(reason) = detect_terminal(&board, &history[..history.len() - 1], cur_hash, ply as usize) {
+        // Pass the FULL history (current included). `count_repetitions`'s
+        // contract is "count of current_hash in history", so >= 3 means
+        // the position has now occurred 3 times — the FIDE threshold.
+        if let Some(reason) = detect_terminal(&board, &history, cur_hash, ply as usize) {
             return Ok(PlayedGame { uci_moves: moves, outcome: reason });
         }
 
@@ -128,7 +133,10 @@ pub fn play_game<R: Rng + ?Sized>(
             current_pv = Some(target_pv);
         }
 
-        let res = sf.candidates(&moves, tier.nodes)?;
+        // Use the incremental position cache: we pushed the previous move
+        // via `play_move` below, so the cached position string is already
+        // up to date and we can skip rebuilding the full move list.
+        let res = sf.candidates_after_play_moves()?;
         if res.terminal.is_some() {
             // We pre-checked all terminals; SF saying (none) here is a bug.
             return Err(GameError::UnexpectedNoneBestmove);
@@ -151,6 +159,7 @@ pub fn play_game<R: Rng + ?Sized>(
             .map_err(|_| GameError::IllegalMoveFromStockfish { uci: pick.uci.clone() })?;
         board.play_unchecked(m);
         history.push(zobrist(&board));
+        sf.play_move(&pick.uci);
         moves.push(pick.uci.clone());
     }
 
@@ -192,7 +201,24 @@ mod tests {
     fn detect_terminal_starting_position_is_alive() {
         let pos = Chess::default();
         let h = zobrist(&pos);
-        assert!(detect_terminal(&pos, &[], h, 0).is_none());
+        assert!(detect_terminal(&pos, &[h], h, 0).is_none());
+    }
+
+    #[test]
+    fn detect_terminal_fires_on_third_occurrence_not_fourth() {
+        // Regression test for the off-by-one that originally counted
+        // *prior* occurrences instead of total: a position seen 3 times
+        // (including the current one) MUST trigger the rule. Anything
+        // less than 3 must not.
+        let pos = Chess::default();
+        let h = zobrist(&pos);
+        // 1st occurrence of `h` (just the current).
+        assert!(detect_terminal(&pos, &[h], h, 0).is_none());
+        // 2nd occurrence (one prior + current).
+        assert!(detect_terminal(&pos, &[h, h], h, 0).is_none());
+        // 3rd occurrence: must fire.
+        let outcome = detect_terminal(&pos, &[h, h, h], h, 0);
+        assert_eq!(outcome, Some(OutcomeReason::ThreefoldRepetition));
     }
 
     fn stockfish_path() -> Option<std::path::PathBuf> {
@@ -231,15 +257,14 @@ mod tests {
             eprintln!("skipping: no stockfish binary");
             return;
         };
-        let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16).unwrap();
+        let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, 1).unwrap();
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let game = play_game(&mut sf, &mut rng, &smoke_tier(), 512).unwrap();
         assert!(!game.uci_moves.is_empty(), "game produced no moves");
         // Re-tokenize via engine and verify all moves are legal under the rules.
         let refs: Vec<&str> = game.uci_moves.iter().map(|s| s.as_str()).collect();
-        let (tokens, san, n) = chess_engine::uci::uci_to_tokens_and_san(&refs);
-        assert_eq!(n, game.uci_moves.len(), "engine rejected one of the moves");
-        assert_eq!(tokens.len(), game.uci_moves.len());
+        let (tokens, san) = chess_engine::uci::uci_to_tokens_and_san(&refs);
+        assert_eq!(tokens.len(), game.uci_moves.len(), "engine rejected one of the moves");
         assert_eq!(san.len(), game.uci_moves.len());
         sf.shutdown();
         eprintln!(
@@ -262,14 +287,14 @@ mod tests {
         };
         let tier = smoke_tier();
         let game_a = {
-            let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16).unwrap();
+            let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, 1).unwrap();
             let mut rng = ChaCha8Rng::seed_from_u64(12345);
             let g = play_game(&mut sf, &mut rng, &tier, 512).unwrap();
             sf.shutdown();
             g
         };
         let game_b = {
-            let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16).unwrap();
+            let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, 1).unwrap();
             let mut rng = ChaCha8Rng::seed_from_u64(12345);
             let g = play_game(&mut sf, &mut rng, &tier, 512).unwrap();
             sf.shutdown();

@@ -69,17 +69,15 @@ fn real_main() -> anyhow::Result<()> {
                 let elapsed = tier_t0.elapsed();
                 let rate = result.n_games_written as f64 / elapsed.as_secs_f64().max(1e-9);
                 eprintln!(
-                    "[{}] {}/{} games in {:.1}s ({:.1} games/s); {} shards, {} dropped",
+                    "[{}] {}/{} games in {:.1}s ({:.1} games/s); {} shards",
                     cfg.tiers[tier_index].name,
                     result.n_games_written,
                     cfg.tiers[tier_index].n_games,
                     elapsed.as_secs_f64(),
                     rate,
                     result.shards.len(),
-                    result.n_games_dropped,
                 );
                 totals.games += result.n_games_written;
-                totals.dropped += result.n_games_dropped;
                 totals.shards += result.shards.len() as u64;
             }
 
@@ -87,9 +85,8 @@ fn real_main() -> anyhow::Result<()> {
             eprintln!();
             eprintln!("=== run complete ===");
             eprintln!(
-                "wrote {} games ({} dropped) across {} shards in {:.1}m",
+                "wrote {} games across {} shards in {:.1}m",
                 totals.games,
-                totals.dropped,
                 totals.shards,
                 total_elapsed.as_secs_f64() / 60.0,
             );
@@ -102,7 +99,6 @@ fn real_main() -> anyhow::Result<()> {
 #[derive(Default)]
 struct Totals {
     games: u64,
-    dropped: u64,
     shards: u64,
 }
 

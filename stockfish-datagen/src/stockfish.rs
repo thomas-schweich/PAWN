@@ -11,7 +11,7 @@
 //! different Stockfish ships a different NNUE and would silently produce
 //! different games from the same `(game_seed, config)` pair.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -67,24 +67,56 @@ pub enum TerminalKind {
 
 pub struct StockfishProcess {
     child: Child,
-    stdin: ChildStdin,
+    /// Buffered to coalesce the multiple small writes per `send` into one
+    /// kernel write per command. `ChildStdin` is unbuffered by default.
+    stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     line_buf: String,
+    /// Reused per-call scratch for `position startpos moves ...`. Maintained
+    /// incrementally — appended to per move, reset on `new_game()` — so we
+    /// don't allocate or recopy O(ply²) text per game.
+    position_cmd: String,
+    /// Pre-rendered `go nodes N` (constant for the lifetime of a process).
+    go_cmd: String,
     /// Banner line value (e.g. `Stockfish 18 by the Stockfish developers`)
     /// captured from the `id name <X>` line. Stored for diagnostics; the
     /// version check itself happens in the constructor.
     pub id_name: String,
 }
 
+impl Drop for StockfishProcess {
+    /// Safety net: ensure the Stockfish subprocess is reaped on any error
+    /// path. `Child` does NOT kill on drop in std (Rust stdlib guarantee),
+    /// so without this, every `?`-returned error in a worker would leak a
+    /// Stockfish process.
+    fn drop(&mut self) {
+        // Best effort: try a graceful quit, then kill if still alive.
+        let _ = writeln!(self.stdin, "quit");
+        let _ = self.stdin.flush();
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
 impl StockfishProcess {
     /// Spawn Stockfish, complete the UCI handshake, set the standard options,
-    /// and verify the version against `expected_version`. The expected string
-    /// is matched as a prefix of the `id name` line (so a config of
-    /// `"Stockfish 18"` accepts `"Stockfish 18 by the Stockfish developers"`).
+    /// and verify the version against `expected_version`.
+    ///
+    /// The expected string is matched at a word boundary against the
+    /// child's `id name` line: equal, or `"<expected> "` is a prefix of
+    /// `id_name`. This ensures `"Stockfish 1"` does NOT match `"Stockfish 18"`,
+    /// which a naive `starts_with` would.
+    ///
+    /// `nodes` here is the per-process budget — every `candidates()` call
+    /// uses it as the `go nodes N` value, so it's pre-rendered into
+    /// `self.go_cmd` to avoid per-ply formatting.
     pub fn spawn(
         path: &Path,
         expected_version: &str,
         hash_mb: u32,
+        nodes: u32,
     ) -> Result<Self, StockfishError> {
         let mut child = Command::new(path)
             .stdin(Stdio::piped())
@@ -96,7 +128,7 @@ impl StockfishProcess {
                 source: e,
             })?;
 
-        let stdin = child.stdin.take().expect("piped");
+        let stdin = BufWriter::new(child.stdin.take().expect("piped"));
         let stdout = BufReader::new(child.stdout.take().expect("piped"));
 
         let mut sf = Self {
@@ -104,6 +136,8 @@ impl StockfishProcess {
             stdin,
             stdout,
             line_buf: String::with_capacity(512),
+            position_cmd: String::with_capacity(64 + 5 * 256),
+            go_cmd: format!("go nodes {nodes}"),
             id_name: String::new(),
         };
 
@@ -126,8 +160,11 @@ impl StockfishProcess {
         self.wait_for_token("readyok")
     }
 
-    /// Tell Stockfish a new game is starting; resets internal heuristics.
+    /// Tell Stockfish a new game is starting; resets internal heuristics
+    /// and our incremental `position_cmd` buffer.
     pub fn new_game(&mut self) -> Result<(), StockfishError> {
+        self.position_cmd.clear();
+        self.position_cmd.push_str("position startpos");
         self.send("ucinewgame")?;
         self.send("isready")?;
         self.wait_for_token("readyok")
@@ -136,22 +173,54 @@ impl StockfishProcess {
     /// Run `go nodes N` from the position reached by playing `moves` from
     /// the start position. Returns up to MultiPV candidates with their
     /// centipawn scores.
+    ///
+    /// `moves` must be the FULL move list from the start; this method
+    /// rebuilds its incremental buffer to match. If you'd prefer the
+    /// fast incremental path (one move at a time), call `play_move`
+    /// after each ply and use [`Self::candidates_after_play_moves`].
     pub fn candidates(
         &mut self,
         moves: &[String],
-        nodes: u32,
     ) -> Result<CandidatesResult, StockfishError> {
-        let mut cmd = String::with_capacity(16 + moves.iter().map(|m| m.len() + 1).sum::<usize>());
-        cmd.push_str("position startpos");
+        // Rebuild the position cmd from scratch. With incremental usage
+        // (callers using play_move), this branch is rarely the hot path.
+        self.position_cmd.clear();
+        self.position_cmd.push_str("position startpos");
         if !moves.is_empty() {
-            cmd.push_str(" moves");
+            self.position_cmd.push_str(" moves");
             for m in moves {
-                cmd.push(' ');
-                cmd.push_str(m);
+                self.position_cmd.push(' ');
+                self.position_cmd.push_str(m);
             }
         }
-        self.send(&cmd)?;
-        self.send(&format!("go nodes {nodes}"))?;
+        self.candidates_after_play_moves()
+    }
+
+    /// Append a single UCI move to the cached position so the next
+    /// [`Self::candidates_after_play_moves`] call doesn't have to rebuild
+    /// the move list from scratch.
+    pub fn play_move(&mut self, uci: &str) {
+        // First move after `new_game()` needs the " moves" preamble.
+        if !self.position_cmd.contains(" moves") {
+            self.position_cmd.push_str(" moves");
+        }
+        self.position_cmd.push(' ');
+        self.position_cmd.push_str(uci);
+    }
+
+    /// Issue `go nodes N` against the cached position (built incrementally
+    /// via [`Self::play_move`] or rebuilt by [`Self::candidates`]).
+    pub fn candidates_after_play_moves(
+        &mut self,
+    ) -> Result<CandidatesResult, StockfishError> {
+        // Write position + go through the BufWriter, then a single flush.
+        // Splitting the writes lets the BufWriter coalesce the two short
+        // commands into one syscall pair instead of three.
+        self.stdin.write_all(self.position_cmd.as_bytes())?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.write_all(self.go_cmd.as_bytes())?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
 
         // Map keyed by multipv index. Later (deeper) info lines for the
         // same index overwrite earlier ones.
@@ -171,7 +240,13 @@ impl StockfishProcess {
                 let _ = parts.next(); // "bestmove"
                 let mv = parts.next().unwrap_or("");
                 if mv == "(none)" {
-                    let terminal = if last_score_was_mate0 || by_pv.is_empty() && last_score_was_mate0 {
+                    // No legal moves. The earlier expression had a dead
+                    // disjunct (`A || (B && A)` collapses to `A`). Real
+                    // intent: any positive mate-score signal in the info
+                    // lines (or no info lines at all, which is what
+                    // Stockfish emits when there are no moves to score)
+                    // means checkmate; otherwise stalemate.
+                    let terminal = if last_score_was_mate0 || by_pv.is_empty() {
                         Some(TerminalKind::Checkmate)
                     } else {
                         Some(TerminalKind::Stalemate)
@@ -266,7 +341,13 @@ impl StockfishProcess {
                 "no `id name` line in UCI handshake".into(),
             ));
         }
-        if !self.id_name.starts_with(expected) {
+        // Word-boundary match. Naive `starts_with(expected)` would
+        // accept e.g. `"Stockfish 1"` as a prefix of `"Stockfish 18"`.
+        // Require equality OR `<expected> ` (so the next char must be a
+        // space, signalling the version token has ended).
+        let matches = self.id_name == expected
+            || self.id_name.starts_with(&format!("{expected} "));
+        if !matches {
             return Err(StockfishError::VersionMismatch {
                 expected: expected.to_string(),
                 actual: self.id_name.clone(),
@@ -288,31 +369,35 @@ struct ParsedInfo {
 /// first move of the principal variation, and the score in centipawns
 /// (mate scores folded to ±30000). Returns `None` if the line doesn't carry
 /// the three fields we need.
+///
+/// Streams over the line — no `Vec<&str>` allocation. With Stockfish at
+/// higher node counts emitting hundreds of `info` lines per `go`, this
+/// matters cumulatively.
 fn parse_info_multipv(line: &str) -> Option<ParsedInfo> {
     if !line.starts_with("info ") || !line.contains(" multipv ") {
         return None;
     }
-    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let mut it = line.split_whitespace();
 
     let mut pv_idx: Option<u32> = None;
     let mut score: Option<f32> = None;
     let mut score_was_mate_zero = false;
     let mut first_move: Option<String> = None;
 
-    let mut i = 0;
-    while i < tokens.len() {
-        match tokens[i] {
-            "multipv" if i + 1 < tokens.len() => {
-                pv_idx = tokens[i + 1].parse().ok();
-                i += 2;
+    while let Some(tok) = it.next() {
+        match tok {
+            "multipv" => {
+                pv_idx = it.next().and_then(|s| s.parse().ok());
             }
-            "score" if i + 2 < tokens.len() => {
-                match tokens[i + 1] {
-                    "cp" => {
-                        score = tokens[i + 2].parse::<f32>().ok();
+            "score" => {
+                let kind = it.next();
+                let val = it.next();
+                match (kind, val) {
+                    (Some("cp"), Some(v)) => {
+                        score = v.parse::<f32>().ok();
                     }
-                    "mate" => {
-                        if let Ok(m) = tokens[i + 2].parse::<i32>() {
+                    (Some("mate"), Some(v)) => {
+                        if let Ok(m) = v.parse::<i32>() {
                             score = Some(if m > 0 { 30_000.0 } else { -30_000.0 });
                             if m == 0 {
                                 score_was_mate_zero = true;
@@ -321,13 +406,14 @@ fn parse_info_multipv(line: &str) -> Option<ParsedInfo> {
                     }
                     _ => {}
                 }
-                i += 3;
             }
-            "pv" if i + 1 < tokens.len() => {
-                first_move = Some(tokens[i + 1].to_string());
+            "pv" => {
+                // First move of the PV — and we're done; later tokens
+                // are the rest of the line we don't care about.
+                first_move = it.next().map(|s| s.to_string());
                 break;
             }
-            _ => i += 1,
+            _ => {}
         }
     }
 
@@ -401,11 +487,11 @@ mod tests {
             eprintln!("skipping: no stockfish binary at $HOME/bin/stockfish");
             return;
         };
-        let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16).unwrap();
+        let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, 1).unwrap();
         assert!(sf.id_name.starts_with("Stockfish"), "got id_name={:?}", sf.id_name);
         sf.set_multi_pv(5).unwrap();
         sf.new_game().unwrap();
-        let res = sf.candidates(&[], 1).unwrap();
+        let res = sf.candidates(&[]).unwrap();
         assert!(res.terminal.is_none());
         assert!(!res.candidates.is_empty(), "expected at least one candidate from start position");
         // First-move candidates from start position should look like UCI
@@ -422,7 +508,7 @@ mod tests {
             eprintln!("skipping: no stockfish binary at $HOME/bin/stockfish");
             return;
         };
-        match StockfishProcess::spawn(&path, "Stockfish 9999", 16) {
+        match StockfishProcess::spawn(&path, "Stockfish 9999", 16, 1) {
             Err(StockfishError::VersionMismatch { .. }) => {}
             Err(e) => panic!("expected VersionMismatch, got {e:?}"),
             Ok(_) => panic!("expected VersionMismatch, got Ok"),

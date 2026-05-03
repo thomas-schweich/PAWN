@@ -110,6 +110,26 @@ impl RunConfig {
         if self.n_workers == 0 {
             anyhow::bail!("n_workers must be > 0");
         }
+        // worker_id is stored as i16 in the parquet schema.
+        if self.n_workers > i16::MAX as u32 {
+            anyhow::bail!(
+                "n_workers={} exceeds i16::MAX ({}); the parquet `worker_id` column is Int16",
+                self.n_workers,
+                i16::MAX,
+            );
+        }
+        // game_length is stored as u16. With max_ply=512 (default) we're
+        // nowhere near this, but reject pathological configs explicitly.
+        if self.max_ply > u16::MAX as u32 {
+            anyhow::bail!(
+                "max_ply={} exceeds u16::MAX ({}); the parquet `game_length` column is UInt16",
+                self.max_ply,
+                u16::MAX,
+            );
+        }
+        if self.shard_size_games == 0 {
+            anyhow::bail!("shard_size_games must be > 0");
+        }
         if self.tiers.is_empty() {
             anyhow::bail!("at least one tier required");
         }
@@ -152,10 +172,33 @@ impl RunConfig {
     /// formatting differences are normalized away). Stored alongside each
     /// tier's manifest so resume can refuse to continue under a changed
     /// config.
+    ///
+    /// Prefer [`Self::tier_fingerprint`] for resume-time tier validation —
+    /// this whole-config hash is too coarse (adding a new tier to the
+    /// config invalidates every existing tier's manifest).
     pub fn fingerprint(&self) -> String {
         let canonical = serde_json::to_vec(self).expect("config is round-trippable");
         let mut h = Sha256::new();
         h.update(&canonical);
+        hex(&h.finalize())
+    }
+
+    /// Per-tier fingerprint covering only the inputs that would change
+    /// the *bytes generated for that tier*: the tier's own config, its
+    /// declaration index, the master seed, the pinned Stockfish version,
+    /// and the shard size. Adding/modifying *other* tiers leaves this
+    /// fingerprint untouched, so users can grow their config over time
+    /// without invalidating prior runs.
+    pub fn tier_fingerprint(&self, tier_index: usize) -> String {
+        let payload = serde_json::json!({
+            "tier_index": tier_index,
+            "tier": &self.tiers[tier_index],
+            "master_seed": self.master_seed,
+            "stockfish_version": &self.stockfish_version,
+            "shard_size_games": self.shard_size_games,
+        });
+        let mut h = Sha256::new();
+        h.update(payload.to_string().as_bytes());
         hex(&h.finalize())
     }
 }
@@ -247,5 +290,68 @@ mod tests {
         a.master_seed = 1;
         b.master_seed = 2;
         assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn validate_rejects_zero_shard_size() {
+        let mut c = minimal_config();
+        c.shard_size_games = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_oversized_n_workers() {
+        let mut c = minimal_config();
+        c.n_workers = i16::MAX as u32 + 1;
+        let err = c.validate().unwrap_err();
+        assert!(format!("{err:#}").contains("Int16"), "got {err:#}");
+    }
+
+    #[test]
+    fn validate_rejects_oversized_max_ply() {
+        let mut c = minimal_config();
+        c.max_ply = u16::MAX as u32 + 1;
+        let err = c.validate().unwrap_err();
+        assert!(format!("{err:#}").contains("UInt16"), "got {err:#}");
+    }
+
+    #[test]
+    fn tier_fingerprint_isolates_tiers() {
+        let mut a = minimal_config();
+        a.tiers.push(TierConfig {
+            name: "second".into(),
+            nodes: 32,
+            n_games: 50,
+            multi_pv: 5,
+            opening_multi_pv: 5,
+            opening_plies: 0,
+            sample_plies: 999,
+            temperature: 1.0,
+        });
+        let mut b = a.clone();
+        // Change only tier 1.
+        b.tiers[1].n_games = 75;
+        // Tier 0's fingerprint must NOT change just because tier 1 did.
+        assert_eq!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+        // Tier 1's fingerprint MUST change.
+        assert_ne!(a.tier_fingerprint(1), b.tier_fingerprint(1));
+    }
+
+    #[test]
+    fn tier_fingerprint_changes_with_master_seed() {
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.master_seed = 1;
+        b.master_seed = 2;
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn tier_fingerprint_changes_with_stockfish_version() {
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.stockfish_version = "Stockfish 17".into();
+        b.stockfish_version = "Stockfish 18".into();
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
     }
 }

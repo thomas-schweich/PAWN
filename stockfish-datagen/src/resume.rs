@@ -98,11 +98,10 @@ pub fn detect_resume(tier_dir: &Path) -> anyhow::Result<HashMap<u32, WorkerResum
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TierManifest {
     pub tier_name: String,
-    /// `RunConfig::fingerprint()` — refuse to skip if the user's config
-    /// has changed since the tier was generated.
+    /// `RunConfig::tier_fingerprint(tier_index)` — refuse to skip if the
+    /// inputs that affect this tier's data have changed.
     pub config_fingerprint: String,
     pub n_games_written: u64,
-    pub n_games_dropped: u64,
     /// Shard file names, relative to the tier dir.
     pub shards: Vec<String>,
     /// ISO-8601 UTC. Purely informational.
@@ -131,7 +130,18 @@ impl TierManifest {
         let p = Self::path(tier_dir);
         let tmp = p.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(self)?;
-        fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        // fsync the manifest before rename for the same reason we fsync
+        // shards: rename is atomic on the dirent but does not imply data
+        // durability. A power failure between rename and journal commit
+        // could leave a zero-byte _manifest.json that incorrectly signals
+        // "tier complete" on the next run.
+        {
+            let mut f = fs::File::create(&tmp)
+                .with_context(|| format!("creating {}", tmp.display()))?;
+            use std::io::Write as _;
+            f.write_all(&bytes).with_context(|| format!("writing {}", tmp.display()))?;
+            f.sync_all().context("fsyncing manifest")?;
+        }
         fs::rename(&tmp, &p).with_context(|| format!("renaming {} -> {}", tmp.display(), p.display()))?;
         Ok(())
     }
@@ -239,7 +249,6 @@ mod tests {
             tier_name: "nodes_0001".into(),
             config_fingerprint: "abc123".into(),
             n_games_written: 100,
-            n_games_dropped: 0,
             shards: vec!["shard-w000-c0000.parquet".into()],
             completed_at: "2026-05-02T00:00:00Z".into(),
         };

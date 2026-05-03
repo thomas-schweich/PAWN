@@ -195,7 +195,13 @@ impl ShardWriter {
             let mut writer = ArrowWriter::try_new(file, SCHEMA.clone(), Some(props))
                 .context("opening parquet writer")?;
             writer.write(&batch).context("writing record batch")?;
-            writer.close().context("closing parquet writer")?;
+            // ArrowWriter::close() returns the wrapped File via into_inner.
+            // We need access to it to issue an fsync before the rename so
+            // the data is durable across power failures (otherwise the
+            // rename can succeed while the file's contents are still in
+            // the page cache, leaving a corrupt parquet on disk).
+            let file = writer.into_inner().context("flushing parquet writer")?;
+            file.sync_all().context("fsyncing shard")?;
         }
 
         fs::rename(&self.tmp_path, &self.final_path)

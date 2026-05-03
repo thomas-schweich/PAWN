@@ -1,27 +1,11 @@
 //! Outcome classification for self-play games.
 //!
-//! Token IDs mirror `engine/src/vocab.rs` exactly — kept as `const`s here
-//! rather than imported from `chess_engine` so the values are visible
-//! at-a-glance and a mismatch with the model's vocabulary surfaces in code
-//! review rather than at training time.
+//! Token IDs are imported directly from `chess_engine::vocab` — single
+//! source of truth, no drift risk. The constants are re-exported below
+//! so callers don't have to depend on chess_engine's module path.
 
-pub const WHITE_CHECKMATES: u16 = 1969;
-pub const BLACK_CHECKMATES: u16 = 1970;
-pub const STALEMATE: u16 = 1971;
-pub const DRAW_BY_RULE: u16 = 1972;
-pub const PLY_LIMIT: u16 = 1973;
-
-#[cfg(test)]
-const _: () = {
-    // Mirror of engine/src/vocab.rs constants. If engine ever shifts these,
-    // the tests below break loudly. (We can't import the consts directly
-    // because chess_engine doesn't re-export them as `pub use`; this is the
-    // deliberate "code-review tripwire" pattern.)
-    assert!(WHITE_CHECKMATES == 1969);
-    assert!(BLACK_CHECKMATES == 1970);
-    assert!(STALEMATE == 1971);
-    assert!(DRAW_BY_RULE == 1972);
-    assert!(PLY_LIMIT == 1973);
+pub use chess_engine::vocab::{
+    BLACK_CHECKMATES, DRAW_BY_RULE, PLY_LIMIT, STALEMATE, WHITE_CHECKMATES,
 };
 
 /// Why a game ended. Maps to `outcome_token` and `result` columns.

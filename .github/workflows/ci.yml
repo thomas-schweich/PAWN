@@ -22,10 +22,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
+            target
             engine/target
             ~/.cargo/registry
             ~/.cargo/git
-          key: rust-${{ hashFiles('engine/Cargo.lock') }}
+          key: rust-${{ hashFiles('Cargo.lock') }}
           restore-keys: rust-
 
       - name: Install uv
@@ -44,3 +45,11 @@ jobs:
 
       - name: Tests
         run: uv run pytest tests/ -x -q -m "not gpu"
+
+      # Rust workspace tests. The stockfish-datagen crate has live tests
+      # that require a real Stockfish binary; those self-skip when
+      # $HOME/bin/stockfish isn't present, so CI without Stockfish runs
+      # the non-live subset only. (Set STOCKFISH_PATH in the runner env
+      # to enable the live tests.)
+      - name: Rust workspace tests
+        run: cargo test --workspace --release

@@ -25,7 +25,6 @@ use crate::stockfish::StockfishProcess;
 #[derive(Debug, Clone)]
 pub struct TierResult {
     pub n_games_written: u64,
-    pub n_games_dropped: u64,
     pub shards: Vec<PathBuf>,
 }
 
@@ -36,22 +35,14 @@ pub enum Progress {
     Heartbeat {
         worker_id: u32,
         games_done: u64,
-        games_dropped: u64,
     },
     /// Worker finished cleanly. Last shard already closed.
     Done {
         worker_id: u32,
         games_written: u64,
-        games_dropped: u64,
         shards: Vec<PathBuf>,
     },
 }
-
-/// Maximum fraction of games a single worker is allowed to drop before we
-/// fail the tier. Drops indicate something the engine couldn't tokenize —
-/// either a real bug or Stockfish proposing an illegal move. >=0.1% means
-/// something is structurally wrong, not just one-off noise.
-const MAX_DROP_FRACTION: f64 = 0.001;
 
 /// Run one tier end-to-end. Spawns `cfg.n_workers` worker threads, each
 /// generating its share of `tier.n_games`. Returns summary stats.
@@ -70,7 +61,11 @@ pub fn run_tier(
     std::fs::create_dir_all(&tier_dir)
         .with_context(|| format!("creating tier dir {}", tier_dir.display()))?;
 
-    let fingerprint = cfg.fingerprint();
+    // Per-tier fingerprint: covers the relevant inputs only (this tier's
+    // config + tier_index + master_seed + stockfish_version + shard size).
+    // Adding or modifying *other* tiers in the run config does NOT
+    // invalidate prior tiers' manifests.
+    let fingerprint = cfg.tier_fingerprint(tier_index);
 
     // Skip if already complete.
     if let Some(manifest) = TierManifest::load(&tier_dir)? {
@@ -81,7 +76,6 @@ pub fn run_tier(
             );
             return Ok(TierResult {
                 n_games_written: manifest.n_games_written,
-                n_games_dropped: manifest.n_games_dropped,
                 shards: manifest
                     .shards
                     .iter()
@@ -90,8 +84,8 @@ pub fn run_tier(
             });
         } else {
             return Err(anyhow!(
-                "[{}] manifest exists but config fingerprint differs (manifest {} vs current {}); \
-                 either restore the original config or delete {}",
+                "[{}] manifest exists but tier fingerprint differs (manifest {} vs current {}); \
+                 either restore the original config for this tier or delete {}",
                 tier.name,
                 manifest.config_fingerprint,
                 fingerprint,
@@ -126,7 +120,40 @@ pub fn run_tier(
     let tier_dir = Arc::new(tier_dir);
 
     let (tx, rx) = crossbeam_channel::unbounded::<Progress>();
+
+    // Spawn the progress drain BEFORE any workers. If the drain spawn
+    // fails, no workers exist yet to leak. (Worker spawn failure after
+    // this point is handled by waiting for already-spawned workers below.)
+    let drain_handle = std::thread::Builder::new()
+        .name("sfd-progress".into())
+        .spawn({
+            let tier_name = tier.name.clone();
+            move || -> Vec<Progress> {
+                let mut completions = Vec::new();
+                for msg in rx {
+                    match &msg {
+                        Progress::Heartbeat { worker_id, games_done } => {
+                            eprintln!(
+                                "  [{tier_name} worker {worker_id:>2}] {games_done:>7} done",
+                            );
+                        }
+                        Progress::Done { worker_id, games_written, shards } => {
+                            eprintln!(
+                                "  [{tier_name} worker {worker_id:>2}] DONE: {games_written} written, {} shards",
+                                shards.len(),
+                            );
+                            completions.push(msg);
+                            continue;
+                        }
+                    }
+                }
+                completions
+            }
+        })
+        .context("spawning progress drain")?;
+
     let mut handles = Vec::with_capacity(cfg.n_workers as usize);
+    let mut spawn_err: Option<anyhow::Error> = None;
 
     for worker_id in 0..cfg.n_workers {
         let target = split[worker_id as usize];
@@ -145,50 +172,30 @@ pub fn run_tier(
         let tx = tx.clone();
         let start_index = resume.games_done;
         let start_chunk = resume.next_chunk_idx;
-        let h = std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name(format!("sfd-w{worker_id}"))
             .spawn(move || {
                 run_worker(
                     &cfg, &tier, &tier_dir, worker_id, worker_seed,
                     start_index, start_chunk, target, tx,
                 )
-            })
-            .with_context(|| format!("spawning worker {worker_id}"))?;
-        handles.push((worker_id, h));
+            });
+        match spawn_result {
+            Ok(h) => handles.push((worker_id, h)),
+            Err(e) => {
+                spawn_err = Some(anyhow!(e).context(format!("spawning worker {worker_id}")));
+                break;
+            }
+        }
     }
     // Drop the original sender so the channel closes once all worker
-    // clones are dropped (i.e. when all workers exit).
+    // clones are dropped (i.e. when all workers exit). Important to do
+    // this even on spawn-error path so the drain thread terminates.
     drop(tx);
-
-    // Drain progress — runs concurrently with the workers.
-    let drain_handle = std::thread::Builder::new()
-        .name("sfd-progress".into())
-        .spawn(move || -> Vec<Progress> {
-            let mut completions = Vec::new();
-            for msg in rx {
-                match &msg {
-                    Progress::Heartbeat { worker_id, games_done, games_dropped } => {
-                        eprintln!(
-                            "  [worker {worker_id:>2}] {games_done:>7} done, {games_dropped} dropped",
-                        );
-                    }
-                    Progress::Done { worker_id, games_written, games_dropped, shards } => {
-                        eprintln!(
-                            "  [worker {worker_id:>2}] DONE: {games_written} written, {games_dropped} dropped, {} shards",
-                            shards.len(),
-                        );
-                        completions.push(msg);
-                        continue;
-                    }
-                }
-            }
-            completions
-        })
-        .context("spawning progress drain")?;
 
     // Wait for all workers, surface the first error if any panicked or
     // returned Err.
-    let mut first_err: Option<anyhow::Error> = None;
+    let mut first_err: Option<anyhow::Error> = spawn_err;
     for (worker_id, h) in handles {
         match h.join() {
             Ok(Ok(())) => {}
@@ -209,16 +216,21 @@ pub fn run_tier(
         }
     }
 
-    let completions = drain_handle.join().map_err(|_| anyhow!("progress drain panicked"))?;
-
+    // Wait for the drain to finish even on the error path so we don't
+    // leak the thread. Suppress drain-panic if we already have a real
+    // worker error to surface — the drain panic is almost always a
+    // downstream symptom of the worker error.
+    let drain_result = drain_handle.join();
     if let Some(e) = first_err {
         return Err(e);
     }
+    let completions = drain_result.map_err(|_| anyhow!("progress drain panicked"))?;
 
     let mut total_written = total_resume_done;
-    let mut total_dropped = 0u64;
     let mut all_shards: Vec<PathBuf> = Vec::new();
-    // Add resumed shards too.
+    // The dir-scan picks up both resumed shards and shards just written
+    // this run; that's all the shards we need. Workers' Done messages
+    // tell us only how many fresh games were written.
     for entry in std::fs::read_dir(tier_dir.as_path())? {
         let entry = entry?;
         if entry.path().extension().is_some_and(|e| e == "parquet") {
@@ -226,52 +238,26 @@ pub fn run_tier(
         }
     }
     for msg in completions {
-        if let Progress::Done { games_written, games_dropped, shards, .. } = msg {
+        if let Progress::Done { games_written, .. } = msg {
             total_written += games_written;
-            total_dropped += games_dropped;
-            for s in shards {
-                if !all_shards.contains(&s) {
-                    all_shards.push(s);
-                }
-            }
         }
     }
     all_shards.sort();
-    all_shards.dedup();
-
-    let target_total: u64 = split.iter().sum();
-    let drop_frac = if target_total > 0 {
-        total_dropped as f64 / target_total as f64
-    } else {
-        0.0
-    };
-    if drop_frac > MAX_DROP_FRACTION {
-        return Err(anyhow!(
-            "[{}] drop rate too high: {} dropped / {} target = {:.3}% > {:.3}%",
-            tier.name,
-            total_dropped,
-            target_total,
-            drop_frac * 100.0,
-            MAX_DROP_FRACTION * 100.0,
-        ));
-    }
 
     eprintln!(
-        "[{}] complete: {} written, {} dropped, {} shards",
+        "[{}] complete: {} written, {} shards",
         tier.name,
         total_written,
-        total_dropped,
         all_shards.len(),
     );
 
     // Write the manifest as the very last step — its presence is the
-    // signal that the tier is done. The shard list is sorted + deduped
-    // and stored as filenames relative to the tier dir.
+    // signal that the tier is done. The shard list is sorted and stored
+    // as filenames relative to the tier dir.
     let manifest = TierManifest {
         tier_name: tier.name.clone(),
         config_fingerprint: fingerprint,
         n_games_written: total_written,
-        n_games_dropped: total_dropped,
         shards: all_shards
             .iter()
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -282,7 +268,6 @@ pub fn run_tier(
 
     Ok(TierResult {
         n_games_written: total_written,
-        n_games_dropped: total_dropped,
         shards: all_shards,
     })
 }
@@ -343,6 +328,7 @@ fn run_worker(
         &expand_tilde(&cfg.stockfish_path),
         &cfg.stockfish_version,
         cfg.stockfish_hash_mb,
+        tier.nodes,
     )
     .with_context(|| format!("spawning stockfish for worker {worker_id}"))?;
     let stockfish_id_name = sf.id_name.clone();
@@ -351,12 +337,15 @@ fn run_worker(
     // run's last shard (if partial) was already closed and counted in
     // start_index. We can't append to a closed parquet, so the next file
     // gets a fresh chunk index.
+    // Hoisted out of the per-game loop: same value every row, so cloning
+    // the Arc<str> per row is one pointer copy instead of a String alloc.
+    let stockfish_version: Arc<str> = Arc::from(stockfish_id_name.as_str());
+
     let shard_size = cfg.shard_size_games as u64;
     let mut current_chunk = start_chunk;
     let mut games_in_shard = 0u64;
     let mut writer: Option<ShardWriter> = None;
     let mut total_written = 0u64;
-    let mut total_dropped = 0u64;
     let mut shards = Vec::new();
 
     for game_index in start_index..target {
@@ -364,22 +353,36 @@ fn run_worker(
         let mut rng = ChaCha8Rng::seed_from_u64(game_seed);
 
         let played = play_game(&mut sf, &mut rng, tier, cfg.max_ply)
-            .with_context(|| format!("playing game {game_index}"))?;
+            .with_context(|| format!("playing game {game_index} (seed {game_seed})"))?;
 
+        // play_game must produce at least one move — the starting position
+        // is never terminal. An empty result indicates a bug in either the
+        // pre-move terminal check or play_game itself. Hard-error rather
+        // than silently dropping, so dropped games never desync game_index
+        // from the row count (which would break resume).
         if played.uci_moves.is_empty() {
-            total_dropped += 1;
-            continue;
+            return Err(anyhow!(
+                "worker {worker_id} game {game_index} (seed {game_seed}): \
+                 play_game returned zero moves — likely terminal-check bug"
+            ));
         }
 
         // Re-tokenize via the canonical encoder. Stockfish should never
-        // give us an unparseable move list, but verify anyway and drop
-        // (with counter) if it does.
+        // give us an unparseable move list — if it does, hard-error so the
+        // run aborts deterministically and resume picks up from the failed
+        // index without skipping it.
         let refs: Vec<&str> = played.uci_moves.iter().map(|s| s.as_str()).collect();
-        let (tokens, san, n) = chess_engine::uci::uci_to_tokens_and_san(&refs);
-        if n != played.uci_moves.len() || n == 0 {
-            total_dropped += 1;
-            continue;
+        let (tokens, san) = chess_engine::uci::uci_to_tokens_and_san(&refs);
+        if tokens.len() != played.uci_moves.len() {
+            let bad = played.uci_moves.get(tokens.len()).cloned().unwrap_or_default();
+            return Err(anyhow!(
+                "worker {worker_id} game {game_index} (seed {game_seed}): \
+                 engine rejected move {} of {}: {bad:?}",
+                tokens.len(),
+                played.uci_moves.len(),
+            ));
         }
+        let n = tokens.len();
 
         let row = GameRow {
             tokens: tokens.into_iter().map(|t| t as i16).collect(),
@@ -395,8 +398,11 @@ fn run_worker(
             sample_plies: tier.sample_plies as i32,
             temperature: tier.temperature,
             worker_id: worker_id as i16,
+            // u64 → i64 bit-pattern cast: reader recovers the original u64
+            // via `value as u64`. See README "Reproducibility" + the
+            // `game_seed` field comment in shard.rs::SCHEMA.
             game_seed: game_seed as i64,
-            stockfish_version: stockfish_id_name.clone(),
+            stockfish_version: stockfish_version.to_string(),
         };
 
         if writer.is_none() {
@@ -417,7 +423,6 @@ fn run_worker(
             let _ = tx.send(Progress::Heartbeat {
                 worker_id,
                 games_done: game_index + 1 - start_index,
-                games_dropped: total_dropped,
             });
         }
     }
@@ -430,12 +435,13 @@ fn run_worker(
         }
     }
 
+    // shutdown is best-effort; the Drop impl on StockfishProcess is the
+    // safety net for early-error returns above.
     sf.shutdown();
 
     let _ = tx.send(Progress::Done {
         worker_id,
         games_written: total_written,
-        games_dropped: total_dropped,
         shards,
     });
     Ok(())
@@ -467,17 +473,11 @@ mod tests {
         if default.exists() { Some(default) } else { None }
     }
 
-    #[test]
-    fn live_run_tier_smoke() {
-        let Some(sf_path) = stockfish_path() else {
-            eprintln!("skipping: no stockfish binary");
-            return;
-        };
-        let dir = tempdir().unwrap();
-        let cfg = RunConfig {
+    fn smoke_config(sf_path: std::path::PathBuf, dir: std::path::PathBuf) -> RunConfig {
+        RunConfig {
             stockfish_path: sf_path,
             stockfish_version: "Stockfish".into(),
-            output_dir: dir.path().to_path_buf(),
+            output_dir: dir,
             master_seed: 7,
             n_workers: 2,
             max_ply: 512,
@@ -493,14 +493,93 @@ mod tests {
                 sample_plies: 12,
                 temperature: 1.0,
             }],
+        }
+    }
+
+    #[test]
+    fn live_run_tier_smoke() {
+        let Some(sf_path) = stockfish_path() else {
+            eprintln!("skipping: no stockfish binary");
+            return;
         };
+        let dir = tempdir().unwrap();
+        let cfg = smoke_config(sf_path, dir.path().to_path_buf());
         let result = run_tier(&cfg, 0).unwrap();
-        assert_eq!(result.n_games_written + result.n_games_dropped, 16);
+        // No drops are tolerated anymore, so written must equal target.
+        assert_eq!(result.n_games_written, 16);
         // 2 workers × 8 games each = exactly 1 shard per worker, so 2 total.
         assert_eq!(result.shards.len(), 2);
         for shard in &result.shards {
             assert!(shard.exists(), "shard {} missing", shard.display());
             assert!(shard.extension().unwrap() == "parquet");
         }
+    }
+
+    /// Resume regression: pre-populate one worker's shard, then run.
+    /// That worker should be skipped entirely; only the other one should
+    /// generate, and the final manifest should reflect the combined total.
+    #[test]
+    fn live_resume_skips_completed_worker() {
+        let Some(sf_path) = stockfish_path() else {
+            eprintln!("skipping: no stockfish binary");
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let cfg = smoke_config(sf_path, dir.path().to_path_buf());
+
+        // First run — full 16 games across 2 workers.
+        let r1 = run_tier(&cfg, 0).unwrap();
+        assert_eq!(r1.n_games_written, 16);
+        let shard0_paths_before: Vec<_> = r1.shards.clone();
+
+        // Delete the manifest and one worker's shard. Resume should
+        // re-run only that worker.
+        let tier_dir = cfg.output_dir.join(&cfg.tiers[0].name);
+        std::fs::remove_file(tier_dir.join("_manifest.json")).unwrap();
+        let w1_shard = tier_dir.join("shard-w001-c0000.parquet");
+        let w0_shard = tier_dir.join("shard-w000-c0000.parquet");
+        let w0_bytes_before = std::fs::read(&w0_shard).unwrap();
+        std::fs::remove_file(&w1_shard).unwrap();
+
+        let r2 = run_tier(&cfg, 0).unwrap();
+        assert_eq!(r2.n_games_written, 16, "resumed total must equal target");
+        assert!(w1_shard.exists(), "resumed worker should have re-created its shard");
+        // Worker 0's shard must be byte-identical: it was skipped, not regenerated.
+        let w0_bytes_after = std::fs::read(&w0_shard).unwrap();
+        assert_eq!(w0_bytes_before, w0_bytes_after, "completed worker's shard should be untouched");
+        // Shard count unchanged — same 2 shards.
+        assert_eq!(r2.shards.len(), shard0_paths_before.len());
+    }
+
+    /// Tier fingerprint scoping regression: changing an UNRELATED tier
+    /// must NOT invalidate this tier's manifest.
+    #[test]
+    fn live_unrelated_tier_change_doesnt_invalidate() {
+        let Some(sf_path) = stockfish_path() else {
+            eprintln!("skipping: no stockfish binary");
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let mut cfg = smoke_config(sf_path, dir.path().to_path_buf());
+        cfg.tiers.push(TierConfig {
+            name: "second".into(),
+            nodes: 1,
+            n_games: 8,
+            multi_pv: 5,
+            opening_multi_pv: 20,
+            opening_plies: 1,
+            sample_plies: 12,
+            temperature: 1.0,
+        });
+
+        // Run only tier 0.
+        let r1 = run_tier(&cfg, 0).unwrap();
+        assert_eq!(r1.n_games_written, 16);
+
+        // Modify tier 1's config (n_games up). Tier 0's manifest must
+        // still be honored on re-run.
+        cfg.tiers[1].n_games = 999;
+        let r2 = run_tier(&cfg, 0).unwrap();
+        assert_eq!(r2.n_games_written, 16, "tier 0 should be skipped via manifest");
     }
 }

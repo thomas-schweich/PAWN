@@ -1,6 +1,5 @@
 //! Temperature-controlled softmax over Stockfish MultiPV candidates.
 //!
-//! Identical semantics to the Python script's `softmax_sample`:
 //! `temperature` is in pawns, so a 100-cp gap shifts probabilities by an
 //! e-fold at temperature=1.0. `temperature <= 0` falls back to argmax.
 //! Single-candidate input short-circuits without consuming RNG state.
