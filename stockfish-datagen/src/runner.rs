@@ -18,7 +18,7 @@ use crate::config::{RunConfig, TierConfig};
 use crate::game::play_game;
 use crate::resume::{TierManifest, TierState, detect_resume};
 use crate::seed;
-use crate::shard::{GameRow, ShardWriter, shard_path};
+use crate::shard::{GameRow, ShardWriter};
 use crate::stockfish::StockfishProcess;
 
 /// Results from a successful tier run.
@@ -288,7 +288,7 @@ pub fn run_tier(
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        let Some((worker_id, _chunk)) = crate::resume::parse_shard_filename(&name_str)
+        let Some((worker_id, _chunk, _rows)) = crate::resume::parse_shard_filename(&name_str)
         else {
             continue;
         };
@@ -462,7 +462,7 @@ fn run_worker(
         };
 
         if writer.is_none() {
-            writer = Some(ShardWriter::create(shard_path(tier_dir, worker_id, current_chunk))?);
+            writer = Some(ShardWriter::create(tier_dir.to_path_buf(), worker_id, current_chunk)?);
         }
         writer.as_mut().unwrap().append(&row);
         games_in_shard += 1;

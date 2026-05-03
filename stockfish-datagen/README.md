@@ -61,13 +61,20 @@ without replaying earlier games.
 ```
 <output_dir>/
   <tier_name>/
-    _manifest.json                    # written last, signals tier-complete
-    shard-w000-c0000.parquet          # one shard per (worker, chunk)
-    shard-w000-c0001.parquet
+    _manifest.json                              # written last, signals tier-complete
+    shard-w000-c0000-r000834.parquet            # one shard per (worker, chunk); -r<N> is the row count
+    shard-w000-c0001-r000833.parquet
     ...
-    shard-w011-c0000.parquet
+    shard-w011-c0000-r000833.parquet
     ...
 ```
+
+The trailing `-r<NNNNNN>` field encodes the row count at six zero-padded
+digits (so any `shard_size_games <= 999_999` fits). Resume reads this
+straight from the directory listing rather than opening parquet metadata,
+which lets a remote-sync tool drop zero-byte placeholder files locally
+that the resume logic treats identically to real shards. See the
+HuggingFace sync section below.
 
 Shards are zstd-compressed parquet (level 3). They're written
 atomically: `shard-…parquet.tmp` is fsynced, then renamed to
@@ -137,6 +144,61 @@ tier-state's fingerprint.
 - **Long multi-tier jobs** are checkpointed at tier granularity. A
   crash in tier N doesn't affect manifests for tiers 0..N-1, and the
   rerun resumes tier N from its last completed shard per worker.
+
+## Fire-and-forget pod runs (HuggingFace sync)
+
+`scripts/datagen_with_hf_sync.py` wraps the rust binary so a pod can
+generate to a HuggingFace dataset without an operator in the loop, and
+resume after a crash without re-downloading the existing shards.
+
+```bash
+HF_TOKEN=... python scripts/datagen_with_hf_sync.py \
+    --config stockfish-datagen/examples/stockfish_20m.json \
+    --repo-id thomas-schweich/pawn-stockfish-20m \
+    --prune-local
+```
+
+Three phases run in one process:
+
+1. **Primer.** Lists the dataset repo. Downloads the per-tier sentinels
+   (`_manifest.json`, `_tier_state.json`) into the local output dir.
+   For every remote shard file, creates a *zero-byte placeholder* at the
+   matching local path. Because the rust binary's resume logic recovers
+   `(worker_id, chunk_idx, n_rows)` from the filename alone, a directory
+   full of placeholders looks identical to a directory full of real
+   shards — no parquet metadata is read on resume, so no actual data
+   needs to be downloaded.
+2. **Subprocess.** Spawns `stockfish-datagen run --config <cfg>`.
+   SIGINT/SIGTERM are forwarded so the rust binary's graceful-shutdown
+   semantics are preserved.
+3. **Watcher.** A daemon thread polls the output dir every
+   `--poll-interval` seconds (default 30 s) and uploads any new
+   completed shards (and updated sentinels) via `HfApi.upload_file`.
+   Zero-byte placeholders are skipped — those are already remote.
+   With `--prune-local`, the local file is replaced with a zero-byte
+   placeholder after a successful upload, so disk usage stays flat
+   regardless of the run's total size.
+
+Pod recipe (Docker image's default entrypoint dispatches to this script
+when both env vars are set):
+
+```bash
+docker run --rm -d \
+    -e HF_TOKEN=... \
+    -e DATAGEN_HF_REPO=thomas-schweich/pawn-stockfish-20m \
+    -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_20m.json \
+    -e DATAGEN_PRUNE_LOCAL=1 \
+    -v /workspace/sf:/workspace/sf \
+    pawn-datagen
+```
+
+Caveats:
+
+- Don't run two pods writing to the same dataset repo. There's no
+  cross-process locking; concurrent writers will race on commits.
+- The rust binary's tier-state fingerprint check still applies after
+  primer download — if the local config doesn't match the remote
+  `_tier_state.json`, the run aborts before generating anything.
 
 ## Failure model
 

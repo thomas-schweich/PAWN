@@ -75,6 +75,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip curl libopenblas0 \
     && rm -rf /var/lib/apt/lists/*
 
+# huggingface_hub is needed by the datagen_with_hf_sync.py orchestrator —
+# it primes the local output dir from a HuggingFace dataset on startup
+# and uploads completed shards in the background as the rust binary
+# generates them. `--break-system-packages` is required on python:3.12-slim
+# / ubuntu:24.04's PEP 668-marked system python.
+RUN pip3 install --break-system-packages --no-cache-dir \
+        "huggingface_hub>=0.24"
+
 # Stockfish 18 (opt-in: --build-arg INCLUDE_STOCKFISH=1)
 ARG INCLUDE_STOCKFISH=0
 RUN if [ "$INCLUDE_STOCKFISH" = "1" ]; then \
@@ -105,29 +113,55 @@ RUN mkdir -p /opt/lc0_nets \
 # Generation scripts. The Stockfish self-play generator is now a
 # standalone Rust binary (`stockfish-datagen`) built in `sfd-builder`
 # above and copied in below; the legacy Python script was removed in
-# favor of it. The Lc0 + benchmark scripts remain Python.
+# favor of it. The Lc0 + benchmark scripts remain Python, and the
+# datagen_with_hf_sync.py orchestrator wraps the rust binary with
+# fire-and-forget HuggingFace dataset sync.
 WORKDIR /opt/datagen
 COPY scripts/benchmark_stockfish_nodes.py scripts/
 COPY scripts/generate_lc0_data.py scripts/
+COPY scripts/datagen_with_hf_sync.py scripts/
 
 # Copy the prebuilt stockfish-datagen binary in from the builder stage.
 # Self-contained — the only runtime dependency is the Stockfish binary
 # (installed earlier when --build-arg INCLUDE_STOCKFISH=1).
 COPY --from=sfd-builder /build/target/release/stockfish-datagen /usr/local/bin/stockfish-datagen
 
-RUN lc0 --help 2>&1 | head -1 \
-    && stockfish-datagen --help 2>&1 | head -1
+# Example configs, so a pod can run with --config /opt/datagen/examples/...
+# without needing the source tree mounted.
+COPY stockfish-datagen/examples /opt/datagen/examples
 
-# Dispatcher entrypoint: route `*.py` args to python3 (preserves the
-# original Lc0-via-Python invocation) and pass anything else through
-# as a regular command. This lets both work without --entrypoint
-# overrides:
+RUN lc0 --help 2>&1 | head -1 \
+    && stockfish-datagen --help 2>&1 | head -1 \
+    && python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)"
+
+# Dispatcher entrypoint:
+#   - if no args, default to the HF-sync orchestrator iff DATAGEN_HF_REPO
+#     and DATAGEN_CONFIG are set (the fire-and-forget pod path).
+#   - if first arg ends in `.py`, run it via python3.
+#   - otherwise exec the command directly.
+# This lets all three modes work without --entrypoint overrides:
+#   # Pod fire-and-forget (env vars provide repo + config):
+#   docker run -e DATAGEN_HF_REPO=org/name -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_20m.json ... pawn-datagen
+#   # Lc0 generator:
 #   docker run ... pawn-datagen scripts/generate_lc0_data.py --output ...
+#   # Bare rust binary (no HF sync):
 #   docker run ... pawn-datagen stockfish-datagen run --config ...
 RUN cat > /usr/local/bin/datagen-entrypoint <<'EOF'
 #!/bin/sh
+set -e
 if [ $# -eq 0 ]; then
+    if [ -n "$DATAGEN_HF_REPO" ] && [ -n "$DATAGEN_CONFIG" ]; then
+        # Fire-and-forget pod mode. Extra flags can be passed via DATAGEN_EXTRA_ARGS.
+        exec python3 /opt/datagen/scripts/datagen_with_hf_sync.py \
+            --config "$DATAGEN_CONFIG" \
+            --repo-id "$DATAGEN_HF_REPO" \
+            ${DATAGEN_PRUNE_LOCAL:+--prune-local} \
+            ${DATAGEN_POLL_INTERVAL:+--poll-interval "$DATAGEN_POLL_INTERVAL"} \
+            $DATAGEN_EXTRA_ARGS
+    fi
     echo "datagen: no command given. Examples:" >&2
+    echo "  # fire-and-forget pod sync (set HF_TOKEN too):" >&2
+    echo "  docker run -e DATAGEN_HF_REPO=org/name -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_20m.json pawn-datagen" >&2
     echo "  docker run pawn-datagen scripts/generate_lc0_data.py --output ..." >&2
     echo "  docker run pawn-datagen stockfish-datagen run --config ..." >&2
     exit 64

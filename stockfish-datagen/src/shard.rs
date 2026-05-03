@@ -1,7 +1,15 @@
 //! One parquet shard per worker per chunk. Atomic on disk: written to
-//! `<path>.tmp` and renamed on close, so a crash mid-shard leaves a
-//! `.tmp` orphan rather than a half-valid `.parquet`. Resume scans only
-//! `.parquet` files.
+//! `shard-w<NNN>-c<NNNN>.parquet.tmp` and renamed on close to
+//! `shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet`, where the trailing `r` field
+//! is the row count. Encoding the row count in the filename lets resume
+//! determine `(worker, chunk, n_rows)` from a directory listing alone —
+//! no parquet metadata reads required. That in turn lets a remote sync
+//! tool (e.g. an HF dataset uploader) drop zero-byte placeholder files
+//! locally that the resume code can read just like real shards, so we
+//! can resume on a fresh pod without re-downloading any actual data.
+//!
+//! A crash mid-shard leaves a `.tmp` orphan rather than a half-valid
+//! `.parquet`. Resume scans only `.parquet` files.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -72,7 +80,9 @@ pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
 /// shard size (~10k games × ~150 plies × few bytes/move = ~15MB), so we
 /// don't need streaming writes within a shard.
 pub struct ShardWriter {
-    final_path: PathBuf,
+    tier_dir: PathBuf,
+    shard_worker_id: u32,
+    shard_chunk_idx: u32,
     tmp_path: PathBuf,
     tokens: ListBuilder<Int16Builder>,
     san: ListBuilder<StringBuilder>,
@@ -93,18 +103,22 @@ pub struct ShardWriter {
 }
 
 impl ShardWriter {
-    pub fn create(final_path: PathBuf) -> anyhow::Result<Self> {
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating shard dir {}", parent.display()))?;
-        }
-        let tmp_path = final_path.with_extension("parquet.tmp");
+    /// Open a writer for `(worker_id, chunk_idx)` under `tier_dir`. The
+    /// final filename — which includes the row count — is determined at
+    /// `close()` time, so writes go to a row-count-free `.parquet.tmp`
+    /// path and the rename happens at the end.
+    pub fn create(tier_dir: PathBuf, worker_id: u32, chunk_idx: u32) -> anyhow::Result<Self> {
+        fs::create_dir_all(&tier_dir)
+            .with_context(|| format!("creating shard dir {}", tier_dir.display()))?;
+        let tmp_path = shard_tmp_path(&tier_dir, worker_id, chunk_idx);
         // Best effort: clean up any leftover .tmp from a prior crash before
         // we start writing this shard.
         let _ = fs::remove_file(&tmp_path);
 
         Ok(Self {
-            final_path,
+            tier_dir,
+            shard_worker_id: worker_id,
+            shard_chunk_idx: chunk_idx,
             tmp_path,
             tokens: ListBuilder::new(Int16Builder::new()),
             san: ListBuilder::new(StringBuilder::new()),
@@ -162,13 +176,19 @@ impl ShardWriter {
     }
 
     /// Materialize the buffered rows, write the parquet, and atomically
-    /// rename `.tmp` → final path. Consumes self.
+    /// rename `.tmp` → final path (which includes the row count). Consumes self.
     pub fn close(mut self) -> anyhow::Result<PathBuf> {
         if self.n_rows == 0 {
             // Nothing to write — clean up the (never-created) tmp and return.
             let _ = fs::remove_file(&self.tmp_path);
-            anyhow::bail!("ShardWriter::close called with zero rows for {}", self.final_path.display());
+            anyhow::bail!(
+                "ShardWriter::close called with zero rows for w{:03}-c{:04} in {}",
+                self.shard_worker_id, self.shard_chunk_idx, self.tier_dir.display(),
+            );
         }
+        let final_path = shard_final_path(
+            &self.tier_dir, self.shard_worker_id, self.shard_chunk_idx, self.n_rows as u64,
+        );
 
         let columns: Vec<ArrayRef> = vec![
             Arc::new(self.tokens.finish()),
@@ -209,16 +229,25 @@ impl ShardWriter {
             file.sync_all().context("fsyncing shard")?;
         }
 
-        fs::rename(&self.tmp_path, &self.final_path)
-            .with_context(|| format!("renaming {} -> {}", self.tmp_path.display(), self.final_path.display()))?;
-        Ok(self.final_path)
+        fs::rename(&self.tmp_path, &final_path)
+            .with_context(|| format!("renaming {} -> {}", self.tmp_path.display(), final_path.display()))?;
+        Ok(final_path)
     }
 }
 
-/// Standard naming: `<tier_dir>/shard-w<worker:03>-c<chunk:04>.parquet`.
-/// Caller is responsible for ensuring `tier_dir` is created.
-pub fn shard_path(tier_dir: &Path, worker_id: u32, chunk_idx: u32) -> PathBuf {
-    tier_dir.join(format!("shard-w{worker_id:03}-c{chunk_idx:04}.parquet"))
+/// In-progress path: `<tier_dir>/shard-w<NNN>-c<NNNN>.parquet.tmp`.
+/// The row count is unknown until close, so the tmp filename omits it.
+pub fn shard_tmp_path(tier_dir: &Path, worker_id: u32, chunk_idx: u32) -> PathBuf {
+    tier_dir.join(format!("shard-w{worker_id:03}-c{chunk_idx:04}.parquet.tmp"))
+}
+
+/// Final, post-rename path: `<tier_dir>/shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet`.
+/// Encoding the row count in the filename lets resume — and remote-sync
+/// placeholder files — recover `(worker, chunk, n_rows)` from a directory
+/// listing alone. `n_rows` is zero-padded to 6 digits, which fits any
+/// `shard_size_games <= 999_999`.
+pub fn shard_final_path(tier_dir: &Path, worker_id: u32, chunk_idx: u32, n_rows: u64) -> PathBuf {
+    tier_dir.join(format!("shard-w{worker_id:03}-c{chunk_idx:04}-r{n_rows:06}.parquet"))
 }
 
 #[cfg(test)]
@@ -249,24 +278,25 @@ mod tests {
     }
 
     #[test]
-    fn shard_path_is_zero_padded() {
-        let p = shard_path(Path::new("/tmp/x"), 3, 17);
-        assert_eq!(p, PathBuf::from("/tmp/x/shard-w003-c0017.parquet"));
+    fn shard_paths_are_zero_padded() {
+        let tmp = shard_tmp_path(Path::new("/tmp/x"), 3, 17);
+        assert_eq!(tmp, PathBuf::from("/tmp/x/shard-w003-c0017.parquet.tmp"));
+        let final_p = shard_final_path(Path::new("/tmp/x"), 3, 17, 834);
+        assert_eq!(final_p, PathBuf::from("/tmp/x/shard-w003-c0017-r000834.parquet"));
     }
 
     #[test]
     fn write_then_read_round_trips() {
         let dir = tempdir().unwrap();
-        let path = shard_path(dir.path(), 0, 0);
-        let mut w = ShardWriter::create(path.clone()).unwrap();
+        let mut w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
         for i in 0..5 {
             w.append(&fake_row(1000 + i));
         }
         let written = w.close().unwrap();
-        assert_eq!(written, path);
+        assert_eq!(written, shard_final_path(dir.path(), 0, 0, 5));
 
         // Re-read via parquet's own reader and verify shape + a couple of cells.
-        let file = File::open(&path).unwrap();
+        let file = File::open(&written).unwrap();
         let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
         let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
         assert_eq!(batches.len(), 1);
@@ -292,11 +322,10 @@ mod tests {
     #[test]
     fn high_bit_game_seed_round_trips() {
         let dir = tempdir().unwrap();
-        let path = shard_path(dir.path(), 0, 0);
-        let mut w = ShardWriter::create(path.clone()).unwrap();
+        let mut w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
         let big = 0xFFFF_FFFF_FFFF_FFFFu64; // u64::MAX — sign bit set
         w.append(&fake_row(big));
-        w.close().unwrap();
+        let path = w.close().unwrap();
 
         let file = File::open(&path).unwrap();
         let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
@@ -313,23 +342,22 @@ mod tests {
     #[test]
     fn close_with_no_rows_errors() {
         let dir = tempdir().unwrap();
-        let path = shard_path(dir.path(), 0, 0);
-        let w = ShardWriter::create(path).unwrap();
+        let w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
         assert!(w.close().is_err());
     }
 
     #[test]
     fn tmp_orphan_is_cleaned_up_on_create() {
         let dir = tempdir().unwrap();
-        let path = shard_path(dir.path(), 0, 0);
-        let tmp = path.with_extension("parquet.tmp");
+        let tmp = shard_tmp_path(dir.path(), 0, 0);
         // Plant a fake .tmp orphan.
         std::fs::write(&tmp, b"garbage").unwrap();
         assert!(tmp.exists());
-        let mut w = ShardWriter::create(path.clone()).unwrap();
+        let mut w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
         assert!(!tmp.exists(), "create() should have cleaned up the orphan tmp");
         w.append(&fake_row(0));
         let final_path = w.close().unwrap();
         assert!(final_path.exists());
+        assert_eq!(final_path, shard_final_path(dir.path(), 0, 0, 1));
     }
 }
