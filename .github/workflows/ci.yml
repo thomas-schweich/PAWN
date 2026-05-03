@@ -51,5 +51,9 @@ jobs:
       # $HOME/bin/stockfish isn't present, so CI without Stockfish runs
       # the non-live subset only. (Set STOCKFISH_PATH in the runner env
       # to enable the live tests.)
+      #
+      # `--nocapture` so the live tests' "skipping: ..." eprintln
+      # messages appear in the CI log — otherwise a CI run without
+      # Stockfish reports them as silently passing.
       - name: Rust workspace tests
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release -- --nocapture

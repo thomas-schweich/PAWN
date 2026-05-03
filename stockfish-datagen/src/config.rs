@@ -120,6 +120,12 @@ impl RunConfig {
         }
         // game_length is stored as u16. With max_ply=512 (default) we're
         // nowhere near this, but reject pathological configs explicitly.
+        if self.max_ply == 0 {
+            // play_game's `for ply in 0..max_ply` loop would never run,
+            // returning an empty move list that the worker would mis-
+            // attribute to a "terminal-check bug" hard error.
+            anyhow::bail!("max_ply must be >= 1");
+        }
         if self.max_ply > u16::MAX as u32 {
             anyhow::bail!(
                 "max_ply={} exceeds u16::MAX ({}); the parquet `game_length` column is UInt16",
@@ -186,9 +192,29 @@ impl RunConfig {
     /// Per-tier fingerprint covering only the inputs that would change
     /// the *bytes generated for that tier*: the tier's own config, its
     /// declaration index, the master seed, the pinned Stockfish version,
-    /// and the shard size. Adding/modifying *other* tiers leaves this
-    /// fingerprint untouched, so users can grow their config over time
-    /// without invalidating prior runs.
+    /// the shard size, the per-game ply cap, and the worker count.
+    /// Adding/modifying *other* tiers leaves this fingerprint untouched,
+    /// so users can grow their config over time without invalidating
+    /// prior runs.
+    ///
+    /// Why every field matters for resume safety:
+    /// - `tier` / `tier_index` / `master_seed`: directly seed every game.
+    /// - `stockfish_version`: different NNUE → different game outcomes.
+    /// - `shard_size_games`: changes which games end up in which shard
+    ///   file, which would silently invalidate the resume row-count math.
+    /// - `max_ply`: longer games may now resolve where they previously
+    ///   hit `PLY_LIMIT`; outcome tokens differ.
+    /// - `n_workers`: changes the (worker_id, game_index) partition AND
+    ///   each game's seed (since `game_seed = mix(worker_seed, idx)`),
+    ///   so an old shard's games are not a prefix of the new run.
+    ///
+    /// Implementation note: `serde_json::Value::Object` is `BTreeMap`
+    /// (we don't enable the `preserve_order` feature), so the serialized
+    /// JSON has keys in alphabetical order regardless of how they're
+    /// listed below. This makes the fingerprint stable across builds.
+    /// **Do not enable `preserve_order` on `serde_json` without a
+    /// fingerprint version bump.** A pinned golden-value test
+    /// (`tier_fingerprint_golden`) catches accidental drift.
     pub fn tier_fingerprint(&self, tier_index: usize) -> String {
         let payload = serde_json::json!({
             "tier_index": tier_index,
@@ -196,6 +222,8 @@ impl RunConfig {
             "master_seed": self.master_seed,
             "stockfish_version": &self.stockfish_version,
             "shard_size_games": self.shard_size_games,
+            "max_ply": self.max_ply,
+            "n_workers": self.n_workers,
         });
         let mut h = Sha256::new();
         h.update(payload.to_string().as_bytes());
@@ -353,5 +381,49 @@ mod tests {
         a.stockfish_version = "Stockfish 17".into();
         b.stockfish_version = "Stockfish 18".into();
         assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn tier_fingerprint_changes_with_max_ply() {
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.max_ply = 256;
+        b.max_ply = 512;
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn tier_fingerprint_changes_with_n_workers() {
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.n_workers = 4;
+        b.n_workers = 8;
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    /// Pin the exact serialized JSON byte-for-byte. If serde or our
+    /// payload structure ever changes the emission order or formatting,
+    /// this test fires loudly — better than silently invalidating every
+    /// existing manifest in production.
+    ///
+    /// To regenerate after an INTENTIONAL change: run the test, copy
+    /// the printed `actual` value below.
+    #[test]
+    fn tier_fingerprint_golden() {
+        let cfg = minimal_config();
+        let actual = cfg.tier_fingerprint(0);
+        let expected = "29cd96241fea62cb47b689e8df1397aa9b7fac969a8ebe8bf1b73003a6f9b4a3";
+        assert_eq!(
+            actual, expected,
+            "tier_fingerprint changed for minimal_config — verify the change is intentional, then update the expected value"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_ply() {
+        let mut c = minimal_config();
+        c.max_ply = 0;
+        let err = c.validate().unwrap_err();
+        assert!(format!("{err:#}").contains("max_ply"), "got {err:#}");
     }
 }

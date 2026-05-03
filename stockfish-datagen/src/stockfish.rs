@@ -199,7 +199,18 @@ impl StockfishProcess {
     /// Append a single UCI move to the cached position so the next
     /// [`Self::candidates_after_play_moves`] call doesn't have to rebuild
     /// the move list from scratch.
+    ///
+    /// **Contract:** the caller must have established a valid base
+    /// position first, either via [`Self::new_game`] (which seeds the
+    /// cache with `position startpos`) or via [`Self::candidates`]
+    /// (which rebuilds the cache from a full move list). Calling
+    /// `play_move` against a freshly-spawned process with no prior
+    /// `new_game` call would produce a malformed UCI command.
     pub fn play_move(&mut self, uci: &str) {
+        debug_assert!(
+            !self.position_cmd.is_empty(),
+            "play_move called before new_game / candidates — no base position",
+        );
         // First move after `new_game()` needs the " moves" preamble.
         if !self.position_cmd.contains(" moves") {
             self.position_cmd.push_str(" moves");

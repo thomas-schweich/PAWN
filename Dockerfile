@@ -66,19 +66,28 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN pip install --no-cache-dir maturin
 
-# Cache Cargo dependency downloads — only re-fetched when Cargo.toml/lock change
-WORKDIR /build/engine
-COPY engine/Cargo.toml engine/Cargo.lock ./
+# Cache Cargo dependency downloads — only re-fetched when the workspace
+# Cargo.toml / Cargo.lock change. The lockfile lives at the repo root
+# now (workspace), not in engine/.
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY engine/Cargo.toml engine/Cargo.toml
+COPY stockfish-datagen/Cargo.toml stockfish-datagen/Cargo.toml
 
-# Stub out the expected source layout so Cargo can resolve the crate,
-# then fetch dependencies into a cached layer. The real source files
-# are copied in the next step — only Cargo.toml/lock changes trigger
-# a re-download.
-RUN mkdir -p src python/chess_engine && \
-    touch src/lib.rs python/chess_engine/__init__.py && \
+# Stub out the expected source layout for both workspace members so
+# Cargo can resolve the crates, then fetch dependencies into a cached
+# layer. Only Cargo.toml/lock changes trigger a re-fetch.
+RUN mkdir -p engine/src engine/python/chess_engine \
+             stockfish-datagen/src && \
+    touch engine/src/lib.rs engine/python/chess_engine/__init__.py && \
+    echo 'fn main() {}' > stockfish-datagen/src/main.rs && \
+    echo '' > stockfish-datagen/src/lib.rs && \
     cargo fetch
 
-# Now copy actual source and build the wheel
+# Now copy actual source and build the wheel. We only need the engine
+# crate's wheel for the Python runtime; the stockfish-datagen binary
+# is built by Dockerfile.datagen.
+WORKDIR /build/engine
 COPY engine/pyproject.toml ./
 COPY engine/src/ src/
 COPY engine/python/ python/

@@ -75,12 +75,32 @@ RUN mkdir -p /opt/lc0_nets \
     && echo "78541c4abc0bc81e8145e1f9a4c35a934ebbefff70f11f33215751d55a886352  /opt/lc0_nets/t3-512x15.pb.gz" | sha256sum -c \
     && echo "e6ada9d6c4a769bfab3aa0848d82caeb809aa45f83e6c605fc58a31d21bdd618  /opt/lc0_nets/bt4-1024x15.pb.gz" | sha256sum -c
 
-# Generation scripts
+# Generation scripts. The Stockfish self-play generator is now a
+# standalone Rust binary (`stockfish-datagen`); the legacy Python
+# script was removed in favor of it. The Lc0 + benchmark scripts
+# remain Python.
 WORKDIR /opt/datagen
-COPY scripts/generate_stockfish_data.py scripts/
 COPY scripts/benchmark_stockfish_nodes.py scripts/
 COPY scripts/generate_lc0_data.py scripts/
 
-RUN lc0 --help 2>&1 | head -1
+# Build and install the Rust generator. We need cargo in this image
+# only for this build step; the resulting binary is self-contained
+# (the only runtime dependency is the Stockfish binary already
+# installed above).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && . $HOME/.cargo/env \
+    && mkdir -p /tmp/build/stockfish-datagen \
+    && true
+COPY Cargo.toml Cargo.lock /tmp/build/
+COPY engine /tmp/build/engine
+COPY stockfish-datagen /tmp/build/stockfish-datagen
+RUN . $HOME/.cargo/env \
+    && cd /tmp/build \
+    && cargo build --release -p stockfish-datagen \
+    && install -m 755 target/release/stockfish-datagen /usr/local/bin/ \
+    && rm -rf /tmp/build $HOME/.cargo $HOME/.rustup
+
+RUN lc0 --help 2>&1 | head -1 \
+    && stockfish-datagen --help 2>&1 | head -1
 
 ENTRYPOINT ["python3"]
