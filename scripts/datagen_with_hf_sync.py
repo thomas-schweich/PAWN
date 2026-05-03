@@ -90,11 +90,15 @@ def load_run_config(path: Path) -> dict[str, Any]:
 
 
 def expand_output_dir(cfg: dict[str, Any]) -> Path:
-    """Apply the same `~`-expansion rule the rust binary uses."""
-    p = Path(cfg["output_dir"])
-    if str(p).startswith("~"):
-        p = Path(os.path.expanduser(str(p)))
-    return p
+    """Tilde-expand `output_dir` so the orchestrator and the rust binary
+    agree on the absolute path.
+
+    The rust side's `expand_tilde` only handles `~/...` (no `~user/...`),
+    while `Path.expanduser()` handles both. In practice configs only use
+    `~/...`, so the two agree on the path the rust binary actually
+    writes to.
+    """
+    return Path(cfg["output_dir"]).expanduser()
 
 
 def tier_layouts(cfg: dict[str, Any]) -> list[TierLayout]:
@@ -346,8 +350,18 @@ def run_subprocess(
     """Spawn the rust binary into `proc_holder` (already-installed handlers).
 
     Signal handlers must already be installed when this is called.
-    The `proc_holder.append(...)` is fused with `Popen` to close the
-    micro-race between Popen returning and the holder being populated.
+    `proc_holder.append(subprocess.Popen(...))` shrinks but does not
+    fully close the race between the child existing and the holder
+    being populated — Python evaluates the inner `Popen(...)` first
+    (child spawns), then calls `.append(result)`. A signal delivered
+    between those two bytecode steps would find `proc_holder` empty
+    and orphan the freshly-spawned child. The window is nanoseconds in
+    practice; the defense is the `not proc_holder` check inside
+    `_forward` exiting with `128 + signum`, which still produces the
+    conventional shell exit even though the child leaks. Truly
+    closing the race needs `posix_spawn` (atomic) or holding off
+    signals around Popen via `signal.pthread_sigmask`, neither of
+    which we currently bother with.
     """
     proc_holder.append(subprocess.Popen([binary, "run", "--config", str(config_path)]))
     proc = proc_holder[0]
@@ -394,7 +408,8 @@ def main() -> int:
     # the same order the rest of huggingface_hub uses at request time.
     # Don't use `HfApi().token` — that only inspects env, not the
     # disk-cached login.
-    if get_token() is None:
+    token = get_token()
+    if token is None:
         LOG.error(
             "no HF token found in env (HF_TOKEN / HUGGING_FACE_HUB_TOKEN / "
             "HUGGINGFACE_HUB_TOKEN) or local credential store "
@@ -404,7 +419,11 @@ def main() -> int:
 
     cfg = load_run_config(args.config)
     tiers = tier_layouts(cfg)
-    api = HfApi()
+    # Pass the resolved token explicitly to make the connection between
+    # the fail-fast check and the API client visible. Without this, HfApi
+    # would re-resolve via `get_token()` itself — same end result, but
+    # the wiring is implicit.
+    api = HfApi(token=token)
 
     # We always touch the repo (cheap: one info-or-create round-trip)
     # before launching the rust binary. `HfApi.upload_file` does NOT
@@ -469,7 +488,8 @@ def main() -> int:
     # truncate the local file while the other is still reading it.
     #
     # The join timeout is generous because a watcher cycle in flight may
-    # be inside `_upload_one`'s retry chain (up to ~62s of backoff plus
+    # be inside `_upload_one`'s retry chain (up to ~30s of backoff —
+    # 2+4+8+16, since attempt 4 raises before its sleep — plus per-attempt
     # HTTP timeouts; multiple shards in one cycle multiplies this). If
     # the watcher is STILL alive after the timeout, we explicitly skip
     # the final drain rather than racing it — the un-drained shards
@@ -523,11 +543,13 @@ def main() -> int:
 def watcher_join_timeout(poll_interval: float) -> float:
     """Wait long enough for an in-flight upload retry chain to finish.
 
-    `_upload_one` does up to 5 attempts with exponential backoff
-    (2+4+8+16+32 = 62s) plus per-attempt HTTP timeout (~30s ceiling each).
-    A worst-case single-cycle stall is therefore ~5 minutes. We wait
-    twice that as headroom, capped to a sensible floor so quick polls
-    don't truncate the wait.
+    `_upload_one` does up to 5 attempts; the first 4 sleep for
+    2+4+8+16 = 30s of backoff total (attempt 4 raises BEFORE its sleep,
+    so the would-be 32s sleep never happens). Add per-attempt HTTP
+    timeouts (~30s ceiling each, ×5 attempts = 150s) and the worst-case
+    single-shard stall is ~3 minutes. With multiple shards per cycle
+    the cycle can take longer, so the 600s (10 min) floor gives ~3×
+    headroom over the worst single-shard case.
     """
     return max(poll_interval, 600.0)
 

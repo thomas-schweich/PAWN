@@ -151,6 +151,12 @@ impl StockfishProcess {
         Ok(sf)
     }
 
+    /// PID of the spawned Stockfish process. Used by the runner to pin
+    /// the child to the same core as its driving worker thread.
+    pub fn child_pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Set MultiPV. No-op if Stockfish is already at this value (caller's
     /// responsibility to track — sending duplicate `setoption` to Stockfish
     /// is allowed but slow because we must wait for `readyok`).

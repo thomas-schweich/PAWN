@@ -14,6 +14,7 @@ use crossbeam_channel::Sender;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
+use crate::affinity;
 use crate::config::{RunConfig, TierConfig};
 use crate::game::play_game;
 use crate::resume::{TierManifest, TierState, detect_resume};
@@ -385,6 +386,17 @@ fn run_worker(
     target: u64,
     tx: Sender<Progress>,
 ) -> anyhow::Result<()> {
+    // Pin THIS worker thread to a fixed core before spawning Stockfish.
+    // The (worker, Stockfish) pair is intrinsically serialized over the
+    // pipe (worker writes `position+go`, waits, reads `bestmove`), so
+    // they want to share the same core's L1/L2 — otherwise the kernel
+    // load-balances them across cores and L1/L2 evicts on every
+    // round-trip. On a 16-core local box at 16 workers we measured
+    // 23% kernel time and 537K ctx switches/sec; pinning addresses
+    // exactly that thrashing. At 128 threads with NUMA the upside
+    // grows. Linux-only — `set_for_current` no-ops on macOS.
+    affinity::pin_current_thread(worker_id);
+
     let mut sf = StockfishProcess::spawn(
         &cfg.stockfish_path,
         &cfg.stockfish_version,
@@ -392,6 +404,10 @@ fn run_worker(
         tier.nodes,
     )
     .with_context(|| format!("spawning stockfish for worker {worker_id}"))?;
+    // Pin the spawned Stockfish to the same core as this worker.
+    // Best-effort: a failure here just means the OS scheduler decides
+    // where the child runs, which is the pre-pinning baseline.
+    affinity::pin_pid(sf.child_pid(), worker_id);
     let stockfish_id_name = sf.id_name.clone();
 
     // On resume we always start a *new* shard at start_chunk — the prior
