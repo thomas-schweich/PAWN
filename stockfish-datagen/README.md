@@ -184,10 +184,22 @@ CLI flags worth knowing:
 - `--prune-local` — replace each local shard with a zero-byte
   placeholder after a successful upload. Use on disk-constrained pods.
 - `--no-primer` — skip the primer phase entirely (no network calls
-  before the first watcher tick). Useful for local testing or when
-  starting a brand-new dataset from scratch.
+  before the first shard is generated). Useful for local testing or
+  when starting a brand-new dataset from scratch.
 - `--poll-interval <seconds>` — watcher poll cadence. Default 30 s.
+- `--max-consecutive-failures <N>` — watcher gives up + SIGTERMs the
+  rust child after N consecutive cycle failures. Default 10
+  (~5 minutes at the default poll). Tune up for runs that may span
+  longer documented HF outages.
 - `--log-level {DEBUG,INFO,WARNING,ERROR}` — default INFO.
+
+Exit codes: `0` clean; non-zero `rc` from the rust binary if it
+failed; `3` watcher gave up after consecutive failures (auth/quota/
+permanent 4xx — the rust child is also SIGTERM'd, so partial output
+remains and is recoverable on the next run via the primer); `4`
+final drain failed (or was skipped because the watcher was still
+mid-upload at join timeout — local shards stay on disk and resume
+picks them up).
 
 Pod recipe (Docker image's default entrypoint dispatches to this script
 when both env vars are set):
@@ -206,12 +218,12 @@ Recognized env vars:
 
 | Env var                | Effect                                                        |
 |------------------------|---------------------------------------------------------------|
-| `HF_TOKEN`             | HuggingFace auth (mandatory).                                 |
+| `HF_TOKEN`             | HuggingFace auth (mandatory). Aliases `HUGGING_FACE_HUB_TOKEN` and `HUGGINGFACE_HUB_TOKEN` are also accepted, as is the on-disk credential store written by `hf auth login`. |
 | `DATAGEN_HF_REPO`      | Dataset repo, e.g. `org/name`. Required for the entrypoint.   |
 | `DATAGEN_CONFIG`       | Path to the run config inside the image.                      |
 | `DATAGEN_PRUNE_LOCAL`  | Any non-empty value enables `--prune-local`.                  |
 | `DATAGEN_POLL_INTERVAL`| Watcher poll seconds (overrides default 30).                  |
-| `DATAGEN_EXTRA_ARGS`   | Extra flags appended to the orchestrator command line.        |
+| `DATAGEN_EXTRA_ARGS`   | Extra flags appended to the orchestrator command line (e.g. `--max-consecutive-failures 30 --log-level DEBUG`). |
 
 Caveats:
 

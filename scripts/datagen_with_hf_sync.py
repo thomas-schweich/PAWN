@@ -41,7 +41,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from huggingface_hub import HfApi
 from huggingface_hub.errors import RepositoryNotFoundError
@@ -196,12 +196,12 @@ def _upload_one(api: HfApi, repo_id: str, repo_path: str, local_path: Path) -> N
             delay *= 2
 
 
-# If the watcher hits this many consecutive cycle failures, give up and
-# let the orchestrator surface the failure rather than churning forever.
-# At default poll=30s this is ~5 min of consecutive failures, which is
-# long enough to ride out transient HF outages but short enough to
-# fail the pod loudly when auth/quota is permanently broken.
-WATCHER_MAX_CONSECUTIVE_FAILURES = 10
+# Default consecutive-failure threshold; CLI-tunable via
+# `--max-consecutive-failures`. At default poll=30s, 10 failures is
+# ~5 min — long enough to ride out brief HF blips, short enough to
+# fail loudly on permanent auth/quota breakage. Tune up for runs
+# expected to span longer documented HF outages.
+DEFAULT_MAX_CONSECUTIVE_FAILURES = 10
 
 
 class WatcherFailed(Exception):
@@ -215,29 +215,43 @@ def watcher_loop(
     repo_id: str,
     tiers: list[TierLayout],
     uploaded: set[str],
+    upload_count: list[int],
     stop: threading.Event,
     poll_interval: float,
     prune_local: bool,
+    max_consecutive_failures: int,
     error_holder: list[BaseException],
+    on_terminal_failure: Callable[[], None] | None = None,
 ) -> None:
-    """Poll until `stop` is set. Stores any terminal exception in `error_holder`."""
+    """Poll until `stop` is set. Stores any terminal exception in `error_holder`.
+
+    On terminal failure (consecutive_failures >= max_consecutive_failures),
+    invokes `on_terminal_failure` so the orchestrator can SIGTERM the rust
+    binary — otherwise the main thread is stuck in `proc.wait()` and the
+    rust binary keeps generating data that nobody syncs.
+    """
     consecutive_failures = 0
     while not stop.is_set():
         try:
-            _scan_and_upload(api, repo_id, tiers, uploaded, prune_local)
+            _scan_and_upload(api, repo_id, tiers, uploaded, upload_count, prune_local)
             consecutive_failures = 0
         except Exception as e:
             consecutive_failures += 1
             LOG.exception(
                 "watcher cycle failed (%d/%d consecutive)",
-                consecutive_failures, WATCHER_MAX_CONSECUTIVE_FAILURES,
+                consecutive_failures, max_consecutive_failures,
             )
-            if consecutive_failures >= WATCHER_MAX_CONSECUTIVE_FAILURES:
+            if consecutive_failures >= max_consecutive_failures:
                 error_holder.append(WatcherFailed(
                     f"{consecutive_failures} consecutive watcher cycles failed; "
                     f"last error: {e!r}"
                 ))
                 stop.set()
+                if on_terminal_failure is not None:
+                    try:
+                        on_terminal_failure()
+                    except Exception:
+                        LOG.exception("on_terminal_failure callback raised; swallowing")
                 return
         # Wait either the full poll interval, or until stop fires.
         stop.wait(poll_interval)
@@ -248,6 +262,7 @@ def _scan_and_upload(
     repo_id: str,
     tiers: list[TierLayout],
     uploaded: set[str],
+    upload_count: list[int],
     prune_local: bool,
 ) -> None:
     for tier in tiers:
@@ -284,6 +299,7 @@ def _scan_and_upload(
             LOG.info("uploading %s (%s bytes)", repo_path, size)
             _upload_one(api, repo_id, repo_path, entry)
             uploaded.add(repo_path)
+            upload_count[0] += 1
             # Sentinels stay local — the rust binary reads them on every
             # tier start. Only shards get pruned.
             if prune_local and is_shard:
@@ -292,22 +308,17 @@ def _scan_and_upload(
                     pass
 
 
-def run_subprocess(binary: str, config_path: Path) -> int:
-    """Spawn the rust binary and forward signals.
+def install_signal_handlers(proc_holder: list["subprocess.Popen[bytes]"]) -> None:
+    """Install SIGINT/SIGTERM forwarders that send the signal to `proc_holder[0]`.
 
-    Signal handlers are installed BEFORE Popen — the alternative
-    leaves a tiny race window where SIGINT/SIGTERM kills the parent
-    without forwarding to the child, orphaning the rust process.
-    The `proc` reference for the closure is created via a single-element
-    list updated after Popen.
+    Installed BEFORE Popen so a signal arriving in the race window
+    doesn't kill the parent without forwarding. If a signal fires
+    before `proc_holder` is populated, we exit with the conventional
+    128+signum so the caller's framework still sees a "terminated by
+    signal" outcome — there's no child to clean up.
     """
-    proc_holder: list[subprocess.Popen[bytes]] = []
-
     def _forward(signum: int, _frame: object) -> None:
         if not proc_holder:
-            # Signal arrived before Popen completed. Nothing to forward
-            # to; default Python behavior would be SystemExit/KeyboardInterrupt
-            # anyway, so re-raise the default behavior by exiting.
             LOG.warning("got signal %d before child spawn; exiting", signum)
             sys.exit(128 + signum)
         LOG.warning("got signal %d, forwarding to child", signum)
@@ -316,10 +327,19 @@ def run_subprocess(binary: str, config_path: Path) -> int:
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, _forward)
 
-    proc = subprocess.Popen([binary, "run", "--config", str(config_path)])
-    proc_holder.append(proc)
-    LOG.info("spawned %s (pid=%d)", binary, proc.pid)
 
+def run_subprocess(
+    binary: str, config_path: Path, proc_holder: list["subprocess.Popen[bytes]"],
+) -> int:
+    """Spawn the rust binary into `proc_holder` (already-installed handlers).
+
+    Signal handlers must already be installed when this is called.
+    The `proc_holder.append(...)` is fused with `Popen` to close the
+    micro-race between Popen returning and the holder being populated.
+    """
+    proc_holder.append(subprocess.Popen([binary, "run", "--config", str(config_path)]))
+    proc = proc_holder[0]
+    LOG.info("spawned %s (pid=%d)", binary, proc.pid)
     return proc.wait()
 
 
@@ -339,6 +359,11 @@ def main() -> int:
     ap.add_argument("--no-primer", action="store_true",
                     help="Skip the primer phase. Useful for local testing where "
                          "you don't want network calls before the first shard.")
+    ap.add_argument("--max-consecutive-failures", type=int,
+                    default=DEFAULT_MAX_CONSECUTIVE_FAILURES,
+                    help="Watcher gives up + kills the rust child after this "
+                         "many consecutive cycle failures (default: %(default)s; "
+                         "tune up for runs that may span longer HF outages).")
     ap.add_argument("--log-level", default="INFO",
                     help="Logging level (default: INFO).")
     args = ap.parse_args()
@@ -375,44 +400,82 @@ def main() -> int:
         primed = primer(api, args.repo_id, tiers)
         LOG.info("primer: %d remote files known (placeholders + sentinels)", len(primed))
 
+    # Signal handlers must be installed BEFORE Popen — the proc_holder
+    # is shared between the handler closure (forwards signals to the
+    # child), the watcher (kills the child on terminal failure), and
+    # the subprocess runner (populates it).
+    proc_holder: list[subprocess.Popen[bytes]] = []
+    install_signal_handlers(proc_holder)
+
+    def _kill_child_on_watcher_failure() -> None:
+        """Forwarded to the watcher so a permanent HF failure terminates
+        the rust binary instead of letting it run for hours producing
+        unsynced data."""
+        if not proc_holder:
+            return
+        proc = proc_holder[0]
+        if proc.poll() is None:
+            LOG.error("watcher gave up; sending SIGTERM to rust binary")
+            try:
+                proc.terminate()
+            except Exception:
+                LOG.exception("failed to terminate rust binary; will continue")
+
     stop = threading.Event()
     watcher_error: list[BaseException] = []
+    upload_count = [0]
     watcher = threading.Thread(
         target=watcher_loop,
-        args=(api, args.repo_id, tiers, primed, stop, args.poll_interval,
-              args.prune_local, watcher_error),
+        args=(api, args.repo_id, tiers, primed, upload_count, stop,
+              args.poll_interval, args.prune_local,
+              args.max_consecutive_failures, watcher_error,
+              _kill_child_on_watcher_failure),
         name="hf-sync-watcher",
         daemon=True,
     )
     watcher.start()
 
-    rc = run_subprocess(args.binary, args.config)
+    rc = run_subprocess(args.binary, args.config, proc_holder)
     LOG.info("rust binary exited with code %d", rc)
 
     # Stop and join the watcher BEFORE the final drain. Otherwise the
-    # watcher's last cycle and the main thread's drain can race on the
-    # same `uploaded` set and on prune-local's truncate-after-upload step
-    # — both threads could be mid-upload of the same shard, and one
-    # could truncate the local file while the other is still reading it.
+    # watcher's last cycle and the main thread's drain race on the same
+    # `uploaded` set and on prune-local's truncate-after-upload step —
+    # both threads could be mid-upload of the same shard, and one could
+    # truncate the local file while the other is still reading it.
+    #
+    # The join timeout is generous because a watcher cycle in flight may
+    # be inside `_upload_one`'s retry chain (up to ~62s of backoff plus
+    # HTTP timeouts; multiple shards in one cycle multiplies this). If
+    # the watcher is STILL alive after the timeout, we explicitly skip
+    # the final drain rather than racing it — the un-drained shards
+    # stay local with the matching `_tier_state.json`, and the next run's
+    # primer will pick them up via the placeholder mechanism.
     stop.set()
-    watcher.join(timeout=poll_interval_join_timeout(args.poll_interval))
-    if watcher.is_alive():
-        LOG.warning("watcher thread didn't exit in time; proceeding anyway")
-
-    # Final drain — single-threaded now. Catches anything written between
-    # the last watcher cycle and the rust binary's exit.
-    LOG.info("final drain")
+    watcher.join(timeout=watcher_join_timeout(args.poll_interval))
     drained_ok = True
-    try:
-        _scan_and_upload(api, args.repo_id, tiers, primed, args.prune_local)
-    except Exception:
-        LOG.exception("final drain failed")
+    if watcher.is_alive():
+        LOG.warning(
+            "watcher thread did not exit within %.0fs; SKIPPING final drain "
+            "to avoid racing in-flight upload. Any locally-staged shards "
+            "will sync on the next run via the primer.",
+            watcher_join_timeout(args.poll_interval),
+        )
         drained_ok = False
+    else:
+        LOG.info("final drain")
+        try:
+            _scan_and_upload(api, args.repo_id, tiers, primed, upload_count, args.prune_local)
+        except Exception:
+            LOG.exception("final drain failed")
+            drained_ok = False
 
-    n_synced = sum(1 for p in primed if p.endswith(".parquet"))
-    LOG.info("sync summary: %d shard paths in upload set; final drain ok=%s; "
-             "watcher_error=%s",
-             n_synced, drained_ok, watcher_error[0] if watcher_error else None)
+    LOG.info(
+        "sync summary: %d files uploaded this run; %d remote files known via "
+        "primer; final drain ok=%s; watcher_error=%s",
+        upload_count[0], len(primed), drained_ok,
+        watcher_error[0] if watcher_error else None,
+    )
 
     if watcher_error:
         # Watcher gave up after consecutive failures (auth / quota /
@@ -425,15 +488,16 @@ def main() -> int:
     return rc
 
 
-def poll_interval_join_timeout(poll_interval: float) -> float:
-    """Cap how long we wait for the watcher to wake from `stop.wait`.
+def watcher_join_timeout(poll_interval: float) -> float:
+    """Wait long enough for an in-flight upload retry chain to finish.
 
-    The watcher sleeps in `stop.wait(poll_interval)`, which returns
-    immediately on `stop.set()`. So the join only needs a short grace
-    period — but we cap at the poll interval as a sanity bound for
-    pathologically long-running upload calls.
+    `_upload_one` does up to 5 attempts with exponential backoff
+    (2+4+8+16+32 = 62s) plus per-attempt HTTP timeout (~30s ceiling each).
+    A worst-case single-cycle stall is therefore ~5 minutes. We wait
+    twice that as headroom, capped to a sensible floor so quick polls
+    don't truncate the wait.
     """
-    return max(5.0, min(poll_interval, 30.0))
+    return max(poll_interval, 600.0)
 
 
 if __name__ == "__main__":
