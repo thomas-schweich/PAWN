@@ -92,8 +92,16 @@ RUN if [ "$INCLUDE_STOCKFISH" = "1" ]; then \
         && cp /tmp/stockfish/stockfish-ubuntu-x86-64-avx2 /usr/local/bin/stockfish \
         && chmod +x /usr/local/bin/stockfish \
         && rm -rf /tmp/sf.tar /tmp/stockfish \
-        && echo "quit" | stockfish | head -1; \
+        && echo "quit" | stockfish | head -1 \
+        && mkdir -p /root/bin \
+        && ln -sf /usr/local/bin/stockfish /root/bin/stockfish; \
     fi
+# The bundled `stockfish-datagen/examples/*.json` configs use
+# `~/bin/stockfish` for parity with local-dev. The image installs
+# Stockfish to `/usr/local/bin/stockfish`; the symlink above makes
+# `~/bin/stockfish` (== `/root/bin/stockfish` for the container's
+# default uid 0) resolve to it, so the bundled configs are runnable
+# as-shipped.
 
 # Lc0 binary
 COPY --from=lc0-builder /lc0/build/release/lc0 /usr/local/bin/lc0

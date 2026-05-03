@@ -244,8 +244,9 @@ pub fn shard_tmp_path(tier_dir: &Path, worker_id: u32, chunk_idx: u32) -> PathBu
 /// Final, post-rename path: `<tier_dir>/shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet`.
 /// Encoding the row count in the filename lets resume — and remote-sync
 /// placeholder files — recover `(worker, chunk, n_rows)` from a directory
-/// listing alone. `n_rows` is zero-padded to 6 digits, which fits any
-/// `shard_size_games <= 999_999`.
+/// listing alone. `n_rows` is zero-padded to a *minimum* of 6 digits;
+/// `shard_size_games > 999_999` simply produces a wider field, which
+/// `parse_shard_filename` and the Python regex `\d{6,}` both accept.
 pub fn shard_final_path(tier_dir: &Path, worker_id: u32, chunk_idx: u32, n_rows: u64) -> PathBuf {
     tier_dir.join(format!("shard-w{worker_id:03}-c{chunk_idx:04}-r{n_rows:06}.parquet"))
 }

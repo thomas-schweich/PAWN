@@ -179,6 +179,16 @@ Three phases run in one process:
    placeholder after a successful upload, so disk usage stays flat
    regardless of the run's total size.
 
+CLI flags worth knowing:
+
+- `--prune-local` — replace each local shard with a zero-byte
+  placeholder after a successful upload. Use on disk-constrained pods.
+- `--no-primer` — skip the primer phase entirely (no network calls
+  before the first watcher tick). Useful for local testing or when
+  starting a brand-new dataset from scratch.
+- `--poll-interval <seconds>` — watcher poll cadence. Default 30 s.
+- `--log-level {DEBUG,INFO,WARNING,ERROR}` — default INFO.
+
 Pod recipe (Docker image's default entrypoint dispatches to this script
 when both env vars are set):
 
@@ -191,6 +201,17 @@ docker run --rm -d \
     -v /workspace/sf:/workspace/sf \
     pawn-datagen
 ```
+
+Recognized env vars:
+
+| Env var                | Effect                                                        |
+|------------------------|---------------------------------------------------------------|
+| `HF_TOKEN`             | HuggingFace auth (mandatory).                                 |
+| `DATAGEN_HF_REPO`      | Dataset repo, e.g. `org/name`. Required for the entrypoint.   |
+| `DATAGEN_CONFIG`       | Path to the run config inside the image.                      |
+| `DATAGEN_PRUNE_LOCAL`  | Any non-empty value enables `--prune-local`.                  |
+| `DATAGEN_POLL_INTERVAL`| Watcher poll seconds (overrides default 30).                  |
+| `DATAGEN_EXTRA_ARGS`   | Extra flags appended to the orchestrator command line.        |
 
 Caveats:
 

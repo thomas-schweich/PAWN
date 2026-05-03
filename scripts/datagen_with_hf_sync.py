@@ -41,9 +41,10 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from huggingface_hub import HfApi
-from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
+from huggingface_hub.errors import RepositoryNotFoundError
 from huggingface_hub.utils import HfHubHTTPError
 
 LOG = logging.getLogger("datagen_sync")
@@ -62,15 +63,14 @@ class TierLayout:
     """One tier's local + remote paths."""
     name: str
     local_dir: Path
-    repo_subdir: str  # always equal to `name`; kept for clarity at call sites
 
 
-def load_run_config(path: Path) -> dict:
+def load_run_config(path: Path) -> dict[str, Any]:
     with path.open("r") as f:
         return json.load(f)
 
 
-def expand_output_dir(cfg: dict) -> Path:
+def expand_output_dir(cfg: dict[str, Any]) -> Path:
     """Apply the same `~`-expansion rule the rust binary uses."""
     p = Path(cfg["output_dir"])
     if str(p).startswith("~"):
@@ -78,10 +78,10 @@ def expand_output_dir(cfg: dict) -> Path:
     return p
 
 
-def tier_layouts(cfg: dict) -> list[TierLayout]:
+def tier_layouts(cfg: dict[str, Any]) -> list[TierLayout]:
     out_dir = expand_output_dir(cfg)
     return [
-        TierLayout(name=t["name"], local_dir=out_dir / t["name"], repo_subdir=t["name"])
+        TierLayout(name=t["name"], local_dir=out_dir / t["name"])
         for t in cfg["tiers"]
     ]
 
@@ -119,12 +119,12 @@ def primer(api: HfApi, repo_id: str, tiers: list[TierLayout]) -> set[str]:
 
     primed: set[str] = set()
     for tier in tiers:
-        files = by_subdir.get(tier.repo_subdir, [])
+        files = by_subdir.get(tier.name, [])
         if not files:
             continue
         tier.local_dir.mkdir(parents=True, exist_ok=True)
         for name in files:
-            repo_path = f"{tier.repo_subdir}/{name}"
+            repo_path = f"{tier.name}/{name}"
             local_path = tier.local_dir / name
             if name in SENTINEL_FILES:
                 # Real file — download. Tiny, so this is cheap.
@@ -138,23 +138,30 @@ def primer(api: HfApi, repo_id: str, tiers: list[TierLayout]) -> set[str]:
                 if not local_path.exists():
                     local_path.touch()
                 primed.add(repo_path)
-            else:
-                # Anything else under the tier subdir we leave alone.
-                pass
     return primed
 
 
 def _download_replace(api: HfApi, repo_id: str, repo_path: str, local_path: Path) -> None:
-    """Download `repo_path` from the dataset repo to `local_path` atomically."""
-    try:
-        downloaded = api.hf_hub_download(
-            repo_id=repo_id,
-            filename=repo_path,
-            repo_type="dataset",
-            # No local_dir; we want the cache, then we copy to the canonical spot.
-        )
-    except EntryNotFoundError:
-        return
+    """Download `repo_path` from the dataset repo to `local_path` atomically.
+
+    Raises `EntryNotFoundError` if the file disappeared between `list_repo_files`
+    and the download. We do NOT silently swallow that — if a sentinel
+    (`_manifest.json` / `_tier_state.json`) was advertised by `list_repo_files`
+    but vanished mid-primer, treating it as absent would cause the rust binary
+    to either re-generate a completed tier or hit a fingerprint-drift abort.
+    Loud failure surfaces the (rare) race so the operator can investigate.
+    """
+    downloaded = api.hf_hub_download(
+        repo_id=repo_id,
+        filename=repo_path,
+        repo_type="dataset",
+        # No local_dir; we want the cache, then we copy to the canonical spot.
+    )
+    # `hf_hub_download` is declared `Union[str, DryRunFileInfo]`; with
+    # dry_run=False (the default) it always returns the cache path string.
+    assert isinstance(downloaded, str), (
+        f"hf_hub_download returned non-str {type(downloaded).__name__} for {repo_path}"
+    )
     local_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = local_path.with_suffix(local_path.suffix + ".dl.tmp")
     # `hf_hub_download` returns a path inside the HF cache; copy contents.
@@ -178,7 +185,7 @@ def _upload_one(api: HfApi, repo_id: str, repo_path: str, local_path: Path) -> N
             return
         except HfHubHTTPError as e:
             # 5xx / rate-limit: retry. 4xx (except 429): give up.
-            status = e.response.status_code if e.response is not None else 0
+            status = e.response.status_code
             if status not in (429, 500, 502, 503, 504) or attempt == 4:
                 raise
             LOG.warning(
@@ -189,6 +196,20 @@ def _upload_one(api: HfApi, repo_id: str, repo_path: str, local_path: Path) -> N
             delay *= 2
 
 
+# If the watcher hits this many consecutive cycle failures, give up and
+# let the orchestrator surface the failure rather than churning forever.
+# At default poll=30s this is ~5 min of consecutive failures, which is
+# long enough to ride out transient HF outages but short enough to
+# fail the pod loudly when auth/quota is permanently broken.
+WATCHER_MAX_CONSECUTIVE_FAILURES = 10
+
+
+class WatcherFailed(Exception):
+    """Raised by the watcher thread when consecutive cycle failures exceed
+    the threshold. Stored on the watcher's `error` attribute and re-raised
+    by the main thread after `join`."""
+
+
 def watcher_loop(
     api: HfApi,
     repo_id: str,
@@ -197,15 +218,27 @@ def watcher_loop(
     stop: threading.Event,
     poll_interval: float,
     prune_local: bool,
+    error_holder: list[BaseException],
 ) -> None:
-    """Poll forever until `stop` is set. Each cycle, upload anything new."""
+    """Poll until `stop` is set. Stores any terminal exception in `error_holder`."""
+    consecutive_failures = 0
     while not stop.is_set():
         try:
             _scan_and_upload(api, repo_id, tiers, uploaded, prune_local)
-        except Exception:
-            # Don't let watcher death silently stall the run. Log + continue;
-            # if HF is down, individual upload retries already handle it.
-            LOG.exception("watcher cycle failed; continuing")
+            consecutive_failures = 0
+        except Exception as e:
+            consecutive_failures += 1
+            LOG.exception(
+                "watcher cycle failed (%d/%d consecutive)",
+                consecutive_failures, WATCHER_MAX_CONSECUTIVE_FAILURES,
+            )
+            if consecutive_failures >= WATCHER_MAX_CONSECUTIVE_FAILURES:
+                error_holder.append(WatcherFailed(
+                    f"{consecutive_failures} consecutive watcher cycles failed; "
+                    f"last error: {e!r}"
+                ))
+                stop.set()
+                return
         # Wait either the full poll interval, or until stop fires.
         stop.wait(poll_interval)
 
@@ -220,9 +253,20 @@ def _scan_and_upload(
     for tier in tiers:
         if not tier.local_dir.exists():
             continue
-        for entry in sorted(tier.local_dir.iterdir()):
+        # Within a tier: shards FIRST, sentinels LAST (manifest is the
+        # tier-complete marker). If a shard upload fails mid-cycle, the
+        # exception aborts before manifest goes up, so the remote can
+        # never have a manifest while missing one of its referenced
+        # shards. (Without this ordering, lex-sorted iterdir uploads
+        # `_manifest.json` before `shard-...` and a crash between the
+        # manifest commit and the next shard upload would leave the
+        # dataset in a "complete-but-incomplete" state that the next
+        # primer would treat as done.)
+        entries = list(tier.local_dir.iterdir())
+        entries.sort(key=lambda e: (1 if e.name in SENTINEL_FILES else 0, e.name))
+        for entry in entries:
             name = entry.name
-            repo_path = f"{tier.repo_subdir}/{name}"
+            repo_path = f"{tier.name}/{name}"
             if repo_path in uploaded:
                 continue
             is_sentinel = name in SENTINEL_FILES
@@ -233,8 +277,9 @@ def _scan_and_upload(
                 continue
             size = entry.stat().st_size
             if size == 0:
-                # Zero-byte placeholder from primer, or a tier_state in
-                # mid-write. Skip until it has content.
+                # Zero-byte placeholder from primer (or a sentinel in
+                # mid-write — atomic-rename means we'll see it next cycle
+                # at full size). Skip until it has content.
                 continue
             LOG.info("uploading %s (%s bytes)", repo_path, size)
             _upload_one(api, repo_id, repo_path, entry)
@@ -248,16 +293,32 @@ def _scan_and_upload(
 
 
 def run_subprocess(binary: str, config_path: Path) -> int:
-    """Spawn the rust binary and forward signals."""
-    proc = subprocess.Popen([binary, "run", "--config", str(config_path)])
-    LOG.info("spawned %s (pid=%d)", binary, proc.pid)
+    """Spawn the rust binary and forward signals.
+
+    Signal handlers are installed BEFORE Popen — the alternative
+    leaves a tiny race window where SIGINT/SIGTERM kills the parent
+    without forwarding to the child, orphaning the rust process.
+    The `proc` reference for the closure is created via a single-element
+    list updated after Popen.
+    """
+    proc_holder: list[subprocess.Popen[bytes]] = []
 
     def _forward(signum: int, _frame: object) -> None:
+        if not proc_holder:
+            # Signal arrived before Popen completed. Nothing to forward
+            # to; default Python behavior would be SystemExit/KeyboardInterrupt
+            # anyway, so re-raise the default behavior by exiting.
+            LOG.warning("got signal %d before child spawn; exiting", signum)
+            sys.exit(128 + signum)
         LOG.warning("got signal %d, forwarding to child", signum)
-        proc.send_signal(signum)
+        proc_holder[0].send_signal(signum)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, _forward)
+
+    proc = subprocess.Popen([binary, "run", "--config", str(config_path)])
+    proc_holder.append(proc)
+    LOG.info("spawned %s (pid=%d)", binary, proc.pid)
 
     return proc.wait()
 
@@ -287,6 +348,20 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
+    # Fail-fast on missing token rather than letting an opaque 401 surface
+    # mid-cycle inside `_upload_one` after the rust binary has already
+    # burned compute. huggingface_hub picks up any of these env vars; the
+    # in-memory token from `~/.cache/huggingface/token` also counts.
+    if not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+            or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+            or HfApi().token is not None):
+        LOG.error(
+            "no HF token found in env (HF_TOKEN / HUGGING_FACE_HUB_TOKEN / "
+            "HUGGINGFACE_HUB_TOKEN) or local credential store. Set HF_TOKEN "
+            "before running this orchestrator."
+        )
+        return 2
+
     cfg = load_run_config(args.config)
     tiers = tier_layouts(cfg)
     api = HfApi()
@@ -301,9 +376,11 @@ def main() -> int:
         LOG.info("primer: %d remote files known (placeholders + sentinels)", len(primed))
 
     stop = threading.Event()
+    watcher_error: list[BaseException] = []
     watcher = threading.Thread(
         target=watcher_loop,
-        args=(api, args.repo_id, tiers, primed, stop, args.poll_interval, args.prune_local),
+        args=(api, args.repo_id, tiers, primed, stop, args.poll_interval,
+              args.prune_local, watcher_error),
         name="hf-sync-watcher",
         daemon=True,
     )
@@ -312,18 +389,51 @@ def main() -> int:
     rc = run_subprocess(args.binary, args.config)
     LOG.info("rust binary exited with code %d", rc)
 
-    # Give the watcher one final pass to drain anything written between
-    # its last cycle and the binary's exit.
+    # Stop and join the watcher BEFORE the final drain. Otherwise the
+    # watcher's last cycle and the main thread's drain can race on the
+    # same `uploaded` set and on prune-local's truncate-after-upload step
+    # — both threads could be mid-upload of the same shard, and one
+    # could truncate the local file while the other is still reading it.
+    stop.set()
+    watcher.join(timeout=poll_interval_join_timeout(args.poll_interval))
+    if watcher.is_alive():
+        LOG.warning("watcher thread didn't exit in time; proceeding anyway")
+
+    # Final drain — single-threaded now. Catches anything written between
+    # the last watcher cycle and the rust binary's exit.
     LOG.info("final drain")
+    drained_ok = True
     try:
         _scan_and_upload(api, args.repo_id, tiers, primed, args.prune_local)
     except Exception:
         LOG.exception("final drain failed")
-        # Still exit with the rust binary's code; partial sync is recoverable.
+        drained_ok = False
 
-    stop.set()
-    watcher.join(timeout=5.0)
+    n_synced = sum(1 for p in primed if p.endswith(".parquet"))
+    LOG.info("sync summary: %d shard paths in upload set; final drain ok=%s; "
+             "watcher_error=%s",
+             n_synced, drained_ok, watcher_error[0] if watcher_error else None)
+
+    if watcher_error:
+        # Watcher gave up after consecutive failures (auth / quota /
+        # permanent 4xx). Surface that as a non-zero exit so the pod
+        # doesn't appear to have completed successfully.
+        LOG.error("watcher terminated abnormally: %r", watcher_error[0])
+        return rc if rc != 0 else 3
+    if not drained_ok:
+        return rc if rc != 0 else 4
     return rc
+
+
+def poll_interval_join_timeout(poll_interval: float) -> float:
+    """Cap how long we wait for the watcher to wake from `stop.wait`.
+
+    The watcher sleeps in `stop.wait(poll_interval)`, which returns
+    immediately on `stop.set()`. So the join only needs a short grace
+    period — but we cap at the poll interval as a sanity bound for
+    pathologically long-running upload calls.
+    """
+    return max(5.0, min(poll_interval, 30.0))
 
 
 if __name__ == "__main__":

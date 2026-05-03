@@ -593,14 +593,29 @@ mod tests {
         // re-run only that worker.
         let tier_dir = cfg.output_dir.join(&cfg.tiers[0].name);
         std::fs::remove_file(tier_dir.join("_manifest.json")).unwrap();
-        let w1_shard = tier_dir.join("shard-w001-c0000.parquet");
-        let w0_shard = tier_dir.join("shard-w000-c0000.parquet");
+        // Derive the actual shard paths from r1.shards rather than
+        // reconstructing names by hand — the filename now includes the
+        // row count, so any hand-written `shard-w001-c0000.parquet`
+        // would not exist.
+        let pick = |w: &str| {
+            r1.shards.iter()
+                .find(|p| p.file_name().unwrap().to_string_lossy().contains(w))
+                .unwrap_or_else(|| panic!("no shard for {w} in {:?}", r1.shards))
+                .clone()
+        };
+        let w1_shard = pick("w001");
+        let w0_shard = pick("w000");
         let w0_bytes_before = std::fs::read(&w0_shard).unwrap();
         std::fs::remove_file(&w1_shard).unwrap();
 
         let r2 = run_tier(&cfg, 0).unwrap();
         assert_eq!(r2.n_games_written, 16, "resumed total must equal target");
-        assert!(w1_shard.exists(), "resumed worker should have re-created its shard");
+        // After resume, w1 produces a NEW shard with a new filename
+        // (same row count → same name; different row count → different name).
+        // Just check that *some* w001 shard exists.
+        let w1_after = r2.shards.iter()
+            .find(|p| p.file_name().unwrap().to_string_lossy().contains("w001"));
+        assert!(w1_after.is_some(), "resumed worker should have re-created its shard");
         // Worker 0's shard must be byte-identical: it was skipped, not regenerated.
         let w0_bytes_after = std::fs::read(&w0_shard).unwrap();
         assert_eq!(w0_bytes_before, w0_bytes_after, "completed worker's shard should be untouched");
