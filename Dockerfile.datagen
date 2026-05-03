@@ -128,6 +128,7 @@ WORKDIR /opt/datagen
 COPY scripts/benchmark_stockfish_nodes.py scripts/
 COPY scripts/generate_lc0_data.py scripts/
 COPY scripts/datagen_with_hf_sync.py scripts/
+COPY scripts/sweep_pod_workers.sh scripts/
 
 # Copy the prebuilt stockfish-datagen binary in from the builder stage.
 # Self-contained — the only runtime dependency is the Stockfish binary

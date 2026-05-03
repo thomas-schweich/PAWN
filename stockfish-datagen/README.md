@@ -189,6 +189,26 @@ The bundled `examples/stockfish_100m.json` defaults to `n_workers: 126`
 assuming a 128-thread / 64-physical / 2-SMT vast.ai box. On a different
 topology, override per the rule above.
 
+### Validating on the actual pod (~1-3 minutes)
+
+`scripts/sweep_pod_workers.sh` runs a quick `n_workers` sweep on the
+pod's hardware. Useful before launching the full fire-and-forget run,
+since `n_workers` is part of the per-tier fingerprint — changing it
+mid-run would invalidate the partial state and waste pod hours.
+
+```bash
+# Auto-detect topology, sweep ±4 around the rule's prediction:
+bash /opt/datagen/scripts/sweep_pod_workers.sh
+
+# Or test specific values:
+bash /opt/datagen/scripts/sweep_pod_workers.sh 122 124 126 128
+```
+
+Each point is 5000 nodes=1 games (~5–15s of pod time), full pipeline
+including pinning. Output is sorted by rate descending; pick the
+winner and put it in your run config before launching the production
+HF-sync job. The script prints to stdout only — nothing is uploaded.
+
 CPU pinning is Linux-only (`core_affinity::set_for_current` for the
 worker thread, `libc::sched_setaffinity` for the Stockfish child PID);
 on macOS both calls no-op. See `stockfish-datagen/src/affinity.rs`
