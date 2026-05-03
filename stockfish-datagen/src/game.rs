@@ -216,11 +216,9 @@ mod tests {
     /// must NOT be labeled PlyLimit. Set max_ply=4 and check that
     /// Fool's mate (4 plies) gets BlackCheckmate, not PlyLimit.
     #[test]
+    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
     fn live_terminal_at_max_ply_is_not_plylimit() {
-        let Some(path) = stockfish_path() else {
-            eprintln!("skipping: no stockfish binary");
-            return;
-        };
+        let path = stockfish_path();
         // Fool's mate is unlikely to come out of stockfish nodes=1 + multipv=20
         // at temperature 1.0, so we use a bespoke max_ply that's very small
         // and let the test verify the contract via game_length math.
@@ -257,17 +255,18 @@ mod tests {
         assert_eq!(outcome, Some(OutcomeReason::ThreefoldRepetition));
     }
 
-    fn stockfish_path() -> Option<std::path::PathBuf> {
+    fn stockfish_path() -> std::path::PathBuf {
         if let Ok(p) = std::env::var("STOCKFISH_PATH") {
-            return Some(p.into());
+            return p.into();
         }
         let default = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
             .join("bin/stockfish");
-        if default.exists() {
-            Some(default)
-        } else {
-            None
-        }
+        assert!(
+            default.exists(),
+            "stockfish binary not found at {} — set STOCKFISH_PATH or install one",
+            default.display(),
+        );
+        default
     }
 
     fn smoke_tier() -> TierConfig {
@@ -286,13 +285,11 @@ mod tests {
     /// Live test: play one game with a real Stockfish, verify it terminated
     /// naturally and produced legal moves.
     #[test]
+    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
     fn live_play_one_game() {
         use rand::SeedableRng;
         use rand_chacha::ChaCha8Rng;
-        let Some(path) = stockfish_path() else {
-            eprintln!("skipping: no stockfish binary");
-            return;
-        };
+        let path = stockfish_path();
         let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, 1).unwrap();
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let game = play_game(&mut sf, &mut rng, &smoke_tier(), 512).unwrap();
@@ -314,13 +311,11 @@ mod tests {
     /// Reproducibility: same Stockfish + same RNG seed + same tier produce
     /// the same game.
     #[test]
+    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
     fn live_play_is_deterministic() {
         use rand::SeedableRng;
         use rand_chacha::ChaCha8Rng;
-        let Some(path) = stockfish_path() else {
-            eprintln!("skipping: no stockfish binary");
-            return;
-        };
+        let path = stockfish_path();
         let tier = smoke_tier();
         let game_a = {
             let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, 1).unwrap();

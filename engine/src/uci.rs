@@ -252,8 +252,9 @@ pub fn uci_to_tokens_and_san(uci_moves: &[&str]) -> (Vec<u16>, Vec<String>) {
             None => break,
         };
         let token = move_to_token(&m);
-        // SanPlus::from_move_and_play_unchecked needs to be called BEFORE
-        // we lose `m` (it consumes by value), so derive the token first.
+        // from_move_and_play_unchecked consumes m and advances pos in
+        // one step; derive the token first since move_to_token needs
+        // the pre-advance move.
         let san_plus = SanPlus::from_move_and_play_unchecked(&mut pos, m);
         tokens.push(token);
         san_moves.push(san_plus.to_string());

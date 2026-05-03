@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arrow::array::{
-    ArrayRef, Float32Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder,
-    RecordBatch, StringBuilder, UInt16Builder,
+    ArrayRef, Float32Builder, Int16Builder, Int32Builder, ListBuilder,
+    RecordBatch, StringBuilder, UInt16Builder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use once_cell::sync::Lazy;
@@ -34,7 +34,7 @@ pub struct GameRow {
     pub sample_plies: i32,
     pub temperature: f32,
     pub worker_id: i16,
-    pub game_seed: i64,
+    pub game_seed: u64,
     pub stockfish_version: String,
 }
 
@@ -58,7 +58,12 @@ pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
         Field::new("sample_plies", DataType::Int32, false),
         Field::new("temperature", DataType::Float32, false),
         Field::new("worker_id", DataType::Int16, false),
-        Field::new("game_seed", DataType::Int64, false),
+        // game_seed is the per-game RNG seed, derived via splitmix64 — a
+        // full u64. Stored as `UInt64` (Arrow + Parquet support it
+        // natively) so any reader sees the actual value without
+        // bit-pattern reinterpretation. Polars / pyarrow / pandas all
+        // handle this correctly.
+        Field::new("game_seed", DataType::UInt64, false),
         Field::new("stockfish_version", DataType::Utf8, false),
     ]))
 });
@@ -82,7 +87,7 @@ pub struct ShardWriter {
     sample_plies: Int32Builder,
     temperature: Float32Builder,
     worker_id: Int16Builder,
-    game_seed: Int64Builder,
+    game_seed: UInt64Builder,
     stockfish_version: StringBuilder,
     n_rows: usize,
 }
@@ -114,7 +119,7 @@ impl ShardWriter {
             sample_plies: Int32Builder::new(),
             temperature: Float32Builder::new(),
             worker_id: Int16Builder::new(),
-            game_seed: Int64Builder::new(),
+            game_seed: UInt64Builder::new(),
             stockfish_version: StringBuilder::new(),
             n_rows: 0,
         })
@@ -223,7 +228,7 @@ mod tests {
     use std::fs::File;
     use tempfile::tempdir;
 
-    fn fake_row(seed: i64) -> GameRow {
+    fn fake_row(seed: u64) -> GameRow {
         GameRow {
             tokens: vec![100, 200, 300],
             san: vec!["e4".into(), "e5".into(), "Nf3".into()],
@@ -273,10 +278,36 @@ mod tests {
             .column_by_name("game_seed")
             .unwrap()
             .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
+            .downcast_ref::<arrow::array::UInt64Array>()
             .unwrap();
         assert_eq!(game_seed_col.value(0), 1000);
         assert_eq!(game_seed_col.value(4), 1004);
+    }
+
+    /// Regression test for the round-7 `game_seed: i64 -> UInt64` change.
+    /// A high-bit seed (>= 2^63) MUST round-trip as itself, not flip to a
+    /// negative integer. With the prior Int64 schema this would store a
+    /// negative value and require explicit bit-reinterpretation in every
+    /// reader.
+    #[test]
+    fn high_bit_game_seed_round_trips() {
+        let dir = tempdir().unwrap();
+        let path = shard_path(dir.path(), 0, 0);
+        let mut w = ShardWriter::create(path.clone()).unwrap();
+        let big = 0xFFFF_FFFF_FFFF_FFFFu64; // u64::MAX — sign bit set
+        w.append(&fake_row(big));
+        w.close().unwrap();
+
+        let file = File::open(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
+        let col = batches[0]
+            .column_by_name("game_seed")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), big, "high-bit seed must round-trip as u64::MAX");
     }
 
     #[test]

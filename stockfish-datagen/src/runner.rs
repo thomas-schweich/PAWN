@@ -268,6 +268,13 @@ pub fn run_tier(
     }
     let completions = drain_result.map_err(|_| anyhow!("progress drain panicked"))?;
 
+    // Accounting invariant: total_resume_done is the count of games
+    // already on disk at the start of this run (filtered to in-scope
+    // workers). Workers that were already complete are skipped before
+    // spawning and never send Progress::Done; only newly-written games
+    // increment via Done messages below. So:
+    //   total_written = (games already on disk) + (newly written games)
+    //                 = total games across the in-scope partition.
     let mut total_written = total_resume_done;
     let mut all_shards: Vec<PathBuf> = Vec::new();
     // Dir-scan picks up both resumed shards and shards just written this
@@ -450,10 +457,7 @@ fn run_worker(
             sample_plies: tier.sample_plies as i32,
             temperature: tier.temperature,
             worker_id: worker_id as i16,
-            // u64 → i64 bit-pattern cast: reader recovers the original u64
-            // via `value as u64`. See README "Reproducibility" + the
-            // `game_seed` field comment in shard.rs::SCHEMA.
-            game_seed: game_seed as i64,
+            game_seed,
             stockfish_version: stockfish_version.to_string(),
         };
 
@@ -516,13 +520,18 @@ mod tests {
     use crate::config::TierConfig;
     use tempfile::tempdir;
 
-    fn stockfish_path() -> Option<std::path::PathBuf> {
+    fn stockfish_path() -> std::path::PathBuf {
         if let Ok(p) = std::env::var("STOCKFISH_PATH") {
-            return Some(p.into());
+            return p.into();
         }
         let default = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
             .join("bin/stockfish");
-        if default.exists() { Some(default) } else { None }
+        assert!(
+            default.exists(),
+            "stockfish binary not found at {} — set STOCKFISH_PATH or install one",
+            default.display(),
+        );
+        default
     }
 
     fn smoke_config(sf_path: std::path::PathBuf, dir: std::path::PathBuf) -> RunConfig {
@@ -549,11 +558,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
     fn live_run_tier_smoke() {
-        let Some(sf_path) = stockfish_path() else {
-            eprintln!("skipping: no stockfish binary");
-            return;
-        };
+        let sf_path = stockfish_path();
         let dir = tempdir().unwrap();
         let cfg = smoke_config(sf_path, dir.path().to_path_buf());
         let result = run_tier(&cfg, 0).unwrap();
@@ -571,11 +578,9 @@ mod tests {
     /// That worker should be skipped entirely; only the other one should
     /// generate, and the final manifest should reflect the combined total.
     #[test]
+    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
     fn live_resume_skips_completed_worker() {
-        let Some(sf_path) = stockfish_path() else {
-            eprintln!("skipping: no stockfish binary");
-            return;
-        };
+        let sf_path = stockfish_path();
         let dir = tempdir().unwrap();
         let cfg = smoke_config(sf_path, dir.path().to_path_buf());
 
@@ -603,16 +608,56 @@ mod tests {
         assert_eq!(r2.shards.len(), shard0_paths_before.len());
     }
 
+    /// Full-resume edge case: ALL workers are already complete on disk,
+    /// the manifest is missing (e.g. crash after the last shard but
+    /// before manifest write), but `_tier_state.json` is present. The
+    /// rerun should write a manifest with `n_games_written == target`
+    /// without spawning any workers.
+    #[test]
+    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
+    fn live_resume_all_workers_done_no_manifest() {
+        let sf_path = stockfish_path();
+        let dir = tempdir().unwrap();
+        let cfg = smoke_config(sf_path, dir.path().to_path_buf());
+
+        // First run: full completion.
+        let r1 = run_tier(&cfg, 0).unwrap();
+        assert_eq!(r1.n_games_written, 16);
+
+        // Delete the manifest, leave shards + tier_state intact.
+        let tier_dir = cfg.output_dir.join(&cfg.tiers[0].name);
+        std::fs::remove_file(tier_dir.join("_manifest.json")).unwrap();
+        assert!(tier_dir.join("_tier_state.json").exists());
+
+        // Snapshot byte-equality of every shard before re-running so we
+        // can prove no worker actually ran.
+        let snapshot: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(&tier_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
+            .map(|e| (e.path(), std::fs::read(e.path()).unwrap()))
+            .collect();
+        assert!(snapshot.len() >= 2);
+
+        let r2 = run_tier(&cfg, 0).unwrap();
+        assert_eq!(r2.n_games_written, 16, "all-resumed total must equal target");
+        assert_eq!(r2.shards.len(), snapshot.len());
+
+        for (path, before) in &snapshot {
+            let after = std::fs::read(path).unwrap();
+            assert_eq!(*before, after, "shard {} must be byte-identical", path.display());
+        }
+        assert!(tier_dir.join("_manifest.json").exists());
+    }
+
     /// Tier-state sentinel: if a user deletes the manifest AND changes
     /// a fingerprint-relevant field (here, master_seed) while shards from
     /// the prior config still exist on disk, the run must abort rather
     /// than silently mixing old + new bytes into the same tier output.
     #[test]
+    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
     fn live_tier_state_catches_config_drift_after_manifest_delete() {
-        let Some(sf_path) = stockfish_path() else {
-            eprintln!("skipping: no stockfish binary");
-            return;
-        };
+        let sf_path = stockfish_path();
         let dir = tempdir().unwrap();
         let cfg_a = smoke_config(sf_path.clone(), dir.path().to_path_buf());
 
@@ -638,11 +683,9 @@ mod tests {
     /// Tier fingerprint scoping regression: changing an UNRELATED tier
     /// must NOT invalidate this tier's manifest.
     #[test]
+    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
     fn live_unrelated_tier_change_doesnt_invalidate() {
-        let Some(sf_path) = stockfish_path() else {
-            eprintln!("skipping: no stockfish binary");
-            return;
-        };
+        let sf_path = stockfish_path();
         let dir = tempdir().unwrap();
         let mut cfg = smoke_config(sf_path, dir.path().to_path_buf());
         cfg.tiers.push(TierConfig {

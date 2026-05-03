@@ -219,7 +219,7 @@ mod tests {
     use crate::shard::{GameRow, ShardWriter, shard_path};
     use tempfile::tempdir;
 
-    fn fake_row(game_seed: i64) -> GameRow {
+    fn fake_row(game_seed: u64) -> GameRow {
         GameRow {
             tokens: vec![1, 2, 3],
             san: vec!["a".into(), "b".into(), "c".into()],
@@ -243,7 +243,7 @@ mod tests {
         let p = shard_path(dir, worker_id, chunk_idx);
         let mut w = ShardWriter::create(p).unwrap();
         for i in 0..n_rows {
-            w.append(&fake_row(i as i64));
+            w.append(&fake_row(i as u64));
         }
         w.close().unwrap();
     }

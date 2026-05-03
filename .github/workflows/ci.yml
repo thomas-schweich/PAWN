@@ -46,14 +46,12 @@ jobs:
       - name: Tests
         run: uv run pytest tests/ -x -q -m "not gpu"
 
-      # Rust workspace tests. The stockfish-datagen crate has live tests
-      # that require a real Stockfish binary; those self-skip when
-      # $HOME/bin/stockfish isn't present, so CI without Stockfish runs
-      # the non-live subset only. (Set STOCKFISH_PATH in the runner env
-      # to enable the live tests.)
-      #
-      # `--nocapture` so the live tests' "skipping: ..." eprintln
-      # messages appear in the CI log — otherwise a CI run without
-      # Stockfish reports them as silently passing.
+      # Rust workspace tests. The stockfish-datagen crate has live
+      # tests marked `#[ignore = "requires stockfish ..."]`; they don't
+      # run by default. CI shows them in the summary as `ignored` (so
+      # the skip is visible — distinct from the silently-passing
+      # eprintln-and-return pattern we used to use). To run them
+      # locally with Stockfish available:
+      #   cargo test --workspace --release -- --include-ignored
       - name: Rust workspace tests
-        run: cargo test --workspace --release -- --nocapture
+        run: cargo test --workspace --release

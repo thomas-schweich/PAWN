@@ -234,7 +234,12 @@ impl StockfishProcess {
         self.stdin.flush()?;
 
         // Map keyed by multipv index. Later (deeper) info lines for the
-        // same index overwrite earlier ones.
+        // same index overwrite earlier ones. BTreeMap is fine at our
+        // typical node budgets (1k–10k → at most a few entries kept).
+        // If we ever drive Stockfish at much higher nodes where it emits
+        // hundreds of `info` lines per `go`, a `Vec<(u32, Candidate)>`
+        // sorted at the end would avoid the per-insert tree-node alloc;
+        // not worth doing speculatively.
         let mut by_pv: std::collections::BTreeMap<u32, Candidate> = std::collections::BTreeMap::new();
         let mut last_score_was_mate0 = false;
 
@@ -493,30 +498,31 @@ mod tests {
         assert_eq!(p.first_move, "e2e4");
     }
 
-    /// Live test against a real Stockfish binary. Skipped automatically if
-    /// the binary isn't where we expect (so CI without Stockfish still
-    /// passes); set `STOCKFISH_PATH=...` to point at an alternate binary.
-    fn stockfish_path() -> Option<std::path::PathBuf> {
+    /// Resolve the Stockfish binary for a live test. Tests that use this
+    /// are marked `#[ignore]` so they only run when the user explicitly
+    /// opts in (`cargo test -- --include-ignored` or
+    /// `cargo test -- --ignored`); inside the test body we expect the
+    /// binary to be present and panic with a clear message otherwise.
+    fn stockfish_path() -> std::path::PathBuf {
         if let Ok(p) = std::env::var("STOCKFISH_PATH") {
-            return Some(p.into());
+            return p.into();
         }
         let default = std::path::PathBuf::from(
             std::env::var("HOME").unwrap_or_default(),
         )
         .join("bin/stockfish");
-        if default.exists() {
-            Some(default)
-        } else {
-            None
-        }
+        assert!(
+            default.exists(),
+            "stockfish binary not found at {} — set STOCKFISH_PATH or install one",
+            default.display(),
+        );
+        default
     }
 
     #[test]
+    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
     fn live_handshake_and_starting_candidates() {
-        let Some(path) = stockfish_path() else {
-            eprintln!("skipping: no stockfish binary at $HOME/bin/stockfish");
-            return;
-        };
+        let path = stockfish_path();
         let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, 1).unwrap();
         assert!(sf.id_name.starts_with("Stockfish"), "got id_name={:?}", sf.id_name);
         sf.set_multi_pv(5).unwrap();
@@ -533,11 +539,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
     fn live_version_mismatch_rejected() {
-        let Some(path) = stockfish_path() else {
-            eprintln!("skipping: no stockfish binary at $HOME/bin/stockfish");
-            return;
-        };
+        let path = stockfish_path();
         match StockfishProcess::spawn(&path, "Stockfish 9999", 16, 1) {
             Err(StockfishError::VersionMismatch { .. }) => {}
             Err(e) => panic!("expected VersionMismatch, got {e:?}"),

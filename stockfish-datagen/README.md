@@ -39,11 +39,9 @@ mismatch aborts before any parquet is written. Different Stockfish
 releases ship different NNUE nets and would silently produce
 different games from the same seed.
 
-The `game_seed` column is stored as `Int64` because parquet has no
-unsigned 64-bit type. Roughly half the seeds end up negative; the
-bit pattern is preserved exactly, so a Python reader can recover
-the original `u64` via `numpy.uint64(value)` (or just
-`value & 0xffffffffffffffff` in pure Python).
+The `game_seed` column is stored as `UInt64` (Arrow + Parquet both
+support it natively), so polars / pyarrow / pandas readers see the
+actual u64 value with no bit-reinterpretation step required.
 
 The seed hierarchy is:
 
@@ -123,8 +121,22 @@ tier-state's fingerprint.
 | `sample_plies`      | `Int32`         | per-row, from tier config               |
 | `temperature`       | `Float32`       | per-row, from tier config               |
 | `worker_id`         | `Int16`         | which worker produced the row           |
-| `game_seed`         | `Int64`         | per-game seed; `u64` bit-cast (see Reproducibility) |
+| `game_seed`         | `UInt64`        | per-game seed (reproduction key)        |
 | `stockfish_version` | `String`        | from Stockfish's `id name` line         |
+
+## Operator notes
+
+- **SIGINT / Ctrl-C is safe.** Hitting Ctrl-C mid-shard leaves a
+  `.parquet.tmp` orphan that the next run cleans up on
+  `ShardWriter::create`. Hitting Ctrl-C between the last shard write
+  and the manifest write leaves all shards complete but no
+  `_manifest.json` — the next run sees the matching `_tier_state.json`,
+  scans the existing shards, finds every worker already at its target,
+  writes the manifest, and exits cleanly without re-running anything.
+  (The `live_resume_all_workers_done_no_manifest` test pins this.)
+- **Long multi-tier jobs** are checkpointed at tier granularity. A
+  crash in tier N doesn't affect manifests for tiers 0..N-1, and the
+  rerun resumes tier N from its last completed shard per worker.
 
 ## Failure model
 
