@@ -111,7 +111,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /opt/pawn
 COPY pyproject.toml uv.lock ./
-COPY --from=builder /build/engine/target/wheels/*.whl /tmp/
+# Wheel output moved to the workspace `target/` (we made /build the
+# workspace root in the builder stage above), not the member-local
+# `engine/target/`.
+COPY --from=builder /build/target/wheels/*.whl /tmp/
 
 # External binaries last — they don't depend on our layers, so placing
 # them here avoids invalidating the layers above on a caddy/uv release.
