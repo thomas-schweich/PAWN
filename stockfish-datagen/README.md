@@ -183,9 +183,12 @@ CLI flags worth knowing:
 
 - `--prune-local` — replace each local shard with a zero-byte
   placeholder after a successful upload. Use on disk-constrained pods.
-- `--no-primer` — skip the primer phase entirely (no network calls
-  before the first shard is generated). Useful for local testing or
-  when starting a brand-new dataset from scratch.
+- `--no-primer` — skip the primer phase (no `list_repo_files` call,
+  no sentinel downloads, no placeholder creation). The cheap repo
+  existence/creation check (`HfApi.repo_info` or `create_repo`) still
+  runs; uploads can't create repos themselves so this guarantees the
+  watcher's first upload won't 404. Useful for local testing or
+  restarting against a known-empty repo.
 - `--poll-interval <seconds>` — watcher poll cadence. Default 30 s.
 - `--max-consecutive-failures <N>` — watcher gives up + SIGTERMs the
   rust child after N consecutive cycle failures. Default 10

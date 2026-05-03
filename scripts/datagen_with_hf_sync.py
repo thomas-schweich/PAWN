@@ -369,8 +369,9 @@ def main() -> int:
                     help="After uploading a shard, replace local file with a "
                          "zero-byte placeholder. Recommended on disk-constrained pods.")
     ap.add_argument("--no-primer", action="store_true",
-                    help="Skip the primer phase. Useful for local testing where "
-                         "you don't want network calls before the first shard.")
+                    help="Skip the primer phase (no `list_repo_files` + sentinel "
+                         "downloads). The cheap repo existence check still runs. "
+                         "Useful for local testing or restarting against a known-empty repo.")
     ap.add_argument("--max-consecutive-failures", type=int,
                     default=DEFAULT_MAX_CONSECUTIVE_FAILURES,
                     help="Watcher gives up + kills the rust child after this "
@@ -405,16 +406,20 @@ def main() -> int:
     tiers = tier_layouts(cfg)
     api = HfApi()
 
+    # We always touch the repo (cheap: one info-or-create round-trip)
+    # before launching the rust binary. `HfApi.upload_file` does NOT
+    # auto-create missing repos, so without this the first watcher
+    # upload would 404, count toward the failure threshold, and
+    # eventually SIGTERM the rust child — leaving the user with a
+    # confusing "watcher failed" exit on what was actually a missing
+    # repo. `--no-primer` only suppresses the heavier `list_repo_files`
+    # + sentinel-download phase, not the repo existence guarantee.
+    ensure_repo(api, args.repo_id)
+
     if args.no_primer:
-        # `--no-primer` is documented as "no network calls before the
-        # first shard is generated" — so don't even create the repo
-        # eagerly. The first watcher upload will hit `ensure_repo`
-        # implicitly (HF auto-creates on first commit if the token has
-        # write access), and any auth errors will surface there.
-        LOG.info("--no-primer: skipping repo touch + primer phase")
+        LOG.info("--no-primer: skipping primer phase (no remote listing or sentinel download)")
         primed: set[str] = set()
     else:
-        ensure_repo(api, args.repo_id)
         LOG.info("priming from %s", args.repo_id)
         primed = primer(api, args.repo_id, tiers)
         LOG.info("primer: %d remote files known (placeholders + sentinels)", len(primed))
