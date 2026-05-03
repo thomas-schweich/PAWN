@@ -4,18 +4,36 @@
 # Optionally includes Stockfish 18 (--build-arg INCLUDE_STOCKFISH=1).
 # Produces UCI move sequences for PAWN training.
 #
-# Build (Lc0 only — default):
-#   docker build --platform linux/amd64 \
+# Two targets:
+#   runtime  — minimal, runs the rust binary or the HF-sync orchestrator
+#              fire-and-forget; pod exits when the run finishes.
+#   dev      — runtime + sshd + interactive tooling (htop, tmux, vim,
+#              jq, numactl). Sshd runs as PID 1, so the pod stays alive
+#              indefinitely for manual benchmarking and run management.
+#
+# Build (runtime, Lc0 only — default):
+#   docker build --platform linux/amd64 --target runtime \
 #     -f Dockerfile.datagen -t pawn-datagen .
 #
-# Build (with Stockfish):
-#   docker build --platform linux/amd64 \
+# Build (runtime, with Stockfish):
+#   docker build --platform linux/amd64 --target runtime \
 #     --build-arg INCLUDE_STOCKFISH=1 \
 #     -f Dockerfile.datagen -t pawn-datagen .
+#
+# Build (dev, with Stockfish — typical for stockfish-datagen workflows):
+#   docker build --platform linux/amd64 --target dev \
+#     --build-arg INCLUDE_STOCKFISH=1 \
+#     -f Dockerfile.datagen -t pawn-datagen:dev .
 #
 # Run (Lc0 — requires NVIDIA GPU):
 #   docker run --rm --gpus all -v $(pwd)/data:/out pawn-datagen \
 #     scripts/generate_lc0_data.py --output /out/lc0
+#
+# Run (dev — needs PUBLIC_KEY for SSH login, HF_TOKEN persisted to cache):
+#   docker run -d -p 22:22 \
+#     -e PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)" \
+#     -e HF_TOKEN=hf_... \
+#     pawn-datagen:dev
 #
 # Pinned versions for reproducibility:
 #   Lc0 afaa5ab         https://github.com/LeelaChessZero/lc0 (v0.28.1-429-gafaa5ab)
@@ -66,7 +84,7 @@ RUN cargo build --release -p stockfish-datagen \
     && strip target/release/stockfish-datagen
 
 # ── Runtime ────────────────────────────────────────────────────────────
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
@@ -183,3 +201,82 @@ EOF
 RUN chmod +x /usr/local/bin/datagen-entrypoint
 
 ENTRYPOINT ["/usr/local/bin/datagen-entrypoint"]
+
+# ── Dev variant ────────────────────────────────────────────────────────
+# Builds on `runtime`, adds sshd + interactive shell tooling, and starts
+# sshd as PID 1 so the pod stays alive indefinitely. Use this when you
+# want to validate hardware before committing to a long fire-and-forget
+# run — sweep n_workers, eyeball lscpu/numactl output, watch sustained
+# clock under load, then launch the full datagen_with_hf_sync.py run
+# manually inside tmux for detach-survival.
+FROM runtime AS dev
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-server tini \
+        htop tmux vim-tiny jq numactl util-linux \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd
+
+# Dev entrypoint: idempotent setup of HF token + SSH key, then sshd in
+# foreground. tini (PID 1) reaps zombies left by interactive sessions.
+RUN cat > /usr/local/bin/datagen-dev-entrypoint <<'EOF'
+#!/bin/sh
+set -e
+
+# HF token: persist to the canonical credential file so both the `hf`
+# CLI and huggingface_hub Python pick it up. Idempotent overwrite.
+if [ -n "$HF_TOKEN" ]; then
+    mkdir -p /root/.cache/huggingface
+    printf '%s' "$HF_TOKEN" > /root/.cache/huggingface/token
+fi
+
+# SSH key injection. vast.ai and RunPod both set PUBLIC_KEY in the pod
+# env. Without it sshd starts but no one can log in (no root password).
+if [ -n "$PUBLIC_KEY" ]; then
+    mkdir -p /root/.ssh
+    # Append rather than overwrite so multiple keys work; dedupe on each boot.
+    {
+        cat /root/.ssh/authorized_keys 2>/dev/null
+        echo "$PUBLIC_KEY"
+    } | sort -u > /root/.ssh/authorized_keys.tmp
+    mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys
+    chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+else
+    echo "WARNING: PUBLIC_KEY not set — sshd will start but no one can log in." >&2
+    echo "         Set PUBLIC_KEY=\"\$(cat ~/.ssh/id_ed25519.pub)\" in the pod env." >&2
+fi
+
+# Permit root login via key (no password). Idempotent regex edit.
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+
+# Generate host keys on first boot. ssh-keygen -A is a no-op if they exist.
+ssh-keygen -A 2>/dev/null || true
+
+cat <<MSG
+=== Datagen dev container ===
+Tools available:
+  stockfish-datagen                          (rust binary, on PATH)
+  /opt/datagen/scripts/datagen_with_hf_sync.py
+  /opt/datagen/scripts/sweep_pod_workers.sh
+Bundled configs:
+  /opt/datagen/examples/smoke.json
+  /opt/datagen/examples/stockfish_100m.json
+Typical workflow:
+  1. lscpu | head -25                    # confirm topology
+  2. bash /opt/datagen/scripts/sweep_pod_workers.sh
+  3. edit n_workers in the config you'll run
+  4. tmux new -s run                     # so detach doesn't kill the run
+  5. python3 /opt/datagen/scripts/datagen_with_hf_sync.py \\
+       --config /opt/datagen/examples/stockfish_100m.json \\
+       --repo-id <org>/<name> --prune-local
+sshd starting on port 22 (key auth only).
+MSG
+
+exec /usr/sbin/sshd -D
+EOF
+RUN chmod +x /usr/local/bin/datagen-dev-entrypoint
+
+EXPOSE 22
+ENTRYPOINT ["tini", "--"]
+CMD ["/usr/local/bin/datagen-dev-entrypoint"]

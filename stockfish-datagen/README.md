@@ -209,6 +209,13 @@ including pinning. Output is sorted by rate descending; pick the
 winner and put it in your run config before launching the production
 HF-sync job. The script prints to stdout only — nothing is uploaded.
 
+The `dev` Docker target (see `Dockerfile.datagen`) is purpose-built
+for this workflow: it adds sshd + tmux + htop + jq + numactl on top
+of the runtime image and keeps the pod alive indefinitely so you can
+SSH in, run the sweep, edit configs, then launch the production run
+manually inside `tmux` for detach-survival. See the Dockerfile header
+for the build/run incantations.
+
 CPU pinning is Linux-only (`core_affinity::set_for_current` for the
 worker thread, `libc::sched_setaffinity` for the Stockfish child PID);
 on macOS both calls no-op. See `stockfish-datagen/src/affinity.rs`
