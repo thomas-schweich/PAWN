@@ -136,6 +136,14 @@ impl RunConfig {
         if self.shard_size_games == 0 {
             anyhow::bail!("shard_size_games must be > 0");
         }
+        if self.stockfish_hash_mb == 0 {
+            // Stockfish silently ignores `setoption Hash 0` and falls
+            // back to its built-in default (~16MB), so the configured
+            // value would no longer reflect what's actually in use,
+            // breaking the fingerprint's "this matches the running run"
+            // contract. Reject up-front.
+            anyhow::bail!("stockfish_hash_mb must be > 0");
+        }
         if self.tiers.is_empty() {
             anyhow::bail!("at least one tier required");
         }
@@ -190,16 +198,16 @@ impl RunConfig {
     }
 
     /// Per-tier fingerprint covering only the inputs that would change
-    /// the *bytes generated for that tier*: the tier's own config, its
-    /// declaration index, the master seed, the pinned Stockfish version,
-    /// the shard size, the per-game ply cap, and the worker count.
-    /// Adding/modifying *other* tiers leaves this fingerprint untouched,
-    /// so users can grow their config over time without invalidating
-    /// prior runs.
+    /// the *bytes generated for that tier*. Adding/modifying *other*
+    /// tiers leaves this fingerprint untouched, so users can grow their
+    /// config over time without invalidating prior runs.
     ///
     /// Why every field matters for resume safety:
     /// - `tier` / `tier_index` / `master_seed`: directly seed every game.
     /// - `stockfish_version`: different NNUE → different game outcomes.
+    /// - `stockfish_hash_mb`: Stockfish's transposition-table size can
+    ///   affect fixed-node search choices (and therefore moves) at the
+    ///   higher tiers (nodes >= 32 or so).
     /// - `shard_size_games`: changes which games end up in which shard
     ///   file, which would silently invalidate the resume row-count math.
     /// - `max_ply`: longer games may now resolve where they previously
@@ -221,6 +229,7 @@ impl RunConfig {
             "tier": &self.tiers[tier_index],
             "master_seed": self.master_seed,
             "stockfish_version": &self.stockfish_version,
+            "stockfish_hash_mb": self.stockfish_hash_mb,
             "shard_size_games": self.shard_size_games,
             "max_ply": self.max_ply,
             "n_workers": self.n_workers,
@@ -412,7 +421,7 @@ mod tests {
     fn tier_fingerprint_golden() {
         let cfg = minimal_config();
         let actual = cfg.tier_fingerprint(0);
-        let expected = "29cd96241fea62cb47b689e8df1397aa9b7fac969a8ebe8bf1b73003a6f9b4a3";
+        let expected = "aef0ee9a09ec2f8889d236deb8a821ee1d980645f1a2f708d4cf65a7573bf956";
         assert_eq!(
             actual, expected,
             "tier_fingerprint changed for minimal_config — verify the change is intentional, then update the expected value"
@@ -425,5 +434,22 @@ mod tests {
         c.max_ply = 0;
         let err = c.validate().unwrap_err();
         assert!(format!("{err:#}").contains("max_ply"), "got {err:#}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_stockfish_hash_mb() {
+        let mut c = minimal_config();
+        c.stockfish_hash_mb = 0;
+        let err = c.validate().unwrap_err();
+        assert!(format!("{err:#}").contains("stockfish_hash_mb"), "got {err:#}");
+    }
+
+    #[test]
+    fn tier_fingerprint_changes_with_stockfish_hash_mb() {
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.stockfish_hash_mb = 16;
+        b.stockfish_hash_mb = 64;
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
     }
 }

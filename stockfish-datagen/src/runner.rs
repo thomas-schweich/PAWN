@@ -99,11 +99,36 @@ pub fn run_tier(
     let tier_seed = seed::tier_seed(cfg.master_seed, tier_index);
     let split = cfg.games_per_worker(tier);
 
-    let total_resume_done: u64 = resume_states.values().map(|s| s.games_done).sum();
+    // Clamp to the *current* worker count: stale shards from worker IDs
+    // beyond cfg.n_workers (left over after a `n_workers` reduction in
+    // the config) are NOT counted toward this run's totals. The fingerprint
+    // already includes n_workers, so a manifest mismatch would normally
+    // catch this — but on first re-run after manifest deletion + n_workers
+    // change, this guard prevents inflating `total_written` with rows from
+    // workers that aren't part of the current partition. Stale shards on
+    // disk are still picked up by the dir-scan and listed in the new
+    // manifest; if that's not desired, the user should clear the tier
+    // dir themselves.
+    let resume_in_scope = (0..cfg.n_workers).filter_map(|id| resume_states.get(&id));
+    let total_resume_done: u64 = resume_in_scope.clone().map(|s| s.games_done).sum();
+    let in_scope_count = resume_in_scope.count();
     if total_resume_done > 0 {
+        let total_on_disk: u64 = resume_states.values().map(|s| s.games_done).sum();
         eprintln!(
-            "[{}] resuming: {} games already on disk across {} worker(s)",
-            tier.name, total_resume_done, resume_states.len(),
+            "[{}] resuming: {} games already on disk across {} worker(s){}",
+            tier.name,
+            total_resume_done,
+            in_scope_count,
+            if total_on_disk != total_resume_done {
+                format!(
+                    " ({} additional on disk from {} stale worker(s) outside current n_workers={})",
+                    total_on_disk - total_resume_done,
+                    resume_states.len() - in_scope_count,
+                    cfg.n_workers,
+                )
+            } else {
+                String::new()
+            },
         );
     }
 
