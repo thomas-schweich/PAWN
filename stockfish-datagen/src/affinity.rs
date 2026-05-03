@@ -17,37 +17,71 @@
 //! ## n_workers tuning under pinning
 //!
 //! Pinning shifts the optimal worker count DOWN versus the unpinned
-//! baseline. On a local 16-core box at nodes=1, 5k games:
+//! baseline. On a local 16-thread / 8-physical-core box at nodes=1,
+//! 5k games:
 //!
 //! ```text
 //! workers   no-pin    pinned    delta
 //! ------------------------------------
 //!   8        179.3    244.1    +36%
 //!  12        219.2    301.5    +38%
-//!  14        261.4    321.8    +23%   ← pinned peak
-//!  15        284.6    309.2     +9%
-//!  16        300.6    291.4     -3%   ← unpinned peak
+//!  13          —      312.0    (peak − 3%)
+//!  14        261.4    321.4    +23%   ← pinned peak
+//!  15        284.6    309.9     +9%
+//!  16        300.6    301.3     ≈0%   ← unpinned peak
 //!  20        298.3    231.7    -22%
 //!  24        303.9    260.0    -14%
 //! ```
 //!
-//! Three things to take from this:
+//! Three observations:
 //! 1. Pinning peaks ~7% higher than the unpinned best, AND uses fewer
-//!    cores to do it (14 vs 16 in the local sweep).
-//! 2. Pinning gives a 36-38% boost in the under-saturated regime
-//!    (workers ≤ ~75% of cores). Each (worker, SF) pair gets a
-//!    dedicated core with cache locality.
+//!    cores to do it (14 vs 16 logical in the local sweep).
+//! 2. Pinning gives a 36-38% boost in the under-saturated regime.
+//!    Each (worker, SF) pair gets a dedicated core with cache locality.
 //! 3. Pinning *hurts* once workers ≥ cores: with multiple pairs
-//!    pinned to the same core via `worker_id % n_cores`, they fight
-//!    over that core's time slice instead of being able to migrate.
+//!    pinned to the same logical core via `worker_id % n_logical`,
+//!    they fight over the time slice instead of being able to migrate.
 //!
-//! Rule of thumb under pinning: set `n_workers ≈ 0.85 × physical_core_count`.
-//! On a 128-thread vast.ai box (typically 64 physical cores × 2 SMT),
-//! ~110 workers is a reasonable starting point. The 14/16 ratio (~87%)
-//! is curiously close to a clean 7/8 — could reflect SMT topology
-//! (14+14 SF = 28 procs ≤ 32 SMT slots on a 16-core box). On a real-NUMA
-//! 128-thread box the ideal ratio might differ; a 30-second sweep at
-//! e.g. 64/96/110 workers on a small batch is cheap insurance.
+//! ## Rule of thumb: `n_workers = total_threads - threads_per_core`
+//!
+//! Equivalent reading: "fully occupy every physical core *except one*,
+//! and leave that one core entirely free for the kernel + the
+//! orchestrator's watcher thread + HF upload network handling +
+//! parquet write-back I/O".
+//!
+//! On the local 16-thread / 8-physical / 2-SMT box: 16 − 2 = 14.
+//! Verified by the table above.
+//!
+//! Why this works (packed Linux topology — the modern default):
+//! `core_affinity::get_core_ids()` returns logical cpus in topology
+//! order: cpus 0,1 are SMT siblings on physical core 0; cpus 2,3 on
+//! physical 1; …; cpus N-2, N-1 on the last physical core. With
+//! `worker_id % n_logical` pinning and `n_workers = n_logical -
+//! threads_per_core`, the LAST physical core's siblings are entirely
+//! out of the rotation — that core is uncontested for everything
+//! else the pod is doing.
+//!
+//! Predictions for other topologies:
+//!
+//! ```text
+//! box                                          rule → workers
+//! ----------------------------------------------------------
+//! local: 16 thread / 8 phys / 2 SMT            16 − 2 = 14   (verified)
+//! vast.ai 128 thread / 64 phys / 2 SMT         128 − 2 = 126
+//! same chip with SMT off (64 phys / 1 SMT)     64 − 1 = 63
+//! POWER-style 32 phys / 4 SMT                  128 − 4 = 124
+//! ```
+//!
+//! Caveats:
+//! - Empirically verified at SMT=2 / 16-thread only. The 128-thread
+//!   case is theoretical extrapolation. A 30-second 5k-game sweep at
+//!   {n−4, n−2, n} workers on the actual pod is cheap insurance.
+//! - Assumes packed topology. On scattered topology (older systems),
+//!   `worker_id % n_logical` would NOT leave a fully-free physical core.
+//! - NUMA-naive. On a dual-socket box, leaving one physical core free
+//!   *globally* might leave 0 free on socket 0 and 1 free on socket 1
+//!   — a NUMA-aware rule would leave one per node. Implementing that
+//!   needs explicit topology query rather than modular pinning.
 //!
 //! Linux-only at runtime. Both `pin_current_thread` and `pin_pid` are
 //! no-ops on other platforms — macOS in particular has no

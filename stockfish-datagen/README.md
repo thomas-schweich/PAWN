@@ -133,32 +133,56 @@ tier-state's fingerprint.
 
 ## Tuning `n_workers` (CPU pinning is on by default)
 
-Each worker thread + its Stockfish child are pinned to the same core
-(`worker_id % n_cores`) on Linux. The pair is intrinsically serialized
-over a pipe, so they want the same core's L1/L2 cache. This shifts the
-optimal worker count *down* compared to the unpinned baseline.
+Each worker thread + its Stockfish child are pinned to the same logical
+cpu (`worker_id % n_logical`) on Linux. The pair is intrinsically
+serialized over a pipe, so they want the same core's L1/L2 cache. This
+shifts the optimal worker count *down* compared to the unpinned baseline.
 
-Local 16-core sweep (5k games, nodes=1, sample_plies=12):
+Local sweep on a 16-thread / 8-physical-core / 2-SMT box (5k games,
+nodes=1, sample_plies=12):
 
 | workers | no-pin g/s | pinned g/s | delta |
 |---|---|---|---|
 | 8 | 179.3 | 244.1 | **+36%** |
 | 12 | 219.2 | 301.5 | **+38%** |
-| 14 | 261.4 | **321.8** | +23% (pinned peak) |
-| 16 | **300.6** | 291.4 | -3% (no-pin peak) |
+| 13 | — | 312.0 | (peak − 3%) |
+| **14** | 261.4 | **321.4** | +23% (pinned peak) |
+| 15 | 284.6 | 309.9 | +9% |
+| 16 | **300.6** | 301.3 | ≈0 (no-pin peak) |
 | 20 | 298.3 | 231.7 | -22% |
 | 24 | 303.9 | 260.0 | -14% |
 
-Rule of thumb: **set `n_workers ≈ 0.85 × physical_core_count`** with
-pinning enabled. The under-saturated regime gives a 36-38% boost
-because each (worker, SF) pair gets a dedicated core. Above
-`n_workers ≥ n_cores`, pinning *hurts* — multiple pairs pinned to
-the same core fight over its time slice instead of being able to
-migrate. On a 128-thread vast.ai pod (64 physical × 2 SMT typical),
-~110 workers is a reasonable start; a 30-second sweep at 64/96/110
-on a 2k-game batch is cheap insurance. The bundled
-`examples/stockfish_100m.json` config defaults to `n_workers: 110`
-on this assumption.
+### Rule of thumb: `n_workers = total_threads − threads_per_core`
+
+Equivalent reading: **occupy every physical core except one, and leave
+that one core entirely free for the kernel + the watcher thread + HF
+upload networking + parquet I/O**.
+
+- 16-thread / 8-physical / 2-SMT (this dev box): 16 − 2 = **14** (verified)
+- 128-thread / 64-physical / 2-SMT (typical vast.ai): 128 − 2 = **126**
+- Same chip with SMT off: 64 − 1 = 63
+- 4-way SMT (POWER): 128 − 4 = 124
+
+Why this works (under packed Linux topology, the modern default):
+`core_affinity::get_core_ids()` returns logical cpus in topology order
+(cpus 0,1 are SMT siblings on physical 0; cpus 2,3 on physical 1; …).
+With `worker_id % n_logical` pinning and the rule above, the LAST
+physical core's siblings are entirely out of the rotation, so that
+core is uncontested for everything else the pod is doing.
+
+Caveats:
+- **Empirically verified at SMT=2 / 16-thread only.** The 128-thread
+  case is theoretical extrapolation. A 30-second 5k-game sweep at
+  {n−4, n−2, n} workers on the actual pod is cheap insurance.
+- **Assumes packed topology.** On scattered topology (older systems),
+  `worker_id % n_logical` doesn't leave a fully-free physical core.
+- **NUMA-naive.** On a dual-socket box, leaving one physical core free
+  *globally* leaves 0 free on socket 0 and 1 free on socket 1 — a
+  NUMA-aware rule would leave one per node. Not implemented.
+
+The bundled `examples/stockfish_100m.json` defaults to `n_workers: 126`
+assuming a 128-thread / 64-physical / 2-SMT vast.ai box. On a different
+topology, override per the rule above.
 
 CPU pinning is Linux-only (`core_affinity::set_for_current` for the
 worker thread, `libc::sched_setaffinity` for the Stockfish child PID);

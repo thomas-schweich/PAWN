@@ -3,7 +3,7 @@
   "stockfish_version": "Stockfish 18",
   "output_dir": "data/stockfish",
   "master_seed": 42,
-  "n_workers": 110,
+  "n_workers": 126,
   "max_ply": 512,
   "stockfish_hash_mb": 16,
   "shard_size_games": 10000,
