@@ -56,6 +56,29 @@ RUN git clone --recurse-submodules https://github.com/LeelaChessZero/lc0.git /lc
     && cd /lc0 && git checkout ${LC0_COMMIT} \
     && PATH=/usr/local/cuda/bin:$PATH ./build.sh
 
+# ── tmux: build from source ──────────────────────────────────────────
+# Same version + sha256 pin as the main Dockerfile's dev image, so both
+# inherit the brace-control-mode + range-status format-vars our
+# `deploy/.tmux.conf` relies on. Ubuntu's packaged tmux (3.4 on 24.04)
+# would technically work, but pinning to 3.6a here keeps the dev
+# experience identical across `Dockerfile` and `Dockerfile.datagen`.
+FROM python:3.12-slim AS tmux-build
+ARG TMUX_VERSION=3.6a
+ARG TMUX_SHA256=b6d8d9c76585db8ef5fa00d4931902fa4b8cbe8166f528f44fc403961a3f3759
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl pkg-config bison \
+        libevent-dev libncurses-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL "https://github.com/tmux/tmux/releases/download/${TMUX_VERSION}/tmux-${TMUX_VERSION}.tar.gz" \
+        -o /tmp/tmux.tar.gz \
+    && echo "${TMUX_SHA256}  /tmp/tmux.tar.gz" | sha256sum -c \
+    && tar -xzf /tmp/tmux.tar.gz -C /tmp \
+    && cd "/tmp/tmux-${TMUX_VERSION}" \
+    && ./configure --prefix=/usr/local \
+    && make -j"$(nproc)" \
+    && make install \
+    && strip /usr/local/bin/tmux
+
 # ── Build the Rust stockfish-datagen binary in a builder stage ────────
 # Multi-stage so the rustup toolchain (~1GB) and the build system
 # (gcc, libc-dev, etc.) don't bloat the runtime image — only the
@@ -211,12 +234,43 @@ ENTRYPOINT ["/usr/local/bin/datagen-entrypoint"]
 # manually inside tmux for detach-survival.
 FROM runtime AS dev
 
+# Runtime libs only — tmux itself comes from the `tmux-build` stage
+# (libevent + libncursesw needed at runtime; the -dev variants are
+# build-only and stay in tmux-build).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        openssh-server tini \
-        htop tmux vim-tiny jq numactl util-linux \
+        openssh-server tini git \
+        htop vim-tiny jq numactl util-linux \
         ca-certificates \
+        libevent-2.1-7t64 libncursesw6 \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
+
+# tmux from source (3.6a, sha256-pinned in `tmux-build` above) for parity
+# with the main dev image's status-bar features.
+COPY --from=tmux-build /usr/local/bin/tmux /usr/local/bin/tmux
+
+# tmux-cpu — sources the #{cpu_percentage} / #{ram_percentage} format
+# vars used by the status bar. Pin to a commit SHA (same as main image)
+# since tmux-cpu has no release tags. Shallow git fetch keeps the
+# layer small.
+ARG TMUX_CPU_SHA=bcb110d754ab2417de824c464730c412a3eb2769
+RUN plugin_dir=/root/.config/tmux/plugins/tmux-cpu \
+    && mkdir -p "$plugin_dir" \
+    && git -C "$plugin_dir" init -q \
+    && git -C "$plugin_dir" remote add origin https://github.com/tmux-plugins/tmux-cpu.git \
+    && git -C "$plugin_dir" fetch --depth 1 origin "${TMUX_CPU_SHA}" \
+    && git -C "$plugin_dir" checkout -q FETCH_HEAD \
+    && rm -rf "$plugin_dir/.git"
+
+# GPU stats helper used by the status bar's `#(/usr/local/bin/pod-gpu-stats)`
+# segment. Tries nvidia-smi then rocm-smi; prints nothing on CPU-only pods.
+COPY deploy/pod-gpu-stats.sh /usr/local/bin/pod-gpu-stats
+RUN chmod +x /usr/local/bin/pod-gpu-stats
+
+# Rich tmux config (catppuccin mocha palette, mouse status-bar bindings,
+# CPU/RAM/GPU/time status segments). Lives at /root/.tmux.conf since
+# this image runs as root.
+COPY deploy/.tmux.conf /root/.tmux.conf
 
 # Dev entrypoint: idempotent setup of HF token + SSH key, then sshd in
 # foreground. tini (PID 1) reaps zombies left by interactive sessions.
@@ -266,7 +320,8 @@ Typical workflow:
   1. lscpu | head -25                    # confirm topology
   2. bash /opt/datagen/scripts/sweep_pod_workers.sh
   3. edit n_workers in the config you'll run
-  4. tmux new -s run                     # so detach doesn't kill the run
+  4. tmux new -s run                     # detach-survival; status bar shows
+                                         # cpu / ram / gpu / time / session
   5. python3 /opt/datagen/scripts/datagen_with_hf_sync.py \\
        --config /opt/datagen/examples/stockfish_100m.json \\
        --repo-id <org>/<name> --prune-local
