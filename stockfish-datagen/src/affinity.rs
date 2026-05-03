@@ -14,6 +14,41 @@
 //! more at high core counts (e.g. 128-thread vast.ai pods); pinning is
 //! a precondition for any further NUMA-aware tuning.
 //!
+//! ## n_workers tuning under pinning
+//!
+//! Pinning shifts the optimal worker count DOWN versus the unpinned
+//! baseline. On a local 16-core box at nodes=1, 5k games:
+//!
+//! ```text
+//! workers   no-pin    pinned    delta
+//! ------------------------------------
+//!   8        179.3    244.1    +36%
+//!  12        219.2    301.5    +38%
+//!  14        261.4    321.8    +23%   ← pinned peak
+//!  15        284.6    309.2     +9%
+//!  16        300.6    291.4     -3%   ← unpinned peak
+//!  20        298.3    231.7    -22%
+//!  24        303.9    260.0    -14%
+//! ```
+//!
+//! Three things to take from this:
+//! 1. Pinning peaks ~7% higher than the unpinned best, AND uses fewer
+//!    cores to do it (14 vs 16 in the local sweep).
+//! 2. Pinning gives a 36-38% boost in the under-saturated regime
+//!    (workers ≤ ~75% of cores). Each (worker, SF) pair gets a
+//!    dedicated core with cache locality.
+//! 3. Pinning *hurts* once workers ≥ cores: with multiple pairs
+//!    pinned to the same core via `worker_id % n_cores`, they fight
+//!    over that core's time slice instead of being able to migrate.
+//!
+//! Rule of thumb under pinning: set `n_workers ≈ 0.85 × physical_core_count`.
+//! On a 128-thread vast.ai box (typically 64 physical cores × 2 SMT),
+//! ~110 workers is a reasonable starting point. The 14/16 ratio (~87%)
+//! is curiously close to a clean 7/8 — could reflect SMT topology
+//! (14+14 SF = 28 procs ≤ 32 SMT slots on a 16-core box). On a real-NUMA
+//! 128-thread box the ideal ratio might differ; a 30-second sweep at
+//! e.g. 64/96/110 workers on a small batch is cheap insurance.
+//!
 //! Linux-only at runtime. Both `pin_current_thread` and `pin_pid` are
 //! no-ops on other platforms — macOS in particular has no
 //! `sched_setaffinity` equivalent, and we don't need to pin during

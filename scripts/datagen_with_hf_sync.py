@@ -391,6 +391,12 @@ def main() -> int:
                     help="Watcher gives up + kills the rust child after this "
                          "many consecutive cycle failures (default: %(default)s; "
                          "tune up for runs that may span longer HF outages).")
+    ap.add_argument("--watcher-drain-timeout-hours", type=float, default=4.0,
+                    help="After the rust binary exits, how long to wait for the "
+                         "watcher to drain the backlog of locally-staged shards "
+                         "before giving up and exiting with code 4 "
+                         "(default: %(default)s). Pod will not exit until "
+                         "either the backlog drains or this timeout fires.")
     ap.add_argument("--log-level", default="INFO",
                     help="Logging level (default: INFO).")
     args = ap.parse_args()
@@ -400,20 +406,24 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    # Fail-fast on missing token rather than letting an opaque 401 surface
-    # mid-cycle inside `_upload_one` after the rust binary has already
-    # burned compute. `get_token()` is the canonical helper: it checks
-    # env vars (HF_TOKEN / HUGGING_FACE_HUB_TOKEN / HUGGINGFACE_HUB_TOKEN)
-    # AND the on-disk credential store written by `hf auth login`, in
-    # the same order the rest of huggingface_hub uses at request time.
-    # Don't use `HfApi().token` — that only inspects env, not the
-    # disk-cached login.
+    # Two-part fail-fast: (a) no token at all, (b) token present but rejected.
+    # Either case must fire before the rust binary spawns — running for hours
+    # only to discover at the end that nothing was uploaded would be the
+    # worst possible failure mode for this tool.
+    #
+    # `get_token()` is the canonical helper: it checks env vars (HF_TOKEN
+    # / HUGGING_FACE_HUB_TOKEN / HUGGINGFACE_HUB_TOKEN) AND the on-disk
+    # credential store written by `hf auth login`, in the same order the
+    # rest of huggingface_hub uses at request time. Don't use
+    # `HfApi().token` — that only inspects env, not the disk-cached login.
     token = get_token()
     if token is None:
         LOG.error(
-            "no HF token found in env (HF_TOKEN / HUGGING_FACE_HUB_TOKEN / "
-            "HUGGINGFACE_HUB_TOKEN) or local credential store "
-            "(`hf auth login`). Set HF_TOKEN before running this orchestrator."
+            "FATAL: no HF token found in env (HF_TOKEN / HUGGING_FACE_HUB_TOKEN "
+            "/ HUGGINGFACE_HUB_TOKEN) or local credential store "
+            "(`hf auth login`). Set HF_TOKEN before running this orchestrator. "
+            "Refusing to start the rust binary — running data generation "
+            "without a working sync target would silently waste pod hours."
         )
         return 2
 
@@ -424,6 +434,28 @@ def main() -> int:
     # would re-resolve via `get_token()` itself — same end result, but
     # the wiring is implicit.
     api = HfApi(token=token)
+
+    # Token-validity preflight. `whoami()` is the canonical "this token works"
+    # call — returns user info on success, raises 401 on a bad token. Doing
+    # this BEFORE `ensure_repo` and BEFORE spawning the rust binary means a
+    # revoked / expired / typo'd token surfaces in seconds rather than as an
+    # opaque 401 stack trace from inside an upload retry chain hours later.
+    try:
+        whoami = api.whoami()
+        LOG.info("authenticated to HuggingFace as %s", whoami.get("name", "<unknown>"))
+    except HfHubHTTPError as e:
+        status = e.response.status_code
+        if status == 401:
+            LOG.error(
+                "FATAL: HF token is set but rejected by HuggingFace (HTTP 401 "
+                "from /api/whoami). Token is likely expired, revoked, or "
+                "mistyped. Refusing to start the rust binary."
+            )
+            return 2
+        # Any other status (network blip, 5xx) we propagate — this is
+        # before any expensive work, so a clean exit with a stack trace
+        # is fine and tells the operator something they need to know.
+        raise
 
     # We always touch the repo (cheap: one info-or-create round-trip)
     # before launching the rust binary. `HfApi.upload_file` does NOT
@@ -487,27 +519,43 @@ def main() -> int:
     # both threads could be mid-upload of the same shard, and one could
     # truncate the local file while the other is still reading it.
     #
-    # The join timeout is generous because a watcher cycle in flight may
-    # be inside `_upload_one`'s retry chain (up to ~30s of backoff —
-    # 2+4+8+16, since attempt 4 raises before its sleep — plus per-attempt
-    # HTTP timeouts; multiple shards in one cycle multiplies this). If
-    # the watcher is STILL alive after the timeout, we explicitly skip
-    # the final drain rather than racing it — the un-drained shards
-    # stay local with the matching `_tier_state.json`, and the next run's
-    # primer will pick them up via the placeholder mechanism.
+    # Critical pod-exit guarantee: when the rust binary finishes, there's
+    # almost always a backlog of locally-staged shards that the watcher
+    # hasn't gotten to yet (cheap tiers can produce shards faster than HF
+    # can commit them). We MUST wait for the watcher to drain that backlog
+    # before exiting, or those shards die with the pod.
+    #
+    # The watcher will exit at the top of its next iteration after
+    # `stop.set()`, but it has to finish its current `_scan_and_upload`
+    # cycle first — which uploads everything currently visible. With a
+    # big backlog this cycle can take many minutes. We give it up to
+    # `--watcher-drain-timeout-hours` hours (default 4); long enough for
+    # tens of thousands of shards even at HF's worst-case ~2s/commit. If
+    # the watcher hasn't finished by then, HF is broken or our retry
+    # logic is malformed; we skip the drain (rather than racing it) and
+    # exit with code 4 so the operator sees the partial-sync state.
     stop.set()
-    watcher.join(timeout=watcher_join_timeout(args.poll_interval))
+    drain_timeout_s = args.watcher_drain_timeout_hours * 3600.0
+    LOG.info(
+        "stopping watcher; waiting up to %.1fh for backlog to drain "
+        "(%d files uploaded so far)",
+        args.watcher_drain_timeout_hours, upload_count[0],
+    )
+    watcher.join(timeout=drain_timeout_s)
     drained_ok = True
     if watcher.is_alive():
-        LOG.warning(
-            "watcher thread did not exit within %.0fs; SKIPPING final drain "
-            "to avoid racing in-flight upload. Any locally-staged shards "
-            "will sync on the next run via the primer.",
-            watcher_join_timeout(args.poll_interval),
+        LOG.error(
+            "watcher still alive after %.1fh of drain attempt — uploaded %d "
+            "files so far. Either HF is extraordinarily slow or our retry "
+            "logic is broken. SKIPPING final drain to avoid racing in-flight "
+            "upload; any remaining locally-staged shards will be lost when "
+            "the pod terminates. Re-run with a larger "
+            "--watcher-drain-timeout-hours if HF is just slow.",
+            args.watcher_drain_timeout_hours, upload_count[0],
         )
         drained_ok = False
     else:
-        LOG.info("final drain")
+        LOG.info("watcher exited cleanly; running final drain")
         try:
             _scan_and_upload(api, args.repo_id, tiers, primed, upload_count, args.prune_local)
         except Exception:
@@ -538,20 +586,6 @@ def main() -> int:
     if not drained_ok:
         return rc if rc != 0 else 4
     return rc
-
-
-def watcher_join_timeout(poll_interval: float) -> float:
-    """Wait long enough for an in-flight upload retry chain to finish.
-
-    `_upload_one` does up to 5 attempts; the first 4 sleep for
-    2+4+8+16 = 30s of backoff total (attempt 4 raises BEFORE its sleep,
-    so the would-be 32s sleep never happens). Add per-attempt HTTP
-    timeouts (~30s ceiling each, ×5 attempts = 150s) and the worst-case
-    single-shard stall is ~3 minutes. With multiple shards per cycle
-    the cycle can take longer, so the 600s (10 min) floor gives ~3×
-    headroom over the worst single-shard case.
-    """
-    return max(poll_interval, 600.0)
 
 
 if __name__ == "__main__":

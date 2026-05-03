@@ -149,7 +149,7 @@ RUN lc0 --help 2>&1 | head -1 \
 #   - otherwise exec the command directly.
 # This lets all three modes work without --entrypoint overrides:
 #   # Pod fire-and-forget (env vars provide repo + config):
-#   docker run -e DATAGEN_HF_REPO=org/name -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_20m.json ... pawn-datagen
+#   docker run -e DATAGEN_HF_REPO=org/name -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_100m.json ... pawn-datagen
 #   # Lc0 generator:
 #   docker run ... pawn-datagen scripts/generate_lc0_data.py --output ...
 #   # Bare rust binary (no HF sync):
@@ -169,7 +169,7 @@ if [ $# -eq 0 ]; then
     fi
     echo "datagen: no command given. Examples:" >&2
     echo "  # fire-and-forget pod sync (set HF_TOKEN too):" >&2
-    echo "  docker run -e DATAGEN_HF_REPO=org/name -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_20m.json pawn-datagen" >&2
+    echo "  docker run -e DATAGEN_HF_REPO=org/name -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_100m.json pawn-datagen" >&2
     echo "  docker run pawn-datagen scripts/generate_lc0_data.py --output ..." >&2
     echo "  docker run pawn-datagen stockfish-datagen run --config ..." >&2
     exit 64

@@ -18,9 +18,9 @@ cargo run --release -p stockfish-datagen -- dry-run \
 cargo run --release -p stockfish-datagen -- run \
   --config stockfish-datagen/examples/smoke.json
 
-# Production: 20M games across 5 tiers.
+# Production: 100M games across 5 tiers (20M per tier).
 cargo run --release -p stockfish-datagen -- run \
-  --config stockfish-datagen/examples/stockfish_20m.json
+  --config stockfish-datagen/examples/stockfish_100m.json
 ```
 
 ## Reproducibility
@@ -131,6 +131,40 @@ tier-state's fingerprint.
 | `game_seed`         | `UInt64`        | per-game seed (reproduction key)        |
 | `stockfish_version` | `String`        | from Stockfish's `id name` line         |
 
+## Tuning `n_workers` (CPU pinning is on by default)
+
+Each worker thread + its Stockfish child are pinned to the same core
+(`worker_id % n_cores`) on Linux. The pair is intrinsically serialized
+over a pipe, so they want the same core's L1/L2 cache. This shifts the
+optimal worker count *down* compared to the unpinned baseline.
+
+Local 16-core sweep (5k games, nodes=1, sample_plies=12):
+
+| workers | no-pin g/s | pinned g/s | delta |
+|---|---|---|---|
+| 8 | 179.3 | 244.1 | **+36%** |
+| 12 | 219.2 | 301.5 | **+38%** |
+| 14 | 261.4 | **321.8** | +23% (pinned peak) |
+| 16 | **300.6** | 291.4 | -3% (no-pin peak) |
+| 20 | 298.3 | 231.7 | -22% |
+| 24 | 303.9 | 260.0 | -14% |
+
+Rule of thumb: **set `n_workers ≈ 0.85 × physical_core_count`** with
+pinning enabled. The under-saturated regime gives a 36-38% boost
+because each (worker, SF) pair gets a dedicated core. Above
+`n_workers ≥ n_cores`, pinning *hurts* — multiple pairs pinned to
+the same core fight over its time slice instead of being able to
+migrate. On a 128-thread vast.ai pod (64 physical × 2 SMT typical),
+~110 workers is a reasonable start; a 30-second sweep at 64/96/110
+on a 2k-game batch is cheap insurance. The bundled
+`examples/stockfish_100m.json` config defaults to `n_workers: 110`
+on this assumption.
+
+CPU pinning is Linux-only (`core_affinity::set_for_current` for the
+worker thread, `libc::sched_setaffinity` for the Stockfish child PID);
+on macOS both calls no-op. See `stockfish-datagen/src/affinity.rs`
+for the full module docstring.
+
 ## Operator notes
 
 - **SIGINT / Ctrl-C is safe.** Hitting Ctrl-C mid-shard leaves a
@@ -153,8 +187,8 @@ resume after a crash without re-downloading the existing shards.
 
 ```bash
 HF_TOKEN=... python scripts/datagen_with_hf_sync.py \
-    --config stockfish-datagen/examples/stockfish_20m.json \
-    --repo-id thomas-schweich/pawn-stockfish-20m \
+    --config stockfish-datagen/examples/stockfish_100m.json \
+    --repo-id thomas-schweich/pawn-stockfish-100m \
     --prune-local
 ```
 
@@ -210,8 +244,8 @@ when both env vars are set):
 ```bash
 docker run --rm -d \
     -e HF_TOKEN=... \
-    -e DATAGEN_HF_REPO=thomas-schweich/pawn-stockfish-20m \
-    -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_20m.json \
+    -e DATAGEN_HF_REPO=thomas-schweich/pawn-stockfish-100m \
+    -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_100m.json \
     -e DATAGEN_PRUNE_LOCAL=1 \
     -v /workspace/sf:/workspace/sf \
     pawn-datagen
