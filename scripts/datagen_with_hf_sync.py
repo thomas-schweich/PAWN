@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, get_token
 from huggingface_hub.errors import RepositoryNotFoundError
 from huggingface_hub.utils import HfHubHTTPError
 
@@ -52,6 +52,25 @@ LOG = logging.getLogger("datagen_sync")
 # Names that are part of every tier directory. Any other file is ignored
 # by the watcher (it'll only ever look at these and the shard pattern).
 SENTINEL_FILES: tuple[str, ...] = ("_manifest.json", "_tier_state.json")
+
+# Upload-order priority: lower number first.
+#   `_tier_state.json` is the FIRST upload — fresh-pod resume requires
+#       it to exist remotely so the primer downloads it before the rust
+#       binary scans the tier dir; without it `run_tier` aborts with
+#       "shards exist but no tier state file is present".
+#   shard files are the BULK — uploaded in any order between sentinels.
+#   `_manifest.json` is the LAST upload — it's the tier-complete marker;
+#       seeing it remotely without all referenced shards already remote
+#       would make the next primer skip the tier (silent data loss).
+#
+# `_tier_state.json` happens to be alphabetically after `_manifest.json`,
+# which is why we can't rely on lex sort.
+def _upload_priority(name: str) -> int:
+    if name == "_tier_state.json":
+        return 0
+    if name == "_manifest.json":
+        return 2
+    return 1  # shards (and anything else, though only shards reach here)
 
 # Matches `shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet`. Mirrors the rust
 # parser in `stockfish-datagen/src/resume.rs::parse_shard_filename`.
@@ -268,17 +287,10 @@ def _scan_and_upload(
     for tier in tiers:
         if not tier.local_dir.exists():
             continue
-        # Within a tier: shards FIRST, sentinels LAST (manifest is the
-        # tier-complete marker). If a shard upload fails mid-cycle, the
-        # exception aborts before manifest goes up, so the remote can
-        # never have a manifest while missing one of its referenced
-        # shards. (Without this ordering, lex-sorted iterdir uploads
-        # `_manifest.json` before `shard-...` and a crash between the
-        # manifest commit and the next shard upload would leave the
-        # dataset in a "complete-but-incomplete" state that the next
-        # primer would treat as done.)
+        # Strict per-cycle upload order: tier_state → shards → manifest.
+        # See `_upload_priority` for the rationale on each anchor.
         entries = list(tier.local_dir.iterdir())
-        entries.sort(key=lambda e: (1 if e.name in SENTINEL_FILES else 0, e.name))
+        entries.sort(key=lambda e: (_upload_priority(e.name), e.name))
         for entry in entries:
             name = entry.name
             repo_path = f"{tier.name}/{name}"
@@ -375,15 +387,17 @@ def main() -> int:
 
     # Fail-fast on missing token rather than letting an opaque 401 surface
     # mid-cycle inside `_upload_one` after the rust binary has already
-    # burned compute. huggingface_hub picks up any of these env vars; the
-    # in-memory token from `~/.cache/huggingface/token` also counts.
-    if not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-            or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-            or HfApi().token is not None):
+    # burned compute. `get_token()` is the canonical helper: it checks
+    # env vars (HF_TOKEN / HUGGING_FACE_HUB_TOKEN / HUGGINGFACE_HUB_TOKEN)
+    # AND the on-disk credential store written by `hf auth login`, in
+    # the same order the rest of huggingface_hub uses at request time.
+    # Don't use `HfApi().token` — that only inspects env, not the
+    # disk-cached login.
+    if get_token() is None:
         LOG.error(
             "no HF token found in env (HF_TOKEN / HUGGING_FACE_HUB_TOKEN / "
-            "HUGGINGFACE_HUB_TOKEN) or local credential store. Set HF_TOKEN "
-            "before running this orchestrator."
+            "HUGGINGFACE_HUB_TOKEN) or local credential store "
+            "(`hf auth login`). Set HF_TOKEN before running this orchestrator."
         )
         return 2
 
