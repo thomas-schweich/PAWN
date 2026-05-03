@@ -57,12 +57,9 @@ pub fn run_tier(
     tier_index: usize,
 ) -> anyhow::Result<TierResult> {
     let tier = &cfg.tiers[tier_index];
-    // `~/...` expansion mirrors what we do for stockfish_path, so configs
-    // that use `output_dir: "~/sf-data"` work the same way the Python
-    // sync orchestrator (which calls os.path.expanduser) interprets them.
-    // Without this, the rust binary would write to a literal `./~/sf-data`
-    // dir while the orchestrator watches `$HOME/sf-data`, breaking sync.
-    let tier_dir = expand_tilde(&cfg.output_dir).join(&tier.name);
+    // `output_dir` was tilde-expanded in `RunConfig::load`, so `~/sf-data`
+    // already resolves to `$HOME/sf-data` here.
+    let tier_dir = cfg.output_dir.join(&tier.name);
     std::fs::create_dir_all(&tier_dir)
         .with_context(|| format!("creating tier dir {}", tier_dir.display()))?;
 
@@ -389,7 +386,7 @@ fn run_worker(
     tx: Sender<Progress>,
 ) -> anyhow::Result<()> {
     let mut sf = StockfishProcess::spawn(
-        &expand_tilde(&cfg.stockfish_path),
+        &cfg.stockfish_path,
         &cfg.stockfish_version,
         cfg.stockfish_hash_mb,
         tier.nodes,
@@ -506,17 +503,6 @@ fn run_worker(
         shards,
     });
     Ok(())
-}
-
-/// Tilde-expand a path. Only handles `~/...` (the common case); doesn't
-/// resolve `~user/...` etc. Anything else is returned as-is.
-fn expand_tilde(p: &std::path::Path) -> PathBuf {
-    if let Ok(s) = p.strip_prefix("~") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(s);
-        }
-    }
-    p.to_path_buf()
 }
 
 #[cfg(test)]

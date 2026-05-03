@@ -9,6 +9,17 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Tilde-expand a path. Only handles `~/...` (the common case);
+/// `~user/...` is returned as-is.
+fn expand_tilde(p: &Path) -> PathBuf {
+    if let Ok(s) = p.strip_prefix("~") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(s);
+        }
+    }
+    p.to_path_buf()
+}
+
 /// Top-level run config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,11 +107,20 @@ fn default_shard_size_games() -> u32 {
 
 impl RunConfig {
     /// Load + validate a config from a JSON file.
+    ///
+    /// Path fields (`stockfish_path`, `output_dir`) are tilde-expanded
+    /// at load time — `~/sf-data` becomes `$HOME/sf-data` before any
+    /// downstream consumer sees the value. Doing this once at the
+    /// boundary prevents downstream callers (the CLI's preflight
+    /// `create_dir_all`, `print_plan`, the python sync orchestrator)
+    /// from each having to remember to expand it themselves.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-        let cfg: RunConfig = serde_json::from_slice(&bytes)
+        let mut cfg: RunConfig = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+        cfg.stockfish_path = expand_tilde(&cfg.stockfish_path);
+        cfg.output_dir = expand_tilde(&cfg.output_dir);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -280,6 +300,42 @@ mod tests {
     #[test]
     fn validate_accepts_minimal_config() {
         minimal_config().validate().unwrap();
+    }
+
+    #[test]
+    fn load_expands_tilde_in_path_fields() {
+        // Pin the contract that `RunConfig::load` is the one place
+        // tilde expansion happens — every downstream consumer (CLI
+        // preflight, run_tier, print_plan, the Python orchestrator)
+        // assumes the path it sees is already absolute.
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("c.json");
+        let body = r#"{
+            "stockfish_path": "~/bin/stockfish",
+            "stockfish_version": "Stockfish",
+            "output_dir": "~/sf-data",
+            "master_seed": 1,
+            "n_workers": 1,
+            "max_ply": 16,
+            "stockfish_hash_mb": 1,
+            "shard_size_games": 4,
+            "tiers": [{
+                "name": "t",
+                "nodes": 1,
+                "n_games": 4,
+                "multi_pv": 1,
+                "opening_multi_pv": 1,
+                "opening_plies": 0,
+                "sample_plies": 1,
+                "temperature": 1.0
+            }]
+        }"#;
+        std::fs::File::create(&cfg_path).unwrap().write_all(body.as_bytes()).unwrap();
+        let cfg = RunConfig::load(&cfg_path).unwrap();
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(cfg.output_dir, PathBuf::from(&home).join("sf-data"));
+        assert_eq!(cfg.stockfish_path, PathBuf::from(&home).join("bin/stockfish"));
     }
 
     #[test]
