@@ -82,8 +82,13 @@ for n in "${workers_list[@]}"; do
     rm -rf "$outdir"
     cfg=$(mktemp --suffix=.json)
     mk_config "$n" "$outdir" > "$cfg"
+    # Two-arg `match()` + RSTART/RLENGTH for POSIX/mawk compatibility.
+    # The three-arg form (`match(str, re, array)`) is a gawk extension
+    # and crashes mawk — which is the default `awk` on Ubuntu 24.04
+    # minimal containers (incl. our dev image), causing "rate=ERROR" for
+    # every worker on the pod.
     rate=$("$BIN" run --config "$cfg" 2>&1 \
-        | awk '/games\/s/{match($0,/\(([0-9.]+) games\/s\)/,a); if(a[1]!="") {print a[1]; exit}}')
+        | awk '/games\/s/{if(match($0, /\([0-9.]+/)){print substr($0, RSTART+1, RLENGTH-1); exit}}')
     rm -f "$cfg"
     rm -rf "$outdir"
     if [ -z "${rate:-}" ]; then
