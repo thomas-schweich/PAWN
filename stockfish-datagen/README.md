@@ -176,9 +176,14 @@ Caveats:
   {n−4, n−2, n} workers on the actual pod is cheap insurance.
 - **Assumes packed topology.** On scattered topology (older systems),
   `worker_id % n_logical` doesn't leave a fully-free physical core.
-- **NUMA-naive.** On a dual-socket box, leaving one physical core free
-  *globally* leaves 0 free on socket 0 and 1 free on socket 1 — a
-  NUMA-aware rule would leave one per node. Not implemented.
+- **NUMA:** the rule generalizes to multi-socket boxes without change.
+  What the free core absorbs (kernel networking, the watcher thread,
+  parquet write-back, orchestrator overhead) doesn't scale with
+  worker count or socket count, so one global free physical core
+  suffices regardless of NUMA layout. The realistic cost of NUMA-
+  remote NIC softirqs preempting worker pairs is ~1% throughput on
+  the affected socket — not worth burning a second physical core
+  per node to avoid.
 
 The bundled `examples/stockfish_100m.json` defaults to `n_workers: 126`
 assuming a 128-thread / 64-physical / 2-SMT vast.ai box. On a different

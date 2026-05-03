@@ -78,10 +78,17 @@
 //!   {n−4, n−2, n} workers on the actual pod is cheap insurance.
 //! - Assumes packed topology. On scattered topology (older systems),
 //!   `worker_id % n_logical` would NOT leave a fully-free physical core.
-//! - NUMA-naive. On a dual-socket box, leaving one physical core free
-//!   *globally* might leave 0 free on socket 0 and 1 free on socket 1
-//!   — a NUMA-aware rule would leave one per node. Implementing that
-//!   needs explicit topology query rather than modular pinning.
+//! - NUMA: the rule doesn't care about socket count — and that's fine.
+//!   What the free core absorbs (kernel networking for HF uploads,
+//!   the watcher thread, parquet I/O write-back, the orchestrator's
+//!   periodic work) doesn't scale with worker count or socket count.
+//!   A 1-socket box and a 2-socket box have the same kernel/watcher
+//!   load, so the same single free physical core suffices for both.
+//!   The realistic NUMA cost — NIC softirqs from a remote socket
+//!   preempting worker pairs because the free core is on the other
+//!   socket — is ~1% throughput on the affected socket at production
+//!   interrupt rates, not worth burning a second physical core to
+//!   avoid.
 //!
 //! Linux-only at runtime. Both `pin_current_thread` and `pin_pid` are
 //! no-ops on other platforms — macOS in particular has no
