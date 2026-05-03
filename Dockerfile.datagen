@@ -118,4 +118,19 @@ COPY --from=sfd-builder /build/target/release/stockfish-datagen /usr/local/bin/s
 RUN lc0 --help 2>&1 | head -1 \
     && stockfish-datagen --help 2>&1 | head -1
 
-ENTRYPOINT ["python3"]
+# Dispatcher entrypoint: route `*.py` args to python3 (preserves the
+# original Lc0-via-Python invocation) and pass anything else through
+# as a regular command. This lets both work without --entrypoint
+# overrides:
+#   docker run ... pawn-datagen scripts/generate_lc0_data.py --output ...
+#   docker run ... pawn-datagen stockfish-datagen run --config ...
+RUN cat > /usr/local/bin/datagen-entrypoint <<'EOF'
+#!/bin/sh
+case "$1" in
+    *.py) exec python3 "$@" ;;
+    *)    exec "$@" ;;
+esac
+EOF
+RUN chmod +x /usr/local/bin/datagen-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/datagen-entrypoint"]

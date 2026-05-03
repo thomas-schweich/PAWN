@@ -297,13 +297,22 @@ impl StockfishProcess {
                         score_cp: parsed.score_cp,
                     },
                 );
-            } else if line.starts_with("info ") && line.contains(" score mate 0") {
+            } else if line.starts_with("info ")
+                && (line.contains(" score mate 0 ")
+                    || line.ends_with(" score mate 0"))
+            {
                 // Non-multipv `info ... score mate 0 ...` lines accompany
                 // a `bestmove (none)` for true checkmate. Stalemate emits
                 // either no info line or `score cp 0` with no mate marker;
                 // without parsing this case we'd misclassify checkmate
                 // as stalemate (or vice-versa) when MultiPV emits no
                 // candidates because there are no legal moves.
+                //
+                // Use a word-boundary check (space-or-EOL after the `0`)
+                // rather than a bare `contains(" score mate 0")` so
+                // `" score mate 0X"` (a hypothetical leading-zero
+                // emission) wouldn't falsely match. Stockfish 18 doesn't
+                // emit such lines, but custom builds might.
                 last_score_was_mate0 = true;
             }
         }
