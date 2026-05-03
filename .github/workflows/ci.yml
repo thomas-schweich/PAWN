@@ -22,10 +22,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
+            target
             engine/target
             ~/.cargo/registry
             ~/.cargo/git
-          key: rust-${{ hashFiles('engine/Cargo.lock') }}
+          key: rust-${{ hashFiles('Cargo.lock') }}
           restore-keys: rust-
 
       - name: Install uv
@@ -44,3 +45,13 @@ jobs:
 
       - name: Tests
         run: uv run pytest tests/ -x -q -m "not gpu"
+
+      # Rust workspace tests. The stockfish-datagen crate has live
+      # tests marked `#[ignore = "requires stockfish ..."]`; they don't
+      # run by default. CI shows them in the summary as `ignored` (so
+      # the skip is visible — distinct from the silently-passing
+      # eprintln-and-return pattern we used to use). To run them
+      # locally with Stockfish available:
+      #   cargo test --workspace --release -- --include-ignored
+      - name: Rust workspace tests
+        run: cargo test --workspace --release

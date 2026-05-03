@@ -38,6 +38,33 @@ RUN git clone --recurse-submodules https://github.com/LeelaChessZero/lc0.git /lc
     && cd /lc0 && git checkout ${LC0_COMMIT} \
     && PATH=/usr/local/cuda/bin:$PATH ./build.sh
 
+# ── Build the Rust stockfish-datagen binary in a builder stage ────────
+# Multi-stage so the rustup toolchain (~1GB) and the build system
+# (gcc, libc-dev, etc.) don't bloat the runtime image — only the
+# stripped binary is copied across.
+FROM ubuntu:24.04 AS sfd-builder
+
+# build-essential gives gcc + ld + libc-dev (needed to link the binary).
+# python3 + python3-dev are needed by pyo3-build-config: even though our
+# binary doesn't *link* libpython (chess_engine inherits pyo3 with the
+# `extension-module` feature, which skips that), pyo3-build-config still
+# probes a Python interpreter at compile time to find the include paths.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config curl ca-certificates \
+        python3 python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+        --default-toolchain stable --profile minimal --no-modify-path
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY engine engine
+COPY stockfish-datagen stockfish-datagen
+RUN cargo build --release -p stockfish-datagen \
+    && strip target/release/stockfish-datagen
+
 # ── Runtime ────────────────────────────────────────────────────────────
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
@@ -75,12 +102,41 @@ RUN mkdir -p /opt/lc0_nets \
     && echo "78541c4abc0bc81e8145e1f9a4c35a934ebbefff70f11f33215751d55a886352  /opt/lc0_nets/t3-512x15.pb.gz" | sha256sum -c \
     && echo "e6ada9d6c4a769bfab3aa0848d82caeb809aa45f83e6c605fc58a31d21bdd618  /opt/lc0_nets/bt4-1024x15.pb.gz" | sha256sum -c
 
-# Generation scripts
+# Generation scripts. The Stockfish self-play generator is now a
+# standalone Rust binary (`stockfish-datagen`) built in `sfd-builder`
+# above and copied in below; the legacy Python script was removed in
+# favor of it. The Lc0 + benchmark scripts remain Python.
 WORKDIR /opt/datagen
-COPY scripts/generate_stockfish_data.py scripts/
 COPY scripts/benchmark_stockfish_nodes.py scripts/
 COPY scripts/generate_lc0_data.py scripts/
 
-RUN lc0 --help 2>&1 | head -1
+# Copy the prebuilt stockfish-datagen binary in from the builder stage.
+# Self-contained — the only runtime dependency is the Stockfish binary
+# (installed earlier when --build-arg INCLUDE_STOCKFISH=1).
+COPY --from=sfd-builder /build/target/release/stockfish-datagen /usr/local/bin/stockfish-datagen
 
-ENTRYPOINT ["python3"]
+RUN lc0 --help 2>&1 | head -1 \
+    && stockfish-datagen --help 2>&1 | head -1
+
+# Dispatcher entrypoint: route `*.py` args to python3 (preserves the
+# original Lc0-via-Python invocation) and pass anything else through
+# as a regular command. This lets both work without --entrypoint
+# overrides:
+#   docker run ... pawn-datagen scripts/generate_lc0_data.py --output ...
+#   docker run ... pawn-datagen stockfish-datagen run --config ...
+RUN cat > /usr/local/bin/datagen-entrypoint <<'EOF'
+#!/bin/sh
+if [ $# -eq 0 ]; then
+    echo "datagen: no command given. Examples:" >&2
+    echo "  docker run pawn-datagen scripts/generate_lc0_data.py --output ..." >&2
+    echo "  docker run pawn-datagen stockfish-datagen run --config ..." >&2
+    exit 64
+fi
+case "$1" in
+    *.py) exec python3 "$@" ;;
+    *)    exec "$@" ;;
+esac
+EOF
+RUN chmod +x /usr/local/bin/datagen-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/datagen-entrypoint"]
