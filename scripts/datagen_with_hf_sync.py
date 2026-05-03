@@ -405,11 +405,16 @@ def main() -> int:
     tiers = tier_layouts(cfg)
     api = HfApi()
 
-    ensure_repo(api, args.repo_id)
-
     if args.no_primer:
+        # `--no-primer` is documented as "no network calls before the
+        # first shard is generated" — so don't even create the repo
+        # eagerly. The first watcher upload will hit `ensure_repo`
+        # implicitly (HF auto-creates on first commit if the token has
+        # write access), and any auth errors will surface there.
+        LOG.info("--no-primer: skipping repo touch + primer phase")
         primed: set[str] = set()
     else:
+        ensure_repo(api, args.repo_id)
         LOG.info("priming from %s", args.repo_id)
         primed = primer(api, args.repo_id, tiers)
         LOG.info("primer: %d remote files known (placeholders + sentinels)", len(primed))
@@ -495,8 +500,16 @@ def main() -> int:
         # Watcher gave up after consecutive failures (auth / quota /
         # permanent 4xx). Surface that as a non-zero exit so the pod
         # doesn't appear to have completed successfully.
+        #
+        # Always 3, regardless of `rc`: when the watcher SIGTERMs the
+        # rust child, `proc.wait()` returns a negative value (-15),
+        # which Python translates to exit code 241 — pod monitoring
+        # would see "weird signal" instead of the documented "watcher
+        # failed" semantic. The watcher failure is the *root cause*
+        # we want to surface; the SIGTERM-induced rust exit is
+        # consequence, not signal.
         LOG.error("watcher terminated abnormally: %r", watcher_error[0])
-        return rc if rc != 0 else 3
+        return 3
     if not drained_ok:
         return rc if rc != 0 else 4
     return rc
