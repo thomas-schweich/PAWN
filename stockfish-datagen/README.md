@@ -91,11 +91,20 @@ current config (i.e. you've changed something on the per-tier
 fingerprint list above for an already-completed tier), `run_tier`
 fails fast with a contextual error rather than silently re-running.
 Either restore the original config for that tier or manually delete
-the tier's `_manifest.json` to force a re-scan / regenerate.
+the tier's `_manifest.json` AND `_tier_state.json` to force a
+regenerate from scratch.
 
-Deleting a manifest causes a re-scan: any `.parquet` shards still
-on disk count toward `games_done` and each worker resumes from
-its next chunk index.
+A second sentinel `_tier_state.json` is written *before* any games
+are generated and carries the same per-tier fingerprint. This
+catches the "manifest is missing because we crashed before writing
+it, AND someone changed the config before retrying" case: the
+tier-state would mismatch and the run fails fast rather than
+silently mixing bytes from two configs into one tier output.
+
+Deleting a manifest (but not the tier-state) causes a re-scan: any
+`.parquet` shards still on disk count toward `games_done` and each
+worker resumes from its next chunk index, validated against the
+tier-state's fingerprint.
 
 ## Schema
 

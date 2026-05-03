@@ -33,7 +33,7 @@ pub struct WorkerResumeState {
 }
 
 /// Parse `shard-w<NNN>-c<NNNN>.parquet` into (worker_id, chunk_idx).
-fn parse_shard_filename(name: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_shard_filename(name: &str) -> Option<(u32, u32)> {
     let s = name.strip_prefix("shard-w")?;
     let s = s.strip_suffix(".parquet")?;
     let (w, c) = s.split_once("-c")?;
@@ -50,9 +50,20 @@ fn count_parquet_rows(path: &Path) -> anyhow::Result<u64> {
     Ok(builder.metadata().file_metadata().num_rows() as u64)
 }
 
-/// Walk `tier_dir`, identify per-worker resume state. Returns an empty map
-/// if the directory doesn't exist or contains no shard files.
-pub fn detect_resume(tier_dir: &Path) -> anyhow::Result<HashMap<u32, WorkerResumeState>> {
+/// Walk `tier_dir`, identify per-worker resume state for workers in
+/// `[0, n_workers)`. Returns an empty map if the directory doesn't exist
+/// or contains no shard files.
+///
+/// Stale shards from worker IDs >= `n_workers` (left over after an
+/// `n_workers` reduction) are SKIPPED entirely — they're not validated
+/// for chunk-gaps and not counted in any worker's resume state. The
+/// runner's dir-scan applies the same filter so the manifest stays
+/// internally consistent (`shards` and `n_games_written` both reflect
+/// only the current partition).
+pub fn detect_resume(
+    tier_dir: &Path,
+    n_workers: u32,
+) -> anyhow::Result<HashMap<u32, WorkerResumeState>> {
     if !tier_dir.exists() {
         return Ok(HashMap::new());
     }
@@ -67,6 +78,10 @@ pub fn detect_resume(tier_dir: &Path) -> anyhow::Result<HashMap<u32, WorkerResum
         let Some((worker_id, chunk_idx)) = parse_shard_filename(&name) else {
             continue;
         };
+        if worker_id >= n_workers {
+            // Stale worker from a prior larger n_workers config — ignore.
+            continue;
+        }
         let n_rows = count_parquet_rows(&entry.path())?;
         by_worker.entry(worker_id).or_default().push((chunk_idx, n_rows));
     }
@@ -91,6 +106,57 @@ pub fn detect_resume(tier_dir: &Path) -> anyhow::Result<HashMap<u32, WorkerResum
         out.insert(worker_id, WorkerResumeState { games_done, next_chunk_idx });
     }
     Ok(out)
+}
+
+/// Per-tier "in-progress" sentinel, written *before* any shards are
+/// generated. Carries the tier fingerprint so a resumed run can detect
+/// "shards are on disk but they were generated under a different config"
+/// — the gap that the manifest alone can't catch (since the manifest is
+/// only written on full completion).
+///
+/// Lifecycle: `run_tier` writes this file at start; the manifest write
+/// at end of run leaves it in place (it's harmless once the manifest
+/// exists, since the manifest takes precedence). A user who wants to
+/// regenerate a tier under a different config must delete BOTH this
+/// file and the matching shards.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierState {
+    pub config_fingerprint: String,
+    /// ISO-8601 UTC start time. Informational.
+    pub started_at: String,
+}
+
+const STATE_FILENAME: &str = "_tier_state.json";
+
+impl TierState {
+    pub fn path(tier_dir: &Path) -> PathBuf {
+        tier_dir.join(STATE_FILENAME)
+    }
+
+    pub fn load(tier_dir: &Path) -> anyhow::Result<Option<Self>> {
+        let p = Self::path(tier_dir);
+        if !p.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+        let s: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", p.display()))?;
+        Ok(Some(s))
+    }
+
+    pub fn save(&self, tier_dir: &Path) -> anyhow::Result<()> {
+        let p = Self::path(tier_dir);
+        let tmp = p.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(self)?;
+        let mut f = fs::File::create(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        use std::io::Write as _;
+        f.write_all(&bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        f.sync_all().context("fsyncing tier state")?;
+        drop(f);
+        fs::rename(&tmp, &p).with_context(|| format!("renaming {} -> {}", tmp.display(), p.display()))?;
+        Ok(())
+    }
 }
 
 /// Per-tier completion record. Presence of this file with a matching
@@ -193,13 +259,13 @@ mod tests {
     #[test]
     fn detect_resume_empty_dir() {
         let dir = tempdir().unwrap();
-        let states = detect_resume(dir.path()).unwrap();
+        let states = detect_resume(dir.path(), 4).unwrap();
         assert!(states.is_empty());
     }
 
     #[test]
     fn detect_resume_missing_dir() {
-        let states = detect_resume(Path::new("/tmp/definitely_not_a_real_dir_xyz_42")).unwrap();
+        let states = detect_resume(Path::new("/tmp/definitely_not_a_real_dir_xyz_42"), 4).unwrap();
         assert!(states.is_empty());
     }
 
@@ -211,7 +277,7 @@ mod tests {
         write_shard(dir.path(), 0, 2, 4); // partial trailing shard
         write_shard(dir.path(), 1, 0, 10);
 
-        let states = detect_resume(dir.path()).unwrap();
+        let states = detect_resume(dir.path(), 4).unwrap();
         let w0 = states[&0];
         assert_eq!(w0.games_done, 24);
         assert_eq!(w0.next_chunk_idx, 3);
@@ -226,7 +292,7 @@ mod tests {
         write_shard(dir.path(), 0, 0, 10);
         // skip chunk 1
         write_shard(dir.path(), 0, 2, 10);
-        let err = detect_resume(dir.path()).unwrap_err();
+        let err = detect_resume(dir.path(), 4).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("chunk gap"), "expected gap error, got: {msg}");
     }
@@ -237,7 +303,7 @@ mod tests {
         write_shard(dir.path(), 0, 0, 10);
         std::fs::write(dir.path().join("_manifest.json"), b"{}").unwrap();
         std::fs::write(dir.path().join("shard-w0-c0.parquet.tmp"), b"orphan").unwrap();
-        let states = detect_resume(dir.path()).unwrap();
+        let states = detect_resume(dir.path(), 4).unwrap();
         assert_eq!(states[&0].games_done, 10);
         assert_eq!(states.len(), 1);
     }

@@ -251,13 +251,15 @@ impl StockfishProcess {
                 let _ = parts.next(); // "bestmove"
                 let mv = parts.next().unwrap_or("");
                 if mv == "(none)" {
-                    // No legal moves. The earlier expression had a dead
-                    // disjunct (`A || (B && A)` collapses to `A`). Real
-                    // intent: any positive mate-score signal in the info
-                    // lines (or no info lines at all, which is what
-                    // Stockfish emits when there are no moves to score)
-                    // means checkmate; otherwise stalemate.
-                    let terminal = if last_score_was_mate0 || by_pv.is_empty() {
+                    // Stockfish reports no legal moves. The
+                    // discriminator is whether ANY info line carried
+                    // `score mate 0` — true checkmate emits this even
+                    // without a multipv field; stalemate emits either
+                    // `score cp 0` or no info at all. Don't use
+                    // `by_pv.is_empty()` as a heuristic here: stalemate
+                    // also produces an empty `by_pv`, so that would
+                    // misclassify it as checkmate.
+                    let terminal = if last_score_was_mate0 {
                         Some(TerminalKind::Checkmate)
                     } else {
                         Some(TerminalKind::Stalemate)
@@ -295,6 +297,14 @@ impl StockfishProcess {
                         score_cp: parsed.score_cp,
                     },
                 );
+            } else if line.starts_with("info ") && line.contains(" score mate 0") {
+                // Non-multipv `info ... score mate 0 ...` lines accompany
+                // a `bestmove (none)` for true checkmate. Stalemate emits
+                // either no info line or `score cp 0` with no mate marker;
+                // without parsing this case we'd misclassify checkmate
+                // as stalemate (or vice-versa) when MultiPV emits no
+                // candidates because there are no legal moves.
+                last_score_was_mate0 = true;
             }
         }
     }

@@ -44,8 +44,14 @@ RUN git clone --recurse-submodules https://github.com/LeelaChessZero/lc0.git /lc
 # stripped binary is copied across.
 FROM ubuntu:24.04 AS sfd-builder
 
+# build-essential gives gcc + ld + libc-dev (needed to link the binary).
+# python3 + python3-dev are needed by pyo3-build-config: even though our
+# binary doesn't *link* libpython (chess_engine inherits pyo3 with the
+# `extension-module` feature, which skips that), pyo3-build-config still
+# probes a Python interpreter at compile time to find the include paths.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential pkg-config curl ca-certificates libssl-dev \
+        build-essential pkg-config curl ca-certificates \
+        python3 python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \

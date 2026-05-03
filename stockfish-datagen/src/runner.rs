@@ -16,7 +16,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::config::{RunConfig, TierConfig};
 use crate::game::play_game;
-use crate::resume::{TierManifest, detect_resume};
+use crate::resume::{TierManifest, TierState, detect_resume};
 use crate::seed;
 use crate::shard::{GameRow, ShardWriter, shard_path};
 use crate::stockfish::StockfishProcess;
@@ -94,41 +94,58 @@ pub fn run_tier(
         }
     }
 
-    let resume_states = detect_resume(&tier_dir)?;
+    let resume_states = detect_resume(&tier_dir, cfg.n_workers)?;
+
+    // Tier-state sentinel: validates that any shards on disk were
+    // generated under the SAME config we're about to run. Without this,
+    // an interrupted run + a config tweak before retry would silently
+    // mix old + new bytes into the same tier output.
+    match TierState::load(&tier_dir)? {
+        Some(state) if state.config_fingerprint == fingerprint => {
+            // Matches — safe to resume.
+        }
+        Some(state) => {
+            return Err(anyhow!(
+                "[{}] tier state fingerprint mismatch (started under {}, current {}); \
+                 this tier was partly generated under a different config. Either restore \
+                 the original config or delete the tier dir ({}) to regenerate from scratch.",
+                tier.name,
+                state.config_fingerprint,
+                fingerprint,
+                tier_dir.display(),
+            ));
+        }
+        None if !resume_states.is_empty() => {
+            return Err(anyhow!(
+                "[{}] shards exist in {} but no tier state file is present; cannot \
+                 verify they belong to the current config. Either move them aside or \
+                 delete the tier dir to regenerate from scratch.",
+                tier.name,
+                tier_dir.display(),
+            ));
+        }
+        None => {
+            TierState {
+                config_fingerprint: fingerprint.clone(),
+                started_at: now_iso8601(),
+            }
+            .save(&tier_dir)
+            .context("writing tier state sentinel")?;
+        }
+    }
 
     let tier_seed = seed::tier_seed(cfg.master_seed, tier_index);
     let split = cfg.games_per_worker(tier);
 
-    // Clamp to the *current* worker count: stale shards from worker IDs
-    // beyond cfg.n_workers (left over after a `n_workers` reduction in
-    // the config) are NOT counted toward this run's totals. The fingerprint
-    // already includes n_workers, so a manifest mismatch would normally
-    // catch this — but on first re-run after manifest deletion + n_workers
-    // change, this guard prevents inflating `total_written` with rows from
-    // workers that aren't part of the current partition. Stale shards on
-    // disk are still picked up by the dir-scan and listed in the new
-    // manifest; if that's not desired, the user should clear the tier
-    // dir themselves.
-    let resume_in_scope = (0..cfg.n_workers).filter_map(|id| resume_states.get(&id));
-    let total_resume_done: u64 = resume_in_scope.clone().map(|s| s.games_done).sum();
-    let in_scope_count = resume_in_scope.count();
+    // detect_resume already filters stale workers (worker_id >= n_workers),
+    // so resume_states represents only the current partition.
+    let total_resume_done: u64 = resume_states.values().map(|s| s.games_done).sum();
     if total_resume_done > 0 {
-        let total_on_disk: u64 = resume_states.values().map(|s| s.games_done).sum();
         eprintln!(
-            "[{}] resuming: {} games already on disk across {} worker(s){}",
+            "[{}] resuming: {} games already on disk across {} worker(s)",
             tier.name,
             total_resume_done,
-            in_scope_count,
-            if total_on_disk != total_resume_done {
-                format!(
-                    " ({} additional on disk from {} stale worker(s) outside current n_workers={})",
-                    total_on_disk - total_resume_done,
-                    resume_states.len() - in_scope_count,
-                    cfg.n_workers,
-                )
-            } else {
-                String::new()
-            },
+            resume_states.len(),
         );
     }
 
@@ -253,12 +270,22 @@ pub fn run_tier(
 
     let mut total_written = total_resume_done;
     let mut all_shards: Vec<PathBuf> = Vec::new();
-    // The dir-scan picks up both resumed shards and shards just written
-    // this run; that's all the shards we need. Workers' Done messages
-    // tell us only how many fresh games were written.
+    // Dir-scan picks up both resumed shards and shards just written this
+    // run. Filter via the same filename parser used by `detect_resume`
+    // so we (a) ignore unrelated `.parquet` files a downstream tool might
+    // drop in the dir, and (b) exclude stale shards from worker IDs that
+    // are no longer in scope (n_workers reduced between runs). The
+    // exclusion keeps `manifest.shards` consistent with `n_games_written`
+    // — both reflect only the current partition.
     for entry in std::fs::read_dir(tier_dir.as_path())? {
         let entry = entry?;
-        if entry.path().extension().is_some_and(|e| e == "parquet") {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let Some((worker_id, _chunk)) = crate::resume::parse_shard_filename(&name_str)
+        else {
+            continue;
+        };
+        if worker_id < cfg.n_workers {
             all_shards.push(entry.path());
         }
     }
@@ -574,6 +601,38 @@ mod tests {
         assert_eq!(w0_bytes_before, w0_bytes_after, "completed worker's shard should be untouched");
         // Shard count unchanged — same 2 shards.
         assert_eq!(r2.shards.len(), shard0_paths_before.len());
+    }
+
+    /// Tier-state sentinel: if a user deletes the manifest AND changes
+    /// a fingerprint-relevant field (here, master_seed) while shards from
+    /// the prior config still exist on disk, the run must abort rather
+    /// than silently mixing old + new bytes into the same tier output.
+    #[test]
+    fn live_tier_state_catches_config_drift_after_manifest_delete() {
+        let Some(sf_path) = stockfish_path() else {
+            eprintln!("skipping: no stockfish binary");
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let cfg_a = smoke_config(sf_path.clone(), dir.path().to_path_buf());
+
+        // First run: completes cleanly, writes manifest + tier_state.
+        run_tier(&cfg_a, 0).unwrap();
+        let tier_dir = cfg_a.output_dir.join(&cfg_a.tiers[0].name);
+        assert!(tier_dir.join("_manifest.json").exists());
+        assert!(tier_dir.join("_tier_state.json").exists());
+
+        // User deletes the manifest, changes master_seed, reruns.
+        std::fs::remove_file(tier_dir.join("_manifest.json")).unwrap();
+        let mut cfg_b = smoke_config(sf_path, dir.path().to_path_buf());
+        cfg_b.master_seed = cfg_a.master_seed + 1;
+
+        let err = run_tier(&cfg_b, 0).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("tier state fingerprint mismatch"),
+            "expected tier-state mismatch error, got: {msg}",
+        );
     }
 
     /// Tier fingerprint scoping regression: changing an UNRELATED tier
