@@ -221,6 +221,32 @@ worker thread, `libc::sched_setaffinity` for the Stockfish child PID);
 on macOS both calls no-op. See `stockfish-datagen/src/affinity.rs`
 for the full module docstring.
 
+## Strategic 50-move-rule claim
+
+The 50-move rule is *claimable* in FIDE rules, not automatic, and a
+strong player has no incentive to claim if they're winning. Our
+generator models this: at the moment the 50-move threshold is reached
+(halfmove 100), the side about to move uses Stockfish's eval —
+specifically the top-candidate `score_cp` (which is documented as
+side-to-move POV). If they're losing (`score_cp < 0`), they claim →
+game ends as `FiftyMoveRule`. If winning or even, they keep playing.
+
+In practice this becomes a "50-or-51-or-… move rule": claims
+fluctuate as evaluations swing, until either someone resets the
+halfmove clock with a capture / pawn move or the FIDE 75-move
+*automatic* rule fires at halfmove 150 (the hard upper bound).
+
+**What this gives the model**: a learnable signal for *when* to claim.
+The dataset contains games that ended in 50-move-rule draws at varying
+halfmove offsets in [100, 150], correlated with the position's eval at
+that point. With unconditional claim at halfmove 100, every such game
+would terminate at the same halfmove and the model would just learn
+"halfmove 100 → game over."
+
+3-fold repetition stays unconditional rather than eval-strategic —
+making it strategic risks both sides perpetually shuffling in a drawn
+position, which the 50-move clock would eventually reset anyway.
+
 ## Operator notes
 
 - **SIGINT / Ctrl-C is safe.** Hitting Ctrl-C mid-shard leaves a

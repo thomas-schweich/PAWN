@@ -1,15 +1,36 @@
 //! One self-play game: drive Stockfish, sample candidates, detect terminals.
 //!
-//! All terminal detection lives in *this* loop, in-process: checkmate,
-//! stalemate, insufficient material, threefold repetition, fifty-move rule.
-//! We use FIDE's *claimable* thresholds (3-fold and 50-move) rather than
-//! the *automatic* ones (5-fold and 75-move) because real games — which
-//! we want this data to look like — end at the claimable thresholds when
-//! both sides accept.
+//! Terminal detection lives in *this* loop, in-process. Two flavors:
 //!
-//! Stockfish is only consulted for move *selection*. It should never need
-//! to report `bestmove (none)`; if it does, we surface that as a bug
-//! rather than papering over it.
+//! - **Pre-eval** terminals (cheap, no Stockfish call needed):
+//!   checkmate, stalemate, insufficient material, threefold repetition.
+//!   Plus the 75-move *automatic* draw (FIDE) as a hard upper bound.
+//!   These fire in `detect_pre_eval_terminal` before the Stockfish call
+//!   for the next move.
+//!
+//! - **Strategic 50-move claim** (needs Stockfish's eval): the 50-move
+//!   rule is *claimable*, not automatic. A player has no incentive to
+//!   claim if they're winning. We model this by using Stockfish's
+//!   side-to-move-relative eval at the moment the 50-move threshold is
+//!   reached: if the side about to move is losing (eval < 0), they
+//!   claim → game ends as `FiftyMoveRule`; if winning or even, they
+//!   continue playing. In practice this becomes a "50-or-51-or-…
+//!   move rule" — claims fluctuate as the eval swings, until either
+//!   someone resets the halfmove clock with a capture / pawn move or
+//!   the 75-move auto-rule fires at halfmove 150. This gives the model
+//!   a meaningful signal to learn *when* to claim, rather than baking
+//!   in an "always claim" policy that doesn't match strong-player
+//!   behavior.
+//!
+//! 3-fold repetition is also technically claimable (vs 5-fold automatic),
+//! but we keep that check unconditional because making it strategic
+//! risks both sides perpetually shuffling in a drawn position. The
+//! 50-move clock would eventually reset things anyway.
+//!
+//! Stockfish is only consulted for move *selection* (and the 50-move
+//! eval-based decision). It should never need to report
+//! `bestmove (none)` from a non-terminal position; if it does, we
+//! surface that as a bug rather than papering over it.
 
 use rand::Rng;
 use shakmaty::zobrist::Zobrist64;
@@ -57,9 +78,15 @@ fn zobrist(pos: &Chess) -> u64 {
     h.0
 }
 
-/// Look up which terminal kind, if any, applies to the current position.
-/// Returns `None` if the game is still alive.
-fn detect_terminal(
+/// Look up which pre-eval terminal kind, if any, applies to the current
+/// position. Returns `None` if the game is alive (no terminal known
+/// without consulting Stockfish — see `should_strategic_claim_50mv` for
+/// the post-eval check).
+///
+/// Includes the 75-move *automatic* draw (FIDE: 150 halfmoves) as a
+/// hard upper bound — neither side can avoid this, so it's safe to
+/// fire without an eval.
+fn detect_pre_eval_terminal(
     pos: &Chess,
     history: &[u64],
     current_hash: u64,
@@ -74,17 +101,30 @@ fn detect_terminal(
     if pos.is_insufficient_material() {
         return Some(OutcomeReason::InsufficientMaterial);
     }
-    // Halfmove clock: 50 moves = 100 halfmoves without pawn move or capture.
-    // Use >=100 (claimable) rather than >=150 (automatic 75-move rule).
-    if pos.halfmoves() >= 100 {
+    // 75-move automatic rule. Both sides MUST accept the draw at this
+    // point. Tagged as `FiftyMoveRule` since we don't have a separate
+    // outcome category for "75-move auto" (and it's still a draw by
+    // halfmove-clock rule).
+    if pos.halfmoves() >= 150 {
         return Some(OutcomeReason::FiftyMoveRule);
     }
     // 3-fold repetition (current position must have been seen at least
-    // twice before, i.e. count >= 3 including the current).
+    // twice before, i.e. count >= 3 including the current). Kept
+    // unconditional rather than eval-strategic — see module docstring.
     if count_repetitions(history, current_hash) >= 3 {
         return Some(OutcomeReason::ThreefoldRepetition);
     }
     None
+}
+
+/// Strategic 50-move claim: the side about to move claims the draw iff
+/// they're losing (eval < 0 from their perspective). At eval == 0 (theoretical
+/// draw) neither side claims; the 75-move auto-rule will eventually fire.
+///
+/// Pulled out as a pure function so we can pin the semantics in unit
+/// tests without driving Stockfish.
+fn should_strategic_claim_50mv(halfmoves: u32, side_to_move_eval_cp: f32) -> bool {
+    halfmoves >= 100 && side_to_move_eval_cp < 0.0
 }
 
 /// Per-ply MultiPV bucket selector — single source of truth for the
@@ -123,7 +163,7 @@ pub fn play_game<R: Rng + ?Sized>(
         // Pass the FULL history (current included). `count_repetitions`'s
         // contract is "count of current_hash in history", so >= 3 means
         // the position has now occurred 3 times — the FIDE threshold.
-        if let Some(reason) = detect_terminal(&board, &history, cur_hash, ply as usize) {
+        if let Some(reason) = detect_pre_eval_terminal(&board, &history, cur_hash, ply as usize) {
             return Ok(PlayedGame { uci_moves: moves, outcome: reason });
         }
 
@@ -143,6 +183,19 @@ pub fn play_game<R: Rng + ?Sized>(
         }
         if res.candidates.is_empty() {
             return Err(GameError::NoCandidates);
+        }
+
+        // Strategic 50-move claim — needs Stockfish's eval, so it has to
+        // run AFTER candidates retrieval. Best candidate's score is the
+        // side-to-move's eval (Candidate.score_cp is documented as POV).
+        // The pre-eval check above caps things at halfmove 150 (75-move
+        // auto), so this only fires in the [100, 150) window where a
+        // claim is strategic.
+        let best_score_cp = res.candidates.iter()
+            .map(|c| c.score_cp)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if should_strategic_claim_50mv(board.halfmoves(), best_score_cp) {
+            return Ok(PlayedGame { uci_moves: moves, outcome: OutcomeReason::FiftyMoveRule });
         }
 
         let pick = if target_pv == 1 {
@@ -165,11 +218,15 @@ pub fn play_game<R: Rng + ?Sized>(
 
     // Terminal recheck on the position reached by the LAST allowed move.
     // The loop above only checks before each move, so a natural terminal
-    // (mate, stalemate, 3-fold, 50-move, insufficient material) hit on
-    // exactly the max_ply'th move would otherwise be mislabeled as
-    // PLY_LIMIT.
+    // (mate, stalemate, 3-fold, insufficient material, 75-move auto) hit
+    // on exactly the max_ply'th move would otherwise be mislabeled as
+    // PLY_LIMIT. We only run the pre-eval checks here — we don't have a
+    // fresh Stockfish eval, and a strategic 50-move claim wouldn't have
+    // fired in the loop precisely because the side-to-move was winning
+    // or even at every prior ply, so PLY_LIMIT is the correct label for
+    // a game that ran out the clock without being natural-terminal.
     let final_hash = *history.last().unwrap();
-    let outcome = detect_terminal(&board, &history, final_hash, moves.len())
+    let outcome = detect_pre_eval_terminal(&board, &history, final_hash, moves.len())
         .unwrap_or(OutcomeReason::PlyLimit);
     Ok(PlayedGame { uci_moves: moves, outcome })
 }
@@ -209,7 +266,55 @@ mod tests {
     fn detect_terminal_starting_position_is_alive() {
         let pos = Chess::default();
         let h = zobrist(&pos);
-        assert!(detect_terminal(&pos, &[h], h, 0).is_none());
+        assert!(detect_pre_eval_terminal(&pos, &[h], h, 0).is_none());
+    }
+
+    #[test]
+    fn strategic_50mv_only_claims_when_losing() {
+        // Below the threshold: never claims, regardless of eval.
+        assert!(!should_strategic_claim_50mv(0, -1000.0));
+        assert!(!should_strategic_claim_50mv(99, -1000.0));
+        // Boundary: at exactly halfmove 100, eval is the discriminator.
+        assert!(!should_strategic_claim_50mv(100, 0.0),
+                "eval==0 (theoretical draw) should NOT claim — let 75-move auto fire");
+        assert!(!should_strategic_claim_50mv(100, 1.0),
+                "winning side should not claim");
+        assert!(should_strategic_claim_50mv(100, -1.0),
+                "losing side claims at the threshold");
+        assert!(should_strategic_claim_50mv(100, -10000.0),
+                "near-mate-against claims");
+        // Above the threshold but still below 75-move auto: same behavior.
+        assert!(!should_strategic_claim_50mv(149, 50.0));
+        assert!(should_strategic_claim_50mv(149, -50.0));
+    }
+
+    #[test]
+    fn pre_eval_terminal_fires_75mv_auto_at_150_halfmoves() {
+        // Construct a position with halfmoves >= 150 via FEN — both sides
+        // are forced into the auto-rule regardless of eval.
+        use shakmaty::fen::Fen;
+        // KK endgame at halfmove 150 (not insufficient material because of
+        // the queen — we want to confirm the 75-move check fires alone,
+        // not via insufficient-material overlap).
+        let fen: Fen = "8/8/4k3/8/3K4/3Q4/8/8 w - - 150 80".parse().unwrap();
+        let pos: Chess = fen.into_position(shakmaty::CastlingMode::Standard).unwrap();
+        let h = zobrist(&pos);
+        let outcome = detect_pre_eval_terminal(&pos, &[h], h, 80);
+        assert_eq!(outcome, Some(OutcomeReason::FiftyMoveRule),
+                   "75-move auto rule must fire unconditionally at halfmove 150");
+    }
+
+    #[test]
+    fn pre_eval_terminal_does_not_fire_50mv_at_100_halfmoves() {
+        // The pre-eval check must NOT auto-claim at halfmove 100 anymore
+        // — that's now a strategic decision driven by Stockfish's eval.
+        use shakmaty::fen::Fen;
+        let fen: Fen = "8/8/4k3/8/3K4/3Q4/8/8 w - - 100 51".parse().unwrap();
+        let pos: Chess = fen.into_position(shakmaty::CastlingMode::Standard).unwrap();
+        let h = zobrist(&pos);
+        assert_eq!(detect_pre_eval_terminal(&pos, &[h], h, 51), None,
+                   "50-move-rule decision moved into the eval-driven path; \
+                    pre-eval must let halfmove 100..149 through");
     }
 
     /// Regression test: a terminal that lands on the max_ply'th move
@@ -247,11 +352,11 @@ mod tests {
         let pos = Chess::default();
         let h = zobrist(&pos);
         // 1st occurrence of `h` (just the current).
-        assert!(detect_terminal(&pos, &[h], h, 0).is_none());
+        assert!(detect_pre_eval_terminal(&pos, &[h], h, 0).is_none());
         // 2nd occurrence (one prior + current).
-        assert!(detect_terminal(&pos, &[h, h], h, 0).is_none());
+        assert!(detect_pre_eval_terminal(&pos, &[h, h], h, 0).is_none());
         // 3rd occurrence: must fire.
-        let outcome = detect_terminal(&pos, &[h, h, h], h, 0);
+        let outcome = detect_pre_eval_terminal(&pos, &[h, h, h], h, 0);
         assert_eq!(outcome, Some(OutcomeReason::ThreefoldRepetition));
     }
 
