@@ -53,7 +53,7 @@ pub struct PlayedGame {
     /// the flag is off this is `None` to avoid the per-ply Vec allocation
     /// overhead in tiers that don't need it. The semantics of each
     /// `Candidate.score_cp` depend on the tier's go-budget (qsearch-resolved
-    /// for `Nodes(_)` tiers, raw NNUE static eval for `Searchless` tiers).
+    /// for `Nodes(_)` tiers, raw NNUE static eval for `EvalLegal` tiers).
     pub per_ply_candidates: Option<Vec<Vec<Candidate>>>,
 }
 

@@ -65,30 +65,32 @@ pub enum TerminalKind {
     Stalemate,
 }
 
-/// What command to issue per ply. Pre-rendered into `StockfishProcess::go_cmd`
+/// What command to issue per ply. Pre-rendered into `StockfishProcess::play_cmd`
 /// at spawn time — picking between these is a tier-level choice, not per-ply.
 ///
-/// `Searchless` requires a Stockfish binary built from
-/// `scripts/build_patched_stockfish.sh` (the patched binary recognizes the
-/// `searchless` UCI extension). On a vanilla Stockfish the token is silently
-/// ignored and the engine falls back to qsearch — *not* the desired behavior,
-/// hence the explicit type.
+/// `EvalLegal` requires a Stockfish binary built from
+/// `scripts/build_patched_stockfish.sh` (the patched binary adds the
+/// `evallegal` UCI command). On a vanilla Stockfish the command yields
+/// `Unknown command: 'evallegal'` and the worker fails fast — the spawn-time
+/// probe in [`StockfishProcess::spawn`] catches the mismatch before it could
+/// silently corrupt a tier.
 #[derive(Debug, Clone, Copy)]
 pub enum GoBudget {
     /// `go nodes N`. Standard search-tree budget; per-move scores are
-    /// qsearch-resolved.
+    /// qsearch-resolved. Output: zero or more `info ... multipv ...` lines
+    /// followed by `bestmove`.
     Nodes(u32),
-    /// `go depth 1 searchless`. Per-move scores are raw NNUE static eval
-    /// (no quiescence). Pair with a high MultiPV (e.g. 256) to score every
-    /// legal move per ply.
-    Searchless,
+    /// `evallegal`. Pure NNUE static eval per legal move, no search loop,
+    /// every legal move scored. Output: a single
+    /// `info string evallegal <status> [<uci> <cp>]...` line.
+    EvalLegal,
 }
 
 impl GoBudget {
     fn render(self) -> String {
         match self {
             GoBudget::Nodes(n) => format!("go nodes {n}"),
-            GoBudget::Searchless => "go depth 1 searchless".to_string(),
+            GoBudget::EvalLegal => "evallegal".to_string(),
         }
     }
 }
@@ -104,18 +106,23 @@ pub struct StockfishProcess {
     /// incrementally — appended to per move, reset on `new_game()` — so we
     /// don't allocate or recopy O(ply²) text per game.
     position_cmd: String,
-    /// Pre-rendered `go nodes N` (constant for the lifetime of a process).
-    go_cmd: String,
+    /// Pre-rendered per-ply command (`go nodes N` or `evallegal`).
+    play_cmd: String,
+    /// Which budget produced `play_cmd`. Drives output-parser dispatch in
+    /// [`Self::candidates_after_play_moves`]: `Nodes` reads multipv info
+    /// lines until `bestmove`, `EvalLegal` reads exactly one
+    /// `info string evallegal ...` line.
+    budget: GoBudget,
     /// Banner line value (e.g. `Stockfish 18 by the Stockfish developers`)
     /// captured from the `id name <X>` line. Stored for diagnostics; the
     /// version check itself happens in the constructor.
     pub id_name: String,
-    /// True iff the binary advertises the `NnueEvalCount` UCI option, which
-    /// only the patched binary built via `scripts/build_patched_stockfish.sh`
-    /// adds. Used by the runner to fail loudly when a tier requests
-    /// `searchless` against a vanilla Stockfish (which would silently
-    /// ignore the flag and produce qsearch-augmented evals — wrong for
-    /// distillation tier 0).
+    /// True iff the binary recognizes the `evallegal` UCI command — the marker
+    /// for our patched binary built via `scripts/build_patched_stockfish.sh`.
+    /// Set by the post-handshake probe in [`Self::spawn`]. Used by the runner
+    /// to fail loudly when a tier requests `EvalLegal` against a vanilla
+    /// Stockfish (which would emit `Unknown command: 'evallegal'` and have no
+    /// way to score the position).
     pub is_patched: bool,
 }
 
@@ -166,13 +173,17 @@ impl StockfishProcess {
         let stdin = BufWriter::new(child.stdin.take().expect("piped"));
         let stdout = BufReader::new(child.stdout.take().expect("piped"));
 
+        // evallegal output for a 218-legal-move position is ~3 KB — bump the
+        // line buffer above the parquet 512-default to avoid the first ply
+        // forcing a regrowth.
         let mut sf = Self {
             child,
             stdin,
             stdout,
-            line_buf: String::with_capacity(512),
+            line_buf: String::with_capacity(4096),
             position_cmd: String::with_capacity(64 + 5 * 256),
-            go_cmd: budget.render(),
+            play_cmd: budget.render(),
+            budget,
             id_name: String::new(),
             is_patched: false,
         };
@@ -183,6 +194,31 @@ impl StockfishProcess {
         sf.send("setoption name Threads value 1")?;
         sf.send("isready")?;
         sf.wait_for_token("readyok")?;
+
+        // Probe for the patched binary by sending `evallegal` against the
+        // start position and tagging `is_patched` based on whether the
+        // response shape matches our protocol. `isready`/`readyok` is the
+        // synchronization barrier — vanilla SF emits `Unknown command:
+        // 'evallegal'` (one stdout line, then nothing more until readyok),
+        // patched SF emits `info string evallegal <status> ...`. Either way,
+        // we read until readyok so the channel is drained.
+        sf.send("position startpos")?;
+        sf.send("evallegal")?;
+        sf.send("isready")?;
+        loop {
+            sf.line_buf.clear();
+            let n = sf.stdout.read_line(&mut sf.line_buf)?;
+            if n == 0 {
+                return Err(StockfishError::UnexpectedEof);
+            }
+            let line = sf.line_buf.trim_end();
+            if line.starts_with("info string evallegal ") {
+                sf.is_patched = true;
+            }
+            if line.starts_with("readyok") {
+                break;
+            }
+        }
 
         Ok(sf)
     }
@@ -261,20 +297,29 @@ impl StockfishProcess {
         self.position_cmd.push_str(uci);
     }
 
-    /// Issue `go nodes N` against the cached position (built incrementally
-    /// via [`Self::play_move`] or rebuilt by [`Self::candidates`]).
+    /// Issue the per-ply command (`go nodes N` or `evallegal`, depending on
+    /// `budget`) against the cached position and parse the response.
     pub fn candidates_after_play_moves(
         &mut self,
     ) -> Result<CandidatesResult, StockfishError> {
-        // Write position + go through the BufWriter, then a single flush.
-        // Splitting the writes lets the BufWriter coalesce the two short
-        // commands into one syscall pair instead of three.
+        // Write position + per-ply command through the BufWriter, then a
+        // single flush. Splitting the writes lets the BufWriter coalesce the
+        // two short commands into one syscall pair instead of three.
         self.stdin.write_all(self.position_cmd.as_bytes())?;
         self.stdin.write_all(b"\n")?;
-        self.stdin.write_all(self.go_cmd.as_bytes())?;
+        self.stdin.write_all(self.play_cmd.as_bytes())?;
         self.stdin.write_all(b"\n")?;
         self.stdin.flush()?;
 
+        match self.budget {
+            GoBudget::Nodes(_) => self.read_go_response(),
+            GoBudget::EvalLegal => self.read_evallegal_response(),
+        }
+    }
+
+    /// Parse the `info ... multipv ...` + `bestmove` stream produced by
+    /// `go ...`. Used for every search-tree-budgeted tier.
+    fn read_go_response(&mut self) -> Result<CandidatesResult, StockfishError> {
         // Map keyed by multipv index. Later (deeper) info lines for the
         // same index overwrite earlier ones. BTreeMap is fine at our
         // typical node budgets (1k–10k → at most a few entries kept).
@@ -365,6 +410,34 @@ impl StockfishProcess {
         }
     }
 
+    /// Parse the single `info string evallegal <status> [<uci> <cp>]...` line
+    /// produced by the patched binary's `evallegal` command. Other `info`
+    /// lines that may have leaked through (e.g. nnue init banners on first
+    /// call) are skipped.
+    fn read_evallegal_response(&mut self) -> Result<CandidatesResult, StockfishError> {
+        loop {
+            self.line_buf.clear();
+            let n = self.stdout.read_line(&mut self.line_buf)?;
+            if n == 0 {
+                return Err(StockfishError::UnexpectedEof);
+            }
+            let line = self.line_buf.trim_end();
+            let Some(rest) = line.strip_prefix("info string evallegal ") else {
+                // Should not happen with a patched binary on a well-formed
+                // position. If a vanilla SF slipped through preflight,
+                // the response would be `Unknown command: 'evallegal'` —
+                // treat as protocol violation.
+                if line.starts_with("Unknown command") {
+                    return Err(StockfishError::Protocol(format!(
+                        "evallegal not supported by this binary: {line}"
+                    )));
+                }
+                continue;
+            };
+            return Ok(parse_evallegal_payload(rest));
+        }
+    }
+
     /// Send `quit` and wait briefly. Best-effort; killed forcibly on timeout.
     pub fn shutdown(mut self) {
         let _ = self.send("quit");
@@ -409,15 +482,6 @@ impl StockfishProcess {
             if let Some(rest) = line.strip_prefix("id name ") {
                 self.id_name = rest.to_string();
             }
-            // The `NnueEvalCount` UCI option is unique to our patched binary
-            // (added in patches/0001-searchless-uci-extension.patch alongside
-            // the `searchless` go-command flag). Presence here is the runtime
-            // signal that `searchless` will actually be honored — vanilla SF
-            // ignores unknown go tokens silently, producing qsearch-augmented
-            // evals that would corrupt the distillation tier-0 dataset.
-            if line.starts_with("option name NnueEvalCount ") {
-                self.is_patched = true;
-            }
             if line.starts_with("uciok") {
                 break;
             }
@@ -441,6 +505,54 @@ impl StockfishProcess {
         }
         Ok(())
     }
+}
+
+/// Parse the payload portion of an `info string evallegal <payload>` line —
+/// `<payload>` is everything after the `evallegal ` prefix:
+///
+/// - `mate` / `stalemate` → empty candidates + matching `TerminalKind`
+/// - `none <uci> <cp> <uci> <cp> ...` → candidates list, no terminal
+/// - `check <uci> <cp> ...` → candidates list, no terminal (in-check
+///   positions are NNUE-OOD; the caller is expected to flag/discard if
+///   they care, but we don't drop them on the engine's behalf)
+///
+/// Malformed payloads (unknown status, odd token count, unparseable cp)
+/// degrade gracefully to "empty list, no terminal" — protocol-level
+/// violations should be impossible from our patched binary, and a stricter
+/// error here would risk killing a worker on the rare malformed line.
+fn parse_evallegal_payload(payload: &str) -> CandidatesResult {
+    let mut it = payload.split_whitespace();
+    let status = match it.next() {
+        Some(s) => s,
+        None => return CandidatesResult { candidates: Vec::new(), terminal: None },
+    };
+    match status {
+        "mate" => {
+            return CandidatesResult {
+                candidates: Vec::new(),
+                terminal: Some(TerminalKind::Checkmate),
+            };
+        }
+        "stalemate" => {
+            return CandidatesResult {
+                candidates: Vec::new(),
+                terminal: Some(TerminalKind::Stalemate),
+            };
+        }
+        "none" | "check" => {} // fall through
+        _ => return CandidatesResult { candidates: Vec::new(), terminal: None },
+    }
+
+    let mut candidates = Vec::with_capacity(32);
+    while let Some(uci) = it.next() {
+        let Some(cp_tok) = it.next() else { break };
+        let Ok(cp) = cp_tok.parse::<i32>() else { break };
+        candidates.push(Candidate {
+            uci: uci.to_string(),
+            score_cp: cp as f32,
+        });
+    }
+    CandidatesResult { candidates, terminal: None }
 }
 
 #[derive(Debug)]
@@ -547,6 +659,47 @@ mod tests {
         let line = "info depth 5 multipv 1 score cp 25 pv e2e4 e7e5 g1f3 b8c6";
         let p = parse_info_multipv(line).unwrap();
         assert_eq!(p.first_move, "e2e4");
+    }
+
+    #[test]
+    fn parse_evallegal_none_pairs() {
+        let r = parse_evallegal_payload("none e2e4 27 d2d4 24 g1f3 -3");
+        assert!(r.terminal.is_none());
+        assert_eq!(r.candidates.len(), 3);
+        assert_eq!(r.candidates[0].uci, "e2e4");
+        assert!((r.candidates[0].score_cp - 27.0).abs() < 1e-6);
+        assert_eq!(r.candidates[2].uci, "g1f3");
+        assert!((r.candidates[2].score_cp - -3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_evallegal_check_pairs() {
+        let r = parse_evallegal_payload("check a8a7 -3");
+        assert!(r.terminal.is_none()); // in-check is NOT terminal
+        assert_eq!(r.candidates.len(), 1);
+    }
+
+    #[test]
+    fn parse_evallegal_mate_and_stalemate() {
+        assert_eq!(
+            parse_evallegal_payload("mate").terminal,
+            Some(TerminalKind::Checkmate),
+        );
+        assert!(parse_evallegal_payload("mate").candidates.is_empty());
+        assert_eq!(
+            parse_evallegal_payload("stalemate").terminal,
+            Some(TerminalKind::Stalemate),
+        );
+    }
+
+    #[test]
+    fn parse_evallegal_odd_token_count_truncates() {
+        // Malformed but graceful: the final "deadbeef" token has no cp partner;
+        // we keep the well-formed pair and stop. Better than panicking on bad
+        // engine output.
+        let r = parse_evallegal_payload("none e2e4 10 deadbeef");
+        assert_eq!(r.candidates.len(), 1);
+        assert_eq!(r.candidates[0].uci, "e2e4");
     }
 
     /// Resolve the Stockfish binary for a live test. Tests that use this

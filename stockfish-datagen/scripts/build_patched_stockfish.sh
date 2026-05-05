@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build the patched Stockfish binary used for tier-0 (searchless) data gen.
+# Build the patched Stockfish binary used for tier-0 (evallegal) data gen.
 #
-# Clones upstream Stockfish, applies our patches, builds with PGO. Output
-# binary is placed in the repo root as `stockfish-patched` (gitignored).
+# Clones upstream Stockfish, applies our patches, builds. Output binary is
+# placed in the repo root as `stockfish-patched` (gitignored).
 #
 # Usage:
 #   bash scripts/build_patched_stockfish.sh           # default: x86-64-avx2
@@ -14,9 +14,9 @@ set -euo pipefail
 
 ARCH="${1:-x86-64-avx2}"
 # Pin to SF18 release. Bundles nn-c288c895ea92.nnue (big) + nn-37f18f62d772.nnue
-# (small) — the same NNUE weights as `~/bin/stockfish` SF18 release. Patched-no-flag
-# is bit-identical to vanilla SF18; the searchless bare-flag adds the pure-NNUE
-# qsearch short-circuit.
+# (small) — the same NNUE weights as `~/bin/stockfish` SF18 release. The patch
+# is purely additive (new `evallegal` UCI command), so every other command in
+# the patched binary is bit-identical to vanilla SF18.
 SF_TAG="sf_18"
 SF_COMMIT="cb3d4ee9b47d0c5aae855b12379378ea1439675c"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"

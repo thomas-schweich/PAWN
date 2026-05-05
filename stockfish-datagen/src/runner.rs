@@ -398,7 +398,7 @@ fn run_worker(
     affinity::pin_current_thread(worker_id);
 
     let budget = if tier.searchless {
-        crate::stockfish::GoBudget::Searchless
+        crate::stockfish::GoBudget::EvalLegal
     } else {
         crate::stockfish::GoBudget::Nodes(tier.nodes)
     };

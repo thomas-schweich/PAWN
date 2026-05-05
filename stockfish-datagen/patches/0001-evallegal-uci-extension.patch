@@ -1,0 +1,95 @@
+diff --git a/src/engine.cpp b/src/engine.cpp
+index dfd2099d..aeef1cd0 100644
+--- a/src/engine.cpp
++++ b/src/engine.cpp
+@@ -31,6 +31,7 @@
+ 
+ #include "evaluate.h"
+ #include "misc.h"
++#include "movegen.h"
+ #include "nnue/network.h"
+ #include "nnue/nnue_common.h"
+ #include "nnue/nnue_misc.h"
+@@ -336,6 +337,50 @@ void Engine::trace_eval() const {
+     sync_cout << "\n" << Eval::trace(p, *networks) << sync_endl;
+ }
+ 
++// pawn datagen extension. See engine.h for protocol.
++void Engine::eval_legal() {
++    verify_networks();
++
++    // Heap-allocate the NNUE working set — AccumulatorStack alone is ~2.8 MB
++    // and tripping `-Wstack-usage=128000` on the stack. Same pattern as trace_eval.
++    auto accumulators = std::make_unique<Eval::NNUE::AccumulatorStack>();
++    auto caches       = std::make_unique<Eval::NNUE::AccumulatorCaches>(*networks);
++
++    MoveList<LEGAL> legals(pos);
++    const bool      in_check = bool(pos.checkers());
++
++    if (legals.size() == 0)
++    {
++        sync_cout << "info string evallegal " << (in_check ? "mate" : "stalemate")
++                  << sync_endl;
++        return;
++    }
++
++    std::stringstream ss;
++    ss << "info string evallegal " << (in_check ? "check" : "none");
++
++    const bool chess960 = options["UCI_Chess960"];
++    for (Move m : legals)
++    {
++        states->emplace_back();
++        pos.do_move(m, states->back());
++
++        // Eval::evaluate returns side-to-move POV; after do_move side has flipped,
++        // so the value is from the opponent's POV. Negate to express each move's
++        // score from the original mover's POV (matching `info ... score cp N`).
++        Value v  = Eval::evaluate(*networks, pos, *accumulators, *caches, VALUE_ZERO);
++        v        = -v;
++        int   cp = UCIEngine::to_cp(v, pos);
++
++        pos.undo_move(m);
++        states->pop_back();
++
++        ss << ' ' << UCIEngine::move(m, chess960) << ' ' << cp;
++    }
++
++    sync_cout << ss.str() << sync_endl;
++}
++
+ const OptionsMap& Engine::get_options() const { return options; }
+ OptionsMap&       Engine::get_options() { return options; }
+ 
+diff --git a/src/engine.h b/src/engine.h
+index 10c92d75..2d4e8fc9 100644
+--- a/src/engine.h
++++ b/src/engine.h
+@@ -95,6 +95,14 @@ class Engine {
+ 
+     void trace_eval() const;
+ 
++    // pawn datagen extension. For each legal move at the current position,
++    // emit a single line `info string evallegal <status> [<uci> <cp> ...]`
++    // where status is one of {none, check, mate, stalemate}. Bypasses the
++    // search loop entirely — just iterates legal moves and calls Eval::evaluate
++    // on each child position. Scores are mover-POV centipawns (matching the
++    // sign convention of `info ... score cp N` lines from a normal search).
++    void eval_legal();
++
+     const OptionsMap& get_options() const;
+     OptionsMap&       get_options();
+ 
+diff --git a/src/uci.cpp b/src/uci.cpp
+index 92700768..8e191bd0 100644
+--- a/src/uci.cpp
++++ b/src/uci.cpp
+@@ -148,6 +148,8 @@ void UCIEngine::loop() {
+             sync_cout << engine.visualize() << sync_endl;
+         else if (token == "eval")
+             engine.trace_eval();
++        else if (token == "evallegal")  // pawn datagen extension
++            engine.eval_legal();
+         else if (token == "compiler")
+             sync_cout << compiler_info() << sync_endl;
+         else if (token == "export_net")

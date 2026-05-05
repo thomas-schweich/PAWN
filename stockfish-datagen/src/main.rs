@@ -106,14 +106,12 @@ struct Totals {
 }
 
 /// If any tier has `searchless: true`, spawn one throwaway Stockfish
-/// process and verify it advertises the `NnueEvalCount` UCI option (the
-/// marker added by `patches/0001-searchless-uci-extension.patch`).
+/// process and verify it recognizes the `evallegal` UCI command (the
+/// marker added by `patches/0001-evallegal-uci-extension.patch`).
 ///
-/// Vanilla Stockfish silently ignores unknown go-command tokens, so a
-/// `searchless` tier driven by a vanilla binary would *appear* to work
-/// but quietly produce qsearch-augmented evals — corrupting the
-/// distillation tier-0 dataset in a way that's invisible until users
-/// look at the data months later. Fail loudly here instead.
+/// Vanilla Stockfish responds with `Unknown command: 'evallegal'` and
+/// would have no way to score the position — fail loudly at startup
+/// rather than mid-run.
 fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
     let needs_patched: Vec<&str> = cfg
         .tiers
@@ -124,8 +122,9 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
     if needs_patched.is_empty() {
         return Ok(());
     }
-    // One throwaway probe — uses GoBudget::Nodes(1) since spawn() pre-renders
-    // the go command but doesn't run it. We only care about handshake output.
+    // One throwaway probe — `spawn()` always sends `evallegal` against startpos
+    // post-handshake and tags `is_patched` based on the response shape, so
+    // the budget choice here doesn't matter.
     let probe = StockfishProcess::spawn(
         &cfg.stockfish_path,
         &cfg.stockfish_version,
@@ -133,16 +132,16 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
         GoBudget::Nodes(1),
     )
     .with_context(|| {
-        format!("preflight: spawning {} to check for searchless patch", cfg.stockfish_path.display())
+        format!("preflight: spawning {} to check for evallegal patch", cfg.stockfish_path.display())
     })?;
     eprintln!(
-        "stockfish patched (searchless extension): {}",
+        "stockfish patched (evallegal command): {}",
         if probe.is_patched { "yes" } else { "NO" },
     );
     if !probe.is_patched {
         anyhow::bail!(
-            "tier(s) {:?} require `searchless: true`, but {} does not advertise the \
-             `NnueEvalCount` UCI option that marks the patched binary. Build it via \
+            "tier(s) {:?} require `searchless: true`, but {} does not recognize the \
+             `evallegal` UCI command that marks the patched binary. Build it via \
              `bash stockfish-datagen/scripts/build_patched_stockfish.sh` and point \
              `stockfish_path` at the resulting `stockfish-datagen/stockfish-patched`.",
             needs_patched, cfg.stockfish_path.display(),
