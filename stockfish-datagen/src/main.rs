@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 
 use stockfish_datagen::config::RunConfig;
 use stockfish_datagen::runner::run_tier;
+use stockfish_datagen::stockfish::{GoBudget, StockfishProcess};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -50,12 +51,14 @@ fn real_main() -> anyhow::Result<()> {
             let cfg = RunConfig::load(&config)
                 .with_context(|| format!("loading config {}", config.display()))?;
             print_plan(&cfg);
+            preflight_check_patched_binary(&cfg)?;
             Ok(())
         }
         Command::Run { config } => {
             let cfg = RunConfig::load(&config)
                 .with_context(|| format!("loading config {}", config.display()))?;
             print_plan(&cfg);
+            preflight_check_patched_binary(&cfg)?;
             std::fs::create_dir_all(&cfg.output_dir).with_context(|| {
                 format!("creating output dir {}", cfg.output_dir.display())
             })?;
@@ -100,6 +103,52 @@ fn real_main() -> anyhow::Result<()> {
 struct Totals {
     games: u64,
     shards: u64,
+}
+
+/// If any tier has `searchless: true`, spawn one throwaway Stockfish
+/// process and verify it advertises the `NnueEvalCount` UCI option (the
+/// marker added by `patches/0001-searchless-uci-extension.patch`).
+///
+/// Vanilla Stockfish silently ignores unknown go-command tokens, so a
+/// `searchless` tier driven by a vanilla binary would *appear* to work
+/// but quietly produce qsearch-augmented evals — corrupting the
+/// distillation tier-0 dataset in a way that's invisible until users
+/// look at the data months later. Fail loudly here instead.
+fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
+    let needs_patched: Vec<&str> = cfg
+        .tiers
+        .iter()
+        .filter(|t| t.searchless)
+        .map(|t| t.name.as_str())
+        .collect();
+    if needs_patched.is_empty() {
+        return Ok(());
+    }
+    // One throwaway probe — uses GoBudget::Nodes(1) since spawn() pre-renders
+    // the go command but doesn't run it. We only care about handshake output.
+    let probe = StockfishProcess::spawn(
+        &cfg.stockfish_path,
+        &cfg.stockfish_version,
+        cfg.stockfish_hash_mb,
+        GoBudget::Nodes(1),
+    )
+    .with_context(|| {
+        format!("preflight: spawning {} to check for searchless patch", cfg.stockfish_path.display())
+    })?;
+    eprintln!(
+        "stockfish patched (searchless extension): {}",
+        if probe.is_patched { "yes" } else { "NO" },
+    );
+    if !probe.is_patched {
+        anyhow::bail!(
+            "tier(s) {:?} require `searchless: true`, but {} does not advertise the \
+             `NnueEvalCount` UCI option that marks the patched binary. Build it via \
+             `bash stockfish-datagen/scripts/build_patched_stockfish.sh` and point \
+             `stockfish_path` at the resulting `stockfish-datagen/stockfish-patched`.",
+            needs_patched, cfg.stockfish_path.display(),
+        );
+    }
+    Ok(())
 }
 
 fn print_plan(cfg: &RunConfig) {

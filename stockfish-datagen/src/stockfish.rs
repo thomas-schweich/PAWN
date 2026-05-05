@@ -110,6 +110,13 @@ pub struct StockfishProcess {
     /// captured from the `id name <X>` line. Stored for diagnostics; the
     /// version check itself happens in the constructor.
     pub id_name: String,
+    /// True iff the binary advertises the `NnueEvalCount` UCI option, which
+    /// only the patched binary built via `scripts/build_patched_stockfish.sh`
+    /// adds. Used by the runner to fail loudly when a tier requests
+    /// `searchless` against a vanilla Stockfish (which would silently
+    /// ignore the flag and produce qsearch-augmented evals — wrong for
+    /// distillation tier 0).
+    pub is_patched: bool,
 }
 
 impl Drop for StockfishProcess {
@@ -167,6 +174,7 @@ impl StockfishProcess {
             position_cmd: String::with_capacity(64 + 5 * 256),
             go_cmd: budget.render(),
             id_name: String::new(),
+            is_patched: false,
         };
 
         sf.send("uci")?;
@@ -400,6 +408,15 @@ impl StockfishProcess {
             let line = self.line_buf.trim_end();
             if let Some(rest) = line.strip_prefix("id name ") {
                 self.id_name = rest.to_string();
+            }
+            // The `NnueEvalCount` UCI option is unique to our patched binary
+            // (added in patches/0001-searchless-uci-extension.patch alongside
+            // the `searchless` go-command flag). Presence here is the runtime
+            // signal that `searchless` will actually be honored — vanilla SF
+            // ignores unknown go tokens silently, producing qsearch-augmented
+            // evals that would corrupt the distillation tier-0 dataset.
+            if line.starts_with("option name NnueEvalCount ") {
+                self.is_patched = true;
             }
             if line.starts_with("uciok") {
                 break;
