@@ -37,13 +37,21 @@ pub enum StockfishError {
     Protocol(String),
 }
 
-/// One candidate move surfaced by `go nodes N` with `MultiPV >= 1`.
+/// One candidate move surfaced by either `go nodes N` (multipv parsing) or
+/// `evallegal` (per-legal-move NNUE).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     pub uci: String,
-    /// Centipawns from side-to-move's perspective. Mate scores are folded
-    /// to ±30000 so downstream softmax never sees +inf.
+    /// Normalized centipawns, mover-POV (`UCIEngine::to_cp(v, pos)` —
+    /// 100 cp ≈ "1 pawn equivalent"). Mate scores are folded to ±30000 so
+    /// downstream softmax never sees +inf. Available from both protocols.
     pub score_cp: f32,
+    /// Raw internal NNUE Value, mover-POV. Only the `evallegal` protocol
+    /// surfaces this directly; `go nodes N` (multipv) reports cp only, so
+    /// this is `None` for that path. Distillation targets should use this
+    /// when present (it's the network's actual output, before win-rate
+    /// normalization shrinks magnitudes by `a / 100` ≈ 2–3.5×).
+    pub score_v: Option<f32>,
 }
 
 /// Result of a `go nodes N` call.
@@ -368,6 +376,7 @@ impl StockfishProcess {
                         candidates: vec![Candidate {
                             uci: mv.to_string(),
                             score_cp: 0.0,
+                            score_v: None,
                         }],
                         terminal: None,
                     });
@@ -387,6 +396,7 @@ impl StockfishProcess {
                     Candidate {
                         uci: parsed.first_move,
                         score_cp: parsed.score_cp,
+                        score_v: None,
                     },
                 );
             } else if line.starts_with("info ")
@@ -511,15 +521,16 @@ impl StockfishProcess {
 /// `<payload>` is everything after the `evallegal ` prefix:
 ///
 /// - `mate` / `stalemate` → empty candidates + matching `TerminalKind`
-/// - `none <uci> <cp> <uci> <cp> ...` → candidates list, no terminal
-/// - `check <uci> <cp> ...` → candidates list, no terminal (in-check
+/// - `none <uci> <cp> <v> <uci> <cp> <v> ...` → candidates list, no terminal
+/// - `check <uci> <cp> <v> ...` → candidates list, no terminal (in-check
 ///   positions are NNUE-OOD; the caller is expected to flag/discard if
 ///   they care, but we don't drop them on the engine's behalf)
 ///
-/// Malformed payloads (unknown status, odd token count, unparseable cp)
-/// degrade gracefully to "empty list, no terminal" — protocol-level
-/// violations should be impossible from our patched binary, and a stricter
-/// error here would risk killing a worker on the rare malformed line.
+/// Malformed payloads (unknown status, missing trailing tokens, unparseable
+/// integers) degrade gracefully — we keep whatever well-formed triplets we
+/// got and stop. Protocol-level violations should be impossible from our
+/// patched binary, and a stricter error here would risk killing a worker
+/// on the rare malformed line.
 fn parse_evallegal_payload(payload: &str) -> CandidatesResult {
     let mut it = payload.split_whitespace();
     let status = match it.next() {
@@ -546,10 +557,13 @@ fn parse_evallegal_payload(payload: &str) -> CandidatesResult {
     let mut candidates = Vec::with_capacity(32);
     while let Some(uci) = it.next() {
         let Some(cp_tok) = it.next() else { break };
+        let Some(v_tok) = it.next() else { break };
         let Ok(cp) = cp_tok.parse::<i32>() else { break };
+        let Ok(v) = v_tok.parse::<i32>() else { break };
         candidates.push(Candidate {
             uci: uci.to_string(),
             score_cp: cp as f32,
+            score_v: Some(v as f32),
         });
     }
     CandidatesResult { candidates, terminal: None }
@@ -662,21 +676,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_evallegal_none_pairs() {
-        let r = parse_evallegal_payload("none e2e4 27 d2d4 24 g1f3 -3");
+    fn parse_evallegal_none_triplets() {
+        let r = parse_evallegal_payload("none e2e4 27 75 d2d4 24 67 g1f3 -3 -8");
         assert!(r.terminal.is_none());
         assert_eq!(r.candidates.len(), 3);
         assert_eq!(r.candidates[0].uci, "e2e4");
         assert!((r.candidates[0].score_cp - 27.0).abs() < 1e-6);
+        assert!((r.candidates[0].score_v.unwrap() - 75.0).abs() < 1e-6);
         assert_eq!(r.candidates[2].uci, "g1f3");
         assert!((r.candidates[2].score_cp - -3.0).abs() < 1e-6);
+        assert!((r.candidates[2].score_v.unwrap() - -8.0).abs() < 1e-6);
     }
 
     #[test]
-    fn parse_evallegal_check_pairs() {
-        let r = parse_evallegal_payload("check a8a7 -3");
+    fn parse_evallegal_check_triplets() {
+        let r = parse_evallegal_payload("check a8a7 -3 -10");
         assert!(r.terminal.is_none()); // in-check is NOT terminal
         assert_eq!(r.candidates.len(), 1);
+        assert!((r.candidates[0].score_v.unwrap() - -10.0).abs() < 1e-6);
     }
 
     #[test]
@@ -693,11 +710,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_evallegal_odd_token_count_truncates() {
-        // Malformed but graceful: the final "deadbeef" token has no cp partner;
-        // we keep the well-formed pair and stop. Better than panicking on bad
-        // engine output.
-        let r = parse_evallegal_payload("none e2e4 10 deadbeef");
+    fn parse_evallegal_truncated_triplet_drops_partial() {
+        // Two well-formed triplets; the third is missing its v token. We keep
+        // the first two and stop — better than panicking on bad engine output.
+        let r = parse_evallegal_payload("none e2e4 10 35 d2d4 8 28 g1f3 -3");
+        assert_eq!(r.candidates.len(), 2);
+        assert_eq!(r.candidates[1].uci, "d2d4");
+    }
+
+    #[test]
+    fn parse_evallegal_unparseable_v_drops_remainder() {
+        let r = parse_evallegal_payload("none e2e4 10 35 d2d4 8 deadbeef");
         assert_eq!(r.candidates.len(), 1);
         assert_eq!(r.candidates[0].uci, "e2e4");
     }

@@ -44,27 +44,41 @@ No arguments. Operates on whatever position was last set via `position`.
 Single line, always:
 
 ```
-info string evallegal <status> [<uci> <cp>]...
+info string evallegal <status> [<uci> <cp> <v>]...
 ```
 
 - `status` is one of `none`, `check`, `mate`, `stalemate`.
-- For `none` / `check`, the rest of the line is space-separated alternating
-  `<uci>` / `<centipawn>` tokens, one pair per legal move.
-- For `mate` / `stalemate`, no pairs follow (no legal moves to emit).
-- Centipawns are mover-POV and use the same conversion as `info ... score
-  cp N` lines from a normal search (`UCIEngine::to_cp` applied to the
-  post-move evaluation, negated to flip back to the mover's perspective).
+- For `none` / `check`, the rest of the line is space-separated triplets
+  of `<uci> <cp> <v>`, one triplet per legal move.
+- For `mate` / `stalemate`, no triplets follow (no legal moves to emit).
+- Both scores are mover-POV (negated from the post-move side-to-move POV
+  that `Eval::evaluate` returns).
+- `cp` is the normalized centipawn value, identical to the conversion
+  `UCIEngine::to_cp(v, pos)` used by `info ... score cp N` lines from a
+  normal search. 100 cp ≈ "1 pawn equivalent" regardless of material.
+- `v` is the raw internal `Value` the NNUE produced before normalization.
+  This is the right target for distillation losses (it's what the network
+  actually emits); `cp` is the more interpretable unit for sampling and
+  human inspection. Ratio `v / cp` varies with the position's win-rate
+  model `a` parameter — typically ~2.0–3.5×.
 
-Example, startpos:
+Example, startpos (cp = v = 0 by symmetry):
 
 ```
-info string evallegal none a2a3 0 b2b3 0 c2c3 0 ... g1h3 0
+info string evallegal none a2a3 0 0 b2b3 0 0 ... g1h3 0 0
 ```
 
-Example, in-check position with one legal escape (Black king takes Qa7):
+Example, after `e2e4 e7e5` (Black to move; small disadvantage from each
+move, normalization shrinks the magnitude):
 
 ```
-info string evallegal check a8a7 -3
+info string evallegal none a2a3 -2 -9 b2b3 -2 -9 ... e1e2 -2 -9
+```
+
+Example, in-check position with one legal escape:
+
+```
+info string evallegal check h8g8 -510 -1981
 ```
 
 Example, checkmate / stalemate:

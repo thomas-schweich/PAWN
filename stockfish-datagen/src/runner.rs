@@ -466,10 +466,10 @@ fn run_worker(
         }
         let n = tokens.len();
 
-        // Convert per-ply candidates (UCI string + f32 cp) into the packed
-        // (move_idx, score_cp) form for distillation. We trust the engine
-        // vocab here — Stockfish has already produced legal UCI strings
-        // (the per-ply move choice was applied successfully above).
+        // Convert per-ply candidates (UCI string + f32 cp + optional f32 raw v)
+        // into the packed (move_idx, score_cp, score_v?) form for distillation.
+        // We trust the engine vocab here — Stockfish has already produced legal
+        // UCI strings (the per-ply move choice was applied successfully above).
         let legal_move_evals = played.per_ply_candidates.map(|plies| {
             plies
                 .into_iter()
@@ -481,6 +481,9 @@ fn run_worker(
                                 .expect("Stockfish-emitted UCI must be in our action vocab")
                                 as i16,
                             score_cp: c.score_cp.clamp(i16::MIN as f32, i16::MAX as f32) as i16,
+                            score_v: c.score_v.map(|v| {
+                                v.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+                            }),
                         })
                         .collect()
                 })

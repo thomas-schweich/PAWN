@@ -26,14 +26,23 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
-/// One candidate move's distillation payload — the searchless_chess vocab
-/// index plus the centipawn score from side-to-move's POV. Stored packed
-/// as `Struct{move_idx: i16, score_cp: i16}` to keep parquet rows compact
-/// while remaining trivially loadable from polars / pyarrow.
+/// One candidate move's distillation payload. Stored packed as
+/// `Struct{move_idx: i16, score_cp: i16, score_v: i16?}` to keep parquet
+/// rows compact while remaining trivially loadable from polars / pyarrow.
+///
+/// - `move_idx`: searchless_chess action vocab index (0..1968).
+/// - `score_cp`: normalized centipawns, mover-POV. 100 cp ≈ "1 pawn equivalent".
+/// - `score_v`: raw internal NNUE Value, mover-POV. `None` when the tier
+///   sourced its candidates from `info ... multipv` (only the patched
+///   binary's `evallegal` command surfaces raw values). Distillation
+///   targets should use this when present — it's what the network actually
+///   produces, before win-rate normalization shrinks magnitudes by `a/100`
+///   ≈ 2–3.5×.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LegalMoveEval {
     pub move_idx: i16,
     pub score_cp: i16,
+    pub score_v: Option<i16>,
 }
 
 /// Fields of the `legal_move_evals` Struct element. Hoisted so the
@@ -42,11 +51,18 @@ fn legal_move_eval_struct_fields() -> Fields {
     Fields::from(vec![
         Field::new("move_idx", DataType::Int16, false),
         Field::new("score_cp", DataType::Int16, false),
+        // Nullable: only the `evallegal` protocol provides this. Multipv-derived
+        // candidates leave it null.
+        Field::new("score_v", DataType::Int16, true),
     ])
 }
 
 fn legal_move_eval_struct_builders() -> Vec<Box<dyn ArrayBuilder>> {
-    vec![Box::new(Int16Builder::new()), Box::new(Int16Builder::new())]
+    vec![
+        Box::new(Int16Builder::new()),
+        Box::new(Int16Builder::new()),
+        Box::new(Int16Builder::new()),
+    ]
 }
 
 /// One row to be written. Constructed by the worker after a game finishes.
@@ -238,6 +254,13 @@ impl ShardWriter {
                         .field_builder::<Int16Builder>(1)
                         .expect("score_cp field 1")
                         .append_value(ev.score_cp);
+                    let v_b = struct_b
+                        .field_builder::<Int16Builder>(2)
+                        .expect("score_v field 2");
+                    match ev.score_v {
+                        Some(v) => v_b.append_value(v),
+                        None => v_b.append_null(),
+                    }
                     struct_b.append(true);
                 }
                 inner_list.append(true);
@@ -397,13 +420,14 @@ mod tests {
         let mut w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
 
         // Game 0: distillation tier — populated. Two plies, varying legal-move counts.
+        // First ply mixes Some / None score_v to exercise the nullable column path.
         let mut row0 = fake_row(1);
         row0.legal_move_evals = Some(vec![
             vec![
-                LegalMoveEval { move_idx: 100, score_cp: 50 },
-                LegalMoveEval { move_idx: 200, score_cp: -25 },
+                LegalMoveEval { move_idx: 100, score_cp: 50, score_v: Some(125) },
+                LegalMoveEval { move_idx: 200, score_cp: -25, score_v: None },
             ],
-            vec![LegalMoveEval { move_idx: 300, score_cp: 10 }],
+            vec![LegalMoveEval { move_idx: 300, score_cp: 10, score_v: Some(28) }],
         ]);
         w.append(&row0);
 
@@ -433,10 +457,14 @@ mod tests {
         assert_eq!(ply0_0.len(), 2);
         let move_idx = ply0_0.column(0).as_any().downcast_ref::<Int16Array>().unwrap();
         let score_cp = ply0_0.column(1).as_any().downcast_ref::<Int16Array>().unwrap();
+        let score_v = ply0_0.column(2).as_any().downcast_ref::<Int16Array>().unwrap();
         assert_eq!(move_idx.value(0), 100);
         assert_eq!(score_cp.value(0), 50);
+        assert_eq!(score_v.value(0), 125);
+        assert!(score_v.is_valid(0));
         assert_eq!(move_idx.value(1), 200);
         assert_eq!(score_cp.value(1), -25);
+        assert!(!score_v.is_valid(1)); // None → null in parquet
 
         // Row 1: empty outer list (no per-ply data captured).
         let plies1 = outer.value(1);

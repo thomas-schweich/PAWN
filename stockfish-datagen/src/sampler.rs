@@ -70,6 +70,7 @@ mod tests {
             .map(|(i, &s)| Candidate {
                 uci: format!("a{}b{}", (i % 8) + 1, ((i + 1) % 8) + 1),
                 score_cp: s,
+                score_v: None,
             })
             .collect()
     }
