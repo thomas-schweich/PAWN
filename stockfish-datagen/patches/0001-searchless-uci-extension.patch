@@ -1,0 +1,117 @@
+diff --git a/src/engine.cpp b/src/engine.cpp
+index dfd2099d..a4688cbb 100644
+--- a/src/engine.cpp
++++ b/src/engine.cpp
+@@ -123,6 +123,11 @@ Engine::Engine(std::optional<std::string> path) :
+ 
+     options.add("UCI_ShowWDL", Option(false));
+ 
++    // pawn datagen instrumentation: when true, emit `info string nnue_evals N`
++    // before bestmove showing the total NNUE forward count for the search.
++    // Useful for measuring searchless-vs-qsearch eval cost ratios.
++    options.add("NnueEvalCount", Option(false));
++
+     options.add(  //
+       "SyzygyPath", Option("", [](const Option& o) {
+           Tablebases::init(o);
+diff --git a/src/search.cpp b/src/search.cpp
+index 40ba2eff..ab7517c3 100644
+--- a/src/search.cpp
++++ b/src/search.cpp
+@@ -180,10 +180,17 @@ void Search::Worker::ensure_network_replicated() {
+     (void) (networks[numaAccessToken]);
+ }
+ 
++extern std::atomic<uint64_t> g_nnue_eval_count;
++
+ void Search::Worker::start_searching() {
+ 
+     accumulatorStack.reset();
+ 
++    // pawn datagen instrumentation: reset NNUE eval counter at the start of
++    // every search (mainthread only — non-main threads share the counter).
++    if (is_mainthread())
++        g_nnue_eval_count.store(0, std::memory_order_relaxed);
++
+     // Non-main threads go directly to iterative_deepening()
+     if (!is_mainthread())
+     {
+@@ -250,6 +257,13 @@ void Search::Worker::start_searching() {
+         ponder = UCIEngine::move(bestThread->rootMoves[0].pv[1], rootPos.is_chess960());
+ 
+     auto bestmove = UCIEngine::move(bestThread->rootMoves[0].pv[0], rootPos.is_chess960());
++
++    // pawn datagen instrumentation: emit NNUE eval count before bestmove if
++    // `NnueEvalCount` UCI option is set. Off by default to avoid UCI chatter.
++    if (bool(options["NnueEvalCount"]))
++        sync_cout << "info string nnue_evals "
++                  << g_nnue_eval_count.load(std::memory_order_relaxed) << sync_endl;
++
+     main_manager()->updates.onBestmove(bestmove, ponder);
+ }
+ 
+@@ -1501,6 +1515,14 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
+     assert(alpha >= -VALUE_INFINITE && alpha < beta && beta <= VALUE_INFINITE);
+     assert(PvNode || (alpha == beta - 1));
+ 
++    // pawn datagen extension (UCI: `go ... searchless`): skip qsearch entirely
++    // and return the raw NNUE static eval. Combine with `depth 1 multipv N` to
++    // get a per-legal-move pure-NNUE ranking. In-check / tactical positions get
++    // an out-of-distribution NNUE forward — that's the documented tradeoff for
++    // the bottom-tier dataset.
++    if (limits.searchless)
++        return evaluate(pos);
++
+     // Check if we have an upcoming move that draws by repetition
+     if (alpha < VALUE_DRAW && pos.upcoming_repetition(ss->ply))
+     {
+@@ -1751,7 +1773,12 @@ TimePoint Search::Worker::elapsed() const {
+ 
+ TimePoint Search::Worker::elapsed_time() const { return main_manager()->tm.elapsed_time(); }
+ 
++// pawn datagen instrumentation: count NNUE forwards across all threads.
++// Reset at search start, dumped via `info string nnue_evals N` after bestmove.
++std::atomic<uint64_t> g_nnue_eval_count{0};
++
+ Value Search::Worker::evaluate(const Position& pos) {
++    g_nnue_eval_count.fetch_add(1, std::memory_order_relaxed);
+     return Eval::evaluate(networks[numaAccessToken], pos, accumulatorStack, refreshTable,
+                           optimism[pos.side_to_move()]);
+ }
+diff --git a/src/search.h b/src/search.h
+index 202f7c8d..e7718cc7 100644
+--- a/src/search.h
++++ b/src/search.h
+@@ -119,6 +119,7 @@ struct LimitsType {
+         movestogo = depth = mate = perft = infinite = 0;
+         nodes                                       = 0;
+         ponderMode                                  = false;
++        searchless                                  = false;
+     }
+ 
+     bool use_time_management() const { return time[WHITE] || time[BLACK]; }
+@@ -128,6 +129,11 @@ struct LimitsType {
+     int                      movestogo, depth, mate, perft, infinite;
+     uint64_t                 nodes;
+     bool                     ponderMode;
++    // pawn datagen extension: bare flag (matching `infinite`/`ponder`). When set,
++    // qsearch returns the pure NNUE static eval instead of resolving captures.
++    // Use `go ... searchless` (no value) with `depth 1 multipv N` to get a
++    // per-legal-move pure-NNUE ranking.
++    bool                     searchless;
+ };
+ 
+ 
+diff --git a/src/uci.cpp b/src/uci.cpp
+index 92700768..b615b253 100644
+--- a/src/uci.cpp
++++ b/src/uci.cpp
+@@ -213,6 +213,8 @@ Search::LimitsType UCIEngine::parse_limits(std::istream& is) {
+             limits.infinite = 1;
+         else if (token == "ponder")
+             limits.ponderMode = true;
++        else if (token == "searchless")  // pawn datagen extension; bare flag
++            limits.searchless = true;
+ 
+     return limits;
+ }
