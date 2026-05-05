@@ -65,6 +65,34 @@ pub enum TerminalKind {
     Stalemate,
 }
 
+/// What command to issue per ply. Pre-rendered into `StockfishProcess::go_cmd`
+/// at spawn time — picking between these is a tier-level choice, not per-ply.
+///
+/// `Searchless` requires a Stockfish binary built from
+/// `scripts/build_patched_stockfish.sh` (the patched binary recognizes the
+/// `searchless` UCI extension). On a vanilla Stockfish the token is silently
+/// ignored and the engine falls back to qsearch — *not* the desired behavior,
+/// hence the explicit type.
+#[derive(Debug, Clone, Copy)]
+pub enum GoBudget {
+    /// `go nodes N`. Standard search-tree budget; per-move scores are
+    /// qsearch-resolved.
+    Nodes(u32),
+    /// `go depth 1 searchless`. Per-move scores are raw NNUE static eval
+    /// (no quiescence). Pair with a high MultiPV (e.g. 256) to score every
+    /// legal move per ply.
+    Searchless,
+}
+
+impl GoBudget {
+    fn render(self) -> String {
+        match self {
+            GoBudget::Nodes(n) => format!("go nodes {n}"),
+            GoBudget::Searchless => "go depth 1 searchless".to_string(),
+        }
+    }
+}
+
 pub struct StockfishProcess {
     child: Child,
     /// Buffered to coalesce the multiple small writes per `send` into one
@@ -109,14 +137,14 @@ impl StockfishProcess {
     /// `id_name`. This ensures `"Stockfish 1"` does NOT match `"Stockfish 18"`,
     /// which a naive `starts_with` would.
     ///
-    /// `nodes` here is the per-process budget — every `candidates()` call
-    /// uses it as the `go nodes N` value, so it's pre-rendered into
-    /// `self.go_cmd` to avoid per-ply formatting.
+    /// `budget` is the per-process go-command shape — every `candidates()`
+    /// call uses it as-is, so it's pre-rendered into `self.go_cmd` to avoid
+    /// per-ply formatting.
     pub fn spawn(
         path: &Path,
         expected_version: &str,
         hash_mb: u32,
-        nodes: u32,
+        budget: GoBudget,
     ) -> Result<Self, StockfishError> {
         let mut child = Command::new(path)
             .stdin(Stdio::piped())
@@ -137,7 +165,7 @@ impl StockfishProcess {
             stdout,
             line_buf: String::with_capacity(512),
             position_cmd: String::with_capacity(64 + 5 * 256),
-            go_cmd: format!("go nodes {nodes}"),
+            go_cmd: budget.render(),
             id_name: String::new(),
         };
 
@@ -529,7 +557,7 @@ mod tests {
     #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
     fn live_handshake_and_starting_candidates() {
         let path = stockfish_path();
-        let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, 1).unwrap();
+        let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, crate::stockfish::GoBudget::Nodes(1)).unwrap();
         assert!(sf.id_name.starts_with("Stockfish"), "got id_name={:?}", sf.id_name);
         sf.set_multi_pv(5).unwrap();
         sf.new_game().unwrap();
@@ -548,7 +576,7 @@ mod tests {
     #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
     fn live_version_mismatch_rejected() {
         let path = stockfish_path();
-        match StockfishProcess::spawn(&path, "Stockfish 9999", 16, 1) {
+        match StockfishProcess::spawn(&path, "Stockfish 9999", 16, crate::stockfish::GoBudget::Nodes(1)) {
             Err(StockfishError::VersionMismatch { .. }) => {}
             Err(e) => panic!("expected VersionMismatch, got {e:?}"),
             Ok(_) => panic!("expected VersionMismatch, got Ok"),

@@ -93,6 +93,26 @@ pub struct TierConfig {
     /// so temperature=1.0 means a 1-pawn gap shifts probability by an
     /// e-fold. <=0 falls back to argmax (top-1).
     pub temperature: f32,
+
+    /// When true, drive Stockfish via the `searchless` UCI extension —
+    /// `qsearch` is short-circuited so each per-move score is the raw NNUE
+    /// static eval after the move. Requires the patched binary built via
+    /// `scripts/build_patched_stockfish.sh`. `nodes` is ignored in this
+    /// mode (the per-move work is one full NNUE forward, not a node-budget
+    /// search). Pair with a wide `multi_pv` (e.g. 256) to score every
+    /// legal move per ply.
+    #[serde(default)]
+    pub searchless: bool,
+
+    /// When true, persist the full Stockfish candidates list for every ply
+    /// alongside the played move. The parquet column is
+    /// `legal_move_evals: List<List<Struct{move_idx: i16, score_cp: i16}>>`,
+    /// indexed per game and per ply. Designed for distillation-style
+    /// training (KL loss vs the per-move softmax). Independent of
+    /// `searchless` — though the typical use case is `searchless=true`
+    /// + `store_legal_move_evals=true` for "tier 0" datasets.
+    #[serde(default)]
+    pub store_legal_move_evals: bool,
 }
 
 fn default_max_ply() -> u32 {
@@ -186,8 +206,12 @@ impl RunConfig {
                     tier.sample_plies,
                 );
             }
-            if tier.nodes == 0 {
-                anyhow::bail!("tier {}: nodes must be >= 1", tier.name);
+            // `nodes` is only consumed in non-searchless mode (it's the
+            // `go nodes K` budget). In searchless mode we send `go depth 1
+            // searchless` and nodes is unused — accept any value so users
+            // can leave it as a leftover from a non-searchless template.
+            if !tier.searchless && tier.nodes == 0 {
+                anyhow::bail!("tier {}: nodes must be >= 1 (or set searchless=true)", tier.name);
             }
         }
         Ok(())
@@ -293,6 +317,8 @@ mod tests {
                 opening_plies: 1,
                 sample_plies: 999,
                 temperature: 1.0,
+                searchless: false,
+                store_legal_move_evals: false,
             }],
         }
     }
@@ -420,6 +446,8 @@ mod tests {
             opening_plies: 0,
             sample_plies: 999,
             temperature: 1.0,
+            searchless: false,
+            store_legal_move_evals: false,
         });
         let mut b = a.clone();
         // Change only tier 1.
@@ -477,7 +505,9 @@ mod tests {
     fn tier_fingerprint_golden() {
         let cfg = minimal_config();
         let actual = cfg.tier_fingerprint(0);
-        let expected = "aef0ee9a09ec2f8889d236deb8a821ee1d980645f1a2f708d4cf65a7573bf956";
+        // Updated when `searchless` and `store_legal_move_evals` were added
+        // to TierConfig (intentional schema change for distillation tier 0).
+        let expected = "62c112888412402b9fe74cbcf18cbedb821e45d316a8e9e0dc448cfa8e1c8693";
         assert_eq!(
             actual, expected,
             "tier_fingerprint changed for minimal_config — verify the change is intentional, then update the expected value"

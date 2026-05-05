@@ -397,11 +397,16 @@ fn run_worker(
     // grows. Linux-only — `set_for_current` no-ops on macOS.
     affinity::pin_current_thread(worker_id);
 
+    let budget = if tier.searchless {
+        crate::stockfish::GoBudget::Searchless
+    } else {
+        crate::stockfish::GoBudget::Nodes(tier.nodes)
+    };
     let mut sf = StockfishProcess::spawn(
         &cfg.stockfish_path,
         &cfg.stockfish_version,
         cfg.stockfish_hash_mb,
-        tier.nodes,
+        budget,
     )
     .with_context(|| format!("spawning stockfish for worker {worker_id}"))?;
     // Pin the spawned Stockfish to the same core as this worker.
@@ -461,6 +466,27 @@ fn run_worker(
         }
         let n = tokens.len();
 
+        // Convert per-ply candidates (UCI string + f32 cp) into the packed
+        // (move_idx, score_cp) form for distillation. We trust the engine
+        // vocab here — Stockfish has already produced legal UCI strings
+        // (the per-ply move choice was applied successfully above).
+        let legal_move_evals = played.per_ply_candidates.map(|plies| {
+            plies
+                .into_iter()
+                .map(|cands| {
+                    cands
+                        .into_iter()
+                        .map(|c| crate::shard::LegalMoveEval {
+                            move_idx: chess_engine::vocab::uci_to_action(&c.uci)
+                                .expect("Stockfish-emitted UCI must be in our action vocab")
+                                as i16,
+                            score_cp: c.score_cp.clamp(i16::MIN as f32, i16::MAX as f32) as i16,
+                        })
+                        .collect()
+                })
+                .collect()
+        });
+
         let row = GameRow {
             tokens: tokens.into_iter().map(|t| t as i16).collect(),
             san,
@@ -477,6 +503,7 @@ fn run_worker(
             worker_id: worker_id as i16,
             game_seed,
             stockfish_version: stockfish_version.to_string(),
+            legal_move_evals,
         };
 
         if writer.is_none() {
@@ -560,6 +587,8 @@ mod tests {
                 opening_plies: 1,
                 sample_plies: 12,
                 temperature: 1.0,
+                searchless: false,
+                store_legal_move_evals: false,
             }],
         }
     }
@@ -719,6 +748,8 @@ mod tests {
             opening_plies: 1,
             sample_plies: 12,
             temperature: 1.0,
+            searchless: false,
+            store_legal_move_evals: false,
         });
 
         // Run only tier 0.

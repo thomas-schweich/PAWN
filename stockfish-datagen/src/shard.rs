@@ -17,14 +17,37 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arrow::array::{
-    ArrayRef, Float32Builder, Int16Builder, Int32Builder, ListBuilder,
-    RecordBatch, StringBuilder, UInt16Builder, UInt64Builder,
+    ArrayBuilder, ArrayRef, Float32Builder, Int16Builder, Int32Builder, ListBuilder,
+    RecordBatch, StringBuilder, StructBuilder, UInt16Builder, UInt64Builder,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use once_cell::sync::Lazy;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+
+/// One candidate move's distillation payload — the searchless_chess vocab
+/// index plus the centipawn score from side-to-move's POV. Stored packed
+/// as `Struct{move_idx: i16, score_cp: i16}` to keep parquet rows compact
+/// while remaining trivially loadable from polars / pyarrow.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LegalMoveEval {
+    pub move_idx: i16,
+    pub score_cp: i16,
+}
+
+/// Fields of the `legal_move_evals` Struct element. Hoisted so the
+/// schema and the StructBuilder agree on order/nullability.
+fn legal_move_eval_struct_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("move_idx", DataType::Int16, false),
+        Field::new("score_cp", DataType::Int16, false),
+    ])
+}
+
+fn legal_move_eval_struct_builders() -> Vec<Box<dyn ArrayBuilder>> {
+    vec![Box::new(Int16Builder::new()), Box::new(Int16Builder::new())]
+}
 
 /// One row to be written. Constructed by the worker after a game finishes.
 #[derive(Debug, Clone)]
@@ -44,6 +67,13 @@ pub struct GameRow {
     pub worker_id: i16,
     pub game_seed: u64,
     pub stockfish_version: String,
+    /// Per-ply per-legal-move NNUE eval payload. `None` when the tier did
+    /// not request distillation data (non-storing tiers leave the parquet
+    /// column as an empty list, paying only a few bytes of offsets per
+    /// row). `Some(Vec)` outer length equals `game_length`; inner lengths
+    /// are the number of legal moves at each ply (capped by the tier's
+    /// MultiPV). See `TierConfig::store_legal_move_evals`.
+    pub legal_move_evals: Option<Vec<Vec<LegalMoveEval>>>,
 }
 
 pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
@@ -52,6 +82,18 @@ pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
     // way. The outer List itself is non-null because every game has tokens.
     let list_i16 = DataType::List(Arc::new(Field::new("item", DataType::Int16, true)));
     let list_utf8 = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+
+    // legal_move_evals: List<List<Struct{move_idx: i16, score_cp: i16}>>.
+    // Outer list = per-ply; inner list = per-legal-move at that ply.
+    // Always present in the schema for forward compat. Tiers that don't
+    // request distillation data leave it as an empty outer list per row
+    // (~8 bytes of offsets, negligible vs the rest of the row).
+    let eval_struct_dt = DataType::Struct(legal_move_eval_struct_fields());
+    let eval_inner_list_dt =
+        DataType::List(Arc::new(Field::new("item", eval_struct_dt, true)));
+    let eval_outer_list_dt =
+        DataType::List(Arc::new(Field::new("item", eval_inner_list_dt, true)));
+
     Arc::new(Schema::new(vec![
         Field::new("tokens", list_i16, false),
         Field::new("san", list_utf8.clone(), false),
@@ -73,6 +115,7 @@ pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
         // handle this correctly.
         Field::new("game_seed", DataType::UInt64, false),
         Field::new("stockfish_version", DataType::Utf8, false),
+        Field::new("legal_move_evals", eval_outer_list_dt, false),
     ]))
 });
 
@@ -99,6 +142,7 @@ pub struct ShardWriter {
     worker_id: Int16Builder,
     game_seed: UInt64Builder,
     stockfish_version: StringBuilder,
+    legal_move_evals: ListBuilder<ListBuilder<StructBuilder>>,
     n_rows: usize,
 }
 
@@ -135,6 +179,10 @@ impl ShardWriter {
             worker_id: Int16Builder::new(),
             game_seed: UInt64Builder::new(),
             stockfish_version: StringBuilder::new(),
+            legal_move_evals: ListBuilder::new(ListBuilder::new(StructBuilder::new(
+                legal_move_eval_struct_fields(),
+                legal_move_eval_struct_builders(),
+            ))),
             n_rows: 0,
         })
     }
@@ -172,6 +220,31 @@ impl ShardWriter {
         self.game_seed.append_value(row.game_seed);
         self.stockfish_version.append_value(&row.stockfish_version);
 
+        // legal_move_evals: outer list = per-ply, inner list = per-move.
+        // Tiers that don't store distillation data leave the outer list
+        // empty (still non-null at row level — schema declares the column
+        // non-null and downstream readers find an empty `[]` rather than
+        // having to handle row-level nulls).
+        if let Some(plies) = &row.legal_move_evals {
+            let inner_list = self.legal_move_evals.values();
+            for ply_evals in plies {
+                let struct_b = inner_list.values();
+                for ev in ply_evals {
+                    struct_b
+                        .field_builder::<Int16Builder>(0)
+                        .expect("move_idx field 0")
+                        .append_value(ev.move_idx);
+                    struct_b
+                        .field_builder::<Int16Builder>(1)
+                        .expect("score_cp field 1")
+                        .append_value(ev.score_cp);
+                    struct_b.append(true);
+                }
+                inner_list.append(true);
+            }
+        }
+        self.legal_move_evals.append(true);
+
         self.n_rows += 1;
     }
 
@@ -206,6 +279,7 @@ impl ShardWriter {
             Arc::new(self.worker_id.finish()),
             Arc::new(self.game_seed.finish()),
             Arc::new(self.stockfish_version.finish()),
+            Arc::new(self.legal_move_evals.finish()),
         ];
         let batch = RecordBatch::try_new(SCHEMA.clone(), columns)
             .context("building record batch")?;
@@ -275,6 +349,7 @@ mod tests {
             worker_id: 0,
             game_seed: seed,
             stockfish_version: "Stockfish 18 by ...".into(),
+            legal_move_evals: None,
         }
     }
 
@@ -313,6 +388,60 @@ mod tests {
             .unwrap();
         assert_eq!(game_seed_col.value(0), 1000);
         assert_eq!(game_seed_col.value(4), 1004);
+    }
+
+    #[test]
+    fn legal_move_evals_round_trip() {
+        use arrow::array::{Array, Int16Array, ListArray, StructArray};
+        let dir = tempdir().unwrap();
+        let mut w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
+
+        // Game 0: distillation tier — populated. Two plies, varying legal-move counts.
+        let mut row0 = fake_row(1);
+        row0.legal_move_evals = Some(vec![
+            vec![
+                LegalMoveEval { move_idx: 100, score_cp: 50 },
+                LegalMoveEval { move_idx: 200, score_cp: -25 },
+            ],
+            vec![LegalMoveEval { move_idx: 300, score_cp: 10 }],
+        ]);
+        w.append(&row0);
+
+        // Game 1: non-storing tier — None / empty outer list. Same shard
+        // can mix both (in practice a tier is one mode or the other, but
+        // the schema must support either per row).
+        w.append(&fake_row(2));
+
+        let path = w.close().unwrap();
+        let file = File::open(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
+        let batch = &batches[0];
+        let outer = batch
+            .column_by_name("legal_move_evals")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        // Row 0: two plies.
+        let plies0 = outer.value(0);
+        let plies0 = plies0.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(plies0.len(), 2);
+
+        let ply0_0 = plies0.value(0);
+        let ply0_0 = ply0_0.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(ply0_0.len(), 2);
+        let move_idx = ply0_0.column(0).as_any().downcast_ref::<Int16Array>().unwrap();
+        let score_cp = ply0_0.column(1).as_any().downcast_ref::<Int16Array>().unwrap();
+        assert_eq!(move_idx.value(0), 100);
+        assert_eq!(score_cp.value(0), 50);
+        assert_eq!(move_idx.value(1), 200);
+        assert_eq!(score_cp.value(1), -25);
+
+        // Row 1: empty outer list (no per-ply data captured).
+        let plies1 = outer.value(1);
+        let plies1 = plies1.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(plies1.len(), 0);
     }
 
     /// Regression test for the round-7 `game_seed: i64 -> UInt64` change.

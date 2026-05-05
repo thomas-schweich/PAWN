@@ -236,6 +236,7 @@ mod tests {
             worker_id: 0,
             game_seed,
             stockfish_version: "Stockfish 18".into(),
+            legal_move_evals: None,
         }
     }
 

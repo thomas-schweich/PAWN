@@ -41,13 +41,20 @@ use thiserror::Error;
 use crate::config::TierConfig;
 use crate::outcome::OutcomeReason;
 use crate::sampler::softmax_sample;
-use crate::stockfish::{StockfishError, StockfishProcess};
+use crate::stockfish::{Candidate, StockfishError, StockfishProcess};
 
 /// Fully-played game.
 #[derive(Debug, Clone)]
 pub struct PlayedGame {
     pub uci_moves: Vec<String>,
     pub outcome: OutcomeReason,
+    /// Per-ply candidates list (one inner Vec per ply, in play order),
+    /// captured iff the tier had `store_legal_move_evals = true`. When
+    /// the flag is off this is `None` to avoid the per-ply Vec allocation
+    /// overhead in tiers that don't need it. The semantics of each
+    /// `Candidate.score_cp` depend on the tier's go-budget (qsearch-resolved
+    /// for `Nodes(_)` tiers, raw NNUE static eval for `Searchless` tiers).
+    pub per_ply_candidates: Option<Vec<Vec<Candidate>>>,
 }
 
 #[derive(Debug, Error)]
@@ -157,6 +164,14 @@ pub fn play_game<R: Rng + ?Sized>(
     history.push(zobrist(&board));
 
     let mut current_pv: Option<u32> = None;
+    // Allocate the per-ply candidates buffer iff the tier asks for it.
+    // Plumbed through every early-return path so the consumer always sees
+    // either Some(complete-list) or None — no partial captures.
+    let mut per_ply_candidates: Option<Vec<Vec<Candidate>>> = if tier.store_legal_move_evals {
+        Some(Vec::with_capacity(128))
+    } else {
+        None
+    };
 
     for ply in 0..max_ply {
         let cur_hash = *history.last().unwrap();
@@ -164,7 +179,7 @@ pub fn play_game<R: Rng + ?Sized>(
         // contract is "count of current_hash in history", so >= 3 means
         // the position has now occurred 3 times — the FIDE threshold.
         if let Some(reason) = detect_pre_eval_terminal(&board, &history, cur_hash, ply as usize) {
-            return Ok(PlayedGame { uci_moves: moves, outcome: reason });
+            return Ok(PlayedGame { uci_moves: moves, outcome: reason, per_ply_candidates });
         }
 
         let target_pv = target_multi_pv(tier, ply);
@@ -195,7 +210,18 @@ pub fn play_game<R: Rng + ?Sized>(
             .map(|c| c.score_cp)
             .fold(f32::NEG_INFINITY, f32::max);
         if should_strategic_claim_50mv(board.halfmoves(), best_score_cp) {
-            return Ok(PlayedGame { uci_moves: moves, outcome: OutcomeReason::FiftyMoveRule });
+            return Ok(PlayedGame {
+                uci_moves: moves,
+                outcome: OutcomeReason::FiftyMoveRule,
+                per_ply_candidates,
+            });
+        }
+
+        // Snapshot the full candidates list BEFORE picking — otherwise the
+        // borrow checker complains about `&res.candidates[0]` outliving the
+        // clone. Cheap when the tier doesn't request it (None path skips).
+        if let Some(buf) = per_ply_candidates.as_mut() {
+            buf.push(res.candidates.clone());
         }
 
         let pick = if target_pv == 1 {
@@ -228,7 +254,7 @@ pub fn play_game<R: Rng + ?Sized>(
     let final_hash = *history.last().unwrap();
     let outcome = detect_pre_eval_terminal(&board, &history, final_hash, moves.len())
         .unwrap_or(OutcomeReason::PlyLimit);
-    Ok(PlayedGame { uci_moves: moves, outcome })
+    Ok(PlayedGame { uci_moves: moves, outcome, per_ply_candidates })
 }
 
 #[cfg(test)]
@@ -246,6 +272,8 @@ mod tests {
             opening_plies: 2,
             sample_plies: 12,
             temperature: 1.0,
+            searchless: false,
+            store_legal_move_evals: false,
         };
         assert_eq!(target_multi_pv(&tier, 0), 20);
         assert_eq!(target_multi_pv(&tier, 1), 20);
@@ -332,7 +360,7 @@ mod tests {
         // depth 1 from the start position). This pins the boundary.
         use rand::SeedableRng;
         use rand_chacha::ChaCha8Rng;
-        let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, 1).unwrap();
+        let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, crate::stockfish::GoBudget::Nodes(1)).unwrap();
         let mut rng = ChaCha8Rng::seed_from_u64(7);
         let game = play_game(&mut sf, &mut rng, &smoke_tier(), 1).unwrap();
         assert_eq!(game.uci_moves.len(), 1);
@@ -384,6 +412,8 @@ mod tests {
             opening_plies: 2,
             sample_plies: 12,
             temperature: 1.0,
+            searchless: false,
+            store_legal_move_evals: false,
         }
     }
 
@@ -395,7 +425,7 @@ mod tests {
         use rand::SeedableRng;
         use rand_chacha::ChaCha8Rng;
         let path = stockfish_path();
-        let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, 1).unwrap();
+        let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, crate::stockfish::GoBudget::Nodes(1)).unwrap();
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let game = play_game(&mut sf, &mut rng, &smoke_tier(), 512).unwrap();
         assert!(!game.uci_moves.is_empty(), "game produced no moves");
@@ -423,14 +453,14 @@ mod tests {
         let path = stockfish_path();
         let tier = smoke_tier();
         let game_a = {
-            let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, 1).unwrap();
+            let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, crate::stockfish::GoBudget::Nodes(1)).unwrap();
             let mut rng = ChaCha8Rng::seed_from_u64(12345);
             let g = play_game(&mut sf, &mut rng, &tier, 512).unwrap();
             sf.shutdown();
             g
         };
         let game_b = {
-            let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, 1).unwrap();
+            let mut sf = StockfishProcess::spawn(&path, "Stockfish", 16, crate::stockfish::GoBudget::Nodes(1)).unwrap();
             let mut rng = ChaCha8Rng::seed_from_u64(12345);
             let g = play_game(&mut sf, &mut rng, &tier, 512).unwrap();
             sf.shutdown();
