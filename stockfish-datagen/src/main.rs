@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use stockfish_datagen::config::RunConfig;
 use stockfish_datagen::runner::run_tier;
 use stockfish_datagen::stockfish::{GoBudget, StockfishProcess};
+use stockfish_datagen::tournament::{TournamentConfig, run_tournament};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -29,6 +30,14 @@ enum Command {
     /// Generate the dataset described by the config. Resumes any
     /// partial tiers automatically (per-shard granularity).
     Run {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Play two SampleScore × temperature configs against each other and
+    /// report W/D/L + Elo difference (Wilson 95% CI). Used for things like
+    /// "is cp-policy or v-policy stronger at T=0?". Always uses the
+    /// patched binary's evallegal protocol.
+    Tournament {
         #[arg(long)]
         config: PathBuf,
     },
@@ -96,6 +105,72 @@ fn real_main() -> anyhow::Result<()> {
             eprintln!("output: {}", cfg.output_dir.display());
             Ok(())
         }
+        Command::Tournament { config } => {
+            let cfg = TournamentConfig::load(&config)
+                .with_context(|| format!("loading tournament config {}", config.display()))?;
+            print_tournament_plan(&cfg);
+
+            let t0 = std::time::Instant::now();
+            let result = run_tournament(&cfg).context("running tournament")?;
+            let elapsed = t0.elapsed();
+
+            print_tournament_summary(&cfg, &result, elapsed);
+            Ok(())
+        }
+    }
+}
+
+fn print_tournament_plan(cfg: &TournamentConfig) {
+    println!("=== tournament plan ===");
+    println!("stockfish:        {}", cfg.stockfish_path.display());
+    println!("master_seed:      {}", cfg.master_seed);
+    println!("workers:          {}", cfg.n_workers);
+    println!("pairs × 2:        {} × 2 = {} games", cfg.n_pairs, 2 * cfg.n_pairs);
+    println!("opening_plies:    {}", cfg.opening_plies);
+    println!("max_ply:          {}", cfg.max_ply);
+    println!(
+        "side_a:           {} (sample_score={:?}, T={})",
+        cfg.side_a.name, cfg.side_a.sample_score, cfg.side_a.temperature,
+    );
+    println!(
+        "side_b:           {} (sample_score={:?}, T={})",
+        cfg.side_b.name, cfg.side_b.sample_score, cfg.side_b.temperature,
+    );
+    println!("config fingerprint: {}", cfg.fingerprint());
+    println!();
+}
+
+fn print_tournament_summary(
+    cfg: &TournamentConfig,
+    result: &stockfish_datagen::tournament::TournamentResult,
+    elapsed: std::time::Duration,
+) {
+    let (lo_wr, hi_wr) = result.a_win_rate_ci95();
+    let (lo_elo, hi_elo) = result.a_elo_ci95();
+    eprintln!();
+    eprintln!("=== tournament complete ===");
+    eprintln!("elapsed:    {:.1}s", elapsed.as_secs_f64());
+    eprintln!(
+        "side_a ({}): {} wins",
+        cfg.side_a.name, result.a_wins,
+    );
+    eprintln!(
+        "side_b ({}): {} wins",
+        cfg.side_b.name, result.b_wins,
+    );
+    eprintln!("draws:      {}", result.draws);
+    eprintln!("total:      {}", result.total);
+    eprintln!();
+    eprintln!(
+        "{} win rate: {:.4} (Wilson 95% CI: {:.4} – {:.4})",
+        cfg.side_a.name, result.a_win_rate(), lo_wr, hi_wr,
+    );
+    eprintln!(
+        "{} − {} Elo: {:+.1} (95% CI: {:+.1} – {:+.1})",
+        cfg.side_a.name, cfg.side_b.name, result.a_elo(), lo_elo, hi_elo,
+    );
+    if let Some(out) = &cfg.output_path {
+        eprintln!("per-game records: {}", out.display());
     }
 }
 

@@ -4,6 +4,7 @@
 pub mod affinity;
 pub mod config;
 pub mod game;
+pub mod match_game;
 pub mod outcome;
 pub mod resume;
 pub mod runner;
@@ -11,3 +12,4 @@ pub mod sampler;
 pub mod seed;
 pub mod shard;
 pub mod stockfish;
+pub mod tournament;

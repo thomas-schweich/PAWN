@@ -76,11 +76,11 @@ pub enum GameError {
 /// expected to push the current position into `history` before calling,
 /// so a return value of `>= 3` means the third occurrence has been seen
 /// (the FIDE 3-fold threshold).
-fn count_repetitions(history: &[u64], current_hash: u64) -> usize {
+pub(crate) fn count_repetitions(history: &[u64], current_hash: u64) -> usize {
     history.iter().filter(|&&h| h == current_hash).count()
 }
 
-fn zobrist(pos: &Chess) -> u64 {
+pub(crate) fn zobrist(pos: &Chess) -> u64 {
     let h: Zobrist64 = pos.zobrist_hash(EnPassantMode::Legal);
     h.0
 }
@@ -93,7 +93,7 @@ fn zobrist(pos: &Chess) -> u64 {
 /// Includes the 75-move *automatic* draw (FIDE: 150 halfmoves) as a
 /// hard upper bound — neither side can avoid this, so it's safe to
 /// fire without an eval.
-fn detect_pre_eval_terminal(
+pub(crate) fn detect_pre_eval_terminal(
     pos: &Chess,
     history: &[u64],
     current_hash: u64,
@@ -130,7 +130,7 @@ fn detect_pre_eval_terminal(
 ///
 /// Pulled out as a pure function so we can pin the semantics in unit
 /// tests without driving Stockfish.
-fn should_strategic_claim_50mv(halfmoves: u32, side_to_move_eval_cp: f32) -> bool {
+pub(crate) fn should_strategic_claim_50mv(halfmoves: u32, side_to_move_eval_cp: f32) -> bool {
     halfmoves >= 100 && side_to_move_eval_cp < 0.0
 }
 
