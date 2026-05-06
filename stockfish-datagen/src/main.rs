@@ -242,19 +242,33 @@ fn print_plan(cfg: &RunConfig) {
         let max_per_worker = split.iter().copied().max().unwrap_or(0);
         let total_shards =
             split.iter().map(|n| n.div_ceil(cfg.shard_size_games as u64)).sum::<u64>();
-        println!(
-            "  [{i}] {name:<14} nodes={nodes:>4} games={n_games:>10} \
-             multi_pv={mpv:>2} opening={ompv:>2}/{op_plies} \
-             sample_plies={spl:<3} temp={temp:.2}",
-            name = tier.name,
-            nodes = tier.nodes,
-            n_games = tier.n_games,
-            mpv = tier.multi_pv,
-            ompv = tier.opening_multi_pv,
-            op_plies = tier.opening_plies,
-            spl = tier.sample_plies,
-            temp = tier.temperature,
-        );
+        if tier.searchless {
+            // Searchless tier: no nodes / multi_pv / opening_* / sample_plies
+            // — those are the search-mode knobs. Show what actually applies.
+            let score = tier.sample_score.expect("validated: searchless has sample_score");
+            println!(
+                "  [{i}] {name:<14} EVALLEGAL  games={n_games:>10} \
+                 sample_score={score:?} temp={temp:.2}{store}",
+                name = tier.name,
+                n_games = tier.n_games,
+                temp = tier.temperature,
+                store = if tier.store_legal_move_evals { " store_legal_move_evals=true" } else { "" },
+            );
+        } else {
+            println!(
+                "  [{i}] {name:<14} nodes={nodes:>4} games={n_games:>10} \
+                 multi_pv={mpv:>2} opening={ompv:>2}/{op_plies} \
+                 sample_plies={spl:<3} temp={temp:.2}",
+                name = tier.name,
+                nodes = tier.nodes.expect("validated"),
+                n_games = tier.n_games,
+                mpv = tier.multi_pv.expect("validated"),
+                ompv = tier.opening_multi_pv.expect("validated"),
+                op_plies = tier.opening_plies.expect("validated"),
+                spl = tier.sample_plies.expect("validated"),
+                temp = tier.temperature,
+            );
+        }
         println!(
             "       per-worker max: {max_per_worker}, total shards: {total_shards}"
         );

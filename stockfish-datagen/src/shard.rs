@@ -74,11 +74,14 @@ pub struct GameRow {
     pub game_length: u16,
     pub outcome_token: u16,
     pub result: String,
-    pub nodes: i32,
-    pub multi_pv: i32,
-    pub opening_multi_pv: i32,
-    pub opening_plies: i32,
-    pub sample_plies: i32,
+    /// Search-mode-only metadata. `None` for searchless tiers — those
+    /// fields don't apply to evallegal-driven generation, so we persist
+    /// SQL-style nulls rather than misleading sentinel values.
+    pub nodes: Option<i32>,
+    pub multi_pv: Option<i32>,
+    pub opening_multi_pv: Option<i32>,
+    pub opening_plies: Option<i32>,
+    pub sample_plies: Option<i32>,
     pub temperature: f32,
     pub worker_id: i16,
     pub game_seed: u64,
@@ -117,11 +120,13 @@ pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
         Field::new("game_length", DataType::UInt16, false),
         Field::new("outcome_token", DataType::UInt16, false),
         Field::new("result", DataType::Utf8, false),
-        Field::new("nodes", DataType::Int32, false),
-        Field::new("multi_pv", DataType::Int32, false),
-        Field::new("opening_multi_pv", DataType::Int32, false),
-        Field::new("opening_plies", DataType::Int32, false),
-        Field::new("sample_plies", DataType::Int32, false),
+        // Search-mode-only metadata; nullable so searchless rows write
+        // SQL-style nulls rather than carrying misleading values.
+        Field::new("nodes", DataType::Int32, true),
+        Field::new("multi_pv", DataType::Int32, true),
+        Field::new("opening_multi_pv", DataType::Int32, true),
+        Field::new("opening_plies", DataType::Int32, true),
+        Field::new("sample_plies", DataType::Int32, true),
         Field::new("temperature", DataType::Float32, false),
         Field::new("worker_id", DataType::Int16, false),
         // game_seed is the per-game RNG seed, derived via splitmix64 — a
@@ -226,11 +231,11 @@ impl ShardWriter {
         self.game_length.append_value(row.game_length);
         self.outcome_token.append_value(row.outcome_token);
         self.result.append_value(&row.result);
-        self.nodes.append_value(row.nodes);
-        self.multi_pv.append_value(row.multi_pv);
-        self.opening_multi_pv.append_value(row.opening_multi_pv);
-        self.opening_plies.append_value(row.opening_plies);
-        self.sample_plies.append_value(row.sample_plies);
+        self.nodes.append_option(row.nodes);
+        self.multi_pv.append_option(row.multi_pv);
+        self.opening_multi_pv.append_option(row.opening_multi_pv);
+        self.opening_plies.append_option(row.opening_plies);
+        self.sample_plies.append_option(row.sample_plies);
         self.temperature.append_value(row.temperature);
         self.worker_id.append_value(row.worker_id);
         self.game_seed.append_value(row.game_seed);
@@ -363,11 +368,11 @@ mod tests {
             game_length: 3,
             outcome_token: 1969,
             result: "1-0".into(),
-            nodes: 1,
-            multi_pv: 5,
-            opening_multi_pv: 20,
-            opening_plies: 2,
-            sample_plies: 12,
+            nodes: Some(1),
+            multi_pv: Some(5),
+            opening_multi_pv: Some(20),
+            opening_plies: Some(2),
+            sample_plies: Some(12),
             temperature: 1.0,
             worker_id: 0,
             game_seed: seed,

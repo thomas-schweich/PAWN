@@ -400,7 +400,10 @@ fn run_worker(
     let budget = if tier.searchless {
         crate::stockfish::GoBudget::EvalLegal
     } else {
-        crate::stockfish::GoBudget::Nodes(tier.nodes)
+        // Validation guarantees nodes is Some when searchless=false.
+        crate::stockfish::GoBudget::Nodes(
+            tier.nodes.expect("validated: search-mode tier has nodes"),
+        )
     };
     let mut sf = StockfishProcess::spawn(
         &cfg.stockfish_path,
@@ -497,11 +500,14 @@ fn run_worker(
             game_length: n as u16,
             outcome_token: played.outcome.token(),
             result: played.outcome.result_str().into(),
-            nodes: tier.nodes as i32,
-            multi_pv: tier.multi_pv as i32,
-            opening_multi_pv: tier.opening_multi_pv as i32,
-            opening_plies: tier.opening_plies as i32,
-            sample_plies: tier.sample_plies as i32,
+            // Validation guarantees these are Some iff !searchless and None
+            // iff searchless, so the Option<u32> → Option<i32> map preserves
+            // the protocol-mode invariant in the parquet metadata.
+            nodes: tier.nodes.map(|n| n as i32),
+            multi_pv: tier.multi_pv.map(|n| n as i32),
+            opening_multi_pv: tier.opening_multi_pv.map(|n| n as i32),
+            opening_plies: tier.opening_plies.map(|n| n as i32),
+            sample_plies: tier.sample_plies.map(|n| n as i32),
             temperature: tier.temperature,
             worker_id: worker_id as i16,
             game_seed,
@@ -583,16 +589,16 @@ mod tests {
             shard_size_games: 8,
             tiers: vec![TierConfig {
                 name: "smoke".into(),
-                nodes: 1,
                 n_games: 16,
-                multi_pv: 5,
-                opening_multi_pv: 20,
-                opening_plies: 1,
-                sample_plies: 12,
                 temperature: 1.0,
                 searchless: false,
                 store_legal_move_evals: false,
-            sample_score: crate::config::SampleScore::Cp,
+                sample_score: None,
+                nodes: Some(1),
+                multi_pv: Some(5),
+                opening_multi_pv: Some(20),
+                opening_plies: Some(1),
+                sample_plies: Some(12),
             }],
         }
     }
@@ -745,16 +751,16 @@ mod tests {
         let mut cfg = smoke_config(sf_path, dir.path().to_path_buf());
         cfg.tiers.push(TierConfig {
             name: "second".into(),
-            nodes: 1,
             n_games: 8,
-            multi_pv: 5,
-            opening_multi_pv: 20,
-            opening_plies: 1,
-            sample_plies: 12,
             temperature: 1.0,
             searchless: false,
             store_legal_move_evals: false,
-            sample_score: crate::config::SampleScore::Cp,
+            sample_score: None,
+            nodes: Some(1),
+            multi_pv: Some(5),
+            opening_multi_pv: Some(20),
+            opening_plies: Some(1),
+            sample_plies: Some(12),
         });
 
         // Run only tier 0.

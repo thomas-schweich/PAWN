@@ -136,11 +136,18 @@ pub(crate) fn should_strategic_claim_50mv(halfmoves: u32, side_to_move_eval_cp: 
 
 /// Per-ply MultiPV bucket selector — single source of truth for the
 /// 3-stage opening / sampling / top-1 schedule.
+///
+/// Only called from non-searchless code paths. Config validation enforces
+/// that `opening_plies`, `multi_pv`, `sample_plies` are all Some when
+/// `searchless == false`, so the unwraps below are safe within this scope.
 fn target_multi_pv(tier: &TierConfig, ply: u32) -> u32 {
-    if ply < tier.opening_plies {
-        tier.opening_multi_pv
-    } else if ply < tier.sample_plies {
-        tier.multi_pv
+    debug_assert!(!tier.searchless, "target_multi_pv called in searchless mode");
+    let opening_plies = tier.opening_plies.expect("validated: search-mode tier has opening_plies");
+    let sample_plies = tier.sample_plies.expect("validated: search-mode tier has sample_plies");
+    if ply < opening_plies {
+        tier.opening_multi_pv.expect("validated: search-mode tier has opening_multi_pv")
+    } else if ply < sample_plies {
+        tier.multi_pv.expect("validated: search-mode tier has multi_pv")
     } else {
         1
     }
@@ -182,11 +189,21 @@ pub fn play_game<R: Rng + ?Sized>(
             return Ok(PlayedGame { uci_moves: moves, outcome: reason, per_ply_candidates });
         }
 
-        let target_pv = target_multi_pv(tier, ply);
-        if current_pv != Some(target_pv) {
-            sf.set_multi_pv(target_pv)?;
-            current_pv = Some(target_pv);
-        }
+        // MultiPV scheduling only applies in non-searchless mode. In
+        // searchless mode, evallegal returns every legal move regardless of
+        // any setoption; touching MultiPV would just incur wasted UCI
+        // round-trips, and the `target_pv == 1` shortcut would silently
+        // pick `candidates[0]` (move-gen order, not score order).
+        let target_pv = if !tier.searchless {
+            let pv = target_multi_pv(tier, ply);
+            if current_pv != Some(pv) {
+                sf.set_multi_pv(pv)?;
+                current_pv = Some(pv);
+            }
+            Some(pv)
+        } else {
+            None
+        };
 
         // Use the incremental position cache: we pushed the previous move
         // via `play_move` below, so the cached position string is already
@@ -224,10 +241,18 @@ pub fn play_game<R: Rng + ?Sized>(
             buf.push(res.candidates.clone());
         }
 
-        let pick = if target_pv == 1 {
+        let pick = if target_pv == Some(1) {
+            // Search-mode top-1 tail: candidates[0] is the multipv=1 entry
+            // (the engine's best move at this depth), which is what we want.
             &res.candidates[0]
         } else {
-            softmax_sample(&res.candidates, tier.sample_score, tier.temperature, rng)
+            // Searchless tiers always softmax-sample (no `sample_plies`
+            // knob — every ply uses `sample_score` per validation). For
+            // non-searchless tiers, `sample_score` is None per validation
+            // and we default to Cp (the only score multipv parsing
+            // surfaces — `score_v` is None on those candidates).
+            let score = tier.sample_score.unwrap_or(crate::config::SampleScore::Cp);
+            softmax_sample(&res.candidates, score, tier.temperature, rng)
                 .ok_or(GameError::NoCandidates)?
         };
 
@@ -266,16 +291,16 @@ mod tests {
     fn target_multi_pv_three_phase_schedule() {
         let tier = TierConfig {
             name: "t".into(),
-            nodes: 1,
             n_games: 1,
-            multi_pv: 5,
-            opening_multi_pv: 20,
-            opening_plies: 2,
-            sample_plies: 12,
             temperature: 1.0,
             searchless: false,
             store_legal_move_evals: false,
-            sample_score: crate::config::SampleScore::Cp,
+            sample_score: None,
+            nodes: Some(1),
+            multi_pv: Some(5),
+            opening_multi_pv: Some(20),
+            opening_plies: Some(2),
+            sample_plies: Some(12),
         };
         assert_eq!(target_multi_pv(&tier, 0), 20);
         assert_eq!(target_multi_pv(&tier, 1), 20);
@@ -407,16 +432,16 @@ mod tests {
     fn smoke_tier() -> TierConfig {
         TierConfig {
             name: "smoke".into(),
-            nodes: 1,
             n_games: 1,
-            multi_pv: 5,
-            opening_multi_pv: 20,
-            opening_plies: 2,
-            sample_plies: 12,
             temperature: 1.0,
             searchless: false,
             store_legal_move_evals: false,
-            sample_score: crate::config::SampleScore::Cp,
+            sample_score: None,
+            nodes: Some(1),
+            multi_pv: Some(5),
+            opening_multi_pv: Some(20),
+            opening_plies: Some(2),
+            sample_plies: Some(12),
         }
     }
 
