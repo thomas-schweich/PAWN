@@ -32,16 +32,6 @@
       "temperature": 0.5
     },
     {
-      "name": "nodes_0032",
-      "nodes": 32,
-      "n_games": 20000000,
-      "multi_pv": 5,
-      "opening_multi_pv": 20,
-      "opening_plies": 2,
-      "sample_plies": 999,
-      "temperature": 0.5
-    },
-    {
       "name": "nodes_0128",
       "nodes": 128,
       "n_games": 20000000,
