@@ -1,5 +1,5 @@
 {
-  "stockfish_path": "~/bin/stockfish",
+  "stockfish_path": "stockfish-datagen/stockfish-patched",
   "stockfish_version": "Stockfish 18",
   "output_dir": "data/stockfish",
   "master_seed": 42,
@@ -8,6 +8,19 @@
   "stockfish_hash_mb": 16,
   "shard_size_games": 10000,
   "tiers": [
+    {
+      "name": "tier0_evallegal",
+      "nodes": 1,
+      "n_games": 20000000,
+      "multi_pv": 5,
+      "opening_multi_pv": 20,
+      "opening_plies": 2,
+      "sample_plies": 999,
+      "temperature": 0.5,
+      "searchless": true,
+      "store_legal_move_evals": true,
+      "sample_score": "v"
+    },
     {
       "name": "nodes_0001",
       "nodes": 1,
