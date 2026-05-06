@@ -592,6 +592,7 @@ mod tests {
                 temperature: 1.0,
                 searchless: false,
                 store_legal_move_evals: false,
+            sample_score: crate::config::SampleScore::Cp,
             }],
         }
     }
@@ -753,6 +754,7 @@ mod tests {
             temperature: 1.0,
             searchless: false,
             store_legal_move_evals: false,
+            sample_score: crate::config::SampleScore::Cp,
         });
 
         // Run only tier 0.

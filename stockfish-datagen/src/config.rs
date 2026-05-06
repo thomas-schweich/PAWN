@@ -106,13 +106,49 @@ pub struct TierConfig {
 
     /// When true, persist the full Stockfish candidates list for every ply
     /// alongside the played move. The parquet column is
-    /// `legal_move_evals: List<List<Struct{move_idx: i16, score_cp: i16}>>`,
+    /// `legal_move_evals: List<List<Struct{move_idx: i16, score_cp: i16, score_v: i16?}>>`,
     /// indexed per game and per ply. Designed for distillation-style
     /// training (KL loss vs the per-move softmax). Independent of
     /// `searchless` — though the typical use case is `searchless=true`
     /// + `store_legal_move_evals=true` for "tier 0" datasets.
     #[serde(default)]
     pub store_legal_move_evals: bool,
+
+    /// Which per-move score the sampler softmaxes over. Default `Cp`
+    /// (normalized centipawns) preserves prior behavior; `V` (raw NNUE
+    /// Value) requires `searchless: true` because only the patched
+    /// binary's `evallegal` command surfaces raw `v` values.
+    ///
+    /// Switching this field changes the *games generated* — it shifts
+    /// the visit distribution through the game tree — and is therefore
+    /// part of the tier fingerprint. Two tiers differing only in
+    /// `sample_score` are different tiers and live in separate shards.
+    ///
+    /// `temperature` is applied via `scale = 100 * T` regardless of
+    /// score field (matching the existing pawn-units convention for cp).
+    /// Because raw `v` is ~3–5× larger in magnitude than `cp`, the same
+    /// nominal `T` is effectively much sharper under `V` — pick higher
+    /// `T` (typically 2–4× the cp-equivalent) if you want comparable
+    /// exploration. See `parse_evallegal_payload` and the `to_cp` formula
+    /// in the patched binary's `engine.cpp` for the v↔cp relationship.
+    #[serde(default)]
+    pub sample_score: SampleScore,
+}
+
+/// Which per-move score the sampler should softmax over.
+///
+/// JSON-renamed to lowercase (`"cp"` / `"v"`) so configs stay terse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SampleScore {
+    /// Normalized centipawns (`UCIEngine::to_cp`). Stable units across
+    /// game phases. Available in every protocol.
+    #[default]
+    Cp,
+    /// Raw NNUE `Value`. Requires `searchless: true` (only surfaced via
+    /// the patched binary's `evallegal` command). Equivalent to using
+    /// the network's policy logits as the sampling distribution.
+    V,
 }
 
 fn default_max_ply() -> u32 {
@@ -212,6 +248,16 @@ impl RunConfig {
             // can leave it as a leftover from a non-searchless template.
             if !tier.searchless && tier.nodes == 0 {
                 anyhow::bail!("tier {}: nodes must be >= 1 (or set searchless=true)", tier.name);
+            }
+            // `sample_score: V` requires the patched binary's `evallegal`
+            // protocol — only that path populates `score_v` on candidates.
+            // Without searchless we'd hit a None at sampling time.
+            if matches!(tier.sample_score, SampleScore::V) && !tier.searchless {
+                anyhow::bail!(
+                    "tier {}: sample_score=\"v\" requires searchless=true \
+                     (raw NNUE Value is only surfaced by the evallegal protocol)",
+                    tier.name,
+                );
             }
         }
         Ok(())
@@ -319,6 +365,7 @@ mod tests {
                 temperature: 1.0,
                 searchless: false,
                 store_legal_move_evals: false,
+                sample_score: SampleScore::Cp,
             }],
         }
     }
@@ -448,6 +495,7 @@ mod tests {
             temperature: 1.0,
             searchless: false,
             store_legal_move_evals: false,
+            sample_score: SampleScore::Cp,
         });
         let mut b = a.clone();
         // Change only tier 1.
@@ -505,13 +553,76 @@ mod tests {
     fn tier_fingerprint_golden() {
         let cfg = minimal_config();
         let actual = cfg.tier_fingerprint(0);
-        // Updated when `searchless` and `store_legal_move_evals` were added
-        // to TierConfig (intentional schema change for distillation tier 0).
-        let expected = "62c112888412402b9fe74cbcf18cbedb821e45d316a8e9e0dc448cfa8e1c8693";
+        // Updated when `sample_score` was added to TierConfig (intentional —
+        // sample-score choice changes the visit distribution and so the
+        // generated games, so tiers differing only in this field are
+        // genuinely different tiers).
+        let expected = "5bcd142dafaf623f9f22e3c1a612465f454f14d12563107fe7ffd90265052d96";
         assert_eq!(
             actual, expected,
             "tier_fingerprint changed for minimal_config — verify the change is intentional, then update the expected value"
         );
+    }
+
+    #[test]
+    fn tier_fingerprint_changes_with_sample_score() {
+        // sample_score swap ⇒ different sampling distribution ⇒ different
+        // games. Tiers must NOT share a fingerprint.
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.tiers[0].searchless = true;
+        b.tiers[0].searchless = true;
+        a.tiers[0].sample_score = SampleScore::Cp;
+        b.tiers[0].sample_score = SampleScore::V;
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn validate_rejects_v_without_searchless() {
+        let mut c = minimal_config();
+        c.tiers[0].searchless = false;
+        c.tiers[0].sample_score = SampleScore::V;
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("sample_score"),
+            "expected error to mention sample_score, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_v_with_searchless() {
+        let mut c = minimal_config();
+        c.tiers[0].searchless = true;
+        c.tiers[0].sample_score = SampleScore::V;
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn sample_score_default_is_cp_for_back_compat() {
+        // Configs that omit `sample_score` must round-trip as Cp so existing
+        // production configs are unaffected by the schema bump.
+        let json = r#"{
+            "stockfish_path": "/usr/bin/stockfish",
+            "stockfish_version": "Stockfish 18",
+            "output_dir": "out",
+            "master_seed": 42,
+            "n_workers": 4,
+            "max_ply": 512,
+            "stockfish_hash_mb": 16,
+            "shard_size_games": 1000,
+            "tiers": [{
+                "name": "t",
+                "nodes": 1,
+                "n_games": 100,
+                "multi_pv": 5,
+                "opening_multi_pv": 20,
+                "opening_plies": 1,
+                "sample_plies": 999,
+                "temperature": 1.0
+            }]
+        }"#;
+        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.tiers[0].sample_score, SampleScore::Cp);
     }
 
     #[test]

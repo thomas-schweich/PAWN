@@ -227,7 +227,8 @@ pub fn play_game<R: Rng + ?Sized>(
         let pick = if target_pv == 1 {
             &res.candidates[0]
         } else {
-            softmax_sample(&res.candidates, tier.temperature, rng).ok_or(GameError::NoCandidates)?
+            softmax_sample(&res.candidates, tier.sample_score, tier.temperature, rng)
+                .ok_or(GameError::NoCandidates)?
         };
 
         let uci_parsed: UciMove = pick.uci.parse().map_err(|_| GameError::IllegalMoveFromStockfish {
@@ -274,6 +275,7 @@ mod tests {
             temperature: 1.0,
             searchless: false,
             store_legal_move_evals: false,
+            sample_score: crate::config::SampleScore::Cp,
         };
         assert_eq!(target_multi_pv(&tier, 0), 20);
         assert_eq!(target_multi_pv(&tier, 1), 20);
@@ -414,6 +416,7 @@ mod tests {
             temperature: 1.0,
             searchless: false,
             store_legal_move_evals: false,
+            sample_score: crate::config::SampleScore::Cp,
         }
     }
 
