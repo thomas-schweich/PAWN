@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Tilde-expand a path. Only handles `~/...` (the common case);
-/// `~user/...` is returned as-is.
-fn expand_tilde(p: &Path) -> PathBuf {
+/// `~user/...` is returned as-is. `pub(crate)` so `tournament.rs`'s
+/// loader can apply the same normalization to its own path fields.
+pub(crate) fn expand_tilde(p: &Path) -> PathBuf {
     if let Ok(s) = p.strip_prefix("~") {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home).join(s);

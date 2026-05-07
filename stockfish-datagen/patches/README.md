@@ -20,12 +20,27 @@ Stockfish, licensed accordingly; PAWN itself stays Apache 2.0) and lets the
 extensions be useful to other projects without dragging the rest of PAWN
 along.
 
-`scripts/build_patched_stockfish.sh` clones the fork at the pinned tag
-(`sf18-v0.2.0`) and runs `make -j build ARCH=x86-64-avx2`. The resulting
-binary is dropped at `stockfish-datagen/stockfish-patched`. The runner's
-preflight check (`main.rs::preflight_check_patched_binary`) probes for the
-`evallegal` command at startup and aborts loudly if any tier sets
-`searchless: true` or `net_selection: <X>` against an unpatched binary.
+`scripts/build_patched_stockfish.sh` clones the fork at the pinned commit
+SHA (`777b8807…`, the commit annotated tag `sf18-v0.2.0` currently points
+at) and runs `make -j build ARCH=x86-64-avx2`. The resulting binary is
+dropped at `stockfish-datagen/stockfish-patched`. The Dockerfile uses
+the same SHA pin (a lightweight tag could be force-moved on the remote
+and silently change the binary).
+
+The runner's preflight check (`main.rs::preflight_check_patched_binary`)
+gates startup on two distinct binary capabilities, both detected during
+the UCI handshake:
+
+- `evallegal` UCI command — required if any tier sets `searchless: true`
+  or `net_selection: <X>`. Vanilla SF responds `Unknown command` to the
+  post-handshake probe; the patched binary returns the expected
+  `info string evallegal …` line.
+- `option name NetSelection` — required if any tier sets
+  `net_selection: <X>`. Older fork builds (`sf18-v0.1.0`) advertise
+  `evallegal` but not this option. UCI silently ignores unknown
+  setoption names, so without this gate a `setoption name NetSelection
+  value large` would no-op while shard fingerprints claimed the
+  requested choice. The preflight rejects this combination loudly.
 
 ## Output format (reference)
 

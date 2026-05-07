@@ -90,90 +90,84 @@
 //!   interrupt rates, not worth burning a second physical core to
 //!   avoid.
 //!
-//! Linux-only at runtime. Both `pin_current_thread` and `pin_pid` are
-//! no-ops on other platforms — macOS in particular has no
-//! `sched_setaffinity` equivalent, and we don't need to pin during
+//! Linux-only at runtime. `pick_core` returns `None`, and `pin_thread_to`
+//! and `pin_child_to` no-op on other platforms — macOS in particular has
+//! no `sched_setaffinity` equivalent, and we don't need to pin during
 //! local dev tests.
+//!
+//! ## API ordering
+//!
+//! Callers should pin the worker thread BEFORE spawning Stockfish, so the
+//! child inherits affinity via `fork()` and does its NNUE init / hash-table
+//! allocation on the target core's L1/L2. After spawn, `pin_child` is a
+//! defensive re-pin — typically a no-op since the child already inherited,
+//! but it confirms the pinning if the kernel scheduled the child elsewhere
+//! during the brief unpinned window between fork and the parent's first
+//! sched_setaffinity (theoretical, but cheap to defend against).
+//!
+//! The single-call rule: resolve the core ONCE per worker via
+//! `pick_core(worker_id)`, then pass the resulting `CoreId` to both pin
+//! functions. Two independent `get_core_ids()` calls would risk seeing
+//! different cpuset lists under cgroup mutation (vast.ai-style containers
+//! occasionally retighten cpusets mid-run) and land the worker thread and
+//! its Stockfish child on different cores.
 
-/// Pin the calling thread + a child process to the same core, deciding
-/// the core via `worker_id % n_cores` from a **single** `get_core_ids()`
-/// call. Best-effort: failures on either pin are logged but don't abort.
-///
-/// Combining the two pins into one function is necessary, not stylistic:
-/// under cgroup CPU restrictions (vast.ai-style containers occasionally
-/// tighten the cpuset mid-run), two independent `get_core_ids()` calls
-/// can return different lists in the nanoseconds between them, landing
-/// the worker thread and its Stockfish child on *different* cores —
-/// silently defeating the shared-L1/L2 goal with no warning emitted.
-/// One call, one core, both pins.
-pub fn pin_pair(child_pid: u32, worker_id: u32) {
-    #[cfg(target_os = "linux")]
-    {
-        let cores = match core_affinity::get_core_ids() {
-            Some(c) if !c.is_empty() => c,
-            _ => {
-                eprintln!(
-                    "[affinity] worker {worker_id}: core_affinity::get_core_ids \
-                     returned no cores; skipping thread + pid pin",
-                );
-                return;
-            }
-        };
-        let pick = cores[(worker_id as usize) % cores.len()];
-        if !core_affinity::set_for_current(pick) {
-            eprintln!(
-                "[affinity] worker {worker_id}: set_for_current({pick:?}) failed; \
-                 thread will run on whatever core the scheduler picks",
-            );
-        }
-        pin_pid_to(child_pid, worker_id, pick.id);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (child_pid, worker_id);
-    }
-}
-
-/// Pin only the calling thread (no child process). Use this when there's
-/// no Stockfish child yet — e.g. tournament workers that haven't spawned
-/// their engine subprocess yet. Once the child exists, prefer `pin_pair`
-/// so both pins resolve to the same core.
-pub fn pin_current_thread(worker_id: u32) {
-    #[cfg(target_os = "linux")]
-    {
-        let cores = match core_affinity::get_core_ids() {
-            Some(c) if !c.is_empty() => c,
-            _ => {
-                eprintln!(
-                    "[affinity] worker {worker_id}: core_affinity::get_core_ids \
-                     returned no cores; skipping thread pin",
-                );
-                return;
-            }
-        };
-        let pick = cores[(worker_id as usize) % cores.len()];
-        if !core_affinity::set_for_current(pick) {
-            eprintln!(
-                "[affinity] worker {worker_id}: set_for_current({pick:?}) failed; \
-                 thread will run on whatever core the scheduler picks",
-            );
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = worker_id;
-    }
-}
-
+/// Resolve the core this worker should pin to, using `worker_id % n_cores`.
+/// Call ONCE per worker, then pass the `CoreId` to both `pin_thread_to`
+/// (before spawn) and `pin_child_to` (after spawn). Returns `None` and
+/// logs a warning if the OS reports no cores.
 #[cfg(target_os = "linux")]
-fn pin_pid_to(pid: u32, worker_id: u32, core: usize) {
+pub fn pick_core(worker_id: u32) -> Option<core_affinity::CoreId> {
+    match core_affinity::get_core_ids() {
+        Some(c) if !c.is_empty() => Some(c[(worker_id as usize) % c.len()]),
+        _ => {
+            eprintln!(
+                "[affinity] worker {worker_id}: core_affinity::get_core_ids \
+                 returned no cores; pinning will be skipped",
+            );
+            None
+        }
+    }
+}
+
+/// Stable `Option`-returning shape on non-Linux too, so callers don't need
+/// `#[cfg]` blocks. Always returns `None` off Linux.
+#[cfg(not(target_os = "linux"))]
+pub fn pick_core(_worker_id: u32) -> Option<()> {
+    None
+}
+
+/// Pin the calling thread to `core`. Best-effort: failures are logged.
+/// Call before spawning Stockfish so the child inherits the affinity via
+/// `fork()` and runs its NNUE init on the target core's cache.
+#[cfg(target_os = "linux")]
+pub fn pin_thread_to(core: core_affinity::CoreId, worker_id: u32) {
+    if !core_affinity::set_for_current(core) {
+        eprintln!(
+            "[affinity] worker {worker_id}: set_for_current({core:?}) failed; \
+             thread will run on whatever core the scheduler picks",
+        );
+    }
+}
+
+/// No-op on non-Linux. The signature uses `()` because `pick_core` returns
+/// `Option<()>` off Linux, so callers can write `if let Some(c) = pick_core(id)
+/// { pin_thread_to(c, id); }` portably without `#[cfg]` blocks.
+#[cfg(not(target_os = "linux"))]
+pub fn pin_thread_to(_core: (), _worker_id: u32) {}
+
+/// Pin a child process to `core`. Defensive re-pin — typically a no-op
+/// because the child already inherited the parent's pin via `fork()`.
+#[cfg(target_os = "linux")]
+pub fn pin_child_to(pid: u32, core: core_affinity::CoreId, worker_id: u32) {
+    let core_id = core.id;
     // Build a single-CPU mask. cpu_set_t is opaque; zero it out then
     // set the target bit via CPU_SET. SAFETY: cpu_set_t is POD; the
     // libc helpers don't escape pointers; sched_setaffinity is the
     // canonical Linux syscall for this.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(core, &mut set);
+        libc::CPU_SET(core_id, &mut set);
         let rc = libc::sched_setaffinity(
             pid as libc::pid_t,
             std::mem::size_of::<libc::cpu_set_t>(),
@@ -182,9 +176,12 @@ fn pin_pid_to(pid: u32, worker_id: u32, core: usize) {
         if rc != 0 {
             let err = std::io::Error::last_os_error();
             eprintln!(
-                "[affinity] worker {worker_id}: sched_setaffinity(pid={pid}, core={core}) \
+                "[affinity] worker {worker_id}: sched_setaffinity(pid={pid}, core={core_id}) \
                  failed: {err}; child will run on whatever core the scheduler picks",
             );
         }
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+pub fn pin_child_to(_pid: u32, _core: (), _worker_id: u32) {}

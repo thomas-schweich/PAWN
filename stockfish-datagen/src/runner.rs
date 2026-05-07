@@ -386,15 +386,24 @@ fn run_worker(
     target: u64,
     tx: Sender<Progress>,
 ) -> anyhow::Result<()> {
-    // Pin THIS worker thread to a fixed core before spawning Stockfish.
-    // The (worker, Stockfish) pair is intrinsically serialized over the
-    // pipe (worker writes `position+go`, waits, reads `bestmove`), so
-    // they want to share the same core's L1/L2 — otherwise the kernel
-    // load-balances them across cores and L1/L2 evicts on every
-    // round-trip. On a 16-core local box at 16 workers we measured
-    // 23% kernel time and 537K ctx switches/sec; pinning addresses
-    // exactly that thrashing. At 128 threads with NUMA the upside
-    // grows. Linux-only — `set_for_current` no-ops on macOS.
+    // Pin THIS worker thread to a fixed core BEFORE spawning Stockfish so
+    // the child inherits affinity via fork() and runs its NNUE init /
+    // hash-table allocation on the target core's L1/L2. The (worker,
+    // Stockfish) pair is intrinsically serialized over the pipe (worker
+    // writes `position+go`, waits, reads `bestmove`), so they want to
+    // share the same core's cache — otherwise the kernel load-balances
+    // them across cores and L1/L2 evicts on every round-trip. On a
+    // 16-core local box at 16 workers we measured 23% kernel time and
+    // 537K ctx switches/sec; pinning addresses exactly that thrashing.
+    // At 128 threads with NUMA the upside grows. `pick_core` is called
+    // once and the result is reused for the post-spawn child re-pin so
+    // a cgroup cpuset mutation between the two calls can't split the
+    // pair across cores.
+    let core = affinity::pick_core(worker_id);
+    if let Some(c) = core {
+        affinity::pin_thread_to(c, worker_id);
+    }
+
     let budget = if tier.searchless {
         crate::stockfish::GoBudget::EvalLegal
     } else {
@@ -410,10 +419,13 @@ fn run_worker(
         budget,
     )
     .with_context(|| format!("spawning stockfish for worker {worker_id}"))?;
-    // Pin worker thread + Stockfish child to the SAME core via a single
-    // get_core_ids() call. A separate pin-thread-then-pin-pid pair would
-    // race with cgroup cpuset mutation in the milliseconds between calls.
-    affinity::pin_pair(sf.child_pid(), worker_id);
+    // Defensive re-pin of the child. Almost always a no-op since the child
+    // already inherited the parent's affinity at fork time; only meaningful
+    // if the kernel scheduled the child elsewhere during the brief window
+    // before fork's affinity copy completed (theoretical, but cheap).
+    if let Some(c) = core {
+        affinity::pin_child_to(sf.child_pid(), c, worker_id);
+    }
     // Apply NetSelection if the tier requested an override. The preflight
     // check in main.rs verified the binary is patched whenever any tier
     // sets this field, so the setoption is guaranteed to take effect here

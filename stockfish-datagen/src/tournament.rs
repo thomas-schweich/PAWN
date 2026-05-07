@@ -67,8 +67,15 @@ impl TournamentConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let cfg: TournamentConfig = serde_json::from_slice(&bytes)
+        let mut cfg: TournamentConfig = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
+        // Tilde-expand path fields so configs like `"~/bin/stockfish"`
+        // work the same way they do for `RunConfig::load` — keeps the CLI
+        // behavior consistent across the run / tournament subcommands.
+        cfg.stockfish_path = crate::config::expand_tilde(&cfg.stockfish_path);
+        if let Some(out) = &cfg.output_path {
+            cfg.output_path = Some(crate::config::expand_tilde(out));
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -197,6 +204,19 @@ pub fn run_tournament(cfg: &TournamentConfig) -> anyhow::Result<TournamentResult
         })
         .collect();
 
+    // Create the output_path parent up-front so a long tournament doesn't
+    // run all games then fail at the final write with `No such file or
+    // directory`. mkdir-p style — already-exists is fine.
+    if let Some(out) = &cfg.output_path {
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("creating output_path parent dir {}", parent.display())
+                })?;
+            }
+        }
+    }
+
     let cfg = Arc::new(cfg.clone());
     let openings = Arc::new(openings);
     let (tx, rx) = crossbeam_channel::unbounded::<(u32, MatchOutcome, Vec<String>)>();
@@ -299,6 +319,13 @@ fn run_worker(
     openings: Arc<Vec<Vec<String>>>,
     tx: crossbeam_channel::Sender<(u32, MatchOutcome, Vec<String>)>,
 ) -> anyhow::Result<()> {
+    // Pin BEFORE spawn so the child inherits affinity via fork() and runs
+    // its NNUE init on the target core's cache. See runner.rs for the full
+    // rationale; same pick_core / pin_thread_to / pin_child_to pattern.
+    let core = affinity::pick_core(worker_id);
+    if let Some(c) = core {
+        affinity::pin_thread_to(c, worker_id);
+    }
     let mut sf = StockfishProcess::spawn(
         &cfg.stockfish_path,
         &cfg.stockfish_version,
@@ -306,7 +333,9 @@ fn run_worker(
         GoBudget::EvalLegal,
     )
     .with_context(|| format!("spawning stockfish for tournament worker {worker_id}"))?;
-    affinity::pin_pair(sf.child_pid(), worker_id);
+    if let Some(c) = core {
+        affinity::pin_child_to(sf.child_pid(), c, worker_id);
+    }
 
     if !sf.is_patched {
         anyhow::bail!(
