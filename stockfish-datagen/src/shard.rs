@@ -82,6 +82,14 @@ pub struct GameRow {
     pub opening_multi_pv: Option<i32>,
     pub opening_plies: Option<i32>,
     pub sample_plies: Option<i32>,
+    /// Searchless-mode-only metadata. `None` for non-searchless tiers.
+    /// Stored per-row so a shard moved out of its directory context
+    /// remains fully attributable — `sample_score` and `net_selection`
+    /// both meaningfully change the games that get generated, and
+    /// without them in the row a moved shard couldn't be distinguished
+    /// from a cp-vs-v / auto-vs-large counterpart at the same temperature.
+    pub sample_score: Option<String>,
+    pub net_selection: Option<String>,
     pub temperature: f32,
     pub worker_id: i16,
     pub game_seed: u64,
@@ -127,6 +135,11 @@ pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
         Field::new("opening_multi_pv", DataType::Int32, true),
         Field::new("opening_plies", DataType::Int32, true),
         Field::new("sample_plies", DataType::Int32, true),
+        // Searchless-mode-only metadata; nullable so non-searchless rows
+        // write SQL-style nulls. Provenance: a shard moved out of its
+        // directory context remains attributable.
+        Field::new("sample_score", DataType::Utf8, true),
+        Field::new("net_selection", DataType::Utf8, true),
         Field::new("temperature", DataType::Float32, false),
         Field::new("worker_id", DataType::Int16, false),
         // game_seed is the per-game RNG seed, derived via splitmix64 — a
@@ -159,6 +172,8 @@ pub struct ShardWriter {
     opening_multi_pv: Int32Builder,
     opening_plies: Int32Builder,
     sample_plies: Int32Builder,
+    sample_score: StringBuilder,
+    net_selection: StringBuilder,
     temperature: Float32Builder,
     worker_id: Int16Builder,
     game_seed: UInt64Builder,
@@ -196,6 +211,8 @@ impl ShardWriter {
             opening_multi_pv: Int32Builder::new(),
             opening_plies: Int32Builder::new(),
             sample_plies: Int32Builder::new(),
+            sample_score: StringBuilder::new(),
+            net_selection: StringBuilder::new(),
             temperature: Float32Builder::new(),
             worker_id: Int16Builder::new(),
             game_seed: UInt64Builder::new(),
@@ -236,6 +253,8 @@ impl ShardWriter {
         self.opening_multi_pv.append_option(row.opening_multi_pv);
         self.opening_plies.append_option(row.opening_plies);
         self.sample_plies.append_option(row.sample_plies);
+        self.sample_score.append_option(row.sample_score.as_deref());
+        self.net_selection.append_option(row.net_selection.as_deref());
         self.temperature.append_value(row.temperature);
         self.worker_id.append_value(row.worker_id);
         self.game_seed.append_value(row.game_seed);
@@ -303,6 +322,8 @@ impl ShardWriter {
             Arc::new(self.opening_multi_pv.finish()),
             Arc::new(self.opening_plies.finish()),
             Arc::new(self.sample_plies.finish()),
+            Arc::new(self.sample_score.finish()),
+            Arc::new(self.net_selection.finish()),
             Arc::new(self.temperature.finish()),
             Arc::new(self.worker_id.finish()),
             Arc::new(self.game_seed.finish()),
@@ -373,6 +394,8 @@ mod tests {
             opening_multi_pv: Some(20),
             opening_plies: Some(2),
             sample_plies: Some(12),
+            sample_score: None,
+            net_selection: None,
             temperature: 1.0,
             worker_id: 0,
             game_seed: seed,

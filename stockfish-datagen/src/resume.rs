@@ -232,6 +232,8 @@ mod tests {
             opening_multi_pv: Some(20),
             opening_plies: Some(1),
             sample_plies: Some(999),
+            sample_score: None,
+            net_selection: None,
             temperature: 1.0,
             worker_id: 0,
             game_seed,

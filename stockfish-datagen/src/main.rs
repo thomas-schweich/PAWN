@@ -109,6 +109,7 @@ fn real_main() -> anyhow::Result<()> {
             let cfg = TournamentConfig::load(&config)
                 .with_context(|| format!("loading tournament config {}", config.display()))?;
             print_tournament_plan(&cfg);
+            preflight_check_tournament_binary(&cfg)?;
 
             let t0 = std::time::Instant::now();
             let result = run_tournament(&cfg).context("running tournament")?;
@@ -178,6 +179,39 @@ fn print_tournament_summary(
 struct Totals {
     games: u64,
     shards: u64,
+}
+
+/// Tournament-side counterpart to `preflight_check_patched_binary`.
+/// Tournaments always drive the patched binary (`GoBudget::EvalLegal`),
+/// and any side using `sample_score: V` requires it too — so the surface
+/// area to check is fixed: the binary must recognize `evallegal`, and if
+/// either side requested an explicit-V sampling, NetSelection (which only
+/// the v0.2.0+ fork advertises) is also required for the per-side
+/// configuration to be meaningful end-to-end. Spawn one throwaway probe;
+/// fail fast before spawning N tournament workers against a vanilla SF.
+fn preflight_check_tournament_binary(cfg: &TournamentConfig) -> anyhow::Result<()> {
+    let probe = StockfishProcess::spawn(
+        &cfg.stockfish_path,
+        &cfg.stockfish_version,
+        cfg.stockfish_hash_mb,
+        GoBudget::Nodes(1),
+    )
+    .with_context(|| {
+        format!("preflight: spawning {} for tournament probe", cfg.stockfish_path.display())
+    })?;
+    eprintln!(
+        "stockfish patched (evallegal command): {}",
+        if probe.is_patched { "yes" } else { "NO" },
+    );
+    if !probe.is_patched {
+        anyhow::bail!(
+            "tournament requires the patched binary (always runs evallegal), but {} \
+             does not recognize the `evallegal` UCI command. Build via \
+             `bash stockfish-datagen/scripts/build_patched_stockfish.sh`.",
+            cfg.stockfish_path.display(),
+        );
+    }
+    Ok(())
 }
 
 /// If any tier sets `searchless: true` or `net_selection: ...`, spawn one

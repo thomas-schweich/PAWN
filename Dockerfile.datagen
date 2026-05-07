@@ -179,14 +179,21 @@ RUN pip3 install --break-system-packages --no-cache-dir \
 # wrapper installed below picks the right one at runtime via
 # /proc/cpuinfo. Set --build-arg INCLUDE_STOCKFISH=0 to skip both.
 ARG INCLUDE_STOCKFISH=1
+# `set -e` so a per-variant download / extract / install failure aborts the
+# build immediately instead of being swallowed by the loop and leaving the
+# image without a binary the wrapper later expects. Without this, a bare
+# `for variant ... do ... && ... done` would only surface the LAST iteration's
+# exit status, so an avx2 download failure followed by avx512 success would
+# build green and explode at pod boot on AVX2-only hardware.
 RUN if [ "$INCLUDE_STOCKFISH" = "1" ]; then \
+        set -e; \
         for variant in avx2 avx512; do \
-            curl -L -o /tmp/sf.tar \
-                "https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64-${variant}.tar" \
-            && tar xf /tmp/sf.tar -C /tmp \
-            && cp "/tmp/stockfish/stockfish-ubuntu-x86-64-${variant}" "/usr/local/bin/stockfish-${variant}" \
-            && chmod +x "/usr/local/bin/stockfish-${variant}" \
-            && rm -rf /tmp/sf.tar /tmp/stockfish; \
+            curl -fL -o /tmp/sf.tar \
+                "https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64-${variant}.tar"; \
+            tar xf /tmp/sf.tar -C /tmp; \
+            cp "/tmp/stockfish/stockfish-ubuntu-x86-64-${variant}" "/usr/local/bin/stockfish-${variant}"; \
+            chmod +x "/usr/local/bin/stockfish-${variant}"; \
+            rm -rf /tmp/sf.tar /tmp/stockfish; \
         done; \
     fi
 

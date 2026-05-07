@@ -100,8 +100,9 @@ impl TournamentConfig {
         // sample_score=V requires the patched binary's evallegal protocol —
         // both sides drive that protocol regardless of mode (we always
         // spawn with GoBudget::EvalLegal in tournament mode), so this is
-        // satisfied as long as the binary is patched. The preflight in the
-        // CLI handler catches an unpatched binary; nothing to validate here.
+        // satisfied as long as the binary is patched. `main.rs::preflight_check_tournament_binary`
+        // probes for `evallegal` once before spawning workers; the per-worker
+        // `is_patched` check below is a defensive backstop.
         if self.side_a.name == self.side_b.name {
             anyhow::bail!("side_a and side_b need distinct names for output disambiguation");
         }

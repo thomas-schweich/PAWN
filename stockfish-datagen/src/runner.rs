@@ -526,6 +526,15 @@ fn run_worker(
             opening_multi_pv: tier.opening_multi_pv.map(|n| n as i32),
             opening_plies: tier.opening_plies.map(|n| n as i32),
             sample_plies: tier.sample_plies.map(|n| n as i32),
+            // Searchless-only metadata: serialized as the same lowercase
+            // string the JSON config uses, so a moved shard reads back
+            // immediately recognizable values without consulting an
+            // external schema.
+            sample_score: tier.sample_score.map(|s| match s {
+                crate::config::SampleScore::Cp => "cp".to_string(),
+                crate::config::SampleScore::V => "v".to_string(),
+            }),
+            net_selection: tier.net_selection.map(|n| n.as_uci_str().to_string()),
             temperature: tier.temperature,
             worker_id: worker_id as i16,
             game_seed,
