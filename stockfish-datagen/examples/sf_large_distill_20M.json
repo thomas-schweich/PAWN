@@ -6,7 +6,7 @@
   "n_workers": 126,
   "max_ply": 512,
   "stockfish_hash_mb": 16,
-  "shard_size_games": 10000,
+  "shard_size_games": 2000,
   "tiers": [
     {
       "name": "large_distill",

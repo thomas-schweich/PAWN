@@ -37,3 +37,25 @@ rather than silently corrupting a tier.
 If you derive a new config from one of these, **change the
 `master_seed`** unless you specifically want to reproduce existing
 output.
+
+## Shard size + memory
+
+`shard_size_games` is the per-worker buffer size before flushing one
+parquet file. The current `ShardWriter` accumulates rows in Arrow
+column builders for an entire shard before writing — fine for
+search-mode tiers (a few hundred bytes per row) but heavy for tiers
+that set `store_legal_move_evals: true`, where each row carries
+~200 plies × ~19 legal-move evals × 6 bytes ≈ 23 KB.
+
+Memory budget per worker = `shard_size_games × ~23 KB`. At 126 workers,
+total peak buffer ≈ that × 126. The bundled production configs
+(`stockfish_100m.json`, `sf_large_distill_20M.json`) use **2000** —
+~46 MB / worker, ~5.8 GB total — leaving comfortable headroom on
+typical 256 GB+ vast.ai pods. The trade is more shard files: 100M
+games / 2000 = ~50K shards across all workers (vs 10K at the older
+shard_size).
+
+Don't push this above 5000 for `store_legal_move_evals: true` tiers
+on a 126-worker pod without first checking pod RAM. Search-mode tiers
+without legal-move-eval storage tolerate much larger shards but live
+under the same global setting; lower wins.

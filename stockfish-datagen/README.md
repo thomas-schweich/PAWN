@@ -37,8 +37,9 @@ cargo run --release -p stockfish-datagen -- tournament \
 
 Every row in the output carries a `game_seed` (`UInt64`). Combined with
 `stockfish_version` and the per-row tier config (`nodes`, `multi_pv`,
-`opening_multi_pv`, `opening_plies`, `sample_plies`, `temperature`),
-that seed is sufficient to deterministically replay the exact game.
+`opening_multi_pv`, `opening_plies`, `sample_plies`, `temperature`,
+`sample_score`, `net_selection`), that seed is sufficient to
+deterministically replay the exact game.
 
 For **searchless tiers** (`searchless: true`), the per-row search-budget
 fields above are all `null`. The two searchless-relevant knobs —
