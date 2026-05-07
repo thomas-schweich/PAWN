@@ -1,0 +1,21 @@
+{
+  "stockfish_path": "stockfish-datagen/stockfish-patched",
+  "stockfish_version": "Stockfish 18",
+  "output_dir": "data/sf_large_distill_20M",
+  "master_seed": 142,
+  "n_workers": 126,
+  "max_ply": 512,
+  "stockfish_hash_mb": 16,
+  "shard_size_games": 2000,
+  "tiers": [
+    {
+      "name": "large_distill",
+      "n_games": 20000000,
+      "temperature": 0.5,
+      "searchless": true,
+      "store_legal_move_evals": true,
+      "sample_score": "v",
+      "net_selection": "large"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "stockfish_path": "stockfish-datagen/stockfish-patched",
+  "stockfish_version": "Stockfish 18",
+  "output_dir": "/tmp/sf_bench_evallegal_14k",
+  "master_seed": 42,
+  "n_workers": 14,
+  "max_ply": 512,
+  "stockfish_hash_mb": 16,
+  "shard_size_games": 256,
+  "tiers": [
+    {
+      "name": "tier0_evallegal",
+      "n_games": 14000,
+      "temperature": 0.5,
+      "searchless": true,
+      "store_legal_move_evals": true,
+      "sample_score": "v",
+      "net_selection": "large"
+    }
+  ]
+}

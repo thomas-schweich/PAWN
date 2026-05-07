@@ -7,7 +7,8 @@ care which source the data came from.
 
 ## Usage
 
-The binary takes a subcommand (`run` or `dry-run`) and a `--config PATH` flag.
+The binary takes a subcommand (`run`, `dry-run`, or `tournament`) and a
+`--config PATH` flag.
 
 ```bash
 # Validate a config without running anything.
@@ -18,17 +19,36 @@ cargo run --release -p stockfish-datagen -- dry-run \
 cargo run --release -p stockfish-datagen -- run \
   --config stockfish-datagen/examples/smoke.json
 
-# Production: 20M games across 5 tiers.
+# Production: 100M games across 5 tiers (20M per tier).
 cargo run --release -p stockfish-datagen -- run \
-  --config stockfish-datagen/examples/stockfish_20m.json
+  --config stockfish-datagen/examples/stockfish_100m.json
+
+# Play two SampleScore × temperature configs against each other and
+# report W/D/L + Elo with a Wilson 95% CI. Always uses the patched
+# binary's `evallegal` protocol — point `stockfish_path` at the binary
+# built by `stockfish-datagen/scripts/build_patched_stockfish.sh`. A
+# tournament-side preflight aborts before any worker spawns if the
+# binary doesn't recognize `evallegal`.
+cargo run --release -p stockfish-datagen -- tournament \
+  --config stockfish-datagen/examples/tournament_cp_vs_v_T0.json
 ```
 
 ## Reproducibility
 
-Every row in the output carries a `game_seed` (i64). Combined with
+Every row in the output carries a `game_seed` (`UInt64`). Combined with
 `stockfish_version` and the per-row tier config (`nodes`, `multi_pv`,
-`opening_multi_pv`, `opening_plies`, `sample_plies`, `temperature`),
-that seed is sufficient to deterministically replay the exact game.
+`opening_multi_pv`, `opening_plies`, `sample_plies`, `temperature`,
+`sample_score`, `net_selection`), that seed is sufficient to
+deterministically replay the exact game.
+
+For **searchless tiers** (`searchless: true`), the per-row search-budget
+fields above are all `null`. The two searchless-relevant knobs —
+`sample_score` (`"cp"` / `"v"`) and `net_selection` (`"auto"` / `"small"`
+/ `"large"`) — are persisted per-row as nullable string columns
+(see the schema table below), so a moved shard remains fully
+attributable without the run-config JSON. `net_selection` is also
+populated for non-searchless tiers that pinned a network; only
+`sample_score` is searchless-only.
 
 The version pin is enforced at startup: the config's
 `stockfish_version` is matched at a word boundary against the
@@ -61,13 +81,20 @@ without replaying earlier games.
 ```
 <output_dir>/
   <tier_name>/
-    _manifest.json                    # written last, signals tier-complete
-    shard-w000-c0000.parquet          # one shard per (worker, chunk)
-    shard-w000-c0001.parquet
+    _manifest.json                              # written last, signals tier-complete
+    shard-w000-c0000-r000834.parquet            # one shard per (worker, chunk); -r<N> is the row count
+    shard-w000-c0001-r000833.parquet
     ...
-    shard-w011-c0000.parquet
+    shard-w011-c0000-r000833.parquet
     ...
 ```
+
+The trailing `-r<NNNNNN>` field encodes the row count at six zero-padded
+digits (so any `shard_size_games <= 999_999` fits). Resume reads this
+straight from the directory listing rather than opening parquet metadata,
+which lets a remote-sync tool drop zero-byte placeholder files locally
+that the resume logic treats identically to real shards. See the
+HuggingFace sync section below.
 
 Shards are zstd-compressed parquet (level 3). They're written
 atomically: `shard-…parquet.tmp` is fsynced, then renamed to
@@ -114,15 +141,134 @@ tier-state's fingerprint.
 | `game_length`       | `UInt16`        | == len of tokens / san / uci            |
 | `outcome_token`     | `UInt16`        | 1969..=1973 (mirrors engine vocab.rs)   |
 | `result`            | `String`        | "1-0", "0-1", or "1/2-1/2"              |
-| `nodes`             | `Int32`         | per-row, from tier config               |
-| `multi_pv`          | `Int32`         | per-row, from tier config               |
-| `opening_multi_pv`  | `Int32`         | per-row, from tier config               |
-| `opening_plies`     | `Int32`         | per-row, from tier config               |
-| `sample_plies`      | `Int32`         | per-row, from tier config               |
+| `nodes`             | `Int32?`        | search-mode-only; null on searchless tiers |
+| `multi_pv`          | `Int32?`        | search-mode-only; null on searchless tiers |
+| `opening_multi_pv`  | `Int32?`        | search-mode-only; null on searchless tiers |
+| `opening_plies`     | `Int32?`        | search-mode-only; null on searchless tiers |
+| `sample_plies`      | `Int32?`        | search-mode-only; null on searchless tiers |
+| `sample_score`      | `Utf8?`         | searchless-only: `"cp"` or `"v"`; null otherwise |
+| `net_selection`     | `Utf8?`         | either tier mode: `"auto"` / `"small"` / `"large"`; null when the tier left the engine on its default |
 | `temperature`       | `Float32`       | per-row, from tier config               |
 | `worker_id`         | `Int16`         | which worker produced the row           |
 | `game_seed`         | `UInt64`        | per-game seed (reproduction key)        |
 | `stockfish_version` | `String`        | from Stockfish's `id name` line         |
+| `legal_move_evals`  | `List<List<Struct{move_idx: Int16, score_cp: Int16, score_v: Int16?}>>` | per-ply per-legal-move NNUE evals when `store_legal_move_evals: true`; empty outer list when not. `score_v` is non-null only for evallegal-protocol rows (searchless tiers). |
+
+## Tuning `n_workers` (CPU pinning is on by default)
+
+Each worker thread + its Stockfish child are pinned to the same logical
+cpu (`worker_id % n_logical`) on Linux. The pair is intrinsically
+serialized over a pipe, so they want the same core's L1/L2 cache. This
+shifts the optimal worker count *down* compared to the unpinned baseline.
+
+Local sweep on a 16-thread / 8-physical-core / 2-SMT box (5k games,
+nodes=1, sample_plies=12):
+
+| workers | no-pin g/s | pinned g/s | delta |
+|---|---|---|---|
+| 8 | 179.3 | 244.1 | **+36%** |
+| 12 | 219.2 | 301.5 | **+38%** |
+| 13 | — | 312.0 | (peak − 3%) |
+| **14** | 261.4 | **321.4** | +23% (pinned peak) |
+| 15 | 284.6 | 309.9 | +9% |
+| 16 | **300.6** | 301.3 | ≈0 (no-pin peak) |
+| 20 | 298.3 | 231.7 | -22% |
+| 24 | 303.9 | 260.0 | -14% |
+
+### Rule of thumb: `n_workers = total_threads − threads_per_core`
+
+Equivalent reading: **occupy every physical core except one, and leave
+that one core entirely free for the kernel + the watcher thread + HF
+upload networking + parquet I/O**.
+
+- 16-thread / 8-physical / 2-SMT (this dev box): 16 − 2 = **14** (verified)
+- 128-thread / 64-physical / 2-SMT (typical vast.ai): 128 − 2 = **126**
+- Same chip with SMT off: 64 − 1 = 63
+- 4-way SMT (POWER): 128 − 4 = 124
+
+Why this works (under packed Linux topology, the modern default):
+`core_affinity::get_core_ids()` returns logical cpus in topology order
+(cpus 0,1 are SMT siblings on physical 0; cpus 2,3 on physical 1; …).
+With `worker_id % n_logical` pinning and the rule above, the LAST
+physical core's siblings are entirely out of the rotation, so that
+core is uncontested for everything else the pod is doing.
+
+Caveats:
+- **Empirically verified at SMT=2 / 16-thread only.** The 128-thread
+  case is theoretical extrapolation. A 30-second 5k-game sweep at
+  {n−4, n−2, n} workers on the actual pod is cheap insurance.
+- **Assumes packed topology.** On scattered topology (older systems),
+  `worker_id % n_logical` doesn't leave a fully-free physical core.
+- **NUMA:** the rule generalizes to multi-socket boxes without change.
+  What the free core absorbs (kernel networking, the watcher thread,
+  parquet write-back, orchestrator overhead) doesn't scale with
+  worker count or socket count, so one global free physical core
+  suffices regardless of NUMA layout. The realistic cost of NUMA-
+  remote NIC softirqs preempting worker pairs is ~1% throughput on
+  the affected socket — not worth burning a second physical core
+  per node to avoid.
+
+The bundled `examples/stockfish_100m.json` defaults to `n_workers: 126`
+assuming a 128-thread / 64-physical / 2-SMT vast.ai box. On a different
+topology, override per the rule above.
+
+### Validating on the actual pod (~1-3 minutes)
+
+`scripts/sweep_pod_workers.sh` runs a quick `n_workers` sweep on the
+pod's hardware. Useful before launching the full fire-and-forget run,
+since `n_workers` is part of the per-tier fingerprint — changing it
+mid-run would invalidate the partial state and waste pod hours.
+
+```bash
+# Auto-detect topology, sweep ±4 around the rule's prediction:
+bash /opt/datagen/scripts/sweep_pod_workers.sh
+
+# Or test specific values:
+bash /opt/datagen/scripts/sweep_pod_workers.sh 122 124 126 128
+```
+
+Each point is 5000 nodes=1 games (~5–15s of pod time), full pipeline
+including pinning. Output is sorted by rate descending; pick the
+winner and put it in your run config before launching the production
+HF-sync job. The script prints to stdout only — nothing is uploaded.
+
+The `dev` Docker target (see `Dockerfile.datagen`) is purpose-built
+for this workflow: it adds sshd + tmux + htop + jq + numactl on top
+of the runtime image and keeps the pod alive indefinitely so you can
+SSH in, run the sweep, edit configs, then launch the production run
+manually inside `tmux` for detach-survival. See the Dockerfile header
+for the build/run incantations.
+
+CPU pinning is Linux-only (`core_affinity::set_for_current` for the
+worker thread, `libc::sched_setaffinity` for the Stockfish child PID);
+on macOS both calls no-op. See `stockfish-datagen/src/affinity.rs`
+for the full module docstring.
+
+## Strategic 50-move-rule claim
+
+The 50-move rule is *claimable* in FIDE rules, not automatic, and a
+strong player has no incentive to claim if they're winning. Our
+generator models this: at the moment the 50-move threshold is reached
+(halfmove 100), the side about to move uses Stockfish's eval —
+specifically the top-candidate `score_cp` (which is documented as
+side-to-move POV). If they're losing (`score_cp < 0`), they claim →
+game ends as `FiftyMoveRule`. If winning or even, they keep playing.
+
+In practice this becomes a "50-or-51-or-… move rule": claims
+fluctuate as evaluations swing, until either someone resets the
+halfmove clock with a capture / pawn move or the FIDE 75-move
+*automatic* rule fires at halfmove 150 (the hard upper bound).
+
+**What this gives the model**: a learnable signal for *when* to claim.
+The dataset contains games that ended in 50-move-rule draws at varying
+halfmove offsets in [100, 150], correlated with the position's eval at
+that point. With unconditional claim at halfmove 100, every such game
+would terminate at the same halfmove and the model would just learn
+"halfmove 100 → game over."
+
+3-fold repetition stays unconditional rather than eval-strategic —
+making it strategic risks both sides perpetually shuffling in a drawn
+position, which the 50-move clock would eventually reset anyway.
 
 ## Operator notes
 
@@ -137,6 +283,103 @@ tier-state's fingerprint.
 - **Long multi-tier jobs** are checkpointed at tier granularity. A
   crash in tier N doesn't affect manifests for tiers 0..N-1, and the
   rerun resumes tier N from its last completed shard per worker.
+
+## Fire-and-forget pod runs (HuggingFace sync)
+
+`scripts/datagen_with_hf_sync.py` wraps the rust binary so a pod can
+generate to a HuggingFace dataset without an operator in the loop, and
+resume after a crash without re-downloading the existing shards.
+
+```bash
+HF_TOKEN=... python scripts/datagen_with_hf_sync.py \
+    --config stockfish-datagen/examples/stockfish_100m.json \
+    --repo-id thomas-schweich/pawn-stockfish-100m \
+    --prune-local
+```
+
+Three phases run in one process:
+
+1. **Primer.** Lists the dataset repo. Downloads the per-tier sentinels
+   (`_manifest.json`, `_tier_state.json`) into the local output dir.
+   For every remote shard file, creates a *zero-byte placeholder* at the
+   matching local path. Because the rust binary's resume logic recovers
+   `(worker_id, chunk_idx, n_rows)` from the filename alone, a directory
+   full of placeholders looks identical to a directory full of real
+   shards — no parquet metadata is read on resume, so no actual data
+   needs to be downloaded.
+2. **Subprocess.** Spawns `stockfish-datagen run --config <cfg>`.
+   SIGINT/SIGTERM are forwarded so the rust binary's graceful-shutdown
+   semantics are preserved.
+3. **Watcher.** A daemon thread polls the output dir every
+   `--poll-interval` seconds (default 30 s) and uploads any new
+   completed shards (and updated sentinels) via `HfApi.upload_file`.
+   Zero-byte placeholders are skipped — those are already remote.
+   With `--prune-local`, the local file is replaced with a zero-byte
+   placeholder after a successful upload, so disk usage stays flat
+   regardless of the run's total size.
+
+CLI flags worth knowing:
+
+- `--prune-local` — replace each local shard with a zero-byte
+  placeholder after a successful upload. Use on disk-constrained pods.
+- `--no-primer` — skip the primer phase (no `list_repo_files` call,
+  no sentinel downloads, no placeholder creation). The cheap repo
+  existence/creation check (`HfApi.repo_info` or `create_repo`) still
+  runs; uploads can't create repos themselves so this guarantees the
+  watcher's first upload won't 404. Useful for local testing or
+  restarting against a known-empty repo.
+- `--poll-interval <seconds>` — watcher poll cadence. Default 30 s.
+- `--max-consecutive-failures <N>` — watcher gives up + SIGTERMs the
+  rust child after N consecutive cycle failures. Default 10
+  (~5 minutes at the default poll). Tune up for runs that may span
+  longer documented HF outages.
+- `--watcher-drain-timeout-hours <hours>` — after the rust binary exits,
+  wait up to this many hours for the watcher to flush any pending shard
+  uploads before exiting. Default 4 hours. If the timeout fires with
+  uploads still pending, exit code is `4` (or the rust binary's non-zero
+  `rc` if that also failed; rc takes precedence). Local shards stay on
+  disk and the next run's primer picks up where this one left off.
+- `--log-level {DEBUG,INFO,WARNING,ERROR}` — default INFO.
+
+Exit codes: `0` clean; non-zero `rc` from the rust binary if it
+failed; `3` watcher gave up after consecutive failures (auth/quota/
+permanent 4xx — the rust child is also SIGTERM'd, so partial output
+remains and is recoverable on the next run via the primer); `4`
+final drain failed (or was skipped because the watcher was still
+mid-upload at join timeout — local shards stay on disk and resume
+picks them up).
+
+Pod recipe (Docker image's default entrypoint dispatches to this script
+when both env vars are set):
+
+```bash
+docker run --rm -d \
+    -e HF_TOKEN=... \
+    -e DATAGEN_HF_REPO=thomas-schweich/pawn-stockfish-100m \
+    -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_100m.json \
+    -e DATAGEN_PRUNE_LOCAL=1 \
+    -v /workspace/sf:/workspace/sf \
+    pawn-datagen
+```
+
+Recognized env vars:
+
+| Env var                | Effect                                                        |
+|------------------------|---------------------------------------------------------------|
+| `HF_TOKEN`             | HuggingFace auth (mandatory). Aliases `HUGGING_FACE_HUB_TOKEN` and `HUGGINGFACE_HUB_TOKEN` are also accepted, as is the on-disk credential store written by `hf auth login`. |
+| `DATAGEN_HF_REPO`      | Dataset repo, e.g. `org/name`. Required for the entrypoint.   |
+| `DATAGEN_CONFIG`       | Path to the run config inside the image.                      |
+| `DATAGEN_PRUNE_LOCAL`  | Any non-empty value enables `--prune-local`.                  |
+| `DATAGEN_POLL_INTERVAL`| Watcher poll seconds (overrides default 30).                  |
+| `DATAGEN_EXTRA_ARGS`   | Extra flags appended to the orchestrator command line (e.g. `--max-consecutive-failures 30 --log-level DEBUG`). |
+
+Caveats:
+
+- Don't run two pods writing to the same dataset repo. There's no
+  cross-process locking; concurrent writers will race on commits.
+- The rust binary's tier-state fingerprint check still applies after
+  primer download — if the local config doesn't match the remote
+  `_tier_state.json`, the run aborts before generating anything.
 
 ## Failure model
 

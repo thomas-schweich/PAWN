@@ -14,11 +14,12 @@ use crossbeam_channel::Sender;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
+use crate::affinity;
 use crate::config::{RunConfig, TierConfig};
 use crate::game::play_game;
 use crate::resume::{TierManifest, TierState, detect_resume};
 use crate::seed;
-use crate::shard::{GameRow, ShardWriter, shard_path};
+use crate::shard::{GameRow, ShardWriter};
 use crate::stockfish::StockfishProcess;
 
 /// Results from a successful tier run.
@@ -57,6 +58,8 @@ pub fn run_tier(
     tier_index: usize,
 ) -> anyhow::Result<TierResult> {
     let tier = &cfg.tiers[tier_index];
+    // `output_dir` was tilde-expanded in `RunConfig::load`, so `~/sf-data`
+    // already resolves to `$HOME/sf-data` here.
     let tier_dir = cfg.output_dir.join(&tier.name);
     std::fs::create_dir_all(&tier_dir)
         .with_context(|| format!("creating tier dir {}", tier_dir.display()))?;
@@ -288,7 +291,7 @@ pub fn run_tier(
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        let Some((worker_id, _chunk)) = crate::resume::parse_shard_filename(&name_str)
+        let Some((worker_id, _chunk, _rows)) = crate::resume::parse_shard_filename(&name_str)
         else {
             continue;
         };
@@ -383,13 +386,54 @@ fn run_worker(
     target: u64,
     tx: Sender<Progress>,
 ) -> anyhow::Result<()> {
+    // Pin THIS worker thread to a fixed core BEFORE spawning Stockfish so
+    // the child inherits affinity via fork() and runs its NNUE init /
+    // hash-table allocation on the target core's L1/L2. The (worker,
+    // Stockfish) pair is intrinsically serialized over the pipe (worker
+    // writes `position+go`, waits, reads `bestmove`), so they want to
+    // share the same core's cache — otherwise the kernel load-balances
+    // them across cores and L1/L2 evicts on every round-trip. On a
+    // 16-core local box at 16 workers we measured 23% kernel time and
+    // 537K ctx switches/sec; pinning addresses exactly that thrashing.
+    // At 128 threads with NUMA the upside grows. `pick_core` is called
+    // once and the result is reused for the post-spawn child re-pin so
+    // a cgroup cpuset mutation between the two calls can't split the
+    // pair across cores.
+    let core = affinity::pick_core(worker_id);
+    if let Some(c) = core {
+        affinity::pin_thread_to(c, worker_id);
+    }
+
+    let budget = if tier.searchless {
+        crate::stockfish::GoBudget::EvalLegal
+    } else {
+        // Validation guarantees nodes is Some when searchless=false.
+        crate::stockfish::GoBudget::Nodes(
+            tier.nodes.expect("validated: search-mode tier has nodes"),
+        )
+    };
     let mut sf = StockfishProcess::spawn(
-        &expand_tilde(&cfg.stockfish_path),
+        &cfg.stockfish_path,
         &cfg.stockfish_version,
         cfg.stockfish_hash_mb,
-        tier.nodes,
+        budget,
     )
     .with_context(|| format!("spawning stockfish for worker {worker_id}"))?;
+    // Defensive re-pin of the child. Almost always a no-op since the child
+    // already inherited the parent's affinity at fork time; only meaningful
+    // if the kernel scheduled the child elsewhere during the brief window
+    // before fork's affinity copy completed (theoretical, but cheap).
+    if let Some(c) = core {
+        affinity::pin_child_to(sf.child_pid(), c, worker_id);
+    }
+    // Apply NetSelection if the tier requested an override. The preflight
+    // check in main.rs verified the binary is patched whenever any tier
+    // sets this field, so the setoption is guaranteed to take effect here
+    // (vs being silently ignored by a vanilla SF18).
+    if let Some(net) = tier.net_selection {
+        sf.set_net_selection(net)
+            .with_context(|| format!("worker {worker_id}: setting NetSelection={:?}", net))?;
+    }
     let stockfish_id_name = sf.id_name.clone();
 
     // On resume we always start a *new* shard at start_chunk — the prior
@@ -443,6 +487,30 @@ fn run_worker(
         }
         let n = tokens.len();
 
+        // Convert per-ply candidates (UCI string + f32 cp + optional f32 raw v)
+        // into the packed (move_idx, score_cp, score_v?) form for distillation.
+        // We trust the engine vocab here — Stockfish has already produced legal
+        // UCI strings (the per-ply move choice was applied successfully above).
+        let legal_move_evals = played.per_ply_candidates.map(|plies| {
+            plies
+                .into_iter()
+                .map(|cands| {
+                    cands
+                        .into_iter()
+                        .map(|c| crate::shard::LegalMoveEval {
+                            move_idx: chess_engine::vocab::uci_to_action(&c.uci)
+                                .expect("Stockfish-emitted UCI must be in our action vocab")
+                                as i16,
+                            score_cp: c.score_cp.clamp(i16::MIN as f32, i16::MAX as f32) as i16,
+                            score_v: c.score_v.map(|v| {
+                                v.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+                            }),
+                        })
+                        .collect()
+                })
+                .collect()
+        });
+
         let row = GameRow {
             tokens: tokens.into_iter().map(|t| t as i16).collect(),
             san,
@@ -450,19 +518,32 @@ fn run_worker(
             game_length: n as u16,
             outcome_token: played.outcome.token(),
             result: played.outcome.result_str().into(),
-            nodes: tier.nodes as i32,
-            multi_pv: tier.multi_pv as i32,
-            opening_multi_pv: tier.opening_multi_pv as i32,
-            opening_plies: tier.opening_plies as i32,
-            sample_plies: tier.sample_plies as i32,
+            // Validation guarantees these are Some iff !searchless and None
+            // iff searchless, so the Option<u32> → Option<i32> map preserves
+            // the protocol-mode invariant in the parquet metadata.
+            nodes: tier.nodes.map(|n| n as i32),
+            multi_pv: tier.multi_pv.map(|n| n as i32),
+            opening_multi_pv: tier.opening_multi_pv.map(|n| n as i32),
+            opening_plies: tier.opening_plies.map(|n| n as i32),
+            sample_plies: tier.sample_plies.map(|n| n as i32),
+            // Searchless-only metadata: serialized as the same lowercase
+            // string the JSON config uses, so a moved shard reads back
+            // immediately recognizable values without consulting an
+            // external schema.
+            sample_score: tier.sample_score.map(|s| match s {
+                crate::config::SampleScore::Cp => "cp".to_string(),
+                crate::config::SampleScore::V => "v".to_string(),
+            }),
+            net_selection: tier.net_selection.map(|n| n.as_uci_str().to_string()),
             temperature: tier.temperature,
             worker_id: worker_id as i16,
             game_seed,
             stockfish_version: stockfish_version.to_string(),
+            legal_move_evals,
         };
 
         if writer.is_none() {
-            writer = Some(ShardWriter::create(shard_path(tier_dir, worker_id, current_chunk))?);
+            writer = Some(ShardWriter::create(tier_dir.to_path_buf(), worker_id, current_chunk)?);
         }
         writer.as_mut().unwrap().append(&row);
         games_in_shard += 1;
@@ -503,17 +584,6 @@ fn run_worker(
     Ok(())
 }
 
-/// Tilde-expand a path. Only handles `~/...` (the common case); doesn't
-/// resolve `~user/...` etc. Anything else is returned as-is.
-fn expand_tilde(p: &std::path::Path) -> PathBuf {
-    if let Ok(s) = p.strip_prefix("~") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(s);
-        }
-    }
-    p.to_path_buf()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,13 +616,17 @@ mod tests {
             shard_size_games: 8,
             tiers: vec![TierConfig {
                 name: "smoke".into(),
-                nodes: 1,
                 n_games: 16,
-                multi_pv: 5,
-                opening_multi_pv: 20,
-                opening_plies: 1,
-                sample_plies: 12,
                 temperature: 1.0,
+                searchless: false,
+                store_legal_move_evals: false,
+                sample_score: None,
+                net_selection: None,
+                nodes: Some(1),
+                multi_pv: Some(5),
+                opening_multi_pv: Some(20),
+                opening_plies: Some(1),
+                sample_plies: Some(12),
             }],
         }
     }
@@ -593,14 +667,29 @@ mod tests {
         // re-run only that worker.
         let tier_dir = cfg.output_dir.join(&cfg.tiers[0].name);
         std::fs::remove_file(tier_dir.join("_manifest.json")).unwrap();
-        let w1_shard = tier_dir.join("shard-w001-c0000.parquet");
-        let w0_shard = tier_dir.join("shard-w000-c0000.parquet");
+        // Derive the actual shard paths from r1.shards rather than
+        // reconstructing names by hand — the filename now includes the
+        // row count, so any hand-written `shard-w001-c0000.parquet`
+        // would not exist.
+        let pick = |w: &str| {
+            r1.shards.iter()
+                .find(|p| p.file_name().unwrap().to_string_lossy().contains(w))
+                .unwrap_or_else(|| panic!("no shard for {w} in {:?}", r1.shards))
+                .clone()
+        };
+        let w1_shard = pick("w001");
+        let w0_shard = pick("w000");
         let w0_bytes_before = std::fs::read(&w0_shard).unwrap();
         std::fs::remove_file(&w1_shard).unwrap();
 
         let r2 = run_tier(&cfg, 0).unwrap();
         assert_eq!(r2.n_games_written, 16, "resumed total must equal target");
-        assert!(w1_shard.exists(), "resumed worker should have re-created its shard");
+        // After resume, w1 produces a NEW shard with a new filename
+        // (same row count → same name; different row count → different name).
+        // Just check that *some* w001 shard exists.
+        let w1_after = r2.shards.iter()
+            .find(|p| p.file_name().unwrap().to_string_lossy().contains("w001"));
+        assert!(w1_after.is_some(), "resumed worker should have re-created its shard");
         // Worker 0's shard must be byte-identical: it was skipped, not regenerated.
         let w0_bytes_after = std::fs::read(&w0_shard).unwrap();
         assert_eq!(w0_bytes_before, w0_bytes_after, "completed worker's shard should be untouched");
@@ -690,13 +779,17 @@ mod tests {
         let mut cfg = smoke_config(sf_path, dir.path().to_path_buf());
         cfg.tiers.push(TierConfig {
             name: "second".into(),
-            nodes: 1,
             n_games: 8,
-            multi_pv: 5,
-            opening_multi_pv: 20,
-            opening_plies: 1,
-            sample_plies: 12,
             temperature: 1.0,
+            searchless: false,
+            store_legal_move_evals: false,
+            sample_score: None,
+            net_selection: None,
+            nodes: Some(1),
+            multi_pv: Some(5),
+            opening_multi_pv: Some(20),
+            opening_plies: Some(1),
+            sample_plies: Some(12),
         });
 
         // Run only tier 0.

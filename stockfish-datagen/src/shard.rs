@@ -1,7 +1,15 @@
 //! One parquet shard per worker per chunk. Atomic on disk: written to
-//! `<path>.tmp` and renamed on close, so a crash mid-shard leaves a
-//! `.tmp` orphan rather than a half-valid `.parquet`. Resume scans only
-//! `.parquet` files.
+//! `shard-w<NNN>-c<NNNN>.parquet.tmp` and renamed on close to
+//! `shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet`, where the trailing `r` field
+//! is the row count. Encoding the row count in the filename lets resume
+//! determine `(worker, chunk, n_rows)` from a directory listing alone —
+//! no parquet metadata reads required. That in turn lets a remote sync
+//! tool (e.g. an HF dataset uploader) drop zero-byte placeholder files
+//! locally that the resume code can read just like real shards, so we
+//! can resume on a fresh pod without re-downloading any actual data.
+//!
+//! A crash mid-shard leaves a `.tmp` orphan rather than a half-valid
+//! `.parquet`. Resume scans only `.parquet` files.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,14 +17,53 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arrow::array::{
-    ArrayRef, Float32Builder, Int16Builder, Int32Builder, ListBuilder,
-    RecordBatch, StringBuilder, UInt16Builder, UInt64Builder,
+    ArrayBuilder, ArrayRef, Float32Builder, Int16Builder, Int32Builder, ListBuilder,
+    RecordBatch, StringBuilder, StructBuilder, UInt16Builder, UInt64Builder,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use once_cell::sync::Lazy;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+
+/// One candidate move's distillation payload. Stored packed as
+/// `Struct{move_idx: i16, score_cp: i16, score_v: i16?}` to keep parquet
+/// rows compact while remaining trivially loadable from polars / pyarrow.
+///
+/// - `move_idx`: searchless_chess action vocab index (0..1968).
+/// - `score_cp`: normalized centipawns, mover-POV. 100 cp ≈ "1 pawn equivalent".
+/// - `score_v`: raw internal NNUE Value, mover-POV. `None` when the tier
+///   sourced its candidates from `info ... multipv` (only the patched
+///   binary's `evallegal` command surfaces raw values). Distillation
+///   targets should use this when present — it's what the network actually
+///   produces, before win-rate normalization shrinks magnitudes by `a/100`
+///   ≈ 2–3.5×.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LegalMoveEval {
+    pub move_idx: i16,
+    pub score_cp: i16,
+    pub score_v: Option<i16>,
+}
+
+/// Fields of the `legal_move_evals` Struct element. Hoisted so the
+/// schema and the StructBuilder agree on order/nullability.
+fn legal_move_eval_struct_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("move_idx", DataType::Int16, false),
+        Field::new("score_cp", DataType::Int16, false),
+        // Nullable: only the `evallegal` protocol provides this. Multipv-derived
+        // candidates leave it null.
+        Field::new("score_v", DataType::Int16, true),
+    ])
+}
+
+fn legal_move_eval_struct_builders() -> Vec<Box<dyn ArrayBuilder>> {
+    vec![
+        Box::new(Int16Builder::new()),
+        Box::new(Int16Builder::new()),
+        Box::new(Int16Builder::new()),
+    ]
+}
 
 /// One row to be written. Constructed by the worker after a game finishes.
 #[derive(Debug, Clone)]
@@ -27,15 +74,37 @@ pub struct GameRow {
     pub game_length: u16,
     pub outcome_token: u16,
     pub result: String,
-    pub nodes: i32,
-    pub multi_pv: i32,
-    pub opening_multi_pv: i32,
-    pub opening_plies: i32,
-    pub sample_plies: i32,
+    /// Search-mode-only metadata. `None` for searchless tiers — those
+    /// fields don't apply to evallegal-driven generation, so we persist
+    /// SQL-style nulls rather than misleading sentinel values.
+    pub nodes: Option<i32>,
+    pub multi_pv: Option<i32>,
+    pub opening_multi_pv: Option<i32>,
+    pub opening_plies: Option<i32>,
+    pub sample_plies: Option<i32>,
+    /// Searchless-only: `"cp"` or `"v"`, the score field the sampler
+    /// softmaxed over. `None` for non-searchless rows (the multipv parsing
+    /// path only surfaces cp). Persisted per-row so a shard moved out of
+    /// its tier directory remains attributable.
+    pub sample_score: Option<String>,
+    /// Either tier mode: the UCI `NetSelection` value (`"auto"`, `"small"`,
+    /// `"large"`) the engine was configured to use. `None` when the tier
+    /// left the engine on its default (`auto` for the patched binary,
+    /// vanilla SF dynamic for unpatched). Both search-mode and searchless
+    /// tiers may set this; `sample_score IS NULL` does NOT imply
+    /// `net_selection IS NULL`.
+    pub net_selection: Option<String>,
     pub temperature: f32,
     pub worker_id: i16,
     pub game_seed: u64,
     pub stockfish_version: String,
+    /// Per-ply per-legal-move NNUE eval payload. `None` when the tier did
+    /// not request distillation data (non-storing tiers leave the parquet
+    /// column as an empty list, paying only a few bytes of offsets per
+    /// row). `Some(Vec)` outer length equals `game_length`; inner lengths
+    /// are the number of legal moves at each ply (capped by the tier's
+    /// MultiPV). See `TierConfig::store_legal_move_evals`.
+    pub legal_move_evals: Option<Vec<Vec<LegalMoveEval>>>,
 }
 
 pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
@@ -44,6 +113,18 @@ pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
     // way. The outer List itself is non-null because every game has tokens.
     let list_i16 = DataType::List(Arc::new(Field::new("item", DataType::Int16, true)));
     let list_utf8 = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+
+    // legal_move_evals: List<List<Struct{move_idx: i16, score_cp: i16}>>.
+    // Outer list = per-ply; inner list = per-legal-move at that ply.
+    // Always present in the schema for forward compat. Tiers that don't
+    // request distillation data leave it as an empty outer list per row
+    // (~8 bytes of offsets, negligible vs the rest of the row).
+    let eval_struct_dt = DataType::Struct(legal_move_eval_struct_fields());
+    let eval_inner_list_dt =
+        DataType::List(Arc::new(Field::new("item", eval_struct_dt, true)));
+    let eval_outer_list_dt =
+        DataType::List(Arc::new(Field::new("item", eval_inner_list_dt, true)));
+
     Arc::new(Schema::new(vec![
         Field::new("tokens", list_i16, false),
         Field::new("san", list_utf8.clone(), false),
@@ -51,11 +132,19 @@ pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
         Field::new("game_length", DataType::UInt16, false),
         Field::new("outcome_token", DataType::UInt16, false),
         Field::new("result", DataType::Utf8, false),
-        Field::new("nodes", DataType::Int32, false),
-        Field::new("multi_pv", DataType::Int32, false),
-        Field::new("opening_multi_pv", DataType::Int32, false),
-        Field::new("opening_plies", DataType::Int32, false),
-        Field::new("sample_plies", DataType::Int32, false),
+        // Search-mode-only metadata; nullable so searchless rows write
+        // SQL-style nulls rather than carrying misleading values.
+        Field::new("nodes", DataType::Int32, true),
+        Field::new("multi_pv", DataType::Int32, true),
+        Field::new("opening_multi_pv", DataType::Int32, true),
+        Field::new("opening_plies", DataType::Int32, true),
+        Field::new("sample_plies", DataType::Int32, true),
+        // sample_score: searchless-only, "cp"|"v"; null on non-searchless rows.
+        // net_selection: any tier may set it ("auto"|"small"|"large"); null
+        // when the tier left the engine on its default. Persisted per-row so
+        // a shard moved out of its directory context remains attributable.
+        Field::new("sample_score", DataType::Utf8, true),
+        Field::new("net_selection", DataType::Utf8, true),
         Field::new("temperature", DataType::Float32, false),
         Field::new("worker_id", DataType::Int16, false),
         // game_seed is the per-game RNG seed, derived via splitmix64 — a
@@ -65,6 +154,7 @@ pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
         // handle this correctly.
         Field::new("game_seed", DataType::UInt64, false),
         Field::new("stockfish_version", DataType::Utf8, false),
+        Field::new("legal_move_evals", eval_outer_list_dt, false),
     ]))
 });
 
@@ -72,7 +162,9 @@ pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
 /// shard size (~10k games × ~150 plies × few bytes/move = ~15MB), so we
 /// don't need streaming writes within a shard.
 pub struct ShardWriter {
-    final_path: PathBuf,
+    tier_dir: PathBuf,
+    shard_worker_id: u32,
+    shard_chunk_idx: u32,
     tmp_path: PathBuf,
     tokens: ListBuilder<Int16Builder>,
     san: ListBuilder<StringBuilder>,
@@ -85,26 +177,33 @@ pub struct ShardWriter {
     opening_multi_pv: Int32Builder,
     opening_plies: Int32Builder,
     sample_plies: Int32Builder,
+    sample_score: StringBuilder,
+    net_selection: StringBuilder,
     temperature: Float32Builder,
     worker_id: Int16Builder,
     game_seed: UInt64Builder,
     stockfish_version: StringBuilder,
+    legal_move_evals: ListBuilder<ListBuilder<StructBuilder>>,
     n_rows: usize,
 }
 
 impl ShardWriter {
-    pub fn create(final_path: PathBuf) -> anyhow::Result<Self> {
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating shard dir {}", parent.display()))?;
-        }
-        let tmp_path = final_path.with_extension("parquet.tmp");
+    /// Open a writer for `(worker_id, chunk_idx)` under `tier_dir`. The
+    /// final filename — which includes the row count — is determined at
+    /// `close()` time, so writes go to a row-count-free `.parquet.tmp`
+    /// path and the rename happens at the end.
+    pub fn create(tier_dir: PathBuf, worker_id: u32, chunk_idx: u32) -> anyhow::Result<Self> {
+        fs::create_dir_all(&tier_dir)
+            .with_context(|| format!("creating shard dir {}", tier_dir.display()))?;
+        let tmp_path = shard_tmp_path(&tier_dir, worker_id, chunk_idx);
         // Best effort: clean up any leftover .tmp from a prior crash before
         // we start writing this shard.
         let _ = fs::remove_file(&tmp_path);
 
         Ok(Self {
-            final_path,
+            tier_dir,
+            shard_worker_id: worker_id,
+            shard_chunk_idx: chunk_idx,
             tmp_path,
             tokens: ListBuilder::new(Int16Builder::new()),
             san: ListBuilder::new(StringBuilder::new()),
@@ -117,10 +216,16 @@ impl ShardWriter {
             opening_multi_pv: Int32Builder::new(),
             opening_plies: Int32Builder::new(),
             sample_plies: Int32Builder::new(),
+            sample_score: StringBuilder::new(),
+            net_selection: StringBuilder::new(),
             temperature: Float32Builder::new(),
             worker_id: Int16Builder::new(),
             game_seed: UInt64Builder::new(),
             stockfish_version: StringBuilder::new(),
+            legal_move_evals: ListBuilder::new(ListBuilder::new(StructBuilder::new(
+                legal_move_eval_struct_fields(),
+                legal_move_eval_struct_builders(),
+            ))),
             n_rows: 0,
         })
     }
@@ -148,27 +253,67 @@ impl ShardWriter {
         self.game_length.append_value(row.game_length);
         self.outcome_token.append_value(row.outcome_token);
         self.result.append_value(&row.result);
-        self.nodes.append_value(row.nodes);
-        self.multi_pv.append_value(row.multi_pv);
-        self.opening_multi_pv.append_value(row.opening_multi_pv);
-        self.opening_plies.append_value(row.opening_plies);
-        self.sample_plies.append_value(row.sample_plies);
+        self.nodes.append_option(row.nodes);
+        self.multi_pv.append_option(row.multi_pv);
+        self.opening_multi_pv.append_option(row.opening_multi_pv);
+        self.opening_plies.append_option(row.opening_plies);
+        self.sample_plies.append_option(row.sample_plies);
+        self.sample_score.append_option(row.sample_score.as_deref());
+        self.net_selection.append_option(row.net_selection.as_deref());
         self.temperature.append_value(row.temperature);
         self.worker_id.append_value(row.worker_id);
         self.game_seed.append_value(row.game_seed);
         self.stockfish_version.append_value(&row.stockfish_version);
 
+        // legal_move_evals: outer list = per-ply, inner list = per-move.
+        // Tiers that don't store distillation data leave the outer list
+        // empty (still non-null at row level — schema declares the column
+        // non-null and downstream readers find an empty `[]` rather than
+        // having to handle row-level nulls).
+        if let Some(plies) = &row.legal_move_evals {
+            let inner_list = self.legal_move_evals.values();
+            for ply_evals in plies {
+                let struct_b = inner_list.values();
+                for ev in ply_evals {
+                    struct_b
+                        .field_builder::<Int16Builder>(0)
+                        .expect("move_idx field 0")
+                        .append_value(ev.move_idx);
+                    struct_b
+                        .field_builder::<Int16Builder>(1)
+                        .expect("score_cp field 1")
+                        .append_value(ev.score_cp);
+                    let v_b = struct_b
+                        .field_builder::<Int16Builder>(2)
+                        .expect("score_v field 2");
+                    match ev.score_v {
+                        Some(v) => v_b.append_value(v),
+                        None => v_b.append_null(),
+                    }
+                    struct_b.append(true);
+                }
+                inner_list.append(true);
+            }
+        }
+        self.legal_move_evals.append(true);
+
         self.n_rows += 1;
     }
 
     /// Materialize the buffered rows, write the parquet, and atomically
-    /// rename `.tmp` → final path. Consumes self.
+    /// rename `.tmp` → final path (which includes the row count). Consumes self.
     pub fn close(mut self) -> anyhow::Result<PathBuf> {
         if self.n_rows == 0 {
             // Nothing to write — clean up the (never-created) tmp and return.
             let _ = fs::remove_file(&self.tmp_path);
-            anyhow::bail!("ShardWriter::close called with zero rows for {}", self.final_path.display());
+            anyhow::bail!(
+                "ShardWriter::close called with zero rows for w{:03}-c{:04} in {}",
+                self.shard_worker_id, self.shard_chunk_idx, self.tier_dir.display(),
+            );
         }
+        let final_path = shard_final_path(
+            &self.tier_dir, self.shard_worker_id, self.shard_chunk_idx, self.n_rows as u64,
+        );
 
         let columns: Vec<ArrayRef> = vec![
             Arc::new(self.tokens.finish()),
@@ -182,10 +327,13 @@ impl ShardWriter {
             Arc::new(self.opening_multi_pv.finish()),
             Arc::new(self.opening_plies.finish()),
             Arc::new(self.sample_plies.finish()),
+            Arc::new(self.sample_score.finish()),
+            Arc::new(self.net_selection.finish()),
             Arc::new(self.temperature.finish()),
             Arc::new(self.worker_id.finish()),
             Arc::new(self.game_seed.finish()),
             Arc::new(self.stockfish_version.finish()),
+            Arc::new(self.legal_move_evals.finish()),
         ];
         let batch = RecordBatch::try_new(SCHEMA.clone(), columns)
             .context("building record batch")?;
@@ -209,16 +357,26 @@ impl ShardWriter {
             file.sync_all().context("fsyncing shard")?;
         }
 
-        fs::rename(&self.tmp_path, &self.final_path)
-            .with_context(|| format!("renaming {} -> {}", self.tmp_path.display(), self.final_path.display()))?;
-        Ok(self.final_path)
+        fs::rename(&self.tmp_path, &final_path)
+            .with_context(|| format!("renaming {} -> {}", self.tmp_path.display(), final_path.display()))?;
+        Ok(final_path)
     }
 }
 
-/// Standard naming: `<tier_dir>/shard-w<worker:03>-c<chunk:04>.parquet`.
-/// Caller is responsible for ensuring `tier_dir` is created.
-pub fn shard_path(tier_dir: &Path, worker_id: u32, chunk_idx: u32) -> PathBuf {
-    tier_dir.join(format!("shard-w{worker_id:03}-c{chunk_idx:04}.parquet"))
+/// In-progress path: `<tier_dir>/shard-w<NNN>-c<NNNN>.parquet.tmp`.
+/// The row count is unknown until close, so the tmp filename omits it.
+pub fn shard_tmp_path(tier_dir: &Path, worker_id: u32, chunk_idx: u32) -> PathBuf {
+    tier_dir.join(format!("shard-w{worker_id:03}-c{chunk_idx:04}.parquet.tmp"))
+}
+
+/// Final, post-rename path: `<tier_dir>/shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet`.
+/// Encoding the row count in the filename lets resume — and remote-sync
+/// placeholder files — recover `(worker, chunk, n_rows)` from a directory
+/// listing alone. `n_rows` is zero-padded to a *minimum* of 6 digits;
+/// `shard_size_games > 999_999` simply produces a wider field, which
+/// `parse_shard_filename` and the Python regex `\d{6,}` both accept.
+pub fn shard_final_path(tier_dir: &Path, worker_id: u32, chunk_idx: u32, n_rows: u64) -> PathBuf {
+    tier_dir.join(format!("shard-w{worker_id:03}-c{chunk_idx:04}-r{n_rows:06}.parquet"))
 }
 
 #[cfg(test)]
@@ -236,37 +394,41 @@ mod tests {
             game_length: 3,
             outcome_token: 1969,
             result: "1-0".into(),
-            nodes: 1,
-            multi_pv: 5,
-            opening_multi_pv: 20,
-            opening_plies: 2,
-            sample_plies: 12,
+            nodes: Some(1),
+            multi_pv: Some(5),
+            opening_multi_pv: Some(20),
+            opening_plies: Some(2),
+            sample_plies: Some(12),
+            sample_score: None,
+            net_selection: None,
             temperature: 1.0,
             worker_id: 0,
             game_seed: seed,
             stockfish_version: "Stockfish 18 by ...".into(),
+            legal_move_evals: None,
         }
     }
 
     #[test]
-    fn shard_path_is_zero_padded() {
-        let p = shard_path(Path::new("/tmp/x"), 3, 17);
-        assert_eq!(p, PathBuf::from("/tmp/x/shard-w003-c0017.parquet"));
+    fn shard_paths_are_zero_padded() {
+        let tmp = shard_tmp_path(Path::new("/tmp/x"), 3, 17);
+        assert_eq!(tmp, PathBuf::from("/tmp/x/shard-w003-c0017.parquet.tmp"));
+        let final_p = shard_final_path(Path::new("/tmp/x"), 3, 17, 834);
+        assert_eq!(final_p, PathBuf::from("/tmp/x/shard-w003-c0017-r000834.parquet"));
     }
 
     #[test]
     fn write_then_read_round_trips() {
         let dir = tempdir().unwrap();
-        let path = shard_path(dir.path(), 0, 0);
-        let mut w = ShardWriter::create(path.clone()).unwrap();
+        let mut w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
         for i in 0..5 {
             w.append(&fake_row(1000 + i));
         }
         let written = w.close().unwrap();
-        assert_eq!(written, path);
+        assert_eq!(written, shard_final_path(dir.path(), 0, 0, 5));
 
         // Re-read via parquet's own reader and verify shape + a couple of cells.
-        let file = File::open(&path).unwrap();
+        let file = File::open(&written).unwrap();
         let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
         let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
         assert_eq!(batches.len(), 1);
@@ -284,6 +446,65 @@ mod tests {
         assert_eq!(game_seed_col.value(4), 1004);
     }
 
+    #[test]
+    fn legal_move_evals_round_trip() {
+        use arrow::array::{Array, Int16Array, ListArray, StructArray};
+        let dir = tempdir().unwrap();
+        let mut w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
+
+        // Game 0: distillation tier — populated. Two plies, varying legal-move counts.
+        // First ply mixes Some / None score_v to exercise the nullable column path.
+        let mut row0 = fake_row(1);
+        row0.legal_move_evals = Some(vec![
+            vec![
+                LegalMoveEval { move_idx: 100, score_cp: 50, score_v: Some(125) },
+                LegalMoveEval { move_idx: 200, score_cp: -25, score_v: None },
+            ],
+            vec![LegalMoveEval { move_idx: 300, score_cp: 10, score_v: Some(28) }],
+        ]);
+        w.append(&row0);
+
+        // Game 1: non-storing tier — None / empty outer list. Same shard
+        // can mix both (in practice a tier is one mode or the other, but
+        // the schema must support either per row).
+        w.append(&fake_row(2));
+
+        let path = w.close().unwrap();
+        let file = File::open(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
+        let batch = &batches[0];
+        let outer = batch
+            .column_by_name("legal_move_evals")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        // Row 0: two plies.
+        let plies0 = outer.value(0);
+        let plies0 = plies0.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(plies0.len(), 2);
+
+        let ply0_0 = plies0.value(0);
+        let ply0_0 = ply0_0.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(ply0_0.len(), 2);
+        let move_idx = ply0_0.column(0).as_any().downcast_ref::<Int16Array>().unwrap();
+        let score_cp = ply0_0.column(1).as_any().downcast_ref::<Int16Array>().unwrap();
+        let score_v = ply0_0.column(2).as_any().downcast_ref::<Int16Array>().unwrap();
+        assert_eq!(move_idx.value(0), 100);
+        assert_eq!(score_cp.value(0), 50);
+        assert_eq!(score_v.value(0), 125);
+        assert!(score_v.is_valid(0));
+        assert_eq!(move_idx.value(1), 200);
+        assert_eq!(score_cp.value(1), -25);
+        assert!(!score_v.is_valid(1)); // None → null in parquet
+
+        // Row 1: empty outer list (no per-ply data captured).
+        let plies1 = outer.value(1);
+        let plies1 = plies1.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(plies1.len(), 0);
+    }
+
     /// Regression test for the round-7 `game_seed: i64 -> UInt64` change.
     /// A high-bit seed (>= 2^63) MUST round-trip as itself, not flip to a
     /// negative integer. With the prior Int64 schema this would store a
@@ -292,11 +513,10 @@ mod tests {
     #[test]
     fn high_bit_game_seed_round_trips() {
         let dir = tempdir().unwrap();
-        let path = shard_path(dir.path(), 0, 0);
-        let mut w = ShardWriter::create(path.clone()).unwrap();
+        let mut w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
         let big = 0xFFFF_FFFF_FFFF_FFFFu64; // u64::MAX — sign bit set
         w.append(&fake_row(big));
-        w.close().unwrap();
+        let path = w.close().unwrap();
 
         let file = File::open(&path).unwrap();
         let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
@@ -313,23 +533,22 @@ mod tests {
     #[test]
     fn close_with_no_rows_errors() {
         let dir = tempdir().unwrap();
-        let path = shard_path(dir.path(), 0, 0);
-        let w = ShardWriter::create(path).unwrap();
+        let w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
         assert!(w.close().is_err());
     }
 
     #[test]
     fn tmp_orphan_is_cleaned_up_on_create() {
         let dir = tempdir().unwrap();
-        let path = shard_path(dir.path(), 0, 0);
-        let tmp = path.with_extension("parquet.tmp");
+        let tmp = shard_tmp_path(dir.path(), 0, 0);
         // Plant a fake .tmp orphan.
         std::fs::write(&tmp, b"garbage").unwrap();
         assert!(tmp.exists());
-        let mut w = ShardWriter::create(path.clone()).unwrap();
+        let mut w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
         assert!(!tmp.exists(), "create() should have cleaned up the orphan tmp");
         w.append(&fake_row(0));
         let final_path = w.close().unwrap();
         assert!(final_path.exists());
+        assert_eq!(final_path, shard_final_path(dir.path(), 0, 0, 1));
     }
 }

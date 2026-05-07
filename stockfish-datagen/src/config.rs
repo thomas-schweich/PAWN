@@ -9,6 +9,18 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Tilde-expand a path. Only handles `~/...` (the common case);
+/// `~user/...` is returned as-is. `pub(crate)` so `tournament.rs`'s
+/// loader can apply the same normalization to its own path fields.
+pub(crate) fn expand_tilde(p: &Path) -> PathBuf {
+    if let Ok(s) = p.strip_prefix("~") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(s);
+        }
+    }
+    p.to_path_buf()
+}
+
 /// Top-level run config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,40 +60,225 @@ pub struct RunConfig {
     pub tiers: Vec<TierConfig>,
 }
 
-/// One tier of self-play games. Fields control sampling / search strength
-/// for that tier; mixing tiers in one run yields a heterogeneous corpus.
+/// One tier of self-play games. Two protocol modes:
+///
+/// - **Search mode** (`searchless: false`, the default): drives Stockfish
+///   via `go nodes N` with MultiPV. Requires `nodes`, `multi_pv`,
+///   `opening_multi_pv`, `opening_plies`, `sample_plies`. `sample_score`
+///   must be omitted (only normalized cp is available from multipv parsing).
+///
+/// - **Searchless mode** (`searchless: true`): drives Stockfish via the
+///   patched binary's `evallegal` command — pure NNUE static eval per
+///   legal move, no search. Requires `sample_score` (deliberate cp/v
+///   choice). Forbids `nodes`, `multi_pv`, `opening_multi_pv`,
+///   `opening_plies`, `sample_plies` — those all describe how the search
+///   budget is partitioned and have no meaning here.
+///
+/// `name`, `n_games`, `temperature`, `store_legal_move_evals` apply to
+/// both modes. `validate()` enforces the field/mode invariants at config
+/// load time, so all downstream `unwrap()`s on the protocol-specific
+/// `Option` fields are safe within their respective code paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TierConfig {
     /// Human-readable name; used as a subdirectory.
     pub name: String,
 
-    /// Stockfish `go nodes N` budget per move.
-    pub nodes: u32,
-
     /// Total games to generate for this tier (across all workers).
     pub n_games: u64,
 
-    /// MultiPV used for plies in `[opening_plies, sample_plies)`.
-    pub multi_pv: u32,
+    /// Softmax temperature over the chosen score field. Scaling factor is
+    /// `100 * T` regardless of mode — so for cp this means "100 cp shifts
+    /// probability by an e-fold at T=1.0", and for raw v this is sharper
+    /// (raw v is ~3–5× larger than cp). `T <= 0` falls back to argmax.
+    pub temperature: f32,
+
+    /// When true, use the patched binary's `evallegal` protocol instead
+    /// of `go nodes N`.
+    #[serde(default)]
+    pub searchless: bool,
+
+    /// When true, persist the full Stockfish candidates list for every ply
+    /// alongside the played move. The parquet column is
+    /// `legal_move_evals: List<List<Struct{move_idx: i16, score_cp: i16, score_v: i16?}>>`,
+    /// indexed per game and per ply. Designed for distillation-style
+    /// training (KL loss vs the per-move softmax). Independent of
+    /// `searchless` — though the typical use case is `searchless=true`
+    /// + `store_legal_move_evals=true` for "tier 0" datasets.
+    #[serde(default)]
+    pub store_legal_move_evals: bool,
+
+    // === Searchless-mode only ===
+    /// Which per-move score the sampler softmaxes over. Required for
+    /// searchless tiers (no default — choosing cp vs v is a meaningful
+    /// decision worth ~10 Elo per the cp-vs-v tournament). Forbidden for
+    /// non-searchless tiers (multipv parsing only surfaces normalized cp,
+    /// raw v has nothing to refer to).
+    #[serde(default)]
+    pub sample_score: Option<SampleScore>,
+
+    /// Force a specific NNUE network for all evaluation (`auto` / `small`
+    /// / `large`). `None` (the default) leaves the engine's default in
+    /// place (`auto`, vanilla SF18 dynamic selection). Applies to both
+    /// search-mode and searchless tiers — vanilla SF18 picks small for
+    /// material-imbalanced positions and may re-evaluate with big, which
+    /// introduces position-dependent eval-source heterogeneity that's
+    /// awkward for ML use cases. `Large` is the natural pick for
+    /// distillation labelling (uniform high-quality teacher network).
+    ///
+    /// Requires the patched binary (vanilla SF18 doesn't recognize the
+    /// `NetSelection` UCI option and would silently ignore the setoption);
+    /// the preflight check in `main.rs` triggers whenever any tier sets
+    /// this field.
+    #[serde(default)]
+    pub net_selection: Option<NetSelection>,
+
+    // === Search-mode only ===
+    /// `go nodes N` per-move budget. Forbidden in searchless mode
+    /// (`evallegal` doesn't take a node budget).
+    #[serde(default)]
+    pub nodes: Option<u32>,
+
+    /// MultiPV used for plies in `[opening_plies, sample_plies)`. Forbidden
+    /// in searchless mode (`evallegal` returns every legal move; there's
+    /// no top-K cap). Could mislead future readers as "limit softmax to
+    /// top N" if accepted there.
+    #[serde(default)]
+    pub multi_pv: Option<u32>,
 
     /// MultiPV used for the very first plies; widens initial branching
-    /// without slowing the rest of the game. Set equal to `multi_pv` to
-    /// disable the per-ply schedule.
-    pub opening_multi_pv: u32,
+    /// without slowing the rest of the game. Forbidden in searchless mode
+    /// for the same reason as `multi_pv`.
+    #[serde(default)]
+    pub opening_multi_pv: Option<u32>,
 
-    /// Number of plies (from move 0) that use `opening_multi_pv`.
-    pub opening_plies: u32,
+    /// Number of plies (from move 0) that use `opening_multi_pv`. Forbidden
+    /// in searchless mode (no opening/main split when every ply enumerates
+    /// all legals).
+    #[serde(default)]
+    pub opening_plies: Option<u32>,
 
     /// First N plies use MultiPV+softmax; beyond N, take top-1 only.
-    /// Set to a very large number (e.g. 999) to keep softmax for the
-    /// whole game.
-    pub sample_plies: u32,
+    /// Forbidden in searchless mode (would silently misbehave: under
+    /// `evallegal` the `target_pv == 1` shortcut takes `candidates[0]`,
+    /// which is move-generation order, NOT the best move).
+    #[serde(default)]
+    pub sample_plies: Option<u32>,
+}
 
-    /// Softmax temperature over centipawn scores. Scale: 100cp ~ 1 pawn,
-    /// so temperature=1.0 means a 1-pawn gap shifts probability by an
-    /// e-fold. <=0 falls back to argmax (top-1).
-    pub temperature: f32,
+/// Which per-move score the sampler should softmax over. Only meaningful
+/// in searchless mode — the multipv path doesn't surface raw `v`, and
+/// validation rejects this field on non-searchless tiers.
+///
+/// JSON-renamed to lowercase (`"cp"` / `"v"`) so configs stay terse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SampleScore {
+    /// Normalized centipawns (`UCIEngine::to_cp`). Stable units across
+    /// game phases.
+    Cp,
+    /// Raw NNUE `Value`. Equivalent to using the network's policy logits
+    /// as the sampling distribution.
+    V,
+}
+
+/// Forces uniform use of one NNUE network across every evaluation, mapped
+/// to the patched binary's `NetSelection` UCI option (`auto` / `small` /
+/// `large`). See `TierConfig::net_selection` for usage.
+///
+/// JSON-renamed to lowercase (`"auto"` / `"small"` / `"large"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetSelection {
+    /// Vanilla SF18 dynamic selection — small net for large material
+    /// imbalances, big net otherwise, with optional re-evaluation.
+    Auto,
+    /// Always use the small NNUE network. Fast but lower quality.
+    Small,
+    /// Always use the big NNUE network. Slower but uniform high quality.
+    /// Recommended for distillation labelling.
+    Large,
+}
+
+impl NetSelection {
+    /// String form expected by the patched binary's UCI handler.
+    pub fn as_uci_str(self) -> &'static str {
+        match self {
+            NetSelection::Auto => "auto",
+            NetSelection::Small => "small",
+            NetSelection::Large => "large",
+        }
+    }
+}
+
+/// Enforce the search-mode / searchless-mode field invariants. The two
+/// modes use disjoint subsets of `TierConfig`'s protocol-specific fields;
+/// the rules below make the user's choice explicit at config-load time
+/// rather than letting it silently corrupt a tier mid-run.
+fn validate_protocol_fields(tier: &TierConfig) -> anyhow::Result<()> {
+    let name = &tier.name;
+    if tier.searchless {
+        // Searchless requires sample_score (deliberate cp/v pick), forbids
+        // every search-budget knob.
+        if tier.sample_score.is_none() {
+            anyhow::bail!(
+                "tier {name}: searchless=true requires sample_score (\"cp\" or \"v\"); \
+                 evallegal surfaces both per-move scores and the choice meaningfully \
+                 affects play strength (~10 Elo per the cp-vs-v tournament)"
+            );
+        }
+        for (field, present) in [
+            ("nodes", tier.nodes.is_some()),
+            ("multi_pv", tier.multi_pv.is_some()),
+            ("opening_multi_pv", tier.opening_multi_pv.is_some()),
+            ("opening_plies", tier.opening_plies.is_some()),
+            ("sample_plies", tier.sample_plies.is_some()),
+        ] {
+            if present {
+                anyhow::bail!(
+                    "tier {name}: searchless=true forbids {field}; evallegal evaluates \
+                     every legal move with no search and no MultiPV cap, so the field \
+                     would be silently ignored or misleading"
+                );
+            }
+        }
+    } else {
+        // Search mode requires every search-budget knob, forbids sample_score.
+        if tier.sample_score.is_some() {
+            anyhow::bail!(
+                "tier {name}: sample_score is only valid for searchless=true tiers; \
+                 the multipv parsing path only surfaces normalized cp (raw v requires \
+                 the patched binary's evallegal command)"
+            );
+        }
+        let nodes = tier.nodes.ok_or_else(|| anyhow::anyhow!(
+            "tier {name}: searchless=false requires nodes (the `go nodes N` budget)"
+        ))?;
+        if nodes == 0 {
+            anyhow::bail!("tier {name}: nodes must be >= 1 (or set searchless=true)");
+        }
+        let multi_pv = tier.multi_pv.ok_or_else(|| anyhow::anyhow!(
+            "tier {name}: searchless=false requires multi_pv"
+        ))?;
+        let opening_multi_pv = tier.opening_multi_pv.ok_or_else(|| anyhow::anyhow!(
+            "tier {name}: searchless=false requires opening_multi_pv"
+        ))?;
+        if multi_pv == 0 || opening_multi_pv == 0 {
+            anyhow::bail!("tier {name}: multi_pv values must be >= 1");
+        }
+        let opening_plies = tier.opening_plies.ok_or_else(|| anyhow::anyhow!(
+            "tier {name}: searchless=false requires opening_plies"
+        ))?;
+        let sample_plies = tier.sample_plies.ok_or_else(|| anyhow::anyhow!(
+            "tier {name}: searchless=false requires sample_plies"
+        ))?;
+        if opening_plies > sample_plies {
+            anyhow::bail!(
+                "tier {name}: opening_plies ({opening_plies}) must be <= sample_plies ({sample_plies})"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn default_max_ply() -> u32 {
@@ -96,11 +293,20 @@ fn default_shard_size_games() -> u32 {
 
 impl RunConfig {
     /// Load + validate a config from a JSON file.
+    ///
+    /// Path fields (`stockfish_path`, `output_dir`) are tilde-expanded
+    /// at load time — `~/sf-data` becomes `$HOME/sf-data` before any
+    /// downstream consumer sees the value. Doing this once at the
+    /// boundary prevents downstream callers (the CLI's preflight
+    /// `create_dir_all`, `print_plan`, the python sync orchestrator)
+    /// from each having to remember to expand it themselves.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-        let cfg: RunConfig = serde_json::from_slice(&bytes)
+        let mut cfg: RunConfig = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+        cfg.stockfish_path = expand_tilde(&cfg.stockfish_path);
+        cfg.output_dir = expand_tilde(&cfg.output_dir);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -155,20 +361,7 @@ impl RunConfig {
             if tier.n_games == 0 {
                 anyhow::bail!("tier {}: n_games must be > 0", tier.name);
             }
-            if tier.multi_pv == 0 || tier.opening_multi_pv == 0 {
-                anyhow::bail!("tier {}: multi_pv values must be >= 1", tier.name);
-            }
-            if tier.opening_plies > tier.sample_plies {
-                anyhow::bail!(
-                    "tier {}: opening_plies ({}) must be <= sample_plies ({})",
-                    tier.name,
-                    tier.opening_plies,
-                    tier.sample_plies,
-                );
-            }
-            if tier.nodes == 0 {
-                anyhow::bail!("tier {}: nodes must be >= 1", tier.name);
-            }
+            validate_protocol_fields(tier)?;
         }
         Ok(())
     }
@@ -266,20 +459,79 @@ mod tests {
             shard_size_games: 1000,
             tiers: vec![TierConfig {
                 name: "nodes_0001".into(),
-                nodes: 1,
                 n_games: 100,
-                multi_pv: 5,
-                opening_multi_pv: 20,
-                opening_plies: 1,
-                sample_plies: 999,
                 temperature: 1.0,
+                searchless: false,
+                store_legal_move_evals: false,
+                sample_score: None,
+                net_selection: None,
+                nodes: Some(1),
+                multi_pv: Some(5),
+                opening_multi_pv: Some(20),
+                opening_plies: Some(1),
+                sample_plies: Some(999),
             }],
+        }
+    }
+
+    /// Searchless-mode tier fixture, parallel to `minimal_config`. Used to
+    /// exercise the validation rules that apply to evallegal tiers.
+    fn searchless_tier(name: &str) -> TierConfig {
+        TierConfig {
+            name: name.into(),
+            n_games: 100,
+            temperature: 0.5,
+            searchless: true,
+            store_legal_move_evals: true,
+            sample_score: Some(SampleScore::V),
+            net_selection: None,
+            nodes: None,
+            multi_pv: None,
+            opening_multi_pv: None,
+            opening_plies: None,
+            sample_plies: None,
         }
     }
 
     #[test]
     fn validate_accepts_minimal_config() {
         minimal_config().validate().unwrap();
+    }
+
+    #[test]
+    fn load_expands_tilde_in_path_fields() {
+        // Pin the contract that `RunConfig::load` is the one place
+        // tilde expansion happens — every downstream consumer (CLI
+        // preflight, run_tier, print_plan, the Python orchestrator)
+        // assumes the path it sees is already absolute.
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("c.json");
+        let body = r#"{
+            "stockfish_path": "~/bin/stockfish",
+            "stockfish_version": "Stockfish",
+            "output_dir": "~/sf-data",
+            "master_seed": 1,
+            "n_workers": 1,
+            "max_ply": 16,
+            "stockfish_hash_mb": 1,
+            "shard_size_games": 4,
+            "tiers": [{
+                "name": "t",
+                "nodes": 1,
+                "n_games": 4,
+                "multi_pv": 1,
+                "opening_multi_pv": 1,
+                "opening_plies": 0,
+                "sample_plies": 1,
+                "temperature": 1.0
+            }]
+        }"#;
+        std::fs::File::create(&cfg_path).unwrap().write_all(body.as_bytes()).unwrap();
+        let cfg = RunConfig::load(&cfg_path).unwrap();
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(cfg.output_dir, PathBuf::from(&home).join("sf-data"));
+        assert_eq!(cfg.stockfish_path, PathBuf::from(&home).join("bin/stockfish"));
     }
 
     #[test]
@@ -299,8 +551,8 @@ mod tests {
     #[test]
     fn validate_rejects_opening_after_sample() {
         let mut c = minimal_config();
-        c.tiers[0].opening_plies = 50;
-        c.tiers[0].sample_plies = 10;
+        c.tiers[0].opening_plies = Some(50);
+        c.tiers[0].sample_plies = Some(10);
         assert!(c.validate().is_err());
     }
 
@@ -357,13 +609,17 @@ mod tests {
         let mut a = minimal_config();
         a.tiers.push(TierConfig {
             name: "second".into(),
-            nodes: 32,
             n_games: 50,
-            multi_pv: 5,
-            opening_multi_pv: 5,
-            opening_plies: 0,
-            sample_plies: 999,
             temperature: 1.0,
+            searchless: false,
+            store_legal_move_evals: false,
+            sample_score: None,
+            net_selection: None,
+            nodes: Some(32),
+            multi_pv: Some(5),
+            opening_multi_pv: Some(5),
+            opening_plies: Some(0),
+            sample_plies: Some(999),
         });
         let mut b = a.clone();
         // Change only tier 1.
@@ -421,11 +677,173 @@ mod tests {
     fn tier_fingerprint_golden() {
         let cfg = minimal_config();
         let actual = cfg.tier_fingerprint(0);
-        let expected = "aef0ee9a09ec2f8889d236deb8a821ee1d980645f1a2f708d4cf65a7573bf956";
+        // Updated when search-budget fields became Option<u32> and
+        // sample_score became Option<SampleScore> (intentional — the JSON
+        // emission for null fields differs from omitted fields, and the
+        // protocol-mode invariant means existing production tiers don't
+        // round-trip identically).
+        let expected = "a36dac69d63481353a7aa5bc1764ab910b022541bf97dd6c2f844870ff8e1491";
         assert_eq!(
             actual, expected,
             "tier_fingerprint changed for minimal_config — verify the change is intentional, then update the expected value"
         );
+    }
+
+    #[test]
+    fn tier_fingerprint_changes_with_sample_score() {
+        let mut a = searchless_tier("t");
+        let mut b = a.clone();
+        a.sample_score = Some(SampleScore::Cp);
+        b.sample_score = Some(SampleScore::V);
+        let mut cfg_a = minimal_config();
+        let mut cfg_b = minimal_config();
+        cfg_a.tiers = vec![a];
+        cfg_b.tiers = vec![b];
+        assert_ne!(cfg_a.tier_fingerprint(0), cfg_b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn validate_rejects_sample_score_on_search_tier() {
+        // sample_score on a non-searchless tier suggests a misunderstanding —
+        // multipv parsing only ever surfaces cp; raw v has no source.
+        let mut c = minimal_config();
+        c.tiers[0].sample_score = Some(SampleScore::Cp);
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("sample_score"),
+            "expected error to mention sample_score, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_searchless_without_sample_score() {
+        let mut c = minimal_config();
+        c.tiers[0] = searchless_tier("t");
+        c.tiers[0].sample_score = None;
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("sample_score"),
+            "expected error to mention sample_score, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_searchless_with_explicit_score() {
+        let mut c = minimal_config();
+        c.tiers[0] = searchless_tier("t");
+        c.tiers[0].sample_score = Some(SampleScore::V);
+        c.validate().unwrap();
+        c.tiers[0].sample_score = Some(SampleScore::Cp);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_searchless_with_search_budget_fields() {
+        for (label, mutator) in [
+            ("nodes", (|t: &mut TierConfig| t.nodes = Some(1)) as fn(&mut TierConfig)),
+            ("multi_pv", |t| t.multi_pv = Some(5)),
+            ("opening_multi_pv", |t| t.opening_multi_pv = Some(20)),
+            ("opening_plies", |t| t.opening_plies = Some(2)),
+            ("sample_plies", |t| t.sample_plies = Some(999)),
+        ] {
+            let mut c = minimal_config();
+            c.tiers[0] = searchless_tier("t");
+            mutator(&mut c.tiers[0]);
+            let err = c.validate().unwrap_err();
+            assert!(
+                err.to_string().contains(label),
+                "expected error to mention {label}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_search_tier_missing_required_fields() {
+        for (label, mutator) in [
+            ("nodes", (|t: &mut TierConfig| t.nodes = None) as fn(&mut TierConfig)),
+            ("multi_pv", |t| t.multi_pv = None),
+            ("opening_multi_pv", |t| t.opening_multi_pv = None),
+            ("opening_plies", |t| t.opening_plies = None),
+            ("sample_plies", |t| t.sample_plies = None),
+        ] {
+            let mut c = minimal_config();
+            mutator(&mut c.tiers[0]);
+            let err = c.validate().unwrap_err();
+            assert!(
+                err.to_string().contains(label),
+                "expected error to mention {label}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_fingerprint_changes_with_net_selection() {
+        // Different network choice ⇒ different evals ⇒ different games.
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.tiers[0].net_selection = None;
+        b.tiers[0].net_selection = Some(NetSelection::Large);
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+        // And small vs large differ too.
+        a.tiers[0].net_selection = Some(NetSelection::Small);
+        b.tiers[0].net_selection = Some(NetSelection::Large);
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn net_selection_serde_round_trip() {
+        let json = r#"{
+            "stockfish_path": "/usr/bin/stockfish",
+            "stockfish_version": "Stockfish 18",
+            "output_dir": "out",
+            "master_seed": 42,
+            "n_workers": 4,
+            "max_ply": 512,
+            "stockfish_hash_mb": 16,
+            "shard_size_games": 1000,
+            "tiers": [{
+                "name": "t",
+                "n_games": 100,
+                "temperature": 1.0,
+                "searchless": true,
+                "store_legal_move_evals": true,
+                "sample_score": "v",
+                "net_selection": "large"
+            }]
+        }"#;
+        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.tiers[0].net_selection, Some(NetSelection::Large));
+        assert_eq!(cfg.tiers[0].net_selection.unwrap().as_uci_str(), "large");
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn search_tier_omitting_sample_score_round_trips() {
+        // Existing search-tier configs (which never set sample_score)
+        // continue to load and validate.
+        let json = r#"{
+            "stockfish_path": "/usr/bin/stockfish",
+            "stockfish_version": "Stockfish 18",
+            "output_dir": "out",
+            "master_seed": 42,
+            "n_workers": 4,
+            "max_ply": 512,
+            "stockfish_hash_mb": 16,
+            "shard_size_games": 1000,
+            "tiers": [{
+                "name": "t",
+                "nodes": 1,
+                "n_games": 100,
+                "multi_pv": 5,
+                "opening_multi_pv": 20,
+                "opening_plies": 1,
+                "sample_plies": 999,
+                "temperature": 1.0
+            }]
+        }"#;
+        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.tiers[0].sample_score, None);
+        cfg.validate().unwrap();
     }
 
     #[test]
