@@ -14,7 +14,8 @@
       "temperature": 0.5,
       "searchless": true,
       "store_legal_move_evals": true,
-      "sample_score": "v"
+      "sample_score": "v",
+      "net_selection": "large"
     },
     {
       "name": "nodes_0001",

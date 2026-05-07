@@ -180,19 +180,25 @@ struct Totals {
     shards: u64,
 }
 
-/// If any tier has `searchless: true`, spawn one throwaway Stockfish
-/// process and verify it recognizes the `evallegal` UCI command (the
-/// marker added by `patches/0001-evallegal-uci-extension.patch`).
+/// If any tier sets `searchless: true` or `net_selection: ...`, spawn one
+/// throwaway Stockfish process and verify it recognizes the patched
+/// binary's surface area (`evallegal` command + `NetSelection` UCI option).
 ///
-/// Vanilla Stockfish responds with `Unknown command: 'evallegal'` and
-/// would have no way to score the position — fail loudly at startup
-/// rather than mid-run.
+/// Vanilla Stockfish responds with `Unknown command: 'evallegal'` to the
+/// probe and silently ignores unknown setoption names — both are silent
+/// failures that would corrupt a tier mid-run. Fail loudly at startup
+/// instead.
 fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
-    let needs_patched: Vec<&str> = cfg
+    let needs_patched: Vec<String> = cfg
         .tiers
         .iter()
-        .filter(|t| t.searchless)
-        .map(|t| t.name.as_str())
+        .filter(|t| t.searchless || t.net_selection.is_some())
+        .map(|t| {
+            let mut why: Vec<&str> = Vec::new();
+            if t.searchless { why.push("searchless"); }
+            if t.net_selection.is_some() { why.push("net_selection"); }
+            format!("{} ({})", t.name, why.join("+"))
+        })
         .collect();
     if needs_patched.is_empty() {
         return Ok(());
@@ -215,8 +221,8 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
     );
     if !probe.is_patched {
         anyhow::bail!(
-            "tier(s) {:?} require `searchless: true`, but {} does not recognize the \
-             `evallegal` UCI command that marks the patched binary. Build it via \
+            "tier(s) {:?} require the patched binary, but {} does not recognize the \
+             `evallegal` UCI command that marks it. Build it via \
              `bash stockfish-datagen/scripts/build_patched_stockfish.sh` and point \
              `stockfish_path` at the resulting `stockfish-datagen/stockfish-patched`.",
             needs_patched, cfg.stockfish_path.display(),
@@ -242,13 +248,16 @@ fn print_plan(cfg: &RunConfig) {
         let max_per_worker = split.iter().copied().max().unwrap_or(0);
         let total_shards =
             split.iter().map(|n| n.div_ceil(cfg.shard_size_games as u64)).sum::<u64>();
+        let net = tier.net_selection
+            .map(|n| format!(" net={:?}", n))
+            .unwrap_or_default();
         if tier.searchless {
             // Searchless tier: no nodes / multi_pv / opening_* / sample_plies
             // — those are the search-mode knobs. Show what actually applies.
             let score = tier.sample_score.expect("validated: searchless has sample_score");
             println!(
                 "  [{i}] {name:<14} EVALLEGAL  games={n_games:>10} \
-                 sample_score={score:?} temp={temp:.2}{store}",
+                 sample_score={score:?} temp={temp:.2}{store}{net}",
                 name = tier.name,
                 n_games = tier.n_games,
                 temp = tier.temperature,
@@ -258,7 +267,7 @@ fn print_plan(cfg: &RunConfig) {
             println!(
                 "  [{i}] {name:<14} nodes={nodes:>4} games={n_games:>10} \
                  multi_pv={mpv:>2} opening={ompv:>2}/{op_plies} \
-                 sample_plies={spl:<3} temp={temp:.2}",
+                 sample_plies={spl:<3} temp={temp:.2}{net}",
                 name = tier.name,
                 nodes = tier.nodes.expect("validated"),
                 n_games = tier.n_games,

@@ -116,6 +116,22 @@ pub struct TierConfig {
     #[serde(default)]
     pub sample_score: Option<SampleScore>,
 
+    /// Force a specific NNUE network for all evaluation (`auto` / `small`
+    /// / `large`). `None` (the default) leaves the engine's default in
+    /// place (`auto`, vanilla SF18 dynamic selection). Applies to both
+    /// search-mode and searchless tiers — vanilla SF18 picks small for
+    /// material-imbalanced positions and may re-evaluate with big, which
+    /// introduces position-dependent eval-source heterogeneity that's
+    /// awkward for ML use cases. `Large` is the natural pick for
+    /// distillation labelling (uniform high-quality teacher network).
+    ///
+    /// Requires the patched binary (vanilla SF18 doesn't recognize the
+    /// `NetSelection` UCI option and would silently ignore the setoption);
+    /// the preflight check in `main.rs` triggers whenever any tier sets
+    /// this field.
+    #[serde(default)]
+    pub net_selection: Option<NetSelection>,
+
     // === Search-mode only ===
     /// `go nodes N` per-move budget. Forbidden in searchless mode
     /// (`evallegal` doesn't take a node budget).
@@ -163,6 +179,35 @@ pub enum SampleScore {
     /// Raw NNUE `Value`. Equivalent to using the network's policy logits
     /// as the sampling distribution.
     V,
+}
+
+/// Forces uniform use of one NNUE network across every evaluation, mapped
+/// to the patched binary's `NetSelection` UCI option (`auto` / `small` /
+/// `large`). See `TierConfig::net_selection` for usage.
+///
+/// JSON-renamed to lowercase (`"auto"` / `"small"` / `"large"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetSelection {
+    /// Vanilla SF18 dynamic selection — small net for large material
+    /// imbalances, big net otherwise, with optional re-evaluation.
+    Auto,
+    /// Always use the small NNUE network. Fast but lower quality.
+    Small,
+    /// Always use the big NNUE network. Slower but uniform high quality.
+    /// Recommended for distillation labelling.
+    Large,
+}
+
+impl NetSelection {
+    /// String form expected by the patched binary's UCI handler.
+    pub fn as_uci_str(self) -> &'static str {
+        match self {
+            NetSelection::Auto => "auto",
+            NetSelection::Small => "small",
+            NetSelection::Large => "large",
+        }
+    }
 }
 
 /// Enforce the search-mode / searchless-mode field invariants. The two
@@ -418,6 +463,7 @@ mod tests {
                 searchless: false,
                 store_legal_move_evals: false,
                 sample_score: None,
+                net_selection: None,
                 nodes: Some(1),
                 multi_pv: Some(5),
                 opening_multi_pv: Some(20),
@@ -437,6 +483,7 @@ mod tests {
             searchless: true,
             store_legal_move_evals: true,
             sample_score: Some(SampleScore::V),
+            net_selection: None,
             nodes: None,
             multi_pv: None,
             opening_multi_pv: None,
@@ -566,6 +613,7 @@ mod tests {
             searchless: false,
             store_legal_move_evals: false,
             sample_score: None,
+            net_selection: None,
             nodes: Some(32),
             multi_pv: Some(5),
             opening_multi_pv: Some(5),
@@ -633,7 +681,7 @@ mod tests {
         // emission for null fields differs from omitted fields, and the
         // protocol-mode invariant means existing production tiers don't
         // round-trip identically).
-        let expected = "83db4504d1064bbb62ce7da18888a5434bd9e013fc3ee8f371bae7ff4ac8e050";
+        let expected = "a36dac69d63481353a7aa5bc1764ab910b022541bf97dd6c2f844870ff8e1491";
         assert_eq!(
             actual, expected,
             "tier_fingerprint changed for minimal_config — verify the change is intentional, then update the expected value"
@@ -725,6 +773,47 @@ mod tests {
                 "expected error to mention {label}, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn tier_fingerprint_changes_with_net_selection() {
+        // Different network choice ⇒ different evals ⇒ different games.
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.tiers[0].net_selection = None;
+        b.tiers[0].net_selection = Some(NetSelection::Large);
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+        // And small vs large differ too.
+        a.tiers[0].net_selection = Some(NetSelection::Small);
+        b.tiers[0].net_selection = Some(NetSelection::Large);
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn net_selection_serde_round_trip() {
+        let json = r#"{
+            "stockfish_path": "/usr/bin/stockfish",
+            "stockfish_version": "Stockfish 18",
+            "output_dir": "out",
+            "master_seed": 42,
+            "n_workers": 4,
+            "max_ply": 512,
+            "stockfish_hash_mb": 16,
+            "shard_size_games": 1000,
+            "tiers": [{
+                "name": "t",
+                "n_games": 100,
+                "temperature": 1.0,
+                "searchless": true,
+                "store_legal_move_evals": true,
+                "sample_score": "v",
+                "net_selection": "large"
+            }]
+        }"#;
+        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.tiers[0].net_selection, Some(NetSelection::Large));
+        assert_eq!(cfg.tiers[0].net_selection.unwrap().as_uci_str(), "large");
+        cfg.validate().unwrap();
     }
 
     #[test]

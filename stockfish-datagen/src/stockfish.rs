@@ -246,6 +246,20 @@ impl StockfishProcess {
         self.wait_for_token("readyok")
     }
 
+    /// Set the patched binary's `NetSelection` UCI option. Vanilla SF18
+    /// silently ignores unknown setoption names, so calling this on an
+    /// unpatched binary is a no-op rather than an error — the caller is
+    /// expected to have run the preflight check (`is_patched`) before
+    /// calling this on a tier that meaningfully needs the override.
+    pub fn set_net_selection(
+        &mut self,
+        choice: crate::config::NetSelection,
+    ) -> Result<(), StockfishError> {
+        self.send(&format!("setoption name NetSelection value {}", choice.as_uci_str()))?;
+        self.send("isready")?;
+        self.wait_for_token("readyok")
+    }
+
     /// Tell Stockfish a new game is starting; resets internal heuristics
     /// and our incremental `position_cmd` buffer.
     pub fn new_game(&mut self) -> Result<(), StockfishError> {

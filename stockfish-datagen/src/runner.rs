@@ -416,6 +416,14 @@ fn run_worker(
     // Best-effort: a failure here just means the OS scheduler decides
     // where the child runs, which is the pre-pinning baseline.
     affinity::pin_pid(sf.child_pid(), worker_id);
+    // Apply NetSelection if the tier requested an override. The preflight
+    // check in main.rs verified the binary is patched whenever any tier
+    // sets this field, so the setoption is guaranteed to take effect here
+    // (vs being silently ignored by a vanilla SF18).
+    if let Some(net) = tier.net_selection {
+        sf.set_net_selection(net)
+            .with_context(|| format!("worker {worker_id}: setting NetSelection={:?}", net))?;
+    }
     let stockfish_id_name = sf.id_name.clone();
 
     // On resume we always start a *new* shard at start_chunk — the prior
@@ -594,6 +602,7 @@ mod tests {
                 searchless: false,
                 store_legal_move_evals: false,
                 sample_score: None,
+                net_selection: None,
                 nodes: Some(1),
                 multi_pv: Some(5),
                 opening_multi_pv: Some(20),
@@ -756,6 +765,7 @@ mod tests {
             searchless: false,
             store_legal_move_evals: false,
             sample_score: None,
+            net_selection: None,
             nodes: Some(1),
             multi_pv: Some(5),
             opening_multi_pv: Some(20),
