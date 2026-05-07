@@ -42,6 +42,13 @@ the UCI handshake:
   value large` would no-op while shard fingerprints claimed the
   requested choice. The preflight rejects this combination loudly.
 
+The `tournament` subcommand has a parallel
+`preflight_check_tournament_binary` that probes only for `evallegal`
+(tournament workers always drive that protocol regardless of which
+`sample_score` either side picks; no per-side `net_selection` exists),
+so a `sf18-v0.1.0` fork build is sufficient there. Either way, an
+unpatched `stockfish_path` aborts startup before any worker spawns.
+
 ## Output format (reference)
 
 ```

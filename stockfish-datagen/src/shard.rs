@@ -82,13 +82,17 @@ pub struct GameRow {
     pub opening_multi_pv: Option<i32>,
     pub opening_plies: Option<i32>,
     pub sample_plies: Option<i32>,
-    /// Searchless-mode-only metadata. `None` for non-searchless tiers.
-    /// Stored per-row so a shard moved out of its directory context
-    /// remains fully attributable — `sample_score` and `net_selection`
-    /// both meaningfully change the games that get generated, and
-    /// without them in the row a moved shard couldn't be distinguished
-    /// from a cp-vs-v / auto-vs-large counterpart at the same temperature.
+    /// Searchless-only: `"cp"` or `"v"`, the score field the sampler
+    /// softmaxed over. `None` for non-searchless rows (the multipv parsing
+    /// path only surfaces cp). Persisted per-row so a shard moved out of
+    /// its tier directory remains attributable.
     pub sample_score: Option<String>,
+    /// Either tier mode: the UCI `NetSelection` value (`"auto"`, `"small"`,
+    /// `"large"`) the engine was configured to use. `None` when the tier
+    /// left the engine on its default (`auto` for the patched binary,
+    /// vanilla SF dynamic for unpatched). Both search-mode and searchless
+    /// tiers may set this; `sample_score IS NULL` does NOT imply
+    /// `net_selection IS NULL`.
     pub net_selection: Option<String>,
     pub temperature: f32,
     pub worker_id: i16,
@@ -135,9 +139,10 @@ pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
         Field::new("opening_multi_pv", DataType::Int32, true),
         Field::new("opening_plies", DataType::Int32, true),
         Field::new("sample_plies", DataType::Int32, true),
-        // Searchless-mode-only metadata; nullable so non-searchless rows
-        // write SQL-style nulls. Provenance: a shard moved out of its
-        // directory context remains attributable.
+        // sample_score: searchless-only, "cp"|"v"; null on non-searchless rows.
+        // net_selection: any tier may set it ("auto"|"small"|"large"); null
+        // when the tier left the engine on its default. Persisted per-row so
+        // a shard moved out of its directory context remains attributable.
         Field::new("sample_score", DataType::Utf8, true),
         Field::new("net_selection", DataType::Utf8, true),
         Field::new("temperature", DataType::Float32, false),

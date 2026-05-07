@@ -182,13 +182,14 @@ struct Totals {
 }
 
 /// Tournament-side counterpart to `preflight_check_patched_binary`.
-/// Tournaments always drive the patched binary (`GoBudget::EvalLegal`),
-/// and any side using `sample_score: V` requires it too — so the surface
-/// area to check is fixed: the binary must recognize `evallegal`, and if
-/// either side requested an explicit-V sampling, NetSelection (which only
-/// the v0.2.0+ fork advertises) is also required for the per-side
-/// configuration to be meaningful end-to-end. Spawn one throwaway probe;
-/// fail fast before spawning N tournament workers against a vanilla SF.
+/// Tournaments always drive the patched binary's `evallegal` command
+/// (`GoBudget::EvalLegal`), so the only requirement to check is that the
+/// binary recognizes that command. NetSelection is irrelevant here —
+/// tournament workers don't apply per-side `net_selection` overrides
+/// (`TournamentSide` has no such field), so a `sf18-v0.1.0` fork build
+/// (evallegal but no NetSelection) is sufficient. Spawn one throwaway
+/// probe; fail fast before spawning N tournament workers against a
+/// vanilla SF.
 fn preflight_check_tournament_binary(cfg: &TournamentConfig) -> anyhow::Result<()> {
     let probe = StockfishProcess::spawn(
         &cfg.stockfish_path,

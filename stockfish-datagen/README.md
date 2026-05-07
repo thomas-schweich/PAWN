@@ -25,7 +25,10 @@ cargo run --release -p stockfish-datagen -- run \
 
 # Play two SampleScore × temperature configs against each other and
 # report W/D/L + Elo with a Wilson 95% CI. Always uses the patched
-# binary's evallegal protocol.
+# binary's `evallegal` protocol — point `stockfish_path` at the binary
+# built by `stockfish-datagen/scripts/build_patched_stockfish.sh`. A
+# tournament-side preflight aborts before any worker spawns if the
+# binary doesn't recognize `evallegal`.
 cargo run --release -p stockfish-datagen -- tournament \
   --config stockfish-datagen/examples/tournament_cp_vs_v_T0.json
 ```
@@ -38,11 +41,13 @@ Every row in the output carries a `game_seed` (`UInt64`). Combined with
 that seed is sufficient to deterministically replay the exact game.
 
 For **searchless tiers** (`searchless: true`), the per-row search-budget
-fields above are all `null` and the additional per-tier knobs
-`sample_score` and `net_selection` are required to replay — those live
-on `TierConfig` (the run config JSON), not in the parquet schema, so
-keep the run config JSON alongside the parquet shards if you want
-per-game replay for searchless data.
+fields above are all `null`. The two searchless-relevant knobs —
+`sample_score` (`"cp"` / `"v"`) and `net_selection` (`"auto"` / `"small"`
+/ `"large"`) — are persisted per-row as nullable string columns
+(see the schema table below), so a moved shard remains fully
+attributable without the run-config JSON. `net_selection` is also
+populated for non-searchless tiers that pinned a network; only
+`sample_score` is searchless-only.
 
 The version pin is enforced at startup: the config's
 `stockfish_version` is matched at a word boundary against the
@@ -140,6 +145,8 @@ tier-state's fingerprint.
 | `opening_multi_pv`  | `Int32?`        | search-mode-only; null on searchless tiers |
 | `opening_plies`     | `Int32?`        | search-mode-only; null on searchless tiers |
 | `sample_plies`      | `Int32?`        | search-mode-only; null on searchless tiers |
+| `sample_score`      | `Utf8?`         | searchless-only: `"cp"` or `"v"`; null otherwise |
+| `net_selection`     | `Utf8?`         | either tier mode: `"auto"` / `"small"` / `"large"`; null when the tier left the engine on its default |
 | `temperature`       | `Float32`       | per-row, from tier config               |
 | `worker_id`         | `Int16`         | which worker produced the row           |
 | `game_seed`         | `UInt64`        | per-game seed (reproduction key)        |

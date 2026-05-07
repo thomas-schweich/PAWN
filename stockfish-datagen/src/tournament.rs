@@ -84,6 +84,13 @@ impl TournamentConfig {
         if self.n_workers == 0 { anyhow::bail!("n_workers must be > 0"); }
         if self.n_pairs == 0 { anyhow::bail!("n_pairs must be > 0"); }
         if self.max_ply == 0 { anyhow::bail!("max_ply must be > 0"); }
+        // Same as RunConfig: Stockfish silently ignores `setoption Hash 0`
+        // and falls back to its built-in default, so the configured value
+        // would no longer reflect what's actually in use, breaking the
+        // fingerprint's "this matches the running run" contract.
+        if self.stockfish_hash_mb == 0 {
+            anyhow::bail!("stockfish_hash_mb must be > 0");
+        }
         // `max_ply` is the absolute cap on total plies (matches play_game).
         // `opening_plies` consumes plies from that budget, so configs with
         // `opening_plies >= max_ply` would skip the play loop entirely and
@@ -508,5 +515,16 @@ mod tests {
         let cfg = minimal_tournament_config();
         // 4 < 64, the default minimal-config combo.
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_zero_stockfish_hash_mb() {
+        let mut cfg = minimal_tournament_config();
+        cfg.stockfish_hash_mb = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("stockfish_hash_mb"),
+            "expected error to mention stockfish_hash_mb, got: {err}"
+        );
     }
 }
