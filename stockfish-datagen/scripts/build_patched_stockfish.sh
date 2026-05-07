@@ -25,7 +25,14 @@ ARCH="${1:-x86-64-avx2}"
 # `NetSelection=auto` (the default), every other command is bit-identical
 # to vanilla SF18.
 SF_REPO="https://github.com/thomas-schweich/stockfish-ml-extensions.git"
-SF_TAG="sf18-v0.2.0"
+# Pinning to commit SHA, not tag. Lightweight tags can be force-moved on
+# the remote and a `git fetch` against a stale local clone will silently
+# leave the local tag pointing at the old commit (fetch never moves an
+# existing local tag without --force). Pinning to SHA matches the
+# Dockerfile's pin and guarantees byte-identical builds across machines.
+# This SHA is the commit annotated tag `sf18-v0.2.0` currently points at;
+# bump together if/when the tag advances.
+SF_COMMIT="777b88071fa00decaed2d1d6b1d4b2031bacb428"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SF_DIR="$ROOT_DIR/upstream-stockfish"
 OUT_BIN="$ROOT_DIR/stockfish-patched"
@@ -36,9 +43,9 @@ if [ ! -d "$SF_DIR" ]; then
 fi
 
 cd "$SF_DIR"
-git fetch --quiet --tags origin
-git checkout --quiet "$SF_TAG"
-git reset --hard --quiet "$SF_TAG"
+git fetch --quiet origin
+git checkout --quiet "$SF_COMMIT"
+git reset --hard --quiet "$SF_COMMIT"
 
 cd src
 echo "Building Stockfish ($ARCH)..."

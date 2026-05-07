@@ -395,8 +395,6 @@ fn run_worker(
     // 23% kernel time and 537K ctx switches/sec; pinning addresses
     // exactly that thrashing. At 128 threads with NUMA the upside
     // grows. Linux-only — `set_for_current` no-ops on macOS.
-    affinity::pin_current_thread(worker_id);
-
     let budget = if tier.searchless {
         crate::stockfish::GoBudget::EvalLegal
     } else {
@@ -412,10 +410,10 @@ fn run_worker(
         budget,
     )
     .with_context(|| format!("spawning stockfish for worker {worker_id}"))?;
-    // Pin the spawned Stockfish to the same core as this worker.
-    // Best-effort: a failure here just means the OS scheduler decides
-    // where the child runs, which is the pre-pinning baseline.
-    affinity::pin_pid(sf.child_pid(), worker_id);
+    // Pin worker thread + Stockfish child to the SAME core via a single
+    // get_core_ids() call. A separate pin-thread-then-pin-pid pair would
+    // race with cgroup cpuset mutation in the milliseconds between calls.
+    affinity::pin_pair(sf.child_pid(), worker_id);
     // Apply NetSelection if the tier requested an override. The preflight
     // check in main.rs verified the binary is patched whenever any tier
     // sets this field, so the setoption is guaranteed to take effect here

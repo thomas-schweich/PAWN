@@ -134,6 +134,15 @@ pub struct StockfishProcess {
     /// Stockfish (which would emit `Unknown command: 'evallegal'` and have no
     /// way to score the position).
     pub is_patched: bool,
+    /// True iff the binary advertised `option name NetSelection` during the
+    /// UCI handshake — the marker for fork tag `sf18-v0.2.0` or later. Used
+    /// by preflight to reject configs that set `net_selection: Some(...)`
+    /// against a binary that has `evallegal` (e.g. an older `sf18-v0.1.0`
+    /// fork build) but not `NetSelection`. Without this distinction a stale
+    /// patched binary would silently ignore the `setoption name NetSelection
+    /// ...` and use the engine's default network — the shard fingerprint
+    /// would say `large` while the engine picked dynamically.
+    pub has_net_selection: bool,
 }
 
 impl Drop for StockfishProcess {
@@ -196,6 +205,7 @@ impl StockfishProcess {
             budget,
             id_name: String::new(),
             is_patched: false,
+            has_net_selection: false,
         };
 
         sf.send("uci")?;
@@ -507,6 +517,15 @@ impl StockfishProcess {
             let line = self.line_buf.trim_end();
             if let Some(rest) = line.strip_prefix("id name ") {
                 self.id_name = rest.to_string();
+            }
+            // The fork's NetSelection is a UCI combo option advertised in
+            // the handshake (`option name NetSelection type combo default
+            // auto var auto var small var large`). Capture its presence so
+            // preflight can distinguish "patched, has evallegal but lacks
+            // NetSelection" (older fork tags) from "fully-featured patched
+            // binary".
+            if line.starts_with("option name NetSelection ") {
+                self.has_net_selection = true;
             }
             if line.starts_with("uciok") {
                 break;

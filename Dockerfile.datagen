@@ -78,17 +78,27 @@ RUN curl -fsSL "https://github.com/tmux/tmux/releases/download/${TMUX_VERSION}/t
 # command or the `NetSelection` UCI option, so the configs that use
 # either would abort at preflight if the runtime image only shipped
 # vanilla SF. This stage builds the patched binary at the pinned fork
-# tag and the runtime stage copies it in below at the relative path
+# commit and the runtime stage copies it in below at the relative path
 # the bundled example configs reference (`stockfish-datagen/stockfish-patched`,
 # resolved from `WORKDIR /opt/datagen`).
-FROM ubuntu:24.04 AS sf-fork-build
+#
+# Two parallel "build-1 / build-0" stages so `--build-arg INCLUDE_STOCKFISH=0`
+# cleanly skips the network clone + C++ compile (the documented sanity-build
+# path). Docker resolves `COPY --from=sf-fork-build-${INCLUDE_STOCKFISH}` at
+# build time; only the chosen stage is actually executed.
+FROM ubuntu:24.04 AS sf-fork-build-1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 ARG SF_FORK_REPO=https://github.com/thomas-schweich/stockfish-ml-extensions.git
-ARG SF_FORK_TAG=sf18-v0.2.0
+# Pin to commit SHA, not just tag. Lightweight git tags can be force-moved
+# on the remote and a `git clone --branch <tag>` would silently pick up the
+# new commit. The annotated tag `sf18-v0.2.0` currently points at this
+# commit; we pin to the SHA so a future tag move (accidental or otherwise)
+# fails the build loudly instead of silently changing the binary.
+ARG SF_FORK_COMMIT=777b88071fa00decaed2d1d6b1d4b2031bacb428
 # AVX2 is the lowest-common-denominator microarch we target; vanilla SF18
 # AVX2 vs AVX-512 produce bit-exact identical NNUE evals (int8 dot products
 # are vector-width-invariant), and the patched binary inherits that — so
@@ -97,10 +107,21 @@ ARG SF_FORK_TAG=sf18-v0.2.0
 ARG SF_PATCHED_ARCH=x86-64-avx2
 
 WORKDIR /build
-RUN git clone --depth 1 --branch "$SF_FORK_TAG" "$SF_FORK_REPO" sf-fork \
+RUN git clone "$SF_FORK_REPO" sf-fork \
+    && git -C sf-fork checkout --quiet "$SF_FORK_COMMIT" \
     && cd sf-fork/src \
     && make -j"$(nproc)" build ARCH="$SF_PATCHED_ARCH" \
     && strip stockfish
+
+# Disabled-build counterpart: produces a stub binary at the same path so
+# the runtime stage's `COPY --from=sf-fork-build-0 ...` succeeds. The stub
+# exits with a clear error if anything ever invokes it, so an accidental
+# attempt to use a searchless tier from an INCLUDE_STOCKFISH=0 image fails
+# loudly rather than mysteriously.
+FROM ubuntu:24.04 AS sf-fork-build-0
+RUN mkdir -p /build/sf-fork/src \
+    && printf '#!/bin/sh\necho "patched stockfish not built (image built with INCLUDE_STOCKFISH=0); searchless / net_selection tiers cannot run" >&2\nexit 127\n' > /build/sf-fork/src/stockfish \
+    && chmod +x /build/sf-fork/src/stockfish
 
 # ── Build the Rust stockfish-datagen binary in a builder stage ────────
 # Multi-stage so the rustup toolchain (~1GB) and the build system
@@ -248,20 +269,33 @@ COPY --from=sfd-builder /build/target/release/stockfish-datagen /usr/local/bin/s
 # /opt/datagen). The configs work identically on a developer checkout
 # (where `bash stockfish-datagen/scripts/build_patched_stockfish.sh`
 # drops the binary at the same path) and on a pod.
-RUN mkdir -p /opt/datagen/stockfish-datagen
-COPY --from=sf-fork-build /build/sf-fork/src/stockfish /opt/datagen/stockfish-datagen/stockfish-patched
+#
+# `COPY --from=sf-fork-build-${INCLUDE_STOCKFISH}` selects the real-build
+# stage at INCLUDE_STOCKFISH=1 (default) or the stub stage at 0, so a
+# sanity build with `--build-arg INCLUDE_STOCKFISH=0` skips both the
+# vanilla downloads above AND the fork's network clone + C++ compile.
+COPY --from=sf-fork-build-${INCLUDE_STOCKFISH} /build/sf-fork/src/stockfish /opt/datagen/stockfish-datagen/stockfish-patched
 RUN chmod +x /opt/datagen/stockfish-datagen/stockfish-patched
 
 # Example configs, so a pod can run with --config /opt/datagen/examples/...
 # without needing the source tree mounted.
 COPY stockfish-datagen/examples /opt/datagen/examples
 
-# Smoke-test all three binaries are wired up correctly.
-RUN stockfish-datagen --help 2>&1 | head -1 \
+# Smoke-test the runtime image: rust binary launches (success status is
+# the smoke), HF library imports, and the patched stockfish's `evallegal`
+# command produces the expected triplet shape on the start position. The
+# triplet check is skipped when INCLUDE_STOCKFISH=0 because the stub
+# binary above intentionally errors. The stockfish-datagen check uses
+# `> /dev/null` instead of `| head -1` so a missing or crashing binary
+# fails the build (`| head -1` always returns 0, masking failures).
+RUN stockfish-datagen --help > /dev/null \
     && python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)" \
-    && printf 'evallegal\nquit\n' | /opt/datagen/stockfish-datagen/stockfish-patched 2>/dev/null \
-        | grep -q '^info string evallegal ' \
-        || (echo "ERROR: patched stockfish does not recognize evallegal" >&2; exit 1)
+    && if [ "$INCLUDE_STOCKFISH" = "1" ]; then \
+        out=$(printf 'position startpos\nevallegal\nquit\n' \
+            | /opt/datagen/stockfish-datagen/stockfish-patched 2>/dev/null) ; \
+        echo "$out" | grep -q '^info string evallegal none a2a3 ' \
+            || (echo "ERROR: patched stockfish missing or malformed evallegal output" >&2; exit 1) ; \
+    fi
 
 # Dispatcher entrypoint:
 #   - if no args, default to the HF-sync orchestrator iff DATAGEN_HF_REPO

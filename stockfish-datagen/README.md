@@ -328,7 +328,8 @@ CLI flags worth knowing:
 - `--watcher-drain-timeout-hours <hours>` — after the rust binary exits,
   wait up to this many hours for the watcher to flush any pending shard
   uploads before exiting. Default 4 hours. If the timeout fires with
-  uploads still pending, exit code is `4`; the local shards stay on
+  uploads still pending, exit code is `4` (or the rust binary's non-zero
+  `rc` if that also failed; rc takes precedence). Local shards stay on
   disk and the next run's primer picks up where this one left off.
 - `--log-level {DEBUG,INFO,WARNING,ERROR}` — default INFO.
 

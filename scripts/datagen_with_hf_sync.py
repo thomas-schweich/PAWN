@@ -451,7 +451,10 @@ def main() -> int:
         whoami = api.whoami()
         LOG.info("authenticated to HuggingFace as %s", whoami.get("name", "<unknown>"))
     except HfHubHTTPError as e:
-        status = e.response.status_code
+        # Same defensive guard as `_upload_one`: `e.response` is documented
+        # always-present on HfHubHTTPError but typed Optional.
+        response = getattr(e, "response", None)
+        status = response.status_code if response is not None else 0
         if status == 401:
             LOG.error(
                 "FATAL: HF token is set but rejected by HuggingFace (HTTP 401 "

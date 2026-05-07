@@ -219,6 +219,10 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
         "stockfish patched (evallegal command): {}",
         if probe.is_patched { "yes" } else { "NO" },
     );
+    eprintln!(
+        "stockfish patched (NetSelection option): {}",
+        if probe.has_net_selection { "yes" } else { "NO" },
+    );
     if !probe.is_patched {
         anyhow::bail!(
             "tier(s) {:?} require the patched binary, but {} does not recognize the \
@@ -226,6 +230,30 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
              `bash stockfish-datagen/scripts/build_patched_stockfish.sh` and point \
              `stockfish_path` at the resulting `stockfish-datagen/stockfish-patched`.",
             needs_patched, cfg.stockfish_path.display(),
+        );
+    }
+    // Separate check: any tier that sets `net_selection` needs the binary
+    // to ALSO advertise the NetSelection UCI option. Older fork builds
+    // (e.g. `sf18-v0.1.0`) have evallegal but not NetSelection — UCI
+    // silently ignores unknown setoption names, so the engine would fall
+    // back to its default network while the shard fingerprint claims
+    // `large` / `small`. Reject loudly.
+    let needs_net_selection: Vec<&str> = cfg
+        .tiers
+        .iter()
+        .filter(|t| t.net_selection.is_some())
+        .map(|t| t.name.as_str())
+        .collect();
+    if !needs_net_selection.is_empty() && !probe.has_net_selection {
+        anyhow::bail!(
+            "tier(s) {:?} set `net_selection`, but {} does not advertise the \
+             `NetSelection` UCI option (fork tag must be `sf18-v0.2.0` or later; \
+             older `sf18-v0.1.0` builds only have `evallegal`). UCI silently \
+             ignores unknown setoption names, so a setoption send here would \
+             leave the engine on its default network while the shard fingerprint \
+             claims the requested choice. Rebuild via \
+             `bash stockfish-datagen/scripts/build_patched_stockfish.sh`.",
+            needs_net_selection, cfg.stockfish_path.display(),
         );
     }
     Ok(())

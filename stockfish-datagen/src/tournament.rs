@@ -77,6 +77,19 @@ impl TournamentConfig {
         if self.n_workers == 0 { anyhow::bail!("n_workers must be > 0"); }
         if self.n_pairs == 0 { anyhow::bail!("n_pairs must be > 0"); }
         if self.max_ply == 0 { anyhow::bail!("max_ply must be > 0"); }
+        // `max_ply` is the absolute cap on total plies (matches play_game).
+        // `opening_plies` consumes plies from that budget, so configs with
+        // `opening_plies >= max_ply` would skip the play loop entirely and
+        // every game would be labeled as `PlyLimit` with the actual game
+        // being just the opening — silently producing meaningless ~50% Elo.
+        if self.opening_plies >= self.max_ply {
+            anyhow::bail!(
+                "opening_plies ({}) must be < max_ply ({}); the opening prefix \
+                 consumes from the play budget and an >=-cap value would skip \
+                 the play loop entirely",
+                self.opening_plies, self.max_ply,
+            );
+        }
         // sample_score=V requires the patched binary's evallegal protocol —
         // both sides drive that protocol regardless of mode (we always
         // spawn with GoBudget::EvalLegal in tournament mode), so this is
@@ -286,7 +299,6 @@ fn run_worker(
     openings: Arc<Vec<Vec<String>>>,
     tx: crossbeam_channel::Sender<(u32, MatchOutcome, Vec<String>)>,
 ) -> anyhow::Result<()> {
-    affinity::pin_current_thread(worker_id);
     let mut sf = StockfishProcess::spawn(
         &cfg.stockfish_path,
         &cfg.stockfish_version,
@@ -294,7 +306,7 @@ fn run_worker(
         GoBudget::EvalLegal,
     )
     .with_context(|| format!("spawning stockfish for tournament worker {worker_id}"))?;
-    affinity::pin_pid(sf.child_pid(), worker_id);
+    affinity::pin_pair(sf.child_pid(), worker_id);
 
     if !sf.is_patched {
         anyhow::bail!(
@@ -422,5 +434,49 @@ mod tests {
         assert!((r.a_score() - 65.0).abs() < 1e-9);
         assert!((r.a_win_rate() - 0.65).abs() < 1e-9);
         assert!(r.a_elo() > 0.0);
+    }
+
+    fn minimal_tournament_config() -> TournamentConfig {
+        TournamentConfig {
+            stockfish_path: "/usr/bin/stockfish".into(),
+            stockfish_version: "Stockfish 18".into(),
+            stockfish_hash_mb: 16,
+            master_seed: 1,
+            n_workers: 1,
+            n_pairs: 1,
+            max_ply: 64,
+            opening_plies: 4,
+            side_a: TournamentSide {
+                name: "a".into(),
+                sample_score: SampleScore::Cp,
+                temperature: 0.0,
+            },
+            side_b: TournamentSide {
+                name: "b".into(),
+                sample_score: SampleScore::V,
+                temperature: 0.0,
+            },
+            output_path: None,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_opening_plies_at_or_above_max_ply() {
+        let mut cfg = minimal_tournament_config();
+        cfg.max_ply = 10;
+        cfg.opening_plies = 10; // equal to max_ply
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("opening_plies"), "got: {err}");
+
+        cfg.opening_plies = 20; // greater than max_ply
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("opening_plies"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_opening_plies_below_max_ply() {
+        let cfg = minimal_tournament_config();
+        // 4 < 64, the default minimal-config combo.
+        cfg.validate().unwrap();
     }
 }
