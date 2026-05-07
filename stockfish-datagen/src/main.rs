@@ -186,7 +186,7 @@ struct Totals {
 /// (`GoBudget::EvalLegal`), so the only requirement to check is that the
 /// binary recognizes that command. NetSelection is irrelevant here —
 /// tournament workers don't apply per-side `net_selection` overrides
-/// (`TournamentSide` has no such field), so a `sf18-v0.1.0` fork build
+/// (`TournamentSide` has no such field), so a `sf_18-v0.1.0` fork build
 /// (evallegal but no NetSelection) is sufficient. Spawn one throwaway
 /// probe; fail fast before spawning N tournament workers against a
 /// vanilla SF.
@@ -269,7 +269,7 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
     }
     // Separate check: any tier that sets `net_selection` needs the binary
     // to ALSO advertise the NetSelection UCI option. Older fork builds
-    // (e.g. `sf18-v0.1.0`) have evallegal but not NetSelection — UCI
+    // (e.g. `sf_18-v0.1.0`) have evallegal but not NetSelection — UCI
     // silently ignores unknown setoption names, so the engine would fall
     // back to its default network while the shard fingerprint claims
     // `large` / `small`. Reject loudly.
@@ -282,8 +282,8 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
     if !needs_net_selection.is_empty() && !probe.has_net_selection {
         anyhow::bail!(
             "tier(s) {:?} set `net_selection`, but {} does not advertise the \
-             `NetSelection` UCI option (fork tag must be `sf18-v0.2.0` or later; \
-             older `sf18-v0.1.0` builds only have `evallegal`). UCI silently \
+             `NetSelection` UCI option (fork tag must be `sf_18-v0.2.0` or later; \
+             older `sf_18-v0.1.0` builds only have `evallegal`). UCI silently \
              ignores unknown setoption names, so a setoption send here would \
              leave the engine on its default network while the shard fingerprint \
              claims the requested choice. Rebuild via \

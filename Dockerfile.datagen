@@ -95,7 +95,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG SF_FORK_REPO=https://github.com/thomas-schweich/stockfish-ml-extensions.git
 # Pin to commit SHA, not just tag. Lightweight git tags can be force-moved
 # on the remote and a `git clone --branch <tag>` would silently pick up the
-# new commit. The annotated tag `sf18-v0.2.0` currently points at this
+# new commit. The annotated tag `sf_18-v0.2.0` currently points at this
 # commit; we pin to the SHA so a future tag move (accidental or otherwise)
 # fails the build loudly instead of silently changing the binary.
 ARG SF_FORK_COMMIT=777b88071fa00decaed2d1d6b1d4b2031bacb428

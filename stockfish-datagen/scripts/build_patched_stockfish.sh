@@ -14,13 +14,13 @@
 set -euo pipefail
 
 ARCH="${1:-x86-64-avx2}"
-# Pin to the sf18-v0.2.0 tag of our fork — based on Stockfish 18 release
+# Pin to the sf_18-v0.2.0 tag of our fork — based on Stockfish 18 release
 # (cb3d4ee9, tag sf_18 upstream) plus two additive extensions:
 #   - `evallegal` UCI command (per-legal-move NNUE eval, single line)
 #   - `NetSelection` UCI option (auto|small|large, default auto)
-# The `sf18-` prefix makes the upstream base explicit in the tag itself, so
-# future rebases onto a new Stockfish release land at e.g. `sf19-v0.1.0`
-# without semver-only ambiguity. Bundles nn-c288c895ea92.nnue (big) +
+# The `sf_18-` prefix mirrors upstream's `sf_18` tag exactly, so future
+# rebases onto a new Stockfish release land at e.g. `sf_19-v0.1.0` without
+# semver-only ambiguity. Bundles nn-c288c895ea92.nnue (big) +
 # nn-37f18f62d772.nnue (small), the same NNUE weights as vanilla SF18. With
 # `NetSelection=auto` (the default), every other command is bit-identical
 # to vanilla SF18.
@@ -30,7 +30,7 @@ SF_REPO="https://github.com/thomas-schweich/stockfish-ml-extensions.git"
 # leave the local tag pointing at the old commit (fetch never moves an
 # existing local tag without --force). Pinning to SHA matches the
 # Dockerfile's pin and guarantees byte-identical builds across machines.
-# This SHA is the commit annotated tag `sf18-v0.2.0` currently points at;
+# This SHA is the commit annotated tag `sf_18-v0.2.0` currently points at;
 # bump together if/when the tag advances.
 SF_COMMIT="777b88071fa00decaed2d1d6b1d4b2031bacb428"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"

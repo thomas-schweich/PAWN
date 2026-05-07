@@ -135,9 +135,9 @@ pub struct StockfishProcess {
     /// way to score the position).
     pub is_patched: bool,
     /// True iff the binary advertised `option name NetSelection` during the
-    /// UCI handshake — the marker for fork tag `sf18-v0.2.0` or later. Used
+    /// UCI handshake — the marker for fork tag `sf_18-v0.2.0` or later. Used
     /// by preflight to reject configs that set `net_selection: Some(...)`
-    /// against a binary that has `evallegal` (e.g. an older `sf18-v0.1.0`
+    /// against a binary that has `evallegal` (e.g. an older `sf_18-v0.1.0`
     /// fork build) but not `NetSelection`. Without this distinction a stale
     /// patched binary would silently ignore the `setoption name NetSelection
     /// ...` and use the engine's default network — the shard fingerprint
