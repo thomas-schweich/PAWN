@@ -2,7 +2,7 @@
   "stockfish_path": "stockfish-datagen/stockfish-patched",
   "stockfish_version": "Stockfish 18",
   "output_dir": "data/sf_large_distill_20M",
-  "master_seed": 42,
+  "master_seed": 142,
   "n_workers": 126,
   "max_ply": 512,
   "stockfish_hash_mb": 16,
