@@ -2,7 +2,7 @@
 
 | File | Purpose | Tiers | Total games | `master_seed` |
 |---|---|---|---|---|
-| `smoke.json` | Local sanity test (60 games, vanilla SF). | 1 | 60 | 1 |
+| `smoke.json` | Local sanity test (vanilla SF). | 1 | 64 | 42 |
 | `bench_evallegal_14k.json` | Local 14k-game benchmark for the searchless / evallegal protocol. | 1 | 14,000 | 42 |
 | `sf_large_distill_20M.json` | Standalone NNUE-distillation dataset: searchless + `sample_score=v` + `net_selection=large` + `store_legal_move_evals=true`. | 1 | 20M | **142** |
 | `stockfish_100m.json` | Full production ladder: tier-0 distillation + four `nodes_N` search-strength tiers. | 5 | 100M | 42 |

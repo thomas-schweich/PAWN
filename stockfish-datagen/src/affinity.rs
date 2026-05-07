@@ -95,14 +95,31 @@
 //! `sched_setaffinity` equivalent, and we don't need to pin during
 //! local dev tests.
 
+/// Resolve the core index this worker should pin to, using the same
+/// `worker_id % n_cores` rule both `pin_current_thread` and `pin_pid`
+/// apply. Returns `None` (logging once) if the OS reports no cores.
+///
+/// Hoisting this out of the two pin functions matters: under cgroup
+/// CPU restrictions (vast.ai-style containers occasionally tighten the
+/// cpuset mid-run), two independent calls to `core_affinity::get_core_ids()`
+/// can return different lists, which would land the worker thread and
+/// its Stockfish PID on *different* cores — silently defeating the
+/// shared-L1/L2 goal with no warning emitted.
+#[cfg(target_os = "linux")]
+fn resolve_core(worker_id: u32) -> Option<core_affinity::CoreId> {
+    let cores = core_affinity::get_core_ids()?;
+    if cores.is_empty() { return None; }
+    Some(cores[(worker_id as usize) % cores.len()])
+}
+
 /// Pin the calling thread to core `worker_id % n_cores`. Best-effort:
 /// failures are logged via `eprintln!` and otherwise ignored.
 pub fn pin_current_thread(worker_id: u32) {
     #[cfg(target_os = "linux")]
     {
-        let cores = match core_affinity::get_core_ids() {
-            Some(c) if !c.is_empty() => c,
-            _ => {
+        let pick = match resolve_core(worker_id) {
+            Some(c) => c,
+            None => {
                 eprintln!(
                     "[affinity] worker {worker_id}: core_affinity::get_core_ids \
                      returned no cores; skipping thread pin",
@@ -110,7 +127,6 @@ pub fn pin_current_thread(worker_id: u32) {
                 return;
             }
         };
-        let pick = cores[(worker_id as usize) % cores.len()];
         if !core_affinity::set_for_current(pick) {
             eprintln!(
                 "[affinity] worker {worker_id}: set_for_current({pick:?}) failed; \
@@ -126,15 +142,16 @@ pub fn pin_current_thread(worker_id: u32) {
 
 /// Pin process `pid` to core `worker_id % n_cores`. Best-effort: a
 /// failure here just leaves the child where the OS scheduler put it,
-/// which is the pre-pinning baseline.
+/// which is the pre-pinning baseline. Uses the same `resolve_core` helper
+/// as `pin_current_thread` so the worker thread and its Stockfish child
+/// always pick the same core (see the helper's docstring).
 pub fn pin_pid(pid: u32, worker_id: u32) {
     #[cfg(target_os = "linux")]
     {
-        let cores = match core_affinity::get_core_ids() {
-            Some(c) if !c.is_empty() => c,
-            _ => return, // already logged in pin_current_thread
+        let core = match resolve_core(worker_id) {
+            Some(c) => c.id,
+            None => return, // already logged in pin_current_thread
         };
-        let core = cores[(worker_id as usize) % cores.len()].id;
 
         // Build a single-CPU mask. cpu_set_t is opaque; zero it out then
         // set the target bit via CPU_SET. SAFETY: cpu_set_t is POD; the

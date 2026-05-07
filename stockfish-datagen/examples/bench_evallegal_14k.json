@@ -1,5 +1,5 @@
 {
-  "stockfish_path": "/home/tas/pawn/stockfish-datagen/stockfish-patched",
+  "stockfish_path": "stockfish-datagen/stockfish-patched",
   "stockfish_version": "Stockfish 18",
   "output_dir": "/tmp/sf_bench_evallegal_14k",
   "master_seed": 42,

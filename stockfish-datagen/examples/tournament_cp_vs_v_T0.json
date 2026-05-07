@@ -1,6 +1,6 @@
 {
   "_comment": "cp-vs-v argmax (T=0) tournament. Both sides drive the patched binary's evallegal protocol; the only difference is which per-move score they argmax over (normalized cp vs raw NNUE Value v). Openings are 4 random plies, deterministic from master_seed; each opening is played twice with sides swapped to cancel first-move advantage. Adjust n_pairs and n_workers to suit your hardware and the precision you need on the Elo CI.",
-  "stockfish_path": "/home/tas/pawn/stockfish-datagen/stockfish-patched",
+  "stockfish_path": "stockfish-datagen/stockfish-patched",
   "stockfish_version": "Stockfish 18",
   "stockfish_hash_mb": 16,
   "master_seed": 42,

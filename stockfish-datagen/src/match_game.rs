@@ -87,9 +87,14 @@ pub fn play_match_game<R: Rng + ?Sized>(
         moves.push(uci.clone());
     }
 
-    let total_max_ply = max_ply.saturating_add(opening_moves.len() as u32);
-
-    for ply in (opening_moves.len() as u32)..total_max_ply {
+    // `max_ply` is the absolute cap on total plies (matches play_game's
+    // semantics). The opening prefix counts toward it, so a tournament
+    // declaring max_ply=512 with 4 opening plies plays at most 508
+    // additional plies. Degenerate case: opening_moves.len() >= max_ply
+    // produces an empty loop and the post-loop terminal recheck handles
+    // labeling.
+    let start_ply = opening_moves.len() as u32;
+    for ply in start_ply..max_ply {
         let cur_hash = *history.last().unwrap();
         if let Some(reason) = detect_pre_eval_terminal(&board, &history, cur_hash, ply as usize) {
             return Ok(finalize(reason, ply as usize, a_color, moves));

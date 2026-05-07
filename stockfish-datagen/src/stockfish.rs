@@ -90,7 +90,9 @@ pub enum GoBudget {
     Nodes(u32),
     /// `evallegal`. Pure NNUE static eval per legal move, no search loop,
     /// every legal move scored. Output: a single
-    /// `info string evallegal <status> [<uci> <cp>]...` line.
+    /// `info string evallegal <status> [<uci> <cp> <v>]...` line, where
+    /// `<cp>` is the normalized centipawn value and `<v>` is the raw
+    /// internal NNUE Value before normalization.
     EvalLegal,
 }
 

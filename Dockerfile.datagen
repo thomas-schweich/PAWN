@@ -72,6 +72,36 @@ RUN curl -fsSL "https://github.com/tmux/tmux/releases/download/${TMUX_VERSION}/t
     && make install \
     && strip /usr/local/bin/tmux
 
+# ── Build the patched Stockfish from the stockfish-ml-extensions fork ──
+# Used by tier-0 distillation (`searchless: true`) and by any tier that
+# sets `net_selection`. Vanilla SF18 doesn't recognize the `evallegal`
+# command or the `NetSelection` UCI option, so the configs that use
+# either would abort at preflight if the runtime image only shipped
+# vanilla SF. This stage builds the patched binary at the pinned fork
+# tag and the runtime stage copies it in below at the relative path
+# the bundled example configs reference (`stockfish-datagen/stockfish-patched`,
+# resolved from `WORKDIR /opt/datagen`).
+FROM ubuntu:24.04 AS sf-fork-build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG SF_FORK_REPO=https://github.com/thomas-schweich/stockfish-ml-extensions.git
+ARG SF_FORK_TAG=sf18-v0.2.0
+# AVX2 is the lowest-common-denominator microarch we target; vanilla SF18
+# AVX2 vs AVX-512 produce bit-exact identical NNUE evals (int8 dot products
+# are vector-width-invariant), and the patched binary inherits that — so
+# one variant is enough for the patched path. Override with --build-arg
+# SF_PATCHED_ARCH=x86-64-avx512 to swap.
+ARG SF_PATCHED_ARCH=x86-64-avx2
+
+WORKDIR /build
+RUN git clone --depth 1 --branch "$SF_FORK_TAG" "$SF_FORK_REPO" sf-fork \
+    && cd sf-fork/src \
+    && make -j"$(nproc)" build ARCH="$SF_PATCHED_ARCH" \
+    && strip stockfish
+
 # ── Build the Rust stockfish-datagen binary in a builder stage ────────
 # Multi-stage so the rustup toolchain (~1GB) and the build system
 # (gcc, libc-dev, etc.) don't bloat the runtime image — only the
@@ -212,12 +242,26 @@ COPY scripts/sweep_pod_workers.sh scripts/
 # (installed earlier when --build-arg INCLUDE_STOCKFISH=1).
 COPY --from=sfd-builder /build/target/release/stockfish-datagen /usr/local/bin/stockfish-datagen
 
+# Patched Stockfish from the stockfish-ml-extensions fork. Installed at
+# the relative path the bundled configs reference (`stockfish_path:
+# "stockfish-datagen/stockfish-patched"` resolved from WORKDIR
+# /opt/datagen). The configs work identically on a developer checkout
+# (where `bash stockfish-datagen/scripts/build_patched_stockfish.sh`
+# drops the binary at the same path) and on a pod.
+RUN mkdir -p /opt/datagen/stockfish-datagen
+COPY --from=sf-fork-build /build/sf-fork/src/stockfish /opt/datagen/stockfish-datagen/stockfish-patched
+RUN chmod +x /opt/datagen/stockfish-datagen/stockfish-patched
+
 # Example configs, so a pod can run with --config /opt/datagen/examples/...
 # without needing the source tree mounted.
 COPY stockfish-datagen/examples /opt/datagen/examples
 
+# Smoke-test all three binaries are wired up correctly.
 RUN stockfish-datagen --help 2>&1 | head -1 \
-    && python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)"
+    && python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)" \
+    && printf 'evallegal\nquit\n' | /opt/datagen/stockfish-datagen/stockfish-patched 2>/dev/null \
+        | grep -q '^info string evallegal ' \
+        || (echo "ERROR: patched stockfish does not recognize evallegal" >&2; exit 1)
 
 # Dispatcher entrypoint:
 #   - if no args, default to the HF-sync orchestrator iff DATAGEN_HF_REPO

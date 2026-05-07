@@ -6,18 +6,26 @@ in a separate repo:
   **<https://github.com/thomas-schweich/stockfish-ml-extensions>**
 
 That fork pins Stockfish to the SF18 release (commit `cb3d4ee9`, tag `sf_18`)
-and adds a single additive UCI command — `evallegal` — that emits per-legal-
-move NNUE evals (both normalized cp and raw `v`) on a single line. Splitting
-the fork out keeps the GPLv3 boundary clean (it's a derivative of Stockfish,
-licensed accordingly; PAWN itself stays Apache 2.0) and lets the extension be
-useful to other projects without dragging the rest of PAWN along.
+and adds two purely-additive extensions:
+
+- **`evallegal`** UCI command — per-legal-move NNUE evals (both normalized
+  cp and raw `v`) on a single line.
+- **`NetSelection`** UCI option (`auto | small | large`, default `auto`) —
+  forces uniform use of one NNUE network across all evaluation, useful for
+  distillation labelling where a per-position dynamic small/large pick
+  introduces eval-source heterogeneity.
+
+Splitting the fork out keeps the GPLv3 boundary clean (it's a derivative of
+Stockfish, licensed accordingly; PAWN itself stays Apache 2.0) and lets the
+extensions be useful to other projects without dragging the rest of PAWN
+along.
 
 `scripts/build_patched_stockfish.sh` clones the fork at the pinned tag
-(`v18.evallegal.0`) and builds it with PGO. The resulting binary is dropped
-at `stockfish-datagen/stockfish-patched`. The runner's preflight check
-(`main.rs::preflight_check_patched_binary`) probes for the `evallegal`
-command at startup and aborts loudly if a tier with `searchless: true` is
-configured against an unpatched binary.
+(`sf18-v0.2.0`) and runs `make -j build ARCH=x86-64-avx2`. The resulting
+binary is dropped at `stockfish-datagen/stockfish-patched`. The runner's
+preflight check (`main.rs::preflight_check_patched_binary`) probes for the
+`evallegal` command at startup and aborts loudly if any tier sets
+`searchless: true` or `net_selection: <X>` against an unpatched binary.
 
 ## Output format (reference)
 

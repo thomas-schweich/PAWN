@@ -208,7 +208,14 @@ def _upload_one(api: HfApi, repo_id: str, repo_path: str, local_path: Path) -> N
             return
         except HfHubHTTPError as e:
             # 5xx / rate-limit: retry. 4xx (except 429): give up.
-            status = e.response.status_code
+            #
+            # `e.response` is documented as always-set on HfHubHTTPError, but
+            # the field is `Optional[Response]` in the type stubs. A library
+            # update or test-monkeypatched error path could violate the
+            # invariant; guarding here lets us log + give up cleanly instead
+            # of `AttributeError`-tripping the consecutive-failure threshold.
+            response = getattr(e, "response", None)
+            status = response.status_code if response is not None else 0
             if status not in (429, 500, 502, 503, 504) or attempt == 4:
                 raise
             LOG.warning(
@@ -485,16 +492,28 @@ def main() -> int:
     def _kill_child_on_watcher_failure() -> None:
         """Forwarded to the watcher so a permanent HF failure terminates
         the rust binary instead of letting it run for hours producing
-        unsynced data."""
+        unsynced data.
+
+        Race-tolerant: between `poll()` returning None and `terminate()`
+        firing, the rust child can finish on its own and the main thread
+        can reap it via `proc.wait()`. After the reap the PID may be
+        recycled, in which case `terminate()` would SIGTERM an unrelated
+        process. We swallow `ProcessLookupError` (already-reaped) and
+        the broader case where terminate fails because the child is
+        gone — those are benign races, not failures worth surfacing."""
         if not proc_holder:
             return
         proc = proc_holder[0]
-        if proc.poll() is None:
-            LOG.error("watcher gave up; sending SIGTERM to rust binary")
-            try:
-                proc.terminate()
-            except Exception:
-                LOG.exception("failed to terminate rust binary; will continue")
+        if proc.poll() is not None:
+            return  # child already exited; main thread will reap.
+        LOG.error("watcher gave up; sending SIGTERM to rust binary")
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            # Child finished between our poll() and terminate() — fine.
+            LOG.debug("rust binary exited before SIGTERM landed; race benign")
+        except Exception:
+            LOG.exception("failed to terminate rust binary; will continue")
 
     stop = threading.Event()
     watcher_error: list[BaseException] = []

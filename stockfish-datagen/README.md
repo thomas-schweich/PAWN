@@ -7,7 +7,8 @@ care which source the data came from.
 
 ## Usage
 
-The binary takes a subcommand (`run` or `dry-run`) and a `--config PATH` flag.
+The binary takes a subcommand (`run`, `dry-run`, or `tournament`) and a
+`--config PATH` flag.
 
 ```bash
 # Validate a config without running anything.
@@ -21,14 +22,27 @@ cargo run --release -p stockfish-datagen -- run \
 # Production: 100M games across 5 tiers (20M per tier).
 cargo run --release -p stockfish-datagen -- run \
   --config stockfish-datagen/examples/stockfish_100m.json
+
+# Play two SampleScore × temperature configs against each other and
+# report W/D/L + Elo with a Wilson 95% CI. Always uses the patched
+# binary's evallegal protocol.
+cargo run --release -p stockfish-datagen -- tournament \
+  --config stockfish-datagen/examples/tournament_cp_vs_v_T0.json
 ```
 
 ## Reproducibility
 
-Every row in the output carries a `game_seed` (i64). Combined with
+Every row in the output carries a `game_seed` (`UInt64`). Combined with
 `stockfish_version` and the per-row tier config (`nodes`, `multi_pv`,
 `opening_multi_pv`, `opening_plies`, `sample_plies`, `temperature`),
 that seed is sufficient to deterministically replay the exact game.
+
+For **searchless tiers** (`searchless: true`), the per-row search-budget
+fields above are all `null` and the additional per-tier knobs
+`sample_score` and `net_selection` are required to replay — those live
+on `TierConfig` (the run config JSON), not in the parquet schema, so
+keep the run config JSON alongside the parquet shards if you want
+per-game replay for searchless data.
 
 The version pin is enforced at startup: the config's
 `stockfish_version` is matched at a word boundary against the
@@ -121,15 +135,16 @@ tier-state's fingerprint.
 | `game_length`       | `UInt16`        | == len of tokens / san / uci            |
 | `outcome_token`     | `UInt16`        | 1969..=1973 (mirrors engine vocab.rs)   |
 | `result`            | `String`        | "1-0", "0-1", or "1/2-1/2"              |
-| `nodes`             | `Int32`         | per-row, from tier config               |
-| `multi_pv`          | `Int32`         | per-row, from tier config               |
-| `opening_multi_pv`  | `Int32`         | per-row, from tier config               |
-| `opening_plies`     | `Int32`         | per-row, from tier config               |
-| `sample_plies`      | `Int32`         | per-row, from tier config               |
+| `nodes`             | `Int32?`        | search-mode-only; null on searchless tiers |
+| `multi_pv`          | `Int32?`        | search-mode-only; null on searchless tiers |
+| `opening_multi_pv`  | `Int32?`        | search-mode-only; null on searchless tiers |
+| `opening_plies`     | `Int32?`        | search-mode-only; null on searchless tiers |
+| `sample_plies`      | `Int32?`        | search-mode-only; null on searchless tiers |
 | `temperature`       | `Float32`       | per-row, from tier config               |
 | `worker_id`         | `Int16`         | which worker produced the row           |
 | `game_seed`         | `UInt64`        | per-game seed (reproduction key)        |
 | `stockfish_version` | `String`        | from Stockfish's `id name` line         |
+| `legal_move_evals`  | `List<List<Struct{move_idx: Int16, score_cp: Int16, score_v: Int16?}>>` | per-ply per-legal-move NNUE evals when `store_legal_move_evals: true`; empty outer list when not. `score_v` is non-null only for evallegal-protocol rows (searchless tiers). |
 
 ## Tuning `n_workers` (CPU pinning is on by default)
 
@@ -310,6 +325,11 @@ CLI flags worth knowing:
   rust child after N consecutive cycle failures. Default 10
   (~5 minutes at the default poll). Tune up for runs that may span
   longer documented HF outages.
+- `--watcher-drain-timeout-hours <hours>` — after the rust binary exits,
+  wait up to this many hours for the watcher to flush any pending shard
+  uploads before exiting. Default 4 hours. If the timeout fires with
+  uploads still pending, exit code is `4`; the local shards stay on
+  disk and the next run's primer picks up where this one left off.
 - `--log-level {DEBUG,INFO,WARNING,ERROR}` — default INFO.
 
 Exit codes: `0` clean; non-zero `rc` from the rust binary if it
