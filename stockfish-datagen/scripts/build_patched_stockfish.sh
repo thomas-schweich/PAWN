@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Build the patched Stockfish binary used for tier-0 (evallegal) data gen.
 #
-# Clones upstream Stockfish, applies our patches, builds. Output binary is
-# placed in the repo root as `stockfish-patched` (gitignored).
+# Clones the `stockfish-ml-extensions` fork (Stockfish 18 + the `evallegal`
+# UCI command) and builds it. Output binary is placed in the repo root as
+# `stockfish-patched` (gitignored).
 #
 # Usage:
 #   bash scripts/build_patched_stockfish.sh           # default: x86-64-avx2
@@ -13,31 +14,26 @@
 set -euo pipefail
 
 ARCH="${1:-x86-64-avx2}"
-# Pin to SF18 release. Bundles nn-c288c895ea92.nnue (big) + nn-37f18f62d772.nnue
-# (small) — the same NNUE weights as `~/bin/stockfish` SF18 release. The patch
-# is purely additive (new `evallegal` UCI command), so every other command in
-# the patched binary is bit-identical to vanilla SF18.
-SF_TAG="sf_18"
-SF_COMMIT="cb3d4ee9b47d0c5aae855b12379378ea1439675c"
+# Pin to the v18.evallegal.0 tag of our fork — Stockfish 18 release
+# (cb3d4ee9, tag sf_18 upstream) plus the additive `evallegal` UCI command.
+# Bundles nn-c288c895ea92.nnue (big) + nn-37f18f62d772.nnue (small), the same
+# NNUE weights as vanilla SF18. Patch is purely additive: every command other
+# than `evallegal` is bit-identical to vanilla SF18.
+SF_REPO="https://github.com/thomas-schweich/stockfish-ml-extensions.git"
+SF_TAG="v18.evallegal.0"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SF_DIR="$ROOT_DIR/upstream-stockfish"
-PATCH_DIR="$ROOT_DIR/patches"
 OUT_BIN="$ROOT_DIR/stockfish-patched"
 
 if [ ! -d "$SF_DIR" ]; then
-    echo "Cloning Stockfish into $SF_DIR..."
-    git clone https://github.com/official-stockfish/Stockfish.git "$SF_DIR"
+    echo "Cloning $SF_REPO into $SF_DIR..."
+    git clone "$SF_REPO" "$SF_DIR"
 fi
 
 cd "$SF_DIR"
 git fetch --quiet --tags origin
-git checkout --quiet "$SF_COMMIT"
-git reset --hard --quiet "$SF_COMMIT"
-
-echo "Applying patches from $PATCH_DIR..."
-for p in "$PATCH_DIR"/*.patch; do
-    git apply "$p"
-done
+git checkout --quiet "$SF_TAG"
+git reset --hard --quiet "$SF_TAG"
 
 cd src
 echo "Building Stockfish ($ARCH)..."
