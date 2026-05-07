@@ -183,13 +183,18 @@ struct Totals {
 
 /// Tournament-side counterpart to `preflight_check_patched_binary`.
 /// Tournaments always drive the patched binary's `evallegal` command
-/// (`GoBudget::EvalLegal`), so the only requirement to check is that the
-/// binary recognizes that command. NetSelection is irrelevant here —
-/// tournament workers don't apply per-side `net_selection` overrides
-/// (`TournamentSide` has no such field), so a `sf_18-v0.1.0` fork build
-/// (evallegal but no NetSelection) is sufficient. Spawn one throwaway
-/// probe; fail fast before spawning N tournament workers against a
-/// vanilla SF.
+/// (`GoBudget::EvalLegal`), so the only requirement here is that the binary
+/// recognizes that command **with the v0.3.0+ output shape**
+/// (`<uci> <cp> <eval_v> <psqt> <positional>` per legal move). NetSelection
+/// is irrelevant — tournament workers don't apply per-side `net_selection`
+/// overrides (`TournamentSide` has no such field) — but the v0.3.0 shape
+/// check is non-negotiable: the parser silently degrades to zero candidates
+/// against pre-v0.3.0 patched binaries, so without the probe-time check a
+/// stale binary would crash workers mid-match with `NoCandidates`. The
+/// `is_patched` flag set by `StockfishProcess::spawn` is true only when
+/// **both** conditions hold (patched + v0.3.0 shape), so this is the same
+/// check as the runner's. Spawn one throwaway probe; fail fast before
+/// spawning N tournament workers against a vanilla or stale SF.
 fn preflight_check_tournament_binary(cfg: &TournamentConfig) -> anyhow::Result<()> {
     let probe = StockfishProcess::spawn(
         &cfg.stockfish_path,
@@ -201,14 +206,16 @@ fn preflight_check_tournament_binary(cfg: &TournamentConfig) -> anyhow::Result<(
         format!("preflight: spawning {} for tournament probe", cfg.stockfish_path.display())
     })?;
     eprintln!(
-        "stockfish patched (evallegal command): {}",
+        "stockfish patched (evallegal v0.3.0 shape): {}",
         if probe.is_patched { "yes" } else { "NO" },
     );
     if !probe.is_patched {
         anyhow::bail!(
-            "tournament requires the patched binary (always runs evallegal), but {} \
-             does not recognize the `evallegal` UCI command. Build via \
-             `bash stockfish-datagen/scripts/build_patched_stockfish.sh`.",
+            "tournament requires the v0.3.0+ patched binary (always runs evallegal), \
+             but {} does not recognize the `evallegal` UCI command or emits a stale \
+             pre-v0.3.0 output shape. Build / rebuild via \
+             `bash stockfish-datagen/scripts/build_patched_stockfish.sh` (currently \
+             pinned to fork tag `sf_18-v0.3.0`).",
             cfg.stockfish_path.display(),
         );
     }
@@ -217,12 +224,18 @@ fn preflight_check_tournament_binary(cfg: &TournamentConfig) -> anyhow::Result<(
 
 /// If any tier sets `searchless: true` or `net_selection: ...`, spawn one
 /// throwaway Stockfish process and verify it recognizes the patched
-/// binary's surface area (`evallegal` command + `NetSelection` UCI option).
+/// binary's surface area (`evallegal` command **with the v0.3.0+ output
+/// shape** + `NetSelection` UCI option).
 ///
 /// Vanilla Stockfish responds with `Unknown command: 'evallegal'` to the
 /// probe and silently ignores unknown setoption names — both are silent
-/// failures that would corrupt a tier mid-run. Fail loudly at startup
-/// instead.
+/// failures that would corrupt a tier mid-run. Pre-v0.3.0 patched binaries
+/// recognize `evallegal` but emit a 3-tuple shape (`<uci> <cp> <v>`) the
+/// current parser silently degrades to zero candidates on, which is the
+/// same class of silent corruption with a worse failure mode (worker dies
+/// 200 plies into a game with `NoCandidates`). Fail loudly at startup
+/// instead — the v0.3.0 shape check is built into the spawn-time probe
+/// and surfaces as `is_patched: false` for stale binaries.
 fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
     let needs_patched: Vec<String> = cfg
         .tiers
@@ -251,7 +264,7 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
         format!("preflight: spawning {} to check for evallegal patch", cfg.stockfish_path.display())
     })?;
     eprintln!(
-        "stockfish patched (evallegal command): {}",
+        "stockfish patched (evallegal v0.3.0 shape): {}",
         if probe.is_patched { "yes" } else { "NO" },
     );
     eprintln!(
@@ -260,19 +273,22 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
     );
     if !probe.is_patched {
         anyhow::bail!(
-            "tier(s) {:?} require the patched binary, but {} does not recognize the \
-             `evallegal` UCI command that marks it. Build it via \
-             `bash stockfish-datagen/scripts/build_patched_stockfish.sh` and point \
-             `stockfish_path` at the resulting `stockfish-datagen/stockfish-patched`.",
+            "tier(s) {:?} require the v0.3.0+ patched binary, but {} either does not \
+             recognize the `evallegal` UCI command or emits a stale pre-v0.3.0 output \
+             shape. Build / rebuild via \
+             `bash stockfish-datagen/scripts/build_patched_stockfish.sh` (currently \
+             pinned to fork tag `sf_18-v0.3.0`) and point `stockfish_path` at the \
+             resulting `stockfish-datagen/stockfish-patched`.",
             needs_patched, cfg.stockfish_path.display(),
         );
     }
     // Separate check: any tier that sets `net_selection` needs the binary
-    // to ALSO advertise the NetSelection UCI option. Older fork builds
-    // (e.g. `sf_18-v0.1.0`) have evallegal but not NetSelection — UCI
-    // silently ignores unknown setoption names, so the engine would fall
-    // back to its default network while the shard fingerprint claims
-    // `large` / `small`. Reject loudly.
+    // to ALSO advertise the NetSelection UCI option. The v0.3.0 patched
+    // binary advertises both, but theoretically a future fork build could
+    // diverge. Older fork builds (pre-`sf_18-v0.2.0`) had `evallegal` but
+    // not NetSelection — UCI silently ignores unknown setoption names, so
+    // without this gate the engine would fall back to its default network
+    // while the shard fingerprint claims `large` / `small`. Reject loudly.
     let needs_net_selection: Vec<&str> = cfg
         .tiers
         .iter()
@@ -282,12 +298,12 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
     if !needs_net_selection.is_empty() && !probe.has_net_selection {
         anyhow::bail!(
             "tier(s) {:?} set `net_selection`, but {} does not advertise the \
-             `NetSelection` UCI option (fork tag must be `sf_18-v0.2.0` or later; \
-             older `sf_18-v0.1.0` builds only have `evallegal`). UCI silently \
-             ignores unknown setoption names, so a setoption send here would \
-             leave the engine on its default network while the shard fingerprint \
-             claims the requested choice. Rebuild via \
-             `bash stockfish-datagen/scripts/build_patched_stockfish.sh`.",
+             `NetSelection` UCI option. The bundled v0.3.0 patched binary advertises \
+             it; a binary that has `evallegal` but not `NetSelection` is either a \
+             pre-v0.2.0 fork build or a divergent fork. UCI silently ignores unknown \
+             setoption names, so a setoption send here would leave the engine on its \
+             default network while the shard fingerprint claims the requested choice. \
+             Rebuild via `bash stockfish-datagen/scripts/build_patched_stockfish.sh`.",
             needs_net_selection, cfg.stockfish_path.display(),
         );
     }

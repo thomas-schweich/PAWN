@@ -152,7 +152,7 @@ tier-state's fingerprint.
 | `worker_id`         | `Int16`         | which worker produced the row           |
 | `game_seed`         | `UInt64`        | per-game seed (reproduction key)        |
 | `stockfish_version` | `String`        | from Stockfish's `id name` line         |
-| `legal_move_evals`  | `List<List<Struct{move_idx: Int16, score_cp: Int16, score_v: Int16?}>>` | per-ply per-legal-move NNUE evals when `store_legal_move_evals: true`; empty outer list when not. `score_v` is non-null only for evallegal-protocol rows (searchless tiers). |
+| `legal_move_evals`  | `List<List<Struct{move_idx: Int16, score_cp: Int16, score_eval_v: Int16?, score_psqt: Int16?, score_positional: Int16?}>>` | per-ply per-legal-move evals when `store_legal_move_evals: true`; empty outer list when not. `score_cp` is always populated; `score_eval_v` (`Eval::evaluate`'s post-processed Value, right target for play-policy distillation) and `score_psqt` / `score_positional` (raw NNUE per-head outputs, right targets for hot-swap NNUE-replacement distillation) are non-null only for evallegal-protocol rows (searchless tiers, sf_18-v0.3.0+ patched binary). |
 
 ## Tuning `n_workers` (CPU pinning is on by default)
 

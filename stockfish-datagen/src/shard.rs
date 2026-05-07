@@ -27,22 +27,30 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
 /// One candidate move's distillation payload. Stored packed as
-/// `Struct{move_idx: i16, score_cp: i16, score_v: i16?}` to keep parquet
-/// rows compact while remaining trivially loadable from polars / pyarrow.
+/// `Struct{move_idx: i16, score_cp: i16, score_eval_v: i16?, score_psqt: i16?,
+/// score_positional: i16?}` to keep parquet rows compact while remaining
+/// trivially loadable from polars / pyarrow.
 ///
 /// - `move_idx`: searchless_chess action vocab index (0..1968).
 /// - `score_cp`: normalized centipawns, mover-POV. 100 cp ≈ "1 pawn equivalent".
-/// - `score_v`: raw internal NNUE Value, mover-POV. `None` when the tier
-///   sourced its candidates from `info ... multipv` (only the patched
-///   binary's `evallegal` command surfaces raw values). Distillation
-///   targets should use this when present — it's what the network actually
-///   produces, before win-rate normalization shrinks magnitudes by `a/100`
-///   ≈ 2–3.5×.
+/// - `score_eval_v`: `Eval::evaluate`'s post-processed Value, mover-POV.
+///   What Stockfish plays with (head-blend + complexity damp + material/optimism
+///   mix + 50-move shuffling damp + TB-clamp). Right target for play-policy
+///   distillation. `None` for multipv-sourced rows (search-mode tiers don't
+///   surface raw values).
+/// - `score_psqt`, `score_positional`: raw NNUE per-head outputs from
+///   `Networks::evaluate()`, mover-POV, before any post-processing. Together
+///   they're the right targets for hot-swap NNUE-replacement distillation —
+///   Stockfish itself applies the post-processing on top, so the student must
+///   not have it baked in. `None` for multipv-sourced rows. `evallegal`
+///   (sf_18-v0.3.0+) surfaces both.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LegalMoveEval {
     pub move_idx: i16,
     pub score_cp: i16,
-    pub score_v: Option<i16>,
+    pub score_eval_v: Option<i16>,
+    pub score_psqt: Option<i16>,
+    pub score_positional: Option<i16>,
 }
 
 /// Fields of the `legal_move_evals` Struct element. Hoisted so the
@@ -51,14 +59,19 @@ fn legal_move_eval_struct_fields() -> Fields {
     Fields::from(vec![
         Field::new("move_idx", DataType::Int16, false),
         Field::new("score_cp", DataType::Int16, false),
-        // Nullable: only the `evallegal` protocol provides this. Multipv-derived
-        // candidates leave it null.
-        Field::new("score_v", DataType::Int16, true),
+        // Three nullable raw-eval columns: only the `evallegal` protocol
+        // (sf_18-v0.3.0+ patched binary) provides any of them. Multipv-derived
+        // candidates leave all three null.
+        Field::new("score_eval_v", DataType::Int16, true),
+        Field::new("score_psqt", DataType::Int16, true),
+        Field::new("score_positional", DataType::Int16, true),
     ])
 }
 
 fn legal_move_eval_struct_builders() -> Vec<Box<dyn ArrayBuilder>> {
     vec![
+        Box::new(Int16Builder::new()),
+        Box::new(Int16Builder::new()),
         Box::new(Int16Builder::new()),
         Box::new(Int16Builder::new()),
         Box::new(Int16Builder::new()),
@@ -283,12 +296,26 @@ impl ShardWriter {
                         .field_builder::<Int16Builder>(1)
                         .expect("score_cp field 1")
                         .append_value(ev.score_cp);
-                    let v_b = struct_b
+                    let eval_v_b = struct_b
                         .field_builder::<Int16Builder>(2)
-                        .expect("score_v field 2");
-                    match ev.score_v {
-                        Some(v) => v_b.append_value(v),
-                        None => v_b.append_null(),
+                        .expect("score_eval_v field 2");
+                    match ev.score_eval_v {
+                        Some(v) => eval_v_b.append_value(v),
+                        None => eval_v_b.append_null(),
+                    }
+                    let psqt_b = struct_b
+                        .field_builder::<Int16Builder>(3)
+                        .expect("score_psqt field 3");
+                    match ev.score_psqt {
+                        Some(v) => psqt_b.append_value(v),
+                        None => psqt_b.append_null(),
+                    }
+                    let positional_b = struct_b
+                        .field_builder::<Int16Builder>(4)
+                        .expect("score_positional field 4");
+                    match ev.score_positional {
+                        Some(v) => positional_b.append_value(v),
+                        None => positional_b.append_null(),
                     }
                     struct_b.append(true);
                 }
@@ -453,14 +480,33 @@ mod tests {
         let mut w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
 
         // Game 0: distillation tier — populated. Two plies, varying legal-move counts.
-        // First ply mixes Some / None score_v to exercise the nullable column path.
+        // First ply mixes Some / None across all three nullable raw-eval fields
+        // to exercise the nullable column path independently for each.
         let mut row0 = fake_row(1);
         row0.legal_move_evals = Some(vec![
             vec![
-                LegalMoveEval { move_idx: 100, score_cp: 50, score_v: Some(125) },
-                LegalMoveEval { move_idx: 200, score_cp: -25, score_v: None },
+                LegalMoveEval {
+                    move_idx: 100,
+                    score_cp: 50,
+                    score_eval_v: Some(125),
+                    score_psqt: Some(140),
+                    score_positional: Some(-15),
+                },
+                LegalMoveEval {
+                    move_idx: 200,
+                    score_cp: -25,
+                    score_eval_v: None,
+                    score_psqt: None,
+                    score_positional: None,
+                },
             ],
-            vec![LegalMoveEval { move_idx: 300, score_cp: 10, score_v: Some(28) }],
+            vec![LegalMoveEval {
+                move_idx: 300,
+                score_cp: 10,
+                score_eval_v: Some(28),
+                score_psqt: Some(35),
+                score_positional: Some(-7),
+            }],
         ]);
         w.append(&row0);
 
@@ -490,14 +536,23 @@ mod tests {
         assert_eq!(ply0_0.len(), 2);
         let move_idx = ply0_0.column(0).as_any().downcast_ref::<Int16Array>().unwrap();
         let score_cp = ply0_0.column(1).as_any().downcast_ref::<Int16Array>().unwrap();
-        let score_v = ply0_0.column(2).as_any().downcast_ref::<Int16Array>().unwrap();
+        let score_eval_v = ply0_0.column(2).as_any().downcast_ref::<Int16Array>().unwrap();
+        let score_psqt = ply0_0.column(3).as_any().downcast_ref::<Int16Array>().unwrap();
+        let score_positional = ply0_0.column(4).as_any().downcast_ref::<Int16Array>().unwrap();
         assert_eq!(move_idx.value(0), 100);
         assert_eq!(score_cp.value(0), 50);
-        assert_eq!(score_v.value(0), 125);
-        assert!(score_v.is_valid(0));
+        assert_eq!(score_eval_v.value(0), 125);
+        assert!(score_eval_v.is_valid(0));
+        assert_eq!(score_psqt.value(0), 140);
+        assert!(score_psqt.is_valid(0));
+        assert_eq!(score_positional.value(0), -15);
+        assert!(score_positional.is_valid(0));
         assert_eq!(move_idx.value(1), 200);
         assert_eq!(score_cp.value(1), -25);
-        assert!(!score_v.is_valid(1)); // None → null in parquet
+        // All three nullable raw-eval fields independently null out per row.
+        assert!(!score_eval_v.is_valid(1));
+        assert!(!score_psqt.is_valid(1));
+        assert!(!score_positional.is_valid(1));
 
         // Row 1: empty outer list (no per-ply data captured).
         let plies1 = outer.value(1);

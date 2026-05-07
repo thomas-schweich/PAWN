@@ -250,7 +250,8 @@ pub fn play_game<R: Rng + ?Sized>(
             // knob — every ply uses `sample_score` per validation). For
             // non-searchless tiers, `sample_score` is None per validation
             // and we default to Cp (the only score multipv parsing
-            // surfaces — `score_v` is None on those candidates).
+            // surfaces — `score_eval_v` / `score_psqt` / `score_positional`
+            // are all None on those candidates).
             let score = tier.sample_score.unwrap_or(crate::config::SampleScore::Cp);
             softmax_sample(&res.candidates, score, tier.temperature, rng)
                 .ok_or(GameError::NoCandidates)?

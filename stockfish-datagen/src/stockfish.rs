@@ -38,20 +38,35 @@ pub enum StockfishError {
 }
 
 /// One candidate move surfaced by either `go nodes N` (multipv parsing) or
-/// `evallegal` (per-legal-move NNUE).
+/// `evallegal` (per-legal-move static eval, sf_18-v0.3.0+).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     pub uci: String,
-    /// Normalized centipawns, mover-POV (`UCIEngine::to_cp(v, pos)` —
+    /// Normalized centipawns, mover-POV (`UCIEngine::to_cp(eval_v, pos)` —
     /// 100 cp ≈ "1 pawn equivalent"). Mate scores are folded to ±30000 so
     /// downstream softmax never sees +inf. Available from both protocols.
     pub score_cp: f32,
-    /// Raw internal NNUE Value, mover-POV. Only the `evallegal` protocol
-    /// surfaces this directly; `go nodes N` (multipv) reports cp only, so
-    /// this is `None` for that path. Distillation targets should use this
-    /// when present (it's the network's actual output, before win-rate
-    /// normalization shrinks magnitudes by `a / 100` ≈ 2–3.5×).
-    pub score_v: Option<f32>,
+    /// `Eval::evaluate`'s post-processed Value before `to_cp` (mover-POV).
+    /// Carries head-blend (125/131 mix), complexity damping, material/optimism
+    /// mix, 50-move shuffling damp, and TB-range clamp. **What Stockfish
+    /// plays with** — the right target for play-policy distillation, and
+    /// what the sampler reads under `sample_score=v`.
+    ///
+    /// Only the `evallegal` protocol surfaces this; `go nodes N` (multipv)
+    /// reports cp only, so this is `None` for that path.
+    pub score_eval_v: Option<f32>,
+    /// Raw NNUE psqt-head output (mover-POV), before any post-processing.
+    /// Pairs with `score_positional` and the network whose `score_eval_v`
+    /// was returned (post any `NetSelection=auto` re-evaluation).
+    ///
+    /// Only the `evallegal` protocol surfaces this. The right target for
+    /// hot-swap NNUE-replacement distillation: the student must reproduce
+    /// `(psqt, positional)`, and Stockfish itself applies the post-processing
+    /// on top — a student trained on `score_eval_v` would have it baked in
+    /// and Stockfish would apply it twice.
+    pub score_psqt: Option<f32>,
+    /// Raw NNUE positional-head output (mover-POV). See `score_psqt`.
+    pub score_positional: Option<f32>,
 }
 
 /// Result of a `go nodes N` call.
@@ -88,11 +103,15 @@ pub enum GoBudget {
     /// qsearch-resolved. Output: zero or more `info ... multipv ...` lines
     /// followed by `bestmove`.
     Nodes(u32),
-    /// `evallegal`. Pure NNUE static eval per legal move, no search loop,
-    /// every legal move scored. Output: a single
-    /// `info string evallegal <status> [<uci> <cp> <v>]...` line, where
-    /// `<cp>` is the normalized centipawn value and `<v>` is the raw
-    /// internal NNUE Value before normalization.
+    /// `evallegal`. Pure static eval per legal move, no search loop, every
+    /// legal move scored. Output: a single
+    /// `info string evallegal <status> [<uci> <cp> <eval_v> <psqt> <positional>]...`
+    /// line (sf_18-v0.3.0+). `<cp>` is the normalized centipawn value;
+    /// `<eval_v>` is `Eval::evaluate`'s post-processed Value before `to_cp`
+    /// (right target for play-policy distillation, what the sampler reads
+    /// under `sample_score=v`); `<psqt>` and `<positional>` are the raw
+    /// per-head NNUE outputs before any post-processing (right targets for
+    /// hot-swap NNUE-replacement distillation). All four mover-POV.
     EvalLegal,
 }
 
@@ -217,14 +236,31 @@ impl StockfishProcess {
 
         // Probe for the patched binary by sending `evallegal` against the
         // start position and tagging `is_patched` based on whether the
-        // response shape matches our protocol. `isready`/`readyok` is the
-        // synchronization barrier — vanilla SF emits `Unknown command:
-        // 'evallegal'` (one stdout line, then nothing more until readyok),
-        // patched SF emits `info string evallegal <status> ...`. Either way,
-        // we read until readyok so the channel is drained.
+        // response **parses as the v0.3.0+ 5-tuple shape**. Looking only at
+        // the `info string evallegal ` prefix is insufficient — older
+        // patched builds (sf_18-v0.1.0 / v0.2.0) emit the same prefix with
+        // a 3-tuple shape `<uci> <cp> <v>`, which our parser (strict
+        // 5-tuple now) silently degrades to zero candidates. That would
+        // mean a stale binary mid-run produces empty candidate lists and
+        // the worker dies on `NoCandidates` 200 plies in — much worse than
+        // failing fast at preflight.
+        //
+        // Concrete check: at startpos there are always 20 legal moves
+        // (UCI-invariant across SF versions). v0.3.0+ output: 5 * 20 = 100
+        // tokens after the status, parser yields 20 candidates. v0.2.0 /
+        // v0.1.0 output: 3 * 20 = 60 tokens, parser hits a UCI string
+        // where it expected an integer on the second iteration and bails
+        // with 0 candidates.
+        //
+        // `isready`/`readyok` is the synchronization barrier — vanilla SF
+        // emits `Unknown command: 'evallegal'` (one stdout line, then
+        // nothing more until readyok), patched SF emits the
+        // `info string evallegal ...` line. Either way, we read until
+        // readyok so the channel is drained.
         sf.send("position startpos")?;
         sf.send("evallegal")?;
         sf.send("isready")?;
+        let mut saw_evallegal_prefix = false;
         loop {
             sf.line_buf.clear();
             let n = sf.stdout.read_line(&mut sf.line_buf)?;
@@ -232,12 +268,28 @@ impl StockfishProcess {
                 return Err(StockfishError::UnexpectedEof);
             }
             let line = sf.line_buf.trim_end();
-            if line.starts_with("info string evallegal ") {
-                sf.is_patched = true;
+            if let Some(payload) = line.strip_prefix("info string evallegal ") {
+                saw_evallegal_prefix = true;
+                let parsed = parse_evallegal_payload(payload);
+                // Startpos has 20 legal moves and is non-terminal — under
+                // the v0.3.0+ shape the parser produces exactly 20
+                // candidates. A patched-but-old binary produces 0.
+                if parsed.terminal.is_none() && parsed.candidates.len() == 20 {
+                    sf.is_patched = true;
+                }
             }
             if line.starts_with("readyok") {
                 break;
             }
+        }
+        if saw_evallegal_prefix && !sf.is_patched {
+            return Err(StockfishError::Protocol(
+                "stockfish recognizes `evallegal` but emits a pre-v0.3.0 output shape \
+                 (expected `<uci> <cp> <eval_v> <psqt> <positional>` per legal move; got fewer fields). \
+                 Rebuild via `bash stockfish-datagen/scripts/build_patched_stockfish.sh` to pick up \
+                 the sf_18-v0.3.0 fork commit."
+                    .into(),
+            ));
         }
 
         Ok(sf)
@@ -402,7 +454,9 @@ impl StockfishProcess {
                         candidates: vec![Candidate {
                             uci: mv.to_string(),
                             score_cp: 0.0,
-                            score_v: None,
+                            score_eval_v: None,
+                            score_psqt: None,
+                            score_positional: None,
                         }],
                         terminal: None,
                     });
@@ -422,7 +476,9 @@ impl StockfishProcess {
                     Candidate {
                         uci: parsed.first_move,
                         score_cp: parsed.score_cp,
-                        score_v: None,
+                        score_eval_v: None,
+                        score_psqt: None,
+                        score_positional: None,
                     },
                 );
             } else if line.starts_with("info ")
@@ -446,10 +502,11 @@ impl StockfishProcess {
         }
     }
 
-    /// Parse the single `info string evallegal <status> [<uci> <cp>]...` line
-    /// produced by the patched binary's `evallegal` command. Other `info`
-    /// lines that may have leaked through (e.g. nnue init banners on first
-    /// call) are skipped.
+    /// Parse the single
+    /// `info string evallegal <status> [<uci> <cp> <eval_v> <psqt> <positional>]...`
+    /// line produced by the patched binary's `evallegal` command (sf_18-v0.3.0+).
+    /// Other `info` lines that may have leaked through (e.g. nnue init banners
+    /// on first call) are skipped.
     fn read_evallegal_response(&mut self) -> Result<CandidatesResult, StockfishError> {
         loop {
             self.line_buf.clear();
@@ -553,16 +610,17 @@ impl StockfishProcess {
 }
 
 /// Parse the payload portion of an `info string evallegal <payload>` line —
-/// `<payload>` is everything after the `evallegal ` prefix:
+/// `<payload>` is everything after the `evallegal ` prefix. Output shape is
+/// from sf_18-v0.3.0+:
 ///
 /// - `mate` / `stalemate` → empty candidates + matching `TerminalKind`
-/// - `none <uci> <cp> <v> <uci> <cp> <v> ...` → candidates list, no terminal
-/// - `check <uci> <cp> <v> ...` → candidates list, no terminal (in-check
-///   positions are NNUE-OOD; the caller is expected to flag/discard if
-///   they care, but we don't drop them on the engine's behalf)
+/// - `none  <uci> <cp> <eval_v> <psqt> <positional>  ...` → candidates list, no terminal
+/// - `check <uci> <cp> <eval_v> <psqt> <positional>  ...` → candidates list, no terminal
+///   (in-check positions are NNUE-OOD; the caller is expected to flag/discard
+///   if they care, but we don't drop them on the engine's behalf)
 ///
 /// Malformed payloads (unknown status, missing trailing tokens, unparseable
-/// integers) degrade gracefully — we keep whatever well-formed triplets we
+/// integers) degrade gracefully — we keep whatever well-formed 5-tuples we
 /// got and stop. Protocol-level violations should be impossible from our
 /// patched binary, and a stricter error here would risk killing a worker
 /// on the rare malformed line.
@@ -592,13 +650,19 @@ fn parse_evallegal_payload(payload: &str) -> CandidatesResult {
     let mut candidates = Vec::with_capacity(32);
     while let Some(uci) = it.next() {
         let Some(cp_tok) = it.next() else { break };
-        let Some(v_tok) = it.next() else { break };
+        let Some(eval_v_tok) = it.next() else { break };
+        let Some(psqt_tok) = it.next() else { break };
+        let Some(positional_tok) = it.next() else { break };
         let Ok(cp) = cp_tok.parse::<i32>() else { break };
-        let Ok(v) = v_tok.parse::<i32>() else { break };
+        let Ok(eval_v) = eval_v_tok.parse::<i32>() else { break };
+        let Ok(psqt) = psqt_tok.parse::<i32>() else { break };
+        let Ok(positional) = positional_tok.parse::<i32>() else { break };
         candidates.push(Candidate {
             uci: uci.to_string(),
             score_cp: cp as f32,
-            score_v: Some(v as f32),
+            score_eval_v: Some(eval_v as f32),
+            score_psqt: Some(psqt as f32),
+            score_positional: Some(positional as f32),
         });
     }
     CandidatesResult { candidates, terminal: None }
@@ -711,24 +775,36 @@ mod tests {
     }
 
     #[test]
-    fn parse_evallegal_none_triplets() {
-        let r = parse_evallegal_payload("none e2e4 27 75 d2d4 24 67 g1f3 -3 -8");
+    fn parse_evallegal_none_5tuples() {
+        // sf_18-v0.3.0+ shape: <uci> <cp> <eval_v> <psqt> <positional> per move.
+        let r = parse_evallegal_payload(
+            "none e2e4 27 75 80 -5 d2d4 24 67 70 -3 g1f3 -3 -8 -10 2",
+        );
         assert!(r.terminal.is_none());
         assert_eq!(r.candidates.len(), 3);
-        assert_eq!(r.candidates[0].uci, "e2e4");
-        assert!((r.candidates[0].score_cp - 27.0).abs() < 1e-6);
-        assert!((r.candidates[0].score_v.unwrap() - 75.0).abs() < 1e-6);
-        assert_eq!(r.candidates[2].uci, "g1f3");
-        assert!((r.candidates[2].score_cp - -3.0).abs() < 1e-6);
-        assert!((r.candidates[2].score_v.unwrap() - -8.0).abs() < 1e-6);
+        let c0 = &r.candidates[0];
+        assert_eq!(c0.uci, "e2e4");
+        assert!((c0.score_cp - 27.0).abs() < 1e-6);
+        assert!((c0.score_eval_v.unwrap() - 75.0).abs() < 1e-6);
+        assert!((c0.score_psqt.unwrap() - 80.0).abs() < 1e-6);
+        assert!((c0.score_positional.unwrap() - -5.0).abs() < 1e-6);
+        let c2 = &r.candidates[2];
+        assert_eq!(c2.uci, "g1f3");
+        assert!((c2.score_cp - -3.0).abs() < 1e-6);
+        assert!((c2.score_eval_v.unwrap() - -8.0).abs() < 1e-6);
+        assert!((c2.score_psqt.unwrap() - -10.0).abs() < 1e-6);
+        assert!((c2.score_positional.unwrap() - 2.0).abs() < 1e-6);
     }
 
     #[test]
-    fn parse_evallegal_check_triplets() {
-        let r = parse_evallegal_payload("check a8a7 -3 -10");
+    fn parse_evallegal_check_5tuple() {
+        let r = parse_evallegal_payload("check a8a7 -3 -10 -8 -2");
         assert!(r.terminal.is_none()); // in-check is NOT terminal
         assert_eq!(r.candidates.len(), 1);
-        assert!((r.candidates[0].score_v.unwrap() - -10.0).abs() < 1e-6);
+        let c0 = &r.candidates[0];
+        assert!((c0.score_eval_v.unwrap() - -10.0).abs() < 1e-6);
+        assert!((c0.score_psqt.unwrap() - -8.0).abs() < 1e-6);
+        assert!((c0.score_positional.unwrap() - -2.0).abs() < 1e-6);
     }
 
     #[test]
@@ -745,17 +821,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_evallegal_truncated_triplet_drops_partial() {
-        // Two well-formed triplets; the third is missing its v token. We keep
-        // the first two and stop — better than panicking on bad engine output.
-        let r = parse_evallegal_payload("none e2e4 10 35 d2d4 8 28 g1f3 -3");
+    fn parse_evallegal_truncated_5tuple_drops_partial() {
+        // Two well-formed 5-tuples; the third is missing its trailing tokens.
+        // Keep the first two and stop — better than panicking on bad output.
+        let r = parse_evallegal_payload(
+            "none e2e4 10 35 40 -5 d2d4 8 28 30 -2 g1f3 -3 -8",
+        );
         assert_eq!(r.candidates.len(), 2);
         assert_eq!(r.candidates[1].uci, "d2d4");
     }
 
     #[test]
-    fn parse_evallegal_unparseable_v_drops_remainder() {
-        let r = parse_evallegal_payload("none e2e4 10 35 d2d4 8 deadbeef");
+    fn parse_evallegal_unparseable_token_drops_remainder() {
+        let r = parse_evallegal_payload("none e2e4 10 35 40 -5 d2d4 8 28 deadbeef 0");
         assert_eq!(r.candidates.len(), 1);
         assert_eq!(r.candidates[0].uci, "e2e4");
     }

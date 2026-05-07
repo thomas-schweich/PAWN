@@ -95,10 +95,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG SF_FORK_REPO=https://github.com/thomas-schweich/stockfish-ml-extensions.git
 # Pin to commit SHA, not just tag. Lightweight git tags can be force-moved
 # on the remote and a `git clone --branch <tag>` would silently pick up the
-# new commit. The annotated tag `sf_18-v0.2.0` currently points at this
+# new commit. The annotated tag `sf_18-v0.3.0` currently points at this
 # commit; we pin to the SHA so a future tag move (accidental or otherwise)
 # fails the build loudly instead of silently changing the binary.
-ARG SF_FORK_COMMIT=777b88071fa00decaed2d1d6b1d4b2031bacb428
+ARG SF_FORK_COMMIT=14f92699733a3d24a9067a20b32f95f0fcf9c4ab
 # AVX2 is the lowest-common-denominator microarch we target; vanilla SF18
 # AVX2 vs AVX-512 produce bit-exact identical NNUE evals (int8 dot products
 # are vector-width-invariant), and the patched binary inherits that — so
@@ -290,18 +290,22 @@ COPY stockfish-datagen/examples /opt/datagen/examples
 
 # Smoke-test the runtime image: rust binary launches (success status is
 # the smoke), HF library imports, and the patched stockfish's `evallegal`
-# command produces the expected triplet shape on the start position. The
-# triplet check is skipped when INCLUDE_STOCKFISH=0 because the stub
-# binary above intentionally errors. The stockfish-datagen check uses
-# `> /dev/null` instead of `| head -1` so a missing or crashing binary
-# fails the build (`| head -1` always returns 0, masking failures).
+# command produces the expected sf_18-v0.3.0+ shape on the start position
+# (status `none`, then 5-tuples `<uci> <cp> <eval_v> <psqt> <positional>`
+# per legal move). The shape check is skipped when INCLUDE_STOCKFISH=0
+# because the stub binary above intentionally errors. The stockfish-datagen
+# check uses `> /dev/null` instead of `| head -1` so a missing or crashing
+# binary fails the build (`| head -1` always returns 0, masking failures).
+# The grep matches the leading status + first move's 5 fields (uci + 4
+# integers, including negatives), pinning the output shape to v0.3.0+ —
+# an older v0.2.0 binary's 3-field shape would not match.
 RUN stockfish-datagen --help > /dev/null \
     && python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)" \
     && if [ "$INCLUDE_STOCKFISH" = "1" ]; then \
         out=$(printf 'position startpos\nevallegal\nquit\n' \
             | /opt/datagen/stockfish-datagen/stockfish-patched 2>/dev/null) ; \
-        echo "$out" | grep -q '^info string evallegal none a2a3 ' \
-            || (echo "ERROR: patched stockfish missing or malformed evallegal output" >&2; exit 1) ; \
+        echo "$out" | grep -Eq '^info string evallegal none a2a3 -?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+ ' \
+            || (echo "ERROR: patched stockfish missing or output is not v0.3.0+ shape" >&2; exit 1) ; \
     fi
 
 # Dispatcher entrypoint:

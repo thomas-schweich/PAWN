@@ -6,11 +6,19 @@
 //! RNG state.
 //!
 //! `sample_score` chooses which per-move score to softmax over: `Cp`
-//! (normalized centipawns; default) or `V` (raw NNUE Value, only available
-//! from the `evallegal` protocol). The 100-factor in `scale` is constant
-//! across both modes — meaning the same nominal `T` is *sharper* under `V`
-//! because raw `v` magnitudes are 3–5× larger than `cp`. Pick higher `T`
-//! under `V` if you want comparable exploration.
+//! (normalized centipawns; default) or `V` (`Eval::evaluate`'s post-processed
+//! Value, only available from the `evallegal` protocol — what Stockfish
+//! actually plays with). The 100-factor in `scale` is constant across both
+//! modes — meaning the same nominal `T` is *sharper* under `V` because
+//! `eval_v` magnitudes are 3–5× larger than `cp` (the `to_cp` `a`-normalization
+//! shrinks them). Pick higher `T` under `V` if you want comparable exploration.
+//!
+//! `V` mode does NOT read the raw NNUE per-head outputs `(score_psqt,
+//! score_positional)` — those are stored on `Candidate` for downstream
+//! parquet emission (hot-swap NNUE distillation labels) but are not used
+//! for sampling. Sampling on raw NNUE would mean playing without the rule50
+//! / complexity / material adjustments that make Stockfish strong, which is
+//! categorically the wrong policy distribution.
 
 use rand::Rng;
 
@@ -20,12 +28,12 @@ use crate::stockfish::Candidate;
 /// Read the sampling score off a candidate per the chosen `SampleScore`.
 /// `V` mode panics on `None` — config validation guarantees this only
 /// happens when the candidates came from the `evallegal` protocol, where
-/// `score_v` is always populated.
+/// `score_eval_v` is always populated.
 fn pick_score(c: &Candidate, score: SampleScore) -> f32 {
     match score {
         SampleScore::Cp => c.score_cp,
         SampleScore::V => c
-            .score_v
+            .score_eval_v
             .expect("sample_score=V requires searchless=true; config validation should prevent this"),
     }
 }
@@ -93,7 +101,9 @@ mod tests {
             .map(|(i, &s)| Candidate {
                 uci: format!("a{}b{}", (i % 8) + 1, ((i + 1) % 8) + 1),
                 score_cp: s,
-                score_v: None,
+                score_eval_v: None,
+                score_psqt: None,
+                score_positional: None,
             })
             .collect()
     }
@@ -153,17 +163,35 @@ mod tests {
         assert!(counts.iter().all(|&c| c > 100), "uneven distribution: {counts:?}");
     }
 
-    /// V mode reads `score_v`, so a candidate with `score_v = Some(huge)` and
-    /// `score_cp = 0` should be argmax-picked at T=0 even though the cp tie
+    /// V mode reads `score_eval_v`, so a candidate with `score_eval_v = Some(huge)`
+    /// and `score_cp = 0` should be argmax-picked at T=0 even though the cp tie
     /// would otherwise let any candidate win.
     #[test]
-    fn v_mode_uses_score_v_not_cp() {
+    fn v_mode_uses_eval_v_not_cp() {
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        // All cp=0 (tied), but the second move has v=1000 (clearly best).
+        // All cp=0 (tied), but the second move has eval_v=1000 (clearly best).
         let c = vec![
-            Candidate { uci: "a1a2".into(), score_cp: 0.0, score_v: Some(0.0) },
-            Candidate { uci: "b1b2".into(), score_cp: 0.0, score_v: Some(1000.0) },
-            Candidate { uci: "c1c2".into(), score_cp: 0.0, score_v: Some(-500.0) },
+            Candidate {
+                uci: "a1a2".into(),
+                score_cp: 0.0,
+                score_eval_v: Some(0.0),
+                score_psqt: None,
+                score_positional: None,
+            },
+            Candidate {
+                uci: "b1b2".into(),
+                score_cp: 0.0,
+                score_eval_v: Some(1000.0),
+                score_psqt: None,
+                score_positional: None,
+            },
+            Candidate {
+                uci: "c1c2".into(),
+                score_cp: 0.0,
+                score_eval_v: Some(-500.0),
+                score_psqt: None,
+                score_positional: None,
+            },
         ];
         let pick = softmax_sample(&c, SampleScore::V, 0.0, &mut rng).unwrap();
         assert_eq!(pick.uci, "b1b2");
@@ -174,10 +202,22 @@ mod tests {
     /// picks differ from Cp picks when scores diverge.
     #[test]
     fn v_mode_diverges_from_cp_mode() {
-        // cp prefers a1a2 (cp=10), v prefers b1b2 (v=100).
+        // cp prefers a1a2 (cp=10), eval_v prefers b1b2 (eval_v=100).
         let c = vec![
-            Candidate { uci: "a1a2".into(), score_cp: 10.0, score_v: Some(20.0) },
-            Candidate { uci: "b1b2".into(), score_cp: 5.0, score_v: Some(100.0) },
+            Candidate {
+                uci: "a1a2".into(),
+                score_cp: 10.0,
+                score_eval_v: Some(20.0),
+                score_psqt: None,
+                score_positional: None,
+            },
+            Candidate {
+                uci: "b1b2".into(),
+                score_cp: 5.0,
+                score_eval_v: Some(100.0),
+                score_psqt: None,
+                score_positional: None,
+            },
         ];
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let cp_pick = softmax_sample(&c, SampleScore::Cp, 0.0, &mut rng).unwrap();

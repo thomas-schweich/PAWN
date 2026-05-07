@@ -487,10 +487,16 @@ fn run_worker(
         }
         let n = tokens.len();
 
-        // Convert per-ply candidates (UCI string + f32 cp + optional f32 raw v)
-        // into the packed (move_idx, score_cp, score_v?) form for distillation.
-        // We trust the engine vocab here — Stockfish has already produced legal
-        // UCI strings (the per-ply move choice was applied successfully above).
+        // Convert per-ply candidates into the packed `LegalMoveEval` form for
+        // distillation. The four raw-eval scalars come from the patched
+        // binary's `evallegal` (sf_18-v0.3.0+) — score_eval_v is the
+        // post-processed Eval::evaluate Value (right target for play-policy
+        // distillation), score_psqt + score_positional are the raw NNUE
+        // per-head outputs (right targets for hot-swap NNUE distillation).
+        // All `None` for multipv-sourced rows — we trust the engine vocab
+        // here; Stockfish has already produced legal UCI strings (the
+        // per-ply move choice was applied successfully above).
+        let to_i16_clamped = |x: f32| x.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
         let legal_move_evals = played.per_ply_candidates.map(|plies| {
             plies
                 .into_iter()
@@ -501,10 +507,10 @@ fn run_worker(
                             move_idx: chess_engine::vocab::uci_to_action(&c.uci)
                                 .expect("Stockfish-emitted UCI must be in our action vocab")
                                 as i16,
-                            score_cp: c.score_cp.clamp(i16::MIN as f32, i16::MAX as f32) as i16,
-                            score_v: c.score_v.map(|v| {
-                                v.clamp(i16::MIN as f32, i16::MAX as f32) as i16
-                            }),
+                            score_cp: to_i16_clamped(c.score_cp),
+                            score_eval_v: c.score_eval_v.map(to_i16_clamped),
+                            score_psqt: c.score_psqt.map(to_i16_clamped),
+                            score_positional: c.score_positional.map(to_i16_clamped),
                         })
                         .collect()
                 })

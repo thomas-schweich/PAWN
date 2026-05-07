@@ -100,11 +100,16 @@ pub struct TierConfig {
 
     /// When true, persist the full Stockfish candidates list for every ply
     /// alongside the played move. The parquet column is
-    /// `legal_move_evals: List<List<Struct{move_idx: i16, score_cp: i16, score_v: i16?}>>`,
+    /// `legal_move_evals: List<List<Struct{move_idx: i16, score_cp: i16,
+    /// score_eval_v: i16?, score_psqt: i16?, score_positional: i16?}>>`,
     /// indexed per game and per ply. Designed for distillation-style
-    /// training (KL loss vs the per-move softmax). Independent of
-    /// `searchless` — though the typical use case is `searchless=true`
-    /// + `store_legal_move_evals=true` for "tier 0" datasets.
+    /// training: `score_eval_v` for play-policy distillation (KL loss vs
+    /// the per-move softmax of post-processed Stockfish evals), or
+    /// `(score_psqt, score_positional)` for hot-swap NNUE-replacement
+    /// distillation (the raw NNUE per-head outputs that Stockfish's
+    /// `Eval::evaluate` then post-processes). Independent of `searchless`
+    /// — though the typical use case is `searchless=true` +
+    /// `store_legal_move_evals=true` for "tier 0" datasets.
     #[serde(default)]
     pub store_legal_move_evals: bool,
 
