@@ -14,13 +14,13 @@
 set -euo pipefail
 
 ARCH="${1:-x86-64-avx2}"
-# Pin to the v18.evallegal.0 tag of our fork — Stockfish 18 release
+# Pin to the v0.1.0 tag of our fork — based on Stockfish 18 release
 # (cb3d4ee9, tag sf_18 upstream) plus the additive `evallegal` UCI command.
 # Bundles nn-c288c895ea92.nnue (big) + nn-37f18f62d772.nnue (small), the same
-# NNUE weights as vanilla SF18. Patch is purely additive: every command other
-# than `evallegal` is bit-identical to vanilla SF18.
+# NNUE weights as vanilla SF18. Every command other than `evallegal` is
+# bit-identical to vanilla SF18.
 SF_REPO="https://github.com/thomas-schweich/stockfish-ml-extensions.git"
-SF_TAG="v18.evallegal.0"
+SF_TAG="v0.1.0"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SF_DIR="$ROOT_DIR/upstream-stockfish"
 OUT_BIN="$ROOT_DIR/stockfish-patched"
