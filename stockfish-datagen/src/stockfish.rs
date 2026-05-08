@@ -94,9 +94,12 @@ pub enum TerminalKind {
 /// `EvalLegal` requires a Stockfish binary built from
 /// `scripts/build_patched_stockfish.sh` (the patched binary adds the
 /// `evallegal` UCI command). On a vanilla Stockfish the command yields
-/// `Unknown command: 'evallegal'` and the worker fails fast — the spawn-time
-/// probe in [`StockfishProcess::spawn`] catches the mismatch before it could
-/// silently corrupt a tier.
+/// `Unknown command: 'evallegal'`. The mismatch is detected at spawn time
+/// — [`StockfishProcess::spawn`] sets `is_patched=false` — and gated by
+/// `preflight_check_patched_binary` (in `main.rs`), which bails before any
+/// worker spawns when a tier requires the patch but the binary doesn't
+/// have it. Library callers that bypass `main.rs` must run the same gate
+/// themselves; inspect `StockfishProcess::is_patched` after `spawn`.
 #[derive(Debug, Clone, Copy)]
 pub enum GoBudget {
     /// `go nodes N`. Standard search-tree budget; per-move scores are
@@ -841,6 +844,33 @@ mod tests {
         let r = parse_evallegal_payload("none e2e4 10 35 40 -5 d2d4 8 28 deadbeef 0");
         assert_eq!(r.candidates.len(), 1);
         assert_eq!(r.candidates[0].uci, "e2e4");
+    }
+
+    /// Regression test pinning the contract the spawn-time probe relies
+    /// on: a v0.2.0 (`<uci> <cp> <v>`) 3-tuple shape parses to **zero**
+    /// candidates under the strict 5-tuple parser. The probe checks
+    /// `candidates.len() == 20` at startpos and leaves `is_patched=false`
+    /// when the count is wrong; if a future refactor of the parser ever
+    /// allowed a stale 3-tuple to silently parse to a non-zero count, the
+    /// probe would mark a stale binary as patched, the workers would run
+    /// against `evallegal` output that's missing fields, and search-only
+    /// configs (which now waive the patched-binary check entirely) would
+    /// silently miscompute `score_eval_v` from a UCI-string token.
+    #[test]
+    fn parse_evallegal_v020_three_tuple_produces_zero_candidates() {
+        // v0.2.0 startpos shape: `<uci> <cp> <v>` × 20. The parser tries
+        // to read the 4th token as `psqt` (i32), hits the next move's UCI
+        // string, fails the parse, breaks out — without ever pushing a
+        // candidate.
+        let r = parse_evallegal_payload(
+            "none a2a3 0 0 b2b3 0 0 c2c3 0 0 d2d3 0 0 e2e3 0 0",
+        );
+        assert_eq!(
+            r.candidates.len(),
+            0,
+            "v0.2.0 3-tuple shape must produce zero candidates so the \
+             spawn-time probe leaves is_patched=false on a stale binary",
+        );
     }
 
     /// Resolve the Stockfish binary for a live test. Tests that use this

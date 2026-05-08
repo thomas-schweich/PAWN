@@ -336,10 +336,13 @@ pub fn run_tier(
 
 /// Saturating cast from f32 to i16, used to pack `evallegal` /
 /// multipv-derived scores into the parquet `LegalMoveEval` struct.
-/// Out-of-range inputs clamp to ±32767 (no panic, no wraparound). NaN
-/// inputs propagate through `f32::clamp` and cast to 0 under Rust's
-/// saturating-cast spec — the parser only feeds finite values here, so
-/// this is a defense-in-depth path rather than a live concern.
+/// Out-of-range inputs clamp to ±32767 (no panic, no wraparound).
+///
+/// NaN handling: `f32::clamp` propagates NaN through (it panics only if
+/// the bounds themselves are NaN, not the input), and `NaN as i16` is
+/// defined as 0 under Rust's saturating-cast spec (RFC 3173, since
+/// Rust 1.45). The parser only feeds finite integer-derived f32 values
+/// here, so NaN can't actually arise — this is defense in depth.
 fn f32_to_i16_clamped(x: f32) -> i16 {
     x.clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
