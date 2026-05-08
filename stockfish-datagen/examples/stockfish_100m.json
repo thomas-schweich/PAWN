@@ -1,62 +1,61 @@
 {
-  "stockfish_path": "~/bin/stockfish",
+  "stockfish_path": "stockfish-datagen/stockfish-patched",
   "stockfish_version": "Stockfish 18",
   "output_dir": "data/stockfish",
   "master_seed": 42,
-  "n_workers": 12,
+  "n_workers": 126,
   "max_ply": 512,
   "stockfish_hash_mb": 16,
-  "shard_size_games": 10000,
+  "shard_size_games": 2000,
   "tiers": [
+    {
+      "name": "tier0_evallegal",
+      "n_games": 20000000,
+      "temperature": 0.5,
+      "searchless": true,
+      "store_legal_move_evals": true,
+      "sample_score": "v",
+      "net_selection": "large"
+    },
     {
       "name": "nodes_0001",
       "nodes": 1,
-      "n_games": 4000000,
+      "n_games": 20000000,
       "multi_pv": 5,
       "opening_multi_pv": 20,
       "opening_plies": 2,
       "sample_plies": 999,
-      "temperature": 1.0
-    },
-    {
-      "name": "nodes_0032",
-      "nodes": 32,
-      "n_games": 4000000,
-      "multi_pv": 5,
-      "opening_multi_pv": 20,
-      "opening_plies": 2,
-      "sample_plies": 999,
-      "temperature": 1.0
+      "temperature": 0.5
     },
     {
       "name": "nodes_0128",
       "nodes": 128,
-      "n_games": 4000000,
+      "n_games": 20000000,
       "multi_pv": 5,
       "opening_multi_pv": 20,
       "opening_plies": 2,
       "sample_plies": 999,
-      "temperature": 1.0
+      "temperature": 0.5
     },
     {
       "name": "nodes_0256",
       "nodes": 256,
-      "n_games": 4000000,
+      "n_games": 20000000,
       "multi_pv": 5,
       "opening_multi_pv": 20,
       "opening_plies": 2,
       "sample_plies": 999,
-      "temperature": 1.0
+      "temperature": 0.5
     },
     {
       "name": "nodes_1024",
       "nodes": 1024,
-      "n_games": 4000000,
+      "n_games": 20000000,
       "multi_pv": 5,
       "opening_multi_pv": 20,
       "opening_plies": 2,
       "sample_plies": 999,
-      "temperature": 1.0
+      "temperature": 0.5
     }
   ]
 }

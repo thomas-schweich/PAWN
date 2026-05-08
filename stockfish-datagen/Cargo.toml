@@ -47,5 +47,12 @@ sha2 = "0.10"
 # Misc.
 once_cell = "1.19"
 
+# CPU pinning for the (worker thread, Stockfish process) pair. core_affinity
+# handles the calling thread; libc::sched_setaffinity is used directly to
+# pin the spawned Stockfish child PID to the same core. Linux-only at
+# runtime — both calls are #[cfg(target_os = "linux")] gated.
+core_affinity = "0.8"
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
