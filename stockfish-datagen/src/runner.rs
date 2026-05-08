@@ -334,6 +334,16 @@ pub fn run_tier(
     })
 }
 
+/// Saturating cast from f32 to i16, used to pack `evallegal` /
+/// multipv-derived scores into the parquet `LegalMoveEval` struct.
+/// Out-of-range inputs clamp to ±32767 (no panic, no wraparound). NaN
+/// inputs propagate through `f32::clamp` and cast to 0 under Rust's
+/// saturating-cast spec — the parser only feeds finite values here, so
+/// this is a defense-in-depth path rather than a live concern.
+fn f32_to_i16_clamped(x: f32) -> i16 {
+    x.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
+
 fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let epoch_secs = SystemTime::now()
@@ -496,7 +506,6 @@ fn run_worker(
         // All `None` for multipv-sourced rows — we trust the engine vocab
         // here; Stockfish has already produced legal UCI strings (the
         // per-ply move choice was applied successfully above).
-        let to_i16_clamped = |x: f32| x.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
         let legal_move_evals = played.per_ply_candidates.map(|plies| {
             plies
                 .into_iter()
@@ -507,10 +516,10 @@ fn run_worker(
                             move_idx: chess_engine::vocab::uci_to_action(&c.uci)
                                 .expect("Stockfish-emitted UCI must be in our action vocab")
                                 as i16,
-                            score_cp: to_i16_clamped(c.score_cp),
-                            score_eval_v: c.score_eval_v.map(to_i16_clamped),
-                            score_psqt: c.score_psqt.map(to_i16_clamped),
-                            score_positional: c.score_positional.map(to_i16_clamped),
+                            score_cp: f32_to_i16_clamped(c.score_cp),
+                            score_eval_v: c.score_eval_v.map(f32_to_i16_clamped),
+                            score_psqt: c.score_psqt.map(f32_to_i16_clamped),
+                            score_positional: c.score_positional.map(f32_to_i16_clamped),
                         })
                         .collect()
                 })

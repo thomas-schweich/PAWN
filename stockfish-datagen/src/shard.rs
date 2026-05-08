@@ -69,13 +69,13 @@ fn legal_move_eval_struct_fields() -> Fields {
 }
 
 fn legal_move_eval_struct_builders() -> Vec<Box<dyn ArrayBuilder>> {
-    vec![
-        Box::new(Int16Builder::new()),
-        Box::new(Int16Builder::new()),
-        Box::new(Int16Builder::new()),
-        Box::new(Int16Builder::new()),
-        Box::new(Int16Builder::new()),
-    ]
+    // Drive the builder count from the field count so adding / removing a
+    // field can never desync the two — `StructBuilder` panics at append
+    // time on a length mismatch, which is far harder to diagnose than the
+    // schema panicking at construction.
+    (0..legal_move_eval_struct_fields().len())
+        .map(|_| Box::new(Int16Builder::new()) as Box<dyn ArrayBuilder>)
+        .collect()
 }
 
 /// One row to be written. Constructed by the worker after a game finishes.
@@ -296,27 +296,18 @@ impl ShardWriter {
                         .field_builder::<Int16Builder>(1)
                         .expect("score_cp field 1")
                         .append_value(ev.score_cp);
-                    let eval_v_b = struct_b
+                    struct_b
                         .field_builder::<Int16Builder>(2)
-                        .expect("score_eval_v field 2");
-                    match ev.score_eval_v {
-                        Some(v) => eval_v_b.append_value(v),
-                        None => eval_v_b.append_null(),
-                    }
-                    let psqt_b = struct_b
+                        .expect("score_eval_v field 2")
+                        .append_option(ev.score_eval_v);
+                    struct_b
                         .field_builder::<Int16Builder>(3)
-                        .expect("score_psqt field 3");
-                    match ev.score_psqt {
-                        Some(v) => psqt_b.append_value(v),
-                        None => psqt_b.append_null(),
-                    }
-                    let positional_b = struct_b
+                        .expect("score_psqt field 3")
+                        .append_option(ev.score_psqt);
+                    struct_b
                         .field_builder::<Int16Builder>(4)
-                        .expect("score_positional field 4");
-                    match ev.score_positional {
-                        Some(v) => positional_b.append_value(v),
-                        None => positional_b.append_null(),
-                    }
+                        .expect("score_positional field 4")
+                        .append_option(ev.score_positional);
                     struct_b.append(true);
                 }
                 inner_list.append(true);

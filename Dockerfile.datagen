@@ -296,15 +296,19 @@ COPY stockfish-datagen/examples /opt/datagen/examples
 # because the stub binary above intentionally errors. The stockfish-datagen
 # check uses `> /dev/null` instead of `| head -1` so a missing or crashing
 # binary fails the build (`| head -1` always returns 0, masking failures).
-# The grep matches the leading status + first move's 5 fields (uci + 4
-# integers, including negatives), pinning the output shape to v0.3.0+ —
-# an older v0.2.0 binary's 3-field shape would not match.
+# The grep matches the leading status + a generic UCI move + 4 integers
+# (including negatives), pinning the output shape to v0.3.0+ — an older
+# v0.2.0 binary's 3-field shape would not match because the third int slot
+# would land on the next move's UCI token. The UCI is matched as
+# `[a-h][1-8][a-h][1-8]` (with optional promotion suffix) rather than a
+# specific move so this doesn't depend on Stockfish's legal-move
+# generation order at startpos.
 RUN stockfish-datagen --help > /dev/null \
     && python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)" \
     && if [ "$INCLUDE_STOCKFISH" = "1" ]; then \
         out=$(printf 'position startpos\nevallegal\nquit\n' \
             | /opt/datagen/stockfish-datagen/stockfish-patched 2>/dev/null) ; \
-        echo "$out" | grep -Eq '^info string evallegal none a2a3 -?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+ ' \
+        echo "$out" | grep -Eq '^info string evallegal none [a-h][1-8][a-h][1-8][qrbn]? -?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+ ' \
             || (echo "ERROR: patched stockfish missing or output is not v0.3.0+ shape" >&2; exit 1) ; \
     fi
 

@@ -218,7 +218,12 @@ impl StockfishProcess {
             child,
             stdin,
             stdout,
-            line_buf: String::with_capacity(4096),
+            // Sized for the v0.3.0 `evallegal` 5-tuple shape: a 218-legal-move
+            // position (the theoretical max) emits ~8 KB of tokens
+            // (`<uci> <cp> <eval_v> <psqt> <positional>` × 218 + status).
+            // Above the parquet 512-default to avoid the first ply forcing
+            // a regrowth; `read_line` will grow further on demand.
+            line_buf: String::with_capacity(8192),
             position_cmd: String::with_capacity(64 + 5 * 256),
             play_cmd: budget.render(),
             budget,
@@ -260,7 +265,6 @@ impl StockfishProcess {
         sf.send("position startpos")?;
         sf.send("evallegal")?;
         sf.send("isready")?;
-        let mut saw_evallegal_prefix = false;
         loop {
             sf.line_buf.clear();
             let n = sf.stdout.read_line(&mut sf.line_buf)?;
@@ -269,11 +273,11 @@ impl StockfishProcess {
             }
             let line = sf.line_buf.trim_end();
             if let Some(payload) = line.strip_prefix("info string evallegal ") {
-                saw_evallegal_prefix = true;
                 let parsed = parse_evallegal_payload(payload);
                 // Startpos has 20 legal moves and is non-terminal — under
                 // the v0.3.0+ shape the parser produces exactly 20
-                // candidates. A patched-but-old binary produces 0.
+                // candidates. A patched-but-old binary produces 0, so
+                // `is_patched` correctly stays false.
                 if parsed.terminal.is_none() && parsed.candidates.len() == 20 {
                     sf.is_patched = true;
                 }
@@ -282,15 +286,16 @@ impl StockfishProcess {
                 break;
             }
         }
-        if saw_evallegal_prefix && !sf.is_patched {
-            return Err(StockfishError::Protocol(
-                "stockfish recognizes `evallegal` but emits a pre-v0.3.0 output shape \
-                 (expected `<uci> <cp> <eval_v> <psqt> <positional>` per legal move; got fewer fields). \
-                 Rebuild via `bash stockfish-datagen/scripts/build_patched_stockfish.sh` to pick up \
-                 the sf_18-v0.3.0 fork commit."
-                    .into(),
-            ));
-        }
+        // Deliberately no error here for stale-shape patched binaries
+        // (v0.1.0/v0.2.0 emit the prefix but parse to 0 candidates under
+        // the strict 5-tuple parser). Gating belongs in
+        // `preflight_check_patched_binary`, which waives the patched-binary
+        // requirement entirely for configs whose tiers don't set
+        // `searchless` or `net_selection`. Erroring at spawn time would
+        // break those legitimate search-only runs even though they never
+        // consume `evallegal`. Configs that DO need the patch see
+        // `is_patched=false` and bail loudly in preflight before any
+        // worker spawns.
 
         Ok(sf)
     }

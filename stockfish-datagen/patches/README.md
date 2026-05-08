@@ -36,8 +36,9 @@ dropped at `stockfish-datagen/stockfish-patched`. The Dockerfile uses
 the same SHA pin (a lightweight tag could be force-moved on the remote
 and silently change the binary).
 
-The runner's preflight checks gate startup on three distinct binary
-capabilities, all detected during the UCI handshake:
+The runner's preflight checks gate startup on two distinct binary
+capabilities, both probed at spawn time (one during the UCI handshake,
+one immediately after):
 
 - **`evallegal` UCI command + v0.3.0 output shape** — required if any
   tier sets `searchless: true` or `net_selection: <X>`. Vanilla SF
