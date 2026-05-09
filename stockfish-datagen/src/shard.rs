@@ -356,8 +356,29 @@ impl ShardWriter {
         let batch = RecordBatch::try_new(SCHEMA.clone(), columns)
             .context("building record batch")?;
 
+        // zstd-19 + 16 MB pages chosen empirically: ~22% smaller files vs the
+        // writer default (zstd-3, 1 MB pages). Sweep on a 1000-game shard
+        // (pyarrow rewrite, comparable but not identical to the rust crate's
+        // numbers):
+        //   zstd-3  +  1 MB:   baseline
+        //   zstd-9  +  8 MB:  -14.8%, 0.97 s/shard
+        //   zstd-15 +  8 MB:  -16.8%, 2.51 s/shard
+        //   zstd-19 +  8 MB:  -21.0%, 4.40 s/shard
+        //   zstd-19 + 16 MB:  -22.6%, 4.85 s/shard   ← chosen
+        //   zstd-22 +  8 MB:  -21.0%, 4.94 s/shard   (plateau, no gain past 19)
+        //
+        // Decompression speed is independent of zstd level, so training
+        // pipelines and downstream consumers see no read-side change.
+        //
+        // Per-shard write is BLOCKING on the worker thread (compress + fsync +
+        // rename happen inline), so a higher zstd level eats into wall-clock.
+        // At ~5 s/shard close cost and 1000-game shards, this is roughly
+        // 1 s blocked per ~70 s worker step ≈ 7 % wall-clock — acceptable for
+        // multi-day generation runs that pay it back many times over via
+        // smaller HF dataset uploads, training cache, etc.
         let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(19)?))
+            .set_data_page_size_limit(16 * 1024 * 1024)
             .build();
 
         {
