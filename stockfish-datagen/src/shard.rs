@@ -78,6 +78,60 @@ fn legal_move_eval_struct_builders() -> Vec<Box<dyn ArrayBuilder>> {
         .collect()
 }
 
+/// Append one row's per-ply per-move payload to a `List<List<Struct>>`
+/// column builder. Used by both `legal_move_evals` (non-nullable column,
+/// `none_is_empty_list = true`) and `static_legal_move_evals` (nullable
+/// column, `none_is_empty_list = false`).
+///
+/// When `plies` is `None`:
+/// - `none_is_empty_list = true`: append a row-level empty list `[]`.
+///   Schema is non-null at the row level; downstream readers see an empty
+///   outer list rather than a row-level null.
+/// - `none_is_empty_list = false`: append a row-level null. Distinguishes
+///   "tier opted out of this column" (null) from "tier opted in but the
+///   game had zero plies" (empty list).
+fn append_eval_column(
+    col: &mut ListBuilder<ListBuilder<StructBuilder>>,
+    plies: Option<&[Vec<LegalMoveEval>]>,
+    none_is_empty_list: bool,
+) {
+    if let Some(plies) = plies {
+        let inner_list = col.values();
+        for ply_evals in plies {
+            let struct_b = inner_list.values();
+            for ev in ply_evals {
+                struct_b
+                    .field_builder::<Int16Builder>(0)
+                    .expect("move_idx field 0")
+                    .append_value(ev.move_idx);
+                struct_b
+                    .field_builder::<Int16Builder>(1)
+                    .expect("score_cp field 1")
+                    .append_value(ev.score_cp);
+                struct_b
+                    .field_builder::<Int16Builder>(2)
+                    .expect("score_eval_v field 2")
+                    .append_option(ev.score_eval_v);
+                struct_b
+                    .field_builder::<Int16Builder>(3)
+                    .expect("score_psqt field 3")
+                    .append_option(ev.score_psqt);
+                struct_b
+                    .field_builder::<Int16Builder>(4)
+                    .expect("score_positional field 4")
+                    .append_option(ev.score_positional);
+                struct_b.append(true);
+            }
+            inner_list.append(true);
+        }
+        col.append(true);
+    } else if none_is_empty_list {
+        col.append(true); // empty outer list at row level
+    } else {
+        col.append(false); // row-level null
+    }
+}
+
 /// One row to be written. Constructed by the worker after a game finishes.
 #[derive(Debug, Clone)]
 pub struct GameRow {
@@ -111,13 +165,34 @@ pub struct GameRow {
     pub worker_id: i16,
     pub game_seed: u64,
     pub stockfish_version: String,
-    /// Per-ply per-legal-move NNUE eval payload. `None` when the tier did
-    /// not request distillation data (non-storing tiers leave the parquet
-    /// column as an empty list, paying only a few bytes of offsets per
-    /// row). `Some(Vec)` outer length equals `game_length`; inner lengths
-    /// are the number of legal moves at each ply (capped by the tier's
-    /// MultiPV). See `TierConfig::store_legal_move_evals`.
+    /// Per-ply per-legal-move payload from the tier's *selection* engine
+    /// call. `None` when the tier did not request distillation data
+    /// (non-storing tiers leave the parquet column as an empty list,
+    /// paying only a few bytes of offsets per row). `Some(Vec)` outer
+    /// length equals `game_length`; inner lengths are the number of
+    /// candidates the selection engine produced at each ply (capped by
+    /// the tier's MultiPV for search-mode; full legal-move set for
+    /// searchless / evallegal). The semantics of each `LegalMoveEval`'s
+    /// score fields therefore depend on tier mode — search-mode rows
+    /// only populate `score_cp`; searchless rows populate all five.
+    /// See `TierConfig::store_legal_move_evals`.
     pub legal_move_evals: Option<Vec<Vec<LegalMoveEval>>>,
+    /// Per-ply per-legal-move *canonical* NNUE static eval payload (full
+    /// `evallegal` output), captured by a separate engine call regardless
+    /// of how the move was actually selected. Same Struct shape as
+    /// `legal_move_evals` but with all five score fields populated and
+    /// the full legal-move set per ply (no MultiPV cap, move-gen ordering).
+    ///
+    /// `None` for: tiers that didn't set `store_legal_move_evals: true`,
+    /// AND for searchless tiers (where the same data already lives in
+    /// `legal_move_evals` — capturing it again would double the storage
+    /// cost on tier-0 distillation data).
+    ///
+    /// Convention for downstream consumers: read the canonical static
+    /// eval as `static_legal_move_evals if not None else legal_move_evals`.
+    /// This null-on-searchless rule keeps the schema uniform without
+    /// duplicating ~16 KB/game on the largest tier.
+    pub static_legal_move_evals: Option<Vec<Vec<LegalMoveEval>>>,
 }
 
 pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
@@ -167,7 +242,14 @@ pub static SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
         // handle this correctly.
         Field::new("game_seed", DataType::UInt64, false),
         Field::new("stockfish_version", DataType::Utf8, false),
-        Field::new("legal_move_evals", eval_outer_list_dt, false),
+        Field::new("legal_move_evals", eval_outer_list_dt.clone(), false),
+        // Canonical NNUE static eval per legal move per ply, captured via
+        // a separate `evallegal` call regardless of selection mode.
+        // Nullable at the row level so searchless tiers can leave it null
+        // (their `legal_move_evals` already contains the same data) and
+        // for forward-compat with shards generated before this column
+        // existed (readers see null, not a missing-column error).
+        Field::new("static_legal_move_evals", eval_outer_list_dt, true),
     ]))
 });
 
@@ -197,6 +279,7 @@ pub struct ShardWriter {
     game_seed: UInt64Builder,
     stockfish_version: StringBuilder,
     legal_move_evals: ListBuilder<ListBuilder<StructBuilder>>,
+    static_legal_move_evals: ListBuilder<ListBuilder<StructBuilder>>,
     n_rows: usize,
 }
 
@@ -236,6 +319,10 @@ impl ShardWriter {
             game_seed: UInt64Builder::new(),
             stockfish_version: StringBuilder::new(),
             legal_move_evals: ListBuilder::new(ListBuilder::new(StructBuilder::new(
+                legal_move_eval_struct_fields(),
+                legal_move_eval_struct_builders(),
+            ))),
+            static_legal_move_evals: ListBuilder::new(ListBuilder::new(StructBuilder::new(
                 legal_move_eval_struct_fields(),
                 legal_move_eval_struct_builders(),
             ))),
@@ -283,37 +370,17 @@ impl ShardWriter {
         // empty (still non-null at row level — schema declares the column
         // non-null and downstream readers find an empty `[]` rather than
         // having to handle row-level nulls).
-        if let Some(plies) = &row.legal_move_evals {
-            let inner_list = self.legal_move_evals.values();
-            for ply_evals in plies {
-                let struct_b = inner_list.values();
-                for ev in ply_evals {
-                    struct_b
-                        .field_builder::<Int16Builder>(0)
-                        .expect("move_idx field 0")
-                        .append_value(ev.move_idx);
-                    struct_b
-                        .field_builder::<Int16Builder>(1)
-                        .expect("score_cp field 1")
-                        .append_value(ev.score_cp);
-                    struct_b
-                        .field_builder::<Int16Builder>(2)
-                        .expect("score_eval_v field 2")
-                        .append_option(ev.score_eval_v);
-                    struct_b
-                        .field_builder::<Int16Builder>(3)
-                        .expect("score_psqt field 3")
-                        .append_option(ev.score_psqt);
-                    struct_b
-                        .field_builder::<Int16Builder>(4)
-                        .expect("score_positional field 4")
-                        .append_option(ev.score_positional);
-                    struct_b.append(true);
-                }
-                inner_list.append(true);
-            }
-        }
-        self.legal_move_evals.append(true);
+        append_eval_column(&mut self.legal_move_evals, row.legal_move_evals.as_deref(), true);
+
+        // static_legal_move_evals: nullable column (schema-level), so when
+        // None we append a row-level null rather than an empty list. This
+        // distinguishes "tier opted out of static labels" (null) from
+        // "tier opted in but the game had zero plies" (empty list).
+        append_eval_column(
+            &mut self.static_legal_move_evals,
+            row.static_legal_move_evals.as_deref(),
+            false,
+        );
 
         self.n_rows += 1;
     }
@@ -352,6 +419,7 @@ impl ShardWriter {
             Arc::new(self.game_seed.finish()),
             Arc::new(self.stockfish_version.finish()),
             Arc::new(self.legal_move_evals.finish()),
+            Arc::new(self.static_legal_move_evals.finish()),
         ];
         let batch = RecordBatch::try_new(SCHEMA.clone(), columns)
             .context("building record batch")?;
@@ -445,6 +513,7 @@ mod tests {
             game_seed: seed,
             stockfish_version: "Stockfish 18 by ...".into(),
             legal_move_evals: None,
+            static_legal_move_evals: None,
         }
     }
 

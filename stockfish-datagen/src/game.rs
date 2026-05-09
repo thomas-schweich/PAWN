@@ -41,20 +41,33 @@ use thiserror::Error;
 use crate::config::TierConfig;
 use crate::outcome::OutcomeReason;
 use crate::sampler::softmax_sample;
-use crate::stockfish::{Candidate, StockfishError, StockfishProcess};
+use crate::stockfish::{Candidate, GoBudget, StockfishError, StockfishProcess};
 
 /// Fully-played game.
 #[derive(Debug, Clone)]
 pub struct PlayedGame {
     pub uci_moves: Vec<String>,
     pub outcome: OutcomeReason,
-    /// Per-ply candidates list (one inner Vec per ply, in play order),
-    /// captured iff the tier had `store_legal_move_evals = true`. When
-    /// the flag is off this is `None` to avoid the per-ply Vec allocation
-    /// overhead in tiers that don't need it. The semantics of each
-    /// `Candidate.score_cp` depend on the tier's go-budget (qsearch-resolved
-    /// for `Nodes(_)` tiers, raw NNUE static eval for `EvalLegal` tiers).
+    /// Per-ply candidates list (one inner Vec per ply, in play order) from
+    /// the tier's *selection* engine call. Captured iff the tier had
+    /// `store_legal_move_evals = true`. When the flag is off this is
+    /// `None` to avoid the per-ply Vec allocation overhead in tiers that
+    /// don't need it. The semantics of each `Candidate.score_cp` depend
+    /// on the tier's go-budget (qsearch-resolved cp + None per-head fields
+    /// for `Nodes(_)` tiers; raw NNUE static eval + populated per-head
+    /// fields for `EvalLegal` tiers).
     pub per_ply_candidates: Option<Vec<Vec<Candidate>>>,
+    /// Per-ply *static* candidates list (full evallegal output, every
+    /// legal move with `score_cp` + `score_eval_v` + `score_psqt` +
+    /// `score_positional` populated), captured iff the tier had
+    /// `store_legal_move_evals = true` AND was a non-searchless tier (on
+    /// searchless tiers the same data is already in `per_ply_candidates`,
+    /// so this stays `None` to avoid duplication). Populated by a
+    /// *separate* `evallegal` call after each ply's selection — the
+    /// per-position teacher signal stays pure NNUE static eval regardless
+    /// of how the move was actually selected. Requires the patched binary
+    /// (preflight check enforces this when any tier sets the flag).
+    pub per_ply_static_candidates: Option<Vec<Vec<Candidate>>>,
 }
 
 #[derive(Debug, Error)]
@@ -179,6 +192,18 @@ pub fn play_game<R: Rng + ?Sized>(
     } else {
         None
     };
+    // For non-searchless tiers that opted into store_legal_move_evals, ALSO
+    // capture the canonical NNUE static eval per legal move per ply via a
+    // separate `evallegal` call. On searchless tiers `per_ply_candidates`
+    // already IS the evallegal output, so this stays None to avoid
+    // duplicating ~16 KB/game of identical data. Preflight check enforces
+    // the patched-binary requirement when this flag is set.
+    let capture_static = tier.store_legal_move_evals && !tier.searchless;
+    let mut per_ply_static_candidates: Option<Vec<Vec<Candidate>>> = if capture_static {
+        Some(Vec::with_capacity(128))
+    } else {
+        None
+    };
 
     for ply in 0..max_ply {
         let cur_hash = *history.last().unwrap();
@@ -186,7 +211,12 @@ pub fn play_game<R: Rng + ?Sized>(
         // contract is "count of current_hash in history", so >= 3 means
         // the position has now occurred 3 times — the FIDE threshold.
         if let Some(reason) = detect_pre_eval_terminal(&board, &history, cur_hash, ply as usize) {
-            return Ok(PlayedGame { uci_moves: moves, outcome: reason, per_ply_candidates });
+            return Ok(PlayedGame {
+                uci_moves: moves,
+                outcome: reason,
+                per_ply_candidates,
+                per_ply_static_candidates,
+            });
         }
 
         // MultiPV scheduling only applies in non-searchless mode. In
@@ -231,6 +261,7 @@ pub fn play_game<R: Rng + ?Sized>(
                 uci_moves: moves,
                 outcome: OutcomeReason::FiftyMoveRule,
                 per_ply_candidates,
+                per_ply_static_candidates,
             });
         }
 
@@ -239,6 +270,18 @@ pub fn play_game<R: Rng + ?Sized>(
         // clone. Cheap when the tier doesn't request it (None path skips).
         if let Some(buf) = per_ply_candidates.as_mut() {
             buf.push(res.candidates.clone());
+        }
+
+        // Capture the canonical NNUE static eval per legal move via a
+        // separate `evallegal` call BEFORE we apply the move. Doing it
+        // here (not after) ensures the position cache reflects the
+        // pre-move state, matching what `legal_move_evals` covers.
+        if let Some(buf) = per_ply_static_candidates.as_mut() {
+            let teacher = sf.candidates_with(GoBudget::EvalLegal)?;
+            if teacher.candidates.is_empty() {
+                return Err(GameError::NoCandidates);
+            }
+            buf.push(teacher.candidates);
         }
 
         let pick = if target_pv == Some(1) {
@@ -281,7 +324,12 @@ pub fn play_game<R: Rng + ?Sized>(
     let final_hash = *history.last().unwrap();
     let outcome = detect_pre_eval_terminal(&board, &history, final_hash, moves.len())
         .unwrap_or(OutcomeReason::PlyLimit);
-    Ok(PlayedGame { uci_moves: moves, outcome, per_ply_candidates })
+    Ok(PlayedGame {
+        uci_moves: moves,
+        outcome,
+        per_ply_candidates,
+        per_ply_static_candidates,
+    })
 }
 
 #[cfg(test)]
@@ -446,6 +494,126 @@ mod tests {
             opening_plies: Some(2),
             sample_plies: Some(12),
         }
+    }
+
+    /// End-to-end: a non-searchless tier with `store_legal_move_evals: true`
+    /// produces evallegal-shaped `static_legal_move_evals` at every ply
+    /// (full per-legal-move static eval, all four score fields populated)
+    /// alongside the existing search-multipv `legal_move_evals`. The two
+    /// columns describe the same plies but with different move sets:
+    /// search-multipv has `<= multi_pv` candidates; static_legal has every
+    /// legal move at that ply.
+    #[test]
+    #[ignore = "requires patched stockfish ($STOCKFISH_PATH or stockfish-datagen/stockfish-patched)"]
+    fn live_search_tier_with_static_legal_move_evals() {
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha8Rng;
+        let path = stockfish_path();
+        let mut sf = StockfishProcess::spawn(
+            &path,
+            "Stockfish",
+            16,
+            crate::stockfish::GoBudget::Nodes(1),
+        ).unwrap();
+        assert!(sf.is_patched, "test requires the v0.3.0+ patched binary");
+        let mut tier = smoke_tier();
+        tier.store_legal_move_evals = true;
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let game = play_game(&mut sf, &mut rng, &tier, 64).unwrap();
+
+        // Both columns should be populated and parallel-shaped.
+        let multipv = game.per_ply_candidates
+            .as_ref()
+            .expect("store_legal_move_evals=true → per_ply_candidates Some");
+        let static_lme = game.per_ply_static_candidates
+            .as_ref()
+            .expect("non-searchless + store_legal_move_evals=true → per_ply_static_candidates Some");
+        assert_eq!(multipv.len(), game.uci_moves.len(),
+                   "multipv: one per-ply entry per move played");
+        assert_eq!(static_lme.len(), game.uci_moves.len(),
+                   "static_lme: one per-ply entry per move played");
+
+        // The search-multipv column should be capped at `opening_multi_pv`
+        // for ply < opening_plies, and at `multi_pv` for ply >= opening_plies
+        // (then top-1 once ply >= sample_plies, but our smoke_tier sets
+        // sample_plies=12 so we'd see a mix). The static_legal column
+        // should have all legal moves (typically 20-40 in opening) and
+        // ALL four score fields populated on every entry.
+        let opening_mpv = tier.opening_multi_pv.unwrap() as usize;
+        let main_mpv = tier.multi_pv.unwrap() as usize;
+        let opening_plies = tier.opening_plies.unwrap() as usize;
+        for (ply, (mpv, stat)) in multipv.iter().zip(static_lme).enumerate() {
+            let cap = if ply < opening_plies { opening_mpv } else { main_mpv };
+            assert!(!mpv.is_empty(), "ply {ply}: empty multipv");
+            assert!(mpv.len() <= cap,
+                    "ply {ply}: multipv len {} > cap {cap}", mpv.len());
+            // Search-mode candidates only carry cp.
+            for c in mpv {
+                assert!(c.score_eval_v.is_none(),
+                        "ply {ply}: search-mode candidate has score_eval_v populated — \
+                         multipv parser shouldn't surface raw v");
+            }
+
+            // static_legal should have FULL evallegal output.
+            assert!(!stat.is_empty(), "ply {ply}: empty static_legal");
+            for c in stat {
+                assert!(c.score_eval_v.is_some(),
+                        "ply {ply} candidate {:?}: score_eval_v=None — \
+                         the per-ply evallegal call isn't firing on this code path", c.uci);
+                assert!(c.score_psqt.is_some(), "ply {ply}: score_psqt missing");
+                assert!(c.score_positional.is_some(), "ply {ply}: score_positional missing");
+            }
+        }
+
+        // Sanity: at least one POST-opening ply should have the static
+        // set strictly larger than the multipv set (i.e. there are
+        // positions with more than `multi_pv` legal moves — true for
+        // almost any middlegame). Opening plies use opening_multi_pv=20
+        // which equals startpos legal-move count, so they coincide.
+        let any_wider = multipv.iter().zip(static_lme)
+            .skip(opening_plies)
+            .any(|(m, s)| s.len() > m.len());
+        assert!(any_wider,
+                "expected at least one post-opening ply where static_legal has more entries than multipv (multi_pv={main_mpv})");
+
+        sf.shutdown();
+    }
+
+    /// Searchless tier with `store_legal_move_evals: true` should leave
+    /// `per_ply_static_candidates = None` — the data already lives in
+    /// `per_ply_candidates`, so duplicating would double tier-0 storage.
+    #[test]
+    #[ignore = "requires patched stockfish ($STOCKFISH_PATH or stockfish-datagen/stockfish-patched)"]
+    fn live_searchless_tier_skips_redundant_static_capture() {
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha8Rng;
+        let path = stockfish_path();
+        let mut sf = StockfishProcess::spawn(
+            &path,
+            "Stockfish",
+            16,
+            crate::stockfish::GoBudget::EvalLegal,
+        ).unwrap();
+        let tier = TierConfig {
+            name: "searchless_smoke".into(),
+            n_games: 1,
+            temperature: 0.5,
+            searchless: true,
+            store_legal_move_evals: true,
+            sample_score: Some(crate::config::SampleScore::V),
+            net_selection: None,
+            nodes: None,
+            multi_pv: None,
+            opening_multi_pv: None,
+            opening_plies: None,
+            sample_plies: None,
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+        let game = play_game(&mut sf, &mut rng, &tier, 64).unwrap();
+        assert!(game.per_ply_candidates.is_some());
+        assert!(game.per_ply_static_candidates.is_none(),
+                "searchless tier should leave per_ply_static_candidates=None to avoid duplicating data");
+        sf.shutdown();
     }
 
     /// Live test: play one game with a real Stockfish, verify it terminated

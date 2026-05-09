@@ -509,7 +509,15 @@ fn run_worker(
         // All `None` for multipv-sourced rows — we trust the engine vocab
         // here; Stockfish has already produced legal UCI strings (the
         // per-ply move choice was applied successfully above).
-        let legal_move_evals = played.per_ply_candidates.map(|plies| {
+        //
+        // `static_legal_move_evals` is the canonical NNUE static-eval signal
+        // captured by a separate evallegal call per ply; populated only on
+        // non-searchless tiers that opted into store_legal_move_evals=true,
+        // and `None` on searchless tiers (their `legal_move_evals` already
+        // is the same data, so duplicating would double tier-0 storage).
+        let pack_candidates = |plies: Vec<Vec<crate::stockfish::Candidate>>|
+            -> Vec<Vec<crate::shard::LegalMoveEval>>
+        {
             plies
                 .into_iter()
                 .map(|cands| {
@@ -527,7 +535,9 @@ fn run_worker(
                         .collect()
                 })
                 .collect()
-        });
+        };
+        let legal_move_evals = played.per_ply_candidates.map(pack_candidates);
+        let static_legal_move_evals = played.per_ply_static_candidates.map(pack_candidates);
 
         let row = GameRow {
             tokens: tokens.into_iter().map(|t| t as i16).collect(),
@@ -558,6 +568,7 @@ fn run_worker(
             game_seed,
             stockfish_version: stockfish_version.to_string(),
             legal_move_evals,
+            static_legal_move_evals,
         };
 
         if writer.is_none() {

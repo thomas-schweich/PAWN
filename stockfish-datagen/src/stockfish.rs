@@ -392,7 +392,9 @@ impl StockfishProcess {
     }
 
     /// Issue the per-ply command (`go nodes N` or `evallegal`, depending on
-    /// `budget`) against the cached position and parse the response.
+    /// the spawn-time `budget`) against the cached position and parse the
+    /// response. Hot path — uses the pre-rendered `play_cmd` to avoid
+    /// re-formatting the command per ply.
     pub fn candidates_after_play_moves(
         &mut self,
     ) -> Result<CandidatesResult, StockfishError> {
@@ -406,6 +408,29 @@ impl StockfishProcess {
         self.stdin.flush()?;
 
         match self.budget {
+            GoBudget::Nodes(_) => self.read_go_response(),
+            GoBudget::EvalLegal => self.read_evallegal_response(),
+        }
+    }
+
+    /// Issue an arbitrary per-ply budget against the cached position. Used
+    /// by `play_game` when the tier wants a *separate* `evallegal` call for
+    /// teacher-signal storage on a process that was spawned with a
+    /// `Nodes(_)` budget for selection. The per-call `budget.render()`
+    /// allocation is fine because this is only invoked when the tier opts
+    /// into `store_legal_move_evals: true` on a non-searchless tier — not
+    /// every shard, and never on plain search runs.
+    pub fn candidates_with(
+        &mut self,
+        budget: GoBudget,
+    ) -> Result<CandidatesResult, StockfishError> {
+        let cmd = budget.render();
+        self.stdin.write_all(self.position_cmd.as_bytes())?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.write_all(cmd.as_bytes())?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
+        match budget {
             GoBudget::Nodes(_) => self.read_go_response(),
             GoBudget::EvalLegal => self.read_evallegal_response(),
         }

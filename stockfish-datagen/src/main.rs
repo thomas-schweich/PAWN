@@ -237,14 +237,30 @@ fn preflight_check_tournament_binary(cfg: &TournamentConfig) -> anyhow::Result<(
 /// instead — the v0.3.0 shape check is built into the spawn-time probe
 /// and surfaces as `is_patched: false` for stale binaries.
 fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
+    // A tier needs the patched binary when:
+    //   - searchless: the whole selection loop runs `evallegal`
+    //   - net_selection: vanilla SF18 silently ignores the unknown setoption,
+    //     and the shard fingerprint would lie about the network in use
+    //   - non-searchless + store_legal_move_evals: the per-ply teacher signal
+    //     is captured by a separate `evallegal` call after each search-mode
+    //     selection (the static_legal_move_evals column). Without the patch
+    //     the call would emit "Unknown command" and the worker would die on
+    //     the first ply of the first game.
     let needs_patched: Vec<String> = cfg
         .tiers
         .iter()
-        .filter(|t| t.searchless || t.net_selection.is_some())
+        .filter(|t| {
+            t.searchless
+                || t.net_selection.is_some()
+                || (t.store_legal_move_evals && !t.searchless)
+        })
         .map(|t| {
             let mut why: Vec<&str> = Vec::new();
             if t.searchless { why.push("searchless"); }
             if t.net_selection.is_some() { why.push("net_selection"); }
+            if t.store_legal_move_evals && !t.searchless {
+                why.push("store_legal_move_evals");
+            }
             format!("{} ({})", t.name, why.join("+"))
         })
         .collect();
