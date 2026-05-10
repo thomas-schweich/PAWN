@@ -194,10 +194,7 @@ pub fn generate_checkmate_games(
     max_ply: usize,
     seed: u64,
 ) -> (GameBatch, usize) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     let batch_size = 4096;
-    let target_total = n_white_wins + n_black_wins;
 
     let mut collected_white: Vec<(Vec<u16>, u16)> = Vec::with_capacity(n_white_wins);
     let mut collected_black: Vec<(Vec<u16>, u16)> = Vec::with_capacity(n_black_wins);

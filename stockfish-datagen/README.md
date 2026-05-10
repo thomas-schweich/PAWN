@@ -211,34 +211,37 @@ tier-state's fingerprint.
 
 ### Schema compatibility with pre-existing shards
 
-The `static_legal_move_evals` column was added in the same release that
-moved the writer to zstd-19 + 16 MB pages, and `SHARD_SCHEMA_VERSION`
-was bumped from v1 to v2. Shards written by earlier versions don't
-have the column on disk. Compatibility:
+`SHARD_SCHEMA_VERSION` is part of the per-tier fingerprint, so any
+schema bump invalidates resume across the upgrade — `_tier_state.json`
+from a previous version's partial run no longer matches the fingerprint
+the new binary computes, and `run_tier` aborts loudly before scanning
+existing shards. Without that guard the new binary would silently mix
+incompatible shards (missing columns, renamed columns) in one tier
+directory.
 
-- Reading an old shard *standalone* with the new code — polars and
-  pyarrow both work; downstream code sees the schema as it was at
-  write time.
-- **Resuming a tier directory built by the previous schema version
-  fails the fingerprint check (intentional).** The bumped
-  `SHARD_SCHEMA_VERSION` is now part of the per-tier fingerprint, so
-  `_tier_state.json` from a v1 partial run no longer matches the v2
-  fingerprint a new binary computes. `run_tier` aborts loudly with a
-  contextual error before ever scanning the directory's existing
-  shards. Recovery: either delete the tier's `_manifest.json` AND
-  `_tier_state.json` to force a regenerate from scratch, or revert
-  the binary to a v1-compatible build and finish that run first.
-  Without this guard, the new binary would silently mix v1 shards
-  (missing the column) with v2 shards (with the column null on
-  searchless tiers, populated on search tiers) in the same directory
-  — the failure mode the next bullet describes.
-- Reading a *mix* of old and new shards in one query — polars (strict)
-  fails with `SchemaError`; pyarrow silently drops the new column
-  (returns schema intersection). For training pipelines that need the
-  static column, either filter to new-schema-only shards or pass
-  `extra_columns='ignore'` to polars and check for null. We don't
-  recommend mixing — regenerate the dataset on the new code if you
-  want consistent labels everywhere.
+Version history:
+
+- **v1** (original): `tokens` / `san` / `uci` + `legal_move_evals` only.
+- **v2**: added the nullable `static_legal_move_evals` column for
+  canonical per-position NNUE labels on non-searchless tiers. Same
+  release switched the writer to zstd-19 + 16 MB pages.
+- **v3** (current, this branch's refactor): dropped the `worker_id`
+  column (no longer a stable identifier under shard-id partitioning);
+  added `global_game_index` (the canonical reproduction key alongside
+  `game_seed`). Filename layout changed from
+  `shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet` to
+  `shard-s<NNNNNN>-r<NNNNNN>.parquet`. There is no in-place upgrade
+  path from v1/v2 to v3 — the partitioning model changed too, so any
+  prior dataset must be regenerated. (For posterity, archive the
+  legacy shards to a separate HF branch.)
+
+Reading mixed-version shards in one query: polars (strict) fails with
+`SchemaError`; pyarrow silently drops the missing-on-some-shards
+column (returns schema intersection). For training pipelines that
+need a specific column, either filter to one-schema-only shards or
+pass `extra_columns='ignore'` to polars and check for null. Mixing is
+not recommended — the per-tier fingerprint check makes this hard to
+do accidentally within one tier directory.
 
 ### Network selection and label uniformity
 
