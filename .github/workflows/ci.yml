@@ -10,7 +10,36 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  ci:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            python:
+              - 'pawn/**'
+              - 'tests/**'
+              - 'engine/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+            rust:
+              - 'engine/**'
+              - 'stockfish-datagen/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+
+  python:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,12 +75,33 @@ jobs:
       - name: Tests
         run: uv run pytest tests/ -x -q -m "not gpu"
 
-      # Rust workspace tests. The stockfish-datagen crate has live
-      # tests marked `#[ignore = "requires stockfish ..."]`; they don't
-      # run by default. CI shows them in the summary as `ignored` (so
-      # the skip is visible — distinct from the silently-passing
-      # eprintln-and-return pattern we used to use). To run them
-      # locally with Stockfish available:
-      #   cargo test --workspace --release -- --include-ignored
+  # Rust workspace tests. The stockfish-datagen crate has live tests
+  # marked `#[ignore = "requires stockfish ..."]`; they don't run by
+  # default. CI shows them in the summary as `ignored` (so the skip is
+  # visible — distinct from the silently-passing eprintln-and-return
+  # pattern we used to use). To run them locally with Stockfish
+  # available:
+  #   cargo test --workspace --release -- --include-ignored
+  rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            engine/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: rust-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-
+
       - name: Rust workspace tests
         run: cargo test --workspace --release

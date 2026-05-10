@@ -10,7 +10,48 @@ env:
   IMAGE: thomasschweich/pawn
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      main: ${{ steps.filter.outputs.main }}
+      datagen: ${{ steps.filter.outputs.datagen }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            main:
+              - 'Dockerfile'
+              - 'pawn/**'
+              - 'engine/**'
+              - 'scripts/**'
+              - 'configs/**'
+              - 'deploy/**'
+              - 'cards/**'
+              - 'docs/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'searchless_chess_vocabulary.json'
+              - '.github/workflows/docker.yml'
+            datagen:
+              - 'Dockerfile.datagen'
+              - 'engine/**'
+              - 'stockfish-datagen/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'scripts/datagen_with_hf_sync.py'
+              - 'scripts/benchmark_stockfish_nodes.py'
+              - 'scripts/sweep_pod_workers.sh'
+              - 'deploy/pod-gpu-stats.sh'
+              - 'deploy/.tmux.conf'
+              - '.github/workflows/docker.yml'
+
   build-cuda:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.main == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,6 +109,8 @@ jobs:
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-dev,mode=max
 
   build-rocm:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.main == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -125,6 +168,8 @@ jobs:
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-dev-rocm,mode=max
 
   build-datagen:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.datagen == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
