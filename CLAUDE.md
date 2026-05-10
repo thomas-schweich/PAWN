@@ -21,7 +21,7 @@ pawn/
 │   └── dashboard/   # Solara training dashboard (metrics, charts, runner)
 ├── scripts/         # Training and evaluation entry points
 ├── tests/           # Unit tests
-├── deploy/          # Runpod deployment scripts
+├── deploy/          # RunPod + vast.ai deployment scripts
 └── docs/            # Architecture, training, adapter docs
 ```
 
@@ -259,7 +259,19 @@ the training loop checks it between steps, saves a checkpoint, pushes to HF, and
 **Never rsync checkpoint files from running pods.** Checkpoints are pushed to HuggingFace
 from the trainer. Load via HF repo ID (e.g. `--checkpoint thomas-schweich/pawn-base`).
 
-## RunPod Operations
+## Cloud GPU Operations
+
+PAWN can run on either RunPod or vast.ai. The same Docker image works on both — pick the provider that has the GPU you want at the price you want. RunPod is the primary (mature, secure-cloud option, simpler pricing); vast.ai is supported for opportunistic pricing on consumer GPUs and access to hosts RunPod doesn't have.
+
+| | RunPod | vast.ai |
+|---|---|---|
+| Manager script | `deploy/pod.sh` | `deploy/vast.sh` |
+| CLI | `runpodctl` | `vastai` (or `uvx vastai`) |
+| Local config dir | `~/.config/pawn/pods/` | `~/.config/pawn/vast/` |
+| Volume model | Network volume mounted at `/workspace` | Single instance disk (use `--disk N`) |
+| Pricing | Fixed per-GPU rates | Marketplace; pass `--max-price` and/or `--interruptible` |
+
+Both share the same Docker image (`thomasschweich/pawn:latest`) and entrypoint (which honors the `PUBLIC_KEY` env var that both providers set). `vast.sh` mirrors `pod.sh`'s command surface (`create / start / stop / delete / ssh / list / status / setup / deploy / launch`) plus a `search` subcommand for browsing offers before committing.
 
 ### Docker Image
 
@@ -289,9 +301,9 @@ docker build --platform linux/amd64 --target runtime-rocm \
     -t thomasschweich/pawn:rocm .
 ```
 
-### Pod Lifecycle
+### Pod Lifecycle (RunPod)
 
-Use `deploy/pod.sh` for all pod management. Requires `runpodctl` (`wget -qO- cli.runpod.net | sudo bash`).
+Use `deploy/pod.sh` for all pod management. Requires `runpodctl` (`curl -sSL https://cli.runpod.net | bash`).
 
 ```bash
 # Create a pod
@@ -312,6 +324,35 @@ bash deploy/pod.sh delete myexp
 
 GPU shortcuts: `a5000`, `a40`, `a6000`, `4090`, `5090`, `l40s`, `h100`. Pod configs are cached in `~/.config/pawn/pods/<name>.env`.
 
+### Instance Lifecycle (vast.ai)
+
+Use `deploy/vast.sh` for vast.ai. Requires `vastai` (`uv tool install vastai` or `pip install --user vastai`) and `jq`. Authenticate once with `vastai set api-key <KEY>` (key at https://vast.ai/console/account).
+
+```bash
+# Browse matching offers without creating anything
+bash deploy/vast.sh search --gpu 4090 --max-price 0.5
+
+# Create from cheapest matching offer
+bash deploy/vast.sh create myexp --gpu 4090 --max-price 0.5
+
+# Or take a chance on a spot/interruptible host
+bash deploy/vast.sh create cheap1 --gpu 3090 --interruptible
+
+# rsync the local checkout into /workspace/pawn on the instance —
+# required before `launch`, since the image bakes code at /opt/pawn
+# but `launch` runs from /workspace/pawn.
+bash deploy/vast.sh deploy myexp
+
+# SSH / launch / stop / delete
+bash deploy/vast.sh ssh myexp
+bash deploy/vast.sh launch myexp scripts/train.py --variant base --hf-repo thomas-schweich/pawn-base
+bash deploy/vast.sh stop myexp
+```
+
+Vast.ai has no separate network volume — instance disk is sized via `--disk` (default 100 GB) and persists across `stop`/`start` (you keep paying the storage rate while stopped). `delete` destroys the disk. Instance configs are cached in `~/.config/pawn/vast/<name>.env`.
+
+`HF_TOKEN` and `PUBLIC_KEY` (or `~/.ssh/id_ed25519.pub`/`id_rsa.pub`) from your local environment are passed through to the instance at create time.
+
 ### GPU Selection
 
 Benchmarks from pretraining 3 models concurrently (cotrain, batch=256):
@@ -327,20 +368,21 @@ Benchmarks from pretraining 3 models concurrently (cotrain, batch=256):
 
 Total cost is remarkably consistent ($30-39) across viable GPUs. The choice is wall-clock time vs cost, not cost vs cost. Single-model training fits on 24GB GPUs.
 
-### Required Pod Configuration
+### Required Instance Configuration
 
-- **Always attach a network volume.** Checkpoints write to disk during atomic rename and HF push. Ephemeral container disk is lost on pod termination.
-- **Set `HF_TOKEN` as a pod environment variable** for automatic HuggingFace authentication. The entrypoint persists it to `~/.cache/huggingface/token`.
+- **Persistent storage.** On RunPod, attach a network volume (mounted at `/workspace`). On vast.ai, the instance disk persists across stop/start; pick a size with `--disk` that comfortably holds checkpoints between HF pushes. Either way, ephemeral container layers are gone on delete.
+- **Set `HF_TOKEN` as an environment variable** for automatic HuggingFace authentication. The entrypoint persists it to `~/.cache/huggingface/token`. `vast.sh create` forwards `HF_TOKEN` from your local shell automatically.
 - `PAWN_MODEL=thomas-schweich/pawn-base` — auto-pull a checkpoint on startup (runner target).
 - `PAWN_CMD` — training command to execute (alternative to Docker CMD args).
 - `PAWN_DASHBOARD=0` — disable the auto-started dashboard + Caddy proxy (enabled by default).
 
-### Pod Safety
+### Instance Safety
 
-- Stop pods with `runpodctl pod stop` or `bash deploy/pod.sh stop` — sends SIGTERM, trainer saves and pushes before exiting.
-- **Never `runpodctl pod delete` while training is running** — data loss risk.
+- Stop with `bash deploy/pod.sh stop <name>` or `bash deploy/vast.sh stop <name>` — sends SIGTERM, trainer saves and pushes before exiting.
+- **Never delete/destroy an instance while training is running** — data loss risk on either provider.
 - **Never `kill -9` training processes** — use SIGTERM (plain `kill`), which triggers graceful shutdown.
-- **Never rsync checkpoint files from running pods** — load via HF repo ID instead.
+- **Never rsync checkpoint files from running instances** — load via HF repo ID instead.
+- On vast.ai with `--interruptible`, the host can preempt you at any time. Keep `--checkpoint-interval` short so HF has a recent push to resume from.
 
 ## Monitoring Training Progress
 
@@ -363,7 +405,7 @@ python -m pawn.dashboard --log-dir logs
 
 Reads `metrics.jsonl` files, no dependency on training packages. Auto-detects run type from config fields. Shows loss curves, accuracy, LR schedules, GPU utilization, patience clocks, and adapter-specific diagnostics. Requires restart for code changes (no hot reload).
 
-**On RunPod pods**, the dashboard starts automatically and is proxied through Caddy on port 8888. Access it via the RunPod HTTP proxy URL (the "Connect" button → port 8888). Set `PAWN_DASHBOARD=0` as a pod environment variable to disable it.
+**On cloud instances**, the dashboard starts automatically and is proxied through Caddy on port 8888. On RunPod, access it via the HTTP proxy URL (the "Connect" button → port 8888). On vast.ai, port 8888 is published on the host's mapped port — find it via `bash deploy/vast.sh status <name>` (look for the `8888/tcp` entry). Set `PAWN_DASHBOARD=0` as an environment variable to disable it.
 
 ## Logs
 
