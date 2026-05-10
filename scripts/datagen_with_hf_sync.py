@@ -3,25 +3,29 @@
 Pod-friendly orchestrator. Three phases:
 
 1. **Primer.** List the target HF dataset repo. Download the per-tier
-   sentinels (`_manifest.json`, `_tier_state.json`) into the local output
-   dir. For every remote shard file (`shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet`)
+   sentinels (`_manifest.json`, `_tier_state.json`, and their per-pod
+   variants `_manifest-s<A>-s<B>.json` etc) into the local output dir.
+   For every remote shard file (`shard-s<NNNNNN>-r<NNNNNN>.parquet`)
    create a *zero-byte placeholder* at the same local path. The rust
-   binary's resume logic reads `(worker_id, chunk_idx, n_rows)` from
-   filenames alone — no parquet metadata reads — so a directory full of
-   placeholders looks identical to a directory full of real shards. This
-   is what lets a fresh pod resume without re-downloading any data.
+   binary's resume logic reads `(shard_id, n_rows)` from filenames
+   alone — no parquet metadata reads — so a directory full of
+   placeholders looks identical to a directory full of real shards.
+   This is what lets a fresh pod resume without re-downloading any data.
 
-2. **Subprocess.** Spawn `stockfish-datagen run --config <cfg>`. Forward
-   SIGINT/SIGTERM so graceful-shutdown semantics still hold.
+2. **Subprocess.** Spawn `stockfish-datagen run --config <cfg> [--tiers
+   <subset>] [--shard-id-range <A:B>]`. Forward SIGINT/SIGTERM so
+   graceful-shutdown semantics still hold.
 
 3. **Watcher.** A daemon thread polls the output dir every
-   `--poll-interval` seconds. Anything matching the canonical shard naming
-   (or one of the sentinel filenames) that isn't already in the in-memory
-   "uploaded" set gets uploaded via `huggingface_hub.HfApi.upload_file`.
+   `--poll-interval` seconds. New shard / sentinel files are committed
+   in batched `huggingface_hub.upload_folder` calls — one commit per
+   tier per cycle for shards, plus one trailing commit for each new
+   manifest. This keeps the per-repo commit count under HF's 128/hour
+   limit even on cheap tiers that produce hundreds of shards per minute.
    Zero-byte placeholders (size == 0) are skipped — those came from the
    primer and are already remote. After a successful upload, if
-   `--prune-local` is set, the local file is replaced with a zero-byte
-   placeholder so disk usage stays flat as the run grows.
+   `--prune-local` is set, the local shard file is truncated to a
+   zero-byte placeholder so disk usage stays flat as the run grows.
 
 Auth: needs HF_TOKEN in the env (standard pod setup). Repo is created
 with `repo_type="dataset"` if it doesn't exist.
@@ -49,32 +53,28 @@ from huggingface_hub.utils import HfHubHTTPError
 
 LOG = logging.getLogger("datagen_sync")
 
-# Names that are part of every tier directory. Any other file is ignored
-# by the watcher (it'll only ever look at these and the shard pattern).
-SENTINEL_FILES: tuple[str, ...] = ("_manifest.json", "_tier_state.json")
+# Per-tier sentinel filenames. The single-pod canonical names plus their
+# per-pod-cooperation variants `_manifest-s<A>-s<B>.json` /
+# `_tier_state-s<A>-s<B>.json` (where A,B are shard-id range bounds).
+# Mirrors the rust filename layout in `stockfish-datagen/src/resume.rs`.
+SENTINEL_RE = re.compile(
+    r"^_(manifest|tier_state)(-s\d{6,}-s\d{6,})?\.json$"
+)
+# Manifest filenames specifically (canonical + per-pod variants). The
+# orchestrator commits these AFTER shards so a tier-complete marker
+# never appears remote without its shards.
+MANIFEST_RE = re.compile(r"^_manifest(-s\d{6,}-s\d{6,})?\.json$")
+# Tier-state filenames specifically (canonical + per-pod variants).
+# Uploaded eagerly before / alongside shards so fresh-pod resume sees
+# the sentinel.
+TIER_STATE_RE = re.compile(r"^_tier_state(-s\d{6,}-s\d{6,})?\.json$")
 
-# Upload-order priority: lower number first.
-#   `_tier_state.json` is the FIRST upload — fresh-pod resume requires
-#       it to exist remotely so the primer downloads it before the rust
-#       binary scans the tier dir; without it `run_tier` aborts with
-#       "shards exist but no tier state file is present".
-#   shard files are the BULK — uploaded in any order between sentinels.
-#   `_manifest.json` is the LAST upload — it's the tier-complete marker;
-#       seeing it remotely without all referenced shards already remote
-#       would make the next primer skip the tier (silent data loss).
-#
-# `_tier_state.json` happens to be alphabetically after `_manifest.json`,
-# which is why we can't rely on lex sort.
-def _upload_priority(name: str) -> int:
-    if name == "_tier_state.json":
-        return 0
-    if name == "_manifest.json":
-        return 2
-    return 1  # shards (and anything else, though only shards reach here)
-
-# Matches `shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet`. Mirrors the rust
-# parser in `stockfish-datagen/src/resume.rs::parse_shard_filename`.
-SHARD_RE = re.compile(r"^shard-w\d{3,}-c\d{4,}-r\d{6,}\.parquet$")
+# Matches `shard-s<NNNNNN>-r<NNNNNN>.parquet`. Mirrors the rust parser in
+# `stockfish-datagen/src/resume.rs::parse_shard_filename`. The
+# `{6,}` quantifier accepts wider fields for >999_999 shards or rows
+# (rare on a 100M-game run with 2K shard size = 50K shards, still 5
+# digits; defensive).
+SHARD_RE = re.compile(r"^shard-s\d{6,}-r\d{6,}\.parquet$")
 
 
 @dataclass(frozen=True)
@@ -149,8 +149,10 @@ def primer(api: HfApi, repo_id: str, tiers: list[TierLayout]) -> set[str]:
         for name in files:
             repo_path = f"{tier.name}/{name}"
             local_path = tier.local_dir / name
-            if name in SENTINEL_FILES:
-                # Real file — download. Tiny, so this is cheap.
+            if SENTINEL_RE.match(name):
+                # Real file — download. Tiny, so this is cheap. Per-pod
+                # variants (`_manifest-s<A>-s<B>.json` etc) match here too,
+                # so a multi-pod run's resume picks up every pod's state.
                 LOG.info("primer: downloading sentinel %s", repo_path)
                 _download_replace(api, repo_id, repo_path, local_path)
                 primed.add(repo_path)
@@ -193,34 +195,50 @@ def _download_replace(api: HfApi, repo_id: str, repo_path: str, local_path: Path
     os.replace(tmp, local_path)
 
 
-def _upload_one(api: HfApi, repo_id: str, repo_path: str, local_path: Path) -> None:
-    """Upload one file. Retries on transient errors; raises on permanent ones."""
+def _upload_folder_batch(
+    api: HfApi,
+    repo_id: str,
+    local_dir: Path,
+    path_in_repo: str,
+    files: list[str],
+    commit_message: str,
+) -> None:
+    """Commit a batch of files from `local_dir` as a single HF commit.
+
+    Uses `huggingface_hub.upload_folder` with `allow_patterns=files` so
+    only the named files participate in the commit. xet handles content
+    dedup, so re-uploading zero-byte placeholders (or any unchanged file)
+    is essentially free. Retries on transient HTTP errors; raises on
+    permanent ones.
+
+    Why folder uploads instead of per-shard `upload_file`: HF caps
+    commits at 128 / hour per repo. A 100M-game run produces ~45
+    shards/min; per-shard commits exceed the limit on the very first
+    cycle. Folder uploads commit many shards atomically — one commit
+    per tier per cycle.
+    """
+    if not files:
+        return
     delay = 2.0
     for attempt in range(5):
         try:
-            api.upload_file(
-                path_or_fileobj=str(local_path),
-                path_in_repo=repo_path,
+            api.upload_folder(
+                folder_path=str(local_dir),
+                path_in_repo=path_in_repo,
                 repo_id=repo_id,
                 repo_type="dataset",
-                commit_message=f"sync: {repo_path}",
+                allow_patterns=files,
+                commit_message=commit_message,
             )
             return
         except HfHubHTTPError as e:
-            # 5xx / rate-limit: retry. 4xx (except 429): give up.
-            #
-            # `e.response` is documented as always-set on HfHubHTTPError, but
-            # the field is `Optional[Response]` in the type stubs. A library
-            # update or test-monkeypatched error path could violate the
-            # invariant; guarding here lets us log + give up cleanly instead
-            # of `AttributeError`-tripping the consecutive-failure threshold.
             response = getattr(e, "response", None)
             status = response.status_code if response is not None else 0
             if status not in (429, 500, 502, 503, 504) or attempt == 4:
                 raise
             LOG.warning(
-                "upload of %s failed with HTTP %d; retrying in %.1fs (attempt %d/5)",
-                repo_path, status, delay, attempt + 1,
+                "folder commit (%s, %d files) failed with HTTP %d; retrying in %.1fs (attempt %d/5)",
+                path_in_repo, len(files), status, delay, attempt + 1,
             )
             time.sleep(delay)
             delay *= 2
@@ -295,40 +313,85 @@ def _scan_and_upload(
     upload_count: list[int],
     prune_local: bool,
 ) -> None:
+    """Per cycle, per tier, commit any new local files in two folder
+    uploads max:
+
+      1. **State+shards commit.** New `_tier_state*.json` and new shard
+         files in one atomic HF commit. Bundling tier_state with shards
+         (instead of as its own commit) saves one commit per tier and is
+         safe because the rust binary writes `_tier_state.json` before
+         any shards exist — there's never a state file without matching
+         shard data in the same cycle.
+
+      2. **Manifest commit.** New `_manifest*.json` in a separate atomic
+         commit AFTER the shards commit. Decoupling guarantees the
+         tier-complete marker never appears remote without all referenced
+         shards already remote, even if cycle 1's batch is interrupted.
+
+    Zero-byte placeholders (size == 0) are skipped — those came from the
+    primer and are already remote. Manifest with no preceding shards
+    commit (because no new shards in this cycle) commits on its own as
+    cycle 2.
+    """
     for tier in tiers:
         if not tier.local_dir.exists():
             continue
-        # Strict per-cycle upload order: tier_state → shards → manifest.
-        # See `_upload_priority` for the rationale on each anchor.
-        entries = list(tier.local_dir.iterdir())
-        entries.sort(key=lambda e: (_upload_priority(e.name), e.name))
-        for entry in entries:
+
+        # Bucket new local files by category.
+        new_shards_and_state: list[str] = []
+        new_manifests: list[str] = []
+        for entry in tier.local_dir.iterdir():
+            if not entry.is_file():
+                continue
             name = entry.name
             repo_path = f"{tier.name}/{name}"
             if repo_path in uploaded:
                 continue
-            is_sentinel = name in SENTINEL_FILES
-            is_shard = bool(SHARD_RE.match(name))
-            if not (is_sentinel or is_shard):
+            if entry.stat().st_size == 0:
+                # Placeholder or mid-write atomic rename — skip until it
+                # has content.
                 continue
-            if not entry.is_file():
-                continue
-            size = entry.stat().st_size
-            if size == 0:
-                # Zero-byte placeholder from primer (or a sentinel in
-                # mid-write — atomic-rename means we'll see it next cycle
-                # at full size). Skip until it has content.
-                continue
-            LOG.info("uploading %s (%s bytes)", repo_path, size)
-            _upload_one(api, repo_id, repo_path, entry)
-            uploaded.add(repo_path)
-            upload_count[0] += 1
-            # Sentinels stay local — the rust binary reads them on every
-            # tier start. Only shards get pruned.
-            if prune_local and is_shard:
-                # Truncate to zero-byte placeholder so resume still finds it.
-                with open(entry, "wb"):
-                    pass
+            if SHARD_RE.match(name) or TIER_STATE_RE.match(name):
+                new_shards_and_state.append(name)
+            elif MANIFEST_RE.match(name):
+                new_manifests.append(name)
+            # else: not ours — ignore.
+
+        if new_shards_and_state:
+            LOG.info(
+                "tier %s: committing %d new file(s) (shards + tier_state)",
+                tier.name, len(new_shards_and_state),
+            )
+            _upload_folder_batch(
+                api, repo_id, tier.local_dir,
+                path_in_repo=tier.name,
+                files=new_shards_and_state,
+                commit_message=f"sync {tier.name}: {len(new_shards_and_state)} file(s)",
+            )
+            for name in new_shards_and_state:
+                uploaded.add(f"{tier.name}/{name}")
+                upload_count[0] += 1
+                # Prune local shards (truncate to 0 bytes) after the
+                # commit lands. Sentinels stay local — the rust binary
+                # reads them on every tier start.
+                if prune_local and SHARD_RE.match(name):
+                    with open(tier.local_dir / name, "wb"):
+                        pass
+
+        if new_manifests:
+            LOG.info(
+                "tier %s: committing %d new manifest file(s)",
+                tier.name, len(new_manifests),
+            )
+            _upload_folder_batch(
+                api, repo_id, tier.local_dir,
+                path_in_repo=tier.name,
+                files=new_manifests,
+                commit_message=f"manifest {tier.name}",
+            )
+            for name in new_manifests:
+                uploaded.add(f"{tier.name}/{name}")
+                upload_count[0] += 1
 
 
 def install_signal_handlers(proc_holder: list["subprocess.Popen[bytes]"]) -> None:
@@ -352,27 +415,31 @@ def install_signal_handlers(proc_holder: list["subprocess.Popen[bytes]"]) -> Non
 
 
 def run_subprocess(
-    binary: str, config_path: Path, proc_holder: list["subprocess.Popen[bytes]"],
+    binary: str,
+    config_path: Path,
+    proc_holder: list["subprocess.Popen[bytes]"],
+    tiers: str | None = None,
+    shard_id_range: str | None = None,
 ) -> int:
     """Spawn the rust binary into `proc_holder` (already-installed handlers).
+
+    Optionally forwards `--tiers` and `--shard-id-range` to the rust
+    binary for multi-pod cooperation.
 
     Signal handlers must already be installed when this is called.
     `proc_holder.append(subprocess.Popen(...))` shrinks but does not
     fully close the race between the child existing and the holder
-    being populated — Python evaluates the inner `Popen(...)` first
-    (child spawns), then calls `.append(result)`. A signal delivered
-    between those two bytecode steps would find `proc_holder` empty
-    and orphan the freshly-spawned child. The window is nanoseconds in
-    practice; the defense is the `not proc_holder` check inside
-    `_forward` exiting with `128 + signum`, which still produces the
-    conventional shell exit even though the child leaks. Truly
-    closing the race needs `posix_spawn` (atomic) or holding off
-    signals around Popen via `signal.pthread_sigmask`, neither of
-    which we currently bother with.
+    being populated. The defense is the `not proc_holder` check inside
+    `_forward` exiting with `128 + signum`.
     """
-    proc_holder.append(subprocess.Popen([binary, "run", "--config", str(config_path)]))
+    cmd = [binary, "run", "--config", str(config_path)]
+    if tiers is not None:
+        cmd.extend(["--tiers", tiers])
+    if shard_id_range is not None:
+        cmd.extend(["--shard-id-range", shard_id_range])
+    proc_holder.append(subprocess.Popen(cmd))
     proc = proc_holder[0]
-    LOG.info("spawned %s (pid=%d)", binary, proc.pid)
+    LOG.info("spawned %s (pid=%d) %s", binary, proc.pid, " ".join(cmd[1:]))
     return proc.wait()
 
 
@@ -404,6 +471,15 @@ def main() -> int:
                          "before giving up and exiting with code 4 "
                          "(default: %(default)s). Pod will not exit until "
                          "either the backlog drains or this timeout fires.")
+    ap.add_argument("--tiers", default=None,
+                    help="Comma-separated tier indices to forward to the rust "
+                         "binary's --tiers flag (e.g. `0,1` or `3`). Default: "
+                         "all tiers in the config. Use for multi-pod runs "
+                         "where each pod handles a tier subset.")
+    ap.add_argument("--shard-id-range", default=None,
+                    help="Half-open shard-id range A:B to forward to the rust "
+                         "binary (e.g. `0:5000`). Default: full tier range. "
+                         "Use to fan a single tier across multiple pods.")
     ap.add_argument("--log-level", default="INFO",
                     help="Logging level (default: INFO).")
     args = ap.parse_args()
@@ -451,7 +527,7 @@ def main() -> int:
         whoami = api.whoami()
         LOG.info("authenticated to HuggingFace as %s", whoami.get("name", "<unknown>"))
     except HfHubHTTPError as e:
-        # Same defensive guard as `_upload_one`: `e.response` is documented
+        # Same defensive guard as `_upload_folder_batch`: `e.response` is documented
         # always-present on HfHubHTTPError but typed Optional.
         response = getattr(e, "response", None)
         status = response.status_code if response is not None else 0
@@ -532,7 +608,13 @@ def main() -> int:
     )
     watcher.start()
 
-    rc = run_subprocess(args.binary, args.config, proc_holder)
+    rc = run_subprocess(
+        args.binary,
+        args.config,
+        proc_holder,
+        tiers=args.tiers,
+        shard_id_range=args.shard_id_range,
+    )
     LOG.info("rust binary exited with code %d", rc)
 
     # Stop and join the watcher BEFORE the final drain. Otherwise the
