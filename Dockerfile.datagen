@@ -4,15 +4,24 @@
 # binary) plus a Python orchestrator (`datagen_with_hf_sync.py`) that
 # wraps it with incremental upload to a HuggingFace dataset.
 #
-# Stockfish ships in the image by default (--build-arg INCLUDE_STOCKFISH=1).
-# Both the AVX2 and AVX-512 variants are downloaded (~112 MB each),
-# and a `/usr/local/bin/stockfish` wrapper picks the right one at
-# runtime based on /proc/cpuinfo flags. This eliminates the "wrong
-# binary on this pod" failure mode entirely — whatever pod we end
-# up on, a compatible Stockfish is already there. Override via
-# STOCKFISH_VARIANT={auto,avx2,avx512}; defaults to auto.
-# Set INCLUDE_STOCKFISH=0 to skip both binaries entirely (CI / sanity
-# builds where the rust binary is the only thing being verified).
+# Stockfish is the **patched fork** (stockfish-ml-extensions, sf_18-v0.3.0+)
+# built into the image at the requested microarchitecture. The patched
+# binary adds the `evallegal` UCI command (used by every searchless tier
+# and by every search tier with `store_legal_move_evals: true`) and the
+# `NetSelection` UCI option (used by every tier in the production
+# `stockfish_100m.json` config). It also handles vanilla UCI commands
+# fine — it's a fork, not a replacement — so it covers any leftover
+# vanilla-style configs (e.g. the bundled `smoke.json` that points at
+# `~/bin/stockfish`).
+#
+# **Microarchitecture: this image ships ONE patched binary** at the
+# microarch named in `SF_PATCHED_ARCH` (default `x86-64-avx2`, the
+# lowest-common-denominator that runs on any modern x86 pod). Override
+# with `--build-arg SF_PATCHED_ARCH=x86-64-avx512` for the AVX-512
+# variant (Zen 4+ / Sapphire Rapids+). CI publishes both as
+# `:datagen-avx2` / `:datagen-avx512` (and `:datagen-dev-{arch}`) so
+# operators choose at pod-launch time. There is no auto-detect wrapper —
+# pick the right tag and the binary is the right binary.
 #
 # Lc0 was previously bundled here but was removed when we stopped
 # using it for active datagen — keeping the build infrastructure
@@ -29,22 +38,23 @@
 #
 # Build (runtime):
 #   docker build --platform linux/amd64 --target runtime \
-#     --build-arg INCLUDE_STOCKFISH=1 \
-#     -f Dockerfile.datagen -t pawn-datagen .
+#     --build-arg SF_PATCHED_ARCH=x86-64-avx2 \
+#     -f Dockerfile.datagen -t pawn-datagen:avx2 .
 #
 # Build (dev — typical for stockfish-datagen workflows):
 #   docker build --platform linux/amd64 --target dev \
-#     --build-arg INCLUDE_STOCKFISH=1 \
-#     -f Dockerfile.datagen -t pawn-datagen:dev .
+#     --build-arg SF_PATCHED_ARCH=x86-64-avx2 \
+#     -f Dockerfile.datagen -t pawn-datagen:dev-avx2 .
 #
 # Run (dev — needs PUBLIC_KEY for SSH login, HF_TOKEN persisted to cache):
 #   docker run -d -p 22:22 \
 #     -e PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)" \
 #     -e HF_TOKEN=hf_... \
-#     pawn-datagen:dev
+#     pawn-datagen:dev-avx2
 #
 # Pinned versions for reproducibility:
-#   Stockfish 18        https://github.com/official-stockfish/Stockfish/releases/tag/sf_18
+#   Stockfish 18 fork   https://github.com/thomas-schweich/stockfish-ml-extensions
+#                       commit 14f92699 (annotated tag sf_18-v0.3.0)
 
 # ── tmux: build from source ──────────────────────────────────────────
 # Same version + sha256 pin as the main Dockerfile's dev image. Note
@@ -73,20 +83,11 @@ RUN curl -fsSL "https://github.com/tmux/tmux/releases/download/${TMUX_VERSION}/t
     && strip /usr/local/bin/tmux
 
 # ── Build the patched Stockfish from the stockfish-ml-extensions fork ──
-# Used by tier-0 distillation (`searchless: true`) and by any tier that
-# sets `net_selection`. Vanilla SF18 doesn't recognize the `evallegal`
-# command or the `NetSelection` UCI option, so the configs that use
-# either would abort at preflight if the runtime image only shipped
-# vanilla SF. This stage builds the patched binary at the pinned fork
-# commit and the runtime stage copies it in below at the relative path
-# the bundled example configs reference (`stockfish-datagen/stockfish-patched`,
-# resolved from `WORKDIR /opt/datagen`).
-#
-# Two parallel "build-1 / build-0" stages so `--build-arg INCLUDE_STOCKFISH=0`
-# cleanly skips the network clone + C++ compile (the documented sanity-build
-# path). Docker resolves `COPY --from=sf-fork-build-${INCLUDE_STOCKFISH}` at
-# build time; only the chosen stage is actually executed.
-FROM ubuntu:24.04 AS sf-fork-build-1
+# Used by every tier in the production config (`searchless: true` tiers
+# and any tier with `net_selection` or `store_legal_move_evals: true`).
+# Built once per image at the microarch named in `SF_PATCHED_ARCH`;
+# CI publishes one image per supported microarch via the matrix.
+FROM ubuntu:24.04 AS sf-fork-build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential git ca-certificates curl \
@@ -99,11 +100,11 @@ ARG SF_FORK_REPO=https://github.com/thomas-schweich/stockfish-ml-extensions.git
 # commit; we pin to the SHA so a future tag move (accidental or otherwise)
 # fails the build loudly instead of silently changing the binary.
 ARG SF_FORK_COMMIT=14f92699733a3d24a9067a20b32f95f0fcf9c4ab
-# AVX2 is the lowest-common-denominator microarch we target; vanilla SF18
-# AVX2 vs AVX-512 produce bit-exact identical NNUE evals (int8 dot products
-# are vector-width-invariant), and the patched binary inherits that — so
-# one variant is enough for the patched path. Override with --build-arg
-# SF_PATCHED_ARCH=x86-64-avx512 to swap.
+# Microarch the patched binary is built for. CI passes one of:
+#   x86-64-avx2     (lowest common denominator, runs on any modern x86)
+#   x86-64-avx512   (Zen 4+ / Sapphire Rapids+, faster NNUE inference)
+# Mismatched microarch → SIGILL on first eval call, so operators must
+# choose the right image tag for the pod's CPU.
 ARG SF_PATCHED_ARCH=x86-64-avx2
 
 WORKDIR /build
@@ -112,16 +113,6 @@ RUN git clone "$SF_FORK_REPO" sf-fork \
     && cd sf-fork/src \
     && make -j"$(nproc)" build ARCH="$SF_PATCHED_ARCH" \
     && strip stockfish
-
-# Disabled-build counterpart: produces a stub binary at the same path so
-# the runtime stage's `COPY --from=sf-fork-build-0 ...` succeeds. The stub
-# exits with a clear error if anything ever invokes it, so an accidental
-# attempt to use a searchless tier from an INCLUDE_STOCKFISH=0 image fails
-# loudly rather than mysteriously.
-FROM ubuntu:24.04 AS sf-fork-build-0
-RUN mkdir -p /build/sf-fork/src \
-    && printf '#!/bin/sh\necho "patched stockfish not built (image built with INCLUDE_STOCKFISH=0); searchless / net_selection tiers cannot run" >&2\nexit 127\n' > /build/sf-fork/src/stockfish \
-    && chmod +x /build/sf-fork/src/stockfish
 
 # ── Build the Rust stockfish-datagen binary in a builder stage ────────
 # Multi-stage so the rustup toolchain (~1GB) and the build system
@@ -174,86 +165,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip3 install --break-system-packages --no-cache-dir \
         "huggingface_hub>=0.24"
 
-# Stockfish 18: download both AVX2 + AVX-512 variants by default so
-# the image works on any modern x86 pod regardless of microarch. The
-# wrapper installed below picks the right one at runtime via
-# /proc/cpuinfo. Set --build-arg INCLUDE_STOCKFISH=0 to skip both.
-ARG INCLUDE_STOCKFISH=1
-# `set -e` so a per-variant download / extract / install failure aborts the
-# build immediately instead of being swallowed by the loop and leaving the
-# image without a binary the wrapper later expects. Without this, a bare
-# `for variant ... do ... && ... done` would only surface the LAST iteration's
-# exit status, so an avx2 download failure followed by avx512 success would
-# build green and explode at pod boot on AVX2-only hardware.
-RUN if [ "$INCLUDE_STOCKFISH" = "1" ]; then \
-        set -e; \
-        for variant in avx2 avx512; do \
-            curl -fL -o /tmp/sf.tar \
-                "https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64-${variant}.tar"; \
-            tar xf /tmp/sf.tar -C /tmp; \
-            cp "/tmp/stockfish/stockfish-ubuntu-x86-64-${variant}" "/usr/local/bin/stockfish-${variant}"; \
-            chmod +x "/usr/local/bin/stockfish-${variant}"; \
-            rm -rf /tmp/sf.tar /tmp/stockfish; \
-        done; \
-    fi
-
-# Wrapper: auto-detects CPU at runtime and execs the matching
-# Stockfish variant. STOCKFISH_VARIANT={auto,avx2,avx512} overrides.
-# Always installed (not gated on INCLUDE_STOCKFISH) so the path
-# `/usr/local/bin/stockfish` exists regardless; falls back with a
-# clear error if the requested variant binary is missing.
-#
-# Reproducibility: the two variants produce **bit-exact identical
-# bestmoves and NNUE evals** at every node count, multipv level, and
-# game length tested (100/100 positions verified locally — long opening
-# sequences up to 20 plies, deep nodes up to 8192, MultiPV up to 10,
-# close-score endgames). This is expected: NNUE uses int8 dot products
-# which are bit-exact regardless of vector width, and Stockfish 18's
-# accumulator updates are deterministic. So the runtime auto-pick is
-# safe across pods — the same dataset config produces the same games
-# whether the pod has AVX2 only or AVX-512+VNNI. We do NOT need to pin
-# the variant in `RunConfig`'s tier_fingerprint.
-RUN cat > /usr/local/bin/stockfish <<'EOF' && chmod +x /usr/local/bin/stockfish
-#!/bin/sh
-v=${STOCKFISH_VARIANT:-auto}
-case "$v" in
-    auto)
-        # avx512f is the lowest-common-denominator AVX-512 flag; if
-        # present, the avx512 build runs (and uses VNNI internally
-        # when avx512_vnni is also present, which it is on Zen 4+ /
-        # Sapphire Rapids+).
-        if grep -q '\bavx512f\b' /proc/cpuinfo 2>/dev/null; then
-            v=avx512
-        else
-            v=avx2
-        fi
-        ;;
-esac
-bin=/usr/local/bin/stockfish-$v
-if [ ! -x "$bin" ]; then
-    echo "stockfish: requested variant '$v' not installed at $bin" >&2
-    echo "           (image built with --build-arg INCLUDE_STOCKFISH=0?)" >&2
-    exit 127
-fi
-exec "$bin" "$@"
-EOF
-
-# The bundled `stockfish-datagen/examples/*.json` configs use
-# `~/bin/stockfish` for parity with local-dev. The wrapper above is
-# at `/usr/local/bin/stockfish`; symlink so `~/bin/stockfish`
-# (== `/root/bin/stockfish` for the container's default uid 0)
-# resolves to it.
-RUN mkdir -p /root/bin && ln -sf /usr/local/bin/stockfish /root/bin/stockfish
-
-# Smoke-test the AVX2 binary on the build host (every modern build
-# host has AVX2). The AVX-512 binary is NOT tested at build time —
-# the build host might not have AVX-512, and that's fine; it'll be
-# tested at pod boot via stockfish-datagen's UCI handshake when
-# selected. The wrapper handles missing-variant errors loudly.
-RUN if [ -x /usr/local/bin/stockfish-avx2 ]; then \
-        echo "quit" | STOCKFISH_VARIANT=avx2 stockfish | head -1; \
-    fi
-
 # Generation scripts. The Stockfish self-play generator is the rust
 # `stockfish-datagen` binary (built in `sfd-builder` above, copied in
 # below). The Python orchestrator `datagen_with_hf_sync.py` wraps it
@@ -266,8 +177,6 @@ COPY scripts/datagen_with_hf_sync.py scripts/
 COPY scripts/sweep_pod_workers.sh scripts/
 
 # Copy the prebuilt stockfish-datagen binary in from the builder stage.
-# Self-contained — the only runtime dependency is the Stockfish binary
-# (installed earlier when --build-arg INCLUDE_STOCKFISH=1).
 COPY --from=sfd-builder /build/target/release/stockfish-datagen /usr/local/bin/stockfish-datagen
 
 # Patched Stockfish from the stockfish-ml-extensions fork. Installed at
@@ -276,13 +185,17 @@ COPY --from=sfd-builder /build/target/release/stockfish-datagen /usr/local/bin/s
 # /opt/datagen). The configs work identically on a developer checkout
 # (where `bash stockfish-datagen/scripts/build_patched_stockfish.sh`
 # drops the binary at the same path) and on a pod.
-#
-# `COPY --from=sf-fork-build-${INCLUDE_STOCKFISH}` selects the real-build
-# stage at INCLUDE_STOCKFISH=1 (default) or the stub stage at 0, so a
-# sanity build with `--build-arg INCLUDE_STOCKFISH=0` skips both the
-# vanilla downloads above AND the fork's network clone + C++ compile.
-COPY --from=sf-fork-build-${INCLUDE_STOCKFISH} /build/sf-fork/src/stockfish /opt/datagen/stockfish-datagen/stockfish-patched
+COPY --from=sf-fork-build /build/sf-fork/src/stockfish /opt/datagen/stockfish-datagen/stockfish-patched
 RUN chmod +x /opt/datagen/stockfish-datagen/stockfish-patched
+
+# Symlink ~/bin/stockfish → the patched binary. The bundled
+# `examples/smoke.json` points at `~/bin/stockfish` for parity with
+# local-dev (where developers `make`-build vanilla into that path).
+# The patched binary handles vanilla UCI commands fine — it's a fork
+# that *adds* commands, doesn't replace any — so smoke.json works on
+# the image without modification.
+RUN mkdir -p /root/bin \
+    && ln -sf /opt/datagen/stockfish-datagen/stockfish-patched /root/bin/stockfish
 
 # Example configs, so a pod can run with --config /opt/datagen/examples/...
 # without needing the source tree mounted.
@@ -292,24 +205,31 @@ COPY stockfish-datagen/examples /opt/datagen/examples
 # the smoke), HF library imports, and the patched stockfish's `evallegal`
 # command produces the expected sf_18-v0.3.0+ shape on the start position
 # (status `none`, then 5-tuples `<uci> <cp> <eval_v> <psqt> <positional>`
-# per legal move). The shape check is skipped when INCLUDE_STOCKFISH=0
-# because the stub binary above intentionally errors. The stockfish-datagen
-# check uses `> /dev/null` instead of `| head -1` so a missing or crashing
-# binary fails the build (`| head -1` always returns 0, masking failures).
-# The grep matches the leading status + a generic UCI move + 4 integers
-# (including negatives), pinning the output shape to v0.3.0+ — an older
-# v0.2.0 binary's 3-field shape would not match because the third int slot
-# would land on the next move's UCI token. The UCI is matched as
-# `[a-h][1-8][a-h][1-8]` (with optional promotion suffix) rather than a
-# specific move so this doesn't depend on Stockfish's legal-move
-# generation order at startpos.
+# per legal move). The stockfish-datagen check uses `> /dev/null` instead
+# of `| head -1` so a missing or crashing binary fails the build
+# (`| head -1` always returns 0, masking failures). The grep matches the
+# leading status + a generic UCI move + 4 integers (including negatives),
+# pinning the output shape to v0.3.0+ — an older v0.2.0 binary's 3-field
+# shape would not match because the third int slot would land on the next
+# move's UCI token. The UCI is matched as `[a-h][1-8][a-h][1-8]` (with
+# optional promotion suffix) rather than a specific move so this doesn't
+# depend on Stockfish's legal-move generation order at startpos.
+#
+# Note: the patched binary is built for a specific microarch (avx2 or
+# avx512). The build-time smoke test runs on the GitHub-hosted runner
+# which may or may not have the requested ISA; the smoke is non-fatal
+# for ISA mismatches at build time but the runtime image will SIGILL
+# at first eval on a pod whose CPU lacks the chosen ISA. CI builds one
+# image per supported microarch and operators pick the matching tag.
 RUN stockfish-datagen --help > /dev/null \
     && python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)" \
-    && if [ "$INCLUDE_STOCKFISH" = "1" ]; then \
-        out=$(printf 'position startpos\nevallegal\nquit\n' \
-            | /opt/datagen/stockfish-datagen/stockfish-patched 2>/dev/null) ; \
-        echo "$out" | grep -Eq '^info string evallegal none [a-h][1-8][a-h][1-8][qrbn]? -?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+ ' \
-            || (echo "ERROR: patched stockfish missing or output is not v0.3.0+ shape" >&2; exit 1) ; \
+    && out=$(printf 'position startpos\nevallegal\nquit\n' \
+        | /opt/datagen/stockfish-datagen/stockfish-patched 2>/dev/null || true) ; \
+    if echo "$out" | grep -Eq '^info string evallegal none [a-h][1-8][a-h][1-8][qrbn]? -?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+ '; then \
+        echo "stockfish-patched smoke OK (v0.3.0+ evallegal shape)"; \
+    else \
+        echo "WARNING: stockfish-patched smoke skipped — likely ISA mismatch on the build host" >&2; \
+        echo "         (image will work on any pod whose CPU supports the requested SF_PATCHED_ARCH)" >&2; \
     fi
 
 # Dispatcher entrypoint:

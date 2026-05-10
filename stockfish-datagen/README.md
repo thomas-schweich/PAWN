@@ -417,7 +417,9 @@ mid-upload at join timeout — local shards stay on disk and resume
 picks them up).
 
 Pod recipe (Docker image's default entrypoint dispatches to this script
-when both env vars are set):
+when both env vars are set). Pick the image tag matching the pod's CPU
+microarch — `:datagen-avx2` runs anywhere, `:datagen-avx512` is faster
+on Zen 4+ / Sapphire Rapids+ but SIGILLs on AVX2-only hardware:
 
 ```bash
 docker run --rm -d \
@@ -426,7 +428,7 @@ docker run --rm -d \
     -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_100m.json \
     -e DATAGEN_PRUNE_LOCAL=1 \
     -v /workspace/sf:/workspace/sf \
-    pawn-datagen
+    thomasschweich/pawn:datagen-avx2     # or :datagen-avx512
 ```
 
 Recognized env vars:
