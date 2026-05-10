@@ -4,24 +4,22 @@
 # binary) plus a Python orchestrator (`datagen_with_hf_sync.py`) that
 # wraps it with incremental upload to a HuggingFace dataset.
 #
-# Stockfish is the **patched fork** (stockfish-ml-extensions, sf_18-v0.3.0+)
-# built into the image at the requested microarchitecture. The patched
-# binary adds the `evallegal` UCI command (used by every searchless tier
-# and by every search tier with `store_legal_move_evals: true`) and the
-# `NetSelection` UCI option (used by every tier in the production
-# `stockfish_100m.json` config). It also handles vanilla UCI commands
-# fine — it's a fork, not a replacement — so it covers any leftover
-# vanilla-style configs (e.g. the bundled `smoke.json` that points at
-# `~/bin/stockfish`).
+# Stockfish is the **patched fork** (stockfish-ml-extensions, sf_18-v0.3.0+).
+# The patched binary adds the `evallegal` UCI command (used by every
+# searchless tier and by every search tier with `store_legal_move_evals:
+# true`) and the `NetSelection` UCI option (used by every tier in the
+# production `stockfish_100m.json` config). It also handles vanilla UCI
+# commands fine — it's a fork, not a replacement.
 #
-# **Microarchitecture: this image ships ONE patched binary** at the
-# microarch named in `SF_PATCHED_ARCH` (default `x86-64-avx2`, the
-# lowest-common-denominator that runs on any modern x86 pod). Override
-# with `--build-arg SF_PATCHED_ARCH=x86-64-avx512` for the AVX-512
-# variant (Zen 4+ / Sapphire Rapids+). CI publishes both as
-# `:datagen-avx2` / `:datagen-avx512` (and `:datagen-dev-{arch}`) so
-# operators choose at pod-launch time. There is no auto-detect wrapper —
-# pick the right tag and the binary is the right binary.
+# **Microarchitecture: JIT-built at pod startup**, not at image build
+# time. The image ships the SF source + a `build_stockfish_for_host.sh`
+# preflight script. On first launch the entrypoint detects the host CPU
+# from `/proc/cpuinfo`, picks the optimal Makefile ARCH (vnni512 on Zen 4
+# / Sapphire Rapids, avx512 on Skylake-X, avx2 on Haswell+, modern
+# fallback), builds the binary, and caches it under
+# `/workspace/.cache/stockfish/<commit-arch-hash>/`. Subsequent launches
+# on the same persistent mount are a cache hit (~10 ms). One image tag
+# covers every supported microarch — operators do not pick at launch.
 #
 # Lc0 was previously bundled here but was removed when we stopped
 # using it for active datagen — keeping the build infrastructure
@@ -38,19 +36,17 @@
 #
 # Build (runtime):
 #   docker build --platform linux/amd64 --target runtime \
-#     --build-arg SF_PATCHED_ARCH=x86-64-avx2 \
-#     -f Dockerfile.datagen -t pawn-datagen:avx2 .
+#     -f Dockerfile.datagen -t pawn-datagen .
 #
 # Build (dev — typical for stockfish-datagen workflows):
 #   docker build --platform linux/amd64 --target dev \
-#     --build-arg SF_PATCHED_ARCH=x86-64-avx2 \
-#     -f Dockerfile.datagen -t pawn-datagen:dev-avx2 .
+#     -f Dockerfile.datagen -t pawn-datagen:dev .
 #
 # Run (dev — needs PUBLIC_KEY for SSH login, HF_TOKEN persisted to cache):
 #   docker run -d -p 22:22 \
 #     -e PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)" \
 #     -e HF_TOKEN=hf_... \
-#     pawn-datagen:dev-avx2
+#     pawn-datagen:dev
 #
 # Pinned versions for reproducibility:
 #   Stockfish 18 fork   https://github.com/thomas-schweich/stockfish-ml-extensions
@@ -82,37 +78,29 @@ RUN curl -fsSL "https://github.com/tmux/tmux/releases/download/${TMUX_VERSION}/t
     && make install \
     && strip /usr/local/bin/tmux
 
-# ── Build the patched Stockfish from the stockfish-ml-extensions fork ──
-# Used by every tier in the production config (`searchless: true` tiers
-# and any tier with `net_selection` or `store_legal_move_evals: true`).
-# Built once per image at the microarch named in `SF_PATCHED_ARCH`;
-# CI publishes one image per supported microarch via the matrix.
-FROM ubuntu:24.04 AS sf-fork-build
+# ── Clone the patched Stockfish source from the fork ───────────────────
+# Source-only stage: the runtime image builds the binary JIT at pod
+# startup against the host CPU (see `scripts/build_stockfish_for_host.sh`).
+# Keeping the clone in a dedicated stage avoids re-cloning on every
+# runtime rebuild (Docker caches this layer keyed on SF_FORK_COMMIT).
+FROM ubuntu:24.04 AS sf-fork-source
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential git ca-certificates curl \
+        git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 ARG SF_FORK_REPO=https://github.com/thomas-schweich/stockfish-ml-extensions.git
 # Pin to commit SHA, not just tag. Lightweight git tags can be force-moved
-# on the remote and a `git clone --branch <tag>` would silently pick up the
-# new commit. The annotated tag `sf_18-v0.3.0` currently points at this
-# commit; we pin to the SHA so a future tag move (accidental or otherwise)
-# fails the build loudly instead of silently changing the binary.
+# on the remote and a `git clone --branch <tag>` would silently pick up
+# the new commit. The annotated tag `sf_18-v0.3.0` currently points at
+# this commit; we pin to the SHA so a future tag move (accidental or
+# otherwise) fails the build loudly instead of silently changing the binary.
 ARG SF_FORK_COMMIT=14f92699733a3d24a9067a20b32f95f0fcf9c4ab
-# Microarch the patched binary is built for. CI passes one of:
-#   x86-64-avx2     (lowest common denominator, runs on any modern x86)
-#   x86-64-avx512   (Zen 4+ / Sapphire Rapids+, faster NNUE inference)
-# Mismatched microarch → SIGILL on first eval call, so operators must
-# choose the right image tag for the pod's CPU.
-ARG SF_PATCHED_ARCH=x86-64-avx2
 
 WORKDIR /build
 RUN git clone "$SF_FORK_REPO" sf-fork \
     && git -C sf-fork checkout --quiet "$SF_FORK_COMMIT" \
-    && cd sf-fork/src \
-    && make -j"$(nproc)" build ARCH="$SF_PATCHED_ARCH" \
-    && strip stockfish
+    && rm -rf sf-fork/.git
 
 # ── Build the Rust stockfish-datagen binary in a builder stage ────────
 # Multi-stage so the rustup toolchain (~1GB) and the build system
@@ -153,8 +141,14 @@ FROM ubuntu:24.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
+# Runtime gains the SF build toolchain (g++ + make + libc-dev) because we
+# build stockfish JIT at pod startup. This is ~150 MB of additional image
+# layers vs the previous prebuilt-binary approach but lets one image cover
+# every microarch (vnni512 on Zen 4, avx512 on Skylake-X, avx2 fallback,
+# etc.) without a CI matrix.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip curl \
+        g++ make libc-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # huggingface_hub is needed by the datagen_with_hf_sync.py orchestrator —
@@ -174,69 +168,56 @@ RUN pip3 install --break-system-packages --no-cache-dir \
 WORKDIR /opt/datagen
 COPY scripts/benchmark_stockfish_nodes.py scripts/
 COPY scripts/datagen_with_hf_sync.py scripts/
+COPY scripts/build_stockfish_for_host.sh scripts/
 COPY scripts/sweep_pod_workers.sh scripts/
 
 # Copy the prebuilt stockfish-datagen binary in from the builder stage.
 COPY --from=sfd-builder /build/target/release/stockfish-datagen /usr/local/bin/stockfish-datagen
 
-# Patched Stockfish from the stockfish-ml-extensions fork. Installed at
-# the relative path the bundled configs reference (`stockfish_path:
-# "stockfish-datagen/stockfish-patched"` resolved from WORKDIR
-# /opt/datagen). The configs work identically on a developer checkout
-# (where `bash stockfish-datagen/scripts/build_patched_stockfish.sh`
-# drops the binary at the same path) and on a pod.
-COPY --from=sf-fork-build /build/sf-fork/src/stockfish /opt/datagen/stockfish-datagen/stockfish-patched
-RUN chmod +x /opt/datagen/stockfish-datagen/stockfish-patched
+# Patched Stockfish source from the stockfish-ml-extensions fork. The
+# `build_stockfish_for_host.sh` preflight script builds it JIT at pod
+# startup against the host CPU and caches the binary under
+# /workspace/.cache/stockfish/. Configs reference the target symlink
+# (`stockfish-datagen/stockfish-patched` resolved from WORKDIR
+# /opt/datagen) that the preflight points at the cached build.
+COPY --from=sf-fork-source /build/sf-fork /opt/datagen/sf-fork
 
-# Symlink ~/bin/stockfish → the patched binary. The bundled
-# `examples/smoke.json` points at `~/bin/stockfish` for parity with
-# local-dev (where developers `make`-build vanilla into that path).
-# The patched binary handles vanilla UCI commands fine — it's a fork
-# that *adds* commands, doesn't replace any — so smoke.json works on
-# the image without modification.
-RUN mkdir -p /root/bin \
+# Stamp the commit into an env var so the preflight script can mix it
+# into the cache key. Keep this in sync with the ARG in the
+# `sf-fork-source` stage above (Docker doesn't propagate ARG values
+# across stages automatically).
+ENV SF_FORK_COMMIT=14f92699733a3d24a9067a20b32f95f0fcf9c4ab
+
+# Symlink ~/bin/stockfish → the soon-to-be-built patched binary. The
+# bundled `examples/smoke.json` points at `~/bin/stockfish` for parity
+# with local-dev. The symlink target doesn't need to exist yet at image
+# build time — the preflight script creates it before any consumer runs.
+RUN mkdir -p /root/bin /opt/datagen/stockfish-datagen \
     && ln -sf /opt/datagen/stockfish-datagen/stockfish-patched /root/bin/stockfish
 
 # Example configs, so a pod can run with --config /opt/datagen/examples/...
 # without needing the source tree mounted.
 COPY stockfish-datagen/examples /opt/datagen/examples
 
-# Smoke-test the runtime image: rust binary launches (success status is
-# the smoke), HF library imports, and the patched stockfish's `evallegal`
-# command produces the expected sf_18-v0.3.0+ shape on the start position
-# (status `none`, then 5-tuples `<uci> <cp> <eval_v> <psqt> <positional>`
-# per legal move). The stockfish-datagen check uses `> /dev/null` instead
-# of `| head -1` so a missing or crashing binary fails the build
-# (`| head -1` always returns 0, masking failures). The grep matches the
-# leading status + a generic UCI move + 4 integers (including negatives),
-# pinning the output shape to v0.3.0+ — an older v0.2.0 binary's 3-field
-# shape would not match because the third int slot would land on the next
-# move's UCI token. The UCI is matched as `[a-h][1-8][a-h][1-8]` (with
-# optional promotion suffix) rather than a specific move so this doesn't
-# depend on Stockfish's legal-move generation order at startpos.
-#
-# Note: the patched binary is built for a specific microarch (avx2 or
-# avx512). The build-time smoke test runs on the GitHub-hosted runner
-# which may or may not have the requested ISA; the smoke is non-fatal
-# for ISA mismatches at build time but the runtime image will SIGILL
-# at first eval on a pod whose CPU lacks the chosen ISA. CI builds one
-# image per supported microarch and operators pick the matching tag.
+# Build-time smoke: the rust binary launches (any binary issue fails the
+# build), and the HF library imports. The stockfish binary itself is NOT
+# smoked here — it doesn't exist until the preflight runs at pod startup.
+# That's a deliberate trade: the previous prebuilt approach also couldn't
+# meaningfully smoke-test ISA-specific binaries on the CI runner (which
+# may lack the build's target ISA); now the smoke moves to the pod, where
+# the host's CPU is the actual target.
 RUN stockfish-datagen --help > /dev/null \
-    && python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)" \
-    && out=$(printf 'position startpos\nevallegal\nquit\n' \
-        | /opt/datagen/stockfish-datagen/stockfish-patched 2>/dev/null || true) ; \
-    if echo "$out" | grep -Eq '^info string evallegal none [a-h][1-8][a-h][1-8][qrbn]? -?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+ '; then \
-        echo "stockfish-patched smoke OK (v0.3.0+ evallegal shape)"; \
-    else \
-        echo "WARNING: stockfish-patched smoke skipped — likely ISA mismatch on the build host" >&2; \
-        echo "         (image will work on any pod whose CPU supports the requested SF_PATCHED_ARCH)" >&2; \
-    fi
+    && python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)"
 
 # Dispatcher entrypoint:
-#   - if no args, default to the HF-sync orchestrator iff DATAGEN_HF_REPO
+#   - First, run the stockfish preflight build (JIT-builds the patched
+#     binary for the host CPU and caches it under /workspace/.cache/).
+#     Skipped via DATAGEN_SKIP_STOCKFISH_BUILD=1 (only useful for very
+#     short interactive sessions that don't run stockfish at all).
+#   - If no args, default to the HF-sync orchestrator iff DATAGEN_HF_REPO
 #     and DATAGEN_CONFIG are set (the fire-and-forget pod path).
-#   - if first arg ends in `.py`, run it via python3.
-#   - otherwise exec the command directly.
+#   - If first arg ends in `.py`, run it via python3.
+#   - Otherwise exec the command directly.
 # Three usage modes without --entrypoint overrides:
 #   # Pod fire-and-forget (env vars provide repo + config):
 #   docker run -e DATAGEN_HF_REPO=org/name -e DATAGEN_CONFIG=/opt/datagen/examples/stockfish_100m.json ... pawn-datagen
@@ -247,6 +228,17 @@ RUN stockfish-datagen --help > /dev/null \
 RUN cat > /usr/local/bin/datagen-entrypoint <<'EOF'
 #!/bin/sh
 set -e
+
+# Preflight: JIT-build the patched stockfish binary for this host's CPU
+# and symlink it into the path configs reference. Cached under
+# /workspace/.cache/stockfish/ so the first launch takes ~30-60s on a
+# 16-core box and ~5-10s on a 96-core EPYC pod; subsequent launches are
+# a cache hit (~10ms). Idempotent — skips work if the cached binary
+# already exists for this commit + arch.
+if [ -z "$DATAGEN_SKIP_STOCKFISH_BUILD" ]; then
+    /opt/datagen/scripts/build_stockfish_for_host.sh
+fi
+
 if [ $# -eq 0 ]; then
     if [ -n "$DATAGEN_HF_REPO" ] && [ -n "$DATAGEN_CONFIG" ]; then
         # Fire-and-forget pod mode. Extra flags can be passed via DATAGEN_EXTRA_ARGS.
@@ -360,6 +352,15 @@ sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd
 
 # Generate host keys on first boot. ssh-keygen -A is a no-op if they exist.
 ssh-keygen -A 2>/dev/null || true
+
+# Preflight: JIT-build the patched stockfish binary for this host's CPU
+# (cached under /workspace/.cache/stockfish/). Same script the
+# fire-and-forget entrypoint runs. Failure here is non-fatal in the dev
+# image — sshd still comes up so the operator can investigate.
+if [ -z "$DATAGEN_SKIP_STOCKFISH_BUILD" ]; then
+    /opt/datagen/scripts/build_stockfish_for_host.sh || \
+        echo "WARNING: stockfish preflight build failed; manual rebuild required" >&2
+fi
 
 cat <<MSG
 === Datagen dev container ===
