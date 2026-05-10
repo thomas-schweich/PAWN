@@ -206,10 +206,22 @@ def _upload_folder_batch(
     """Commit a batch of files from `local_dir` as a single HF commit.
 
     Uses `huggingface_hub.upload_folder` with `allow_patterns=files` so
-    only the named files participate in the commit. xet handles content
-    dedup, so re-uploading zero-byte placeholders (or any unchanged file)
-    is essentially free. Retries on transient HTTP errors; raises on
-    permanent ones.
+    only the named files participate in the commit. Per its docstring
+    `upload_folder` overwrites files of the same name on the remote and
+    leaves others untouched (no deletions unless `delete_patterns` is
+    set, which this code path never sets).
+
+    **Safety invariant — DO NOT BREAK**: every file in `files` MUST
+    exist locally with non-zero size at call time. The previous
+    orchestrator's "upload then truncate" pattern silently destroyed
+    data when a future sync rebroadcast the truncated zero-byte file
+    over the populated remote (see ANALYSIS.md A4). The watcher's
+    filtering already excludes zero-byte placeholders before they
+    reach this function; the explicit guard below catches any race or
+    refactor regression rather than letting it land as a silent
+    data-loss commit. Failing loud here is the right call — the
+    operator can re-run after fixing the root cause; a quiet
+    overwrite is unrecoverable.
 
     Why folder uploads instead of per-shard `upload_file`: HF caps
     commits at 128 / hour per repo. A 100M-game run produces ~45
@@ -219,6 +231,22 @@ def _upload_folder_batch(
     """
     if not files:
         return
+    # Defense in depth: refuse to ever upload a zero-byte file.
+    for name in files:
+        path = local_dir / name
+        try:
+            size = path.stat().st_size
+        except OSError as e:
+            raise RuntimeError(
+                f"upload_folder safety check: {path} stat failed ({e}); "
+                f"refusing to commit a batch with a missing file"
+            ) from e
+        if size == 0:
+            raise RuntimeError(
+                f"upload_folder safety check: {path} is zero bytes; "
+                f"refusing to overwrite remote {path_in_repo}/{name} with "
+                f"empty content (would silently destroy already-uploaded data)"
+            )
     delay = 2.0
     for attempt in range(5):
         try:
