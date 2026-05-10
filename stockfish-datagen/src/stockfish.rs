@@ -146,9 +146,19 @@ pub struct StockfishProcess {
     position_cmd: String,
     /// Whether `position_cmd` already contains the ` moves` preamble. Set
     /// by the first `play_move()` after `new_game()`; reset by
-    /// `new_game()`. Avoids the per-ply linear scan that
-    /// `position_cmd.contains(" moves")` would do — at ply 100 the cmd is
-    /// ~550 bytes and the scan runs O(ply²) across a game.
+    /// `new_game()` and by `candidates(&[])`. Avoids the per-ply linear
+    /// scan that `position_cmd.contains(" moves")` would do — at ply 100
+    /// the cmd is ~550 bytes and the scan runs O(ply²) across a game.
+    ///
+    /// **Mutation sites** (must be kept in sync with `position_cmd`):
+    /// `spawn` (initializes both empty), `new_game`, `candidates(&[])`,
+    /// `candidates(non-empty)`, `play_move`. The spawn-time `evallegal`
+    /// probe sends `"position startpos"` directly via `send()` rather
+    /// than through `position_cmd`, so both fields remain in their
+    /// initial empty/false state until `new_game()` is called — the
+    /// `debug_assert!(!position_cmd.is_empty())` in `play_move` /
+    /// `candidates_with` guards against a future probe extension that
+    /// forgets this and tries to pre-play moves.
     position_has_moves: bool,
     /// Pre-rendered per-ply command (`go nodes N` or `evallegal`). Stored
     /// as `Cow` so `EvalLegal` borrows a `'static` string at no allocation

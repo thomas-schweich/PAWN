@@ -503,18 +503,31 @@ fn run_worker(
         // either `None` or a Vec whose length equals `uci_moves.len()`. If
         // a future refactor of the play loop ever pushes to one buffer
         // without matching the other (or returns Ok with a partial buffer
-        // on a non-error path), this assert fires immediately rather than
-        // letting the desync silently produce a parquet row whose static
-        // labels are misaligned by one ply against the actual game.
+        // on a non-error path), this fails the run rather than letting the
+        // desync silently produce a parquet row whose static labels are
+        // misaligned by one ply against the actual game.
+        //
+        // Use `anyhow::ensure!` (Result-returning) rather than `assert_eq!`
+        // (panicking) so the structured worker_id / game_index / counts
+        // context survives through `first_err` and out to the operator.
+        // The thread-join machinery would otherwise swallow the panic
+        // payload and surface only "worker N panicked", which is hard to
+        // diagnose in a 126-worker pod log.
         if let Some(c) = &played.per_ply_candidates {
-            assert_eq!(c.len(), played.uci_moves.len(),
-                "worker {worker_id} game {game_index}: per_ply_candidates len {} != uci_moves len {}",
-                c.len(), played.uci_moves.len());
+            anyhow::ensure!(
+                c.len() == played.uci_moves.len(),
+                "worker {worker_id} game {game_index} (seed {game_seed}): \
+                 per_ply_candidates len {} != uci_moves len {}",
+                c.len(), played.uci_moves.len(),
+            );
         }
         if let Some(c) = &played.per_ply_static_candidates {
-            assert_eq!(c.len(), played.uci_moves.len(),
-                "worker {worker_id} game {game_index}: per_ply_static_candidates len {} != uci_moves len {}",
-                c.len(), played.uci_moves.len());
+            anyhow::ensure!(
+                c.len() == played.uci_moves.len(),
+                "worker {worker_id} game {game_index} (seed {game_seed}): \
+                 per_ply_static_candidates len {} != uci_moves len {}",
+                c.len(), played.uci_moves.len(),
+            );
         }
         let n = tokens.len();
 
