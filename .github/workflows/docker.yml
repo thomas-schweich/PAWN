@@ -10,7 +10,48 @@ env:
   IMAGE: thomasschweich/pawn
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      main: ${{ steps.filter.outputs.main }}
+      datagen: ${{ steps.filter.outputs.datagen }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            main:
+              - 'Dockerfile'
+              - 'pawn/**'
+              - 'engine/**'
+              - 'scripts/**'
+              - 'configs/**'
+              - 'deploy/**'
+              - 'cards/**'
+              - 'docs/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'searchless_chess_vocabulary.json'
+              - '.github/workflows/docker.yml'
+            datagen:
+              - 'Dockerfile.datagen'
+              - 'engine/**'
+              - 'stockfish-datagen/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'scripts/datagen_with_hf_sync.py'
+              - 'scripts/benchmark_stockfish_nodes.py'
+              - 'scripts/sweep_pod_workers.sh'
+              - 'deploy/pod-gpu-stats.sh'
+              - 'deploy/.tmux.conf'
+              - '.github/workflows/docker.yml'
+
   build-cuda:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.main == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,6 +109,8 @@ jobs:
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-dev,mode=max
 
   build-rocm:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.main == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -123,3 +166,62 @@ jobs:
             type=registry,ref=${{ env.IMAGE }}:buildcache-runtime-rocm
             type=registry,ref=${{ env.IMAGE }}:buildcache-dev-rocm
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-dev-rocm,mode=max
+
+  build-datagen:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.datagen == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve git tag
+        id: meta
+        run: echo "tag=$(git tag --points-at HEAD | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push runtime (datagen)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.datagen
+          target: runtime
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:datagen
+            ${{ env.IMAGE }}:datagen-${{ github.sha }}
+          build-args: |
+            GIT_HASH=${{ github.sha }}
+            GIT_TAG=${{ steps.meta.outputs.tag }}
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime,mode=max
+
+      - name: Build and push dev (datagen)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.datagen
+          target: dev
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:datagen-dev
+            ${{ env.IMAGE }}:datagen-dev-${{ github.sha }}
+          build-args: |
+            GIT_HASH=${{ github.sha }}
+            GIT_TAG=${{ steps.meta.outputs.tag }}
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime
+            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-dev
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-dev,mode=max
