@@ -83,6 +83,13 @@ pub enum GameError {
          this indicates a bug in the in-process terminal detector or a Stockfish issue."
     )]
     UnexpectedNoneBestmove,
+    #[error(
+        "stockfish's `evallegal` reported a {kind:?} terminal during the static-eval teacher \
+         capture, but our pre-move terminal check found legal moves at this position; \
+         this indicates a disagreement between `detect_pre_eval_terminal` and Stockfish's \
+         in-process terminal detection that should be diagnosed before the run continues."
+    )]
+    StaticEvalUnexpectedTerminal { kind: crate::stockfish::TerminalKind },
 }
 
 /// Number of times `current_hash` appears in `history`. The caller is
@@ -273,24 +280,23 @@ pub fn play_game<R: Rng + ?Sized>(
         }
 
         // Capture the canonical NNUE static eval per legal move via a
-        // separate `evallegal` call BEFORE we apply the move. Doing it
-        // here (not after) ensures the position cache reflects the
-        // pre-move state, matching what `legal_move_evals` covers — the
-        // `sf.play_move(...)` call below mutates `position_cmd`, so any
-        // refactor that moves it earlier would silently mis-attribute
-        // labels to the next position. The capture and the play_move are
-        // intentionally separated by the picker block to keep the
-        // position-cache invariant explicit.
+        // separate `evallegal` call. **Must happen before `sf.play_move`
+        // (further down in this loop body)** — that call mutates
+        // `position_cmd`, so any refactor that moves this block below
+        // it would silently mis-attribute labels to the next position
+        // rather than the current one.
         if let Some(buf) = per_ply_static_candidates.as_mut() {
             let teacher = sf.candidates_with(GoBudget::EvalLegal)?;
             // Distinguish "engine reports a real terminal we missed" from
-            // "engine returned an empty list for a non-terminal position":
-            // the former is a contract violation of our pre-eval terminal
-            // detector (handled the same way as the search-budget path
-            // does at line ~226), while the latter is the only thing
-            // `NoCandidates` can plausibly mean here.
-            if teacher.terminal.is_some() {
-                return Err(GameError::UnexpectedNoneBestmove);
+            // "engine returned an empty list for a non-terminal position".
+            // The terminal case is the same contract violation the search
+            // path detects at line ~241, but `evallegal` doesn't return a
+            // `bestmove` so the prose of `UnexpectedNoneBestmove` would
+            // mislead anyone debugging the first occurrence — use a
+            // dedicated variant that names the actual signal source and
+            // carries the specific terminal kind for diagnosis.
+            if let Some(kind) = teacher.terminal {
+                return Err(GameError::StaticEvalUnexpectedTerminal { kind });
             }
             if teacher.candidates.is_empty() {
                 return Err(GameError::NoCandidates);

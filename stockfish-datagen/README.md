@@ -20,6 +20,11 @@ cargo run --release -p stockfish-datagen -- run \
   --config stockfish-datagen/examples/smoke.json
 
 # Production: 100M games across 5 tiers (20M per tier).
+# *Requires the patched binary* — every tier sets store_legal_move_evals=true
+# and net_selection=large, both of which trigger the patched-binary preflight
+# check (`evallegal` UCI command + `NetSelection` option). Vanilla SF18 will
+# fail the preflight before any worker spawns. Build via
+# `bash stockfish-datagen/scripts/build_patched_stockfish.sh`.
 cargo run --release -p stockfish-datagen -- run \
   --config stockfish-datagen/examples/stockfish_100m.json
 

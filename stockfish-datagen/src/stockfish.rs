@@ -460,6 +460,18 @@ impl StockfishProcess {
         &mut self,
         budget: GoBudget,
     ) -> Result<CandidatesResult, StockfishError> {
+        // `candidates_with` is intended for one-shot `EvalLegal` teacher-
+        // signal capture from a process spawned with a different budget.
+        // A caller passing `GoBudget::Nodes(N)` would silently work
+        // (falls through to read_go_response) but leave `self.budget`
+        // and `self.play_cmd` stale relative to the issued command,
+        // confusing any subsequent `candidates_after_play_moves` call
+        // that re-reads them. Pin the intent at compile-debug time.
+        debug_assert!(
+            matches!(budget, GoBudget::EvalLegal),
+            "candidates_with is intended for one-shot EvalLegal teacher-signal capture; \
+             use candidates_after_play_moves for the tier's primary budget",
+        );
         debug_assert!(
             !self.position_cmd.is_empty(),
             "candidates_with called before new_game / candidates — no base position",
