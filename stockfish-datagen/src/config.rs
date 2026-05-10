@@ -751,33 +751,35 @@ mod tests {
 
     #[test]
     fn tier_fingerprint_actually_depends_on_shard_schema_version() {
-        // Pin the causal link "version constant controls hash output" by
+        // Pin the causal link "version field controls hash output" by
         // computing the real `tier_fingerprint` and a hand-rolled hash
-        // over a payload identical EXCEPT the version is bumped, then
-        // asserting the two hashes differ. If a future refactor
-        // accidentally drops `shard_schema_version` from the live payload
-        // construction in `tier_fingerprint`, this test fails loudly:
-        // the live hash would no longer respond to a version change, so
-        // it'd equal the hand-rolled hash regardless of which version we
-        // construct it with.
+        // over the SAME 8 non-version fields with the version field
+        // OMITTED, then asserting the two hashes differ. The regression
+        // we're guarding against: someone drops the
+        // `shard_schema_version` line from the live payload (refactor
+        // accident, lint cleanup, etc.). After the drop, the live
+        // payload would have 8 fields and our hand-rolled payload would
+        // also have 8 fields with the same values — the hashes would
+        // collide and `assert_ne!` would fail loudly.
         //
-        // Why not just `payload.to_string().contains("shard_schema_version")`?
-        // That tests the test's own local payload literal, not the
-        // production code path. The golden-hash test pins the live
-        // payload byte-for-byte, but doesn't *causally* prove the
-        // version field is the discriminator — a future refactor that
-        // replaces the field with some other equally-fingerprint-
-        // changing value would update the golden but silently lose the
-        // schema-version protection.
+        // Earlier rounds tried two weaker variants:
+        //   - `payload.to_string().contains("shard_schema_version")` —
+        //     tests the test's own local literal, not the production
+        //     code path. Tautology.
+        //   - hand-roll the payload WITH a bumped version, assert it
+        //     differs from the real hash — gives a false green: if the
+        //     live payload drops the version, real becomes hash-of-8
+        //     and the bumped hand-rolled is hash-of-9-with-bump, which
+        //     differ for the wrong reason (different field count, not
+        //     missing version protection).
+        // The current form catches the regression by construction:
+        // production-with-version vs hand-rolled-without-version must
+        // differ; production-without-version vs hand-rolled-without-
+        // version would equal, failing the assert.
         let cfg = minimal_config();
         let real = cfg.tier_fingerprint(0);
 
-        // Reconstruct the same payload but with version + 1 (or any
-        // other value distinct from the constant). Hash it the same way
-        // tier_fingerprint does. If the live tier_fingerprint truly
-        // depends on the version, the two hashes must differ.
-        let bumped_version = crate::shard::SHARD_SCHEMA_VERSION + 1;
-        let payload = serde_json::json!({
+        let payload_no_version = serde_json::json!({
             "tier_index": 0,
             "tier": &cfg.tiers[0],
             "master_seed": cfg.master_seed,
@@ -786,16 +788,17 @@ mod tests {
             "shard_size_games": cfg.shard_size_games,
             "max_ply": cfg.max_ply,
             "n_workers": cfg.n_workers,
-            "shard_schema_version": bumped_version,
         });
         let mut h = Sha256::new();
-        h.update(payload.to_string().as_bytes());
-        let bumped_hash = hex(&h.finalize());
+        h.update(payload_no_version.to_string().as_bytes());
+        let no_version_hash = hex(&h.finalize());
         assert_ne!(
-            real, bumped_hash,
-            "tier_fingerprint must depend on SHARD_SCHEMA_VERSION; real hash matches the \
-             hand-rolled hash with a different version, meaning the live payload is no longer \
-             carrying the version field",
+            real, no_version_hash,
+            "tier_fingerprint must depend on SHARD_SCHEMA_VERSION; if it didn't, removing the \
+             version field from the live payload would produce the same hash as the hand-rolled \
+             8-field payload — meaning the live `tier_fingerprint` no longer carries the \
+             schema-version discriminator and a code upgrade across a schema bump would silently \
+             pass the resume fingerprint check.",
         );
     }
 
