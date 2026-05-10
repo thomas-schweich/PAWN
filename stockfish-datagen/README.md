@@ -203,8 +203,8 @@ tier-state's fingerprint.
 | `sample_score`      | `Utf8?`         | searchless-only: `"cp"` or `"v"`; null otherwise |
 | `net_selection`     | `Utf8?`         | either tier mode: `"auto"` / `"small"` / `"large"`; null when the tier left the engine on its default |
 | `temperature`       | `Float32`       | per-row, from tier config               |
-| `worker_id`         | `Int16`         | which worker produced the row           |
-| `game_seed`         | `UInt64`        | per-game seed (reproduction key)        |
+| `global_game_index` | `UInt64`        | canonical per-tier global index, independent of `n_workers`; together with the tier config this uniquely identifies a game in the dataset |
+| `game_seed`         | `UInt64`        | per-game seed: `mix(tier_seed, global_game_index)` (reproduction key with `stockfish_version`) |
 | `stockfish_version` | `String`        | from Stockfish's `id name` line         |
 | `legal_move_evals`  | `List<List<Struct{move_idx: Int16, score_cp: Int16, score_eval_v: Int16?, score_psqt: Int16?, score_positional: Int16?}>>` | per-ply per-legal-move payload from the tier's **selection** engine call when `store_legal_move_evals: true`; empty outer list when not. Semantics depend on tier mode: searchless tiers populate every legal move with all five fields (evallegal source); search-mode tiers populate the multipv top-K with `score_cp` only and the three nullable fields are `None`. Always non-null at the row level — readers find an empty `[]` rather than a row-level null on tiers that didn't opt in. |
 | `static_legal_move_evals` | (same Struct as `legal_move_evals`) | per-ply per-legal-move **canonical NNUE static eval** captured by a separate `evallegal` call after each ply's selection. Same shape and same struct fields as `legal_move_evals`, but always full-evallegal-sourced (every legal move, all four score fields — `score_cp`, `score_eval_v`, `score_psqt`, `score_positional` — populated alongside `move_idx`). Populated only when `store_legal_move_evals: true` AND the tier is non-searchless — on searchless tiers this is **null** (the same data already lives in `legal_move_evals`, so duplicating would double tier-0 storage). Convention for downstream: read the canonical static eval as `static_legal_move_evals if not None else legal_move_evals`. The two columns describe the same plies but with different move sets and orderings; join via `move_idx` if pairing is needed. |
@@ -319,9 +319,12 @@ topology, override per the rule above.
 ### Validating on the actual pod (~1-3 minutes)
 
 `scripts/sweep_pod_workers.sh` runs a quick `n_workers` sweep on the
-pod's hardware. Useful before launching the full fire-and-forget run,
-since `n_workers` is part of the per-tier fingerprint — changing it
-mid-run would invalidate the partial state and waste pod hours.
+pod's hardware. Useful before launching the full fire-and-forget run
+to find the throughput-optimal worker count. `n_workers` is purely
+operational (the per-tier fingerprint excludes it; see "Dataset
+extension recipes" below), so you can change it freely between runs
+without invalidating prior shards — the sweep is about throughput,
+not data identity.
 
 ```bash
 # Auto-detect topology, sweep ±4 around the rule's prediction:
@@ -466,23 +469,29 @@ HF_TOKEN=... python scripts/datagen_with_hf_sync.py \
 Three phases run in one process:
 
 1. **Primer.** Lists the dataset repo. Downloads the per-tier sentinels
-   (`_manifest.json`, `_tier_state.json`) into the local output dir.
-   For every remote shard file, creates a *zero-byte placeholder* at the
-   matching local path. Because the rust binary's resume logic recovers
-   `(worker_id, chunk_idx, n_rows)` from the filename alone, a directory
-   full of placeholders looks identical to a directory full of real
-   shards — no parquet metadata is read on resume, so no actual data
-   needs to be downloaded.
-2. **Subprocess.** Spawns `stockfish-datagen run --config <cfg>`.
-   SIGINT/SIGTERM are forwarded so the rust binary's graceful-shutdown
-   semantics are preserved.
+   (`_manifest.json`, `_tier_state.json`, plus their per-pod
+   `_manifest-s<A>-s<B>.json` / `_tier_state-s<A>-s<B>.json` variants)
+   into the local output dir. For every remote shard file, creates a
+   *zero-byte placeholder* at the matching local path. Because the
+   rust binary's resume logic recovers `(shard_id, n_rows)` from the
+   filename alone, a directory full of placeholders looks identical to
+   a directory full of real shards — no parquet metadata is read on
+   resume, so no actual data needs to be downloaded.
+2. **Subprocess.** Spawns `stockfish-datagen run --config <cfg>` (with
+   `--tiers` / `--shard-id-range` forwarded when set on the
+   orchestrator). SIGINT/SIGTERM are forwarded so the rust binary's
+   graceful-shutdown semantics are preserved.
 3. **Watcher.** A daemon thread polls the output dir every
    `--poll-interval` seconds (default 30 s) and uploads any new
-   completed shards (and updated sentinels) via `HfApi.upload_file`.
-   Zero-byte placeholders are skipped — those are already remote.
-   With `--prune-local`, the local file is replaced with a zero-byte
-   placeholder after a successful upload, so disk usage stays flat
-   regardless of the run's total size.
+   completed shards (and updated sentinels) via
+   `huggingface_hub.upload_folder` — folder-batched commits, at most
+   two per tier per cycle (state+shards, then manifest). One commit
+   per tier per cycle keeps the per-repo commit count well under HF's
+   128 commits/hour limit even at full datagen rate. Zero-byte
+   placeholders are skipped — those are already remote. With
+   `--prune-local`, each shard is truncated to a zero-byte placeholder
+   after its commit lands, so disk usage stays flat regardless of the
+   run's total size.
 
 CLI flags worth knowing:
 
