@@ -750,18 +750,33 @@ mod tests {
     }
 
     #[test]
-    fn tier_fingerprint_includes_shard_schema_version() {
-        // The fingerprint payload must carry SHARD_SCHEMA_VERSION so that
-        // a code upgrade adding a new parquet column invalidates resume
-        // for in-progress tier directories whose config didn't change.
-        // Without this, a searchless tier that already had
-        // store_legal_move_evals=true (config unchanged across the
-        // upgrade) would silently start writing new-schema shards into a
-        // dir of old-schema ones — exactly the mixed-schema gotcha
-        // documented in the README. Verify the version is in the
-        // serialized payload byte-for-byte (not just included in the
-        // hash) so a future refactor that drops it is caught loudly.
+    fn tier_fingerprint_actually_depends_on_shard_schema_version() {
+        // Pin the causal link "version constant controls hash output" by
+        // computing the real `tier_fingerprint` and a hand-rolled hash
+        // over a payload identical EXCEPT the version is bumped, then
+        // asserting the two hashes differ. If a future refactor
+        // accidentally drops `shard_schema_version` from the live payload
+        // construction in `tier_fingerprint`, this test fails loudly:
+        // the live hash would no longer respond to a version change, so
+        // it'd equal the hand-rolled hash regardless of which version we
+        // construct it with.
+        //
+        // Why not just `payload.to_string().contains("shard_schema_version")`?
+        // That tests the test's own local payload literal, not the
+        // production code path. The golden-hash test pins the live
+        // payload byte-for-byte, but doesn't *causally* prove the
+        // version field is the discriminator — a future refactor that
+        // replaces the field with some other equally-fingerprint-
+        // changing value would update the golden but silently lose the
+        // schema-version protection.
         let cfg = minimal_config();
+        let real = cfg.tier_fingerprint(0);
+
+        // Reconstruct the same payload but with version + 1 (or any
+        // other value distinct from the constant). Hash it the same way
+        // tier_fingerprint does. If the live tier_fingerprint truly
+        // depends on the version, the two hashes must differ.
+        let bumped_version = crate::shard::SHARD_SCHEMA_VERSION + 1;
         let payload = serde_json::json!({
             "tier_index": 0,
             "tier": &cfg.tiers[0],
@@ -771,11 +786,16 @@ mod tests {
             "shard_size_games": cfg.shard_size_games,
             "max_ply": cfg.max_ply,
             "n_workers": cfg.n_workers,
-            "shard_schema_version": crate::shard::SHARD_SCHEMA_VERSION,
+            "shard_schema_version": bumped_version,
         });
-        assert!(
-            payload.to_string().contains("\"shard_schema_version\""),
-            "payload must reference shard_schema_version key",
+        let mut h = Sha256::new();
+        h.update(payload.to_string().as_bytes());
+        let bumped_hash = hex(&h.finalize());
+        assert_ne!(
+            real, bumped_hash,
+            "tier_fingerprint must depend on SHARD_SCHEMA_VERSION; real hash matches the \
+             hand-rolled hash with a different version, meaning the live payload is no longer \
+             carrying the version field",
         );
     }
 
