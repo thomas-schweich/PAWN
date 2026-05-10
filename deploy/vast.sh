@@ -247,6 +247,7 @@ cmd_create() {
     local name="" gpu="$DEFAULT_GPU" count=1
     local disk="$DEFAULT_DISK" image="$DEFAULT_IMAGE"
     local max_price="$DEFAULT_MAX_PRICE" interruptible=0
+    local offer_id_arg=""
 
     name="${1:-}"
     shift || true
@@ -258,12 +259,18 @@ cmd_create() {
             --image)         image="$2"; shift 2 ;;
             --max-price)     max_price="$2"; shift 2 ;;
             --interruptible) interruptible=1; shift ;;
+            --offer-id)      offer_id_arg="$2"; shift 2 ;;
             *)               echo "Unknown option: $1"; exit 1 ;;
         esac
     done
 
     if [ -z "$name" ]; then
-        echo "Usage: $0 create <name> [--gpu <type>] [--count <n>] [--disk <gb>] [--max-price <\$/hr>] [--interruptible]"
+        echo "Usage: $0 create <name> [--gpu <type>] [--count <n>] [--disk <gb>] [--max-price <\$/hr>] [--interruptible] [--offer-id <id>]"
+        exit 1
+    fi
+
+    if [ -n "$offer_id_arg" ] && ! [[ "$offer_id_arg" =~ ^[0-9]+$ ]]; then
+        echo "Error: --offer-id must be a positive integer, got: $offer_id_arg" >&2
         exit 1
     fi
 
@@ -335,32 +342,41 @@ cmd_create() {
         exit 1
     fi
 
-    # Find a cheap offer that matches.
-    local query
-    query=$(build_search_query "$gpu" "$count" "$disk" "$max_price" "$interruptible")
-    echo "Searching offers: $query"
-    local offers offer_id offer_dph offer_dc search_rc=0
-    # `set -e` would abort the script on a non-zero exit (missing API key,
-    # network down, rejected query) before we get a chance to print a useful
-    # error. Capture the rc explicitly.
-    offers=$(vastai search offers "$query" -o "dph_total" --raw 2>&1) || search_rc=$?
-    if [ "$search_rc" -ne 0 ]; then
-        echo "Error: vastai search offers failed (exit $search_rc):" >&2
-        echo "$offers" | sed 's/^/  /' >&2
-        echo "Check that 'vastai set api-key <KEY>' has been run and your network is up." >&2
-        exit 1
-    fi
-    if ! echo "$offers" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
-        echo "Error: no matching offers found."
-        echo "Try relaxing constraints (--gpu, --max-price) or run: $0 search --gpu $gpu"
-        exit 1
-    fi
-    offer_id=$(echo "$offers" | jq -r '.[0].id // empty')
-    offer_dph=$(echo "$offers" | jq -r '.[0].dph_total // "?"')
-    offer_dc=$(echo "$offers" | jq -r '.[0].geolocation // .[0].datacenter // "?"')
-    if [ -z "$offer_id" ]; then
-        echo "Error: top offer has no .id field — vastai response shape may have changed."
-        exit 1
+    # Find a cheap offer that matches — or use the explicit one the caller pinned.
+    local offer_id offer_dph="(pinned)" offer_dc="(pinned)"
+    if [ -n "$offer_id_arg" ]; then
+        # No probe: vast.ai's `search offers` filters don't include `id=`, and
+        # there's no `show offer` command. If the offer is gone, the create
+        # call below will fail with a clear vastai error — that's good enough.
+        offer_id="$offer_id_arg"
+        echo "Using pinned offer $offer_id (skipping market probe)"
+    else
+        local query
+        query=$(build_search_query "$gpu" "$count" "$disk" "$max_price" "$interruptible")
+        echo "Searching offers: $query"
+        local offers search_rc=0
+        # `set -e` would abort the script on a non-zero exit (missing API key,
+        # network down, rejected query) before we get a chance to print a useful
+        # error. Capture the rc explicitly.
+        offers=$(vastai search offers "$query" -o "dph_total" --raw 2>&1) || search_rc=$?
+        if [ "$search_rc" -ne 0 ]; then
+            echo "Error: vastai search offers failed (exit $search_rc):" >&2
+            echo "$offers" | sed 's/^/  /' >&2
+            echo "Check that 'vastai set api-key <KEY>' has been run and your network is up." >&2
+            exit 1
+        fi
+        if ! echo "$offers" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+            echo "Error: no matching offers found."
+            echo "Try relaxing constraints (--gpu, --max-price) or run: $0 search --gpu $gpu"
+            exit 1
+        fi
+        offer_id=$(echo "$offers" | jq -r '.[0].id // empty')
+        offer_dph=$(echo "$offers" | jq -r '.[0].dph_total // "?"')
+        offer_dc=$(echo "$offers" | jq -r '.[0].geolocation // .[0].datacenter // "?"')
+        if [ -z "$offer_id" ]; then
+            echo "Error: top offer has no .id field — vastai response shape may have changed."
+            exit 1
+        fi
     fi
 
     echo "Creating instance '$name' from offer $offer_id..."
