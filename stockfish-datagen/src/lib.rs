@@ -5,6 +5,7 @@ pub mod affinity;
 pub mod config;
 pub mod game;
 pub mod match_game;
+pub mod numa;
 pub mod outcome;
 pub mod resume;
 pub mod runner;

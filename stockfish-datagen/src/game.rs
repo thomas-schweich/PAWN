@@ -371,6 +371,7 @@ mod tests {
             opening_multi_pv: Some(20),
             opening_plies: Some(2),
             sample_plies: Some(12),
+            stockfish_hash_mb: None,
         };
         assert_eq!(target_multi_pv(&tier, 0), 20);
         assert_eq!(target_multi_pv(&tier, 1), 20);
@@ -513,6 +514,7 @@ mod tests {
             opening_multi_pv: Some(20),
             opening_plies: Some(2),
             sample_plies: Some(12),
+            stockfish_hash_mb: None,
         }
     }
 
@@ -627,6 +629,7 @@ mod tests {
             opening_multi_pv: None,
             opening_plies: None,
             sample_plies: None,
+            stockfish_hash_mb: None,
         };
         let mut rng = ChaCha8Rng::seed_from_u64(9);
         let game = play_game(&mut sf, &mut rng, &tier, 64).unwrap();

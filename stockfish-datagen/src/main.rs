@@ -9,7 +9,9 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 use stockfish_datagen::config::RunConfig;
-use stockfish_datagen::runner::run_tier;
+use stockfish_datagen::numa::set_interleave_all_nodes;
+use stockfish_datagen::resume::ShardRange;
+use stockfish_datagen::runner::{RunScope, run_tier};
 use stockfish_datagen::stockfish::{GoBudget, StockfishProcess};
 use stockfish_datagen::tournament::{TournamentConfig, run_tournament};
 
@@ -32,6 +34,27 @@ enum Command {
     Run {
         #[arg(long)]
         config: PathBuf,
+
+        /// Comma-separated tier indices to run (e.g. `0,1` or `3`).
+        /// Default: all tiers in the config. Skipped tiers are not
+        /// preflighted, not started, and don't have state files written.
+        /// Useful for multi-pod runs where each pod tackles a different
+        /// subset of the tier list.
+        #[arg(long, value_delimiter = ',')]
+        tiers: Option<Vec<usize>>,
+
+        /// Restrict this pod's work to shard ids in the half-open range
+        /// `A:B` (e.g. `0:5000`). Default: full tier range. Used to fan
+        /// a single tier across multiple pods — each pod claims a
+        /// disjoint slice of the shard ids while the per-tier
+        /// `n_games` / `shard_size_games` stay constant across pods.
+        ///
+        /// Per-pod state and manifest sentinels are suffixed with the
+        /// range (`_tier_state-s<A>-s<B>.json`,
+        /// `_manifest-s<A>-s<B>.json`) so disjoint pods coexist cleanly
+        /// in the same HF dataset folder.
+        #[arg(long, value_parser = parse_shard_range)]
+        shard_id_range: Option<ShardRange>,
     },
     /// Play two SampleScore × temperature configs against each other and
     /// report W/D/L + Elo difference (Wilson 95% CI). Used for things like
@@ -41,6 +64,19 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+}
+
+/// Parse `A:B` (half-open) into a `ShardRange`. Reject `A >= B`.
+fn parse_shard_range(s: &str) -> Result<ShardRange, String> {
+    let (a, b) = s.split_once(':').ok_or_else(|| {
+        format!("expected `<start>:<end>` (half-open), got `{s}`")
+    })?;
+    let start: u64 = a.parse().map_err(|e| format!("invalid start: {e}"))?;
+    let end: u64 = b.parse().map_err(|e| format!("invalid end: {e}"))?;
+    if start >= end {
+        return Err(format!("empty range: start {start} >= end {end}"));
+    }
+    Ok(ShardRange { start, end })
 }
 
 fn main() -> ExitCode {
@@ -59,14 +95,38 @@ fn real_main() -> anyhow::Result<()> {
         Command::DryRun { config } => {
             let cfg = RunConfig::load(&config)
                 .with_context(|| format!("loading config {}", config.display()))?;
-            print_plan(&cfg);
+            print_plan(&cfg, &RunScope::default());
             preflight_check_patched_binary(&cfg)?;
             Ok(())
         }
-        Command::Run { config } => {
+        Command::Run { config, tiers, shard_id_range } => {
+            // Set MPOL_INTERLEAVE before any allocation / spawn so the
+            // policy is inherited by every stockfish child. On
+            // single-socket pods this is effectively a no-op; on
+            // multi-socket pods it spreads NNUE page-cache first-touches
+            // evenly across NUMA nodes. See `numa.rs` for details.
+            set_interleave_all_nodes();
+
             let cfg = RunConfig::load(&config)
                 .with_context(|| format!("loading config {}", config.display()))?;
-            print_plan(&cfg);
+            // Validate tier subset against the config NOW so a typo
+            // surfaces before any expensive setup (preflight spawn, etc).
+            if let Some(t) = &tiers {
+                for idx in t {
+                    if *idx >= cfg.tiers.len() {
+                        anyhow::bail!(
+                            "--tiers {idx} out of range; config has {} tier(s) (0..{})",
+                            cfg.tiers.len(),
+                            cfg.tiers.len().saturating_sub(1),
+                        );
+                    }
+                }
+            }
+            let scope = RunScope {
+                tiers: tiers.clone(),
+                shard_range: shard_id_range,
+            };
+            print_plan(&cfg, &scope);
             preflight_check_patched_binary(&cfg)?;
             std::fs::create_dir_all(&cfg.output_dir).with_context(|| {
                 format!("creating output dir {}", cfg.output_dir.display())
@@ -75,8 +135,11 @@ fn real_main() -> anyhow::Result<()> {
             let t0 = std::time::Instant::now();
             let mut totals = Totals::default();
             for tier_index in 0..cfg.tiers.len() {
+                if !scope.includes_tier(tier_index) {
+                    continue;
+                }
                 let tier_t0 = std::time::Instant::now();
-                let result = run_tier(&cfg, tier_index)
+                let result = run_tier(&cfg, tier_index, &scope)
                     .with_context(|| format!("tier {} failed", cfg.tiers[tier_index].name))?;
                 let elapsed = tier_t0.elapsed();
                 let rate = result.n_games_written as f64 / elapsed.as_secs_f64().max(1e-9);
@@ -326,7 +389,7 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_plan(cfg: &RunConfig) {
+fn print_plan(cfg: &RunConfig, scope: &RunScope) {
     println!("=== stockfish-datagen plan ===");
     println!("stockfish:          {}", cfg.stockfish_path.display());
     println!("stockfish_version:  {}", cfg.stockfish_version);
@@ -335,39 +398,45 @@ fn print_plan(cfg: &RunConfig) {
     println!("workers:            {}", cfg.n_workers);
     println!("max_ply:            {}", cfg.max_ply);
     println!("shard_size_games:   {}", cfg.shard_size_games);
+    println!("stockfish_hash_mb:  {} (top-level default)", cfg.stockfish_hash_mb);
+    if let Some(t) = &scope.tiers {
+        println!("--tiers:            {t:?}");
+    }
+    if let Some(r) = scope.shard_range {
+        println!("--shard-id-range:   {}..{}", r.start, r.end);
+    }
     println!("config fingerprint: {}", cfg.fingerprint());
     println!();
     println!("tiers:");
     for (i, tier) in cfg.tiers.iter().enumerate() {
-        let split = cfg.games_per_worker(tier);
-        let max_per_worker = split.iter().copied().max().unwrap_or(0);
-        let total_shards =
-            split.iter().map(|n| n.div_ceil(cfg.shard_size_games as u64)).sum::<u64>();
+        let active = scope.includes_tier(i);
+        let active_marker = if active { " " } else { "*" }; // * = skipped this run
+        let total_shards = cfg.total_shards(tier);
+        let pod_range = scope.effective_shard_range(cfg, tier);
+        let pod_shards = pod_range.end.saturating_sub(pod_range.start);
         let net = tier.net_selection
             .map(|n| format!(" net={:?}", n))
             .unwrap_or_default();
+        let hash_mb_str = match tier.stockfish_hash_mb {
+            Some(v) => format!(" hash_mb={v}"),
+            None => String::new(),
+        };
         if tier.searchless {
-            // Searchless tier: no nodes / multi_pv / opening_* / sample_plies
-            // — those are the search-mode knobs. Show what actually applies.
             let score = tier.sample_score.expect("validated: searchless has sample_score");
             println!(
-                "  [{i}] {name:<14} EVALLEGAL  games={n_games:>10} \
-                 sample_score={score:?} temp={temp:.2}{store}{net}",
+                "  [{i}]{active_marker}{name:<14} EVALLEGAL  games={n_games:>10} \
+                 sample_score={score:?} temp={temp:.2}{store}{net}{hash}",
                 name = tier.name,
                 n_games = tier.n_games,
                 temp = tier.temperature,
                 store = if tier.store_legal_move_evals { " store_legal_move_evals=true" } else { "" },
+                hash = hash_mb_str,
             );
         } else {
-            // Search-mode tier. `store_legal_move_evals=true` here means the
-            // worker also issues a separate `evallegal` call after each ply's
-            // selection to populate the static_legal_move_evals column, so
-            // surface that explicitly — it materially changes per-ply cost
-            // (~2x slowdown at low node budgets) and storage (+~10 KB/game).
             println!(
-                "  [{i}] {name:<14} nodes={nodes:>4} games={n_games:>10} \
+                "  [{i}]{active_marker}{name:<14} nodes={nodes:>4} games={n_games:>10} \
                  multi_pv={mpv:>2} opening={ompv:>2}/{op_plies} \
-                 sample_plies={spl:<3} temp={temp:.2}{net}{store}",
+                 sample_plies={spl:<3} temp={temp:.2}{net}{store}{hash}",
                 name = tier.name,
                 nodes = tier.nodes.expect("validated"),
                 n_games = tier.n_games,
@@ -377,10 +446,18 @@ fn print_plan(cfg: &RunConfig) {
                 spl = tier.sample_plies.expect("validated"),
                 temp = tier.temperature,
                 store = if tier.store_legal_move_evals { " store_legal_move_evals=true" } else { "" },
+                hash = hash_mb_str,
             );
         }
+        let scope_note = if active && pod_shards < total_shards {
+            format!(", this pod owns {pod_shards} ({:?})", pod_range)
+        } else if !active {
+            " — SKIPPED via --tiers".into()
+        } else {
+            String::new()
+        };
         println!(
-            "       per-worker max: {max_per_worker}, total shards: {total_shards}"
+            "       total shards: {total_shards}{scope_note}",
         );
     }
 }

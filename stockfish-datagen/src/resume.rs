@@ -1,111 +1,134 @@
-//! Resume-time scanning + per-tier manifest.
+//! Resume-time scanning + per-tier sentinels.
 //!
-//! On startup, for each tier, we either (a) skip it because a manifest with
-//! matching config fingerprint exists, or (b) resume by listing the shard
-//! files in the tier dir and parsing the row count out of each filename
-//! to figure out how many games each worker has already produced.
+//! Under the shard-id partitioning model, a tier has `total_shards`
+//! deterministically-numbered shards; shard `s` owns global game indices
+//! `[s * shard_size_games, min((s+1) * shard_size_games, n_games))`. Resume
+//! walks the tier dir, parses each `shard-s<NNNNNN>-r<NNNNNN>.parquet`
+//! filename, and builds two sets:
 //!
-//! The row count is encoded in the shard filename
-//! (`shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet`), so resume does NOT need to
+//! - `done_shards`: shard ids that already exist on disk with their
+//!   expected row count (i.e. the row count this run would write for that
+//!   shard given the *current* config). Workers skip these.
+//! - `boundary_rewrites`: shard ids that exist on disk but with a row count
+//!   *less* than what the current config expects. This happens iff `n_games`
+//!   grew between runs and the previous run's last shard was truncated.
+//!   That one shard is regenerated; its existing-prefix games are
+//!   bit-identical because the seed depends only on `tier_seed` +
+//!   `global_game_index`, but the file's row count must grow to cover the
+//!   new range. Workers pick this shard up via the same atomic counter
+//!   and the on-disk truncated file is removed once the new one renames in.
+//!
+//! Row count is encoded in the shard filename, so resume does NOT need to
 //! open the parquet files. That matters because it lets a remote-sync tool
 //! (e.g. an HF dataset uploader) drop zero-byte placeholder files locally
 //! that the resume code reads identically to real shards — enabling
 //! "resume on a fresh pod without re-downloading any actual data".
 //!
-//! Per-worker resume relies on shard files being written in strict
-//! chunk-index order, atomically (`.tmp` -> `.parquet` rename), and at
-//! exactly `shard_size_games` rows each *except* possibly the highest
-//! chunk if the worker had a non-multiple-of-shard-size leftover. We
-//! don't need to distinguish "interrupted mid-game" from "completed with
-//! a partial last shard" because game seeds are deterministic from
-//! `(worker_seed, game_index)` — every shard's contents depend only on
-//! its chunk index, so picking up from `last_chunk_idx + 1` is correct
-//! either way.
+//! The per-tier `_tier_state.json` and `_manifest.json` sentinels carry
+//! the `tier_fingerprint` so a resumed run can detect a config change
+//! that would invalidate prior shards. Under multi-pod cooperation
+//! (`--shard-id-range A:B`) the sentinels are suffixed with the range
+//! so disjoint pods can coexist in the same HF dataset folder.
 
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 
-/// What we know about one worker's prior output in `tier_dir`.
-#[derive(Debug, Clone, Copy)]
-pub struct WorkerResumeState {
-    /// Total rows already on disk for this worker (sum across its shards).
-    pub games_done: u64,
-    /// Chunk index for the *next* shard this worker should write.
-    pub next_chunk_idx: u32,
-}
-
-/// Parse `shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet` into
-/// `(worker_id, chunk_idx, n_rows)`. Returns `None` for any other filename
-/// (including `.parquet.tmp` orphans, sentinels, and the pre-row-count
-/// legacy naming `shard-w<NNN>-c<NNNN>.parquet` — those are unsupported
-/// by current resume and will be left untouched by the dir scan).
-pub(crate) fn parse_shard_filename(name: &str) -> Option<(u32, u32, u64)> {
-    let s = name.strip_prefix("shard-w")?;
+/// Parse `shard-s<NNNNNN>-r<NNNNNN>.parquet` into `(shard_id, n_rows)`.
+/// Returns `None` for any other filename (including `.parquet.tmp`
+/// orphans, sentinels, and the pre-v3 legacy naming
+/// `shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet` — legacy shards are not
+/// readable under the new schema and are intentionally ignored).
+pub(crate) fn parse_shard_filename(name: &str) -> Option<(u64, u64)> {
+    let s = name.strip_prefix("shard-s")?;
     let s = s.strip_suffix(".parquet")?;
-    let (w, rest) = s.split_once("-c")?;
-    let (c, r) = rest.split_once("-r")?;
-    Some((w.parse().ok()?, c.parse().ok()?, r.parse().ok()?))
+    let (sid, r) = s.split_once("-r")?;
+    Some((sid.parse().ok()?, r.parse().ok()?))
 }
 
-/// Walk `tier_dir`, identify per-worker resume state for workers in
-/// `[0, n_workers)`. Returns an empty map if the directory doesn't exist
-/// or contains no shard files.
+/// What we found on disk in `tier_dir` relative to the current config.
+#[derive(Debug, Clone, Default)]
+pub struct ShardResumeState {
+    /// Shard ids whose existing file row count matches the expected row
+    /// count for the *current* `n_games` + `shard_size_games`. Workers
+    /// skip these.
+    pub done_shards: BTreeSet<u64>,
+    /// Shard ids that exist on disk but with a row count smaller than the
+    /// current config expects — i.e. previously-truncated last shards
+    /// after `n_games` grew. Workers regenerate these and the old short
+    /// file is removed at rename time.
+    ///
+    /// Stored as `(shard_id, old_path)` so we can delete the old file
+    /// after the new one is written, without re-scanning the directory.
+    pub boundary_rewrites: Vec<(u64, PathBuf)>,
+}
+
+/// Walk `tier_dir`, identify per-shard resume state for shard ids in
+/// `[0, total_shards)`. Returns an empty state if the directory doesn't
+/// exist or contains no shard files.
 ///
-/// Stale shards from worker IDs >= `n_workers` (left over after an
-/// `n_workers` reduction) are SKIPPED entirely — they're not validated
-/// for chunk-gaps and not counted in any worker's resume state. The
-/// runner's dir-scan applies the same filter so the manifest stays
-/// internally consistent (`shards` and `n_games_written` both reflect
-/// only the current partition).
+/// `expected_n_rows(s)` is the number of rows shard `s` should contain
+/// under the current config — typically `shard_size_games` for all shards
+/// except possibly the last (`n_games % shard_size_games` if non-zero).
+/// Pass the same closure the runner uses for new shards so the row-count
+/// check stays consistent.
+///
+/// Stale shards with `shard_id >= total_shards` (e.g. left over after a
+/// `n_games` shrink) are SKIPPED — not validated, not counted, not
+/// deleted. The operator can remove them with a manual prune.
 pub fn detect_resume(
     tier_dir: &Path,
-    n_workers: u32,
-) -> anyhow::Result<HashMap<u32, WorkerResumeState>> {
+    total_shards: u64,
+    expected_n_rows: impl Fn(u64) -> u64,
+) -> anyhow::Result<ShardResumeState> {
     if !tier_dir.exists() {
-        return Ok(HashMap::new());
+        return Ok(ShardResumeState::default());
     }
 
-    let mut by_worker: HashMap<u32, Vec<(u32, u64)>> = HashMap::new();
+    let mut state = ShardResumeState::default();
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
     for entry in fs::read_dir(tier_dir)
         .with_context(|| format!("listing {}", tier_dir.display()))?
     {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let Some((worker_id, chunk_idx, n_rows)) = parse_shard_filename(&name) else {
+        let Some((shard_id, n_rows)) = parse_shard_filename(&name) else {
             continue;
         };
-        if worker_id >= n_workers {
-            // Stale worker from a prior larger n_workers config — ignore.
+        if shard_id >= total_shards {
+            // Stale shard from a prior larger `n_games` — leave on disk
+            // for the operator to handle.
             continue;
         }
-        by_worker.entry(worker_id).or_default().push((chunk_idx, n_rows));
-    }
-
-    let mut out = HashMap::new();
-    for (worker_id, mut chunks) in by_worker {
-        chunks.sort_by_key(|&(c, _)| c);
-        // Defensive: chunk indices must be a contiguous prefix starting
-        // at 0. Gaps mean someone deleted a middle shard and we can't
-        // safely resume — bail with a clear message.
-        for (i, &(c, _)) in chunks.iter().enumerate() {
-            if c as usize != i {
-                return Err(anyhow!(
-                    "worker {worker_id} has shard chunk gap: expected chunk {i}, found {c} \
-                     (full chunk list: {:?})",
-                    chunks.iter().map(|&(c, _)| c).collect::<Vec<_>>(),
-                ));
-            }
+        if !seen.insert(shard_id) {
+            // Two files for the same shard id with different row counts
+            // (e.g. a truncated old + the new growth-rewrite that hasn't
+            // been cleaned up). Refuse to guess which is authoritative.
+            return Err(anyhow!(
+                "duplicate shard files for shard id {shard_id} in {}; \
+                 delete one before resuming",
+                tier_dir.display(),
+            ));
         }
-        let games_done: u64 = chunks.iter().map(|&(_, n)| n).sum();
-        let next_chunk_idx = chunks.last().map(|&(c, _)| c + 1).unwrap_or(0);
-        out.insert(worker_id, WorkerResumeState { games_done, next_chunk_idx });
+        let expected = expected_n_rows(shard_id);
+        if n_rows == expected {
+            state.done_shards.insert(shard_id);
+        } else if n_rows < expected {
+            state.boundary_rewrites.push((shard_id, entry.path()));
+        } else {
+            return Err(anyhow!(
+                "shard {shard_id} in {} has {n_rows} rows but current config expects {expected}; \
+                 shrinking shard contents is not supported (would invalidate already-written data)",
+                tier_dir.display(),
+            ));
+        }
     }
-    Ok(out)
+    Ok(state)
 }
 
 /// Per-tier "in-progress" sentinel, written *before* any shards are
@@ -113,28 +136,53 @@ pub fn detect_resume(
 /// "shards are on disk but they were generated under a different config"
 /// — the gap that the manifest alone can't catch (since the manifest is
 /// only written on full completion).
-///
-/// Lifecycle: `run_tier` writes this file at start; the manifest write
-/// at end of run leaves it in place (it's harmless once the manifest
-/// exists, since the manifest takes precedence). A user who wants to
-/// regenerate a tier under a different config must delete BOTH this
-/// file and the matching shards.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TierState {
     pub config_fingerprint: String,
     /// ISO-8601 UTC start time. Informational.
     pub started_at: String,
+    /// Half-open shard-id range owned by the pod that wrote this state
+    /// file. `None` ≡ "whole tier" (single-pod, default). When `Some`,
+    /// the state file is named `_tier_state-s<A>-s<B>.json` so disjoint
+    /// pods can coexist in the same HF dataset folder without colliding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_range: Option<ShardRange>,
 }
 
-const STATE_FILENAME: &str = "_tier_state.json";
+/// Inclusive-exclusive shard-id range. Serializes as `{"start": A, "end": B}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl From<Range<u64>> for ShardRange {
+    fn from(r: Range<u64>) -> Self {
+        ShardRange { start: r.start, end: r.end }
+    }
+}
+
+impl From<ShardRange> for Range<u64> {
+    fn from(r: ShardRange) -> Self {
+        r.start..r.end
+    }
+}
+
+/// Filename suffix for per-pod sentinel files. `None` ≡ "" (single-pod default).
+fn pod_suffix(shard_range: Option<&ShardRange>) -> String {
+    match shard_range {
+        Some(r) => format!("-s{:06}-s{:06}", r.start, r.end),
+        None => String::new(),
+    }
+}
 
 impl TierState {
-    pub fn path(tier_dir: &Path) -> PathBuf {
-        tier_dir.join(STATE_FILENAME)
+    pub fn path(tier_dir: &Path, shard_range: Option<&ShardRange>) -> PathBuf {
+        tier_dir.join(format!("_tier_state{}.json", pod_suffix(shard_range)))
     }
 
-    pub fn load(tier_dir: &Path) -> anyhow::Result<Option<Self>> {
-        let p = Self::path(tier_dir);
+    pub fn load(tier_dir: &Path, shard_range: Option<&ShardRange>) -> anyhow::Result<Option<Self>> {
+        let p = Self::path(tier_dir, shard_range);
         if !p.exists() {
             return Ok(None);
         }
@@ -145,7 +193,7 @@ impl TierState {
     }
 
     pub fn save(&self, tier_dir: &Path) -> anyhow::Result<()> {
-        let p = Self::path(tier_dir);
+        let p = Self::path(tier_dir, self.shard_range.as_ref());
         let tmp = p.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(self)?;
         let mut f = fs::File::create(&tmp)
@@ -161,6 +209,11 @@ impl TierState {
 
 /// Per-tier completion record. Presence of this file with a matching
 /// `config_fingerprint` tells `run` to skip the tier on restart.
+///
+/// In multi-pod runs each pod writes its OWN manifest covering its shard
+/// range; a separate `scripts/datagen_reconcile_tier.py` helper merges
+/// the per-pod manifests into a unified `_manifest.json` covering the
+/// full `[0, total_shards)` range.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TierManifest {
     pub tier_name: String,
@@ -172,17 +225,19 @@ pub struct TierManifest {
     pub shards: Vec<String>,
     /// ISO-8601 UTC. Purely informational.
     pub completed_at: String,
+    /// Per-pod shard range, mirrored from the matching `TierState`.
+    /// `None` for the canonical single-pod (or reconciled) manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_range: Option<ShardRange>,
 }
 
-const MANIFEST_FILENAME: &str = "_manifest.json";
-
 impl TierManifest {
-    pub fn path(tier_dir: &Path) -> PathBuf {
-        tier_dir.join(MANIFEST_FILENAME)
+    pub fn path(tier_dir: &Path, shard_range: Option<&ShardRange>) -> PathBuf {
+        tier_dir.join(format!("_manifest{}.json", pod_suffix(shard_range)))
     }
 
-    pub fn load(tier_dir: &Path) -> anyhow::Result<Option<Self>> {
-        let p = Self::path(tier_dir);
+    pub fn load(tier_dir: &Path, shard_range: Option<&ShardRange>) -> anyhow::Result<Option<Self>> {
+        let p = Self::path(tier_dir, shard_range);
         if !p.exists() {
             return Ok(None);
         }
@@ -193,7 +248,7 @@ impl TierManifest {
     }
 
     pub fn save(&self, tier_dir: &Path) -> anyhow::Result<()> {
-        let p = Self::path(tier_dir);
+        let p = Self::path(tier_dir, self.shard_range.as_ref());
         let tmp = p.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(self)?;
         // fsync the manifest before rename for the same reason we fsync
@@ -219,7 +274,7 @@ mod tests {
     use crate::shard::{GameRow, ShardWriter};
     use tempfile::tempdir;
 
-    fn fake_row(game_seed: u64) -> GameRow {
+    fn fake_row(global_game_index: u64) -> GameRow {
         GameRow {
             tokens: vec![1, 2, 3],
             san: vec!["a".into(), "b".into(), "c".into()],
@@ -235,18 +290,18 @@ mod tests {
             sample_score: None,
             net_selection: None,
             temperature: 1.0,
-            worker_id: 0,
-            game_seed,
+            global_game_index,
+            game_seed: global_game_index, // tests don't care about real seeding
             stockfish_version: "Stockfish 18".into(),
             legal_move_evals: None,
             static_legal_move_evals: None,
         }
     }
 
-    fn write_shard(dir: &Path, worker_id: u32, chunk_idx: u32, n_rows: usize) {
-        let mut w = ShardWriter::create(dir.to_path_buf(), worker_id, chunk_idx).unwrap();
+    fn write_shard(dir: &Path, shard_id: u64, n_rows: usize) {
+        let mut w = ShardWriter::create(dir.to_path_buf(), shard_id).unwrap();
         for i in 0..n_rows {
-            w.append(&fake_row(i as u64));
+            w.append(&fake_row(shard_id * 1000 + i as u64));
         }
         w.close().unwrap();
     }
@@ -254,109 +309,154 @@ mod tests {
     #[test]
     fn parse_shard_filename_basic() {
         assert_eq!(
-            parse_shard_filename("shard-w003-c0017-r000834.parquet"),
-            Some((3, 17, 834)),
+            parse_shard_filename("shard-s000017-r000834.parquet"),
+            Some((17, 834)),
         );
         assert_eq!(
-            parse_shard_filename("shard-w000-c0000-r000001.parquet"),
-            Some((0, 0, 1)),
+            parse_shard_filename("shard-s000000-r000001.parquet"),
+            Some((0, 1)),
         );
-        // Pre-row-count legacy naming is intentionally rejected.
-        assert!(parse_shard_filename("shard-w003-c0017.parquet").is_none());
+        // Wider field accepted (n_rows > 999_999, shard_id > 999_999).
+        assert_eq!(
+            parse_shard_filename("shard-s1234567-r1234567.parquet"),
+            Some((1_234_567, 1_234_567)),
+        );
+        // Pre-v3 legacy naming intentionally rejected.
+        assert!(parse_shard_filename("shard-w003-c0017-r000834.parquet").is_none());
         assert!(parse_shard_filename("garbage.parquet").is_none());
-        assert!(parse_shard_filename("shard-w0-c0.parquet.tmp").is_none());
+        assert!(parse_shard_filename("shard-s0.parquet.tmp").is_none());
     }
 
     #[test]
     fn detect_resume_empty_dir() {
         let dir = tempdir().unwrap();
-        let states = detect_resume(dir.path(), 4).unwrap();
-        assert!(states.is_empty());
+        let st = detect_resume(dir.path(), 4, |_| 10).unwrap();
+        assert!(st.done_shards.is_empty());
+        assert!(st.boundary_rewrites.is_empty());
     }
 
     #[test]
     fn detect_resume_missing_dir() {
-        let states = detect_resume(Path::new("/tmp/definitely_not_a_real_dir_xyz_42"), 4).unwrap();
-        assert!(states.is_empty());
+        let st = detect_resume(Path::new("/tmp/definitely_not_a_real_dir_xyz_42"), 4, |_| 10).unwrap();
+        assert!(st.done_shards.is_empty());
     }
 
     #[test]
-    fn detect_resume_counts_rows_and_chunks() {
+    fn detect_resume_classifies_done_vs_boundary_rewrite() {
         let dir = tempdir().unwrap();
-        write_shard(dir.path(), 0, 0, 10);
-        write_shard(dir.path(), 0, 1, 10);
-        write_shard(dir.path(), 0, 2, 4); // partial trailing shard
-        write_shard(dir.path(), 1, 0, 10);
-
-        let states = detect_resume(dir.path(), 4).unwrap();
-        let w0 = states[&0];
-        assert_eq!(w0.games_done, 24);
-        assert_eq!(w0.next_chunk_idx, 3);
-        let w1 = states[&1];
-        assert_eq!(w1.games_done, 10);
-        assert_eq!(w1.next_chunk_idx, 1);
+        // 3 full shards, then a truncated last shard (4 rows where 10 expected).
+        write_shard(dir.path(), 0, 10);
+        write_shard(dir.path(), 1, 10);
+        write_shard(dir.path(), 2, 10);
+        write_shard(dir.path(), 3, 4);
+        // Pretend n_games grew so shard 3 now expects 10 rows.
+        let st = detect_resume(dir.path(), 4, |_| 10).unwrap();
+        assert_eq!(st.done_shards, BTreeSet::from([0, 1, 2]));
+        assert_eq!(st.boundary_rewrites.len(), 1);
+        assert_eq!(st.boundary_rewrites[0].0, 3);
     }
 
     #[test]
-    fn detect_resume_rejects_chunk_gaps() {
+    fn detect_resume_treats_exact_partial_last_as_done() {
         let dir = tempdir().unwrap();
-        write_shard(dir.path(), 0, 0, 10);
-        // skip chunk 1
-        write_shard(dir.path(), 0, 2, 10);
-        let err = detect_resume(dir.path(), 4).unwrap_err();
+        // Shard 3 is the partial last shard under the *current* config too
+        // (n_games = 34, shard_size = 10 ⇒ last shard has 4 rows). So it's
+        // already complete, not a boundary rewrite.
+        write_shard(dir.path(), 0, 10);
+        write_shard(dir.path(), 1, 10);
+        write_shard(dir.path(), 2, 10);
+        write_shard(dir.path(), 3, 4);
+        let st = detect_resume(dir.path(), 4, |sid| if sid == 3 { 4 } else { 10 }).unwrap();
+        assert_eq!(st.done_shards, BTreeSet::from([0, 1, 2, 3]));
+        assert!(st.boundary_rewrites.is_empty());
+    }
+
+    #[test]
+    fn detect_resume_rejects_oversized_shard() {
+        let dir = tempdir().unwrap();
+        // Shard 0 has 15 rows; current config expects 10. Shrinking is
+        // unsupported (would invalidate already-written rows).
+        write_shard(dir.path(), 0, 15);
+        let err = detect_resume(dir.path(), 4, |_| 10).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("chunk gap"), "expected gap error, got: {msg}");
+        assert!(msg.contains("shrinking"), "expected shrink error, got: {msg}");
+    }
+
+    #[test]
+    fn detect_resume_skips_stale_shard_ids() {
+        let dir = tempdir().unwrap();
+        write_shard(dir.path(), 0, 10);
+        write_shard(dir.path(), 1, 10);
+        // Shard 5 is outside [0, total_shards=2) — stale, ignored.
+        write_shard(dir.path(), 5, 10);
+        let st = detect_resume(dir.path(), 2, |_| 10).unwrap();
+        assert_eq!(st.done_shards, BTreeSet::from([0, 1]));
+        assert!(st.boundary_rewrites.is_empty());
     }
 
     #[test]
     fn detect_resume_ignores_non_shard_files() {
         let dir = tempdir().unwrap();
-        write_shard(dir.path(), 0, 0, 10);
+        write_shard(dir.path(), 0, 10);
         std::fs::write(dir.path().join("_manifest.json"), b"{}").unwrap();
-        std::fs::write(dir.path().join("shard-w0-c0.parquet.tmp"), b"orphan").unwrap();
-        let states = detect_resume(dir.path(), 4).unwrap();
-        assert_eq!(states[&0].games_done, 10);
-        assert_eq!(states.len(), 1);
+        std::fs::write(dir.path().join("shard-s0.parquet.tmp"), b"orphan").unwrap();
+        let st = detect_resume(dir.path(), 4, |_| 10).unwrap();
+        assert_eq!(st.done_shards, BTreeSet::from([0]));
     }
 
-    /// The HF-sync placeholder strategy: the primer drops zero-byte files
-    /// with the canonical shard naming, and resume must read them as if
-    /// they were real shards (since the row count is in the filename).
+    /// HF-sync placeholder contract: the primer drops zero-byte files with
+    /// the canonical shard naming, and resume must read them as if they
+    /// were real shards (the row count is in the filename).
     #[test]
     fn detect_resume_reads_zero_byte_placeholders() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("shard-w000-c0000-r000010.parquet"), b"").unwrap();
-        std::fs::write(dir.path().join("shard-w000-c0001-r000010.parquet"), b"").unwrap();
-        std::fs::write(dir.path().join("shard-w001-c0000-r000007.parquet"), b"").unwrap();
-        let states = detect_resume(dir.path(), 4).unwrap();
-        assert_eq!(states[&0].games_done, 20);
-        assert_eq!(states[&0].next_chunk_idx, 2);
-        assert_eq!(states[&1].games_done, 7);
-        assert_eq!(states[&1].next_chunk_idx, 1);
+        std::fs::write(dir.path().join("shard-s000000-r000010.parquet"), b"").unwrap();
+        std::fs::write(dir.path().join("shard-s000001-r000010.parquet"), b"").unwrap();
+        std::fs::write(dir.path().join("shard-s000002-r000007.parquet"), b"").unwrap();
+        let st = detect_resume(dir.path(), 4, |sid| if sid == 2 { 7 } else { 10 }).unwrap();
+        assert_eq!(st.done_shards, BTreeSet::from([0, 1, 2]));
     }
 
     #[test]
-    fn manifest_round_trips() {
+    fn manifest_round_trips_with_shard_range() {
         let dir = tempdir().unwrap();
         let m = TierManifest {
             tier_name: "nodes_0001".into(),
             config_fingerprint: "abc123".into(),
             n_games_written: 100,
-            shards: vec!["shard-w000-c0000-r000100.parquet".into()],
+            shards: vec!["shard-s000000-r000100.parquet".into()],
             completed_at: "2026-05-02T00:00:00Z".into(),
+            shard_range: Some(ShardRange { start: 0, end: 50 }),
         };
         m.save(dir.path()).unwrap();
-        let loaded = TierManifest::load(dir.path()).unwrap().unwrap();
+        // Per-pod manifest lives under the suffixed filename.
+        assert_eq!(
+            TierManifest::path(dir.path(), m.shard_range.as_ref()).file_name().unwrap(),
+            "_manifest-s000000-s000050.json",
+        );
+        let loaded = TierManifest::load(dir.path(), m.shard_range.as_ref()).unwrap().unwrap();
         assert_eq!(loaded.tier_name, m.tier_name);
-        assert_eq!(loaded.config_fingerprint, m.config_fingerprint);
-        assert_eq!(loaded.n_games_written, m.n_games_written);
-        assert_eq!(loaded.shards, m.shards);
+        assert_eq!(loaded.shard_range, m.shard_range);
+        // The single-pod canonical path is a different file.
+        assert!(TierManifest::load(dir.path(), None).unwrap().is_none());
     }
 
     #[test]
     fn manifest_load_missing_returns_none() {
         let dir = tempdir().unwrap();
-        let m = TierManifest::load(dir.path()).unwrap();
+        let m = TierManifest::load(dir.path(), None).unwrap();
         assert!(m.is_none());
+    }
+
+    #[test]
+    fn manifest_default_path_no_suffix() {
+        assert_eq!(
+            TierManifest::path(Path::new("/x"), None).file_name().unwrap(),
+            "_manifest.json",
+        );
+        assert_eq!(
+            TierState::path(Path::new("/x"), None).file_name().unwrap(),
+            "_tier_state.json",
+        );
     }
 }

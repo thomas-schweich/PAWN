@@ -36,18 +36,26 @@ pub struct RunConfig {
     /// Output directory. One subdirectory per tier.
     pub output_dir: PathBuf,
 
-    /// Master RNG seed. All per-tier and per-worker / per-game seeds are
-    /// derived from this deterministically.
+    /// Master RNG seed. All per-tier and per-game seeds are derived from
+    /// this deterministically.
     pub master_seed: u64,
 
     /// Number of worker threads (each owns one Stockfish subprocess).
+    /// Operational only: changing `n_workers` between runs does not change
+    /// any game's content. Workers claim shard ids from a shared atomic
+    /// counter and the per-game seed depends only on the **global** game
+    /// index (`seed::game_seed(tier_seed, global_game_index)`).
     pub n_workers: u32,
 
     /// Per-game ply cap. Beyond this the game terminates with PLY_LIMIT.
     #[serde(default = "default_max_ply")]
     pub max_ply: u32,
 
-    /// Stockfish `Hash` option (MB).
+    /// Default Stockfish `Hash` option (MB). May be overridden per-tier via
+    /// `TierConfig::stockfish_hash_mb`. Affects game outcomes via the
+    /// transposition table even at fixed `nodes=N` (TT probes / early
+    /// cutoffs / move-ordering), so the *effective* per-tier value is part
+    /// of that tier's fingerprint.
     #[serde(default = "default_stockfish_hash_mb")]
     pub stockfish_hash_mb: u32,
 
@@ -191,6 +199,17 @@ pub struct TierConfig {
     /// which is move-generation order, NOT the best move).
     #[serde(default)]
     pub sample_plies: Option<u32>,
+
+    /// Optional per-tier override of `RunConfig::stockfish_hash_mb`. Lets
+    /// the operator drop the TT size on low-`nodes` tiers (where the
+    /// `ucinewgame` memset of a 16 MB table is wasted bandwidth — see
+    /// `ANALYSIS.md`) while keeping a larger TT for high-`nodes` tiers
+    /// where it actually buys search efficiency. The effective per-tier
+    /// value (the override OR the top-level default) is part of the
+    /// tier's fingerprint, so changing it invalidates that tier's
+    /// existing shards.
+    #[serde(default)]
+    pub stockfish_hash_mb: Option<u32>,
 }
 
 /// Which per-move score the sampler should softmax over. Only meaningful
@@ -388,18 +407,35 @@ impl RunConfig {
             if tier.n_games == 0 {
                 anyhow::bail!("tier {}: n_games must be > 0", tier.name);
             }
+            if let Some(0) = tier.stockfish_hash_mb {
+                anyhow::bail!("tier {}: stockfish_hash_mb override must be > 0", tier.name);
+            }
             validate_protocol_fields(tier)?;
         }
         Ok(())
     }
 
-    /// Per-tier games-per-worker breakdown. Surplus games go to the
-    /// lowest worker indices, matching the Python script's behavior.
-    pub fn games_per_worker(&self, tier: &TierConfig) -> Vec<u64> {
-        let n = self.n_workers as u64;
-        let base = tier.n_games / n;
-        let rem = tier.n_games % n;
-        (0..n).map(|i| base + if i < rem { 1 } else { 0 }).collect()
+    /// Effective `Hash` value for the given tier — the per-tier override
+    /// if set, else the top-level default. This is what gets sent to
+    /// Stockfish at spawn time and what the per-tier fingerprint hashes.
+    pub fn effective_hash_mb(&self, tier: &TierConfig) -> u32 {
+        tier.stockfish_hash_mb.unwrap_or(self.stockfish_hash_mb)
+    }
+
+    /// Number of shards this tier produces in total. Shard `s` covers
+    /// global game indices `[s * shard_size_games, min((s+1) * shard_size_games, n_games))`.
+    pub fn total_shards(&self, tier: &TierConfig) -> u64 {
+        let shard_size = self.shard_size_games as u64;
+        tier.n_games.div_ceil(shard_size)
+    }
+
+    /// Half-open range of global game indices owned by shard `shard_id`
+    /// in `tier`. The last shard may be smaller than `shard_size_games`.
+    pub fn shard_game_range(&self, tier: &TierConfig, shard_id: u64) -> std::ops::Range<u64> {
+        let shard_size = self.shard_size_games as u64;
+        let start = shard_id * shard_size;
+        let end = ((shard_id + 1) * shard_size).min(tier.n_games);
+        start..end
     }
 
     /// Hex-encoded sha256 of the config bytes (after re-serialization, so
@@ -422,19 +458,32 @@ impl RunConfig {
     /// tiers leaves this fingerprint untouched, so users can grow their
     /// config over time without invalidating prior runs.
     ///
-    /// Why every field matters for resume safety:
-    /// - `tier` / `tier_index` / `master_seed`: directly seed every game.
-    /// - `stockfish_version`: different NNUE → different game outcomes.
-    /// - `stockfish_hash_mb`: Stockfish's transposition-table size can
-    ///   affect fixed-node search choices (and therefore moves) at the
-    ///   higher tiers (nodes >= 32 or so).
-    /// - `shard_size_games`: changes which games end up in which shard
-    ///   file, which would silently invalidate the resume row-count math.
+    /// Includes:
+    /// - `tier_name_key` (sha256(tier.name) prefix as u64 — same value
+    ///   `seed::tier_seed` uses): pins identity to the tier name. Renaming
+    ///   a tier creates a new dataset under the new name; the old shards
+    ///   remain valid under the old name.
+    /// - `tier_body`: the full TierConfig **with `n_games` removed**.
+    ///   Excluding `n_games` is what makes "grow a tier" extension-safe:
+    ///   bumping `n_games` adds shards `[total_shards_old, total_shards_new)`
+    ///   but doesn't alter the contents of any existing shard, since
+    ///   game seeds depend only on `tier_seed` + `global_game_index`.
+    /// - `master_seed`: directly feeds every game seed.
+    /// - `stockfish_version`: different NNUE / search behavior → different games.
+    /// - `effective_stockfish_hash_mb`: the per-tier override if set, else
+    ///   the top-level default. Verified against stockfish source: the TT
+    ///   affects move selection at any node budget via TT probes / early
+    ///   cutoffs / move ordering, so it IS dataset-affecting.
+    /// - `shard_size_games`: defines the per-shard global-index range; a
+    ///   change would shift which games land in which shard file.
     /// - `max_ply`: longer games may now resolve where they previously
     ///   hit `PLY_LIMIT`; outcome tokens differ.
-    /// - `n_workers`: changes the (worker_id, game_index) partition AND
-    ///   each game's seed (since `game_seed = mix(worker_seed, idx)`),
-    ///   so an old shard's games are not a prefix of the new run.
+    /// - `shard_schema_version`: parquet schema discriminator (see below).
+    ///
+    /// Excluded (purely operational, no effect on shard contents):
+    /// `n_workers`, top-level `stockfish_hash_mb` (subsumed by the per-tier
+    /// effective value above), `stockfish_path` (only the running version
+    /// matters, captured by `stockfish_version`), `output_dir`, `tier.n_games`.
     ///
     /// Implementation note: `serde_json::Value::Object` is `BTreeMap`
     /// (we don't enable the `preserve_order` feature), so the serialized
@@ -444,30 +493,42 @@ impl RunConfig {
     /// fingerprint version bump.** A pinned golden-value test
     /// (`tier_fingerprint_golden`) catches accidental drift.
     pub fn tier_fingerprint(&self, tier_index: usize) -> String {
+        let tier = &self.tiers[tier_index];
+        // Serialize the tier struct, then strip the `n_games` key so growing
+        // n_games doesn't invalidate the fingerprint. Serializing through
+        // a Value (rather than re-listing fields by hand) means new
+        // TierConfig fields automatically participate in the fingerprint
+        // — the safe default — and any intentional exclusions live here
+        // as explicit `.remove(...)` lines.
+        let mut tier_body = serde_json::to_value(tier).expect("TierConfig is serializable");
+        if let Some(obj) = tier_body.as_object_mut() {
+            obj.remove("n_games");
+            // Normalize: hash the *effective* value (override-or-default)
+            // rather than the raw `Option`. So a tier with no override on a
+            // run with `stockfish_hash_mb: 16` hashes the same as a tier
+            // with an explicit override of 16. This makes "promote the
+            // top-level default to per-tier overrides" a no-op refactor.
+            obj.remove("stockfish_hash_mb");
+        }
         let payload = serde_json::json!({
-            "tier_index": tier_index,
-            "tier": &self.tiers[tier_index],
+            "tier_name_key": format!("{:016x}", crate::seed::tier_name_to_key(&tier.name)),
+            "tier_body": tier_body,
             "master_seed": self.master_seed,
             "stockfish_version": &self.stockfish_version,
-            "stockfish_hash_mb": self.stockfish_hash_mb,
+            "effective_stockfish_hash_mb": self.effective_hash_mb(tier),
             "shard_size_games": self.shard_size_games,
             "max_ply": self.max_ply,
-            "n_workers": self.n_workers,
             // Bump SHARD_SCHEMA_VERSION whenever the parquet schema changes
             // in a way that would mix incompatibly with prior shards in the
-            // same tier directory. Currently:
-            //   v1 (implicit, pre-bump): tokens/san/uci + legal_move_evals only
-            //   v2 (current): adds nullable `static_legal_move_evals` column
-            // Without this discriminator, a code upgrade that adds the new
-            // column would re-pass the resume fingerprint check on a tier
-            // whose *config* didn't change (e.g. a searchless tier whose
-            // store_legal_move_evals was already true), then write new
-            // shards into a directory that already contains old-schema
-            // shards. Strict polars reads would fail; permissive pyarrow
-            // reads would silently drop the new column. Bumping the
+            // same tier directory. Without this discriminator, a code
+            // upgrade that adds a new column would re-pass the resume
+            // fingerprint check on a tier whose *config* didn't change,
+            // then write new shards into a directory that already contains
+            // old-schema shards. Strict polars reads would fail; permissive
+            // pyarrow reads would silently drop the new column. Bumping the
             // version here forces a loud fingerprint mismatch on resume,
-            // requiring the operator to either delete the partial tier
-            // dir or revert to the old binary.
+            // requiring the operator to either delete the partial tier dir
+            // or revert to the old binary.
             "shard_schema_version": crate::shard::SHARD_SCHEMA_VERSION,
         });
         let mut h = Sha256::new();
@@ -513,6 +574,7 @@ mod tests {
                 opening_multi_pv: Some(20),
                 opening_plies: Some(1),
                 sample_plies: Some(999),
+                stockfish_hash_mb: None,
             }],
         }
     }
@@ -533,6 +595,7 @@ mod tests {
             opening_multi_pv: None,
             opening_plies: None,
             sample_plies: None,
+            stockfish_hash_mb: None,
         }
     }
 
@@ -600,13 +663,36 @@ mod tests {
     }
 
     #[test]
-    fn games_per_worker_distributes_remainder() {
+    fn total_shards_handles_partial_last_shard() {
         let mut c = minimal_config();
-        c.n_workers = 3;
-        c.tiers[0].n_games = 10;
-        let split = c.games_per_worker(&c.tiers[0]);
-        assert_eq!(split, vec![4, 3, 3]);
-        assert_eq!(split.iter().sum::<u64>(), 10);
+        c.shard_size_games = 10;
+        c.tiers[0].n_games = 100;
+        assert_eq!(c.total_shards(&c.tiers[0]), 10);
+        c.tiers[0].n_games = 101;
+        assert_eq!(c.total_shards(&c.tiers[0]), 11); // last shard has 1 row
+        c.tiers[0].n_games = 5;
+        assert_eq!(c.total_shards(&c.tiers[0]), 1);
+    }
+
+    #[test]
+    fn shard_game_range_caps_at_n_games() {
+        let mut c = minimal_config();
+        c.shard_size_games = 10;
+        c.tiers[0].n_games = 23;
+        assert_eq!(c.shard_game_range(&c.tiers[0], 0), 0..10);
+        assert_eq!(c.shard_game_range(&c.tiers[0], 1), 10..20);
+        // Last shard: 3 rows, not 10.
+        assert_eq!(c.shard_game_range(&c.tiers[0], 2), 20..23);
+    }
+
+    #[test]
+    fn effective_hash_mb_uses_per_tier_override() {
+        let mut c = minimal_config();
+        c.stockfish_hash_mb = 16;
+        // No override -> top-level default.
+        assert_eq!(c.effective_hash_mb(&c.tiers[0]), 16);
+        c.tiers[0].stockfish_hash_mb = Some(1);
+        assert_eq!(c.effective_hash_mb(&c.tiers[0]), 1);
     }
 
     #[test]
@@ -663,14 +749,73 @@ mod tests {
             opening_multi_pv: Some(5),
             opening_plies: Some(0),
             sample_plies: Some(999),
+            stockfish_hash_mb: None,
         });
         let mut b = a.clone();
-        // Change only tier 1.
-        b.tiers[1].n_games = 75;
+        // Change a dataset-affecting field on tier 1 only (temperature).
+        b.tiers[1].temperature = 0.5;
         // Tier 0's fingerprint must NOT change just because tier 1 did.
         assert_eq!(a.tier_fingerprint(0), b.tier_fingerprint(0));
         // Tier 1's fingerprint MUST change.
         assert_ne!(a.tier_fingerprint(1), b.tier_fingerprint(1));
+    }
+
+    #[test]
+    fn tier_fingerprint_invariant_to_n_games_growth() {
+        // The core extension-friendliness contract: growing `n_games`
+        // doesn't invalidate the existing data. Each new game's seed is
+        // `mix(tier_seed, global_game_index)` — independent of how many
+        // games will ultimately be generated — so shards [0..total_old)
+        // remain bit-identical when we resume with a larger n_games.
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.tiers[0].n_games = 100;
+        b.tiers[0].n_games = 1_000_000;
+        assert_eq!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn tier_fingerprint_changes_with_tier_name() {
+        // Rename invalidates: a tier's identity is its name. The seeds for
+        // (master_seed, "nodes_0001", idx) differ from (master_seed,
+        // "renamed", idx), so existing shards under the old name would not
+        // be valid under the new name.
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.tiers[0].name = "nodes_0001".into();
+        b.tiers[0].name = "nodes_0001_v2".into();
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn tier_fingerprint_invariant_to_tier_reorder() {
+        // Reorder safety: putting tier B before tier A in the config must
+        // not change either tier's fingerprint. (Renaming would; reordering
+        // by index alone, with stable names, must not.)
+        let mut a = minimal_config();
+        a.tiers.push(TierConfig {
+            name: "second".into(),
+            n_games: 50,
+            temperature: 1.0,
+            searchless: false,
+            store_legal_move_evals: false,
+            sample_score: None,
+            net_selection: None,
+            nodes: Some(32),
+            multi_pv: Some(5),
+            opening_multi_pv: Some(5),
+            opening_plies: Some(0),
+            sample_plies: Some(999),
+            stockfish_hash_mb: None,
+        });
+        let fp_first_before = a.tier_fingerprint(0); // "nodes_0001"
+        let fp_second_before = a.tier_fingerprint(1); // "second"
+        // Swap the order.
+        a.tiers.swap(0, 1);
+        let fp_first_after = a.tier_fingerprint(1); // "nodes_0001" now at index 1
+        let fp_second_after = a.tier_fingerprint(0); // "second" now at index 0
+        assert_eq!(fp_first_before, fp_first_after);
+        assert_eq!(fp_second_before, fp_second_after);
     }
 
     #[test]
@@ -701,12 +846,38 @@ mod tests {
     }
 
     #[test]
-    fn tier_fingerprint_changes_with_n_workers() {
+    fn tier_fingerprint_invariant_to_n_workers() {
+        // `n_workers` is purely operational under shard-id partitioning:
+        // workers claim shards from a shared atomic counter and every
+        // game's content depends only on the global game index. Changing
+        // n_workers between runs must not invalidate any data.
         let mut a = minimal_config();
         let mut b = minimal_config();
         a.n_workers = 4;
-        b.n_workers = 8;
-        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+        b.n_workers = 380;
+        assert_eq!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn tier_fingerprint_invariant_to_stockfish_path() {
+        // Only the running version matters (captured separately by
+        // `stockfish_version`), not where the binary lives.
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.stockfish_path = "/usr/bin/stockfish".into();
+        b.stockfish_path = "/opt/bin/stockfish-patched".into();
+        assert_eq!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn tier_fingerprint_invariant_to_output_dir() {
+        // `output_dir` is operational; the same dataset can be staged in
+        // any directory without invalidation.
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.output_dir = "/data/a".into();
+        b.output_dir = "/data/b".into();
+        assert_eq!(a.tier_fingerprint(0), b.tier_fingerprint(0));
     }
 
     /// Pin the exact serialized JSON byte-for-byte. If serde or our
@@ -725,14 +896,15 @@ mod tests {
         //     became Option<SampleScore> (JSON null vs omitted, protocol-
         //     mode invariant).
         //   - SHARD_SCHEMA_VERSION added to the payload (v1 → v2 covers
-        //     the new `static_legal_move_evals` column). A future shard
-        //     schema bump invalidates this golden again — that's the
-        //     point: forces a loud test failure rather than a silent
-        //     resume across incompatible bytes on disk.
-        let expected = "e938e2f9d2aa39d4f61bd06ed9f678046de0e7f6ba9da49a8fb1b4cfaf5c2042";
+        //     the new `static_legal_move_evals` column).
+        //   - v3 refactor: keyed by sha256(tier.name) instead of
+        //     tier_index, n_games / n_workers / stockfish_path /
+        //     output_dir dropped, hash_mb hashed as the effective value.
+        //     Bumps SHARD_SCHEMA_VERSION 2 → 3 alongside.
+        let expected = "76d0524dda1514bf945206f736c02bff4217bae8ba7a92f855a54afb531850d6";
         assert_eq!(
             actual, expected,
-            "tier_fingerprint changed for minimal_config — verify the change is intentional, then update the expected value"
+            "tier_fingerprint changed for minimal_config — verify the change is intentional, then update the expected value (actual was: {actual})"
         );
     }
 
@@ -753,41 +925,29 @@ mod tests {
     fn tier_fingerprint_actually_depends_on_shard_schema_version() {
         // Pin the causal link "version field controls hash output" by
         // computing the real `tier_fingerprint` and a hand-rolled hash
-        // over the SAME 8 non-version fields with the version field
-        // OMITTED, then asserting the two hashes differ. The regression
-        // we're guarding against: someone drops the
-        // `shard_schema_version` line from the live payload (refactor
-        // accident, lint cleanup, etc.). After the drop, the live
-        // payload would have 8 fields and our hand-rolled payload would
-        // also have 8 fields with the same values — the hashes would
-        // collide and `assert_ne!` would fail loudly.
-        //
-        // Earlier rounds tried two weaker variants:
-        //   - `payload.to_string().contains("shard_schema_version")` —
-        //     tests the test's own local literal, not the production
-        //     code path. Tautology.
-        //   - hand-roll the payload WITH a bumped version, assert it
-        //     differs from the real hash — gives a false green: if the
-        //     live payload drops the version, real becomes hash-of-8
-        //     and the bumped hand-rolled is hash-of-9-with-bump, which
-        //     differ for the wrong reason (different field count, not
-        //     missing version protection).
-        // The current form catches the regression by construction:
-        // production-with-version vs hand-rolled-without-version must
-        // differ; production-without-version vs hand-rolled-without-
-        // version would equal, failing the assert.
+        // over the SAME non-version fields with the version field
+        // OMITTED, then asserting the two hashes differ. Guards against
+        // a refactor that drops the `shard_schema_version` line from the
+        // live payload — the live payload would have N fields and our
+        // hand-rolled payload would also have N fields with the same
+        // values, so this `assert_ne!` would fail loudly.
         let cfg = minimal_config();
         let real = cfg.tier_fingerprint(0);
 
+        let tier = &cfg.tiers[0];
+        let mut tier_body = serde_json::to_value(tier).unwrap();
+        if let Some(obj) = tier_body.as_object_mut() {
+            obj.remove("n_games");
+            obj.remove("stockfish_hash_mb");
+        }
         let payload_no_version = serde_json::json!({
-            "tier_index": 0,
-            "tier": &cfg.tiers[0],
+            "tier_name_key": format!("{:016x}", crate::seed::tier_name_to_key(&tier.name)),
+            "tier_body": tier_body,
             "master_seed": cfg.master_seed,
             "stockfish_version": &cfg.stockfish_version,
-            "stockfish_hash_mb": cfg.stockfish_hash_mb,
+            "effective_stockfish_hash_mb": cfg.effective_hash_mb(tier),
             "shard_size_games": cfg.shard_size_games,
             "max_ply": cfg.max_ply,
-            "n_workers": cfg.n_workers,
         });
         let mut h = Sha256::new();
         h.update(payload_no_version.to_string().as_bytes());
@@ -796,7 +956,7 @@ mod tests {
             real, no_version_hash,
             "tier_fingerprint must depend on SHARD_SCHEMA_VERSION; if it didn't, removing the \
              version field from the live payload would produce the same hash as the hand-rolled \
-             8-field payload — meaning the live `tier_fingerprint` no longer carries the \
+             payload — meaning the live `tier_fingerprint` no longer carries the \
              schema-version discriminator and a code upgrade across a schema bump would silently \
              pass the resume fingerprint check.",
         );
@@ -979,11 +1139,47 @@ mod tests {
     }
 
     #[test]
-    fn tier_fingerprint_changes_with_stockfish_hash_mb() {
+    fn tier_fingerprint_changes_with_top_level_hash_mb_when_no_override() {
+        // If no per-tier override is set, the *effective* hash size is the
+        // top-level default — so changing the top-level value changes the
+        // tier fingerprint.
         let mut a = minimal_config();
         let mut b = minimal_config();
         a.stockfish_hash_mb = 16;
         b.stockfish_hash_mb = 64;
+        a.tiers[0].stockfish_hash_mb = None;
+        b.tiers[0].stockfish_hash_mb = None;
         assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn tier_fingerprint_changes_with_per_tier_hash_mb_override() {
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.tiers[0].stockfish_hash_mb = Some(1);
+        b.tiers[0].stockfish_hash_mb = Some(16);
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn tier_fingerprint_invariant_to_promoting_default_to_override() {
+        // Promoting the top-level default to an explicit per-tier override
+        // of the same value must not invalidate existing shards. Tests that
+        // we hash the *effective* value, not the raw `Option`.
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.stockfish_hash_mb = 16;
+        a.tiers[0].stockfish_hash_mb = None;
+        b.stockfish_hash_mb = 16; // could equally be a different value here
+        b.tiers[0].stockfish_hash_mb = Some(16);
+        assert_eq!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn validate_rejects_zero_per_tier_hash_mb() {
+        let mut c = minimal_config();
+        c.tiers[0].stockfish_hash_mb = Some(0);
+        let err = c.validate().unwrap_err();
+        assert!(format!("{err:#}").contains("stockfish_hash_mb"), "got {err:#}");
     }
 }

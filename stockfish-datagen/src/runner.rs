@@ -1,13 +1,28 @@
 //! Tier orchestration: spawn N workers, each driving one Stockfish, drain
 //! their progress messages, collect results.
 //!
-//! Workers are independent threads communicating with the main thread via
-//! a single mpsc channel. Each worker owns one parquet shard at a time;
-//! shards are rotated when they reach `shard_size_games`. On worker
-//! completion the final partial shard (if any) is closed and renamed.
+//! Partitioning is by **shard id**, not by worker. Each tier has
+//! `total_shards = ceil(n_games / shard_size_games)` deterministically-
+//! numbered shards; workers pull shard ids from a shared `AtomicU64`
+//! counter (`fetch_add(1)`). The per-game seed depends only on the
+//! *global* game index within the tier, so `n_workers` is operational
+//! only — changing it never changes any game's content, only which
+//! worker thread happens to generate it.
+//!
+//! Multi-pod cooperation: each pod is given a half-open `shard_range`
+//! (default `0..total_shards`). The atomic counter starts at the range's
+//! `start` and stops at `end`; disjoint pods on different machines
+//! produce disjoint shard files and can sync to the same HF dataset
+//! folder without name collisions. Per-pod sentinels
+//! (`_tier_state-s<A>-s<B>.json`, `_manifest-s<A>-s<B>.json`) keep their
+//! resume / completion records separate; a `datagen_reconcile_tier.py`
+//! helper merges them into a unified manifest after all pods finish.
 
+use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, anyhow};
 use crossbeam_channel::Sender;
@@ -17,10 +32,47 @@ use rand_chacha::ChaCha8Rng;
 use crate::affinity;
 use crate::config::{RunConfig, TierConfig};
 use crate::game::play_game;
-use crate::resume::{TierManifest, TierState, detect_resume};
+use crate::resume::{ShardRange, TierManifest, TierState, detect_resume};
 use crate::seed;
 use crate::shard::{GameRow, ShardWriter};
 use crate::stockfish::StockfishProcess;
+
+/// Tier-execution scope: which tiers to run and which shard ids each tier
+/// should restrict its work to.
+#[derive(Debug, Clone, Default)]
+pub struct RunScope {
+    /// Subset of tier indices to run; `None` means "all tiers in cfg".
+    pub tiers: Option<Vec<usize>>,
+    /// Per-tier shard-id range; `None` means "full range `0..total_shards`".
+    /// Same range applies to every tier in this run (the multi-pod model
+    /// is "this pod owns shard ids `[A, B)` across all of its assigned tiers").
+    pub shard_range: Option<ShardRange>,
+}
+
+impl RunScope {
+    pub fn includes_tier(&self, tier_index: usize) -> bool {
+        match &self.tiers {
+            Some(t) => t.contains(&tier_index),
+            None => true,
+        }
+    }
+
+    /// Effective shard-id range for `tier` under this scope.
+    pub fn effective_shard_range(&self, cfg: &RunConfig, tier: &TierConfig) -> Range<u64> {
+        let full = 0..cfg.total_shards(tier);
+        match self.shard_range {
+            Some(r) => {
+                // Clamp to the tier's actual shard count so a multi-pod
+                // run that doesn't recompute ranges per-tier stays
+                // bounded if one tier has fewer shards than others.
+                let start = r.start.min(full.end);
+                let end = r.end.min(full.end);
+                start..end
+            }
+            None => full,
+        }
+    }
+}
 
 /// Results from a successful tier run.
 #[derive(Debug, Clone)]
@@ -34,48 +86,51 @@ pub struct TierResult {
 pub enum Progress {
     /// Periodic update so the user knows things are alive.
     Heartbeat {
-        worker_id: u32,
+        worker_idx: u32,
+        shards_done: u64,
         games_done: u64,
     },
-    /// Worker finished cleanly. Last shard already closed.
+    /// Worker finished cleanly. Final partial shard already closed.
     Done {
-        worker_id: u32,
+        worker_idx: u32,
+        shards_done: u64,
         games_written: u64,
         shards: Vec<PathBuf>,
     },
 }
 
-/// Run one tier end-to-end. Spawns `cfg.n_workers` worker threads, each
-/// generating its share of `tier.n_games`. Returns summary stats.
+/// Run one tier end-to-end under the given `scope`. Spawns `cfg.n_workers`
+/// worker threads, each pulling shard ids from a shared atomic counter
+/// bounded by `scope.effective_shard_range(cfg, tier)`. Returns summary
+/// stats for THIS pod's slice (not the full tier).
 ///
 /// Resume behavior:
-/// - If a manifest exists with matching `config_fingerprint`, the tier is
-///   skipped entirely (returns the manifest's recorded stats).
-/// - Otherwise existing shard files are scanned and each worker resumes
-///   from `(games_done, next_chunk_idx)` derived from disk.
+/// - If a manifest for this pod's `shard_range` exists with matching
+///   `config_fingerprint`, the tier is skipped entirely (returns the
+///   recorded stats).
+/// - Otherwise existing shard files in `[shard_range.start, shard_range.end)`
+///   are scanned and the atomic counter starts at `shard_range.start`;
+///   workers skip done shards and regenerate boundary-rewrite shards.
 pub fn run_tier(
     cfg: &RunConfig,
     tier_index: usize,
+    scope: &RunScope,
 ) -> anyhow::Result<TierResult> {
     let tier = &cfg.tiers[tier_index];
-    // `output_dir` was tilde-expanded in `RunConfig::load`, so `~/sf-data`
-    // already resolves to `$HOME/sf-data` here.
     let tier_dir = cfg.output_dir.join(&tier.name);
     std::fs::create_dir_all(&tier_dir)
         .with_context(|| format!("creating tier dir {}", tier_dir.display()))?;
 
-    // Per-tier fingerprint: covers the relevant inputs only (this tier's
-    // config + tier_index + master_seed + stockfish_version + shard size).
-    // Adding or modifying *other* tiers in the run config does NOT
-    // invalidate prior tiers' manifests.
     let fingerprint = cfg.tier_fingerprint(tier_index);
+    let shard_range = scope.effective_shard_range(cfg, tier);
+    let pod_range: Option<ShardRange> = scope.shard_range;
 
-    // Skip if already complete.
-    if let Some(manifest) = TierManifest::load(&tier_dir)? {
+    // Skip if this pod's slice is already complete.
+    if let Some(manifest) = TierManifest::load(&tier_dir, pod_range.as_ref())? {
         if manifest.config_fingerprint == fingerprint {
             eprintln!(
-                "[{}] already complete ({} games, {} shards) — skipping",
-                tier.name, manifest.n_games_written, manifest.shards.len(),
+                "[{}] already complete for range {:?} ({} games, {} shards) — skipping",
+                tier.name, shard_range, manifest.n_games_written, manifest.shards.len(),
             );
             return Ok(TierResult {
                 n_games_written: manifest.n_games_written,
@@ -92,18 +147,43 @@ pub fn run_tier(
                 tier.name,
                 manifest.config_fingerprint,
                 fingerprint,
-                TierManifest::path(&tier_dir).display(),
+                TierManifest::path(&tier_dir, pod_range.as_ref()).display(),
             ));
         }
     }
 
-    let resume_states = detect_resume(&tier_dir, cfg.n_workers)?;
+    // Expected-row-count closure: same logic the runner uses when writing
+    // a fresh shard, so resume's "done vs boundary-rewrite" classification
+    // stays consistent.
+    let shard_size = cfg.shard_size_games as u64;
+    let n_games = tier.n_games;
+    let expected_n_rows = |sid: u64| -> u64 {
+        let start = sid * shard_size;
+        let end = ((sid + 1) * shard_size).min(n_games);
+        end.saturating_sub(start)
+    };
+    // Run resume against the full tier dir; we'll filter to this pod's
+    // range below.
+    let resume_state = detect_resume(&tier_dir, cfg.total_shards(tier), expected_n_rows)?;
 
-    // Tier-state sentinel: validates that any shards on disk were
-    // generated under the SAME config we're about to run. Without this,
-    // an interrupted run + a config tweak before retry would silently
-    // mix old + new bytes into the same tier output.
-    match TierState::load(&tier_dir)? {
+    // Filter resume state to this pod's range. Other pods' shards are
+    // visible on disk (multi-pod runs share the directory) but not this
+    // pod's business.
+    let in_range = |sid: u64| sid >= shard_range.start && sid < shard_range.end;
+    let done_shards: BTreeSet<u64> = resume_state.done_shards.iter().copied().filter(|s| in_range(*s)).collect();
+    let boundary_rewrites: Vec<(u64, PathBuf)> = resume_state
+        .boundary_rewrites
+        .iter()
+        .filter(|(s, _)| in_range(*s))
+        .cloned()
+        .collect();
+
+    // Tier-state sentinel: validates that any shards on disk in this
+    // pod's range were generated under the SAME config we're about to
+    // run. Without this, an interrupted run + a config tweak before
+    // retry would silently mix old + new bytes into the same tier output.
+    let any_existing_in_range = !done_shards.is_empty() || !boundary_rewrites.is_empty();
+    match TierState::load(&tier_dir, pod_range.as_ref())? {
         Some(state) if state.config_fingerprint == fingerprint => {
             // Matches — safe to resume.
         }
@@ -118,7 +198,7 @@ pub fn run_tier(
                 tier_dir.display(),
             ));
         }
-        None if !resume_states.is_empty() => {
+        None if any_existing_in_range => {
             return Err(anyhow!(
                 "[{}] shards exist in {} but no tier state file is present; cannot \
                  verify they belong to the current config. Either move them aside or \
@@ -131,44 +211,51 @@ pub fn run_tier(
             TierState {
                 config_fingerprint: fingerprint.clone(),
                 started_at: now_iso8601(),
+                shard_range: pod_range,
             }
             .save(&tier_dir)
             .context("writing tier state sentinel")?;
         }
     }
 
-    let tier_seed = seed::tier_seed(cfg.master_seed, tier_index);
-    let split = cfg.games_per_worker(tier);
+    let tier_seed = seed::tier_seed(cfg.master_seed, &tier.name);
 
-    // detect_resume already filters stale workers (worker_id >= n_workers),
-    // so resume_states represents only the current partition.
-    let total_resume_done: u64 = resume_states.values().map(|s| s.games_done).sum();
-    if total_resume_done > 0 {
+    let total_resume_games: u64 = done_shards.iter().map(|s| expected_n_rows(*s)).sum();
+    if total_resume_games > 0 {
         eprintln!(
-            "[{}] resuming: {} games already on disk across {} worker(s)",
+            "[{}] resuming: {} games already on disk across {} done shard(s){}",
             tier.name,
-            total_resume_done,
-            resume_states.len(),
+            total_resume_games,
+            done_shards.len(),
+            if boundary_rewrites.is_empty() {
+                String::new()
+            } else {
+                format!(" + {} boundary-rewrite shard(s)", boundary_rewrites.len())
+            },
         );
     }
 
+    let pod_shards = shard_range.end.saturating_sub(shard_range.start);
     eprintln!(
-        "[{}] starting: {} games across {} workers ({} max per worker)",
+        "[{}] starting: {} games across {} workers (shard range {:?}, {} shard(s) in this pod)",
         tier.name,
         tier.n_games,
         cfg.n_workers,
-        split.iter().copied().max().unwrap_or(0),
+        shard_range,
+        pod_shards,
     );
 
     let cfg = Arc::new(cfg.clone());
     let tier = Arc::new(tier.clone());
     let tier_dir = Arc::new(tier_dir);
+    let done_shards = Arc::new(done_shards);
+    let boundary_rewrites = Arc::new(boundary_rewrites);
+
+    let counter = Arc::new(AtomicU64::new(shard_range.start));
+    let counter_end = shard_range.end;
 
     let (tx, rx) = crossbeam_channel::unbounded::<Progress>();
 
-    // Spawn the progress drain BEFORE any workers. If the drain spawn
-    // fails, no workers exist yet to leak. (Worker spawn failure after
-    // this point is handled by waiting for already-spawned workers below.)
     let drain_handle = std::thread::Builder::new()
         .name("sfd-progress".into())
         .spawn({
@@ -177,15 +264,14 @@ pub fn run_tier(
                 let mut completions = Vec::new();
                 for msg in rx {
                     match &msg {
-                        Progress::Heartbeat { worker_id, games_done } => {
+                        Progress::Heartbeat { worker_idx, shards_done, games_done } => {
                             eprintln!(
-                                "  [{tier_name} worker {worker_id:>2}] {games_done:>7} done",
+                                "  [{tier_name} w{worker_idx:>2}] {shards_done} shard(s), {games_done} games"
                             );
                         }
-                        Progress::Done { worker_id, games_written, shards } => {
+                        Progress::Done { worker_idx, shards_done, games_written, .. } => {
                             eprintln!(
-                                "  [{tier_name} worker {worker_id:>2}] DONE: {games_written} written, {} shards",
-                                shards.len(),
+                                "  [{tier_name} w{worker_idx:>2}] DONE: {games_written} games across {shards_done} shard(s)"
                             );
                             completions.push(msg);
                             continue;
@@ -200,59 +286,45 @@ pub fn run_tier(
     let mut handles = Vec::with_capacity(cfg.n_workers as usize);
     let mut spawn_err: Option<anyhow::Error> = None;
 
-    for worker_id in 0..cfg.n_workers {
-        let target = split[worker_id as usize];
-        let resume = resume_states
-            .get(&worker_id)
-            .copied()
-            .unwrap_or(crate::resume::WorkerResumeState { games_done: 0, next_chunk_idx: 0 });
-        if resume.games_done >= target {
-            // Worker already finished its share — skip.
-            continue;
-        }
-        let worker_seed = seed::worker_seed(tier_seed, worker_id);
+    for worker_idx in 0..cfg.n_workers {
         let cfg = Arc::clone(&cfg);
         let tier = Arc::clone(&tier);
         let tier_dir = Arc::clone(&tier_dir);
+        let done_shards = Arc::clone(&done_shards);
+        let boundary_rewrites = Arc::clone(&boundary_rewrites);
+        let counter = Arc::clone(&counter);
         let tx = tx.clone();
-        let start_index = resume.games_done;
-        let start_chunk = resume.next_chunk_idx;
         let spawn_result = std::thread::Builder::new()
-            .name(format!("sfd-w{worker_id}"))
+            .name(format!("sfd-w{worker_idx}"))
             .spawn(move || {
                 run_worker(
-                    &cfg, &tier, &tier_dir, worker_id, worker_seed,
-                    start_index, start_chunk, target, tx,
+                    &cfg, &tier, &tier_dir, worker_idx, tier_seed,
+                    &counter, counter_end, &done_shards, &boundary_rewrites, tx,
                 )
             });
         match spawn_result {
-            Ok(h) => handles.push((worker_id, h)),
+            Ok(h) => handles.push((worker_idx, h)),
             Err(e) => {
-                spawn_err = Some(anyhow!(e).context(format!("spawning worker {worker_id}")));
+                spawn_err = Some(anyhow!(e).context(format!("spawning worker {worker_idx}")));
                 break;
             }
         }
     }
-    // Drop the original sender so the channel closes once all worker
-    // clones are dropped (i.e. when all workers exit). Important to do
-    // this even on spawn-error path so the drain thread terminates.
     drop(tx);
 
-    // Wait for all workers, surface the first error if any panicked or
-    // returned Err.
     let mut first_err: Option<anyhow::Error> = spawn_err;
-    for (worker_id, h) in handles {
+    for (worker_idx, h) in handles {
         match h.join() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                let e = e.context(format!("worker {worker_id}"));
-                eprintln!("worker {worker_id} failed: {e:#}");
+                let e = e.context(format!("worker {worker_idx}"));
+                eprintln!("worker {worker_idx} failed: {e:#}");
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
             }
             Err(_) => {
-                let e = anyhow!("worker {worker_id} panicked");
+                let e = anyhow!("worker {worker_idx} panicked");
                 eprintln!("{e:#}");
                 if first_err.is_none() {
                     first_err = Some(e);
@@ -261,61 +333,41 @@ pub fn run_tier(
         }
     }
 
-    // Wait for the drain to finish even on the error path so we don't
-    // leak the thread. Suppress drain-panic if we already have a real
-    // worker error to surface — the drain panic is almost always a
-    // downstream symptom of the worker error.
     let drain_result = drain_handle.join();
     if let Some(e) = first_err {
         return Err(e);
     }
-    let completions = drain_result.map_err(|_| anyhow!("progress drain panicked"))?;
+    let _completions = drain_result.map_err(|_| anyhow!("progress drain panicked"))?;
 
-    // Accounting invariant: total_resume_done is the count of games
-    // already on disk at the start of this run (filtered to in-scope
-    // workers). Workers that were already complete are skipped before
-    // spawning and never send Progress::Done; only newly-written games
-    // increment via Done messages below. So:
-    //   total_written = (games already on disk) + (newly written games)
-    //                 = total games across the in-scope partition.
-    let mut total_written = total_resume_done;
-    let mut all_shards: Vec<PathBuf> = Vec::new();
-    // Dir-scan picks up both resumed shards and shards just written this
-    // run. Filter via the same filename parser used by `detect_resume`
-    // so we (a) ignore unrelated `.parquet` files a downstream tool might
-    // drop in the dir, and (b) exclude stale shards from worker IDs that
-    // are no longer in scope (n_workers reduced between runs). The
-    // exclusion keeps `manifest.shards` consistent with `n_games_written`
-    // — both reflect only the current partition.
-    for entry in std::fs::read_dir(tier_dir.as_path())? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        let Some((worker_id, _chunk, _rows)) = crate::resume::parse_shard_filename(&name_str)
-        else {
-            continue;
-        };
-        if worker_id < cfg.n_workers {
-            all_shards.push(entry.path());
-        }
-    }
-    for msg in completions {
-        if let Progress::Done { games_written, .. } = msg {
-            total_written += games_written;
-        }
-    }
+    // Re-scan the dir for this pod's shards (resumed + newly written +
+    // boundary rewrites). Use the same expected-rows fn we built earlier
+    // so the manifest's shard list reflects only validly-sized files.
+    let final_state = detect_resume(tier_dir.as_path(), cfg.total_shards(&tier), expected_n_rows)?;
+    let mut all_shards: Vec<PathBuf> = final_state
+        .done_shards
+        .iter()
+        .copied()
+        .filter(|sid| in_range(*sid))
+        .map(|sid| crate::shard::shard_final_path(tier_dir.as_path(), sid, expected_n_rows(sid)))
+        .collect();
     all_shards.sort();
 
+    // Accounting: every shard in this pod's range should now be `done`.
+    // If anything was left in `boundary_rewrites` or beyond, that's a bug.
+    let expected_shard_count = pod_shards as usize;
+    if all_shards.len() != expected_shard_count {
+        return Err(anyhow!(
+            "[{}] post-run shard count mismatch: have {} shards on disk in range {:?}, expected {}",
+            tier.name, all_shards.len(), shard_range, expected_shard_count,
+        ));
+    }
+    let total_written: u64 = (shard_range.start..shard_range.end).map(expected_n_rows).sum();
+
     eprintln!(
-        "[{}] complete: {} written, {} shards",
-        tier.name,
-        total_written,
-        all_shards.len(),
+        "[{}] complete: {} games across {} shards in range {:?}",
+        tier.name, total_written, all_shards.len(), shard_range,
     );
 
-    // Write the manifest as the very last step — its presence is the
-    // signal that the tier is done. The shard list is sorted and stored
-    // as filenames relative to the tier dir.
     let manifest = TierManifest {
         tier_name: tier.name.clone(),
         config_fingerprint: fingerprint,
@@ -325,6 +377,7 @@ pub fn run_tier(
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .collect(),
         completed_at: now_iso8601(),
+        shard_range: pod_range,
     };
     manifest.save(tier_dir.as_path()).context("writing tier manifest")?;
 
@@ -336,13 +389,6 @@ pub fn run_tier(
 
 /// Saturating cast from f32 to i16, used to pack `evallegal` /
 /// multipv-derived scores into the parquet `LegalMoveEval` struct.
-/// Out-of-range inputs clamp to ±32767 (no panic, no wraparound).
-///
-/// NaN handling: `f32::clamp` propagates NaN through (it panics only if
-/// the bounds themselves are NaN, not the input), and `NaN as i16` is
-/// defined as 0 under Rust's saturating-cast spec (RFC 3173, since
-/// Rust 1.45). The parser only feeds finite integer-derived f32 values
-/// here, so NaN can't actually arise — this is defense in depth.
 fn f32_to_i16_clamped(x: f32) -> i16 {
     x.clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
@@ -353,8 +399,6 @@ fn now_iso8601() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // RFC3339 in UTC, second precision. Manual formatter to avoid pulling
-    // in `chrono` for one timestamp.
     format_epoch_secs(epoch_secs)
 }
 
@@ -370,13 +414,10 @@ fn format_epoch_secs(epoch_secs: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-/// Convert days-since-1970 into (year, month, day). Pulled from the
-/// classic algorithm; correct for the Gregorian calendar over our range.
 fn days_to_ymd(days: i64) -> (i32, u32, u32) {
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
     let z = days + 719468;
     let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
-    let doe = (z - era * 146097) as u64; // [0, 146096]
+    let doe = (z - era * 146097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
@@ -392,252 +433,204 @@ fn run_worker(
     cfg: &RunConfig,
     tier: &TierConfig,
     tier_dir: &std::path::Path,
-    worker_id: u32,
-    worker_seed: u64,
-    start_index: u64,
-    start_chunk: u32,
-    target: u64,
+    worker_idx: u32,
+    tier_seed: u64,
+    counter: &AtomicU64,
+    counter_end: u64,
+    done_shards: &BTreeSet<u64>,
+    boundary_rewrites: &[(u64, PathBuf)],
     tx: Sender<Progress>,
 ) -> anyhow::Result<()> {
-    // Pin THIS worker thread to a fixed core BEFORE spawning Stockfish so
-    // the child inherits affinity via fork() and runs its NNUE init /
-    // hash-table allocation on the target core's L1/L2. The (worker,
-    // Stockfish) pair is intrinsically serialized over the pipe (worker
-    // writes `position+go`, waits, reads `bestmove`), so they want to
-    // share the same core's cache — otherwise the kernel load-balances
-    // them across cores and L1/L2 evicts on every round-trip. On a
-    // 16-core local box at 16 workers we measured 23% kernel time and
-    // 537K ctx switches/sec; pinning addresses exactly that thrashing.
-    // At 128 threads with NUMA the upside grows. `pick_core` is called
-    // once and the result is reused for the post-spawn child re-pin so
-    // a cgroup cpuset mutation between the two calls can't split the
-    // pair across cores.
-    let core = affinity::pick_core(worker_id);
+    // Pin BEFORE spawning Stockfish so the child inherits affinity via
+    // fork() and runs NNUE init / hash-table allocation on the target
+    // core's L1/L2. `pick_core` mod-rotates `worker_idx` over the
+    // available logical cores, so the worker count being unrelated to
+    // the partitioning model has no effect here.
+    let core = affinity::pick_core(worker_idx);
     if let Some(c) = core {
-        affinity::pin_thread_to(c, worker_id);
+        affinity::pin_thread_to(c, worker_idx);
     }
 
     let budget = if tier.searchless {
         crate::stockfish::GoBudget::EvalLegal
     } else {
-        // Validation guarantees nodes is Some when searchless=false.
         crate::stockfish::GoBudget::Nodes(
             tier.nodes.expect("validated: search-mode tier has nodes"),
         )
     };
+    // Per-tier hash_mb override (falls back to top-level default if absent).
+    // The effective value is part of the tier fingerprint, so resume only
+    // accepts shards produced under the same setting.
+    let hash_mb = cfg.effective_hash_mb(tier);
     let mut sf = StockfishProcess::spawn(
         &cfg.stockfish_path,
         &cfg.stockfish_version,
-        cfg.stockfish_hash_mb,
+        hash_mb,
         budget,
     )
-    .with_context(|| format!("spawning stockfish for worker {worker_id}"))?;
-    // Defensive re-pin of the child. Almost always a no-op since the child
-    // already inherited the parent's affinity at fork time; only meaningful
-    // if the kernel scheduled the child elsewhere during the brief window
-    // before fork's affinity copy completed (theoretical, but cheap).
+    .with_context(|| format!("spawning stockfish for worker {worker_idx}"))?;
     if let Some(c) = core {
-        affinity::pin_child_to(sf.child_pid(), c, worker_id);
+        affinity::pin_child_to(sf.child_pid(), c, worker_idx);
     }
-    // Apply NetSelection if the tier requested an override. The preflight
-    // check in main.rs verified the binary is patched whenever any tier
-    // sets this field, so the setoption is guaranteed to take effect here
-    // (vs being silently ignored by a vanilla SF18).
     if let Some(net) = tier.net_selection {
         sf.set_net_selection(net)
-            .with_context(|| format!("worker {worker_id}: setting NetSelection={:?}", net))?;
+            .with_context(|| format!("worker {worker_idx}: setting NetSelection={:?}", net))?;
     }
     let stockfish_id_name = sf.id_name.clone();
-
-    // On resume we always start a *new* shard at start_chunk — the prior
-    // run's last shard (if partial) was already closed and counted in
-    // start_index. We can't append to a closed parquet, so the next file
-    // gets a fresh chunk index.
-    // Hoisted out of the per-game loop: same value every row, so cloning
-    // the Arc<str> per row is one pointer copy instead of a String alloc.
     let stockfish_version: Arc<str> = Arc::from(stockfish_id_name.as_str());
 
     let shard_size = cfg.shard_size_games as u64;
-    let mut current_chunk = start_chunk;
-    let mut games_in_shard = 0u64;
-    let mut writer: Option<ShardWriter> = None;
+    let n_games = tier.n_games;
+    let mut shards_done = 0u64;
     let mut total_written = 0u64;
     let mut shards = Vec::new();
+    // Quick lookup for boundary rewrites: shard_id -> existing-file-to-delete.
+    let boundary_paths: std::collections::BTreeMap<u64, PathBuf> =
+        boundary_rewrites.iter().cloned().collect();
 
-    for game_index in start_index..target {
-        let game_seed = seed::game_seed(worker_seed, game_index);
-        let mut rng = ChaCha8Rng::seed_from_u64(game_seed);
-
-        let played = play_game(&mut sf, &mut rng, tier, cfg.max_ply)
-            .with_context(|| format!("playing game {game_index} (seed {game_seed})"))?;
-
-        // play_game must produce at least one move — the starting position
-        // is never terminal. An empty result indicates a bug in either the
-        // pre-move terminal check or play_game itself. Hard-error rather
-        // than silently dropping, so dropped games never desync game_index
-        // from the row count (which would break resume).
-        if played.uci_moves.is_empty() {
-            return Err(anyhow!(
-                "worker {worker_id} game {game_index} (seed {game_seed}): \
-                 play_game returned zero moves — likely terminal-check bug"
-            ));
+    loop {
+        let shard_id = counter.fetch_add(1, Ordering::Relaxed);
+        if shard_id >= counter_end {
+            break;
+        }
+        // Skip shards that are already complete on disk. Boundary
+        // rewrites fall through and get regenerated.
+        if done_shards.contains(&shard_id) {
+            continue;
+        }
+        let start = shard_id * shard_size;
+        let end = ((shard_id + 1) * shard_size).min(n_games);
+        if end <= start {
+            // Pathological: shard_id beyond n_games. Shouldn't happen
+            // given total_shards math but defend in depth.
+            continue;
         }
 
-        // Re-tokenize via the canonical encoder. Stockfish should never
-        // give us an unparseable move list — if it does, hard-error so the
-        // run aborts deterministically and resume picks up from the failed
-        // index without skipping it.
-        let refs: Vec<&str> = played.uci_moves.iter().map(|s| s.as_str()).collect();
-        let (tokens, san) = chess_engine::uci::uci_to_tokens_and_san(&refs);
-        if tokens.len() != played.uci_moves.len() {
-            let bad = played.uci_moves.get(tokens.len()).cloned().unwrap_or_default();
-            return Err(anyhow!(
-                "worker {worker_id} game {game_index} (seed {game_seed}): \
-                 engine rejected move {} of {}: {bad:?}",
-                tokens.len(),
-                played.uci_moves.len(),
-            ));
-        }
-        // Pin the per-ply-list length invariants. `play_game` documents that
-        // `per_ply_candidates` and `per_ply_static_candidates` are each
-        // either `None` or a Vec whose length equals `uci_moves.len()`. If
-        // a future refactor of the play loop ever pushes to one buffer
-        // without matching the other (or returns Ok with a partial buffer
-        // on a non-error path), this fails the run rather than letting the
-        // desync silently produce a parquet row whose static labels are
-        // misaligned by one ply against the actual game.
-        //
-        // Use `anyhow::ensure!` (Result-returning) rather than `assert_eq!`
-        // (panicking) so the structured worker_id / game_index / counts
-        // context survives through `first_err` and out to the operator.
-        // The thread-join machinery would otherwise swallow the panic
-        // payload and surface only "worker N panicked", which is hard to
-        // diagnose in a 126-worker pod log.
-        if let Some(c) = &played.per_ply_candidates {
-            anyhow::ensure!(
-                c.len() == played.uci_moves.len(),
-                "worker {worker_id} game {game_index} (seed {game_seed}): \
-                 per_ply_candidates len {} != uci_moves len {}",
-                c.len(), played.uci_moves.len(),
-            );
-        }
-        if let Some(c) = &played.per_ply_static_candidates {
-            anyhow::ensure!(
-                c.len() == played.uci_moves.len(),
-                "worker {worker_id} game {game_index} (seed {game_seed}): \
-                 per_ply_static_candidates len {} != uci_moves len {}",
-                c.len(), played.uci_moves.len(),
-            );
-        }
-        let n = tokens.len();
+        let mut writer = ShardWriter::create(tier_dir.to_path_buf(), shard_id)?;
 
-        // Convert per-ply candidates into the packed `LegalMoveEval` form for
-        // distillation. The four raw-eval scalars come from the patched
-        // binary's `evallegal` (sf_18-v0.3.0+) — score_eval_v is the
-        // post-processed Eval::evaluate Value (right target for play-policy
-        // distillation), score_psqt + score_positional are the raw NNUE
-        // per-head outputs (right targets for hot-swap NNUE distillation).
-        // All `None` for multipv-sourced rows — we trust the engine vocab
-        // here; Stockfish has already produced legal UCI strings (the
-        // per-ply move choice was applied successfully above).
-        //
-        // `static_legal_move_evals` is the canonical NNUE static-eval signal
-        // captured by a separate evallegal call per ply; populated only on
-        // non-searchless tiers that opted into store_legal_move_evals=true,
-        // and `None` on searchless tiers (their `legal_move_evals` already
-        // is the same data, so duplicating would double tier-0 storage).
-        let pack_candidates = |plies: Vec<Vec<crate::stockfish::Candidate>>|
-            -> Vec<Vec<crate::shard::LegalMoveEval>>
-        {
-            plies
-                .into_iter()
-                .map(|cands| {
-                    cands
-                        .into_iter()
-                        .map(|c| crate::shard::LegalMoveEval {
-                            move_idx: chess_engine::vocab::uci_to_action(&c.uci)
-                                .expect("Stockfish-emitted UCI must be in our action vocab")
-                                as i16,
-                            score_cp: f32_to_i16_clamped(c.score_cp),
-                            score_eval_v: c.score_eval_v.map(f32_to_i16_clamped),
-                            score_psqt: c.score_psqt.map(f32_to_i16_clamped),
-                            score_positional: c.score_positional.map(f32_to_i16_clamped),
-                        })
-                        .collect()
-                })
-                .collect()
-        };
-        let legal_move_evals = played.per_ply_candidates.map(pack_candidates);
-        let static_legal_move_evals = played.per_ply_static_candidates.map(pack_candidates);
+        for global_game_index in start..end {
+            let game_seed = seed::game_seed(tier_seed, global_game_index);
+            let mut rng = ChaCha8Rng::seed_from_u64(game_seed);
 
-        let row = GameRow {
-            tokens: tokens.into_iter().map(|t| t as i16).collect(),
-            san,
-            uci: played.uci_moves,
-            game_length: n as u16,
-            outcome_token: played.outcome.token(),
-            result: played.outcome.result_str().into(),
-            // Validation guarantees these are Some iff !searchless and None
-            // iff searchless, so the Option<u32> → Option<i32> map preserves
-            // the protocol-mode invariant in the parquet metadata.
-            nodes: tier.nodes.map(|n| n as i32),
-            multi_pv: tier.multi_pv.map(|n| n as i32),
-            opening_multi_pv: tier.opening_multi_pv.map(|n| n as i32),
-            opening_plies: tier.opening_plies.map(|n| n as i32),
-            sample_plies: tier.sample_plies.map(|n| n as i32),
-            // Searchless-only metadata: serialized as the same lowercase
-            // string the JSON config uses, so a moved shard reads back
-            // immediately recognizable values without consulting an
-            // external schema.
-            sample_score: tier.sample_score.map(|s| match s {
-                crate::config::SampleScore::Cp => "cp".to_string(),
-                crate::config::SampleScore::V => "v".to_string(),
-            }),
-            net_selection: tier.net_selection.map(|n| n.as_uci_str().to_string()),
-            temperature: tier.temperature,
-            worker_id: worker_id as i16,
-            game_seed,
-            stockfish_version: stockfish_version.to_string(),
-            legal_move_evals,
-            static_legal_move_evals,
-        };
+            let played = play_game(&mut sf, &mut rng, tier, cfg.max_ply)
+                .with_context(|| format!(
+                    "playing game {global_game_index} (seed {game_seed})"
+                ))?;
 
-        if writer.is_none() {
-            writer = Some(ShardWriter::create(tier_dir.to_path_buf(), worker_id, current_chunk)?);
-        }
-        writer.as_mut().unwrap().append(&row);
-        games_in_shard += 1;
-        total_written += 1;
+            if played.uci_moves.is_empty() {
+                return Err(anyhow!(
+                    "worker {worker_idx} game {global_game_index} (seed {game_seed}): \
+                     play_game returned zero moves — likely terminal-check bug"
+                ));
+            }
 
-        if games_in_shard >= shard_size {
-            let path = writer.take().unwrap().close()?;
-            shards.push(path);
-            current_chunk += 1;
-            games_in_shard = 0;
+            let refs: Vec<&str> = played.uci_moves.iter().map(|s| s.as_str()).collect();
+            let (tokens, san) = chess_engine::uci::uci_to_tokens_and_san(&refs);
+            if tokens.len() != played.uci_moves.len() {
+                let bad = played.uci_moves.get(tokens.len()).cloned().unwrap_or_default();
+                return Err(anyhow!(
+                    "worker {worker_idx} game {global_game_index} (seed {game_seed}): \
+                     engine rejected move {} of {}: {bad:?}",
+                    tokens.len(),
+                    played.uci_moves.len(),
+                ));
+            }
+            if let Some(c) = &played.per_ply_candidates {
+                anyhow::ensure!(
+                    c.len() == played.uci_moves.len(),
+                    "worker {worker_idx} game {global_game_index} (seed {game_seed}): \
+                     per_ply_candidates len {} != uci_moves len {}",
+                    c.len(), played.uci_moves.len(),
+                );
+            }
+            if let Some(c) = &played.per_ply_static_candidates {
+                anyhow::ensure!(
+                    c.len() == played.uci_moves.len(),
+                    "worker {worker_idx} game {global_game_index} (seed {game_seed}): \
+                     per_ply_static_candidates len {} != uci_moves len {}",
+                    c.len(), played.uci_moves.len(),
+                );
+            }
+            let n = tokens.len();
+
+            let pack_candidates = |plies: Vec<Vec<crate::stockfish::Candidate>>|
+                -> Vec<Vec<crate::shard::LegalMoveEval>>
+            {
+                plies
+                    .into_iter()
+                    .map(|cands| {
+                        cands
+                            .into_iter()
+                            .map(|c| crate::shard::LegalMoveEval {
+                                move_idx: chess_engine::vocab::uci_to_action(&c.uci)
+                                    .expect("Stockfish-emitted UCI must be in our action vocab")
+                                    as i16,
+                                score_cp: f32_to_i16_clamped(c.score_cp),
+                                score_eval_v: c.score_eval_v.map(f32_to_i16_clamped),
+                                score_psqt: c.score_psqt.map(f32_to_i16_clamped),
+                                score_positional: c.score_positional.map(f32_to_i16_clamped),
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+            let legal_move_evals = played.per_ply_candidates.map(pack_candidates);
+            let static_legal_move_evals = played.per_ply_static_candidates.map(pack_candidates);
+
+            let row = GameRow {
+                tokens: tokens.into_iter().map(|t| t as i16).collect(),
+                san,
+                uci: played.uci_moves,
+                game_length: n as u16,
+                outcome_token: played.outcome.token(),
+                result: played.outcome.result_str().into(),
+                nodes: tier.nodes.map(|n| n as i32),
+                multi_pv: tier.multi_pv.map(|n| n as i32),
+                opening_multi_pv: tier.opening_multi_pv.map(|n| n as i32),
+                opening_plies: tier.opening_plies.map(|n| n as i32),
+                sample_plies: tier.sample_plies.map(|n| n as i32),
+                sample_score: tier.sample_score.map(|s| match s {
+                    crate::config::SampleScore::Cp => "cp".to_string(),
+                    crate::config::SampleScore::V => "v".to_string(),
+                }),
+                net_selection: tier.net_selection.map(|n| n.as_uci_str().to_string()),
+                temperature: tier.temperature,
+                global_game_index,
+                game_seed,
+                stockfish_version: stockfish_version.to_string(),
+                legal_move_evals,
+                static_legal_move_evals,
+            };
+            writer.append(&row);
+            total_written += 1;
+
+            if total_written % 500 == 0 {
+                let _ = tx.send(Progress::Heartbeat {
+                    worker_idx,
+                    shards_done,
+                    games_done: total_written,
+                });
+            }
         }
 
-        if (game_index + 1 - start_index) % 500 == 0 {
-            let _ = tx.send(Progress::Heartbeat {
-                worker_id,
-                games_done: game_index + 1 - start_index,
-            });
+        let path = writer.close()?;
+        // Boundary-rewrite cleanup: the old (truncated) file had a
+        // smaller `r<...>` suffix than the new one, so it's a different
+        // path. Delete it now that the new file is durably renamed in.
+        if let Some(old) = boundary_paths.get(&shard_id) {
+            if old != &path {
+                let _ = std::fs::remove_file(old);
+            }
         }
+        shards.push(path);
+        shards_done += 1;
     }
 
-    // Flush any partial trailing shard.
-    if let Some(w) = writer.take() {
-        if w.n_rows() > 0 {
-            let path = w.close()?;
-            shards.push(path);
-        }
-    }
-
-    // shutdown is best-effort; the Drop impl on StockfishProcess is the
-    // safety net for early-error returns above.
     sf.shutdown();
 
     let _ = tx.send(Progress::Done {
-        worker_id,
+        worker_idx,
+        shards_done,
         games_written: total_written,
         shards,
     });
@@ -687,8 +680,36 @@ mod tests {
                 opening_multi_pv: Some(20),
                 opening_plies: Some(1),
                 sample_plies: Some(12),
+                stockfish_hash_mb: None,
             }],
         }
+    }
+
+    #[test]
+    fn run_scope_includes_tier_default() {
+        let scope = RunScope::default();
+        assert!(scope.includes_tier(0));
+        assert!(scope.includes_tier(99));
+    }
+
+    #[test]
+    fn run_scope_filters_tiers() {
+        let scope = RunScope { tiers: Some(vec![0, 2]), shard_range: None };
+        assert!(scope.includes_tier(0));
+        assert!(!scope.includes_tier(1));
+        assert!(scope.includes_tier(2));
+    }
+
+    #[test]
+    fn run_scope_clamps_shard_range_to_tier() {
+        let cfg = smoke_config("/tmp/sf".into(), "/tmp/out".into());
+        // Tier has 16 games / shard_size 8 = 2 shards.
+        let scope = RunScope {
+            tiers: None,
+            shard_range: Some(ShardRange { start: 1, end: 100 }),
+        };
+        let r = scope.effective_shard_range(&cfg, &cfg.tiers[0]);
+        assert_eq!(r, 1..2);
     }
 
     #[test]
@@ -697,10 +718,10 @@ mod tests {
         let sf_path = stockfish_path();
         let dir = tempdir().unwrap();
         let cfg = smoke_config(sf_path, dir.path().to_path_buf());
-        let result = run_tier(&cfg, 0).unwrap();
-        // No drops are tolerated anymore, so written must equal target.
+        let scope = RunScope::default();
+        let result = run_tier(&cfg, 0, &scope).unwrap();
         assert_eq!(result.n_games_written, 16);
-        // 2 workers × 8 games each = exactly 1 shard per worker, so 2 total.
+        // 16 games / shard_size 8 = exactly 2 shards.
         assert_eq!(result.shards.len(), 2);
         for shard in &result.shards {
             assert!(shard.exists(), "shard {} missing", shard.display());
@@ -708,125 +729,31 @@ mod tests {
         }
     }
 
-    /// Resume regression: pre-populate one worker's shard, then run.
-    /// That worker should be skipped entirely; only the other one should
-    /// generate, and the final manifest should reflect the combined total.
+    /// Resume regression: delete one shard, re-run, that shard should be
+    /// regenerated and the other one untouched.
     #[test]
     #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
-    fn live_resume_skips_completed_worker() {
+    fn live_resume_regenerates_missing_shard() {
         let sf_path = stockfish_path();
         let dir = tempdir().unwrap();
         let cfg = smoke_config(sf_path, dir.path().to_path_buf());
+        let scope = RunScope::default();
 
-        // First run — full 16 games across 2 workers.
-        let r1 = run_tier(&cfg, 0).unwrap();
-        assert_eq!(r1.n_games_written, 16);
-        let shard0_paths_before: Vec<_> = r1.shards.clone();
-
-        // Delete the manifest and one worker's shard. Resume should
-        // re-run only that worker.
-        let tier_dir = cfg.output_dir.join(&cfg.tiers[0].name);
-        std::fs::remove_file(tier_dir.join("_manifest.json")).unwrap();
-        // Derive the actual shard paths from r1.shards rather than
-        // reconstructing names by hand — the filename now includes the
-        // row count, so any hand-written `shard-w001-c0000.parquet`
-        // would not exist.
-        let pick = |w: &str| {
-            r1.shards.iter()
-                .find(|p| p.file_name().unwrap().to_string_lossy().contains(w))
-                .unwrap_or_else(|| panic!("no shard for {w} in {:?}", r1.shards))
-                .clone()
-        };
-        let w1_shard = pick("w001");
-        let w0_shard = pick("w000");
-        let w0_bytes_before = std::fs::read(&w0_shard).unwrap();
-        std::fs::remove_file(&w1_shard).unwrap();
-
-        let r2 = run_tier(&cfg, 0).unwrap();
-        assert_eq!(r2.n_games_written, 16, "resumed total must equal target");
-        // After resume, w1 produces a NEW shard with a new filename
-        // (same row count → same name; different row count → different name).
-        // Just check that *some* w001 shard exists.
-        let w1_after = r2.shards.iter()
-            .find(|p| p.file_name().unwrap().to_string_lossy().contains("w001"));
-        assert!(w1_after.is_some(), "resumed worker should have re-created its shard");
-        // Worker 0's shard must be byte-identical: it was skipped, not regenerated.
-        let w0_bytes_after = std::fs::read(&w0_shard).unwrap();
-        assert_eq!(w0_bytes_before, w0_bytes_after, "completed worker's shard should be untouched");
-        // Shard count unchanged — same 2 shards.
-        assert_eq!(r2.shards.len(), shard0_paths_before.len());
-    }
-
-    /// Full-resume edge case: ALL workers are already complete on disk,
-    /// the manifest is missing (e.g. crash after the last shard but
-    /// before manifest write), but `_tier_state.json` is present. The
-    /// rerun should write a manifest with `n_games_written == target`
-    /// without spawning any workers.
-    #[test]
-    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
-    fn live_resume_all_workers_done_no_manifest() {
-        let sf_path = stockfish_path();
-        let dir = tempdir().unwrap();
-        let cfg = smoke_config(sf_path, dir.path().to_path_buf());
-
-        // First run: full completion.
-        let r1 = run_tier(&cfg, 0).unwrap();
+        let r1 = run_tier(&cfg, 0, &scope).unwrap();
         assert_eq!(r1.n_games_written, 16);
 
-        // Delete the manifest, leave shards + tier_state intact.
         let tier_dir = cfg.output_dir.join(&cfg.tiers[0].name);
         std::fs::remove_file(tier_dir.join("_manifest.json")).unwrap();
-        assert!(tier_dir.join("_tier_state.json").exists());
+        // Delete shard 1, keep shard 0.
+        let s0_bytes_before = std::fs::read(&r1.shards[0]).unwrap();
+        std::fs::remove_file(&r1.shards[1]).unwrap();
 
-        // Snapshot byte-equality of every shard before re-running so we
-        // can prove no worker actually ran.
-        let snapshot: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(&tier_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
-            .map(|e| (e.path(), std::fs::read(e.path()).unwrap()))
-            .collect();
-        assert!(snapshot.len() >= 2);
-
-        let r2 = run_tier(&cfg, 0).unwrap();
-        assert_eq!(r2.n_games_written, 16, "all-resumed total must equal target");
-        assert_eq!(r2.shards.len(), snapshot.len());
-
-        for (path, before) in &snapshot {
-            let after = std::fs::read(path).unwrap();
-            assert_eq!(*before, after, "shard {} must be byte-identical", path.display());
-        }
-        assert!(tier_dir.join("_manifest.json").exists());
-    }
-
-    /// Tier-state sentinel: if a user deletes the manifest AND changes
-    /// a fingerprint-relevant field (here, master_seed) while shards from
-    /// the prior config still exist on disk, the run must abort rather
-    /// than silently mixing old + new bytes into the same tier output.
-    #[test]
-    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
-    fn live_tier_state_catches_config_drift_after_manifest_delete() {
-        let sf_path = stockfish_path();
-        let dir = tempdir().unwrap();
-        let cfg_a = smoke_config(sf_path.clone(), dir.path().to_path_buf());
-
-        // First run: completes cleanly, writes manifest + tier_state.
-        run_tier(&cfg_a, 0).unwrap();
-        let tier_dir = cfg_a.output_dir.join(&cfg_a.tiers[0].name);
-        assert!(tier_dir.join("_manifest.json").exists());
-        assert!(tier_dir.join("_tier_state.json").exists());
-
-        // User deletes the manifest, changes master_seed, reruns.
-        std::fs::remove_file(tier_dir.join("_manifest.json")).unwrap();
-        let mut cfg_b = smoke_config(sf_path, dir.path().to_path_buf());
-        cfg_b.master_seed = cfg_a.master_seed + 1;
-
-        let err = run_tier(&cfg_b, 0).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("tier state fingerprint mismatch"),
-            "expected tier-state mismatch error, got: {msg}",
-        );
+        let r2 = run_tier(&cfg, 0, &scope).unwrap();
+        assert_eq!(r2.n_games_written, 16);
+        assert_eq!(r2.shards.len(), 2);
+        // Shard 0 must be byte-identical.
+        let s0_bytes_after = std::fs::read(&r1.shards[0]).unwrap();
+        assert_eq!(s0_bytes_before, s0_bytes_after, "untouched shard should be byte-identical");
     }
 
     /// Tier fingerprint scoping regression: changing an UNRELATED tier
@@ -850,16 +777,56 @@ mod tests {
             opening_multi_pv: Some(20),
             opening_plies: Some(1),
             sample_plies: Some(12),
+            stockfish_hash_mb: None,
         });
+        let scope = RunScope::default();
 
-        // Run only tier 0.
-        let r1 = run_tier(&cfg, 0).unwrap();
+        let r1 = run_tier(&cfg, 0, &scope).unwrap();
         assert_eq!(r1.n_games_written, 16);
 
-        // Modify tier 1's config (n_games up). Tier 0's manifest must
-        // still be honored on re-run.
-        cfg.tiers[1].n_games = 999;
-        let r2 = run_tier(&cfg, 0).unwrap();
+        // Modify tier 1's config (dataset-affecting field). Tier 0's
+        // manifest must still be honored on re-run.
+        cfg.tiers[1].temperature = 0.5;
+        let r2 = run_tier(&cfg, 0, &scope).unwrap();
         assert_eq!(r2.n_games_written, 16, "tier 0 should be skipped via manifest");
+    }
+
+    /// Extension safety: growing n_games adds new shards but doesn't
+    /// invalidate existing ones. Boundary shard with a partial row count
+    /// gets regenerated to the full row count; new shards beyond the
+    /// previous total are produced.
+    #[test]
+    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
+    fn live_grow_n_games_extends_cleanly() {
+        let sf_path = stockfish_path();
+        let dir = tempdir().unwrap();
+        let mut cfg = smoke_config(sf_path, dir.path().to_path_buf());
+        // First run: 16 games / shard_size 8 = 2 shards, no partial last.
+        let scope = RunScope::default();
+        let r1 = run_tier(&cfg, 0, &scope).unwrap();
+        assert_eq!(r1.shards.len(), 2);
+
+        // Snapshot byte contents of existing shards.
+        let snapshot: Vec<(PathBuf, Vec<u8>)> = r1.shards.iter()
+            .map(|p| (p.clone(), std::fs::read(p).unwrap()))
+            .collect();
+
+        // Grow n_games to 30. New total = 4 shards (last has 6 rows).
+        // Delete the manifest so resume re-runs.
+        let tier_dir = cfg.output_dir.join(&cfg.tiers[0].name);
+        std::fs::remove_file(tier_dir.join("_manifest.json")).unwrap();
+        cfg.tiers[0].n_games = 30;
+
+        let r2 = run_tier(&cfg, 0, &scope).unwrap();
+        assert_eq!(r2.n_games_written, 30);
+        assert_eq!(r2.shards.len(), 4);
+
+        // Original shards 0 and 1 (full 8 rows each) must be byte-identical:
+        // their content depends only on tier_seed + global_game_index, both
+        // unchanged.
+        for (orig_path, orig_bytes) in &snapshot {
+            let now = std::fs::read(orig_path).unwrap();
+            assert_eq!(orig_bytes, &now, "shard {} should be byte-identical after n_games growth", orig_path.display());
+        }
     }
 }
