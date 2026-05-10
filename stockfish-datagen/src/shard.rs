@@ -26,6 +26,21 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
+/// Parquet schema version. Bump whenever the schema changes in a way
+/// that would mix incompatibly with prior shards in the same tier
+/// directory (added columns, removed columns, changed types).
+///
+/// `tier_fingerprint` (in `config.rs`) includes this in its hash so a
+/// resumed run across a schema upgrade fails loudly with a fingerprint
+/// mismatch rather than silently writing new-schema shards into a
+/// directory of old-schema ones.
+///
+/// History:
+///   v1 — original schema (tokens/san/uci + legal_move_evals only)
+///   v2 — adds nullable `static_legal_move_evals` column for canonical
+///        per-position NNUE labels on non-searchless tiers
+pub const SHARD_SCHEMA_VERSION: u32 = 2;
+
 /// One candidate move's distillation payload. Stored packed as
 /// `Struct{move_idx: i16, score_cp: i16, score_eval_v: i16?, score_psqt: i16?,
 /// score_positional: i16?}` to keep parquet rows compact while remaining

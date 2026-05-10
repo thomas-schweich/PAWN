@@ -453,6 +453,22 @@ impl RunConfig {
             "shard_size_games": self.shard_size_games,
             "max_ply": self.max_ply,
             "n_workers": self.n_workers,
+            // Bump SHARD_SCHEMA_VERSION whenever the parquet schema changes
+            // in a way that would mix incompatibly with prior shards in the
+            // same tier directory. Currently:
+            //   v1 (implicit, pre-bump): tokens/san/uci + legal_move_evals only
+            //   v2 (current): adds nullable `static_legal_move_evals` column
+            // Without this discriminator, a code upgrade that adds the new
+            // column would re-pass the resume fingerprint check on a tier
+            // whose *config* didn't change (e.g. a searchless tier whose
+            // store_legal_move_evals was already true), then write new
+            // shards into a directory that already contains old-schema
+            // shards. Strict polars reads would fail; permissive pyarrow
+            // reads would silently drop the new column. Bumping the
+            // version here forces a loud fingerprint mismatch on resume,
+            // requiring the operator to either delete the partial tier
+            // dir or revert to the old binary.
+            "shard_schema_version": crate::shard::SHARD_SCHEMA_VERSION,
         });
         let mut h = Sha256::new();
         h.update(payload.to_string().as_bytes());
@@ -704,12 +720,16 @@ mod tests {
     fn tier_fingerprint_golden() {
         let cfg = minimal_config();
         let actual = cfg.tier_fingerprint(0);
-        // Updated when search-budget fields became Option<u32> and
-        // sample_score became Option<SampleScore> (intentional — the JSON
-        // emission for null fields differs from omitted fields, and the
-        // protocol-mode invariant means existing production tiers don't
-        // round-trip identically).
-        let expected = "a36dac69d63481353a7aa5bc1764ab910b022541bf97dd6c2f844870ff8e1491";
+        // History of intentional bumps:
+        //   - search-budget fields became Option<u32> and sample_score
+        //     became Option<SampleScore> (JSON null vs omitted, protocol-
+        //     mode invariant).
+        //   - SHARD_SCHEMA_VERSION added to the payload (v1 → v2 covers
+        //     the new `static_legal_move_evals` column). A future shard
+        //     schema bump invalidates this golden again — that's the
+        //     point: forces a loud test failure rather than a silent
+        //     resume across incompatible bytes on disk.
+        let expected = "e938e2f9d2aa39d4f61bd06ed9f678046de0e7f6ba9da49a8fb1b4cfaf5c2042";
         assert_eq!(
             actual, expected,
             "tier_fingerprint changed for minimal_config — verify the change is intentional, then update the expected value"
@@ -727,6 +747,36 @@ mod tests {
         cfg_a.tiers = vec![a];
         cfg_b.tiers = vec![b];
         assert_ne!(cfg_a.tier_fingerprint(0), cfg_b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn tier_fingerprint_includes_shard_schema_version() {
+        // The fingerprint payload must carry SHARD_SCHEMA_VERSION so that
+        // a code upgrade adding a new parquet column invalidates resume
+        // for in-progress tier directories whose config didn't change.
+        // Without this, a searchless tier that already had
+        // store_legal_move_evals=true (config unchanged across the
+        // upgrade) would silently start writing new-schema shards into a
+        // dir of old-schema ones — exactly the mixed-schema gotcha
+        // documented in the README. Verify the version is in the
+        // serialized payload byte-for-byte (not just included in the
+        // hash) so a future refactor that drops it is caught loudly.
+        let cfg = minimal_config();
+        let payload = serde_json::json!({
+            "tier_index": 0,
+            "tier": &cfg.tiers[0],
+            "master_seed": cfg.master_seed,
+            "stockfish_version": &cfg.stockfish_version,
+            "stockfish_hash_mb": cfg.stockfish_hash_mb,
+            "shard_size_games": cfg.shard_size_games,
+            "max_ply": cfg.max_ply,
+            "n_workers": cfg.n_workers,
+            "shard_schema_version": crate::shard::SHARD_SCHEMA_VERSION,
+        });
+        assert!(
+            payload.to_string().contains("\"shard_schema_version\""),
+            "payload must reference shard_schema_version key",
+        );
     }
 
     #[test]
