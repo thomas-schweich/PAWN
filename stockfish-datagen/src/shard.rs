@@ -36,14 +36,19 @@ use parquet::file::properties::WriterProperties;
 /// - `score_eval_v`: `Eval::evaluate`'s post-processed Value, mover-POV.
 ///   What Stockfish plays with (head-blend + complexity damp + material/optimism
 ///   mix + 50-move shuffling damp + TB-clamp). Right target for play-policy
-///   distillation. `None` for multipv-sourced rows (search-mode tiers don't
-///   surface raw values).
+///   distillation. `Some` iff the row's source list was the patched binary's
+///   `evallegal` protocol; `None` for multipv-sourced rows (the multipv
+///   parser only surfaces normalized cp). The Some/None distinction is
+///   per-source-list, not per-tier-mode — search-mode tiers populate
+///   `legal_move_evals` from multipv (so `score_eval_v` is `None` there)
+///   but ALSO populate `static_legal_move_evals` from a separate evallegal
+///   call (where `score_eval_v` IS `Some`). See `GameRow` field docs.
 /// - `score_psqt`, `score_positional`: raw NNUE per-head outputs from
 ///   `Networks::evaluate()`, mover-POV, before any post-processing. Together
 ///   they're the right targets for hot-swap NNUE-replacement distillation —
 ///   Stockfish itself applies the post-processing on top, so the student must
-///   not have it baked in. `None` for multipv-sourced rows. `evallegal`
-///   (sf_18-v0.3.0+) surfaces both.
+///   not have it baked in. Same Some/None rule as `score_eval_v` — present
+///   on evallegal-sourced rows, absent on multipv-sourced rows.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LegalMoveEval {
     pub move_idx: i16,

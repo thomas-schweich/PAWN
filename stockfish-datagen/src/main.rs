@@ -359,10 +359,15 @@ fn print_plan(cfg: &RunConfig) {
                 store = if tier.store_legal_move_evals { " store_legal_move_evals=true" } else { "" },
             );
         } else {
+            // Search-mode tier. `store_legal_move_evals=true` here means the
+            // worker also issues a separate `evallegal` call after each ply's
+            // selection to populate the static_legal_move_evals column, so
+            // surface that explicitly — it materially changes per-ply cost
+            // (~2x slowdown at low node budgets) and storage (+~10 KB/game).
             println!(
                 "  [{i}] {name:<14} nodes={nodes:>4} games={n_games:>10} \
                  multi_pv={mpv:>2} opening={ompv:>2}/{op_plies} \
-                 sample_plies={spl:<3} temp={temp:.2}{net}",
+                 sample_plies={spl:<3} temp={temp:.2}{net}{store}",
                 name = tier.name,
                 nodes = tier.nodes.expect("validated"),
                 n_games = tier.n_games,
@@ -371,6 +376,7 @@ fn print_plan(cfg: &RunConfig) {
                 op_plies = tier.opening_plies.expect("validated"),
                 spl = tier.sample_plies.expect("validated"),
                 temp = tier.temperature,
+                store = if tier.store_legal_move_evals { " store_legal_move_evals=true" } else { "" },
             );
         }
         println!(

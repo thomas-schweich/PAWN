@@ -152,7 +152,44 @@ tier-state's fingerprint.
 | `worker_id`         | `Int16`         | which worker produced the row           |
 | `game_seed`         | `UInt64`        | per-game seed (reproduction key)        |
 | `stockfish_version` | `String`        | from Stockfish's `id name` line         |
-| `legal_move_evals`  | `List<List<Struct{move_idx: Int16, score_cp: Int16, score_eval_v: Int16?, score_psqt: Int16?, score_positional: Int16?}>>` | per-ply per-legal-move evals when `store_legal_move_evals: true`; empty outer list when not. `score_cp` is always populated; `score_eval_v` (`Eval::evaluate`'s post-processed Value, right target for play-policy distillation) and `score_psqt` / `score_positional` (raw NNUE per-head outputs, right targets for hot-swap NNUE-replacement distillation) are non-null only for evallegal-protocol rows (searchless tiers, sf_18-v0.3.0+ patched binary). |
+| `legal_move_evals`  | `List<List<Struct{move_idx: Int16, score_cp: Int16, score_eval_v: Int16?, score_psqt: Int16?, score_positional: Int16?}>>` | per-ply per-legal-move payload from the tier's **selection** engine call when `store_legal_move_evals: true`; empty outer list when not. Semantics depend on tier mode: searchless tiers populate every legal move with all five fields (evallegal source); search-mode tiers populate the multipv top-K with `score_cp` only and the three nullable fields are `None`. Always non-null at the row level — readers find an empty `[]` rather than a row-level null on tiers that didn't opt in. |
+| `static_legal_move_evals` | (same Struct as `legal_move_evals`) | per-ply per-legal-move **canonical NNUE static eval** captured by a separate `evallegal` call after each ply's selection. Same shape and same struct fields as `legal_move_evals`, but always full-evallegal-sourced (every legal move, all five score fields populated). Populated only when `store_legal_move_evals: true` AND the tier is non-searchless — on searchless tiers this is **null** (the same data already lives in `legal_move_evals`, so duplicating would double tier-0 storage). Convention for downstream: read the canonical static eval as `static_legal_move_evals if not None else legal_move_evals`. The two columns describe the same plies but with different move sets and orderings; join via `move_idx` if pairing is needed. |
+
+### Schema compatibility with pre-existing shards
+
+The `static_legal_move_evals` column was added in the same release that
+moved the writer to zstd-19 + 16 MB pages. Shards written by earlier
+versions don't have the column on disk. Compatibility:
+
+- Reading an old shard *standalone* with the new code — polars and
+  pyarrow both work; downstream code sees the schema as it was at
+  write time.
+- Resuming from a directory of old shards — works. Resume reads
+  `(worker, chunk, n_rows)` from filenames, never opens parquet content.
+- Reading a *mix* of old and new shards in one query — polars (strict)
+  fails with `SchemaError`; pyarrow silently drops the new column (returns
+  schema intersection). For training pipelines that need the static column,
+  either filter to new-schema-only shards or pass `extra_columns='ignore'`
+  to polars and check for null. We don't recommend mixing — regenerate
+  the dataset on the new code if you want consistent labels everywhere.
+
+### Network selection and label uniformity
+
+`net_selection` applies globally to the spawned Stockfish process — the
+same setting governs both `go nodes N` (selection) and `evallegal` (the
+per-ply teacher signal in `static_legal_move_evals`). There's no way to
+use one network for selection and a different one for labels on the same
+process.
+
+Without it set (i.e. `auto`), `Eval::evaluate` picks per-position:
+small net when `|simple_eval(pos)| > 962` (heavy material imbalance),
+big net otherwise, with potential re-eval when the small-net result is
+within ±277. **For distillation this means a single dataset's
+`legal_move_evals` / `static_legal_move_evals` columns end up as a
+mixture of small-net and big-net evaluations, switching per-position
+based on material imbalance.** Set `net_selection: "large"` to force
+uniform big-net labels everywhere — the canonical pick for any tier
+that sets `store_legal_move_evals: true`.
 
 ## Tuning `n_workers` (CPU pinning is on by default)
 

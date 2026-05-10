@@ -124,12 +124,34 @@ pub struct TierConfig {
 
     /// Force a specific NNUE network for all evaluation (`auto` / `small`
     /// / `large`). `None` (the default) leaves the engine's default in
-    /// place (`auto`, vanilla SF18 dynamic selection). Applies to both
-    /// search-mode and searchless tiers — vanilla SF18 picks small for
-    /// material-imbalanced positions and may re-evaluate with big, which
-    /// introduces position-dependent eval-source heterogeneity that's
-    /// awkward for ML use cases. `Large` is the natural pick for
-    /// distillation labelling (uniform high-quality teacher network).
+    /// place (`auto`, vanilla SF18 dynamic selection).
+    ///
+    /// **Applies globally to the spawned process** — the same `NetSelection`
+    /// governs both `go nodes N` (search) AND `evallegal` (per-position
+    /// teacher signal). The patched binary's `evallegal` reads the setoption
+    /// once per command and propagates it through `Eval::evaluate`, so there's
+    /// no way to use one network for selection and a different one for
+    /// labels on the same Stockfish process.
+    ///
+    /// Without this set (i.e. `auto`), the dynamic selection per
+    /// `evaluate.cpp` is:
+    ///   - small net when `|simple_eval(pos)| > 962` (heavy material imbalance)
+    ///   - big net otherwise
+    ///   - if the small-net path returned `|nnue| < 277`, re-evaluate with
+    ///     big (catches positions the small net thought were closer than
+    ///     material suggested)
+    ///
+    /// Implication for distillation: with `auto`, a single dataset's
+    /// `legal_move_evals` / `static_legal_move_evals` columns end up as a
+    /// **mixture** of small-net and big-net evaluations, switching
+    /// per-position based on material imbalance. The student would have to
+    /// learn to mimic two different teachers depending on position phase,
+    /// which is harder to fit and harder to interpret.
+    ///
+    /// `Large` forces uniform high-quality labels everywhere — the natural
+    /// pick for any tier with `store_legal_move_evals: true`. Cost: small
+    /// net's faster forward pass is bypassed for ~5-10% of positions per
+    /// game, costing a few percent of throughput.
     ///
     /// Requires the patched binary (vanilla SF18 doesn't recognize the
     /// `NetSelection` UCI option and would silently ignore the setoption);
