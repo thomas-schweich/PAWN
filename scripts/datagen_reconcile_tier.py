@@ -32,6 +32,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import re
 import sys
 import tempfile
@@ -40,7 +41,6 @@ from pathlib import Path
 from typing import Any
 
 from huggingface_hub import HfApi, get_token
-from huggingface_hub.errors import EntryNotFoundError
 
 LOG = logging.getLogger("datagen_reconcile")
 
@@ -195,29 +195,64 @@ def reconcile_one(
 
     if dry_run:
         LOG.info(
-            "DRY RUN: would commit %s/%s with %d shards / %d games",
+            "DRY RUN: would commit %s/%s with %d shards / %d games, "
+            "then delete %d per-pod manifest(s)",
             repo_id, f"{tier_name}/{CANONICAL_MANIFEST}",
-            len(merged_shards), n_games,
+            len(merged_shards), n_games, len(manifests),
         )
         return
 
+    repo_path = f"{tier_name}/{CANONICAL_MANIFEST}"
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
         json.dump(unified, tf, indent=2)
         tmp_path = tf.name
-    repo_path = f"{tier_name}/{CANONICAL_MANIFEST}"
-    LOG.info(
-        "committing unified %s (%d shards / %d games)",
-        repo_path, len(merged_shards), n_games,
-    )
-    api.upload_file(
-        path_or_fileobj=tmp_path,
-        path_in_repo=repo_path,
-        repo_id=repo_id,
-        repo_type="dataset",
-        commit_message=(
-            f"reconcile {tier_name}: merge {len(manifests)} per-pod manifest(s)"
-        ),
-    )
+    try:
+        LOG.info(
+            "committing unified %s (%d shards / %d games)",
+            repo_path, len(merged_shards), n_games,
+        )
+        api.upload_file(
+            path_or_fileobj=tmp_path,
+            path_in_repo=repo_path,
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message=(
+                f"reconcile {tier_name}: merge {len(manifests)} per-pod manifest(s)"
+            ),
+        )
+    finally:
+        # Always clean up the temp file, success or failure. Without this,
+        # repeated failed reconcile invocations leak ~1 file per attempt
+        # into /tmp until the pod is destroyed.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    # Clean up the per-pod manifests now that the unified one is committed.
+    # Without this, the orchestrator's primer would re-download every
+    # per-pod manifest on the next pod startup (SENTINEL_RE matches both
+    # the canonical and per-pod variants), and a re-run of reconcile
+    # would either merge the same set again (idempotent) or trip on a
+    # mix of stale and fresh per-pod state if the run was extended.
+    for m in manifests:
+        try:
+            api.delete_file(
+                path_in_repo=m.repo_path,
+                repo_id=repo_id,
+                repo_type="dataset",
+                commit_message=(
+                    f"reconcile {tier_name}: remove per-pod manifest "
+                    f"{m.repo_path.rsplit('/', 1)[-1]}"
+                ),
+            )
+        except Exception as e:  # noqa: BLE001 — log every failure mode
+            LOG.warning(
+                "failed to delete per-pod manifest %s after unified commit: %s; "
+                "the unified manifest is authoritative, but the dangling per-pod "
+                "file may confuse a future reconcile",
+                m.repo_path, e,
+            )
 
 
 def main() -> int:
