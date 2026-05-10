@@ -171,6 +171,19 @@ jobs:
     needs: changes
     if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.datagen == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      # Build one image per supported microarch. The patched stockfish is
+      # compiled at the requested ISA; running an `avx512` image on an
+      # AVX2-only pod would SIGILL on the first eval call. Operators pick
+      # the right tag for their pod's CPU. `fail-fast: false` so a
+      # transient failure on one arch doesn't cancel the other.
+      fail-fast: false
+      matrix:
+        include:
+          - tag_arch: avx2
+            sf_arch: x86-64-avx2
+          - tag_arch: avx512
+            sf_arch: x86-64-avx512
     steps:
       - uses: actions/checkout@v4
         with:
@@ -189,7 +202,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push runtime (datagen)
+      - name: Build and push runtime (datagen-${{ matrix.tag_arch }})
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -198,16 +211,20 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: |
-            ${{ env.IMAGE }}:datagen
-            ${{ env.IMAGE }}:datagen-${{ github.sha }}
+            ${{ env.IMAGE }}:datagen-${{ matrix.tag_arch }}
+            ${{ env.IMAGE }}:datagen-${{ matrix.tag_arch }}-${{ github.sha }}
           build-args: |
             GIT_HASH=${{ github.sha }}
             GIT_TAG=${{ steps.meta.outputs.tag }}
+            SF_PATCHED_ARCH=${{ matrix.sf_arch }}
+          # Per-arch buildcache. The `sf-fork-build` stage produces
+          # different binaries per ISA, so they can't share a cache —
+          # would invalidate on every alternate arch's build.
           cache-from: |
-            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime,mode=max
+            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime-${{ matrix.tag_arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime-${{ matrix.tag_arch }},mode=max
 
-      - name: Build and push dev (datagen)
+      - name: Build and push dev (datagen-dev-${{ matrix.tag_arch }})
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -216,12 +233,13 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: |
-            ${{ env.IMAGE }}:datagen-dev
-            ${{ env.IMAGE }}:datagen-dev-${{ github.sha }}
+            ${{ env.IMAGE }}:datagen-dev-${{ matrix.tag_arch }}
+            ${{ env.IMAGE }}:datagen-dev-${{ matrix.tag_arch }}-${{ github.sha }}
           build-args: |
             GIT_HASH=${{ github.sha }}
             GIT_TAG=${{ steps.meta.outputs.tag }}
+            SF_PATCHED_ARCH=${{ matrix.sf_arch }}
           cache-from: |
-            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime
-            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-dev
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-dev,mode=max
+            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime-${{ matrix.tag_arch }}
+            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-dev-${{ matrix.tag_arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-dev-${{ matrix.tag_arch }},mode=max
