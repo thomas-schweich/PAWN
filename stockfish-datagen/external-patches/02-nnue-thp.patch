@@ -1,0 +1,122 @@
+From e18db37492e6f6c1ef194e9ab855e8ab2de7749c Mon Sep 17 00:00:00 2001
+From: Claude <claude@local>
+Date: Sun, 10 May 2026 15:32:07 -0700
+Subject: [PATCH] feat(nnue): madvise(MADV_HUGEPAGE) the feature-transformer
+ weights
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On a multi-worker datagen pod the 50+ MiB of NNUE feature-transformer
+weights dominate the 4 KiB-page TLB working set. The kernel will
+coalesce 4 KiB pages into 2 MiB ones via khugepaged if the region
+gets MADV_HUGEPAGE; without the hint the std::array members allocated
+inside the heap-allocated Networks struct never trigger the
+promotion heuristic on their own.
+
+Hook the advise call at the end of Network::load(istream), after
+read_parameters has filled the arrays. The kernel coalesces only the
+2 MiB-aligned subregion, but for 50 MiB that's >96% of the bytes —
+enough to put a meaningful dent in TLB pressure on a 380-worker pod
+without changing allocator code.
+
+Gated on SF_NNUE_HUGEPAGE=1 env var so A/B comparisons are a one-line
+env diff, not a rebuild. Linux-only — the include and madvise call
+are guarded by __linux__. NNUE_NO_HUGEPAGE escape hatch added in
+case a platform's libc surfaces MADV_HUGEPAGE but its kernel rejects
+it loudly (none known today, but cheap insurance).
+
+No correctness impact: madvise is a hint; if the kernel ignores it,
+the only effect is that THP doesn't engage. The weights themselves
+are untouched.
+---
+ src/nnue/network.cpp                | 11 +++++++-
+ src/nnue/nnue_feature_transformer.h | 39 +++++++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/src/nnue/network.cpp b/src/nnue/network.cpp
+index d1f2b14..63a35f4 100644
+--- a/src/nnue/network.cpp
++++ b/src/nnue/network.cpp
+@@ -322,7 +322,16 @@ std::optional<std::string> Network<Arch, Transformer>::load(std::istream& stream
+     initialize();
+     std::string description;
+ 
+-    return read_parameters(stream, description) ? std::make_optional(description) : std::nullopt;
++    if (!read_parameters(stream, description))
++        return std::nullopt;
++
++    // stockfish-ml-extensions: hint THP for the feature-transformer weight
++    // arrays now that they're populated. No-op unless SF_NNUE_HUGEPAGE=1
++    // is set; intentionally not a UCI option because it must apply before
++    // any eval and UCI options come in *after* network load.
++    featureTransformer.advise_huge_pages();
++
++    return std::make_optional(description);
+ }
+ 
+ 
+diff --git a/src/nnue/nnue_feature_transformer.h b/src/nnue/nnue_feature_transformer.h
+index f4cf348..adba2f0 100644
+--- a/src/nnue/nnue_feature_transformer.h
++++ b/src/nnue/nnue_feature_transformer.h
+@@ -23,10 +23,15 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <iosfwd>
+ #include <iterator>
+ 
++#if defined(__linux__) && !defined(NNUE_NO_HUGEPAGE)
++    #include <sys/mman.h>
++#endif
++
+ #include "../position.h"
+ #include "../types.h"
+ #include "nnue_accumulator.h"
+@@ -151,6 +156,40 @@ class FeatureTransformer {
+             b = read ? b * 2 : b / 2;
+     }
+ 
++    // stockfish-ml-extensions: hint the kernel to back the NNUE weight
++    // arrays with transparent huge pages. On a 380-worker EPYC datagen
++    // pod, the 4 KiB-page TLB working set across the 50+ MiB of weights
++    // dominates feature-transformer cost (see `ANALYSIS.md` in the
++    // stockfish-datagen repo). MADV_HUGEPAGE asks khugepaged to coalesce
++    // 4 KiB pages into 2 MiB ones in the background; the kernel only
++    // promotes 2 MiB-aligned subregions, so the head/tail of each array
++    // (~tens of KiB) stays on 4 KiB pages but the bulk goes to THP.
++    //
++    // Gated on the `SF_NNUE_HUGEPAGE=1` env var so we can A/B without
++    // a rebuild. Linux-only; no-op elsewhere (MADV_HUGEPAGE is a Linux
++    // ABI constant). Idempotent — safe to call once after each load.
++    void advise_huge_pages() {
++#if defined(__linux__) && !defined(NNUE_NO_HUGEPAGE)
++        const char* env = std::getenv("SF_NNUE_HUGEPAGE");
++        if (env == nullptr || env[0] != '1')
++            return;
++        auto advise = [](void* p, std::size_t n) {
++            // POSIX-compliant ignore-on-failure; older kernels / FS combos
++            // may reject MADV_HUGEPAGE silently.
++            (void)::madvise(p, n, MADV_HUGEPAGE);
++        };
++        advise(biases.data(), biases.size() * sizeof(biases[0]));
++        advise(weights.data(), weights.size() * sizeof(weights[0]));
++        if constexpr (UseThreats)
++            advise(threatWeights.data(),
++                   threatWeights.size() * sizeof(threatWeights[0]));
++        advise(psqtWeights.data(), psqtWeights.size() * sizeof(psqtWeights[0]));
++        if constexpr (UseThreats)
++            advise(threatPsqtWeights.data(),
++                   threatPsqtWeights.size() * sizeof(threatPsqtWeights[0]));
++#endif
++    }
++
+     // Read network parameters
+     bool read_parameters(std::istream& stream) {
+         read_leb_128(stream, biases);
+-- 
+2.34.1
+
