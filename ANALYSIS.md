@@ -125,3 +125,74 @@ Items (5) and (6) are research-level and should only be tackled if (1)-(4) don't
 - Rust binary entry point: `stockfish-datagen/src/main.rs`, shard writer at `stockfish-datagen/src/shard.rs:467` (where the zstd-19 + 16 MiB page-size choice lives).
 - Patched stockfish fork: <https://github.com/thomas-schweich/stockfish-ml-extensions> (sf_18-v0.3.0).
 - Architecture rule-of-thumb already in `CLAUDE.md`: `n_workers = total_threads − threads_per_core` — confirmed empirically; no change needed.
+
+---
+
+## Appendix — Pipeline / orchestration changes (separate from CPU efficiency)
+
+The body of this document focuses on per-worker compute efficiency on a single pod. The three items below are about the *upload pipeline and the resume model*, and were all identified during the same production run when each became a real operational pain point.
+
+### A1. Replace the Python orchestrator's per-file uploader with the `hf` CLI
+
+**Problem.** `scripts/datagen_with_hf_sync.py` uses `huggingface_hub.HfApi.upload_file()` per shard. Each call fans out to ~5 underlying API requests (`preupload`, `lfs/objects/batch`, `xet-write-token`, `commit`, tree refresh). At our generation rate of ~45 shards/min, that's ~225 API requests/min — well over HF's authenticated rate limits (1,000 req / 5 min general API; **128 commits / hour per repo**). The watcher hits 429 on the very first cycle of a heavy backlog, retries with exponential backoff, fails again, and never makes forward progress until the user intervenes.
+
+We worked around this mid-run by killing the orchestrator's watcher and replacing it with a tmux-side bash loop that calls `hf upload <repo> <tier_dir> <tier_path> --repo-type dataset --exclude '*.tmp' --commit-message ...`. Each call uploads a folder atomically as **one** commit; xet handles dedupe so re-uploading 0-byte placeholders is essentially free; rate-limit footprint drops from ~225/min to 1 commit per tier per cycle (~5/cycle).
+
+**Recommendation.** Rewrite the watcher in `scripts/datagen_with_hf_sync.py` to shell out to `hf upload` (or use `huggingface_hub`'s `upload_folder` helper, which is the Python equivalent and uses the same xet-batched commit path under the hood). Keep the existing primer + signal-handling + drain-on-exit logic; only the inner per-cycle upload loop changes. After each successful folder commit, truncate the uploaded shards to 0-byte placeholders to preserve the existing `--prune-local` invariant.
+
+The transient sync script we ran in production is at `/tmp/datagen_sync_hf.sh` on the local box used for the live run; that's a reasonable starting point for a permanent re-implementation.
+
+### A2. Stop fingerprinting fields that don't affect the dataset
+
+**Problem.** `RunConfig::tier_fingerprint()` (`stockfish-datagen/src/config.rs:446`) currently includes `n_workers`, `stockfish_hash_mb`, and several other fields that are *operational* concerns rather than properties of the produced data. So if you want to resume a tier on a differently-sized pod (e.g. moved from a 128-thread to a 384-thread pod), or if you want to drop `stockfish_hash_mb` from 16 to 1 (per Tier 1 recommendation #1 above), the fingerprint changes and resume refuses to honor the existing `_tier_state.json`. That makes operationally useful changes annoyingly destructive.
+
+The dataset-affecting inputs to a tier are:
+
+- The tier-specific config (`tier_index`, `tier`, including `nodes`, `multi_pv`, `temperature`, `sample_score`, `store_legal_move_evals`, `net_selection`, opening params, etc.)
+- `master_seed`
+- `stockfish_version`
+- `max_ply`
+- `shard_size_games` (changes shard boundaries, which IS observable)
+- `shard_schema_version` (catches binary upgrades that change the parquet schema)
+
+The dataset-*neutral* fields currently lumped into the fingerprint are:
+
+- `n_workers` — determines per-worker game-index partitioning, but the per-game RNG seed is `master_seed + game_index`, not `master_seed + (worker_id, chunk_idx)`. Different `n_workers` produces the same set of (game_index → state) outputs, just with a different worker→game assignment. The shard *contents* are identical, only their distribution across worker_id slots changes.
+- `stockfish_hash_mb` — hash table is a search-time speedup; with our deterministic UCI command stream it doesn't change move selection at fixed `nodes=N`.
+- `stockfish_path` — same binary by content, different path.
+- `output_dir` — operational, never read into the dataset.
+
+**Recommendation.** Drop `n_workers`, `stockfish_hash_mb`, `stockfish_path`, and `output_dir` from `tier_fingerprint()`. The pinned golden-value test (`tier_fingerprint_golden`) needs updating in lockstep. Document the new contract clearly: the fingerprint is "would resuming change the *recorded data*?" — operational tuning is allowed to vary.
+
+The one subtle thing to verify: that two pods with different `n_workers` resuming against the same `_tier_state.json` correctly figure out their next chunk indices without colliding on `worker_id`. The current resume logic per-worker reads the highest existing `chunk_idx` for that worker_id from the local dir; if pod A had `n_workers=128` and pod B picks up with `n_workers=384`, B's workers 128-383 will see no existing shards for their worker_ids and start at chunk 0 — which is correct. (See A3 for the related concern about cross-pod runs.)
+
+### A3. Allow per-tier (or per-shard-range) work assignment across pods
+
+**Problem.** The longest tier (`nodes_1024`) is projected to take ~30+ hours on the current pod purely on its own. We could parallelize across pods if the rust binary supported being told "you're responsible for tier N only" or "tier N, shards in worker-id range [A, B)" — and if shard filenames stayed globally consistent so multiple pods could push to the same HF dataset without name collisions.
+
+The current binary always runs all tiers in `cfg.tiers` order, top-to-bottom. There's no CLI knob for "skip tiers 0..2, only do 3" or "do tier 3 but only worker_ids 0..127."
+
+**Recommendation.** Add two orthogonal CLI flags to `stockfish-datagen run`:
+
+1. `--tiers N[,M,...]` — restrict execution to a subset of tier indices. Skipped tiers are not preflighted, not started, and not blamed for missing manifests.
+2. `--worker-id-range A:B` (half-open) — the rust binary normally instantiates workers `0..cfg.n_workers`. With this flag it instantiates workers `A..B` instead. Game-index partitioning still uses the *full* `cfg.n_workers` for the modular split, so the `master_seed + game_index` mapping is identical regardless of which worker-id slice this pod owns. Shard filenames already encode `worker_id` (`shard-w<NNN>-c<NNNN>-r<NNNNNN>.parquet`), so two pods running disjoint worker-id ranges produce disjoint filenames and can sync to the same HF dataset concurrently without collisions.
+
+With both flags, the operator's deployment recipe for a 100M run would look like:
+
+```
+pod A:  --tiers 0,1,2  --worker-id-range 0:380
+pod B:  --tiers 3       --worker-id-range 0:190
+pod C:  --tiers 3       --worker-id-range 190:380
+pod D:  --tiers 4       --worker-id-range 0:380
+```
+
+(Pods B and C cooperate on the same tier with disjoint worker IDs; the HF watcher on each independently uploads its own shards.)
+
+A few subtleties worth handling explicitly:
+
+- `_tier_state.json` and `_manifest.json` are tier-level sentinels. With multiple pods writing into the same tier directory, they need a write-discipline (e.g. each pod owns a per-pod state file `_tier_state-w0-w189.json`, and a final manifest is a *merge* of the per-pod sentinels — done either by a small post-run reducer script or by making the manifest the union of contributing pods' worker ranges).
+- The "all tier manifests present → ALL_DONE" check in the monitoring/check-in loop needs to understand the per-pod-sentinel scheme.
+- Resume on a single pod within a worker-id slice is unchanged — each pod's slice is independent, and within its slice it behaves like the existing single-pod model.
+- The fingerprint change in A2 is a precondition for this to be ergonomic: pods with different physical core counts will naturally pick different `n_workers`, and we need that not to block them from cooperating on a shared tier directory.
+
+Together, A2 and A3 turn 100M-game runs from "one machine, multi-day wall-clock" into "shard the long-pole tier across N pods, ~5-10× wall-clock reduction at proportional total cost."
