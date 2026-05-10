@@ -730,6 +730,22 @@ mod tests {
     }
 
     #[test]
+    fn tier_fingerprint_changes_with_store_legal_move_evals() {
+        // Flipping `store_legal_move_evals` changes the *bytes* a tier
+        // generates: the new column is populated/null and the per-ply
+        // evallegal call fires/doesn't on non-searchless tiers. A run
+        // resumed under a flipped flag must NOT silently merge old (no
+        // static labels) shards with new (with labels) shards. Pin the
+        // fingerprint sensitivity here so a future `#[serde(skip)]` or
+        // similar accident is caught immediately.
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.tiers[0].store_legal_move_evals = false;
+        b.tiers[0].store_legal_move_evals = true;
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
+    }
+
+    #[test]
     fn validate_rejects_sample_score_on_search_tier() {
         // sample_score on a non-searchless tier suggests a misunderstanding —
         // multipv parsing only ever surfaces cp; raw v has no source.

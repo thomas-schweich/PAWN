@@ -498,6 +498,24 @@ fn run_worker(
                 played.uci_moves.len(),
             ));
         }
+        // Pin the per-ply-list length invariants. `play_game` documents that
+        // `per_ply_candidates` and `per_ply_static_candidates` are each
+        // either `None` or a Vec whose length equals `uci_moves.len()`. If
+        // a future refactor of the play loop ever pushes to one buffer
+        // without matching the other (or returns Ok with a partial buffer
+        // on a non-error path), this assert fires immediately rather than
+        // letting the desync silently produce a parquet row whose static
+        // labels are misaligned by one ply against the actual game.
+        if let Some(c) = &played.per_ply_candidates {
+            assert_eq!(c.len(), played.uci_moves.len(),
+                "worker {worker_id} game {game_index}: per_ply_candidates len {} != uci_moves len {}",
+                c.len(), played.uci_moves.len());
+        }
+        if let Some(c) = &played.per_ply_static_candidates {
+            assert_eq!(c.len(), played.uci_moves.len(),
+                "worker {worker_id} game {game_index}: per_ply_static_candidates len {} != uci_moves len {}",
+                c.len(), played.uci_moves.len());
+        }
         let n = tokens.len();
 
         // Convert per-ply candidates into the packed `LegalMoveEval` form for

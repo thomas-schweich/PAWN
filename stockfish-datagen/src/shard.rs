@@ -646,6 +646,97 @@ mod tests {
         assert_eq!(plies1.len(), 0);
     }
 
+    /// `static_legal_move_evals` is nullable at the row level (the schema
+    /// declares it nullable, and `append_eval_column(..., none_is_empty_list:
+    /// false)` appends a row-level null when the field is `None`). This test
+    /// pins both halves of that contract:
+    /// - `Some(...)` round-trips with full per-ply per-move data
+    /// - `None` produces a row-level null (NOT an empty outer list, which
+    ///   is what `legal_move_evals` does for its non-null column)
+    /// Without this, a future swap of the `col.append(true/false)` flag in
+    /// `append_eval_column` (or a schema-nullability change) would silently
+    /// drop static labels, since the live integration tests only assert on
+    /// in-memory `PlayedGame` shape, never re-read the parquet column.
+    #[test]
+    fn static_legal_move_evals_round_trip() {
+        use arrow::array::{Array, Int16Array, ListArray, StructArray};
+        let dir = tempdir().unwrap();
+        let mut w = ShardWriter::create(dir.path().to_path_buf(), 0, 0).unwrap();
+
+        // Row 0: search-mode tier with the static column populated. Mirrors
+        // the live test's expected shape: every entry has all five struct
+        // fields populated (move_idx + 4 score fields), distinguishing the
+        // evallegal-sourced data from the multipv-sourced legal_move_evals.
+        let mut row0 = fake_row(101);
+        row0.legal_move_evals = Some(vec![vec![LegalMoveEval {
+            move_idx: 50,
+            score_cp: 10,
+            score_eval_v: None, // multipv-sourced — raw v not surfaced
+            score_psqt: None,
+            score_positional: None,
+        }]]);
+        row0.static_legal_move_evals = Some(vec![vec![
+            LegalMoveEval {
+                move_idx: 50,
+                score_cp: 10,
+                score_eval_v: Some(35),
+                score_psqt: Some(40),
+                score_positional: Some(-5),
+            },
+            LegalMoveEval {
+                move_idx: 75,
+                score_cp: 8,
+                score_eval_v: Some(28),
+                score_psqt: Some(30),
+                score_positional: Some(-2),
+            },
+        ]]);
+        w.append(&row0);
+
+        // Row 1: searchless tier — `static_legal_move_evals` left None, so
+        // the row-level null path of append_eval_column fires.
+        let mut row1 = fake_row(102);
+        row1.legal_move_evals = Some(vec![vec![LegalMoveEval {
+            move_idx: 100,
+            score_cp: 5,
+            score_eval_v: Some(17),
+            score_psqt: Some(20),
+            score_positional: Some(-3),
+        }]]);
+        row1.static_legal_move_evals = None;
+        w.append(&row1);
+
+        let path = w.close().unwrap();
+        let file = File::open(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
+        let batch = &batches[0];
+        let static_col = batch
+            .column_by_name("static_legal_move_evals")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        // Row 0 should be NON-null, with one ply containing two moves.
+        assert!(static_col.is_valid(0), "row 0 static_legal_move_evals should be non-null");
+        let plies0 = static_col.value(0);
+        let plies0 = plies0.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(plies0.len(), 1, "row 0 should have 1 ply");
+        let ply0 = plies0.value(0);
+        let ply0 = ply0.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(ply0.len(), 2, "row 0 ply 0 should have 2 moves");
+        let move_idx = ply0.column(0).as_any().downcast_ref::<Int16Array>().unwrap();
+        let score_eval_v = ply0.column(2).as_any().downcast_ref::<Int16Array>().unwrap();
+        assert_eq!(move_idx.value(0), 50);
+        assert_eq!(score_eval_v.value(0), 35);
+        assert_eq!(move_idx.value(1), 75);
+        assert_eq!(score_eval_v.value(1), 28);
+
+        // Row 1 should be ROW-LEVEL NULL — pin this against any future
+        // refactor that confuses "no data" with "empty outer list".
+        assert!(!static_col.is_valid(1), "row 1 static_legal_move_evals should be row-level null");
+    }
+
     /// Regression test for the round-7 `game_seed: i64 -> UInt64` change.
     /// A high-bit seed (>= 2^63) MUST round-trip as itself, not flip to a
     /// negative integer. With the prior Int64 schema this would store a

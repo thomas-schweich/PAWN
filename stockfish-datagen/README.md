@@ -96,8 +96,8 @@ which lets a remote-sync tool drop zero-byte placeholder files locally
 that the resume logic treats identically to real shards. See the
 HuggingFace sync section below.
 
-Shards are zstd-compressed parquet (level 3). They're written
-atomically: `shard-…parquet.tmp` is fsynced, then renamed to
+Shards are zstd-compressed parquet (level 19, 16 MB pages). They're
+written atomically: `shard-…parquet.tmp` is fsynced, then renamed to
 `shard-…parquet`. A crash mid-shard leaves an orphan `.parquet.tmp`
 rather than a half-valid finished file. The same fsync-then-rename
 pattern is used for `_manifest.json`, so a power failure can never
@@ -153,7 +153,7 @@ tier-state's fingerprint.
 | `game_seed`         | `UInt64`        | per-game seed (reproduction key)        |
 | `stockfish_version` | `String`        | from Stockfish's `id name` line         |
 | `legal_move_evals`  | `List<List<Struct{move_idx: Int16, score_cp: Int16, score_eval_v: Int16?, score_psqt: Int16?, score_positional: Int16?}>>` | per-ply per-legal-move payload from the tier's **selection** engine call when `store_legal_move_evals: true`; empty outer list when not. Semantics depend on tier mode: searchless tiers populate every legal move with all five fields (evallegal source); search-mode tiers populate the multipv top-K with `score_cp` only and the three nullable fields are `None`. Always non-null at the row level — readers find an empty `[]` rather than a row-level null on tiers that didn't opt in. |
-| `static_legal_move_evals` | (same Struct as `legal_move_evals`) | per-ply per-legal-move **canonical NNUE static eval** captured by a separate `evallegal` call after each ply's selection. Same shape and same struct fields as `legal_move_evals`, but always full-evallegal-sourced (every legal move, all five score fields populated). Populated only when `store_legal_move_evals: true` AND the tier is non-searchless — on searchless tiers this is **null** (the same data already lives in `legal_move_evals`, so duplicating would double tier-0 storage). Convention for downstream: read the canonical static eval as `static_legal_move_evals if not None else legal_move_evals`. The two columns describe the same plies but with different move sets and orderings; join via `move_idx` if pairing is needed. |
+| `static_legal_move_evals` | (same Struct as `legal_move_evals`) | per-ply per-legal-move **canonical NNUE static eval** captured by a separate `evallegal` call after each ply's selection. Same shape and same struct fields as `legal_move_evals`, but always full-evallegal-sourced (every legal move, all four score fields — `score_cp`, `score_eval_v`, `score_psqt`, `score_positional` — populated alongside `move_idx`). Populated only when `store_legal_move_evals: true` AND the tier is non-searchless — on searchless tiers this is **null** (the same data already lives in `legal_move_evals`, so duplicating would double tier-0 storage). Convention for downstream: read the canonical static eval as `static_legal_move_evals if not None else legal_move_evals`. The two columns describe the same plies but with different move sets and orderings; join via `move_idx` if pairing is needed. |
 
 ### Schema compatibility with pre-existing shards
 
