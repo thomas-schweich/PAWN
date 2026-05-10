@@ -196,3 +196,29 @@ A few subtleties worth handling explicitly:
 - The fingerprint change in A2 is a precondition for this to be ergonomic: pods with different physical core counts will naturally pick different `n_workers`, and we need that not to block them from cooperating on a shared tier directory.
 
 Together, A2 and A3 turn 100M-game runs from "one machine, multi-day wall-clock" into "shard the long-pole tier across N pods, ~5-10× wall-clock reduction at proportional total cost."
+
+### A4. CRITICAL — `hf upload <folder>` + truncate-after-upload silently destroys uploaded data
+
+**Severity: data-loss bug.** The mid-run sync script we built (`/tmp/datagen_sync_hf.sh` on the operator's local box, never landed in this repo) lost ~91 % of the generated data on the first production run. Reconstructed forensically from the archive branch (`archive/2026-05-10-pre-seed-rework`) after the pod was destroyed:
+
+```
+tier0_evallegal:   8,359 / 9,646 files are 0-byte placeholders (only 1,287 real shards)
+nodes_0001:        9,396 / 9,895 files are 0-byte placeholders (only   499 real shards)
+nodes_0128:        5,381 / 5,874 files are 0-byte placeholders (only   493 real shards)
+```
+
+The surviving full shards are exactly the highest-numbered chunks per worker (worker 0: chunks 21-24 full, 0-20 are 0-byte stubs; worker 300: only 25-26 full). That's the signature of "the last sync cycle preserved its own uploads, every prior cycle was clobbered."
+
+**Mechanism.** The script ran `hf upload <repo> <local_dir> <path_in_repo>` per cycle, then truncated newly-uploaded shards to 0 bytes (porting the python orchestrator's `--prune-local` pattern). `hf upload <folder>` walks the entire directory and uploads any local file whose content differs from remote. After truncation, local files are 0 bytes, remote still has the 30 MB. The next cycle sees the size mismatch, classifies the local 0-byte as the new state, and commits it — overwriting the real shard on HF with an empty file.
+
+The python orchestrator's `--prune-local` did NOT have this bug because it tracked an in-memory `uploaded: set[str]` and filtered already-uploaded files out of the candidate set at the top of every cycle (`if repo_path in uploaded: continue`). The folder-upload CLI has no such filter.
+
+**Fix (mandatory before any production run that uses HF sync).** The truncate-after-upload pattern is fine on its own; the bug is letting the truncated files re-enter the upload candidate set. Two safe architectures:
+
+1. **Explicit per-shard commits.** Maintain a state file (`<tier>/.uploaded_shards.txt` or similar) listing shard names already on remote. Each cycle: enumerate non-empty shards, set-diff against the state file, build a `huggingface_hub.create_commit` call with `CommitOperationAdd` per new shard. After commit success, append to the state file, then truncate. Subsequent cycles never see the truncated files because the state-file diff excludes them.
+
+2. **Folder upload with explicit allow-list.** Use `huggingface_hub.upload_folder(..., allow_patterns=[<list of unuploaded shard filenames>])`. Same idea, fewer moving parts. The allow-list explicitly enumerates what's allowed to enter the upload candidate set; truncated 0-byte files are not in it because their names are already in the "uploaded" state, not the "to-upload" state.
+
+**Invariant for the implementer:** *a 0-byte local file MUST NEVER enter the upload candidate set in any cycle after the cycle that first uploaded its full content.* Audit any sync architecture against that statement.
+
+**Test before deploying at scale.** Stand up a tiny scratch dataset repo. Upload a 1 MB file. Truncate it locally to 0 bytes. Run the candidate sync logic. Verify the file on HF is still 1 MB. Repeat for 3-5 cycles. Only then trust the sync at production scale. The cost of getting this wrong on a 100M-game run is ~$20 of compute and ~14 hours of clock time, all of it landfilled.
