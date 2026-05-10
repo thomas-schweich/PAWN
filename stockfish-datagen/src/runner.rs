@@ -421,6 +421,33 @@ fn f32_to_i16_clamped(x: f32) -> i16 {
     x.clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
+/// Pack a worker's per-ply candidate list into the parquet-bound
+/// `LegalMoveEval` representation. Lives at module scope (not as a
+/// closure inside the per-game hot loop) so the function isn't
+/// re-instantiated per game and the reader can find it without
+/// hunting through `run_worker`.
+fn pack_candidates(
+    plies: Vec<Vec<crate::stockfish::Candidate>>,
+) -> Vec<Vec<crate::shard::LegalMoveEval>> {
+    plies
+        .into_iter()
+        .map(|cands| {
+            cands
+                .into_iter()
+                .map(|c| crate::shard::LegalMoveEval {
+                    move_idx: chess_engine::vocab::uci_to_action(&c.uci)
+                        .expect("Stockfish-emitted UCI must be in our action vocab")
+                        as i16,
+                    score_cp: f32_to_i16_clamped(c.score_cp),
+                    score_eval_v: c.score_eval_v.map(f32_to_i16_clamped),
+                    score_psqt: c.score_psqt.map(f32_to_i16_clamped),
+                    score_positional: c.score_positional.map(f32_to_i16_clamped),
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let epoch_secs = SystemTime::now()
@@ -581,27 +608,6 @@ fn run_worker(
             }
             let n = tokens.len();
 
-            let pack_candidates = |plies: Vec<Vec<crate::stockfish::Candidate>>|
-                -> Vec<Vec<crate::shard::LegalMoveEval>>
-            {
-                plies
-                    .into_iter()
-                    .map(|cands| {
-                        cands
-                            .into_iter()
-                            .map(|c| crate::shard::LegalMoveEval {
-                                move_idx: chess_engine::vocab::uci_to_action(&c.uci)
-                                    .expect("Stockfish-emitted UCI must be in our action vocab")
-                                    as i16,
-                                score_cp: f32_to_i16_clamped(c.score_cp),
-                                score_eval_v: c.score_eval_v.map(f32_to_i16_clamped),
-                                score_psqt: c.score_psqt.map(f32_to_i16_clamped),
-                                score_positional: c.score_positional.map(f32_to_i16_clamped),
-                            })
-                            .collect()
-                    })
-                    .collect()
-            };
             let legal_move_evals = played.per_ply_candidates.map(pack_candidates);
             let static_legal_move_evals = played.per_ply_static_candidates.map(pack_candidates);
 
@@ -625,7 +631,9 @@ fn run_worker(
                 temperature: tier.temperature,
                 global_game_index,
                 game_seed,
-                stockfish_version: stockfish_version.to_string(),
+                // Cheap refcount bump; the underlying string is shared
+                // across every game this worker writes.
+                stockfish_version: Arc::clone(&stockfish_version),
                 legal_move_evals,
                 static_legal_move_evals,
             };

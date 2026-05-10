@@ -362,12 +362,16 @@ impl RunConfig {
         if self.n_workers == 0 {
             anyhow::bail!("n_workers must be > 0");
         }
-        // worker_id is stored as i16 in the parquet schema.
-        if self.n_workers > i16::MAX as u32 {
+        // Sanity ceiling: realistic vast.ai / RunPod hosts top out at
+        // ~512 threads. n_workers above 32K is almost certainly a typo
+        // (and crossing thread-pool / FD / cgroup limits gives terrible
+        // errors). The pre-v3 schema had a hard i16 limit because shards
+        // stored a `worker_id Int16` column; v3 dropped that column but
+        // the soft sanity ceiling here remains useful.
+        if self.n_workers > 32_768 {
             anyhow::bail!(
-                "n_workers={} exceeds i16::MAX ({}); the parquet `worker_id` column is Int16",
+                "n_workers={} is unrealistically high (>32K); typical pods top out around 512",
                 self.n_workers,
-                i16::MAX,
             );
         }
         // game_length is stored as u16. With max_ply=512 (default) we're
@@ -720,9 +724,9 @@ mod tests {
     #[test]
     fn validate_rejects_oversized_n_workers() {
         let mut c = minimal_config();
-        c.n_workers = i16::MAX as u32 + 1;
+        c.n_workers = 32_769;
         let err = c.validate().unwrap_err();
-        assert!(format!("{err:#}").contains("Int16"), "got {err:#}");
+        assert!(format!("{err:#}").contains("unrealistically high"), "got {err:#}");
     }
 
     #[test]
