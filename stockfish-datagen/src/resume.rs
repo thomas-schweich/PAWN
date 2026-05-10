@@ -30,12 +30,12 @@
 //! (`--shard-id-range A:B`) the sentinels are suffixed with the range
 //! so disjoint pods can coexist in the same HF dataset folder.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 /// Parse `shard-s<NNNNNN>-r<NNNNNN>.parquet` into `(shard_id, n_rows)`.
@@ -89,8 +89,20 @@ pub fn detect_resume(
         return Ok(ShardResumeState::default());
     }
 
-    let mut state = ShardResumeState::default();
-    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    // Group by shard_id, keeping the file with the highest `n_rows`. Two
+    // files for the same shard id are possible in two benign cases:
+    //   * Boundary-rewrite race: a writer in another pod (or this pod's
+    //     prior process) has renamed the new larger file into place but
+    //     hasn't yet `remove_file`'d the older smaller one. Both live on
+    //     disk for milliseconds.
+    //   * Crash mid-rewrite: the same window, but never closed by cleanup.
+    // Picking the highest-row-count file is always the correct interpretation:
+    // the newer file is the larger one (writers grow shards, never shrink),
+    // and the smaller file will be deleted shortly (or is an orphan the
+    // operator can prune). The lower-row file shows up as a missing
+    // boundary-rewrite if it would otherwise have been the canonical entry,
+    // so the worker that owns it triggers cleanup on next pass.
+    let mut by_shard: BTreeMap<u64, (u64, PathBuf)> = BTreeMap::new();
     for entry in fs::read_dir(tier_dir)
         .with_context(|| format!("listing {}", tier_dir.display()))?
     {
@@ -105,23 +117,26 @@ pub fn detect_resume(
             // for the operator to handle.
             continue;
         }
-        if !seen.insert(shard_id) {
-            // Two files for the same shard id with different row counts
-            // (e.g. a truncated old + the new growth-rewrite that hasn't
-            // been cleaned up). Refuse to guess which is authoritative.
-            return Err(anyhow!(
-                "duplicate shard files for shard id {shard_id} in {}; \
-                 delete one before resuming",
-                tier_dir.display(),
-            ));
-        }
+        by_shard
+            .entry(shard_id)
+            .and_modify(|(cur_rows, cur_path)| {
+                if n_rows > *cur_rows {
+                    *cur_rows = n_rows;
+                    *cur_path = entry.path();
+                }
+            })
+            .or_insert((n_rows, entry.path()));
+    }
+
+    let mut state = ShardResumeState::default();
+    for (shard_id, (n_rows, path)) in by_shard {
         let expected = expected_n_rows(shard_id);
         if n_rows == expected {
             state.done_shards.insert(shard_id);
         } else if n_rows < expected {
-            state.boundary_rewrites.push((shard_id, entry.path()));
+            state.boundary_rewrites.push((shard_id, path));
         } else {
-            return Err(anyhow!(
+            return Err(anyhow::anyhow!(
                 "shard {shard_id} in {} has {n_rows} rows but current config expects {expected}; \
                  shrinking shard contents is not supported (would invalidate already-written data)",
                 tier_dir.display(),
@@ -380,6 +395,24 @@ mod tests {
         let err = detect_resume(dir.path(), 4, |_| 10).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("shrinking"), "expected shrink error, got: {msg}");
+    }
+
+    /// Boundary-rewrite race tolerance: a worker that grew a partial
+    /// last shard just renamed the larger file into place but hasn't yet
+    /// `remove_file`'d the old smaller one. Both files coexist for
+    /// milliseconds. Another pod's `detect_resume` (or this same pod's
+    /// post-run rescan) MUST pick the canonical entry — the highest
+    /// row count — and not error on "duplicate shard files".
+    #[test]
+    fn detect_resume_tolerates_two_files_for_same_shard() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("shard-s000005-r000005.parquet"), b"").unwrap();
+        std::fs::write(dir.path().join("shard-s000005-r000010.parquet"), b"").unwrap();
+        // Current config expects 10 rows per shard → the 10-row file is
+        // canonical, the 5-row file is the to-be-removed stale rewrite.
+        let st = detect_resume(dir.path(), 6, |_| 10).unwrap();
+        assert_eq!(st.done_shards, BTreeSet::from([5]));
+        assert!(st.boundary_rewrites.is_empty());
     }
 
     #[test]

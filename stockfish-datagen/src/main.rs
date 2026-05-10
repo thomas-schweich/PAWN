@@ -95,8 +95,9 @@ fn real_main() -> anyhow::Result<()> {
         Command::DryRun { config } => {
             let cfg = RunConfig::load(&config)
                 .with_context(|| format!("loading config {}", config.display()))?;
-            print_plan(&cfg, &RunScope::default());
-            preflight_check_patched_binary(&cfg)?;
+            let scope = RunScope::default();
+            print_plan(&cfg, &scope);
+            preflight_check_patched_binary(&cfg, &scope)?;
             Ok(())
         }
         Command::Run { config, tiers, shard_id_range } => {
@@ -127,7 +128,7 @@ fn real_main() -> anyhow::Result<()> {
                 shard_range: shard_id_range,
             };
             print_plan(&cfg, &scope);
-            preflight_check_patched_binary(&cfg)?;
+            preflight_check_patched_binary(&cfg, &scope)?;
             std::fs::create_dir_all(&cfg.output_dir).with_context(|| {
                 format!("creating output dir {}", cfg.output_dir.display())
             })?;
@@ -299,7 +300,7 @@ fn preflight_check_tournament_binary(cfg: &TournamentConfig) -> anyhow::Result<(
 /// 200 plies into a game with `NoCandidates`). Fail loudly at startup
 /// instead — the v0.3.0 shape check is built into the spawn-time probe
 /// and surfaces as `is_patched: false` for stale binaries.
-fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
+fn preflight_check_patched_binary(cfg: &RunConfig, scope: &RunScope) -> anyhow::Result<()> {
     // A tier needs the patched binary when:
     //   - searchless: the whole selection loop runs `evallegal`
     //   - net_selection: vanilla SF18 silently ignores the unknown setoption,
@@ -309,9 +310,17 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
     //     selection (the static_legal_move_evals column). Without the patch
     //     the call would emit "Unknown command" and the worker would die on
     //     the first ply of the first game.
+    //
+    // Restricted to tiers actually in scope: `--tiers` lets the operator
+    // run a vanilla-compatible subset of a mixed config without the
+    // patched binary, and demanding the patch for tiers we won't run is
+    // gratuitous breakage.
     let needs_patched: Vec<String> = cfg
         .tiers
         .iter()
+        .enumerate()
+        .filter(|(i, _)| scope.includes_tier(*i))
+        .map(|(_, t)| t)
         .filter(|t| {
             t.searchless
                 || t.net_selection.is_some()
@@ -371,8 +380,10 @@ fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
     let needs_net_selection: Vec<&str> = cfg
         .tiers
         .iter()
-        .filter(|t| t.net_selection.is_some())
-        .map(|t| t.name.as_str())
+        .enumerate()
+        .filter(|(i, _)| scope.includes_tier(*i))
+        .filter(|(_, t)| t.net_selection.is_some())
+        .map(|(_, t)| t.name.as_str())
         .collect();
     if !needs_net_selection.is_empty() && !probe.has_net_selection {
         anyhow::bail!(

@@ -123,11 +123,40 @@ pub fn run_tier(
 
     let fingerprint = cfg.tier_fingerprint(tier_index);
     let shard_range = scope.effective_shard_range(cfg, tier);
-    let pod_range: Option<ShardRange> = scope.shard_range;
+    // Derive the per-pod sentinel range from the CLAMPED work range, not
+    // the raw user input. A `--shard-id-range 0:5000` on a tier with only
+    // 1000 shards has effective range 0..1000; storing the unclamped
+    // 0..5000 in the filename would mislead a reconcile pass into
+    // claiming coverage out to 5000. Canonical (no suffix) when the
+    // clamped range covers the full tier.
+    let pod_range: Option<ShardRange> = {
+        let full = 0..cfg.total_shards(tier);
+        if shard_range == full {
+            None
+        } else {
+            Some(ShardRange { start: shard_range.start, end: shard_range.end })
+        }
+    };
+    let expected_shard_count = shard_range.end.saturating_sub(shard_range.start);
 
-    // Skip if this pod's slice is already complete.
+    // Skip if this pod's slice is already complete. "Complete" requires
+    // both fingerprint match AND a shard count consistent with the
+    // current config — without the count check, growing `tier.n_games`
+    // between runs would silently re-use the smaller manifest and never
+    // generate the extra shards (the tier-extension contract documented
+    // in stockfish-datagen/README.md).
     if let Some(manifest) = TierManifest::load(&tier_dir, pod_range.as_ref())? {
-        if manifest.config_fingerprint == fingerprint {
+        if manifest.config_fingerprint != fingerprint {
+            return Err(anyhow!(
+                "[{}] manifest exists but tier fingerprint differs (manifest {} vs current {}); \
+                 either restore the original config for this tier or delete {}",
+                tier.name,
+                manifest.config_fingerprint,
+                fingerprint,
+                TierManifest::path(&tier_dir, pod_range.as_ref()).display(),
+            ));
+        }
+        if manifest.shards.len() as u64 == expected_shard_count {
             eprintln!(
                 "[{}] already complete for range {:?} ({} games, {} shards) — skipping",
                 tier.name, shard_range, manifest.n_games_written, manifest.shards.len(),
@@ -140,16 +169,15 @@ pub fn run_tier(
                     .map(|s| tier_dir.join(s))
                     .collect(),
             });
-        } else {
-            return Err(anyhow!(
-                "[{}] manifest exists but tier fingerprint differs (manifest {} vs current {}); \
-                 either restore the original config for this tier or delete {}",
-                tier.name,
-                manifest.config_fingerprint,
-                fingerprint,
-                TierManifest::path(&tier_dir, pod_range.as_ref()).display(),
-            ));
         }
+        // Same fingerprint, different shard count ⇒ n_games changed since
+        // last completion (likely grew). Fall through to the normal run
+        // path which will regenerate any boundary shard and write the new
+        // tail. The stale manifest gets overwritten at end of run.
+        eprintln!(
+            "[{}] manifest covers {} shards, current config expects {} — regenerating delta",
+            tier.name, manifest.shards.len(), expected_shard_count,
+        );
     }
 
     // Expected-row-count closure: same logic the runner uses when writing
@@ -617,9 +645,19 @@ fn run_worker(
         // Boundary-rewrite cleanup: the old (truncated) file had a
         // smaller `r<...>` suffix than the new one, so it's a different
         // path. Delete it now that the new file is durably renamed in.
+        // Log failures rather than swallowing — leaving the old file
+        // behind would let another pod's `detect_resume` see two files
+        // for the same shard_id (and pick the larger one, but the small
+        // one then sits as an orphan until manual cleanup).
         if let Some(old) = boundary_paths.get(&shard_id) {
             if old != &path {
-                let _ = std::fs::remove_file(old);
+                if let Err(e) = std::fs::remove_file(old) {
+                    eprintln!(
+                        "[w{worker_idx}] boundary-rewrite: failed to delete old shard \
+                         {} after writing {}: {e}",
+                        old.display(), path.display(),
+                    );
+                }
             }
         }
         shards.push(path);

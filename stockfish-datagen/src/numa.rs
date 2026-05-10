@@ -29,7 +29,10 @@
 //!
 //! See `ANALYSIS.md` "Phase 5 — NUMA wrapping" for the full rationale.
 
-#[cfg(target_os = "linux")]
+// x86_64-specific syscall numbers — Linux's syscall numbering is
+// per-architecture. aarch64 uses 237, riscv uses different numbers, etc.
+// Restrict to x86_64 + Linux; the no-op stub catches every other host.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
     // `mempolicy.h` constants. Hardcoded rather than depending on the
     // `nix` crate or a custom build script — the values are part of the
@@ -102,13 +105,15 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 mod imp {
     pub fn set_interleave_all_nodes() {
-        // No-op on non-Linux: the syscall doesn't exist and there's no
-        // analog. macOS / Windows pods aren't a supported deployment
-        // target for stockfish-datagen, but we still want the code to
-        // compile locally for tests.
+        // No-op everywhere except Linux x86_64: the syscall number we
+        // hardcode is x86_64-specific (aarch64 Linux uses 237, etc.) and
+        // macOS / Windows don't have `set_mempolicy` at all. Production
+        // pods are linux/amd64, so this is the only path that ever
+        // executes the real syscall; the stub keeps tests building on
+        // macOS dev machines and on a hypothetical aarch64 host.
     }
 }
 
