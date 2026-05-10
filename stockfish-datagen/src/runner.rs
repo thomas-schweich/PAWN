@@ -498,6 +498,37 @@ fn run_worker(
                 played.uci_moves.len(),
             ));
         }
+        // Pin the per-ply-list length invariants. `play_game` documents that
+        // `per_ply_candidates` and `per_ply_static_candidates` are each
+        // either `None` or a Vec whose length equals `uci_moves.len()`. If
+        // a future refactor of the play loop ever pushes to one buffer
+        // without matching the other (or returns Ok with a partial buffer
+        // on a non-error path), this fails the run rather than letting the
+        // desync silently produce a parquet row whose static labels are
+        // misaligned by one ply against the actual game.
+        //
+        // Use `anyhow::ensure!` (Result-returning) rather than `assert_eq!`
+        // (panicking) so the structured worker_id / game_index / counts
+        // context survives through `first_err` and out to the operator.
+        // The thread-join machinery would otherwise swallow the panic
+        // payload and surface only "worker N panicked", which is hard to
+        // diagnose in a 126-worker pod log.
+        if let Some(c) = &played.per_ply_candidates {
+            anyhow::ensure!(
+                c.len() == played.uci_moves.len(),
+                "worker {worker_id} game {game_index} (seed {game_seed}): \
+                 per_ply_candidates len {} != uci_moves len {}",
+                c.len(), played.uci_moves.len(),
+            );
+        }
+        if let Some(c) = &played.per_ply_static_candidates {
+            anyhow::ensure!(
+                c.len() == played.uci_moves.len(),
+                "worker {worker_id} game {game_index} (seed {game_seed}): \
+                 per_ply_static_candidates len {} != uci_moves len {}",
+                c.len(), played.uci_moves.len(),
+            );
+        }
         let n = tokens.len();
 
         // Convert per-ply candidates into the packed `LegalMoveEval` form for
@@ -509,7 +540,15 @@ fn run_worker(
         // All `None` for multipv-sourced rows — we trust the engine vocab
         // here; Stockfish has already produced legal UCI strings (the
         // per-ply move choice was applied successfully above).
-        let legal_move_evals = played.per_ply_candidates.map(|plies| {
+        //
+        // `static_legal_move_evals` is the canonical NNUE static-eval signal
+        // captured by a separate evallegal call per ply; populated only on
+        // non-searchless tiers that opted into store_legal_move_evals=true,
+        // and `None` on searchless tiers (their `legal_move_evals` already
+        // is the same data, so duplicating would double tier-0 storage).
+        let pack_candidates = |plies: Vec<Vec<crate::stockfish::Candidate>>|
+            -> Vec<Vec<crate::shard::LegalMoveEval>>
+        {
             plies
                 .into_iter()
                 .map(|cands| {
@@ -527,7 +566,9 @@ fn run_worker(
                         .collect()
                 })
                 .collect()
-        });
+        };
+        let legal_move_evals = played.per_ply_candidates.map(pack_candidates);
+        let static_legal_move_evals = played.per_ply_static_candidates.map(pack_candidates);
 
         let row = GameRow {
             tokens: tokens.into_iter().map(|t| t as i16).collect(),
@@ -558,6 +599,7 @@ fn run_worker(
             game_seed,
             stockfish_version: stockfish_version.to_string(),
             legal_move_evals,
+            static_legal_move_evals,
         };
 
         if writer.is_none() {

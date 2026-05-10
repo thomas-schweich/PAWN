@@ -124,12 +124,34 @@ pub struct TierConfig {
 
     /// Force a specific NNUE network for all evaluation (`auto` / `small`
     /// / `large`). `None` (the default) leaves the engine's default in
-    /// place (`auto`, vanilla SF18 dynamic selection). Applies to both
-    /// search-mode and searchless tiers — vanilla SF18 picks small for
-    /// material-imbalanced positions and may re-evaluate with big, which
-    /// introduces position-dependent eval-source heterogeneity that's
-    /// awkward for ML use cases. `Large` is the natural pick for
-    /// distillation labelling (uniform high-quality teacher network).
+    /// place (`auto`, vanilla SF18 dynamic selection).
+    ///
+    /// **Applies globally to the spawned process** — the same `NetSelection`
+    /// governs both `go nodes N` (search) AND `evallegal` (per-position
+    /// teacher signal). The patched binary's `evallegal` reads the setoption
+    /// once per command and propagates it through `Eval::evaluate`, so there's
+    /// no way to use one network for selection and a different one for
+    /// labels on the same Stockfish process.
+    ///
+    /// Without this set (i.e. `auto`), the dynamic selection per
+    /// `evaluate.cpp` is:
+    ///   - small net when `|simple_eval(pos)| > 962` (heavy material imbalance)
+    ///   - big net otherwise
+    ///   - if the small-net path returned `|nnue| < 277`, re-evaluate with
+    ///     big (catches positions the small net thought were closer than
+    ///     material suggested)
+    ///
+    /// Implication for distillation: with `auto`, a single dataset's
+    /// `legal_move_evals` / `static_legal_move_evals` columns end up as a
+    /// **mixture** of small-net and big-net evaluations, switching
+    /// per-position based on material imbalance. The student would have to
+    /// learn to mimic two different teachers depending on position phase,
+    /// which is harder to fit and harder to interpret.
+    ///
+    /// `Large` forces uniform high-quality labels everywhere — the natural
+    /// pick for any tier with `store_legal_move_evals: true`. Cost: small
+    /// net's faster forward pass is bypassed for ~5-10% of positions per
+    /// game, costing a few percent of throughput.
     ///
     /// Requires the patched binary (vanilla SF18 doesn't recognize the
     /// `NetSelection` UCI option and would silently ignore the setoption);
@@ -431,6 +453,22 @@ impl RunConfig {
             "shard_size_games": self.shard_size_games,
             "max_ply": self.max_ply,
             "n_workers": self.n_workers,
+            // Bump SHARD_SCHEMA_VERSION whenever the parquet schema changes
+            // in a way that would mix incompatibly with prior shards in the
+            // same tier directory. Currently:
+            //   v1 (implicit, pre-bump): tokens/san/uci + legal_move_evals only
+            //   v2 (current): adds nullable `static_legal_move_evals` column
+            // Without this discriminator, a code upgrade that adds the new
+            // column would re-pass the resume fingerprint check on a tier
+            // whose *config* didn't change (e.g. a searchless tier whose
+            // store_legal_move_evals was already true), then write new
+            // shards into a directory that already contains old-schema
+            // shards. Strict polars reads would fail; permissive pyarrow
+            // reads would silently drop the new column. Bumping the
+            // version here forces a loud fingerprint mismatch on resume,
+            // requiring the operator to either delete the partial tier
+            // dir or revert to the old binary.
+            "shard_schema_version": crate::shard::SHARD_SCHEMA_VERSION,
         });
         let mut h = Sha256::new();
         h.update(payload.to_string().as_bytes());
@@ -682,12 +720,16 @@ mod tests {
     fn tier_fingerprint_golden() {
         let cfg = minimal_config();
         let actual = cfg.tier_fingerprint(0);
-        // Updated when search-budget fields became Option<u32> and
-        // sample_score became Option<SampleScore> (intentional — the JSON
-        // emission for null fields differs from omitted fields, and the
-        // protocol-mode invariant means existing production tiers don't
-        // round-trip identically).
-        let expected = "a36dac69d63481353a7aa5bc1764ab910b022541bf97dd6c2f844870ff8e1491";
+        // History of intentional bumps:
+        //   - search-budget fields became Option<u32> and sample_score
+        //     became Option<SampleScore> (JSON null vs omitted, protocol-
+        //     mode invariant).
+        //   - SHARD_SCHEMA_VERSION added to the payload (v1 → v2 covers
+        //     the new `static_legal_move_evals` column). A future shard
+        //     schema bump invalidates this golden again — that's the
+        //     point: forces a loud test failure rather than a silent
+        //     resume across incompatible bytes on disk.
+        let expected = "e938e2f9d2aa39d4f61bd06ed9f678046de0e7f6ba9da49a8fb1b4cfaf5c2042";
         assert_eq!(
             actual, expected,
             "tier_fingerprint changed for minimal_config — verify the change is intentional, then update the expected value"
@@ -705,6 +747,75 @@ mod tests {
         cfg_a.tiers = vec![a];
         cfg_b.tiers = vec![b];
         assert_ne!(cfg_a.tier_fingerprint(0), cfg_b.tier_fingerprint(0));
+    }
+
+    #[test]
+    fn tier_fingerprint_actually_depends_on_shard_schema_version() {
+        // Pin the causal link "version field controls hash output" by
+        // computing the real `tier_fingerprint` and a hand-rolled hash
+        // over the SAME 8 non-version fields with the version field
+        // OMITTED, then asserting the two hashes differ. The regression
+        // we're guarding against: someone drops the
+        // `shard_schema_version` line from the live payload (refactor
+        // accident, lint cleanup, etc.). After the drop, the live
+        // payload would have 8 fields and our hand-rolled payload would
+        // also have 8 fields with the same values — the hashes would
+        // collide and `assert_ne!` would fail loudly.
+        //
+        // Earlier rounds tried two weaker variants:
+        //   - `payload.to_string().contains("shard_schema_version")` —
+        //     tests the test's own local literal, not the production
+        //     code path. Tautology.
+        //   - hand-roll the payload WITH a bumped version, assert it
+        //     differs from the real hash — gives a false green: if the
+        //     live payload drops the version, real becomes hash-of-8
+        //     and the bumped hand-rolled is hash-of-9-with-bump, which
+        //     differ for the wrong reason (different field count, not
+        //     missing version protection).
+        // The current form catches the regression by construction:
+        // production-with-version vs hand-rolled-without-version must
+        // differ; production-without-version vs hand-rolled-without-
+        // version would equal, failing the assert.
+        let cfg = minimal_config();
+        let real = cfg.tier_fingerprint(0);
+
+        let payload_no_version = serde_json::json!({
+            "tier_index": 0,
+            "tier": &cfg.tiers[0],
+            "master_seed": cfg.master_seed,
+            "stockfish_version": &cfg.stockfish_version,
+            "stockfish_hash_mb": cfg.stockfish_hash_mb,
+            "shard_size_games": cfg.shard_size_games,
+            "max_ply": cfg.max_ply,
+            "n_workers": cfg.n_workers,
+        });
+        let mut h = Sha256::new();
+        h.update(payload_no_version.to_string().as_bytes());
+        let no_version_hash = hex(&h.finalize());
+        assert_ne!(
+            real, no_version_hash,
+            "tier_fingerprint must depend on SHARD_SCHEMA_VERSION; if it didn't, removing the \
+             version field from the live payload would produce the same hash as the hand-rolled \
+             8-field payload — meaning the live `tier_fingerprint` no longer carries the \
+             schema-version discriminator and a code upgrade across a schema bump would silently \
+             pass the resume fingerprint check.",
+        );
+    }
+
+    #[test]
+    fn tier_fingerprint_changes_with_store_legal_move_evals() {
+        // Flipping `store_legal_move_evals` changes the *bytes* a tier
+        // generates: the new column is populated/null and the per-ply
+        // evallegal call fires/doesn't on non-searchless tiers. A run
+        // resumed under a flipped flag must NOT silently merge old (no
+        // static labels) shards with new (with labels) shards. Pin the
+        // fingerprint sensitivity here so a future `#[serde(skip)]` or
+        // similar accident is caught immediately.
+        let mut a = minimal_config();
+        let mut b = minimal_config();
+        a.tiers[0].store_legal_move_evals = false;
+        b.tiers[0].store_legal_move_evals = true;
+        assert_ne!(a.tier_fingerprint(0), b.tier_fingerprint(0));
     }
 
     #[test]

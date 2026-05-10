@@ -11,6 +11,7 @@
 //! different Stockfish ships a different NNUE and would silently produce
 //! different games from the same `(game_seed, config)` pair.
 
+use std::borrow::Cow;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -119,10 +120,15 @@ pub enum GoBudget {
 }
 
 impl GoBudget {
-    fn render(self) -> String {
+    /// Render the budget as the UCI per-ply command bytes. `EvalLegal`
+    /// returns a borrowed `'static` literal — no allocation — because it's
+    /// the same string for every call. `Nodes(N)` allocates a `String`
+    /// since `N` is per-tier-config (and we still want one render per
+    /// process at spawn time, not one per ply on the hot path).
+    fn render(self) -> Cow<'static, str> {
         match self {
-            GoBudget::Nodes(n) => format!("go nodes {n}"),
-            GoBudget::EvalLegal => "evallegal".to_string(),
+            GoBudget::Nodes(n) => Cow::Owned(format!("go nodes {n}")),
+            GoBudget::EvalLegal => Cow::Borrowed("evallegal"),
         }
     }
 }
@@ -138,8 +144,26 @@ pub struct StockfishProcess {
     /// incrementally — appended to per move, reset on `new_game()` — so we
     /// don't allocate or recopy O(ply²) text per game.
     position_cmd: String,
-    /// Pre-rendered per-ply command (`go nodes N` or `evallegal`).
-    play_cmd: String,
+    /// Whether `position_cmd` already contains the ` moves` preamble. Set
+    /// by the first `play_move()` after `new_game()`; reset by
+    /// `new_game()` and by `candidates(&[])`. Avoids the per-ply linear
+    /// scan that `position_cmd.contains(" moves")` would do — at ply 100
+    /// the cmd is ~550 bytes and the scan runs O(ply²) across a game.
+    ///
+    /// **Mutation sites** (must be kept in sync with `position_cmd`):
+    /// `spawn` (initializes both empty), `new_game`, `candidates(&[])`,
+    /// `candidates(non-empty)`, `play_move`. The spawn-time `evallegal`
+    /// probe sends `"position startpos"` directly via `send()` rather
+    /// than through `position_cmd`, so both fields remain in their
+    /// initial empty/false state until `new_game()` is called — the
+    /// `debug_assert!(!position_cmd.is_empty())` in `play_move` /
+    /// `candidates_with` guards against a future probe extension that
+    /// forgets this and tries to pre-play moves.
+    position_has_moves: bool,
+    /// Pre-rendered per-ply command (`go nodes N` or `evallegal`). Stored
+    /// as `Cow` so `EvalLegal` borrows a `'static` string at no allocation
+    /// cost; `Nodes(N)` allocates once at spawn time.
+    play_cmd: Cow<'static, str>,
     /// Which budget produced `play_cmd`. Drives output-parser dispatch in
     /// [`Self::candidates_after_play_moves`]: `Nodes` reads multipv info
     /// lines until `bestmove`, `EvalLegal` reads exactly one
@@ -228,6 +252,7 @@ impl StockfishProcess {
             // a regrowth; `read_line` will grow further on demand.
             line_buf: String::with_capacity(8192),
             position_cmd: String::with_capacity(64 + 5 * 256),
+            position_has_moves: false,
             play_cmd: budget.render(),
             budget,
             id_name: String::new(),
@@ -337,6 +362,7 @@ impl StockfishProcess {
     pub fn new_game(&mut self) -> Result<(), StockfishError> {
         self.position_cmd.clear();
         self.position_cmd.push_str("position startpos");
+        self.position_has_moves = false;
         self.send("ucinewgame")?;
         self.send("isready")?;
         self.wait_for_token("readyok")
@@ -364,6 +390,9 @@ impl StockfishProcess {
                 self.position_cmd.push(' ');
                 self.position_cmd.push_str(m);
             }
+            self.position_has_moves = true;
+        } else {
+            self.position_has_moves = false;
         }
         self.candidates_after_play_moves()
     }
@@ -383,16 +412,21 @@ impl StockfishProcess {
             !self.position_cmd.is_empty(),
             "play_move called before new_game / candidates — no base position",
         );
-        // First move after `new_game()` needs the " moves" preamble.
-        if !self.position_cmd.contains(" moves") {
+        // First move after `new_game()` needs the " moves" preamble. Use a
+        // boolean flag rather than `position_cmd.contains(" moves")` — the
+        // latter is O(ply) per call and the cumulative game cost is O(ply²).
+        if !self.position_has_moves {
             self.position_cmd.push_str(" moves");
+            self.position_has_moves = true;
         }
         self.position_cmd.push(' ');
         self.position_cmd.push_str(uci);
     }
 
     /// Issue the per-ply command (`go nodes N` or `evallegal`, depending on
-    /// `budget`) against the cached position and parse the response.
+    /// the spawn-time `budget`) against the cached position and parse the
+    /// response. Hot path — uses the pre-rendered `play_cmd` to avoid
+    /// re-formatting the command per ply.
     pub fn candidates_after_play_moves(
         &mut self,
     ) -> Result<CandidatesResult, StockfishError> {
@@ -406,6 +440,49 @@ impl StockfishProcess {
         self.stdin.flush()?;
 
         match self.budget {
+            GoBudget::Nodes(_) => self.read_go_response(),
+            GoBudget::EvalLegal => self.read_evallegal_response(),
+        }
+    }
+
+    /// Issue an arbitrary per-ply budget against the cached position. Used
+    /// by `play_game` when the tier wants a *separate* `evallegal` call for
+    /// teacher-signal storage on a process that was spawned with a
+    /// `Nodes(_)` budget for selection. `EvalLegal` is the only realistic
+    /// argument; per `GoBudget::render`, it returns a borrowed `'static`
+    /// literal so the call doesn't allocate.
+    ///
+    /// **Contract:** same as [`Self::play_move`] — caller must have
+    /// established a base position via [`Self::new_game`] or
+    /// [`Self::candidates`] first. A freshly-spawned process has an empty
+    /// `position_cmd` and would send a malformed UCI sequence here.
+    pub fn candidates_with(
+        &mut self,
+        budget: GoBudget,
+    ) -> Result<CandidatesResult, StockfishError> {
+        // `candidates_with` is intended for one-shot `EvalLegal` teacher-
+        // signal capture from a process spawned with a different budget.
+        // A caller passing `GoBudget::Nodes(N)` would silently work
+        // (falls through to read_go_response) but leave `self.budget`
+        // and `self.play_cmd` stale relative to the issued command,
+        // confusing any subsequent `candidates_after_play_moves` call
+        // that re-reads them. Pin the intent at compile-debug time.
+        debug_assert!(
+            matches!(budget, GoBudget::EvalLegal),
+            "candidates_with is intended for one-shot EvalLegal teacher-signal capture; \
+             use candidates_after_play_moves for the tier's primary budget",
+        );
+        debug_assert!(
+            !self.position_cmd.is_empty(),
+            "candidates_with called before new_game / candidates — no base position",
+        );
+        let cmd = budget.render();
+        self.stdin.write_all(self.position_cmd.as_bytes())?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.write_all(cmd.as_bytes())?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
+        match budget {
             GoBudget::Nodes(_) => self.read_go_response(),
             GoBudget::EvalLegal => self.read_evallegal_response(),
         }

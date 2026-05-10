@@ -237,14 +237,30 @@ fn preflight_check_tournament_binary(cfg: &TournamentConfig) -> anyhow::Result<(
 /// instead — the v0.3.0 shape check is built into the spawn-time probe
 /// and surfaces as `is_patched: false` for stale binaries.
 fn preflight_check_patched_binary(cfg: &RunConfig) -> anyhow::Result<()> {
+    // A tier needs the patched binary when:
+    //   - searchless: the whole selection loop runs `evallegal`
+    //   - net_selection: vanilla SF18 silently ignores the unknown setoption,
+    //     and the shard fingerprint would lie about the network in use
+    //   - non-searchless + store_legal_move_evals: the per-ply teacher signal
+    //     is captured by a separate `evallegal` call after each search-mode
+    //     selection (the static_legal_move_evals column). Without the patch
+    //     the call would emit "Unknown command" and the worker would die on
+    //     the first ply of the first game.
     let needs_patched: Vec<String> = cfg
         .tiers
         .iter()
-        .filter(|t| t.searchless || t.net_selection.is_some())
+        .filter(|t| {
+            t.searchless
+                || t.net_selection.is_some()
+                || (t.store_legal_move_evals && !t.searchless)
+        })
         .map(|t| {
             let mut why: Vec<&str> = Vec::new();
             if t.searchless { why.push("searchless"); }
             if t.net_selection.is_some() { why.push("net_selection"); }
+            if t.store_legal_move_evals && !t.searchless {
+                why.push("store_legal_move_evals");
+            }
             format!("{} ({})", t.name, why.join("+"))
         })
         .collect();
@@ -343,10 +359,15 @@ fn print_plan(cfg: &RunConfig) {
                 store = if tier.store_legal_move_evals { " store_legal_move_evals=true" } else { "" },
             );
         } else {
+            // Search-mode tier. `store_legal_move_evals=true` here means the
+            // worker also issues a separate `evallegal` call after each ply's
+            // selection to populate the static_legal_move_evals column, so
+            // surface that explicitly — it materially changes per-ply cost
+            // (~2x slowdown at low node budgets) and storage (+~10 KB/game).
             println!(
                 "  [{i}] {name:<14} nodes={nodes:>4} games={n_games:>10} \
                  multi_pv={mpv:>2} opening={ompv:>2}/{op_plies} \
-                 sample_plies={spl:<3} temp={temp:.2}{net}",
+                 sample_plies={spl:<3} temp={temp:.2}{net}{store}",
                 name = tier.name,
                 nodes = tier.nodes.expect("validated"),
                 n_games = tier.n_games,
@@ -355,6 +376,7 @@ fn print_plan(cfg: &RunConfig) {
                 op_plies = tier.opening_plies.expect("validated"),
                 spl = tier.sample_plies.expect("validated"),
                 temp = tier.temperature,
+                store = if tier.store_legal_move_evals { " store_legal_move_evals=true" } else { "" },
             );
         }
         println!(

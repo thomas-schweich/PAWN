@@ -25,7 +25,9 @@
       "opening_multi_pv": 20,
       "opening_plies": 2,
       "sample_plies": 999,
-      "temperature": 0.5
+      "temperature": 0.5,
+      "store_legal_move_evals": true,
+      "net_selection": "large"
     },
     {
       "name": "nodes_0128",
@@ -35,7 +37,9 @@
       "opening_multi_pv": 20,
       "opening_plies": 2,
       "sample_plies": 999,
-      "temperature": 0.5
+      "temperature": 0.5,
+      "store_legal_move_evals": true,
+      "net_selection": "large"
     },
     {
       "name": "nodes_0256",
@@ -45,7 +49,9 @@
       "opening_multi_pv": 20,
       "opening_plies": 2,
       "sample_plies": 999,
-      "temperature": 0.5
+      "temperature": 0.5,
+      "store_legal_move_evals": true,
+      "net_selection": "large"
     },
     {
       "name": "nodes_1024",
@@ -55,7 +61,9 @@
       "opening_multi_pv": 20,
       "opening_plies": 2,
       "sample_plies": 999,
-      "temperature": 0.5
+      "temperature": 0.5,
+      "store_legal_move_evals": true,
+      "net_selection": "large"
     }
   ]
 }
