@@ -142,8 +142,11 @@ def test_scan_and_upload_excludes_zero_byte_placeholders(tmp_path: Path) -> None
     tiers = [mod.TierLayout(name="nodes_0001", local_dir=tier_dir)]
     api = _FakeApi()
     uploaded: set[str] = set()
+    sentinel_state: dict[str, tuple[int, int]] = {}
     upload_count = [0]
-    mod._scan_and_upload(api, "org/name", tiers, uploaded, upload_count, prune_local=False)
+    mod._scan_and_upload(
+        api, "org/name", tiers, uploaded, sentinel_state, upload_count, prune_local=False
+    )
 
     # Exactly one commit (shards+state batch); no separate manifest batch
     # since no `_manifest.json` exists yet.
@@ -155,8 +158,68 @@ def test_scan_and_upload_excludes_zero_byte_placeholders(tmp_path: Path) -> None
         "nodes_0001/shard-s000001-r000010.parquet",
         "nodes_0001/_tier_state.json",
     }
-    # Both committed files made it into the in-memory uploaded set.
-    assert uploaded == {
-        "nodes_0001/shard-s000001-r000010.parquet",
+    # Shard goes into the immutable `uploaded` set; sentinel goes into
+    # `sentinel_state` keyed by (size, mtime_ns) so a future rewrite is
+    # re-uploaded rather than skipped.
+    assert uploaded == {"nodes_0001/shard-s000001-r000010.parquet"}
+    assert set(sentinel_state.keys()) == {"nodes_0001/_tier_state.json"}
+
+
+def test_sentinel_rewrite_triggers_reupload(tmp_path: Path) -> None:
+    """Codex round-3 P1 regression: when the rust binary rewrites a
+    `_tier_state.json` or `_manifest.json` with updated content (e.g.
+    refreshed `n_games` after a tier extension, or end-of-run manifest
+    completion), the watcher MUST re-upload it. Tracking sentinels by
+    `repo_path in uploaded` (as the previous implementation did) caused
+    the rewritten content to be silently dropped — new shards landed
+    remote while the manifest stayed stale, and future pods couldn't
+    observe the completed extension."""
+    mod = _load_module()
+    tier_dir = tmp_path / "nodes_0001"
+    tier_dir.mkdir()
+    state_path = tier_dir / "_tier_state.json"
+    state_path.write_text('{"n_games": 100}')
+    (tier_dir / "shard-s000000-r000050.parquet").write_bytes(b"x" * 1000)
+
+    tiers = [mod.TierLayout(name="nodes_0001", local_dir=tier_dir)]
+    api = _FakeApi()
+    uploaded: set[str] = set()
+    sentinel_state: dict[str, tuple[int, int]] = {}
+    upload_count = [0]
+
+    # Cycle 1: shard + sentinel both upload.
+    mod._scan_and_upload(
+        api, "org/name", tiers, uploaded, sentinel_state, upload_count, prune_local=False
+    )
+    assert len(api.calls) == 1
+    cycle1_paths = {op.path_in_repo for op in api.calls[0]["operations"]}
+    assert cycle1_paths == {
+        "nodes_0001/shard-s000000-r000050.parquet",
         "nodes_0001/_tier_state.json",
     }
+
+    # Cycle 2: nothing changed — shard skipped (in `uploaded`), sentinel
+    # skipped (signature matches `sentinel_state`).
+    mod._scan_and_upload(
+        api, "org/name", tiers, uploaded, sentinel_state, upload_count, prune_local=False
+    )
+    assert len(api.calls) == 1, "no new commit when nothing changed"
+
+    # Rewrite the sentinel as the rust binary would (atomic rename via
+    # write to .tmp then rename; here we just rewrite to ensure a fresh
+    # mtime_ns). Also slightly different content so size+mtime differs
+    # at least in mtime_ns.
+    import time
+    time.sleep(0.01)  # ensure mtime_ns advances even on coarse clocks
+    state_path.write_text('{"n_games": 200, "extended": true}')
+
+    # Cycle 3: sentinel signature differs → it should re-upload. Shard
+    # is unchanged so it should NOT re-upload.
+    mod._scan_and_upload(
+        api, "org/name", tiers, uploaded, sentinel_state, upload_count, prune_local=False
+    )
+    assert len(api.calls) == 2, "rewritten sentinel must re-upload"
+    cycle3_paths = {op.path_in_repo for op in api.calls[1]["operations"]}
+    assert cycle3_paths == {"nodes_0001/_tier_state.json"}, (
+        f"only the rewritten sentinel should be in the second commit; got {cycle3_paths}"
+    )

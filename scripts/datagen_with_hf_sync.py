@@ -118,18 +118,28 @@ def ensure_repo(api: HfApi, repo_id: str) -> None:
         api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
 
 
-def primer(api: HfApi, repo_id: str, tiers: list[TierLayout]) -> set[str]:
+def primer(
+    api: HfApi, repo_id: str, tiers: list[TierLayout]
+) -> tuple[set[str], dict[str, tuple[int, int]]]:
     """Download sentinels and create zero-byte placeholders for remote shards.
 
-    Returns the set of repo paths (e.g. `nodes_0001/shard-w000-...parquet`)
-    we already know are remote — used to seed the watcher's "uploaded" set
-    so it doesn't try to re-upload them.
+    Returns:
+      * `uploaded_shards`: repo paths of remote shards (immutable; the
+        watcher must never re-upload these).
+      * `sentinel_state`: for each downloaded sentinel, the local
+        `(size, mtime_ns)` snapshot taken right after the download. The
+        watcher compares each cycle's local sentinel signature against
+        this baseline and re-uploads when it differs — so when the rust
+        binary rewrites `_manifest*.json` or `_tier_state*.json` (with
+        updated row counts / completed_at, or with a refreshed n_games
+        after extension), the new content actually reaches HF instead of
+        being skipped as "already primed".
     """
     try:
         remote_files = api.list_repo_files(repo_id, repo_type="dataset")
     except RepositoryNotFoundError:
         # Brand-new run: nothing to prime.
-        return set()
+        return set(), {}
 
     by_subdir: dict[str, list[str]] = {}
     for f in remote_files:
@@ -140,7 +150,8 @@ def primer(api: HfApi, repo_id: str, tiers: list[TierLayout]) -> set[str]:
         subdir, name = f.split("/", 1)
         by_subdir.setdefault(subdir, []).append(name)
 
-    primed: set[str] = set()
+    uploaded_shards: set[str] = set()
+    sentinel_state: dict[str, tuple[int, int]] = {}
     for tier in tiers:
         files = by_subdir.get(tier.name, [])
         if not files:
@@ -155,15 +166,16 @@ def primer(api: HfApi, repo_id: str, tiers: list[TierLayout]) -> set[str]:
                 # so a multi-pod run's resume picks up every pod's state.
                 LOG.info("primer: downloading sentinel %s", repo_path)
                 _download_replace(api, repo_id, repo_path, local_path)
-                primed.add(repo_path)
+                st = local_path.stat()
+                sentinel_state[repo_path] = (st.st_size, st.st_mtime_ns)
             elif SHARD_RE.match(name):
                 # Placeholder — touch a zero-byte file with the same name.
                 # If a real (non-placeholder) file is already there, leave
                 # it alone — could be mid-upload or pre-existing.
                 if not local_path.exists():
                     local_path.touch()
-                primed.add(repo_path)
-    return primed
+                uploaded_shards.add(repo_path)
+    return uploaded_shards, sentinel_state
 
 
 def _download_replace(api: HfApi, repo_id: str, repo_path: str, local_path: Path) -> None:
@@ -311,6 +323,7 @@ def watcher_loop(
     repo_id: str,
     tiers: list[TierLayout],
     uploaded: set[str],
+    sentinel_state: dict[str, tuple[int, int]],
     upload_count: list[int],
     stop: threading.Event,
     poll_interval: float,
@@ -329,7 +342,7 @@ def watcher_loop(
     consecutive_failures = 0
     while not stop.is_set():
         try:
-            _scan_and_upload(api, repo_id, tiers, uploaded, upload_count, prune_local)
+            _scan_and_upload(api, repo_id, tiers, uploaded, sentinel_state, upload_count, prune_local)
             consecutive_failures = 0
         except Exception as e:
             consecutive_failures += 1
@@ -358,6 +371,7 @@ def _scan_and_upload(
     repo_id: str,
     tiers: list[TierLayout],
     uploaded: set[str],
+    sentinel_state: dict[str, tuple[int, int]],
     upload_count: list[int],
     prune_local: bool,
 ) -> None:
@@ -380,6 +394,14 @@ def _scan_and_upload(
     primer and are already remote. Manifest with no preceding shards
     commit (because no new shards in this cycle) commits on its own as
     cycle 2.
+
+    Shards (`uploaded`) are immutable: a `repo_path in uploaded` short
+    circuit is correct. Sentinels (tier_state / manifest) ARE mutable —
+    the rust binary rewrites them with updated counts at end-of-run and
+    on tier-extension — so they're tracked separately by
+    `(size, mtime_ns)` in `sentinel_state`. A sentinel whose local
+    signature differs from the recorded one re-enters the upload batch
+    so the new content reaches HF.
     """
     for tier in tiers:
         if not tier.local_dir.exists():
@@ -393,15 +415,24 @@ def _scan_and_upload(
                 continue
             name = entry.name
             repo_path = f"{tier.name}/{name}"
-            if repo_path in uploaded:
-                continue
-            if entry.stat().st_size == 0:
+            st = entry.stat()
+            if st.st_size == 0:
                 # Placeholder or mid-write atomic rename — skip until it
                 # has content.
                 continue
-            if SHARD_RE.match(name) or TIER_STATE_RE.match(name):
+            if SHARD_RE.match(name):
+                if repo_path in uploaded:
+                    continue
+                new_shards_and_state.append(name)
+            elif TIER_STATE_RE.match(name):
+                sig = (st.st_size, st.st_mtime_ns)
+                if sentinel_state.get(repo_path) == sig:
+                    continue
                 new_shards_and_state.append(name)
             elif MANIFEST_RE.match(name):
+                sig = (st.st_size, st.st_mtime_ns)
+                if sentinel_state.get(repo_path) == sig:
+                    continue
                 new_manifests.append(name)
             # else: not ours — ignore.
 
@@ -417,14 +448,21 @@ def _scan_and_upload(
                 commit_message=f"sync {tier.name}: {len(new_shards_and_state)} file(s)",
             )
             for name in new_shards_and_state:
-                uploaded.add(f"{tier.name}/{name}")
+                repo_path = f"{tier.name}/{name}"
                 upload_count[0] += 1
-                # Prune local shards (truncate to 0 bytes) after the
-                # commit lands. Sentinels stay local — the rust binary
-                # reads them on every tier start.
-                if prune_local and SHARD_RE.match(name):
-                    with open(tier.local_dir / name, "wb"):
-                        pass
+                if SHARD_RE.match(name):
+                    uploaded.add(repo_path)
+                    # Prune local shards (truncate to 0 bytes) after the
+                    # commit lands. Sentinels stay local — the rust binary
+                    # reads them on every tier start.
+                    if prune_local:
+                        with open(tier.local_dir / name, "wb"):
+                            pass
+                else:
+                    # Sentinel: record the (size, mtime_ns) we just
+                    # uploaded so the next cycle skips it iff unchanged.
+                    st = (tier.local_dir / name).stat()
+                    sentinel_state[repo_path] = (st.st_size, st.st_mtime_ns)
 
         if new_manifests:
             LOG.info(
@@ -438,8 +476,10 @@ def _scan_and_upload(
                 commit_message=f"manifest {tier.name}",
             )
             for name in new_manifests:
-                uploaded.add(f"{tier.name}/{name}")
+                repo_path = f"{tier.name}/{name}"
                 upload_count[0] += 1
+                st = (tier.local_dir / name).stat()
+                sentinel_state[repo_path] = (st.st_size, st.st_mtime_ns)
 
 
 def install_signal_handlers(proc_holder: list["subprocess.Popen[bytes]"]) -> None:
@@ -618,10 +658,14 @@ def main() -> int:
     if args.no_primer:
         LOG.info("--no-primer: skipping primer phase (no remote listing or sentinel download)")
         primed: set[str] = set()
+        sentinel_state: dict[str, tuple[int, int]] = {}
     else:
         LOG.info("priming from %s", args.repo_id)
-        primed = primer(api, args.repo_id, tiers)
-        LOG.info("primer: %d remote files known (placeholders + sentinels)", len(primed))
+        primed, sentinel_state = primer(api, args.repo_id, tiers)
+        LOG.info(
+            "primer: %d remote shards known, %d sentinel(s) downloaded",
+            len(primed), len(sentinel_state),
+        )
 
     # Signal handlers must be installed BEFORE Popen — the proc_holder
     # is shared between the handler closure (forwards signals to the
@@ -661,7 +705,7 @@ def main() -> int:
     upload_count = [0]
     watcher = threading.Thread(
         target=watcher_loop,
-        args=(api, args.repo_id, tiers, primed, upload_count, stop,
+        args=(api, args.repo_id, tiers, primed, sentinel_state, upload_count, stop,
               args.poll_interval, args.prune_local,
               args.max_consecutive_failures, watcher_error,
               _kill_child_on_watcher_failure),
@@ -723,7 +767,7 @@ def main() -> int:
     else:
         LOG.info("watcher exited cleanly; running final drain")
         try:
-            _scan_and_upload(api, args.repo_id, tiers, primed, upload_count, args.prune_local)
+            _scan_and_upload(api, args.repo_id, tiers, primed, sentinel_state, upload_count, args.prune_local)
         except Exception:
             LOG.exception("final drain failed")
             drained_ok = False

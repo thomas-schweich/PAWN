@@ -190,14 +190,18 @@ pub fn run_tier(
         .map(expected_n_rows)
         .sum();
 
-    // Skip if this pod's slice is already complete. "Complete" requires:
-    //   1. fingerprint match (catches config drift),
-    //   2. shard count match (catches n_games growth that adds new shards),
-    //   3. n_games_written >= expected_total_games (catches n_games growth
-    //      that stays WITHIN the last shard — e.g. 900 -> 950 with
-    //      shard_size_games=1000 keeps total_shards at 1, so check (2) is
-    //      a no-op and we'd silently re-use the old manifest without
-    //      regenerating the boundary shard, leaving the dataset short).
+    // Skip if this pod's slice is already complete. "Complete" requires
+    // EXACT equality on shard count AND on n_games_written:
+    //   1. Fingerprint match (catches config drift).
+    //   2. shard count == expected (catches n_games growth that adds
+    //      new shards).
+    //   3. n_games_written == expected (catches both directions: growth
+    //      that stays WITHIN the last shard — 900→950 with
+    //      shard_size_games=1000 keeps total_shards at 1 so check (2) is
+    //      a no-op — AND shrink that leaves oversized shards on disk.
+    //      For the shrink case we *want* fall-through so `detect_resume`
+    //      can reject the oversized rows with a clear error rather than
+    //      silently re-using a stale-and-larger manifest).
     if let Some(manifest) = TierManifest::load(&tier_dir, pod_range.as_ref())? {
         if manifest.config_fingerprint != fingerprint {
             return Err(anyhow!(
@@ -210,7 +214,7 @@ pub fn run_tier(
             ));
         }
         if manifest.shards.len() as u64 == expected_shard_count
-            && manifest.n_games_written >= expected_total_games
+            && manifest.n_games_written == expected_total_games
         {
             eprintln!(
                 "[{}] already complete for range {:?} ({} games, {} shards) — skipping",
@@ -226,10 +230,13 @@ pub fn run_tier(
             });
         }
         // Same fingerprint but shard count or game count don't agree ⇒
-        // `tier.n_games` changed since last completion (likely grew). Fall
-        // through to the normal run path; it will regenerate the boundary
-        // shard and write the new tail. The stale manifest gets
-        // overwritten at end of run.
+        // `tier.n_games` changed since last completion. Fall through:
+        //   * Grew → run path regenerates boundary shard + adds new tail.
+        //   * Shrank → `detect_resume` errors loudly on the oversized
+        //     shards that are still on disk.
+        // The stale manifest gets overwritten at end of run on the grow
+        // path; on the shrink path the operator sees the error before
+        // any state is mutated.
         eprintln!(
             "[{}] manifest covers {} shards / {} games, current config expects {} / {} — regenerating delta",
             tier.name, manifest.shards.len(), manifest.n_games_written,
@@ -252,7 +259,26 @@ pub fn run_tier(
     let any_existing_in_range = !done_shards.is_empty() || !boundary_rewrites.is_empty();
     match TierState::load(&tier_dir, pod_range.as_ref())? {
         Some(state) if state.config_fingerprint == fingerprint => {
-            // Matches — safe to resume.
+            // Refresh `n_games` if it grew since the state file was
+            // written. The fingerprint excludes `n_games` so this branch
+            // is hit on tier extension — but `enforce_n_games_invariant`
+            // on a sibling/later pod scans state files to learn what
+            // n_games other pods committed to. Without this refresh, the
+            // state stays at its prior smaller value forever after a
+            // single-pod extension, and a sibling pod launched later
+            // with the old smaller n_games config would pass the
+            // invariant (state==current, not state>current) instead of
+            // being caught.
+            if state.n_games < tier.n_games {
+                TierState {
+                    config_fingerprint: fingerprint.clone(),
+                    started_at: state.started_at.clone(),
+                    n_games: tier.n_games,
+                    shard_range: pod_range.clone(),
+                }
+                .save(&tier_dir)
+                .context("refreshing tier state n_games after extension")?;
+            }
         }
         Some(state) => {
             return Err(anyhow!(
