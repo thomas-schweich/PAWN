@@ -116,8 +116,18 @@ else
     # Strip is mandatory: unstripped binary is ~30 MB vs ~7 MB stripped.
     strip "$SF_SRC/stockfish"
     mkdir -p "$cache_dir"
-    cp "$SF_SRC/stockfish" "$cache_bin"
-    chmod +x "$cache_bin"
+    # Atomic install: copy to a tempfile in the SAME directory (so `mv` is
+    # a rename, not a cross-fs copy), chmod, then `mv` over the final
+    # path. Without this, a pod interrupted mid-`cp` leaves a truncated
+    # binary at "$cache_bin"; the next launch's `-x "$cache_bin"` test
+    # passes (`-x` only checks the executable bit, not size or content),
+    # so the script symlinks a corrupt binary and the rust runner crashes
+    # on first UCI handshake. The operator would have to manually delete
+    # the cache entry to recover.
+    cache_tmp="$cache_dir/.stockfish-patched.tmp.$$"
+    cp "$SF_SRC/stockfish" "$cache_tmp"
+    chmod +x "$cache_tmp"
+    mv "$cache_tmp" "$cache_bin"
     t1=$(date +%s 2>/dev/null || echo 0)
     elapsed=$((t1 - t0))
 fi

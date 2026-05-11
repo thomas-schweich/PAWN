@@ -339,6 +339,58 @@ pub fn run_tier(
         pod_shards,
     );
 
+    // Short-circuit before spawning workers / Stockfish if there's no
+    // work to do. Two cases hit this:
+    //   (a) Empty clamped range — operator passed `--shard-id-range`
+    //       that doesn't overlap this tier (already warned above).
+    //   (b) Every shard in the pod's range is already done + nothing
+    //       needs a boundary rewrite. This is the recovery path: a
+    //       prior run wrote all the shards but never landed the
+    //       manifest (e.g. crashed during manifest write, or the
+    //       operator deleted just the manifest to force a re-run).
+    //       Without this short-circuit, the runner spawns `n_workers`
+    //       threads each launching a Stockfish process, only to
+    //       discover the atomic counter is exhausted — wasteful on
+    //       the happy path and a hard failure if the stockfish binary
+    //       isn't installed in this recovery context (e.g. running
+    //       reconciliation tooling on a pod that never had stockfish).
+    let no_work_to_do = expected_shard_count == 0
+        || (done_shards.len() as u64 == expected_shard_count
+            && boundary_rewrites.is_empty());
+    if no_work_to_do {
+        if expected_shard_count == 0 {
+            eprintln!(
+                "[{}] no shards in this pod's range — writing empty manifest only",
+                tier.name,
+            );
+        } else {
+            eprintln!(
+                "[{}] all {} shards already on disk — skipping worker spawn, rewriting manifest only",
+                tier.name, expected_shard_count,
+            );
+        }
+        let all_shards: Vec<PathBuf> = (shard_range.start..shard_range.end)
+            .map(|sid| crate::shard::shard_final_path(&tier_dir, sid, expected_n_rows(sid)))
+            .collect();
+        let total_written: u64 = (shard_range.start..shard_range.end).map(expected_n_rows).sum();
+        let manifest = TierManifest {
+            tier_name: tier.name.clone(),
+            config_fingerprint: fingerprint,
+            n_games_written: total_written,
+            shards: all_shards
+                .iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect(),
+            completed_at: now_iso8601(),
+            shard_range: pod_range,
+        };
+        manifest.save(&tier_dir).context("writing tier manifest (no-work path)")?;
+        return Ok(TierResult {
+            n_games_written: total_written,
+            shards: all_shards,
+        });
+    }
+
     let cfg = Arc::new(cfg.clone());
     let tier = Arc::new(tier.clone());
     let tier_dir = Arc::new(tier_dir);
