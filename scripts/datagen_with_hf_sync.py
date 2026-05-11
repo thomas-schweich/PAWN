@@ -47,7 +47,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from huggingface_hub import CommitOperationAdd, HfApi, get_token
+from huggingface_hub import (
+    CommitOperationAdd,
+    CommitOperationDelete,
+    HfApi,
+    get_token,
+)
 from huggingface_hub.errors import RepositoryNotFoundError
 from huggingface_hub.utils import HfHubHTTPError
 
@@ -74,7 +79,7 @@ TIER_STATE_RE = re.compile(r"^_tier_state(-s\d{6,}-s\d{6,})?\.json$")
 # `{6,}` quantifier accepts wider fields for >999_999 shards or rows
 # (rare on a 100M-game run with 2K shard size = 50K shards, still 5
 # digits; defensive).
-SHARD_RE = re.compile(r"^shard-s\d{6,}-r\d{6,}\.parquet$")
+SHARD_RE = re.compile(r"^shard-s(?P<shard_id>\d{6,})-r\d{6,}\.parquet$")
 
 
 @dataclass(frozen=True)
@@ -218,6 +223,7 @@ def _upload_folder_batch(
     path_in_repo: str,
     files: list[str],
     commit_message: str,
+    deletes: list[str] | None = None,
 ) -> None:
     """Commit a batch of files from `local_dir` as a single HF commit.
 
@@ -258,10 +264,10 @@ def _upload_folder_batch(
     cycle. Batched commits commit many shards atomically — one commit
     per tier per cycle.
     """
-    if not files:
+    if not files and not deletes:
         return
     # Defense in depth: refuse to ever upload a zero-byte file.
-    operations: list[CommitOperationAdd] = []
+    operations: list[CommitOperationAdd | CommitOperationDelete] = []
     for name in files:
         path = local_dir / name
         try:
@@ -280,6 +286,14 @@ def _upload_folder_batch(
         operations.append(CommitOperationAdd(
             path_in_repo=f"{path_in_repo}/{name}",
             path_or_fileobj=str(path),
+        ))
+    # Deletes for superseded files (e.g. boundary-rewrite shards whose
+    # filename changed because the row count grew). Bundled into the
+    # same atomic commit as the adds so a downstream lister never sees
+    # both the old and the new filename simultaneously.
+    for repo_relative in deletes or []:
+        operations.append(CommitOperationDelete(
+            path_in_repo=f"{path_in_repo}/{repo_relative}",
         ))
     delay = 2.0
     for attempt in range(5):
@@ -407,9 +421,27 @@ def _scan_and_upload(
         if not tier.local_dir.exists():
             continue
 
+        # Build a `shard_id -> uploaded-filename` map for THIS tier so we
+        # can detect boundary-rewrite supersession: if the rust runner
+        # produces a `shard-sNNN-rNEW.parquet` (different row count, same
+        # shard id as a previously-uploaded `shard-sNNN-rOLD.parquet`),
+        # we issue a `CommitOperationDelete` for the old filename in the
+        # same atomic commit as the add. Otherwise both copies live on
+        # HF and downstream listers see both, double-counting games.
+        prefix = f"{tier.name}/"
+        uploaded_by_shard_id: dict[int, str] = {}
+        for repo_path in uploaded:
+            if not repo_path.startswith(prefix):
+                continue
+            name = repo_path[len(prefix):]
+            m = SHARD_RE.match(name)
+            if m:
+                uploaded_by_shard_id[int(m.group("shard_id"))] = name
+
         # Bucket new local files by category.
         new_shards_and_state: list[str] = []
         new_manifests: list[str] = []
+        superseded_shards: list[str] = []  # OLD filenames to delete remote-side
         for entry in tier.local_dir.iterdir():
             if not entry.is_file():
                 continue
@@ -420,9 +452,17 @@ def _scan_and_upload(
                 # Placeholder or mid-write atomic rename — skip until it
                 # has content.
                 continue
-            if SHARD_RE.match(name):
+            shard_match = SHARD_RE.match(name)
+            if shard_match:
                 if repo_path in uploaded:
                     continue
+                shard_id = int(shard_match.group("shard_id"))
+                old_name = uploaded_by_shard_id.get(shard_id)
+                if old_name is not None and old_name != name:
+                    # Boundary-rewrite: same shard_id, different rows.
+                    # The rust runner already `remove_file`'d the local
+                    # OLD; the remote copy is what we need to retire.
+                    superseded_shards.append(old_name)
                 new_shards_and_state.append(name)
             elif TIER_STATE_RE.match(name):
                 sig = (st.st_size, st.st_mtime_ns)
@@ -436,16 +476,20 @@ def _scan_and_upload(
                 new_manifests.append(name)
             # else: not ours — ignore.
 
-        if new_shards_and_state:
+        if new_shards_and_state or superseded_shards:
             LOG.info(
-                "tier %s: committing %d new file(s) (shards + tier_state)",
+                "tier %s: committing %d new file(s) (shards + tier_state)%s",
                 tier.name, len(new_shards_and_state),
+                f" + deleting {len(superseded_shards)} superseded shard(s)"
+                if superseded_shards else "",
             )
             _upload_folder_batch(
                 api, repo_id, tier.local_dir,
                 path_in_repo=tier.name,
                 files=new_shards_and_state,
-                commit_message=f"sync {tier.name}: {len(new_shards_and_state)} file(s)",
+                deletes=superseded_shards,
+                commit_message=f"sync {tier.name}: {len(new_shards_and_state)} file(s)"
+                + (f", {len(superseded_shards)} superseded" if superseded_shards else ""),
             )
             for name in new_shards_and_state:
                 repo_path = f"{tier.name}/{name}"
@@ -463,6 +507,8 @@ def _scan_and_upload(
                     # uploaded so the next cycle skips it iff unchanged.
                     st = (tier.local_dir / name).stat()
                     sentinel_state[repo_path] = (st.st_size, st.st_mtime_ns)
+            for old_name in superseded_shards:
+                uploaded.discard(f"{tier.name}/{old_name}")
 
         if new_manifests:
             LOG.info(

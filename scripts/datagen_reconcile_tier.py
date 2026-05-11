@@ -40,7 +40,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from huggingface_hub import CommitOperationDelete, HfApi, get_token
+from huggingface_hub import (
+    CommitOperationAdd,
+    CommitOperationDelete,
+    HfApi,
+    get_token,
+)
 
 LOG = logging.getLogger("datagen_reconcile")
 
@@ -50,7 +55,11 @@ LOG = logging.getLogger("datagen_reconcile")
 PER_POD_MANIFEST_RE = re.compile(
     r"^_manifest-s(?P<start>\d{6,})-s(?P<end>\d{6,})\.json$"
 )
+PER_POD_TIER_STATE_RE = re.compile(
+    r"^_tier_state-s(?P<start>\d{6,})-s(?P<end>\d{6,})\.json$"
+)
 CANONICAL_MANIFEST = "_manifest.json"
+CANONICAL_TIER_STATE = "_tier_state.json"
 
 
 @dataclass(frozen=True)
@@ -64,6 +73,16 @@ class PerPodManifest:
     completed_at: str
 
 
+@dataclass(frozen=True)
+class PerPodTierState:
+    repo_path: str
+    start: int
+    end: int
+    fingerprint: str
+    n_games: int
+    started_at: str
+
+
 def load_run_config(path: Path) -> dict[str, Any]:
     with path.open("r") as f:
         return json.load(f)
@@ -73,15 +92,32 @@ def total_shards(tier_cfg: dict[str, Any], shard_size_games: int) -> int:
     return math.ceil(tier_cfg["n_games"] / shard_size_games)
 
 
+def _list_repo_files(api: HfApi, repo_id: str) -> list[str]:
+    try:
+        return api.list_repo_files(repo_id, repo_type="dataset")
+    except Exception as e:
+        raise SystemExit(f"failed to list repo {repo_id}: {e}") from e
+
+
+def _download_json(api: HfApi, repo_id: str, repo_path: str) -> dict[str, Any]:
+    local = api.hf_hub_download(repo_id=repo_id, filename=repo_path, repo_type="dataset")
+    # Explicit if-raise (not assert) so the type narrowing survives
+    # `python -O`, which strips asserts and would otherwise let a
+    # `DryRunFileInfo` slip through to `open()`.
+    if not isinstance(local, str):
+        raise RuntimeError(
+            f"hf_hub_download returned non-str {type(local).__name__} for {repo_path}"
+        )
+    with open(local, "r") as fh:
+        return json.load(fh)
+
+
 def fetch_remote_manifests(
     api: HfApi, repo_id: str, tier_name: str
 ) -> list[PerPodManifest]:
     """List the tier's directory in the remote repo, download each
     per-pod manifest, return parsed contents."""
-    try:
-        files = api.list_repo_files(repo_id, repo_type="dataset")
-    except Exception as e:
-        raise SystemExit(f"failed to list repo {repo_id}: {e}") from e
+    files = _list_repo_files(api, repo_id)
 
     pod_paths: list[tuple[str, int, int]] = []  # (repo_path, start, end)
     prefix = f"{tier_name}/"
@@ -96,16 +132,7 @@ def fetch_remote_manifests(
 
     out: list[PerPodManifest] = []
     for repo_path, start, end in pod_paths:
-        local = api.hf_hub_download(repo_id=repo_id, filename=repo_path, repo_type="dataset")
-        # Explicit if-raise (not assert) so the type narrowing survives
-        # `python -O`, which strips asserts and would otherwise let a
-        # `DryRunFileInfo` slip through to `open()`.
-        if not isinstance(local, str):
-            raise RuntimeError(
-                f"hf_hub_download returned non-str {type(local).__name__} for {repo_path}"
-            )
-        with open(local, "r") as fh:
-            payload = json.load(fh)
+        payload = _download_json(api, repo_id, repo_path)
         out.append(PerPodManifest(
             repo_path=repo_path,
             start=start,
@@ -116,6 +143,42 @@ def fetch_remote_manifests(
             completed_at=payload["completed_at"],
         ))
     out.sort(key=lambda m: m.start)
+    return out
+
+
+def fetch_remote_tier_states(
+    api: HfApi, repo_id: str, tier_name: str
+) -> list[PerPodTierState]:
+    """Same as `fetch_remote_manifests` but for `_tier_state-s<A>-s<B>.json`
+    sentinels. We need these to construct a canonical `_tier_state.json`
+    after reconciliation — without one, a later unscoped run that grows
+    `tier.n_games` would hit `TierState::load(..., None) -> None` and
+    abort with "shards exist but no tier state file is present" because
+    the per-pod state files were also deleted by reconcile."""
+    files = _list_repo_files(api, repo_id)
+    prefix = f"{tier_name}/"
+    pod_paths: list[tuple[str, int, int]] = []
+    for f in files:
+        if not f.startswith(prefix):
+            continue
+        name = f[len(prefix):]
+        m = PER_POD_TIER_STATE_RE.match(name)
+        if not m:
+            continue
+        pod_paths.append((f, int(m.group("start")), int(m.group("end"))))
+
+    out: list[PerPodTierState] = []
+    for repo_path, start, end in pod_paths:
+        payload = _download_json(api, repo_id, repo_path)
+        out.append(PerPodTierState(
+            repo_path=repo_path,
+            start=start,
+            end=end,
+            fingerprint=payload["config_fingerprint"],
+            n_games=payload.get("n_games", 0),
+            started_at=payload["started_at"],
+        ))
+    out.sort(key=lambda s: s.start)
     return out
 
 
@@ -183,6 +246,25 @@ def reconcile_one(
     validate_ranges(manifests, total)
     fingerprint = validate_fingerprints(manifests)
 
+    states = fetch_remote_tier_states(api, repo_id, tier_name)
+    LOG.info("found %d per-pod tier-state(s) for %s", len(states), tier_name)
+    # Sanity-check states. They're optional fallbacks if missing (the run
+    # might predate the n_games-in-state field), but if present they must
+    # all agree on fingerprint and n_games.
+    if states:
+        state_fps = {s.fingerprint for s in states}
+        if state_fps != {fingerprint}:
+            raise SystemExit(
+                f"per-pod tier states disagree with manifests on fingerprint: "
+                f"manifests={fingerprint!r}, states={sorted(state_fps)!r}"
+            )
+        state_ngs = {s.n_games for s in states if s.n_games > 0}
+        if len(state_ngs) > 1:
+            raise SystemExit(
+                f"per-pod tier states disagree on tier-level n_games: "
+                f"{sorted(state_ngs)}; reconciliation refuses to merge"
+            )
+
     merged_shards: list[str] = []
     n_games = 0
     completed_at = ""
@@ -201,58 +283,95 @@ def reconcile_one(
             f"per-pod manifests reference overlapping shards"
         )
 
-    unified = {
+    unified_manifest = {
         "tier_name": tier_name,
         "config_fingerprint": fingerprint,
         "n_games_written": n_games,
         "shards": merged_shards,
         "completed_at": completed_at,
     }
+    # Build a canonical `_tier_state.json` from the per-pod states (or
+    # synthesize one if no per-pod states exist, e.g. legacy reconcile).
+    # Without this, a later UNSCOPED run that grows `tier.n_games` would
+    # fall through the manifest-skip check, find shards on disk, then
+    # abort because `TierState::load(..., None)` returns None (the
+    # per-pod state files get deleted below, leaving no sentinel for a
+    # canonical-scope reader to find). The canonical state lets the
+    # documented "grow n_games" flow work after multi-pod reconciliation.
+    canonical_n_games = max(
+        (s.n_games for s in states if s.n_games > 0),
+        default=int(tier_cfg["n_games"]),
+    )
+    earliest_started_at = min((s.started_at for s in states), default=completed_at)
+    canonical_state = {
+        "config_fingerprint": fingerprint,
+        "started_at": earliest_started_at,
+        "n_games": canonical_n_games,
+        # shard_range omitted — canonical sentinels never carry one.
+    }
 
     if dry_run:
         LOG.info(
-            "DRY RUN: would commit %s/%s with %d shards / %d games, "
-            "then delete %d per-pod manifest(s)",
-            repo_id, f"{tier_name}/{CANONICAL_MANIFEST}",
-            len(merged_shards), n_games, len(manifests),
+            "DRY RUN: would commit canonical %s + %s (%d shards / %d games), "
+            "then delete %d per-pod manifest(s) and %d per-pod tier-state(s)",
+            f"{tier_name}/{CANONICAL_MANIFEST}",
+            f"{tier_name}/{CANONICAL_TIER_STATE}",
+            len(merged_shards), n_games, len(manifests), len(states),
         )
         return
 
-    repo_path = f"{tier_name}/{CANONICAL_MANIFEST}"
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
-        json.dump(unified, tf, indent=2)
-        tmp_path = tf.name
+    # Phase 1: write canonical manifest + canonical state to local tempfiles,
+    # then commit both in ONE atomic create_commit. Atomicity guarantees a
+    # downstream reader never sees the canonical manifest without the
+    # canonical state (or vice versa) — both appear together or not at all.
+    manifest_tmp: str | None = None
+    state_tmp: str | None = None
     try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
+            json.dump(unified_manifest, tf, indent=2)
+            manifest_tmp = tf.name
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
+            json.dump(canonical_state, tf, indent=2)
+            state_tmp = tf.name
         LOG.info(
-            "committing unified %s (%d shards / %d games)",
-            repo_path, len(merged_shards), n_games,
+            "committing canonical manifest + tier_state for %s (%d shards / %d games)",
+            tier_name, len(merged_shards), n_games,
         )
-        api.upload_file(
-            path_or_fileobj=tmp_path,
-            path_in_repo=repo_path,
+        api.create_commit(
             repo_id=repo_id,
             repo_type="dataset",
+            operations=[
+                CommitOperationAdd(
+                    path_in_repo=f"{tier_name}/{CANONICAL_MANIFEST}",
+                    path_or_fileobj=manifest_tmp,
+                ),
+                CommitOperationAdd(
+                    path_in_repo=f"{tier_name}/{CANONICAL_TIER_STATE}",
+                    path_or_fileobj=state_tmp,
+                ),
+            ],
             commit_message=(
-                f"reconcile {tier_name}: merge {len(manifests)} per-pod manifest(s)"
+                f"reconcile {tier_name}: merge {len(manifests)} per-pod sentinel(s)"
             ),
         )
     finally:
-        # Always clean up the temp file, success or failure. Without this,
-        # repeated failed reconcile invocations leak ~1 file per attempt
+        # Always clean up the temp files, success or failure. Without this,
+        # repeated failed reconcile invocations leak ~2 files per attempt
         # into /tmp until the pod is destroyed.
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        for p in (manifest_tmp, state_tmp):
+            if p is None:
+                continue
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
-    # Clean up the per-pod manifests now that the unified one is committed.
-    # Batched into a single `create_commit` with one `CommitOperationDelete`
-    # per pod: a 20-pod reconcile would otherwise commit 20 delete-files
-    # back-to-back, eating ~16 % of HF's 128 commits/hour budget while the
-    # watcher on another pod is also committing. One batched commit is one
-    # rate-limit slot regardless of pod count.
-    delete_ops = [
+    # Phase 2: delete per-pod manifests + per-pod states in one batched
+    # commit. Two commits total per reconcile, regardless of pod count.
+    delete_ops: list[CommitOperationDelete] = [
         CommitOperationDelete(path_in_repo=m.repo_path) for m in manifests
+    ] + [
+        CommitOperationDelete(path_in_repo=s.repo_path) for s in states
     ]
     try:
         api.create_commit(
@@ -260,15 +379,17 @@ def reconcile_one(
             repo_type="dataset",
             operations=delete_ops,
             commit_message=(
-                f"reconcile {tier_name}: remove {len(manifests)} per-pod manifest(s)"
+                f"reconcile {tier_name}: remove {len(manifests)} per-pod manifest(s) "
+                f"+ {len(states)} per-pod state(s)"
             ),
         )
     except Exception as e:  # noqa: BLE001 — log every failure mode
         LOG.warning(
-            "failed to delete per-pod manifests after unified commit: %s; "
-            "the unified manifest is authoritative, but the dangling per-pod "
+            "failed to delete per-pod sentinels after canonical commit: %s; "
+            "the canonical files are authoritative, but the dangling per-pod "
             "files may confuse a future reconcile. Manual cleanup: %s",
-            e, ", ".join(m.repo_path for m in manifests),
+            e,
+            ", ".join([m.repo_path for m in manifests] + [s.repo_path for s in states]),
         )
 
 

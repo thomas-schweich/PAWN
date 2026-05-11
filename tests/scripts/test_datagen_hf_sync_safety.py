@@ -165,6 +165,59 @@ def test_scan_and_upload_excludes_zero_byte_placeholders(tmp_path: Path) -> None
     assert set(sentinel_state.keys()) == {"nodes_0001/_tier_state.json"}
 
 
+def test_boundary_rewrite_deletes_superseded_shard(tmp_path: Path) -> None:
+    """Codex round-4 P2 regression: when a tier grows `n_games` such
+    that the previous last shard was partial, the rust runner writes a
+    NEW shard filename with a larger row count and `remove_file`'s the
+    old smaller-row-count file. The orchestrator must include a
+    `CommitOperationDelete` for the old filename in the same commit
+    as the new file's `CommitOperationAdd`; otherwise both shards live
+    on HF and downstream listers double-count the games in the
+    boundary shard."""
+    mod = _load_module()
+    tier_dir = tmp_path / "nodes_0001"
+    tier_dir.mkdir()
+    # Cycle 1: only the small (boundary, partial) version of shard 0 exists.
+    (tier_dir / "shard-s000000-r000006.parquet").write_bytes(b"x" * 100)
+
+    tiers = [mod.TierLayout(name="nodes_0001", local_dir=tier_dir)]
+    api = _FakeApi()
+    uploaded: set[str] = set()
+    sentinel_state: dict[str, tuple[int, int]] = {}
+    upload_count = [0]
+    mod._scan_and_upload(
+        api, "org/name", tiers, uploaded, sentinel_state, upload_count, prune_local=False
+    )
+    assert len(api.calls) == 1
+    cycle1 = api.calls[0]["operations"]
+    assert len(cycle1) == 1
+    assert cycle1[0].path_in_repo == "nodes_0001/shard-s000000-r000006.parquet"
+    assert uploaded == {"nodes_0001/shard-s000000-r000006.parquet"}
+
+    # Boundary rewrite: rust binary renames `r000006` -> `r000008`
+    # (larger row count) and removes the old file.
+    (tier_dir / "shard-s000000-r000006.parquet").unlink()
+    (tier_dir / "shard-s000000-r000008.parquet").write_bytes(b"x" * 130)
+
+    mod._scan_and_upload(
+        api, "org/name", tiers, uploaded, sentinel_state, upload_count, prune_local=False
+    )
+    assert len(api.calls) == 2
+    cycle2 = api.calls[1]["operations"]
+    add_paths = [
+        op.path_in_repo for op in cycle2 if type(op).__name__ == "CommitOperationAdd"
+    ]
+    del_paths = [
+        op.path_in_repo for op in cycle2 if type(op).__name__ == "CommitOperationDelete"
+    ]
+    assert add_paths == ["nodes_0001/shard-s000000-r000008.parquet"]
+    assert del_paths == ["nodes_0001/shard-s000000-r000006.parquet"], (
+        f"superseded shard must be deleted in the same atomic commit; got dels={del_paths}"
+    )
+    # `uploaded` now reflects the new filename only.
+    assert uploaded == {"nodes_0001/shard-s000000-r000008.parquet"}
+
+
 def test_sentinel_rewrite_triggers_reupload(tmp_path: Path) -> None:
     """Codex round-3 P1 regression: when the rust binary rewrites a
     `_tier_state.json` or `_manifest.json` with updated content (e.g.
