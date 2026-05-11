@@ -287,13 +287,32 @@ impl TierState {
 
     pub fn load(tier_dir: &Path, shard_range: Option<&ShardRange>) -> anyhow::Result<Option<Self>> {
         let p = Self::path(tier_dir, shard_range);
-        if !p.exists() {
-            return Ok(None);
+        if p.exists() {
+            let bytes = fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+            let s: Self = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing {}", p.display()))?;
+            return Ok(Some(s));
         }
-        let bytes = fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
-        let s: Self = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing {}", p.display()))?;
-        Ok(Some(s))
+        // Fallback: a scoped lookup that found no per-pod state file
+        // falls back to the canonical `_tier_state.json` if it exists.
+        // This covers the post-reconcile-then-scoped-rerun case: the
+        // reconciler deletes all `_tier_state-s<A>-s<B>.json` files
+        // after committing the canonical state, so a later operator
+        // running with `--shard-id-range A:B` against the reconciled
+        // tier would otherwise hit `None` here despite the canonical
+        // sentinel existing. The runner's fingerprint check still
+        // applies — a non-matching canonical state correctly errors.
+        if shard_range.is_some() {
+            let canonical = Self::path(tier_dir, None);
+            if canonical.exists() {
+                let bytes = fs::read(&canonical)
+                    .with_context(|| format!("reading {}", canonical.display()))?;
+                let s: Self = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parsing {}", canonical.display()))?;
+                return Ok(Some(s));
+            }
+        }
+        Ok(None)
     }
 
     pub fn save(&self, tier_dir: &Path) -> anyhow::Result<()> {
@@ -606,6 +625,67 @@ mod tests {
         };
         state.save(dir).unwrap();
         TierState::path(dir, shard_range.as_ref())
+    }
+
+    /// Post-reconcile scoped-rerun regression: after reconciliation
+    /// deletes all `_tier_state-s<A>-s<B>.json` files (leaving only the
+    /// canonical `_tier_state.json`), a scoped lookup must fall back to
+    /// the canonical state so the operator can re-run / extend the
+    /// reconciled tier with `--shard-id-range`. Without the fallback,
+    /// `TierState::load(..., Some(range))` returns `None`, and the
+    /// runner aborts with "shards exist but no tier state" because the
+    /// shard placeholders are still on disk.
+    #[test]
+    fn tier_state_scoped_load_falls_back_to_canonical() {
+        let dir = tempdir().unwrap();
+        // Only the canonical state exists (per-pod files deleted by reconcile).
+        write_tier_state(dir.path(), None, 1000);
+
+        // A scoped lookup for a range that has no matching per-pod file
+        // falls back to canonical instead of returning None.
+        let loaded = TierState::load(
+            dir.path(),
+            Some(&ShardRange { start: 0, end: 50 }),
+        )
+        .unwrap();
+        assert!(loaded.is_some(), "scoped load should fall back to canonical");
+        let state = loaded.unwrap();
+        assert_eq!(state.n_games, 1000);
+        // The canonical state has no shard_range.
+        assert!(state.shard_range.is_none());
+    }
+
+    /// Negative: when a scoped state file DOES exist, the load returns
+    /// that one — never the canonical. Two pods cooperating mid-run
+    /// must each see their own scope's state, not each other's nor a
+    /// canonical that hasn't been produced yet.
+    #[test]
+    fn tier_state_scoped_load_prefers_own_per_pod_file() {
+        let dir = tempdir().unwrap();
+        // Canonical with n_games=1000 — should NOT be returned.
+        write_tier_state(dir.path(), None, 1000);
+        // Per-pod state for [0, 50) with n_games=500 — SHOULD be returned.
+        write_tier_state(dir.path(), Some(ShardRange { start: 0, end: 50 }), 500);
+
+        let loaded = TierState::load(
+            dir.path(),
+            Some(&ShardRange { start: 0, end: 50 }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded.n_games, 500, "per-pod file must take priority over canonical");
+    }
+
+    /// Fallback applies ONLY to scoped lookups. Canonical lookups with
+    /// no canonical file present return None as before; they don't
+    /// further fall back to any per-pod file.
+    #[test]
+    fn tier_state_canonical_load_does_not_fall_back_to_per_pod() {
+        let dir = tempdir().unwrap();
+        write_tier_state(dir.path(), Some(ShardRange { start: 0, end: 50 }), 500);
+        // Canonical lookup: no file → None.
+        let loaded = TierState::load(dir.path(), None).unwrap();
+        assert!(loaded.is_none(), "canonical lookup must not borrow a per-pod state");
     }
 
     #[test]
