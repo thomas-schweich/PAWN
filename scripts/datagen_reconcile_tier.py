@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from huggingface_hub import HfApi, get_token
+from huggingface_hub import CommitOperationDelete, HfApi, get_token
 
 LOG = logging.getLogger("datagen_reconcile")
 
@@ -246,29 +246,30 @@ def reconcile_one(
             pass
 
     # Clean up the per-pod manifests now that the unified one is committed.
-    # Without this, the orchestrator's primer would re-download every
-    # per-pod manifest on the next pod startup (SENTINEL_RE matches both
-    # the canonical and per-pod variants), and a re-run of reconcile
-    # would either merge the same set again (idempotent) or trip on a
-    # mix of stale and fresh per-pod state if the run was extended.
-    for m in manifests:
-        try:
-            api.delete_file(
-                path_in_repo=m.repo_path,
-                repo_id=repo_id,
-                repo_type="dataset",
-                commit_message=(
-                    f"reconcile {tier_name}: remove per-pod manifest "
-                    f"{m.repo_path.rsplit('/', 1)[-1]}"
-                ),
-            )
-        except Exception as e:  # noqa: BLE001 — log every failure mode
-            LOG.warning(
-                "failed to delete per-pod manifest %s after unified commit: %s; "
-                "the unified manifest is authoritative, but the dangling per-pod "
-                "file may confuse a future reconcile",
-                m.repo_path, e,
-            )
+    # Batched into a single `create_commit` with one `CommitOperationDelete`
+    # per pod: a 20-pod reconcile would otherwise commit 20 delete-files
+    # back-to-back, eating ~16 % of HF's 128 commits/hour budget while the
+    # watcher on another pod is also committing. One batched commit is one
+    # rate-limit slot regardless of pod count.
+    delete_ops = [
+        CommitOperationDelete(path_in_repo=m.repo_path) for m in manifests
+    ]
+    try:
+        api.create_commit(
+            repo_id=repo_id,
+            repo_type="dataset",
+            operations=delete_ops,
+            commit_message=(
+                f"reconcile {tier_name}: remove {len(manifests)} per-pod manifest(s)"
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — log every failure mode
+        LOG.warning(
+            "failed to delete per-pod manifests after unified commit: %s; "
+            "the unified manifest is authoritative, but the dangling per-pod "
+            "files may confuse a future reconcile. Manual cleanup: %s",
+            e, ", ".join(m.repo_path for m in manifests),
+        )
 
 
 def main() -> int:

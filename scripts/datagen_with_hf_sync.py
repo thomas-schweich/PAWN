@@ -537,6 +537,20 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
+    # Validate `--shard-id-range` format before any HF calls. Otherwise an
+    # invalid input (e.g. `500-1000` with a dash, or `:5000` missing the
+    # start) only fails inside the rust binary's clap parser — seconds
+    # after this script's HF auth, primer, etc., with an error message
+    # that points back to the rust binary, not the orchestrator flag.
+    if args.shard_id_range is not None:
+        if not re.fullmatch(r"\d+:\d+", args.shard_id_range):
+            LOG.error(
+                "FATAL: --shard-id-range must be A:B with non-negative integers "
+                "(e.g. `0:5000`); got %r. Refusing to start the rust binary.",
+                args.shard_id_range,
+            )
+            return 2
+
     # Two-part fail-fast: (a) no token at all, (b) token present but rejected.
     # Either case must fire before the rust binary spawns — running for hours
     # only to discover at the end that nothing was uploaded would be the

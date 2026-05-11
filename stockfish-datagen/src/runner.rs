@@ -144,13 +144,31 @@ pub fn run_tier(
     let pod_range: Option<ShardRange> = scope.shard_range.as_ref().map(|_| {
         ShardRange { start: shard_range.start, end: shard_range.end }
     });
-    // Warn loudly when raw range extends past the tier; without this an
-    // operator who overspec'd gets a silent clamp and no signal.
+    // Warn loudly when raw range overshoots the tier; without this an
+    // operator who overspec'd gets a silent clamp and no signal. Two
+    // distinct cases worth surfacing:
+    //   (a) raw range starts past the tier (e.g. `1000:2000` on a 100-
+    //       shard tier) → clamped range is empty, the pod does no work,
+    //       a 0-game manifest gets written. Likely an operator typo;
+    //       flag it especially loudly.
+    //   (b) raw range overlaps but its end is past total (e.g. uniform
+    //       `0:5000` deploy across pods on a 1000-shard tier). Often
+    //       intentional — uniform deploy across tiers of varying size —
+    //       but still a heads-up.
     if let Some(raw) = scope.shard_range.as_ref() {
-        if raw.end > cfg.total_shards(tier) {
+        let total = cfg.total_shards(tier);
+        if raw.start < raw.end && raw.start >= total {
+            eprintln!(
+                "[{}] WARNING: --shard-id-range {}..{} is entirely past this tier's {} shards; \
+                 this pod has NO WORK here (empty clamped range {}..{}). A zero-game manifest \
+                 will be written. Check for an off-by-one or wrong tier.",
+                tier.name, raw.start, raw.end, total,
+                shard_range.start, shard_range.end,
+            );
+        } else if raw.end > total {
             eprintln!(
                 "[{}] WARNING: --shard-id-range {}..{} extends past tier total of {} shards; clamped to {}..{}",
-                tier.name, raw.start, raw.end, cfg.total_shards(tier),
+                tier.name, raw.start, raw.end, total,
                 shard_range.start, shard_range.end,
             );
         }
@@ -919,9 +937,12 @@ mod tests {
             .collect();
 
         // Grow n_games to 30. New total = 4 shards (last has 6 rows).
-        // Delete the manifest so resume re-runs.
-        let tier_dir = cfg.output_dir.join(&cfg.tiers[0].name);
-        std::fs::remove_file(tier_dir.join("_manifest.json")).unwrap();
+        // Leave the manifest in place — this exercises the production
+        // extension path: fingerprint matches (n_games is excluded), so
+        // the manifest-skip check sees a stale shard count and falls
+        // through to "regenerating delta". Round-2 review added an
+        // n_games_written check; the stale manifest's value (16) is
+        // below the new expected (30), which also forces fall-through.
         cfg.tiers[0].n_games = 30;
 
         let r2 = run_tier(&cfg, 0, &scope).unwrap();
