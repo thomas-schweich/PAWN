@@ -77,12 +77,22 @@ pub struct ShardResumeState {
 /// Pass the same closure the runner uses for new shards so the row-count
 /// check stays consistent.
 ///
-/// Stale shards with `shard_id >= total_shards` (e.g. left over after a
-/// `n_games` shrink) are SKIPPED — not validated, not counted, not
-/// deleted. The operator can remove them with a manual prune.
+/// Shards with `shard_id` outside `validate_range` are SKIPPED — not
+/// validated, not counted, not deleted. This covers two cases:
+///   * Stale shards from a prior larger `n_games` (`shard_id >= total_shards`):
+///     caller passes `0..total_shards` and they fall off the end.
+///   * Other pods' shards in a multi-pod run sharing the tier dir
+///     (e.g. via the orchestrator primer): caller scopes the range to
+///     this pod's `[shard_range.start, shard_range.end)` and another
+///     pod's shards are ignored rather than misvalidated against this
+///     pod's `expected_n_rows` (which is fine for shards this pod owns
+///     but could spuriously flag another pod's last shard as oversized
+///     if the two pods happen to disagree on tier-level `n_games` —
+///     in normal operation `enforce_n_games_invariant` blocks that, so
+///     the scope filter is defense in depth rather than the only line).
 pub fn detect_resume(
     tier_dir: &Path,
-    total_shards: u64,
+    validate_range: Range<u64>,
     expected_n_rows: impl Fn(u64) -> u64,
 ) -> anyhow::Result<ShardResumeState> {
     if !tier_dir.exists() {
@@ -112,9 +122,8 @@ pub fn detect_resume(
         let Some((shard_id, n_rows)) = parse_shard_filename(&name) else {
             continue;
         };
-        if shard_id >= total_shards {
-            // Stale shard from a prior larger `n_games` — leave on disk
-            // for the operator to handle.
+        if !validate_range.contains(&shard_id) {
+            // Out of scope for this caller — stale, or owned by another pod.
             continue;
         }
         by_shard
@@ -425,14 +434,14 @@ mod tests {
     #[test]
     fn detect_resume_empty_dir() {
         let dir = tempdir().unwrap();
-        let st = detect_resume(dir.path(), 4, |_| 10).unwrap();
+        let st = detect_resume(dir.path(), 0..4, |_| 10).unwrap();
         assert!(st.done_shards.is_empty());
         assert!(st.boundary_rewrites.is_empty());
     }
 
     #[test]
     fn detect_resume_missing_dir() {
-        let st = detect_resume(Path::new("/tmp/definitely_not_a_real_dir_xyz_42"), 4, |_| 10).unwrap();
+        let st = detect_resume(Path::new("/tmp/definitely_not_a_real_dir_xyz_42"), 0..4, |_| 10).unwrap();
         assert!(st.done_shards.is_empty());
     }
 
@@ -445,7 +454,7 @@ mod tests {
         write_shard(dir.path(), 2, 10);
         write_shard(dir.path(), 3, 4);
         // Pretend n_games grew so shard 3 now expects 10 rows.
-        let st = detect_resume(dir.path(), 4, |_| 10).unwrap();
+        let st = detect_resume(dir.path(), 0..4, |_| 10).unwrap();
         assert_eq!(st.done_shards, BTreeSet::from([0, 1, 2]));
         assert_eq!(st.boundary_rewrites.len(), 1);
         assert_eq!(st.boundary_rewrites[0].0, 3);
@@ -461,7 +470,7 @@ mod tests {
         write_shard(dir.path(), 1, 10);
         write_shard(dir.path(), 2, 10);
         write_shard(dir.path(), 3, 4);
-        let st = detect_resume(dir.path(), 4, |sid| if sid == 3 { 4 } else { 10 }).unwrap();
+        let st = detect_resume(dir.path(), 0..4, |sid| if sid == 3 { 4 } else { 10 }).unwrap();
         assert_eq!(st.done_shards, BTreeSet::from([0, 1, 2, 3]));
         assert!(st.boundary_rewrites.is_empty());
     }
@@ -472,7 +481,7 @@ mod tests {
         // Shard 0 has 15 rows; current config expects 10. Shrinking is
         // unsupported (would invalidate already-written rows).
         write_shard(dir.path(), 0, 15);
-        let err = detect_resume(dir.path(), 4, |_| 10).unwrap_err();
+        let err = detect_resume(dir.path(), 0..4, |_| 10).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("shrinking"), "expected shrink error, got: {msg}");
     }
@@ -490,7 +499,7 @@ mod tests {
         std::fs::write(dir.path().join("shard-s000005-r000010.parquet"), b"").unwrap();
         // Current config expects 10 rows per shard → the 10-row file is
         // canonical, the 5-row file is the to-be-removed stale rewrite.
-        let st = detect_resume(dir.path(), 6, |_| 10).unwrap();
+        let st = detect_resume(dir.path(), 0..6, |_| 10).unwrap();
         assert_eq!(st.done_shards, BTreeSet::from([5]));
         assert!(st.boundary_rewrites.is_empty());
     }
@@ -502,7 +511,7 @@ mod tests {
         write_shard(dir.path(), 1, 10);
         // Shard 5 is outside [0, total_shards=2) — stale, ignored.
         write_shard(dir.path(), 5, 10);
-        let st = detect_resume(dir.path(), 2, |_| 10).unwrap();
+        let st = detect_resume(dir.path(), 0..2, |_| 10).unwrap();
         assert_eq!(st.done_shards, BTreeSet::from([0, 1]));
         assert!(st.boundary_rewrites.is_empty());
     }
@@ -513,7 +522,7 @@ mod tests {
         write_shard(dir.path(), 0, 10);
         std::fs::write(dir.path().join("_manifest.json"), b"{}").unwrap();
         std::fs::write(dir.path().join("shard-s0.parquet.tmp"), b"orphan").unwrap();
-        let st = detect_resume(dir.path(), 4, |_| 10).unwrap();
+        let st = detect_resume(dir.path(), 0..4, |_| 10).unwrap();
         assert_eq!(st.done_shards, BTreeSet::from([0]));
     }
 
@@ -526,8 +535,31 @@ mod tests {
         std::fs::write(dir.path().join("shard-s000000-r000010.parquet"), b"").unwrap();
         std::fs::write(dir.path().join("shard-s000001-r000010.parquet"), b"").unwrap();
         std::fs::write(dir.path().join("shard-s000002-r000007.parquet"), b"").unwrap();
-        let st = detect_resume(dir.path(), 4, |sid| if sid == 2 { 7 } else { 10 }).unwrap();
+        let st = detect_resume(dir.path(), 0..4, |sid| if sid == 2 { 7 } else { 10 }).unwrap();
         assert_eq!(st.done_shards, BTreeSet::from([0, 1, 2]));
+    }
+
+    /// Scope filter: shards outside `validate_range` must be skipped
+    /// entirely — neither validated nor counted. Covers the multi-pod
+    /// case where two pods share a tier dir on a single filesystem
+    /// (uncommon, but possible via the HF primer) and one pod's
+    /// post-run rescan would otherwise see and error on another pod's
+    /// last (oversized-vs-this-pod's-expectation) shard. The same
+    /// filter also handles the legacy "stale shard from prior larger
+    /// n_games" case: stale shards live outside `0..total_shards`,
+    /// caller passes `0..total_shards` as the validate range.
+    #[test]
+    fn detect_resume_scopes_to_validate_range() {
+        let dir = tempdir().unwrap();
+        write_shard(dir.path(), 0, 10);
+        write_shard(dir.path(), 5, 10);
+        write_shard(dir.path(), 7, 15); // oversize under any callers expectations
+        // Pod owns only [5, 7) — shard 0 + shard 7 are out of scope.
+        let st = detect_resume(dir.path(), 5..7, |_| 10).unwrap();
+        assert_eq!(st.done_shards, BTreeSet::from([5]));
+        assert!(st.boundary_rewrites.is_empty());
+        // Even though shard 7 is technically oversized, we don't error on it
+        // because it's outside our scope (another pod owns shard 7).
     }
 
     #[test]

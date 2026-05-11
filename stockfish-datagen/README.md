@@ -392,12 +392,16 @@ python scripts/datagen_reconcile_tier.py \
     --repo-id <repo> --tier nodes_1024
 ```
 
-Each pod writes per-pod sentinels (`_tier_state-s<A>-s<B>.json`,
-`_manifest-s<A>-s<B>.json`) so the pods don't fight over the
-canonical names. Both `cfg.n_workers` and the per-tier `n_games` /
-`shard_size_games` MUST match across pods — they determine the
-total-shards count and therefore the global shard-id range. Anything
-else (`stockfish_path`, `output_dir`, `n_workers`) can differ per pod.
+Each pod writes per-pod sentinels with the shard-id range padded to
+6 digits — e.g. `_tier_state-s000000-s005000.json`,
+`_manifest-s000000-s005000.json` — so the pods don't fight over the
+canonical filenames. The per-tier `n_games` and `shard_size_games`
+MUST match across pods because they determine the total-shards count
+and therefore the global shard-id range. Operational fields can
+differ per pod: `n_workers`, `stockfish_path`, `output_dir`,
+`stockfish_hash_mb` at the top level (use per-tier
+`stockfish_hash_mb` if you want it pinned to the dataset
+fingerprint).
 
 ### Dataset extension recipes
 
@@ -414,7 +418,7 @@ supported on an existing dataset without invalidating its shards:
 | Move dataset to a new HF repo | ✓ | Just push; fingerprints don't include repo. |
 | Rename a tier | ✗ | New name hashes to a different `tier_seed`. Treat as creating a new tier; the old shards remain valid under the old name. |
 | Change `master_seed`, `stockfish_version`, `max_ply`, `shard_size_games`, `stockfish_hash_mb`, or any other tier-config field | ✗ | All are dataset-affecting per the fingerprint contract. Operator must move existing shards aside before resume. |
-| Shrink `tier.n_games` | partial | New shards `[total_shards_new, total_shards_old)` become orphans on disk / HF. Resume itself doesn't touch them; clean up manually if you care. |
+| Shrink `tier.n_games` | ✗ | `enforce_n_games_invariant` refuses to start if any existing `_tier_state*.json` declares a larger `n_games`. To shrink, delete every `_tier_state*.json` AND the orphan shards `[total_shards_new, total_shards_old)` before re-running. |
 
 ## Strategic 50-move-rule claim
 

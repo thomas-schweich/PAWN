@@ -133,28 +133,53 @@ pub fn run_tier(
 
     let fingerprint = cfg.tier_fingerprint(tier_index);
     let shard_range = scope.effective_shard_range(cfg, tier);
-    // Derive the per-pod sentinel range from the CLAMPED work range, not
-    // the raw user input. A `--shard-id-range 0:5000` on a tier with only
-    // 1000 shards has effective range 0..1000; storing the unclamped
-    // 0..5000 in the filename would mislead a reconcile pass into
-    // claiming coverage out to 5000. Canonical (no suffix) when the
-    // clamped range covers the full tier.
-    let pod_range: Option<ShardRange> = {
-        let full = 0..cfg.total_shards(tier);
-        if shard_range == full {
-            None
-        } else {
-            Some(ShardRange { start: shard_range.start, end: shard_range.end })
+    // The PRESENCE of `--shard-id-range` (not whether the clamped range
+    // happens to equal the full tier) is the explicit signal that this
+    // pod is part of a multi-pod cooperation. Always write per-pod
+    // sentinels in that case; otherwise a pod that passes an over-wide
+    // range (e.g. `0:99999` on a tier with only 1000 shards) would clamp
+    // to full → collide on canonical sentinels with a sibling pod that
+    // didn't pass the flag. Filename uses the CLAMPED values so reconcile
+    // sees the actual work claim (the raw value could lie about coverage).
+    let pod_range: Option<ShardRange> = scope.shard_range.as_ref().map(|_| {
+        ShardRange { start: shard_range.start, end: shard_range.end }
+    });
+    // Warn loudly when raw range extends past the tier; without this an
+    // operator who overspec'd gets a silent clamp and no signal.
+    if let Some(raw) = scope.shard_range.as_ref() {
+        if raw.end > cfg.total_shards(tier) {
+            eprintln!(
+                "[{}] WARNING: --shard-id-range {}..{} extends past tier total of {} shards; clamped to {}..{}",
+                tier.name, raw.start, raw.end, cfg.total_shards(tier),
+                shard_range.start, shard_range.end,
+            );
         }
-    };
+    }
     let expected_shard_count = shard_range.end.saturating_sub(shard_range.start);
 
-    // Skip if this pod's slice is already complete. "Complete" requires
-    // both fingerprint match AND a shard count consistent with the
-    // current config — without the count check, growing `tier.n_games`
-    // between runs would silently re-use the smaller manifest and never
-    // generate the extra shards (the tier-extension contract documented
-    // in stockfish-datagen/README.md).
+    // Expected-row-count closure: same logic the runner uses when writing
+    // a fresh shard, so resume's "done vs boundary-rewrite" classification
+    // stays consistent. Computed before the manifest-skip check so the
+    // skip can compare game counts (Codex P1, round 2 review).
+    let shard_size = cfg.shard_size_games as u64;
+    let n_games = tier.n_games;
+    let expected_n_rows = |sid: u64| -> u64 {
+        let start = sid * shard_size;
+        let end = ((sid + 1) * shard_size).min(n_games);
+        end.saturating_sub(start)
+    };
+    let expected_total_games: u64 = (shard_range.start..shard_range.end)
+        .map(expected_n_rows)
+        .sum();
+
+    // Skip if this pod's slice is already complete. "Complete" requires:
+    //   1. fingerprint match (catches config drift),
+    //   2. shard count match (catches n_games growth that adds new shards),
+    //   3. n_games_written >= expected_total_games (catches n_games growth
+    //      that stays WITHIN the last shard — e.g. 900 -> 950 with
+    //      shard_size_games=1000 keeps total_shards at 1, so check (2) is
+    //      a no-op and we'd silently re-use the old manifest without
+    //      regenerating the boundary shard, leaving the dataset short).
     if let Some(manifest) = TierManifest::load(&tier_dir, pod_range.as_ref())? {
         if manifest.config_fingerprint != fingerprint {
             return Err(anyhow!(
@@ -166,7 +191,9 @@ pub fn run_tier(
                 TierManifest::path(&tier_dir, pod_range.as_ref()).display(),
             ));
         }
-        if manifest.shards.len() as u64 == expected_shard_count {
+        if manifest.shards.len() as u64 == expected_shard_count
+            && manifest.n_games_written >= expected_total_games
+        {
             eprintln!(
                 "[{}] already complete for range {:?} ({} games, {} shards) — skipping",
                 tier.name, shard_range, manifest.n_games_written, manifest.shards.len(),
@@ -180,41 +207,25 @@ pub fn run_tier(
                     .collect(),
             });
         }
-        // Same fingerprint, different shard count ⇒ n_games changed since
-        // last completion (likely grew). Fall through to the normal run
-        // path which will regenerate any boundary shard and write the new
-        // tail. The stale manifest gets overwritten at end of run.
+        // Same fingerprint but shard count or game count don't agree ⇒
+        // `tier.n_games` changed since last completion (likely grew). Fall
+        // through to the normal run path; it will regenerate the boundary
+        // shard and write the new tail. The stale manifest gets
+        // overwritten at end of run.
         eprintln!(
-            "[{}] manifest covers {} shards, current config expects {} — regenerating delta",
-            tier.name, manifest.shards.len(), expected_shard_count,
+            "[{}] manifest covers {} shards / {} games, current config expects {} / {} — regenerating delta",
+            tier.name, manifest.shards.len(), manifest.n_games_written,
+            expected_shard_count, expected_total_games,
         );
     }
 
-    // Expected-row-count closure: same logic the runner uses when writing
-    // a fresh shard, so resume's "done vs boundary-rewrite" classification
-    // stays consistent.
-    let shard_size = cfg.shard_size_games as u64;
-    let n_games = tier.n_games;
-    let expected_n_rows = |sid: u64| -> u64 {
-        let start = sid * shard_size;
-        let end = ((sid + 1) * shard_size).min(n_games);
-        end.saturating_sub(start)
-    };
-    // Run resume against the full tier dir; we'll filter to this pod's
-    // range below.
-    let resume_state = detect_resume(&tier_dir, cfg.total_shards(tier), expected_n_rows)?;
-
-    // Filter resume state to this pod's range. Other pods' shards are
-    // visible on disk (multi-pod runs share the directory) but not this
-    // pod's business.
-    let in_range = |sid: u64| sid >= shard_range.start && sid < shard_range.end;
-    let done_shards: BTreeSet<u64> = resume_state.done_shards.iter().copied().filter(|s| in_range(*s)).collect();
-    let boundary_rewrites: Vec<(u64, PathBuf)> = resume_state
-        .boundary_rewrites
-        .iter()
-        .filter(|(s, _)| in_range(*s))
-        .cloned()
-        .collect();
+    // Scope detect_resume to this pod's range. Other pods' shards may be
+    // visible on disk (multi-pod runs share the directory via the HF
+    // primer); scoping inside the function avoids spurious oversize
+    // errors on shards we don't own.
+    let resume_state = detect_resume(&tier_dir, shard_range.clone(), expected_n_rows)?;
+    let done_shards: BTreeSet<u64> = resume_state.done_shards.clone();
+    let boundary_rewrites: Vec<(u64, PathBuf)> = resume_state.boundary_rewrites.clone();
 
     // Tier-state sentinel: validates that any shards on disk in this
     // pod's range were generated under the SAME config we're about to
@@ -381,12 +392,14 @@ pub fn run_tier(
     // Re-scan the dir for this pod's shards (resumed + newly written +
     // boundary rewrites). Use the same expected-rows fn we built earlier
     // so the manifest's shard list reflects only validly-sized files.
-    let final_state = detect_resume(tier_dir.as_path(), cfg.total_shards(&tier), expected_n_rows)?;
+    // Scope to this pod's range — `detect_resume` filters out shards
+    // owned by other cooperating pods (which may also live in the same
+    // shared tier dir).
+    let final_state = detect_resume(tier_dir.as_path(), shard_range.clone(), expected_n_rows)?;
     let mut all_shards: Vec<PathBuf> = final_state
         .done_shards
         .iter()
         .copied()
-        .filter(|sid| in_range(*sid))
         .map(|sid| crate::shard::shard_final_path(tier_dir.as_path(), sid, expected_n_rows(sid)))
         .collect();
     all_shards.sort();
@@ -846,6 +859,43 @@ mod tests {
         cfg.tiers[1].temperature = 0.5;
         let r2 = run_tier(&cfg, 0, &scope).unwrap();
         assert_eq!(r2.n_games_written, 16, "tier 0 should be skipped via manifest");
+    }
+
+    /// Codex P1 round-2 regression: growing `tier.n_games` such that
+    /// `total_shards` is UNCHANGED (the growth stays within the last
+    /// shard) must still regenerate the boundary shard. Without the
+    /// `n_games_written` check in the manifest-skip path, the second
+    /// run would see "same shard count" and silently re-use the smaller
+    /// manifest, leaving the dataset short by the growth delta. We pin
+    /// this with starting `n_games=14, shard_size=8` (shards `[0..8)`
+    /// full + `[8..14)` partial = 2 shards) and growing to `n_games=16`
+    /// (shards `[0..8)` + `[8..16)` full = still 2 shards).
+    #[test]
+    #[ignore = "requires stockfish binary ($HOME/bin/stockfish or $STOCKFISH_PATH)"]
+    fn live_grow_within_last_shard_regenerates_boundary() {
+        let sf_path = stockfish_path();
+        let dir = tempdir().unwrap();
+        let mut cfg = smoke_config(sf_path, dir.path().to_path_buf());
+        cfg.tiers[0].n_games = 14;
+        let scope = RunScope::default();
+        let r1 = run_tier(&cfg, 0, &scope).unwrap();
+        assert_eq!(r1.n_games_written, 14);
+        assert_eq!(r1.shards.len(), 2, "14 games / shard_size 8 = 2 shards (8 + 6)");
+
+        // Snapshot shard 0 — its rows depend only on tier_seed + global
+        // game index, so growth must not change them.
+        let s0_bytes = std::fs::read(&r1.shards[0]).unwrap();
+
+        // Grow within the last shard: 14 → 16. Total shards stays 2;
+        // shard 1 grows from 6 to 8 rows. The manifest-skip check must
+        // detect the n_games mismatch and fall through to regenerate.
+        cfg.tiers[0].n_games = 16;
+        let r2 = run_tier(&cfg, 0, &scope).unwrap();
+        assert_eq!(r2.n_games_written, 16, "must not silently truncate to 14");
+        assert_eq!(r2.shards.len(), 2);
+
+        let s0_after = std::fs::read(&r1.shards[0]).unwrap();
+        assert_eq!(s0_bytes, s0_after, "shard 0 must be byte-identical (global-index seeding)");
     }
 
     /// Extension safety: growing n_games adds new shards but doesn't

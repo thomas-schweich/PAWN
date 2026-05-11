@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from huggingface_hub import HfApi, get_token
+from huggingface_hub import CommitOperationAdd, HfApi, get_token
 from huggingface_hub.errors import RepositoryNotFoundError
 from huggingface_hub.utils import HfHubHTTPError
 
@@ -184,9 +184,13 @@ def _download_replace(api: HfApi, repo_id: str, repo_path: str, local_path: Path
     )
     # `hf_hub_download` is declared `Union[str, DryRunFileInfo]`; with
     # dry_run=False (the default) it always returns the cache path string.
-    assert isinstance(downloaded, str), (
-        f"hf_hub_download returned non-str {type(downloaded).__name__} for {repo_path}"
-    )
+    # Use an explicit if-raise (not assert) so the check survives `python -O`,
+    # which strips asserts and would let a non-str silently propagate to the
+    # downstream `open()` and crash with a less actionable TypeError.
+    if not isinstance(downloaded, str):
+        raise RuntimeError(
+            f"hf_hub_download returned non-str {type(downloaded).__name__} for {repo_path}"
+        )
     local_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = local_path.with_suffix(local_path.suffix + ".dl.tmp")
     # `hf_hub_download` returns a path inside the HF cache; copy contents.
@@ -205,11 +209,24 @@ def _upload_folder_batch(
 ) -> None:
     """Commit a batch of files from `local_dir` as a single HF commit.
 
-    Uses `huggingface_hub.upload_folder` with `allow_patterns=files` so
-    only the named files participate in the commit. Per its docstring
-    `upload_folder` overwrites files of the same name on the remote and
-    leaves others untouched (no deletions unless `delete_patterns` is
-    set, which this code path never sets).
+    Uses `huggingface_hub.HfApi.create_commit` with one
+    `CommitOperationAdd` per named file — NOT `upload_folder`. Two
+    reasons:
+
+      1. **Safety.** `upload_folder` accepts `allow_patterns` which is
+         interpreted as a `fnmatch` glob list, not a literal filename
+         list. Our current naming scheme (`shard-s000001-r000010.parquet`,
+         `_tier_state.json`) doesn't include glob metacharacters, but a
+         future naming scheme or a manual file with `*` / `?` / `[` in
+         its name would silently over-match. With `create_commit` each
+         file is named explicitly — no glob, no over-match.
+
+      2. **Perf.** `upload_folder` walks the entire folder via
+         `folder_path.glob("**/*")` before applying `allow_patterns` —
+         O(total_shards) `stat` calls per commit, even when only a
+         few new shards exist. On a 50K-shard tier dir at 30s polls,
+         this cost dominates the watcher's hot path. `create_commit`
+         skips the walk entirely.
 
     **Safety invariant — DO NOT BREAK**: every file in `files` MUST
     exist locally with non-zero size at call time. The previous
@@ -223,15 +240,16 @@ def _upload_folder_batch(
     operator can re-run after fixing the root cause; a quiet
     overwrite is unrecoverable.
 
-    Why folder uploads instead of per-shard `upload_file`: HF caps
+    Why batched commits at all (vs per-shard `upload_file`): HF caps
     commits at 128 / hour per repo. A 100M-game run produces ~45
     shards/min; per-shard commits exceed the limit on the very first
-    cycle. Folder uploads commit many shards atomically — one commit
+    cycle. Batched commits commit many shards atomically — one commit
     per tier per cycle.
     """
     if not files:
         return
     # Defense in depth: refuse to ever upload a zero-byte file.
+    operations: list[CommitOperationAdd] = []
     for name in files:
         path = local_dir / name
         try:
@@ -247,15 +265,17 @@ def _upload_folder_batch(
                 f"refusing to overwrite remote {path_in_repo}/{name} with "
                 f"empty content (would silently destroy already-uploaded data)"
             )
+        operations.append(CommitOperationAdd(
+            path_in_repo=f"{path_in_repo}/{name}",
+            path_or_fileobj=str(path),
+        ))
     delay = 2.0
     for attempt in range(5):
         try:
-            api.upload_folder(
-                folder_path=str(local_dir),
-                path_in_repo=path_in_repo,
+            api.create_commit(
                 repo_id=repo_id,
                 repo_type="dataset",
-                allow_patterns=files,
+                operations=operations,
                 commit_message=commit_message,
             )
             return

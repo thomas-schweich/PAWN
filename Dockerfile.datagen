@@ -242,10 +242,18 @@ fi
 if [ $# -eq 0 ]; then
     if [ -n "$DATAGEN_HF_REPO" ] && [ -n "$DATAGEN_CONFIG" ]; then
         # Fire-and-forget pod mode. Extra flags can be passed via DATAGEN_EXTRA_ARGS.
+        # `${VAR:+--flag}` would enable --prune-local on ANY non-empty value
+        # including `0` / `false`, which contradicts boolean intuition. Gate
+        # on a literal "1" so the env var behaves consistently with `--bool`-
+        # style flags elsewhere in the codebase.
+        PRUNE_FLAG=""
+        if [ "$DATAGEN_PRUNE_LOCAL" = "1" ] || [ "$DATAGEN_PRUNE_LOCAL" = "true" ]; then
+            PRUNE_FLAG="--prune-local"
+        fi
         exec python3 /opt/datagen/scripts/datagen_with_hf_sync.py \
             --config "$DATAGEN_CONFIG" \
             --repo-id "$DATAGEN_HF_REPO" \
-            ${DATAGEN_PRUNE_LOCAL:+--prune-local} \
+            $PRUNE_FLAG \
             ${DATAGEN_POLL_INTERVAL:+--poll-interval "$DATAGEN_POLL_INTERVAL"} \
             $DATAGEN_EXTRA_ARGS
     fi

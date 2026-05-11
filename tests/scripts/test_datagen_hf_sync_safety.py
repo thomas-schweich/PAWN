@@ -8,6 +8,13 @@ ANALYSIS.md A4). The new orchestrator's `_upload_folder_batch` has
 both a watcher-level filter (zero-byte local files are excluded from
 the upload list) and an explicit at-call-time guard inside
 `_upload_folder_batch`. These tests pin both.
+
+Round-2 review change: `_upload_folder_batch` now drives
+`HfApi.create_commit` with explicit `CommitOperationAdd` objects
+instead of `upload_folder(..., allow_patterns=files)`. The new shape
+closes a defense-in-depth gap (allow_patterns is a glob, not a literal
+list) and avoids `upload_folder`'s O(total_shards) folder walk on every
+commit. The tests below assert on the new contract.
 """
 
 from __future__ import annotations
@@ -37,12 +44,12 @@ def _load_module() -> Any:
 
 
 class _FakeApi:
-    """Captures upload_folder invocations without touching the network."""
+    """Captures create_commit invocations without touching the network."""
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    def upload_folder(self, **kwargs: Any) -> None:
+    def create_commit(self, **kwargs: Any) -> None:
         self.calls.append(kwargs)
 
 
@@ -64,7 +71,7 @@ def test_upload_folder_batch_rejects_zero_byte_file(tmp_path: Path) -> None:
             files=["good.parquet", "empty.parquet"],
             commit_message="test",
         )
-    # The guard fires BEFORE the upload, so the fake API records no calls.
+    # The guard fires BEFORE the commit, so the fake API records no calls.
     assert api.calls == []
 
 
@@ -86,8 +93,10 @@ def test_upload_folder_batch_rejects_missing_file(tmp_path: Path) -> None:
 
 
 def test_upload_folder_batch_uploads_non_empty_files(tmp_path: Path) -> None:
-    """Happy path: non-empty files in the upload list reach the fake
-    HfApi.upload_folder call."""
+    """Happy path: non-empty files reach `create_commit` with one
+    explicit `CommitOperationAdd` per file. Each op names the file
+    literally — no glob — so a `*` in a future filename can't
+    over-match into adjacent files."""
     mod = _load_module()
     (tmp_path / "a.parquet").write_bytes(b"a" * 16)
     (tmp_path / "b.parquet").write_bytes(b"b" * 32)
@@ -103,16 +112,15 @@ def test_upload_folder_batch_uploads_non_empty_files(tmp_path: Path) -> None:
     assert len(api.calls) == 1
     call = api.calls[0]
     assert call["repo_id"] == "org/name"
-    assert call["path_in_repo"] == "tier_X"
     assert call["repo_type"] == "dataset"
-    # allow_patterns is the explicit non-empty file list — this is what
-    # prevents `upload_folder` from sweeping the whole local dir, which
-    # would re-upload pruned zero-byte placeholders.
-    assert set(call["allow_patterns"]) == {"a.parquet", "b.parquet"}
-    # delete_patterns must never be set on this code path — remote
-    # deletions are an explicit operator action, not a side effect of
-    # the sync watcher.
-    assert "delete_patterns" not in call or call["delete_patterns"] is None
+    ops = call["operations"]
+    assert len(ops) == 2
+    # Each op is a CommitOperationAdd carrying the literal repo path
+    # (`tier_X/<name>`) — no glob, no allow_patterns.
+    op_paths = {op.path_in_repo for op in ops}
+    assert op_paths == {"tier_X/a.parquet", "tier_X/b.parquet"}
+    op_locals = {op.path_or_fileobj for op in ops}
+    assert op_locals == {str(tmp_path / "a.parquet"), str(tmp_path / "b.parquet")}
 
 
 def test_scan_and_upload_excludes_zero_byte_placeholders(tmp_path: Path) -> None:
@@ -140,9 +148,13 @@ def test_scan_and_upload_excludes_zero_byte_placeholders(tmp_path: Path) -> None
     # Exactly one commit (shards+state batch); no separate manifest batch
     # since no `_manifest.json` exists yet.
     assert len(api.calls) == 1
-    batch_files = set(api.calls[0]["allow_patterns"])
+    ops = api.calls[0]["operations"]
+    repo_paths = {op.path_in_repo for op in ops}
     # Real shard + tier_state, NOT the zero-byte placeholder, NOT the .tmp.
-    assert batch_files == {"shard-s000001-r000010.parquet", "_tier_state.json"}
+    assert repo_paths == {
+        "nodes_0001/shard-s000001-r000010.parquet",
+        "nodes_0001/_tier_state.json",
+    }
     # Both committed files made it into the in-memory uploaded set.
     assert uploaded == {
         "nodes_0001/shard-s000001-r000010.parquet",

@@ -97,9 +97,13 @@ def fetch_remote_manifests(
     out: list[PerPodManifest] = []
     for repo_path, start, end in pod_paths:
         local = api.hf_hub_download(repo_id=repo_id, filename=repo_path, repo_type="dataset")
-        assert isinstance(local, str), (
-            f"hf_hub_download returned non-str for {repo_path}"
-        )
+        # Explicit if-raise (not assert) so the type narrowing survives
+        # `python -O`, which strips asserts and would otherwise let a
+        # `DryRunFileInfo` slip through to `open()`.
+        if not isinstance(local, str):
+            raise RuntimeError(
+                f"hf_hub_download returned non-str {type(local).__name__} for {repo_path}"
+            )
         with open(local, "r") as fh:
             payload = json.load(fh)
         out.append(PerPodManifest(
@@ -121,6 +125,18 @@ def validate_ranges(manifests: list[PerPodManifest], total: int) -> None:
         raise SystemExit("no per-pod manifests found for this tier")
     expected = 0
     for m in manifests:
+        # Zero-length ranges (`_manifest-s005000-s005000.json`) can arise
+        # from a misconfigured pod that passed `--shard-id-range` with
+        # `start >= tier total` and got clamped to an empty range. The
+        # tiling check below would silently accept them (start == end ==
+        # expected, no advance). Reject explicitly so the operator sees
+        # the stray manifest rather than reconciling around it.
+        if m.end <= m.start:
+            raise SystemExit(
+                f"empty range manifest {m.repo_path} (start={m.start}, "
+                f"end={m.end}); a pod was launched with a shard-id-range "
+                f"that clamped to zero work — investigate before reconciling"
+            )
         if m.start != expected:
             if m.start < expected:
                 raise SystemExit(
@@ -310,10 +326,19 @@ def main() -> int:
                 args.tier, sorted(tiers_by_name),
             )
             return 2
-        reconcile_one(
-            api, args.repo_id, args.tier, tiers_by_name[args.tier],
-            shard_size_games, args.dry_run,
-        )
+        # Catch SystemExit consistently with the --all-tiers branch so a
+        # validation failure (gap/overlap/fingerprint mismatch) returns
+        # the documented exit code 4 rather than Python's default 1 for
+        # an unhandled `SystemExit("message")` — CI/monitoring that's
+        # keyed on the documented codes would otherwise misclassify.
+        try:
+            reconcile_one(
+                api, args.repo_id, args.tier, tiers_by_name[args.tier],
+                shard_size_games, args.dry_run,
+            )
+        except SystemExit as e:
+            LOG.error("tier %s failed: %s", args.tier, e)
+            return 4
 
     return 0
 
