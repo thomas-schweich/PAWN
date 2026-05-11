@@ -156,12 +156,92 @@ pub struct TierState {
     pub config_fingerprint: String,
     /// ISO-8601 UTC start time. Informational.
     pub started_at: String,
+    /// Tier-level `n_games` at the time this state was written. Excluded
+    /// from the per-tier fingerprint (so growth is allowed without
+    /// invalidating prior shards), but enforced across pods via
+    /// `enforce_n_games_invariant` to prevent two pods cooperating with
+    /// different `n_games` from silently producing inconsistent
+    /// datasets. See bug-detector finding #2 in the review history.
+    #[serde(default)]
+    pub n_games: u64,
     /// Half-open shard-id range owned by the pod that wrote this state
     /// file. `None` ≡ "whole tier" (single-pod, default). When `Some`,
     /// the state file is named `_tier_state-s<A>-s<B>.json` so disjoint
     /// pods can coexist in the same HF dataset folder without colliding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_range: Option<ShardRange>,
+}
+
+/// Walk `tier_dir` and parse every `_tier_state*.json` (canonical +
+/// per-pod variants). Used by `enforce_n_games_invariant` so a new pod
+/// can see what every other pod committed to.
+pub fn scan_all_tier_states(tier_dir: &Path) -> anyhow::Result<Vec<(PathBuf, TierState)>> {
+    if !tier_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(tier_dir)
+        .with_context(|| format!("listing {}", tier_dir.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Match the canonical name and the per-pod variants; reject the
+        // `.json.tmp` from atomic-rename in-flight.
+        if !(name.starts_with("_tier_state") && name.ends_with(".json")) {
+            continue;
+        }
+        let path = entry.path();
+        let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let state: TierState = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        out.push((path, state));
+    }
+    Ok(out)
+}
+
+/// Refuse to start if any existing `_tier_state*.json` in `tier_dir`
+/// declares an `n_games` larger than what this pod's config says. The
+/// fingerprint excludes `n_games` (to make tier extension safe), so
+/// without this guard a smaller-n_games pod would silently "complete"
+/// its slice — its own manifest matches, the larger pod's extra shards
+/// fall outside `total_shards` and get skipped as "stale" — while
+/// another pod is committed to writing more data. Operator error
+/// (two pods configured with different `n_games`), but caught with a
+/// clear startup error rather than a silently-truncated dataset.
+///
+/// Allows the inverse direction: existing state with smaller `n_games`
+/// is treated as the prior version of an extended run, which is the
+/// supported single-pod extension flow.
+pub fn enforce_n_games_invariant(
+    tier_dir: &Path,
+    current_n_games: u64,
+) -> anyhow::Result<()> {
+    for (path, state) in scan_all_tier_states(tier_dir)? {
+        // Pre-fix state files (written before this field existed)
+        // serialize without `n_games`; `#[serde(default)]` parses them
+        // as 0. Skip the check in that case — we can't enforce what
+        // we don't know, and erroring would block re-runs against
+        // partial datasets from this branch's earlier commits.
+        if state.n_games == 0 {
+            continue;
+        }
+        if state.n_games > current_n_games {
+            anyhow::bail!(
+                "{} declares n_games={} but current config has n_games={}; \
+                 refusing to start — this run would silently skip {} games \
+                 another pod committed to producing. Either raise this \
+                 config's n_games to >= {}, or delete the conflicting state \
+                 file if you genuinely mean to shrink the dataset.",
+                path.display(),
+                state.n_games,
+                current_n_games,
+                state.n_games - current_n_games,
+                state.n_games,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Inclusive-exclusive shard-id range. Serializes as `{"start": A, "end": B}`.
@@ -479,6 +559,110 @@ mod tests {
         let dir = tempdir().unwrap();
         let m = TierManifest::load(dir.path(), None).unwrap();
         assert!(m.is_none());
+    }
+
+    fn write_tier_state(
+        dir: &Path,
+        shard_range: Option<ShardRange>,
+        n_games: u64,
+    ) -> PathBuf {
+        let state = TierState {
+            config_fingerprint: "fingerprint".into(),
+            started_at: "2026-05-10T00:00:00Z".into(),
+            n_games,
+            shard_range,
+        };
+        state.save(dir).unwrap();
+        TierState::path(dir, shard_range.as_ref())
+    }
+
+    #[test]
+    fn scan_all_tier_states_collects_canonical_and_per_pod() {
+        let dir = tempdir().unwrap();
+        write_tier_state(dir.path(), None, 1000);
+        write_tier_state(dir.path(), Some(ShardRange { start: 0, end: 50 }), 1000);
+        write_tier_state(dir.path(), Some(ShardRange { start: 50, end: 100 }), 1000);
+        // Decoys that must be ignored.
+        std::fs::write(dir.path().join("_manifest.json"), b"{}").unwrap();
+        std::fs::write(dir.path().join("shard-s000000-r000001.parquet"), b"").unwrap();
+        let states = scan_all_tier_states(dir.path()).unwrap();
+        assert_eq!(states.len(), 3, "expected 3 tier_state files, got {states:?}");
+        for (_, s) in &states {
+            assert_eq!(s.n_games, 1000);
+        }
+    }
+
+    #[test]
+    fn enforce_n_games_invariant_passes_on_equal() {
+        let dir = tempdir().unwrap();
+        write_tier_state(dir.path(), None, 100);
+        enforce_n_games_invariant(dir.path(), 100).unwrap();
+    }
+
+    #[test]
+    fn enforce_n_games_invariant_allows_extension() {
+        // The single-pod extension flow: prior run wrote state at 100,
+        // current run is growing to 500. Allowed — the larger run will
+        // pick up where the prior left off and fill the new tail.
+        let dir = tempdir().unwrap();
+        write_tier_state(dir.path(), None, 100);
+        enforce_n_games_invariant(dir.path(), 500).unwrap();
+    }
+
+    #[test]
+    fn enforce_n_games_invariant_refuses_when_current_is_smaller() {
+        // The bug-detector #2 scenario: a cooperating pod with smaller
+        // n_games would silently skip games another pod committed to.
+        let dir = tempdir().unwrap();
+        write_tier_state(
+            dir.path(),
+            Some(ShardRange { start: 0, end: 5000 }),
+            100_000,
+        );
+        let err = enforce_n_games_invariant(dir.path(), 50_000).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to start") && msg.contains("50000 games"),
+            "expected refusal-with-delta message, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn enforce_n_games_invariant_refuses_if_any_state_is_larger() {
+        // Multiple per-pod state files, ONE of them is larger than the
+        // current pod's n_games — must still refuse. The check is
+        // "max(existing_n_games)" not "any single one".
+        let dir = tempdir().unwrap();
+        write_tier_state(
+            dir.path(),
+            Some(ShardRange { start: 0, end: 5000 }),
+            50_000,
+        );
+        write_tier_state(
+            dir.path(),
+            Some(ShardRange { start: 5000, end: 10_000 }),
+            100_000, // the offending one
+        );
+        let err = enforce_n_games_invariant(dir.path(), 50_000).unwrap_err();
+        assert!(format!("{err:#}").contains("100000"));
+    }
+
+    #[test]
+    fn enforce_n_games_invariant_skips_zero_n_games_state() {
+        // Pre-fix state files (written before n_games existed)
+        // serialize without the field; serde's #[default] gives 0.
+        // The invariant treats 0 as "unknown, can't enforce" so a
+        // partial dataset from this branch's earlier commits doesn't
+        // get blocked. Future runs re-write the state with the
+        // current n_games and the invariant takes effect from then on.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("_tier_state.json"),
+            br#"{"config_fingerprint": "abc", "started_at": "2026-05-10T00:00:00Z"}"#,
+        ).unwrap();
+        // Even with a tiny current n_games, the legacy state with
+        // n_games=0 doesn't block the run.
+        enforce_n_games_invariant(dir.path(), 1).unwrap();
     }
 
     #[test]

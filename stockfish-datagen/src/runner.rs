@@ -32,7 +32,9 @@ use rand_chacha::ChaCha8Rng;
 use crate::affinity;
 use crate::config::{RunConfig, TierConfig};
 use crate::game::play_game;
-use crate::resume::{ShardRange, TierManifest, TierState, detect_resume};
+use crate::resume::{
+    ShardRange, TierManifest, TierState, detect_resume, enforce_n_games_invariant,
+};
 use crate::seed;
 use crate::shard::{GameRow, ShardWriter};
 use crate::stockfish::StockfishProcess;
@@ -120,6 +122,14 @@ pub fn run_tier(
     let tier_dir = cfg.output_dir.join(&tier.name);
     std::fs::create_dir_all(&tier_dir)
         .with_context(|| format!("creating tier dir {}", tier_dir.display()))?;
+
+    // Cross-pod n_games safety: refuse if any existing `_tier_state*.json`
+    // in the dir declares an `n_games` larger than the current config.
+    // Runs BEFORE the manifest-skip check so a smaller-n_games pod's own
+    // (correct-for-it) manifest can't mask the fact that another pod has
+    // committed to producing more games for this tier. See
+    // `resume::enforce_n_games_invariant` for the rationale.
+    enforce_n_games_invariant(&tier_dir, tier.n_games)?;
 
     let fingerprint = cfg.tier_fingerprint(tier_index);
     let shard_range = scope.effective_shard_range(cfg, tier);
@@ -239,6 +249,7 @@ pub fn run_tier(
             TierState {
                 config_fingerprint: fingerprint.clone(),
                 started_at: now_iso8601(),
+                n_games: tier.n_games,
                 shard_range: pod_range,
             }
             .save(&tier_dir)
