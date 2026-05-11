@@ -43,6 +43,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'scripts/datagen_with_hf_sync.py'
+              - 'scripts/build_stockfish_for_host.sh'
               - 'scripts/benchmark_stockfish_nodes.py'
               - 'scripts/sweep_pod_workers.sh'
               - 'deploy/pod-gpu-stats.sh'
@@ -171,19 +172,6 @@ jobs:
     needs: changes
     if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.datagen == 'true'
     runs-on: ubuntu-latest
-    strategy:
-      # Build one image per supported microarch. The patched stockfish is
-      # compiled at the requested ISA; running an `avx512` image on an
-      # AVX2-only pod would SIGILL on the first eval call. Operators pick
-      # the right tag for their pod's CPU. `fail-fast: false` so a
-      # transient failure on one arch doesn't cancel the other.
-      fail-fast: false
-      matrix:
-        include:
-          - tag_arch: avx2
-            sf_arch: x86-64-avx2
-          - tag_arch: avx512
-            sf_arch: x86-64-avx512
     steps:
       - uses: actions/checkout@v4
         with:
@@ -202,7 +190,11 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push runtime (datagen-${{ matrix.tag_arch }})
+      # Single :datagen / :datagen-dev image. The patched-stockfish binary
+      # is JIT-built at pod startup against the host CPU
+      # (`scripts/build_stockfish_for_host.sh`), so one image covers every
+      # supported microarch (avx2 / avx512 / vnni512 / fallback).
+      - name: Build and push runtime (datagen)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -211,20 +203,16 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: |
-            ${{ env.IMAGE }}:datagen-${{ matrix.tag_arch }}
-            ${{ env.IMAGE }}:datagen-${{ matrix.tag_arch }}-${{ github.sha }}
+            ${{ env.IMAGE }}:datagen
+            ${{ env.IMAGE }}:datagen-${{ github.sha }}
           build-args: |
             GIT_HASH=${{ github.sha }}
             GIT_TAG=${{ steps.meta.outputs.tag }}
-            SF_PATCHED_ARCH=${{ matrix.sf_arch }}
-          # Per-arch buildcache. The `sf-fork-build` stage produces
-          # different binaries per ISA, so they can't share a cache —
-          # would invalidate on every alternate arch's build.
           cache-from: |
-            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime-${{ matrix.tag_arch }}
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime-${{ matrix.tag_arch }},mode=max
+            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime,mode=max
 
-      - name: Build and push dev (datagen-dev-${{ matrix.tag_arch }})
+      - name: Build and push dev (datagen-dev)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -233,13 +221,24 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: |
-            ${{ env.IMAGE }}:datagen-dev-${{ matrix.tag_arch }}
-            ${{ env.IMAGE }}:datagen-dev-${{ matrix.tag_arch }}-${{ github.sha }}
+            ${{ env.IMAGE }}:datagen-dev
+            ${{ env.IMAGE }}:datagen-dev-${{ github.sha }}
           build-args: |
             GIT_HASH=${{ github.sha }}
             GIT_TAG=${{ steps.meta.outputs.tag }}
-            SF_PATCHED_ARCH=${{ matrix.sf_arch }}
           cache-from: |
-            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime-${{ matrix.tag_arch }}
-            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-dev-${{ matrix.tag_arch }}
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-dev-${{ matrix.tag_arch }},mode=max
+            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-runtime
+            type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-dev
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-datagen-dev,mode=max
+
+      # Integration test: the preflight build script must work end-to-end
+      # on the CI runner (which is x86-64 avx2 — won't trigger the vnni512
+      # / avx512 branches but does exercise the avx2 path that's most
+      # commonly the fallback). Run inside the just-built image so the
+      # actual binary contents are validated.
+      - name: Smoke-test JIT stockfish build
+        run: |
+          docker run --rm \
+            -e DATAGEN_BUILD_CACHE=/tmp/sfcache \
+            --entrypoint /opt/datagen/scripts/build_stockfish_for_host.sh \
+            ${{ env.IMAGE }}:datagen-${{ github.sha }}

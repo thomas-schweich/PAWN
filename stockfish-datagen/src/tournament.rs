@@ -207,7 +207,10 @@ pub fn run_tournament(cfg: &TournamentConfig) -> anyhow::Result<TournamentResult
     eprintln!("generating {} openings ({} plies each)...", cfg.n_pairs, cfg.opening_plies);
     let openings: Vec<Vec<String>> = (0..cfg.n_pairs)
         .map(|i| {
-            let mut rng = ChaCha8Rng::seed_from_u64(seed::tier_seed(cfg.master_seed, i as usize));
+            // Tournament has its own seed namespace (not the dataset's
+            // tier_seed scheme); use the low-level `mix` to derive a
+            // per-pair opening RNG seed from the master.
+            let mut rng = ChaCha8Rng::seed_from_u64(seed::mix(cfg.master_seed, i as u64));
             generate_opening(&mut rng, cfg.opening_plies)
         })
         .collect();
@@ -370,8 +373,8 @@ fn run_worker(
         let opening = &openings[pair_idx as usize];
 
         // Game 0 of the pair: side_a as White, side_b as Black.
-        let game0_seed = seed::worker_seed(
-            seed::tier_seed(cfg.master_seed.wrapping_add(0xA17EE7), pair_idx as usize),
+        let game0_seed = seed::mix(
+            seed::mix(cfg.master_seed.wrapping_add(0xA17EE7), pair_idx as u64),
             0,
         );
         let mut rng0 = ChaCha8Rng::seed_from_u64(game0_seed);
@@ -384,8 +387,8 @@ fn run_worker(
 
         // Game 1: side_a as Black, side_b as White. Different seed so the
         // RNG draws don't accidentally line up.
-        let game1_seed = seed::worker_seed(
-            seed::tier_seed(cfg.master_seed.wrapping_add(0xB17EE7), pair_idx as usize),
+        let game1_seed = seed::mix(
+            seed::mix(cfg.master_seed.wrapping_add(0xB17EE7), pair_idx as u64),
             1,
         );
         let mut rng1 = ChaCha8Rng::seed_from_u64(game1_seed);

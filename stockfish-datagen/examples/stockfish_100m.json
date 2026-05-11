@@ -15,7 +15,8 @@
       "searchless": true,
       "store_legal_move_evals": true,
       "sample_score": "v",
-      "net_selection": "large"
+      "net_selection": "large",
+      "stockfish_hash_mb": 1
     },
     {
       "name": "nodes_0001",
@@ -27,7 +28,8 @@
       "sample_plies": 999,
       "temperature": 0.5,
       "store_legal_move_evals": true,
-      "net_selection": "large"
+      "net_selection": "large",
+      "stockfish_hash_mb": 1
     },
     {
       "name": "nodes_0128",
@@ -39,7 +41,8 @@
       "sample_plies": 999,
       "temperature": 0.5,
       "store_legal_move_evals": true,
-      "net_selection": "large"
+      "net_selection": "large",
+      "stockfish_hash_mb": 1
     },
     {
       "name": "nodes_0256",
@@ -51,7 +54,8 @@
       "sample_plies": 999,
       "temperature": 0.5,
       "store_legal_move_evals": true,
-      "net_selection": "large"
+      "net_selection": "large",
+      "stockfish_hash_mb": 1
     },
     {
       "name": "nodes_1024",
