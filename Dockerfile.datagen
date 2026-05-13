@@ -99,7 +99,7 @@ ARG SF_FORK_REPO=https://github.com/thomas-schweich/stockfish-ml-extensions.git
 # at the time the post-`madvise(MADV_HUGEPAGE)` PR (#2 on the fork)
 # merged — i.e. the NNUE-THP feature is live in this binary. Bump
 # alongside any new fork PR landing.
-ARG SF_FORK_COMMIT=341d1cd1f8c8ad7b80f33beed27d3b6a08d4ad79
+ARG SF_FORK_COMMIT=341d1cd14dd92285973a244d8acfca9c37cf15df
 
 WORKDIR /build
 RUN git clone "$SF_FORK_REPO" sf-fork \
@@ -192,7 +192,7 @@ COPY --from=sf-fork-source /build/sf-fork /opt/datagen/sf-fork
 # values across stages, so the two literals must match by hand. The
 # script `stockfish-datagen/scripts/build_patched_stockfish.sh` also
 # pins the same SHA for local-dev builds.
-ENV SF_FORK_COMMIT=341d1cd1f8c8ad7b80f33beed27d3b6a08d4ad79
+ENV SF_FORK_COMMIT=341d1cd14dd92285973a244d8acfca9c37cf15df
 
 # Opt in to the NNUE-THP feature shipped in fork commit 341d1cd1 (PR #2
 # on the fork): on Network::load, `madvise(MADV_HUGEPAGE)` is issued
