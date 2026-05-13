@@ -36,7 +36,7 @@ SF_REPO="https://github.com/thomas-schweich/stockfish-ml-extensions.git"
 # stage). The CI build pulls from the Dockerfile; this script is the
 # local-dev parallel — drift between the two means a dev gets a
 # differently-patched binary than the pod runs.
-SF_COMMIT="341d1cd1f8c8ad7b80f33beed27d3b6a08d4ad79"
+SF_COMMIT="341d1cd14dd92285973a244d8acfca9c37cf15df"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SF_DIR="$ROOT_DIR/upstream-stockfish"
 OUT_BIN="$ROOT_DIR/stockfish-patched"
