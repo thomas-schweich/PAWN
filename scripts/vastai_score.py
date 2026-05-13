@@ -358,41 +358,155 @@ def score_offer(
     }, None
 
 
+_DUAL_WORDS = {"dual", "2-socket", "2socket"}
+_QUAD_WORDS = {"quad", "4-socket", "4socket"}
+
+
+def lookup_anchor_cpu(
+    user_string: str, passmark: dict[str, dict]
+) -> dict | None:
+    """
+    Permissive PassMark lookup for the --anchor-cpu string. The user might
+    type "EPYC 9654 dual", "dual EPYC 9654", "2x EPYC 9654", or "AMD EPYC
+    9654" — all should resolve to PassMark's "[Dual CPU] AMD EPYC 9654".
+
+    Strategy: detect a multi-socket hint (word or `Nx` prefix), strip it,
+    then run the base name through the standard `lookup_cpu_entry` ladder.
+    Re-prepend `Nx ` when looking in the multi-socket pool. Also try with
+    an "AMD " prefix since the user may omit it for AMD parts.
+    """
+    n = normalize_name(user_string)
+    n_sockets = 1
+
+    m = re.match(r"^(\d+)x\s+(.*)", n)
+    if m:
+        n_sockets = int(m.group(1))
+        bare = m.group(2)
+    else:
+        tokens = n.split()
+        bare_tokens: list[str] = []
+        for t in tokens:
+            if t in _DUAL_WORDS:
+                n_sockets = max(n_sockets, 2)
+            elif t in _QUAD_WORDS:
+                n_sockets = max(n_sockets, 4)
+            else:
+                bare_tokens.append(t)
+        bare = " ".join(bare_tokens)
+
+    candidates: list[str] = []
+    if n_sockets > 1:
+        candidates += [f"{n_sockets}x {bare}", f"{n_sockets}x amd {bare}"]
+    candidates += [bare, f"amd {bare}"]
+
+    for key in candidates:
+        entry = passmark.get(key)
+        if entry is not None:
+            return entry
+        # Prefix-shortened fallback through the standard ladder.
+        entry = lookup_cpu_entry(key, passmark)
+        if entry is not None:
+            return entry
+    return None
+
+
+def resolve_workload_size(
+    *,
+    target_tb: float,
+    total_kscore_hours: float | None,
+    anchor_cpu: str | None,
+    anchor_hours: float | None,
+    data_gb_per_kscore_h: float,
+    passmark: dict[str, dict],
+) -> tuple[float, str]:
+    """
+    Collapse the three workload-size input forms into a single number.
+
+    Precedence: explicit `--total-kscore-hours` > anchor (cpu + hours) > rate.
+
+    Returns `(total_kscore_hours, human-readable_note)` for the run header.
+    """
+    if total_kscore_hours is not None:
+        return total_kscore_hours, (
+            f"workload anchor: --total-kscore-hours={total_kscore_hours:.1f} "
+            "(direct)"
+        )
+
+    if anchor_cpu is not None or anchor_hours is not None:
+        if anchor_cpu is None or anchor_hours is None:
+            raise SystemExit(
+                "--anchor-cpu and --anchor-hours must be set together"
+            )
+        entry = lookup_anchor_cpu(anchor_cpu, passmark)
+        if entry is None:
+            raise SystemExit(
+                f"--anchor-cpu {anchor_cpu!r} did not match any PassMark "
+                "entry. Try forms like 'AMD EPYC 9654', 'EPYC 9654 dual', "
+                "'2x EPYC 9654', 'Threadripper PRO 7995WX'."
+            )
+        anchor_mark = entry["mark"]
+        anchor_kscore = anchor_mark / 1000.0
+        kscore_hours = anchor_hours * anchor_kscore
+        return kscore_hours, (
+            f"workload anchor: {anchor_hours:.1f}h on {anchor_cpu!r} "
+            f"(PassMark {anchor_mark}, {anchor_kscore:.2f} kscore) "
+            f"→ {kscore_hours:.1f} kscore-h total"
+        )
+
+    # Fallback: GB-per-kscore-hour rate.
+    rate = data_gb_per_kscore_h
+    kscore_hours = (target_tb * 1024.0) / rate
+    return kscore_hours, (
+        f"workload anchor: --data-gb-per-kscore-h={rate} × "
+        f"{target_tb} TB → {kscore_hours:.1f} kscore-h total "
+        "(loose default — prefer an empirical anchor)"
+    )
+
+
 def add_target_tb_estimates(
     scored: list[dict],
     target_tb: float,
-    data_gb_per_kscore_hr: float,
+    total_kscore_hours: float,
     download_gb: float,
 ) -> None:
     """
     Project the total dollar cost of producing `target_tb` of output on each
-    offer, given a workload calibration constant `data_gb_per_kscore_hr`.
+    offer, given the total CPU work in kscore-hours required to produce that
+    much data (`total_kscore_hours`).
 
-    Throughput model: data_GB/hour = effective_score_kscore × data_gb_per_kscore_hr
-    Wall-clock:       hours = (target_tb × 1024) / data_GB/hour
-    Compute cost:     dph × hours
-    Upload cost:      target_tb × up_cost_per_tb
-    Download cost:    (download_gb / 1024) × down_cost_per_tb
-    Total cost:       compute + upload + download
-    Total $/TB:       total / target_tb
+    `total_kscore_hours` is the one knob that encodes "how heavy the workload
+    is." It can be derived from any of:
+      - direct: `--total-kscore-hours K`
+      - empirical anchor: `--anchor-cpu CPU --anchor-hours H`
+            → W = H × PassMark(CPU) / 1000
+      - calibration rate: `--data-gb-per-kscore-h C`
+            → W = target_tb × 1024 / C
 
-    Bandwidth bottleneck check: required Mbps = (data_GB/hour × 1024 × 8) / 3600.
-    Flag offers where required > 0.7 × inet_up_mbps as bandwidth-limited.
+    Per-machine math (S = effective_score / 1000):
+      hours_X      = W / S
+      compute_$    = dph_X × hours_X
+      upload_$     = target_tb × up_cost_per_tb_X      (exact, no calibration)
+      download_$   = (download_gb / 1024) × down_cost_per_tb_X
+      total_$      = compute + upload + download
+
+    Bandwidth check: req Mbps = (target_GB × 1024 × 8) / (hours × 3600).
+    Flag offers where req > 0.7 × inet_up_mbps.
     """
-    target_gb = target_tb * 1024.0
     target_download_tb = download_gb / 1024.0
+    target_gb = target_tb * 1024.0
     for s in scored:
         effective_kscore = s["effective_score"] / 1000.0
-        data_gb_per_h = effective_kscore * data_gb_per_kscore_hr
-        if data_gb_per_h <= 0:
+        if effective_kscore <= 0 or total_kscore_hours <= 0:
             continue
-        hours = target_gb / data_gb_per_h
+        hours = total_kscore_hours / effective_kscore
+        if hours <= 0:
+            continue
         compute = s["dph"] * hours
         upload = target_tb * s["up_cost_per_tb"]
         download = target_download_tb * s["down_cost_per_tb"]
         total = compute + upload + download
-        # Required egress Mbps to keep up with compute throughput.
-        required_up_mbps = (data_gb_per_h * 1024 * 8) / 3600
+        # Required sustained egress Mbps to clear `target_tb` in `hours`.
+        required_up_mbps = (target_gb * 1024 * 8) / (hours * 3600)
         bw_limited = (
             s["inet_up_mbps"] > 0
             and required_up_mbps > 0.7 * s["inet_up_mbps"]
@@ -522,19 +636,48 @@ def main() -> int:
         "--target-tb", type=float, default=None,
         help=(
             "if set, project total $ to produce this many TB of output "
-            "(compute + upload + download), sort by total $/TB, and add "
-            "bandwidth-bottleneck check."
+            "(compute + upload + download), sort by total $/TB, and add a "
+            "bandwidth-bottleneck check. Requires one workload-size knob: "
+            "--total-kscore-hours OR (--anchor-cpu + --anchor-hours) OR "
+            "--data-gb-per-kscore-h. Anchor mode is preferred — it pins the "
+            "workload to a single empirical observation instead of a "
+            "two-unknown rate guess."
         ),
+    )
+    p.add_argument(
+        "--total-kscore-hours", type=float, default=None,
+        help=(
+            "direct workload size: total CPU work (in kscore-hours) needed "
+            "to produce --target-tb of output. Once you've run the workload "
+            "once and measured (compute_hours × kscore), this is the most "
+            "honest number to pass forward."
+        ),
+    )
+    p.add_argument(
+        "--anchor-cpu", type=str, default=None,
+        help=(
+            "empirical-anchor mode: a CPU description (e.g. 'EPYC 9654 dual', "
+            "'AMD EPYC 7B13', '2x EPYC 9654') used to look up PassMark. "
+            "Paired with --anchor-hours, this says 'the --target-tb workload "
+            "takes H hours on this CPU'. The script then back-derives "
+            "total_kscore_hours = H × PassMark(CPU) / 1000 and projects every "
+            "other offer from there."
+        ),
+    )
+    p.add_argument(
+        "--anchor-hours", type=float, default=None,
+        help="hours the --target-tb workload takes on --anchor-cpu",
     )
     p.add_argument(
         "--data-gb-per-kscore-h", type=float, default=0.1,
         help=(
-            "workload calibration: GB of output produced per kscore-hour of "
-            "CPU work. Default 0.1, calibrated for stockfish-datagen "
+            "fallback workload calibration when no anchor or direct kscore-h "
+            "is provided: GB of output produced per kscore-hour. Default 0.1, "
+            "a rough order-of-magnitude estimate for stockfish-datagen "
             "(evallegal mode, ~5 KB/game compressed, ~800 g/s on a dual "
-            "EPYC 9654 at PassMark 141k ≈ 14.4 GB/h ÷ 141.8 kscore). Adjust "
-            "for other workloads — denser output (e.g. full eval trees) "
-            "raises this; sparser (token-only) lowers it."
+            "EPYC 9654 at PassMark 141k ≈ 14.4 GB/h ÷ 141.8 kscore). Each "
+            "factor in that chain is loose — prefer the anchor form once "
+            "you have one real run to anchor against."
         ),
     )
     p.add_argument(
@@ -565,10 +708,19 @@ def main() -> int:
                 unmatched_cpus.append(offer.get("cpu_name", "?"))
 
     if args.target_tb is not None:
+        total_kscore_hours, anchor_note = resolve_workload_size(
+            target_tb=args.target_tb,
+            total_kscore_hours=args.total_kscore_hours,
+            anchor_cpu=args.anchor_cpu,
+            anchor_hours=args.anchor_hours,
+            data_gb_per_kscore_h=args.data_gb_per_kscore_h,
+            passmark=passmark,
+        )
+        print(f"[workload] {anchor_note}", file=sys.stderr)
         add_target_tb_estimates(
             scored,
             target_tb=args.target_tb,
-            data_gb_per_kscore_hr=args.data_gb_per_kscore_h,
+            total_kscore_hours=total_kscore_hours,
             download_gb=args.download_gb,
         )
         scored.sort(key=lambda x: x.get("est_total_dollars_per_tb", float("inf")))
