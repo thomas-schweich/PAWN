@@ -4,7 +4,9 @@
 # binary) plus a Python orchestrator (`datagen_with_hf_sync.py`) that
 # wraps it with incremental upload to a HuggingFace dataset.
 #
-# Stockfish is the **patched fork** (stockfish-ml-extensions, sf_18-v0.3.0+).
+# Stockfish is the **patched fork** (stockfish-ml-extensions, fork-main
+# pinned by SF_FORK_COMMIT below — current pin is post the NNUE-THP
+# merge, i.e. fork-main commit 341d1cd1, beyond the sf_18-v0.3.0 tag).
 # The patched binary adds the `evallegal` UCI command (used by every
 # searchless tier and by every search tier with `store_legal_move_evals:
 # true`) and the `NetSelection` UCI option (used by every tier in the
@@ -185,9 +187,11 @@ COPY --from=sfd-builder /build/target/release/stockfish-datagen /usr/local/bin/s
 COPY --from=sf-fork-source /build/sf-fork /opt/datagen/sf-fork
 
 # Stamp the commit into an env var so the preflight script can mix it
-# into the cache key. Keep this in sync with the ARG in the
-# `sf-fork-source` stage above (Docker doesn't propagate ARG values
-# across stages automatically).
+# into the cache key. **Keep this in sync with the ARG SF_FORK_COMMIT
+# in the `sf-fork-source` stage above** — Docker doesn't propagate ARG
+# values across stages, so the two literals must match by hand. The
+# script `stockfish-datagen/scripts/build_patched_stockfish.sh` also
+# pins the same SHA for local-dev builds.
 ENV SF_FORK_COMMIT=341d1cd1f8c8ad7b80f33beed27d3b6a08d4ad79
 
 # Opt in to the NNUE-THP feature shipped in fork commit 341d1cd1 (PR #2

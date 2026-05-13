@@ -31,9 +31,12 @@ SF_REPO="https://github.com/thomas-schweich/stockfish-ml-extensions.git"
 # leave the local tag pointing at the old commit (fetch never moves an
 # existing local tag without --force). Pinning to SHA matches the
 # Dockerfile's pin and guarantees byte-identical builds across machines.
-# This SHA is the commit annotated tag `sf_18-v0.3.0` currently points at;
-# bump together if/when the tag advances.
-SF_COMMIT="14f92699733a3d24a9067a20b32f95f0fcf9c4ab"
+# Keep in sync with `Dockerfile.datagen`'s SF_FORK_COMMIT (both the ARG
+# at the top of the sf-fork-source stage and the ENV in the runtime
+# stage). The CI build pulls from the Dockerfile; this script is the
+# local-dev parallel — drift between the two means a dev gets a
+# differently-patched binary than the pod runs.
+SF_COMMIT="341d1cd1f8c8ad7b80f33beed27d3b6a08d4ad79"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SF_DIR="$ROOT_DIR/upstream-stockfish"
 OUT_BIN="$ROOT_DIR/stockfish-patched"
