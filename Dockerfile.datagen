@@ -4,7 +4,9 @@
 # binary) plus a Python orchestrator (`datagen_with_hf_sync.py`) that
 # wraps it with incremental upload to a HuggingFace dataset.
 #
-# Stockfish is the **patched fork** (stockfish-ml-extensions, sf_18-v0.3.0+).
+# Stockfish is the **patched fork** (stockfish-ml-extensions, fork-main
+# pinned by SF_FORK_COMMIT below — current pin is post the NNUE-THP
+# merge, i.e. fork-main commit 341d1cd1, beyond the sf_18-v0.3.0 tag).
 # The patched binary adds the `evallegal` UCI command (used by every
 # searchless tier and by every search tier with `store_legal_move_evals:
 # true`) and the `NetSelection` UCI option (used by every tier in the
@@ -50,7 +52,7 @@
 #
 # Pinned versions for reproducibility:
 #   Stockfish 18 fork   https://github.com/thomas-schweich/stockfish-ml-extensions
-#                       commit 14f92699 (annotated tag sf_18-v0.3.0)
+#                       commit 341d1cd1 (post-NNUE-THP-merge fork-main)
 
 # ── tmux: build from source ──────────────────────────────────────────
 # Same version + sha256 pin as the main Dockerfile's dev image. Note
@@ -92,10 +94,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG SF_FORK_REPO=https://github.com/thomas-schweich/stockfish-ml-extensions.git
 # Pin to commit SHA, not just tag. Lightweight git tags can be force-moved
 # on the remote and a `git clone --branch <tag>` would silently pick up
-# the new commit. The annotated tag `sf_18-v0.3.0` currently points at
-# this commit; we pin to the SHA so a future tag move (accidental or
-# otherwise) fails the build loudly instead of silently changing the binary.
-ARG SF_FORK_COMMIT=14f92699733a3d24a9067a20b32f95f0fcf9c4ab
+# the new commit; SHA pin fails the build loudly instead of silently
+# changing the binary. The currently-pinned SHA tracks fork-main HEAD
+# at the time the post-`madvise(MADV_HUGEPAGE)` PR (#2 on the fork)
+# merged — i.e. the NNUE-THP feature is live in this binary. Bump
+# alongside any new fork PR landing.
+ARG SF_FORK_COMMIT=341d1cd1f8c8ad7b80f33beed27d3b6a08d4ad79
 
 WORKDIR /build
 RUN git clone "$SF_FORK_REPO" sf-fork \
@@ -183,10 +187,23 @@ COPY --from=sfd-builder /build/target/release/stockfish-datagen /usr/local/bin/s
 COPY --from=sf-fork-source /build/sf-fork /opt/datagen/sf-fork
 
 # Stamp the commit into an env var so the preflight script can mix it
-# into the cache key. Keep this in sync with the ARG in the
-# `sf-fork-source` stage above (Docker doesn't propagate ARG values
-# across stages automatically).
-ENV SF_FORK_COMMIT=14f92699733a3d24a9067a20b32f95f0fcf9c4ab
+# into the cache key. **Keep this in sync with the ARG SF_FORK_COMMIT
+# in the `sf-fork-source` stage above** — Docker doesn't propagate ARG
+# values across stages, so the two literals must match by hand. The
+# script `stockfish-datagen/scripts/build_patched_stockfish.sh` also
+# pins the same SHA for local-dev builds.
+ENV SF_FORK_COMMIT=341d1cd1f8c8ad7b80f33beed27d3b6a08d4ad79
+
+# Opt in to the NNUE-THP feature shipped in fork commit 341d1cd1 (PR #2
+# on the fork): on Network::load, `madvise(MADV_HUGEPAGE)` is issued
+# over the feature-transformer weights so the kernel coalesces 4 KiB
+# pages into 2 MiB ones for ~99% of the ~50 MiB weight bytes. On the
+# 380-worker EPYC datagen pod this cuts the per-process TLB working
+# set ~500×. Read-only hint; safe to leave on globally. Disable per
+# launch with `vast.sh launch ... -e SF_NNUE_HUGEPAGE=0` if A/B'ing.
+# Requires `cat /sys/kernel/mm/transparent_hugepage/enabled` to be
+# `[madvise]` or `[always]` — true on every standard Linux distro.
+ENV SF_NNUE_HUGEPAGE=1
 
 # Symlink ~/bin/stockfish → the soon-to-be-built patched binary. The
 # bundled `examples/smoke.json` points at `~/bin/stockfish` for parity

@@ -100,6 +100,50 @@ Compounded: 1.50 × 1.40 × 1.25 × 1.20 × 1.20 × 1.20 ≈ **4.54×**, matchin
    The CI matrix currently builds `x86-64-avx2` and `x86-64-avx512` variants. A `znver4`-tuned build would benefit from Zen 4-specific instruction scheduling and could give an additional 5-10 % on Genoa pods.
    - Caveat: requires us to keep the avx2/avx512 fallback variants for non-Zen-4 hosts.
 
+## Considered and rejected: `SkipTTClear` UCI option
+
+The TT-clear row in the gap table above (1.20× penalty) is real, and at
+the time this analysis was written we drafted a fork patch
+([thomas-schweich/stockfish-ml-extensions #1](https://github.com/thomas-schweich/stockfish-ml-extensions/pull/1))
+adding a `SkipTTClear` UCI option that gates the per-`ucinewgame`
+`tt.clear()` memset. Smoke-tested clean (signature/perft/reprosearch
+all bit-identical to vanilla with the option default-`false`). Closed
+without merging on a design review of the consuming architecture.
+
+**Why rejected:** the post-refactor `stockfish-datagen` architecture
+promises that shard bytes are a pure function of
+`(master_seed, tier.name, global_game_index)`. With `SkipTTClear=true`
+the TT carries across `ucinewgame`, so a search at fixed node budget
+can pick a different `bestmove` depending on TT residue. The residue
+is determined by which other games this worker played first, which is
+determined by the AtomicU64 shard-counter race in `run_tier` — all of
+which is non-deterministic across pods, across re-runs, and even across
+workers within a pod. Shard contents become a function of
+`(master_seed, tier.name, global_game_index, worker_shard_history)`
+with the trailing term non-reproducible.
+
+That violates the bit-identical guarantees that
+`live_resume_regenerates_missing_shard`,
+`live_grow_within_last_shard_regenerates_boundary`, and
+`live_grow_n_games_extends_cleanly` pin — plus the cross-pod manifest
+reconciliation contract, which assumes that two pods generating the
+same shard_id produce the same bytes.
+
+**Why the perf trade isn't worth the determinism cost:** the original
+"12 GB/s wasted memset bandwidth" estimate was at `hash_mb=16`. Tier 1
+recommendation (1) above already drops `hash_mb` to 1 MB on the low-
+nodes tiers — a 16× reduction at the source. With `hash_mb=1`, TT clear
+is ~1 MB × 380 workers × ~1 game/few-seconds ≈ <500 MB/s of zero-write
+bandwidth across the whole pod. That's under 0.1% of EPYC DRAM
+bandwidth. Realistic `SkipTTClear` win, after the related-but-cheap
+config change, is under 1%.
+
+**Determinism-safe alternative:** a `Hash=0` / `NoTT` mode in the fork
+would eliminate the TT memset entirely without breaking determinism
+(no state to carry; every probe is a miss). Deferred: the ~1% residual
+isn't worth a fork patch right now, but is the right shape if the gap
+ever becomes relevant.
+
 ## Work-order suggestion for the implementing agent
 
 Recommended order, optimizing for getting wins into production fastest with least disruption:

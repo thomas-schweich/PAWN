@@ -1,8 +1,8 @@
-From e18db37492e6f6c1ef194e9ab855e8ab2de7749c Mon Sep 17 00:00:00 2001
-From: Claude <claude@local>
-Date: Sun, 10 May 2026 15:32:07 -0700
+From 341d1cd14dd92285973a244d8acfca9c37cf15df Mon Sep 17 00:00:00 2001
+From: Thomas Schweich <thomas.schweich@gmail.com>
+Date: Tue, 12 May 2026 20:08:30 -0700
 Subject: [PATCH] feat(nnue): madvise(MADV_HUGEPAGE) the feature-transformer
- weights
+ weights (#2)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -29,13 +29,15 @@ it loudly (none known today, but cheap insurance).
 No correctness impact: madvise is a hint; if the kernel ignores it,
 the only effect is that THP doesn't engage. The weights themselves
 are untouched.
+
+Signed-off-by: Thomas Schweich <thomas.schweich@gmail.com>
 ---
- src/nnue/network.cpp                | 11 +++++++-
- src/nnue/nnue_feature_transformer.h | 39 +++++++++++++++++++++++++++++
- 2 files changed, 49 insertions(+), 1 deletion(-)
+ src/nnue/network.cpp                | 11 +++++-
+ src/nnue/nnue_feature_transformer.h | 57 +++++++++++++++++++++++++++++
+ 2 files changed, 67 insertions(+), 1 deletion(-)
 
 diff --git a/src/nnue/network.cpp b/src/nnue/network.cpp
-index d1f2b14..63a35f4 100644
+index d1f2b14c..63a35f45 100644
 --- a/src/nnue/network.cpp
 +++ b/src/nnue/network.cpp
 @@ -322,7 +322,16 @@ std::optional<std::string> Network<Arch, Transformer>::load(std::istream& stream
@@ -57,7 +59,7 @@ index d1f2b14..63a35f4 100644
  
  
 diff --git a/src/nnue/nnue_feature_transformer.h b/src/nnue/nnue_feature_transformer.h
-index f4cf348..adba2f0 100644
+index f4cf348a..a7687196 100644
 --- a/src/nnue/nnue_feature_transformer.h
 +++ b/src/nnue/nnue_feature_transformer.h
 @@ -23,10 +23,15 @@
@@ -76,7 +78,7 @@ index f4cf348..adba2f0 100644
  #include "../position.h"
  #include "../types.h"
  #include "nnue_accumulator.h"
-@@ -151,6 +156,40 @@ class FeatureTransformer {
+@@ -151,6 +156,58 @@ class FeatureTransformer {
              b = read ? b * 2 : b / 2;
      }
  
@@ -97,10 +99,28 @@ index f4cf348..adba2f0 100644
 +        const char* env = std::getenv("SF_NNUE_HUGEPAGE");
 +        if (env == nullptr || env[0] != '1')
 +            return;
++        // madvise requires a page-aligned address (Linux returns EINVAL
++        // otherwise). The weight arrays are alignas(CacheLineSize) (64 B),
++        // not page-aligned in general, so we round the start UP to the
++        // next 4 KiB boundary and the end DOWN to a 4 KiB boundary
++        // before calling. The kernel only promotes 2 MiB-aligned
++        // subregions internally anyway, so trimming a sub-page stub
++        // from each end loses no THP coverage that would otherwise have
++        // succeeded — and the call no longer pollutes strace with
++        // ignorable EINVAL noise.
++        constexpr std::size_t page = 4096;
 +        auto advise = [](void* p, std::size_t n) {
++            const std::uintptr_t raw_start = reinterpret_cast<std::uintptr_t>(p);
++            const std::uintptr_t raw_end   = raw_start + n;
++            const std::uintptr_t start = (raw_start + page - 1) & ~(page - 1);
++            const std::uintptr_t end   = raw_end & ~(page - 1);
++            if (end <= start)
++                return; // region smaller than one page after alignment
 +            // POSIX-compliant ignore-on-failure; older kernels / FS combos
-+            // may reject MADV_HUGEPAGE silently.
-+            (void)::madvise(p, n, MADV_HUGEPAGE);
++            // may still reject MADV_HUGEPAGE silently.
++            (void)::madvise(reinterpret_cast<void*>(start),
++                            static_cast<std::size_t>(end - start),
++                            MADV_HUGEPAGE);
 +        };
 +        advise(biases.data(), biases.size() * sizeof(biases[0]));
 +        advise(weights.data(), weights.size() * sizeof(weights[0]));
