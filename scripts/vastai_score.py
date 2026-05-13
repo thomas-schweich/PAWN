@@ -324,6 +324,11 @@ def score_offer(
     if not price or effective_score <= 0:
         return None, "zero price or score"
 
+    up_cost_per_tb = offer.get("internet_up_cost_per_tb") or 0.0
+    down_cost_per_tb = offer.get("internet_down_cost_per_tb") or 0.0
+    inet_up_mbps = offer.get("inet_up") or 0.0
+    inet_down_mbps = offer.get("inet_down") or 0.0
+
     return {
         "id": offer["id"],
         "cpu": cpu_name,
@@ -338,6 +343,10 @@ def score_offer(
         "effective_score": effective_score,
         "dph": price,
         "dollars_per_kscore_hr": price / (effective_score / 1000),
+        "up_cost_per_tb": up_cost_per_tb,
+        "down_cost_per_tb": down_cost_per_tb,
+        "inet_up_mbps": inet_up_mbps,
+        "inet_down_mbps": inet_down_mbps,
         "ram_mb": offer.get("cpu_ram", 0),
         "disk_gb": offer.get("disk_space", 0),
         "reliability": offer.get("reliability", 0),
@@ -347,6 +356,57 @@ def score_offer(
         "gpu_name": offer.get("gpu_name", ""),
         "rentable": offer.get("rentable", False),
     }, None
+
+
+def add_target_tb_estimates(
+    scored: list[dict],
+    target_tb: float,
+    data_gb_per_kscore_hr: float,
+    download_gb: float,
+) -> None:
+    """
+    Project the total dollar cost of producing `target_tb` of output on each
+    offer, given a workload calibration constant `data_gb_per_kscore_hr`.
+
+    Throughput model: data_GB/hour = effective_score_kscore × data_gb_per_kscore_hr
+    Wall-clock:       hours = (target_tb × 1024) / data_GB/hour
+    Compute cost:     dph × hours
+    Upload cost:      target_tb × up_cost_per_tb
+    Download cost:    (download_gb / 1024) × down_cost_per_tb
+    Total cost:       compute + upload + download
+    Total $/TB:       total / target_tb
+
+    Bandwidth bottleneck check: required Mbps = (data_GB/hour × 1024 × 8) / 3600.
+    Flag offers where required > 0.7 × inet_up_mbps as bandwidth-limited.
+    """
+    target_gb = target_tb * 1024.0
+    target_download_tb = download_gb / 1024.0
+    for s in scored:
+        effective_kscore = s["effective_score"] / 1000.0
+        data_gb_per_h = effective_kscore * data_gb_per_kscore_hr
+        if data_gb_per_h <= 0:
+            continue
+        hours = target_gb / data_gb_per_h
+        compute = s["dph"] * hours
+        upload = target_tb * s["up_cost_per_tb"]
+        download = target_download_tb * s["down_cost_per_tb"]
+        total = compute + upload + download
+        # Required egress Mbps to keep up with compute throughput.
+        required_up_mbps = (data_gb_per_h * 1024 * 8) / 3600
+        bw_limited = (
+            s["inet_up_mbps"] > 0
+            and required_up_mbps > 0.7 * s["inet_up_mbps"]
+        )
+        s.update({
+            "est_hours": hours,
+            "est_compute_cost": compute,
+            "est_upload_cost": upload,
+            "est_download_cost": download,
+            "est_total_cost": total,
+            "est_total_dollars_per_tb": total / target_tb,
+            "required_up_mbps": required_up_mbps,
+            "bw_limited": bw_limited,
+        })
 
 
 def query_vastai(query: str) -> list[dict]:
@@ -370,21 +430,57 @@ def print_table(scored: list[dict], top: int) -> None:
     hdr = (
         f"{'#':>3} {'id':>10} {'$/kscore':>10} {'$/h':>7} "
         f"{'score':>9} {'threads':>10} {'sock':>4} "
-        f"{'CPU':<28} {'src':<20} "
+        f"{'CPU':<26} "
+        f"{'up$/TB':>7} {'upMbps':>7} "
         f"{'RAM/GB':>7} {'reliab':>7} {'verif':<11} {'geo':<22}"
     )
     print(hdr)
     print("-" * len(hdr))
     for i, s in enumerate(scored, 1):
         threads = f"{s['threads_eff']}/{s['threads_total']}"
-        cpu_short = re.sub(r"\s+\d+-Core Processor$", "", s["cpu"])[:28]
+        cpu_short = re.sub(r"\s+\d+-Core Processor$", "", s["cpu"])[:26]
         print(
             f"{i:>3} {s['id']:>10} {s['dollars_per_kscore_hr']:>10.4f} "
             f"{s['dph']:>7.3f} {s['effective_score']:>9.0f} "
             f"{threads:>10} {s['sockets']:>4} "
-            f"{cpu_short:<28} {s['score_source']:<20} "
+            f"{cpu_short:<26} "
+            f"{s['up_cost_per_tb']:>7.2f} {s['inet_up_mbps']:>7.0f} "
             f"{s['ram_mb'] / 1024:>7.0f} {s['reliability']:>7.3f} "
             f"{s['verification']:<11} {s['geo']:<22}"
+        )
+
+
+def print_target_tb_table(
+    scored: list[dict], top: int, target_tb: float, download_gb: float
+) -> None:
+    scored = scored[:top]
+    if not scored:
+        print("no matches", file=sys.stderr)
+        return
+    hdr = (
+        f"{'#':>3} {'id':>10} {'$/TB':>7} {'total$':>7} {'hours':>6} "
+        f"{'comp$':>6} {'up$':>5} {'dn$':>5} "
+        f"{'CPU':<26} {'reqMbps':>8} {'upMbps':>7} {'bw?':<4} "
+        f"{'reliab':>7} {'verif':<11} {'geo':<22}"
+    )
+    print(
+        f"# target: produce {target_tb:.2f} TB of output "
+        f"+ {download_gb:.1f} GB ingress (image pulls etc.)"
+    )
+    print(hdr)
+    print("-" * len(hdr))
+    for i, s in enumerate(scored, 1):
+        cpu_short = re.sub(r"\s+\d+-Core Processor$", "", s["cpu"])[:26]
+        bw_flag = "!!" if s["bw_limited"] else ""
+        print(
+            f"{i:>3} {s['id']:>10} {s['est_total_dollars_per_tb']:>7.2f} "
+            f"{s['est_total_cost']:>7.2f} {s['est_hours']:>6.1f} "
+            f"{s['est_compute_cost']:>6.2f} {s['est_upload_cost']:>5.2f} "
+            f"{s['est_download_cost']:>5.2f} "
+            f"{cpu_short:<26} {s['required_up_mbps']:>8.1f} "
+            f"{s['inet_up_mbps']:>7.0f} {bw_flag:<4} "
+            f"{s['reliability']:>7.3f} {s['verification']:<11} "
+            f"{s['geo']:<22}"
         )
 
 
@@ -422,6 +518,32 @@ def main() -> int:
             "stockfish-datagen."
         ),
     )
+    p.add_argument(
+        "--target-tb", type=float, default=None,
+        help=(
+            "if set, project total $ to produce this many TB of output "
+            "(compute + upload + download), sort by total $/TB, and add "
+            "bandwidth-bottleneck check."
+        ),
+    )
+    p.add_argument(
+        "--data-gb-per-kscore-h", type=float, default=0.1,
+        help=(
+            "workload calibration: GB of output produced per kscore-hour of "
+            "CPU work. Default 0.1, calibrated for stockfish-datagen "
+            "(evallegal mode, ~5 KB/game compressed, ~800 g/s on a dual "
+            "EPYC 9654 at PassMark 141k ≈ 14.4 GB/h ÷ 141.8 kscore). Adjust "
+            "for other workloads — denser output (e.g. full eval trees) "
+            "raises this; sparser (token-only) lowers it."
+        ),
+    )
+    p.add_argument(
+        "--download-gb", type=float, default=5.0,
+        help=(
+            "GB of ingress per run (Docker image pull, HF dataset prime). "
+            "Default 5. Multiplied by the host's down-cost-per-TB."
+        ),
+    )
     args = p.parse_args()
 
     passmark = fetch_passmark(refresh=args.refresh)
@@ -442,7 +564,16 @@ def main() -> int:
             if reason.startswith("no PassMark match"):
                 unmatched_cpus.append(offer.get("cpu_name", "?"))
 
-    scored.sort(key=lambda x: x["dollars_per_kscore_hr"])
+    if args.target_tb is not None:
+        add_target_tb_estimates(
+            scored,
+            target_tb=args.target_tb,
+            data_gb_per_kscore_hr=args.data_gb_per_kscore_h,
+            download_gb=args.download_gb,
+        )
+        scored.sort(key=lambda x: x.get("est_total_dollars_per_tb", float("inf")))
+    else:
+        scored.sort(key=lambda x: x["dollars_per_kscore_hr"])
 
     if args.json:
         print(json.dumps(scored[: args.top], indent=2))
@@ -452,7 +583,12 @@ def main() -> int:
             f"(skip reasons: {skip_reasons})\n",
             file=sys.stderr,
         )
-        print_table(scored, args.top)
+        if args.target_tb is not None:
+            print_target_tb_table(
+                scored, args.top, args.target_tb, args.download_gb
+            )
+        else:
+            print_table(scored, args.top)
 
     if args.show_unmatched and unmatched_cpus:
         print(
