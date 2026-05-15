@@ -20,13 +20,45 @@ REPO = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO / "scripts"
 
 
-def _run_help(script_name: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
-    """Invoke ``python scripts/<name> --help`` and return the result."""
+def _has_pep723_inline_deps(path: Path) -> bool:
+    """Return True iff the script declares PEP 723 inline dependencies.
+
+    Such scripts (e.g. `vastai_score.py`) need to be invoked through
+    `uv run --script` so the declared deps are installed in a transient
+    venv. Running them with bare `python` produces a misleading
+    `ModuleNotFoundError` for deps the script's shebang would have set
+    up automatically.
+    """
+    try:
+        with path.open("r") as fh:
+            for _ in range(10):
+                line = fh.readline()
+                if not line:
+                    return False
+                if line.startswith("# /// script"):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _run_help(script_name: str, timeout: float = 120.0) -> subprocess.CompletedProcess[str]:
+    """Invoke ``<script> --help`` and return the result.
+
+    PEP 723 inline-deps scripts (`# /// script` block at the top) are
+    dispatched through ``uv run --script`` so their declared deps resolve;
+    plain scripts use the test's Python directly.
+    """
     env = os.environ.copy()
     env.setdefault("MPLCONFIGDIR", str(REPO / ".mpl-cache"))
     env.setdefault("PAWN_ALLOW_CPU", "1")
+    path = SCRIPTS / script_name
+    if _has_pep723_inline_deps(path):
+        cmd = ["uv", "run", "--script", str(path), "--help"]
+    else:
+        cmd = [sys.executable, str(path), "--help"]
     return subprocess.run(
-        [sys.executable, str(SCRIPTS / script_name), "--help"],
+        cmd,
         capture_output=True, text=True, timeout=timeout, env=env,
         cwd=str(REPO),
     )
@@ -52,6 +84,7 @@ ARGPARSE_SCRIPTS = [
     "generate_model_cards.py",
     "rename_shards.py",
     "run_evals_backbone.py",
+    "vastai_score.py",
 ]
 
 

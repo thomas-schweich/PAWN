@@ -272,6 +272,10 @@ if [ $# -eq 0 ]; then
             --repo-id "$DATAGEN_HF_REPO" \
             $PRUNE_FLAG \
             ${DATAGEN_POLL_INTERVAL:+--poll-interval "$DATAGEN_POLL_INTERVAL"} \
+            ${DATAGEN_POLL_JITTER_RATIO:+--poll-jitter-ratio "$DATAGEN_POLL_JITTER_RATIO"} \
+            ${DATAGEN_HF_COMMIT_RETRIES:+--hf-commit-retries "$DATAGEN_HF_COMMIT_RETRIES"} \
+            ${DATAGEN_HF_RETRY_MAX_DELAY:+--hf-retry-max-delay "$DATAGEN_HF_RETRY_MAX_DELAY"} \
+            ${DATAGEN_HF_OVERLOAD_MIN_DELAY:+--hf-overload-min-delay "$DATAGEN_HF_OVERLOAD_MIN_DELAY"} \
             $DATAGEN_EXTRA_ARGS
     fi
     echo "datagen: no command given. Examples:" >&2

@@ -17,15 +17,18 @@ Pod-friendly orchestrator. Three phases:
    graceful-shutdown semantics still hold.
 
 3. **Watcher.** A daemon thread polls the output dir every
-   `--poll-interval` seconds. New shard / sentinel files are committed
-   in batched `huggingface_hub.upload_folder` calls — one commit per
-   tier per cycle for shards, plus one trailing commit for each new
-   manifest. This keeps the per-repo commit count under HF's 128/hour
-   limit even on cheap tiers that produce hundreds of shards per minute.
-   Zero-byte placeholders (size == 0) are skipped — those came from the
-   primer and are already remote. After a successful upload, if
-   `--prune-local` is set, the local shard file is truncated to a
-   zero-byte placeholder so disk usage stays flat as the run grows.
+   `--poll-interval` seconds, with optional jitter so multiple pods do
+   not hit HF in lockstep. New shard / sentinel files are committed in
+   batched `huggingface_hub.create_commit` calls — one commit per tier
+   per cycle for shards, plus one trailing commit for each new manifest.
+   This keeps the per-repo commit count under HF's 128/hour limit even
+   on cheap tiers that produce hundreds of shards per minute. HF 429s,
+   529s, and transient 5xx responses are retried with server-directed
+   delays when available and jittered backoff otherwise. Zero-byte
+   placeholders (size == 0) are skipped — those came from the primer and
+   are already remote. After a successful upload, if `--prune-local` is
+   set, the local shard file is truncated to a zero-byte placeholder so
+   disk usage stays flat as the run grows.
 
 Auth: needs HF_TOKEN in the env (standard pod setup). Repo is created
 with `repo_type="dataset"` if it doesn't exist.
@@ -34,9 +37,12 @@ with `repo_type="dataset"` if it doesn't exist.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import json
 import logging
 import os
+import random
 import re
 import signal
 import subprocess
@@ -80,6 +86,22 @@ TIER_STATE_RE = re.compile(r"^_tier_state(-s\d{6,}-s\d{6,})?\.json$")
 # (rare on a 100M-game run with 2K shard size = 50K shards, still 5
 # digits; defensive).
 SHARD_RE = re.compile(r"^shard-s(?P<shard_id>\d{6,})-r\d{6,}\.parquet$")
+RATELIMIT_RESET_RE = re.compile(r"(?:^|[;,])\s*t=(?P<seconds>\d+(?:\.\d+)?)")
+
+# HF's documented rate limits use 429 for quota exhaustion, but in practice
+# heavily-loaded upload endpoints can also return 529 ("service overloaded").
+# Treat both as backoff-worthy so a pod fleet does not amplify a transient.
+RETRYABLE_HF_STATUS_CODES = {429, 500, 502, 503, 504, 529}
+
+
+@dataclass(frozen=True)
+class HfRetryConfig:
+    """Retry policy for HuggingFace commit calls."""
+
+    max_attempts: int = 8
+    base_delay_seconds: float = 2.0
+    max_delay_seconds: float = 300.0
+    overload_min_delay_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -121,6 +143,89 @@ def ensure_repo(api: HfApi, repo_id: str) -> None:
     except RepositoryNotFoundError:
         LOG.info("creating dataset repo %s", repo_id)
         api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
+
+
+def _header(response: object, name: str) -> str | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        value = headers.get(name)
+    except AttributeError:
+        return None
+    return str(value) if value is not None else None
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse an HTTP Retry-After value into seconds."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+
+
+def _parse_ratelimit_reset(value: str | None) -> float | None:
+    """Parse HF's RateLimit `t=<seconds until reset>` parameter."""
+    if value is None:
+        return None
+    match = RATELIMIT_RESET_RE.search(value)
+    if match is None:
+        return None
+    try:
+        return max(0.0, float(match.group("seconds")))
+    except ValueError:
+        return None
+
+
+def _hf_retry_delay_seconds(
+    status: int,
+    response: object | None,
+    attempt: int,
+    retry_config: HfRetryConfig,
+) -> tuple[float, str]:
+    """Return the non-jittered retry delay and the source of that delay."""
+    retry_after = _parse_retry_after(_header(response, "retry-after"))
+    if retry_after is not None:
+        return min(retry_after, retry_config.max_delay_seconds), "Retry-After"
+
+    if status == 429:
+        ratelimit_reset = _parse_ratelimit_reset(_header(response, "ratelimit"))
+        if ratelimit_reset is not None:
+            return min(ratelimit_reset, retry_config.max_delay_seconds), "RateLimit"
+
+    delay = retry_config.base_delay_seconds * (2 ** attempt)
+    if status == 529:
+        delay = max(delay, retry_config.overload_min_delay_seconds)
+    return min(delay, retry_config.max_delay_seconds), "exponential backoff"
+
+
+def _jitter_retry_delay(delay: float, source: str) -> float:
+    """Jitter retry sleeps so many pods do not retry in lockstep."""
+    if delay <= 0:
+        return 0.0
+    if source in {"Retry-After", "RateLimit"}:
+        # Honor server-directed sleeps as a floor, then add a small spread.
+        return delay + random.uniform(0.0, min(30.0, max(1.0, delay * 0.10)))
+    return random.uniform(delay * 0.5, delay)
+
+
+def _jitter_poll_interval(poll_interval: float, poll_jitter_ratio: float) -> float:
+    if poll_interval <= 0 or poll_jitter_ratio <= 0:
+        return max(0.0, poll_interval)
+    spread = poll_interval * poll_jitter_ratio
+    return max(0.0, poll_interval + random.uniform(-spread, spread))
 
 
 def primer(
@@ -224,6 +329,8 @@ def _upload_folder_batch(
     files: list[str],
     commit_message: str,
     deletes: list[str] | None = None,
+    retry_config: HfRetryConfig | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Commit a batch of files from `local_dir` as a single HF commit.
 
@@ -295,8 +402,8 @@ def _upload_folder_batch(
         operations.append(CommitOperationDelete(
             path_in_repo=f"{path_in_repo}/{repo_relative}",
         ))
-    delay = 2.0
-    for attempt in range(5):
+    retry_config = retry_config or HfRetryConfig()
+    for attempt in range(retry_config.max_attempts):
         try:
             api.create_commit(
                 repo_id=repo_id,
@@ -308,14 +415,22 @@ def _upload_folder_batch(
         except HfHubHTTPError as e:
             response = getattr(e, "response", None)
             status = response.status_code if response is not None else 0
-            if status not in (429, 500, 502, 503, 504) or attempt == 4:
+            if (
+                status not in RETRYABLE_HF_STATUS_CODES
+                or attempt == retry_config.max_attempts - 1
+            ):
                 raise
-            LOG.warning(
-                "folder commit (%s, %d files) failed with HTTP %d; retrying in %.1fs (attempt %d/5)",
-                path_in_repo, len(files), status, delay, attempt + 1,
+            delay, delay_source = _hf_retry_delay_seconds(
+                status, response, attempt, retry_config
             )
-            time.sleep(delay)
-            delay *= 2
+            jittered_delay = _jitter_retry_delay(delay, delay_source)
+            LOG.warning(
+                "folder commit (%s, %d files) failed with HTTP %d; "
+                "retrying in %.1fs via %s (attempt %d/%d)",
+                path_in_repo, len(files), status, jittered_delay, delay_source,
+                attempt + 1, retry_config.max_attempts,
+            )
+            sleep(jittered_delay)
 
 
 # Default consecutive-failure threshold; CLI-tunable via
@@ -345,6 +460,8 @@ def watcher_loop(
     max_consecutive_failures: int,
     error_holder: list[BaseException],
     on_terminal_failure: Callable[[], None] | None = None,
+    retry_config: HfRetryConfig | None = None,
+    poll_jitter_ratio: float = 0.0,
 ) -> None:
     """Poll until `stop` is set. Stores any terminal exception in `error_holder`.
 
@@ -356,7 +473,10 @@ def watcher_loop(
     consecutive_failures = 0
     while not stop.is_set():
         try:
-            _scan_and_upload(api, repo_id, tiers, uploaded, sentinel_state, upload_count, prune_local)
+            _scan_and_upload(
+                api, repo_id, tiers, uploaded, sentinel_state, upload_count,
+                prune_local, retry_config=retry_config,
+            )
             consecutive_failures = 0
         except Exception as e:
             consecutive_failures += 1
@@ -376,8 +496,8 @@ def watcher_loop(
                     except Exception:
                         LOG.exception("on_terminal_failure callback raised; swallowing")
                 return
-        # Wait either the full poll interval, or until stop fires.
-        stop.wait(poll_interval)
+        # Wait either the jittered poll interval, or until stop fires.
+        stop.wait(_jitter_poll_interval(poll_interval, poll_jitter_ratio))
 
 
 def _scan_and_upload(
@@ -388,6 +508,7 @@ def _scan_and_upload(
     sentinel_state: dict[str, tuple[int, int]],
     upload_count: list[int],
     prune_local: bool,
+    retry_config: HfRetryConfig | None = None,
 ) -> None:
     """Per cycle, per tier, commit any new local files in two folder
     uploads max:
@@ -490,6 +611,7 @@ def _scan_and_upload(
                 deletes=superseded_shards,
                 commit_message=f"sync {tier.name}: {len(new_shards_and_state)} file(s)"
                 + (f", {len(superseded_shards)} superseded" if superseded_shards else ""),
+                retry_config=retry_config,
             )
             for name in new_shards_and_state:
                 repo_path = f"{tier.name}/{name}"
@@ -520,6 +642,7 @@ def _scan_and_upload(
                 path_in_repo=tier.name,
                 files=new_manifests,
                 commit_message=f"manifest {tier.name}",
+                retry_config=retry_config,
             )
             for name in new_manifests:
                 repo_path = f"{tier.name}/{name}"
@@ -587,6 +710,10 @@ def main() -> int:
                     help="Name (on PATH) or path to the stockfish-datagen binary.")
     ap.add_argument("--poll-interval", type=float, default=30.0,
                     help="Watcher poll interval in seconds (default: 30).")
+    ap.add_argument("--poll-jitter-ratio", type=float, default=0.20,
+                    help="Randomly vary each watcher sleep by this fraction "
+                         "of --poll-interval (default: 0.20). This keeps "
+                         "multiple pods from polling/uploading in lockstep.")
     ap.add_argument("--prune-local", action="store_true",
                     help="After uploading a shard, replace local file with a "
                          "zero-byte placeholder. Recommended on disk-constrained pods.")
@@ -599,6 +726,19 @@ def main() -> int:
                     help="Watcher gives up + kills the rust child after this "
                          "many consecutive cycle failures (default: %(default)s; "
                          "tune up for runs that may span longer HF outages).")
+    ap.add_argument("--hf-commit-retries", type=int,
+                    default=HfRetryConfig.max_attempts,
+                    help="Max attempts for each HuggingFace commit batch "
+                         "(default: %(default)s). Retries cover 429, 529, "
+                         "and transient 5xx responses.")
+    ap.add_argument("--hf-retry-max-delay", type=float,
+                    default=HfRetryConfig.max_delay_seconds,
+                    help="Cap for a single HuggingFace retry sleep in seconds "
+                         "(default: %(default)s).")
+    ap.add_argument("--hf-overload-min-delay", type=float,
+                    default=HfRetryConfig.overload_min_delay_seconds,
+                    help="Minimum non-header retry delay for HTTP 529 overload "
+                         "responses, before jitter (default: %(default)s).")
     ap.add_argument("--watcher-drain-timeout-hours", type=float, default=4.0,
                     help="After the rust binary exits, how long to wait for the "
                          "watcher to drain the backlog of locally-staged shards "
@@ -636,6 +776,27 @@ def main() -> int:
                 args.shard_id_range,
             )
             return 2
+    if args.poll_jitter_ratio < 0:
+        LOG.error("FATAL: --poll-jitter-ratio must be >= 0; got %s", args.poll_jitter_ratio)
+        return 2
+    if args.hf_commit_retries < 1:
+        LOG.error("FATAL: --hf-commit-retries must be >= 1; got %s", args.hf_commit_retries)
+        return 2
+    if args.hf_retry_max_delay <= 0:
+        LOG.error("FATAL: --hf-retry-max-delay must be > 0; got %s", args.hf_retry_max_delay)
+        return 2
+    if args.hf_overload_min_delay < 0:
+        LOG.error(
+            "FATAL: --hf-overload-min-delay must be >= 0; got %s",
+            args.hf_overload_min_delay,
+        )
+        return 2
+
+    retry_config = HfRetryConfig(
+        max_attempts=args.hf_commit_retries,
+        max_delay_seconds=args.hf_retry_max_delay,
+        overload_min_delay_seconds=args.hf_overload_min_delay,
+    )
 
     # Two-part fail-fast: (a) no token at all, (b) token present but rejected.
     # Either case must fire before the rust binary spawns — running for hours
@@ -754,7 +915,8 @@ def main() -> int:
         args=(api, args.repo_id, tiers, primed, sentinel_state, upload_count, stop,
               args.poll_interval, args.prune_local,
               args.max_consecutive_failures, watcher_error,
-              _kill_child_on_watcher_failure),
+              _kill_child_on_watcher_failure, retry_config,
+              args.poll_jitter_ratio),
         name="hf-sync-watcher",
         daemon=True,
     )
@@ -813,7 +975,10 @@ def main() -> int:
     else:
         LOG.info("watcher exited cleanly; running final drain")
         try:
-            _scan_and_upload(api, args.repo_id, tiers, primed, sentinel_state, upload_count, args.prune_local)
+            _scan_and_upload(
+                api, args.repo_id, tiers, primed, sentinel_state, upload_count,
+                args.prune_local, retry_config=retry_config,
+            )
         except Exception:
             LOG.exception("final drain failed")
             drained_ok = False
