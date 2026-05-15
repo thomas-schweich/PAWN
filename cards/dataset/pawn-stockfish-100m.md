@@ -112,21 +112,21 @@ Search depth is the only thing that varies across tiers.
 
 | Tier (config) | Search budget | `multi_pv` | Games (total) | Mean game length (plies) |
 |---|---|---|---|---|
-| `tier0_evallegal` | none (searchless) | — | 20,000,000 | ~267 |
-| `nodes_0001` | `nodes = 1` | 5 | 20,000,000 | ~150 |
-| `nodes_0128` | `nodes = 128` | 5 | 20,000,000 | ~143 |
-| `nodes_0256` | `nodes = 256` | 5 | 20,000,000 | ~127 |
-| `nodes_1024` | `nodes = 1024` | 5 | 20,000,000 | ~129 |
+| `tier0_evallegal` | none (searchless) | — | 20,000,000 | 268.0 |
+| `nodes_0001` | `nodes = 1` | 5 | 20,000,000 | 153.8 |
+| `nodes_0128` | `nodes = 128` | 5 | 20,000,000 | 143.5 |
+| `nodes_0256` | `nodes = 256` | 5 | 20,000,000 | 126.1 |
+| `nodes_1024` | `nodes = 1024` | 5 | 20,000,000 | 129.5 |
 
-**Total: 100,000,000 games.** (Game-length figures are sample-based — see
-*Statistics* below.)
+**Total: 100,000,000 games.** Mean game lengths are exact — see
+*Statistics* below.
 
 `nodes = N` is a hard cap on the number of search nodes Stockfish expands
 per move. **`nodes = 1` is equivalent to `depth = 1`**: the search completes
 exactly the first iteration of iterative deepening — the root's immediate
 one-ply evaluation — and stops. Higher tiers (`128 / 256 / 1024`) let the
 search go progressively deeper. As search deepens, play gets sharper and
-games end faster (note the mean game length dropping from ~150 plies at
+games end faster (note the mean game length dropping from ~154 plies at
 `nodes=1` to ~129 at `nodes=1024`), and the dominant outcome shifts from
 draws toward decisive results.
 
@@ -229,54 +229,83 @@ keep their original high ids (see [Shard naming](#shard-naming-scheme)).
 
 ## Statistics
 
-### Exact (from shard layout)
+All counts below are **exact** unless marked *estimated*. The exact figures
+were computed from the parquet file footers alone — every shard's
+per-column `num_values` / `null_count` metadata — without reading a single
+data page (~370 MB of footer metadata across all 50,000 shards). `move_idx`
+is non-nullable inside each `LegalMoveEval`, so a leaf column's
+`num_values − null_count` is the exact entry count.
 
-- **Games**: 5 tiers × 10,000 shards × 2,000 games = **100,000,000 games**
-  (20,000,000 per tier; every shard is exactly 2,000 rows). Per-split
-  breakdown is in [Splits](#splits).
+### Games and positions (exact)
 
-### Estimated (sampled — see methodology)
+A "position" is one ply — a board state from which a move was chosen and
+its legal moves evaluated.
 
-The eval-entry counts below are **not** exact: the number of
-`LegalMoveEval` entries per game depends on game length and the number of
-legal moves at each position, both of which vary game to game. They were
-estimated by sampling shards from each tier (58,000 games sampled in total:
-12k / 8k / 8k / 20k / 10k across the five tiers) and extrapolating to the
-full 20,000,000 games per tier. Expected relative error is well under 1%.
-The figures cover the whole dataset (all three splits combined).
+| Tier | Games | Positions | Mean game length |
+|---|---|---|---|
+| `tier0_evallegal` | 20,000,000 | 5,359,412,373 | 268.0 |
+| `nodes_0001` | 20,000,000 | 3,075,361,857 | 153.8 |
+| `nodes_0128` | 20,000,000 | 2,870,813,480 | 143.5 |
+| `nodes_0256` | 20,000,000 | 2,521,727,240 | 126.1 |
+| `nodes_1024` | 20,000,000 | 2,589,518,029 | 129.5 |
+| **Total** | **100,000,000** | **16,416,832,979** | 164.2 |
 
-**Raw network evals** (`static_legal_move_evals` on the search tiers +
-`legal_move_evals` on the searchless tier) — the direct-distillation
-targets:
+### Evaluation entries (exact)
 
-| Tier | Raw evals / game (sampled) | Raw evals (extrapolated) |
+| Tier | Raw network evals | MultiPV evals |
 |---|---|---|
-| `tier0_evallegal` | ~6,527 | ~130.5 B |
-| `nodes_0001` | ~3,434 | ~68.7 B |
-| `nodes_0128` | ~3,446 | ~68.9 B |
-| `nodes_0256` | ~3,254 | ~65.1 B |
-| `nodes_1024` | ~3,518 | ~70.4 B |
-| **Total** | | **≈ 404 billion raw evals** |
+| `tier0_evallegal` | 131,022,823,122 | — |
+| `nodes_0001` | 69,814,451,439 | 15,219,863,450 |
+| `nodes_0128` | 68,964,296,966 | 14,215,676,259 |
+| `nodes_0256` | 65,045,515,778 | 12,621,204,731 |
+| `nodes_1024` | 70,196,200,065 | 13,046,231,906 |
+| **Total** | **405,043,287,370** | **55,102,976,346** |
 
-**MultiPV / search-ranked evals** (`legal_move_evals` on the search tiers;
-the searchless tier has no MultiPV) — the policy-learning targets:
+- **Raw network evals — 405,043,287,370** (`static_legal_move_evals` on the
+  search tiers + `legal_move_evals` on the searchless tier). The
+  direct-distillation targets.
+- **MultiPV / search-ranked evals — 55,102,976,346** (`legal_move_evals` on
+  the search tiers). The policy-learning targets.
+- **Combined: 460,146,263,716 `LegalMoveEval` entries.**
 
-| Tier | MultiPV evals / game (sampled) | MultiPV evals (extrapolated) |
-|---|---|---|
-| `nodes_0001` | ~745 | ~14.9 B |
-| `nodes_0128` | ~711 | ~14.2 B |
-| `nodes_0256` | ~632 | ~12.6 B |
-| `nodes_1024` | ~652 | ~13.0 B |
-| **Total** | | **≈ 55 billion MultiPV evals** |
+On the search tiers MultiPV averages ~5.0 entries per position (`multi_pv =
+5`; the first 2 plies widen to `opening_multi_pv = 20`, and positions with
+fewer than 5 legal moves report fewer). Raw eval sets average ~23–27
+entries per position — the mean number of legal moves.
 
-Combined, the dataset contains **≈ 458 billion `LegalMoveEval` entries**
-(~404 B raw + ~55 B MultiPV). On-disk size is ~750 GB of zstd-compressed
-parquet.
+On-disk size: **987 GB** of zstd-compressed parquet (294 GB
+`tier0_evallegal`; 163–182 GB each search tier).
 
-> Note on the MultiPV counts: although `multi_pv = 5`, the per-game average
-> is ~6–7 evals per ply rather than exactly 5 — the opening plies widen to
-> `opening_multi_pv = 20`, and positions with fewer than 5 legal moves
-> report fewer entries.
+### Unique positions (estimated)
+
+Evaluated positions are the board states before each played move; `tokens`
+stores the moves, not the board states, so distinct-position counts are not
+recoverable from metadata. They were estimated by replaying one 2,000-game
+sample shard per tier (only the small `uci` column was downloaded) and
+hashing each position (piece placement, side to move, castling, en passant):
+
+| Tier | Sample positions | Distinct | Distinct % | Collisions vanish by depth |
+|---|---|---|---|---|
+| `tier0_evallegal` | 533,179 | 525,367 | 98.5% | ~5 |
+| `nodes_0001` | 307,872 | 292,165 | 94.9% | ~7 |
+| `nodes_0128` | 289,449 | 277,238 | 95.8% | ~8 |
+| `nodes_0256` | 253,546 | 243,484 | 96.0% | ~8 |
+| `nodes_1024` | 256,525 | 247,169 | 96.4% | ~7 |
+
+Duplicate positions sit entirely in the opening: depth 0 is always the
+start position, depth 1 has 20 distinct positions, depth 2 ~390, and from
+roughly depth 8 onward every position in the sample is distinct.
+
+This **does not extrapolate by a flat ×10,000**: the opening positions form
+a small finite universe (a few million board states) shared by all
+100,000,000 games, so adding games multiplies duplicate *instances*, not
+distinct positions — the dataset-wide distinct fraction is therefore lower
+than the per-shard 95–98%. Positions past the opening (the large majority,
+given mean game lengths of 126–268 plies) are very nearly all distinct.
+Netting the two, the dataset holds on the order of **15.5 billion distinct
+evaluated positions (~94–95% of the 16.4 billion total)** — dominated by
+the all-but-unique middlegame and endgame, with an opening-overlap
+correction of order 0.8 billion. Treat this figure as a rough estimate.
 
 ## Usage
 
