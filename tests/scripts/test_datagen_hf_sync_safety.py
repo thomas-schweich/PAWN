@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 
@@ -51,6 +52,28 @@ class _FakeApi:
 
     def create_commit(self, **kwargs: Any) -> None:
         self.calls.append(kwargs)
+
+
+class _FlakyApi(_FakeApi):
+    """Raises queued errors before recording a successful commit."""
+
+    def __init__(self, errors: list[BaseException]) -> None:
+        super().__init__()
+        self.errors = errors
+
+    def create_commit(self, **kwargs: Any) -> None:
+        if self.errors:
+            raise self.errors.pop(0)
+        super().create_commit(**kwargs)
+
+
+def _hf_error(mod: Any, status_code: int, headers: dict[str, str] | None = None) -> Exception:
+    response = httpx.Response(
+        status_code,
+        headers=headers or {},
+        request=httpx.Request("POST", "https://huggingface.co/api/datasets/org/name/commit/main"),
+    )
+    return mod.HfHubHTTPError(f"HTTP {status_code}", response=response)
 
 
 def test_upload_folder_batch_rejects_zero_byte_file(tmp_path: Path) -> None:
@@ -121,6 +144,66 @@ def test_upload_folder_batch_uploads_non_empty_files(tmp_path: Path) -> None:
     assert op_paths == {"tier_X/a.parquet", "tier_X/b.parquet"}
     op_locals = {op.path_or_fileobj for op in ops}
     assert op_locals == {str(tmp_path / "a.parquet"), str(tmp_path / "b.parquet")}
+
+
+def test_upload_folder_batch_retries_529_with_overload_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HTTP 529 is HF overload, not a permanent commit failure. The
+    orchestrator should back off with a pod-spreading delay and retry
+    instead of counting the whole watcher cycle as failed immediately."""
+    mod = _load_module()
+    (tmp_path / "a.parquet").write_bytes(b"a" * 16)
+    api = _FlakyApi([_hf_error(mod, 529)])
+    sleeps: list[float] = []
+    monkeypatch.setattr(mod.random, "uniform", lambda _lo, hi: hi)
+
+    mod._upload_folder_batch(
+        api,
+        repo_id="org/name",
+        local_dir=tmp_path,
+        path_in_repo="tier_X",
+        files=["a.parquet"],
+        commit_message="test",
+        retry_config=mod.HfRetryConfig(max_attempts=2),
+        sleep=sleeps.append,
+    )
+
+    assert len(api.calls) == 1
+    assert sleeps == [mod.HfRetryConfig.overload_min_delay_seconds]
+
+
+def test_hf_retry_delay_honors_retry_after_before_backoff() -> None:
+    """Server-provided Retry-After wins over exponential delay. This is
+    especially important when HF asks clients to wait longer than a local
+    backoff formula would."""
+    mod = _load_module()
+    response = httpx.Response(
+        529,
+        headers={"Retry-After": "91"},
+        request=httpx.Request("POST", "https://huggingface.co/api/datasets/org/name/commit/main"),
+    )
+
+    delay, source = mod._hf_retry_delay_seconds(529, response, 0, mod.HfRetryConfig())
+
+    assert delay == 91
+    assert source == "Retry-After"
+
+
+def test_hf_retry_delay_uses_ratelimit_reset_for_429() -> None:
+    """HF documents RateLimit `t=<seconds>` on 429s. Use that window reset
+    instead of guessing with exponential backoff."""
+    mod = _load_module()
+    response = httpx.Response(
+        429,
+        headers={"RateLimit": '"api";r=0;t=123'},
+        request=httpx.Request("POST", "https://huggingface.co/api/datasets/org/name/commit/main"),
+    )
+
+    delay, source = mod._hf_retry_delay_seconds(429, response, 0, mod.HfRetryConfig())
+
+    assert delay == 123
+    assert source == "RateLimit"
 
 
 def test_scan_and_upload_excludes_zero_byte_placeholders(tmp_path: Path) -> None:

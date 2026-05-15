@@ -126,7 +126,13 @@ see "Multi-pod runs" below), each pod's `_tier_state.json` and
 `_manifest.json` get a `-s<A>-s<B>.json` suffix so multiple pods can
 coexist in the same tier directory without colliding. Run
 `scripts/datagen_reconcile_tier.py` after all pods finish to merge the
-per-pod manifests into a unified `_manifest.json`.
+per-pod manifests into a unified canonical manifest at
+`_meta/<tier_name>/_manifest.json` (NOT in the tier directory itself —
+HF caps any directory at 10000 files, so a tier configured for 10000
+shards has zero room for in-tier canonical sidecars after the last shard
+lands). The reconciler also deletes the per-pod sidecars from the tier
+directory in a follow-up commit, leaving the tier directory as pure
+parquet shards.
 
 Shards are zstd-compressed parquet (level 19, 16 MB pages). They're
 written atomically: `shard-…parquet.tmp` is fsynced, then renamed to
@@ -489,16 +495,18 @@ Three phases run in one process:
    orchestrator). SIGINT/SIGTERM are forwarded so the rust binary's
    graceful-shutdown semantics are preserved.
 3. **Watcher.** A daemon thread polls the output dir every
-   `--poll-interval` seconds (default 30 s) and uploads any new
-   completed shards (and updated sentinels) via
-   `huggingface_hub.upload_folder` — folder-batched commits, at most
-   two per tier per cycle (state+shards, then manifest). One commit
-   per tier per cycle keeps the per-repo commit count well under HF's
-   128 commits/hour limit even at full datagen rate. Zero-byte
-   placeholders are skipped — those are already remote. With
-   `--prune-local`, each shard is truncated to a zero-byte placeholder
-   after its commit lands, so disk usage stays flat regardless of the
-   run's total size.
+   `--poll-interval` seconds (default 30 s, with 20% jitter by default)
+   and uploads any new completed shards (and updated sentinels) via
+   explicit `huggingface_hub.create_commit` batches, at most two per
+   tier per cycle (state+shards, then manifest). One commit per tier per
+   cycle keeps the per-repo commit count well under HF's 128 commits/hour
+   limit even at full datagen rate. HF 429s, 529s, and transient 5xx
+   responses are retried with server-directed delays when present and
+   jittered backoff otherwise, so multiple pods don't hammer the API in
+   lockstep during overload. Zero-byte placeholders are skipped — those
+   are already remote. With `--prune-local`, each shard is truncated to
+   a zero-byte placeholder after its commit lands, so disk usage stays
+   flat regardless of the run's total size.
 
 CLI flags worth knowing:
 
@@ -511,10 +519,19 @@ CLI flags worth knowing:
   watcher's first upload won't 404. Useful for local testing or
   restarting against a known-empty repo.
 - `--poll-interval <seconds>` — watcher poll cadence. Default 30 s.
+- `--poll-jitter-ratio <fraction>` — random jitter applied to each
+  watcher sleep as a fraction of `--poll-interval`. Default 0.20. Set
+  to 0 for deterministic local testing.
 - `--max-consecutive-failures <N>` — watcher gives up + SIGTERMs the
   rust child after N consecutive cycle failures. Default 10
   (~5 minutes at the default poll). Tune up for runs that may span
   longer documented HF outages.
+- `--hf-commit-retries <N>` — max attempts for each HF commit batch.
+  Default 8. Retries cover 429, 529, and transient 5xx responses.
+- `--hf-retry-max-delay <seconds>` — cap for a single HF retry sleep.
+  Default 300 s.
+- `--hf-overload-min-delay <seconds>` — minimum non-header retry delay
+  for HTTP 529 overload responses, before jitter. Default 30 s.
 - `--watcher-drain-timeout-hours <hours>` — after the rust binary exits,
   wait up to this many hours for the watcher to flush any pending shard
   uploads before exiting. Default 4 hours. If the timeout fires with
@@ -560,14 +577,23 @@ Recognized env vars:
 | `HF_TOKEN`             | HuggingFace auth (mandatory). Aliases `HUGGING_FACE_HUB_TOKEN` and `HUGGINGFACE_HUB_TOKEN` are also accepted, as is the on-disk credential store written by `hf auth login`. |
 | `DATAGEN_HF_REPO`      | Dataset repo, e.g. `org/name`. Required for the entrypoint.   |
 | `DATAGEN_CONFIG`       | Path to the run config inside the image.                      |
-| `DATAGEN_PRUNE_LOCAL`  | Any non-empty value enables `--prune-local`.                  |
+| `DATAGEN_PRUNE_LOCAL`  | `1` or `true` enables `--prune-local`.                        |
 | `DATAGEN_POLL_INTERVAL`| Watcher poll seconds (overrides default 30).                  |
+| `DATAGEN_POLL_JITTER_RATIO` | Watcher poll jitter fraction (overrides default 0.20).  |
+| `DATAGEN_HF_COMMIT_RETRIES` | HF commit attempts (overrides default 8).              |
+| `DATAGEN_HF_RETRY_MAX_DELAY` | Max HF retry sleep seconds (overrides default 300).    |
+| `DATAGEN_HF_OVERLOAD_MIN_DELAY` | Minimum non-header 529 retry delay seconds (overrides default 30). |
 | `DATAGEN_EXTRA_ARGS`   | Extra flags appended to the orchestrator command line (e.g. `--max-consecutive-failures 30 --log-level DEBUG`). |
 
 Caveats:
 
-- Don't run two pods writing to the same dataset repo. There's no
-  cross-process locking; concurrent writers will race on commits.
+- Multiple pods may target the same dataset repo only when their
+  `--tiers` / `--shard-id-range` assignments are disjoint. The watcher
+  jitters poll and retry sleeps to reduce HF API herd effects, but there
+  is still no cross-process lock. If HF overload persists at high pod
+  counts, the cleaner coordination model is one uploader/reconciler:
+  pods write to per-pod repos or durable object storage, and a single
+  process performs the HF commits.
 - The rust binary's tier-state fingerprint check still applies after
   primer download — if the local config doesn't match the remote
   `_tier_state.json`, the run aborts before generating anything.

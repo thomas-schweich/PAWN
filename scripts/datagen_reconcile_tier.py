@@ -9,9 +9,21 @@ per-pod manifests for one tier, verifies they:
   2. Share the same `config_fingerprint` (i.e. were all generated from
      the same per-tier config).
 
-…then commits a unified `_manifest.json` for that tier whose `shards`
-list is the sorted concat of every pod's shards and whose
-`n_games_written` is the sum.
+…then commits a unified canonical manifest covering the entire tier under
+`_meta/<tier_name>/_manifest.json` whose `shards` list is the sorted concat
+of every pod's shards and whose `n_games_written` is the sum.
+
+The canonical manifest lives under `_meta/` rather than in the tier
+directory itself because HF (the underlying git layer) caps any directory
+at 10000 files. A tier configured for 10000 shards has zero room for
+in-directory sidecars after the last shard lands, so keeping canonical
+state in a sibling tree keeps the tier directories pure-parquet and
+fully utilizes the 10K budget. Per-pod manifests still live in the tier
+directory during a run (they're deleted by this script post-merge), so a
+tier that pushes near 10000 shards while multiple pods are writing
+sidecars can still hit the wall — see the operational notes in the
+project's reconciliation README. Future schema bump (v4) will move
+per-pod files into `_meta/` too.
 
 Usage:
     python scripts/datagen_reconcile_tier.py \\
@@ -20,7 +32,8 @@ Usage:
         --tier nodes_0001
 
 Pass `--all-tiers` to reconcile every tier in the config (skipping any
-that already have a canonical `_manifest.json` remotely).
+that already have a canonical manifest at either the new `_meta/<tier>/`
+location or the legacy `<tier>/` location).
 
 Exits non-zero on any gap / overlap / fingerprint mismatch — those are
 operator-visible problems that need investigation, not silent acceptance.
@@ -60,6 +73,24 @@ PER_POD_TIER_STATE_RE = re.compile(
 )
 CANONICAL_MANIFEST = "_manifest.json"
 CANONICAL_TIER_STATE = "_tier_state.json"
+
+# Canonical manifests + states are written under a sibling `_meta/` tree
+# rather than into the tier directory itself. HF (and the underlying git
+# layer) enforces a hard 10000-files-per-directory limit; a tier configured
+# for 10000 shards has no room for extra sidecars after the last shard
+# lands. Hoisting them to `_meta/<tier>/...` keeps the tier directory
+# pure-parquet and lets every tier hit 10000/10000 cleanly. See
+# `feedback_hf_commit_rate_limit.md` (memory) for the empirical 100M-run
+# diagnosis that produced this layout.
+META_PREFIX = "_meta"
+
+
+def canonical_manifest_path(tier_name: str) -> str:
+    return f"{META_PREFIX}/{tier_name}/{CANONICAL_MANIFEST}"
+
+
+def canonical_tier_state_path(tier_name: str) -> str:
+    return f"{META_PREFIX}/{tier_name}/{CANONICAL_TIER_STATE}"
 
 
 @dataclass(frozen=True)
@@ -314,8 +345,8 @@ def reconcile_one(
         LOG.info(
             "DRY RUN: would commit canonical %s + %s (%d shards / %d games), "
             "then delete %d per-pod manifest(s) and %d per-pod tier-state(s)",
-            f"{tier_name}/{CANONICAL_MANIFEST}",
-            f"{tier_name}/{CANONICAL_TIER_STATE}",
+            canonical_manifest_path(tier_name),
+            canonical_tier_state_path(tier_name),
             len(merged_shards), n_games, len(manifests), len(states),
         )
         return
@@ -342,11 +373,11 @@ def reconcile_one(
             repo_type="dataset",
             operations=[
                 CommitOperationAdd(
-                    path_in_repo=f"{tier_name}/{CANONICAL_MANIFEST}",
+                    path_in_repo=canonical_manifest_path(tier_name),
                     path_or_fileobj=manifest_tmp,
                 ),
                 CommitOperationAdd(
-                    path_in_repo=f"{tier_name}/{CANONICAL_TIER_STATE}",
+                    path_in_repo=canonical_tier_state_path(tier_name),
                     path_or_fileobj=state_tmp,
                 ),
             ],
@@ -403,7 +434,9 @@ def main() -> int:
     g.add_argument("--tier", help="Tier name to reconcile (e.g. `nodes_0001`).")
     g.add_argument("--all-tiers", action="store_true",
                    help="Reconcile every tier in the config; skip tiers that "
-                        "already have a remote `_manifest.json`.")
+                        "already have a canonical manifest at either "
+                        "`_meta/<tier>/_manifest.json` (current) or "
+                        "`<tier>/_manifest.json` (legacy).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Validate and print, don't commit.")
     ap.add_argument("--log-level", default="INFO")
@@ -431,8 +464,17 @@ def main() -> int:
             return 3
         for tier_cfg in cfg["tiers"]:
             name = tier_cfg["name"]
+            # Treat either the new sibling-`_meta/` location OR the
+            # legacy in-tier location as "already reconciled" so older
+            # datasets with `<tier>/_manifest.json` aren't re-reconciled
+            # and pushed into a duplicate location.
+            if canonical_manifest_path(name) in remote_files:
+                LOG.info("tier %s already has canonical manifest at %s; skipping",
+                         name, canonical_manifest_path(name))
+                continue
             if f"{name}/{CANONICAL_MANIFEST}" in remote_files:
-                LOG.info("tier %s already has canonical manifest; skipping", name)
+                LOG.info("tier %s has legacy canonical manifest at %s/%s; skipping",
+                         name, name, CANONICAL_MANIFEST)
                 continue
             try:
                 reconcile_one(api, args.repo_id, name, tier_cfg, shard_size_games, args.dry_run)
