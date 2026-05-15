@@ -1,0 +1,423 @@
+---
+license: cc-by-4.0
+pretty_name: PAWN Stockfish 100M
+task_categories:
+  - other
+tags:
+  - chess
+  - stockfish
+  - nnue
+  - distillation
+  - policy-learning
+size_categories:
+  - 100M<n<1B
+configs:
+  - config_name: tier0_evallegal
+    data_files:
+      - split: train
+        path: train/tier0_evallegal/*.parquet
+      - split: validation
+        path: val/tier0_evallegal/*.parquet
+      - split: test
+        path: test/tier0_evallegal/*.parquet
+  - config_name: nodes_0001
+    data_files:
+      - split: train
+        path: train/nodes_0001/*.parquet
+      - split: validation
+        path: val/nodes_0001/*.parquet
+      - split: test
+        path: test/nodes_0001/*.parquet
+  - config_name: nodes_0128
+    data_files:
+      - split: train
+        path: train/nodes_0128/*.parquet
+      - split: validation
+        path: val/nodes_0128/*.parquet
+      - split: test
+        path: test/nodes_0128/*.parquet
+  - config_name: nodes_0256
+    data_files:
+      - split: train
+        path: train/nodes_0256/*.parquet
+      - split: validation
+        path: val/nodes_0256/*.parquet
+      - split: test
+        path: test/nodes_0256/*.parquet
+  - config_name: nodes_1024
+    data_files:
+      - split: train
+        path: train/nodes_1024/*.parquet
+      - split: validation
+        path: val/nodes_1024/*.parquet
+      - split: test
+        path: test/nodes_1024/*.parquet
+---
+
+# PAWN Stockfish 100M
+
+100,000,000 self-play chess games generated with **Stockfish 18**, each
+annotated with per-position, per-legal-move evaluations. Built as training
+data for [PAWN](https://github.com/thomas-schweich/PAWN) — a testbed for
+finetuning and augmentation methods at small scale — but useful for any
+chess policy-learning or NNUE-distillation work.
+
+> **Engine note.** Games and evaluations were produced with a *patched*
+> Stockfish build:
+> [**thomas-schweich/stockfish-ml-extensions**](https://github.com/thomas-schweich/stockfish-ml-extensions).
+> The patch adds two things this dataset depends on: an **`evallegal`**
+> UCI protocol that runs a single raw-NNUE forward pass over *every* legal
+> move and reports the full set of per-move evaluations, and a
+> **`net_selection`** option that pins which NNUE network is used. Without
+> this fork, references below to `evallegal`, `net_selection`, the
+> searchless tier, and the raw per-head score fields (`score_psqt`,
+> `score_positional`) would not make sense — they are all features of the
+> fork, not of vanilla Stockfish.
+
+The dataset is split into **5 tiers of 20,000,000 games each**. The tiers
+share an identical game-sampling policy (temperature-0.5 softmax move
+selection) but differ in how much *search* Stockfish was allowed per move,
+from zero (a pure raw-network tier) up to a 1024-node search. Each tier is
+exposed as a separate dataset config; every config carries `train`,
+`validation`, and `test` splits (see [Splits](#splits)).
+
+## Generation summary
+
+- **Engine**: Stockfish 18, patched build
+  ([stockfish-ml-extensions](https://github.com/thomas-schweich/stockfish-ml-extensions)).
+  The version is pinned at generation time — a mismatch aborts before any
+  data is written, since different SF releases ship different NNUE nets and
+  would silently produce different games from the same seed.
+- **Network**: Stockfish was configured to use **only its large NNUE
+  network**, never the small net (`net_selection = large` on every tier).
+  Stockfish 18 normally switches to a smaller, faster net on positions with
+  large material imbalance; that switching is disabled here so every
+  evaluation in the dataset comes from one and the same network. This makes
+  the raw-eval columns a clean, single-network distillation target.
+- **Move-selection policy**: at every ply the move actually played is
+  sampled from a temperature-0.5 softmax over candidate evaluations (see
+  the per-tier descriptions). Openings are widened: the first 2 plies of
+  each game sample from the top 20 candidates rather than the top 5, to
+  diversify game starts.
+- **Determinism**: every game is reproducible from
+  `(master_seed, tier_name, global_game_index)`. The seed hierarchy is
+  `master_seed → tier_seed = mix(master_seed, sha256(tier.name)) →
+  game_seed = mix(tier_seed, global_game_index)`. `master_seed = 42`.
+- **Game length cap**: 512 plies (`max_ply`). The `tokens` column is the
+  played move sequence; the longest games are truncated at 512.
+
+## Tiers
+
+Search depth is the only thing that varies across tiers.
+
+| Tier (config) | Search budget | `multi_pv` | Games (total) | Mean game length (plies) |
+|---|---|---|---|---|
+| `tier0_evallegal` | none (searchless) | — | 20,000,000 | ~267 |
+| `nodes_0001` | `nodes = 1` | 5 | 20,000,000 | ~150 |
+| `nodes_0128` | `nodes = 128` | 5 | 20,000,000 | ~143 |
+| `nodes_0256` | `nodes = 256` | 5 | 20,000,000 | ~127 |
+| `nodes_1024` | `nodes = 1024` | 5 | 20,000,000 | ~129 |
+
+**Total: 100,000,000 games.** (Game-length figures are sample-based — see
+*Statistics* below.)
+
+`nodes = N` is a hard cap on the number of search nodes Stockfish expands
+per move. **`nodes = 1` is equivalent to `depth = 1`**: the search completes
+exactly the first iteration of iterative deepening — the root's immediate
+one-ply evaluation — and stops. Higher tiers (`128 / 256 / 1024`) let the
+search go progressively deeper. As search deepens, play gets sharper and
+games end faster (note the mean game length dropping from ~150 plies at
+`nodes=1` to ~129 at `nodes=1024`), and the dominant outcome shifts from
+draws toward decisive results.
+
+### The searchless tier (`tier0_evallegal`)
+
+`tier0_evallegal` does **no search at all**. At each position the patched
+Stockfish runs its `evallegal` protocol: it evaluates *every legal move*
+with a single raw NNUE forward pass (no tree, no lookahead) and returns the
+full set of per-move evaluations.
+
+The move played is then sampled from a **temperature-scaled softmax over
+those raw, centipawn-adjusted network evaluations** — i.e. the policy for
+this tier is, exactly:
+
+```
+P(move_i) = softmax( eval(move_i) / T )      with  T = 0.5
+```
+
+where `eval(move_i)` is the network's evaluation of the position after
+`move_i`, mover-POV. There is no search ranking anywhere in this tier — it
+is a pure, move-by-move readout of what the raw network "thinks", and the
+played game is a sample from that raw-network policy. This makes
+`tier0_evallegal` the reference tier for studying / cloning the network's
+intrinsic positional judgment without any search on top.
+
+## Eval columns
+
+Every row carries two per-position, per-legal-move eval columns. Both are
+`List<List<Struct>>` — outer list indexed by ply, inner list indexed by
+move, each `Struct` being one `LegalMoveEval`:
+
+```
+LegalMoveEval {
+  move_idx:         int16     # searchless_chess action-vocab index (0..1967)
+  score_cp:         int16     # normalized centipawns, mover-POV
+  score_eval_v:     int16?    # post-processed Value (what SF plays with)
+  score_psqt:       int16?    # raw NNUE PSQT head output, mover-POV
+  score_positional: int16?    # raw NNUE positional head output, mover-POV
+}
+```
+
+`move_idx` indexes the same 1,968-entry searchless_chess action vocabulary
+as the `tokens` column (see [Schema](#schema)).
+
+### `legal_move_evals` — *MultiPV / search-ranked* (policy-learning target)
+
+- On the **search tiers** (`nodes_0001` … `nodes_1024`): the **MultiPV
+  search output** — Stockfish's top `multi_pv = 5` candidate moves as ranked
+  by the (depth-limited) search. Only `score_cp` is populated; the three
+  raw-NNUE fields are `null` (MultiPV reports normalized centipawns, not the
+  network's internal head outputs).
+- On the **searchless tier** (`tier0_evallegal`): the **full evallegal
+  output** — *every* legal move, with all five score fields populated.
+
+**Use case: policy learning.** On the search tiers this column is the
+search-ranked top-k — a supervised target for "which moves does a real
+(depth-limited) Stockfish search prefer here." Train a policy head against
+it to imitate search-quality move selection.
+
+### `static_legal_move_evals` — *raw network evals* (distillation target)
+
+- On the **search tiers**: a *separate* full-legal-move `evallegal` call at
+  every position — every legal move, all five score fields populated,
+  captured independently of how the move was actually selected.
+- On the **searchless tier**: `null` (it would exactly duplicate
+  `legal_move_evals`, which is already the full raw-eval set — see the
+  consumer convention below).
+
+**Use case: direct network distillation.** This is the raw NNUE's verdict
+on every legal move at every position — `score_eval_v` (the post-processed
+Value), `score_psqt` and `score_positional` (the un-post-processed per-head
+outputs). It is the right target for hot-swap NNUE-replacement distillation:
+train a student to reproduce the network's per-move evaluations directly,
+independent of search.
+
+**Consumer convention**: to read "the canonical raw per-move eval" uniformly
+across all tiers, use
+`static_legal_move_evals if static_legal_move_evals is not None else legal_move_evals`.
+On the searchless tier this falls back to `legal_move_evals` (which *is* the
+raw eval there); on the search tiers it picks the dedicated raw-eval column.
+
+## Splits
+
+Every tier (config) is divided into three splits. The split is a
+directory-level packaging of the tier's 10,000 shards — the held-out shards
+are simply the last 50 of each tier:
+
+| Split | Shards / tier | Shard ids | Games / tier | Total games |
+|---|---|---|---|---|
+| `train` | 9,950 | `s000000`–`s009949` | 19,900,000 | 99,500,000 |
+| `validation` | 25 | `s009950`–`s009974` | 50,000 | 250,000 |
+| `test` | 25 | `s009975`–`s009999` | 50,000 | 250,000 |
+
+Each game is seeded independently by `mix(tier_seed, global_game_index)`,
+and `global_game_index` is just an enumeration order with no correlation to
+game content — so the tail shards are an i.i.d. sample of each tier, not a
+biased slice. Shard ids are **not** renumbered per split: a shard's
+`s<NNNNNN>` id is its seed / game-index key, so `validation` and `test`
+keep their original high ids (see [Shard naming](#shard-naming-scheme)).
+
+## Statistics
+
+### Exact (from shard layout)
+
+- **Games**: 5 tiers × 10,000 shards × 2,000 games = **100,000,000 games**
+  (20,000,000 per tier; every shard is exactly 2,000 rows). Per-split
+  breakdown is in [Splits](#splits).
+
+### Estimated (sampled — see methodology)
+
+The eval-entry counts below are **not** exact: the number of
+`LegalMoveEval` entries per game depends on game length and the number of
+legal moves at each position, both of which vary game to game. They were
+estimated by sampling shards from each tier (58,000 games sampled in total:
+12k / 8k / 8k / 20k / 10k across the five tiers) and extrapolating to the
+full 20,000,000 games per tier. Expected relative error is well under 1%.
+The figures cover the whole dataset (all three splits combined).
+
+**Raw network evals** (`static_legal_move_evals` on the search tiers +
+`legal_move_evals` on the searchless tier) — the direct-distillation
+targets:
+
+| Tier | Raw evals / game (sampled) | Raw evals (extrapolated) |
+|---|---|---|
+| `tier0_evallegal` | ~6,527 | ~130.5 B |
+| `nodes_0001` | ~3,434 | ~68.7 B |
+| `nodes_0128` | ~3,446 | ~68.9 B |
+| `nodes_0256` | ~3,254 | ~65.1 B |
+| `nodes_1024` | ~3,518 | ~70.4 B |
+| **Total** | | **≈ 404 billion raw evals** |
+
+**MultiPV / search-ranked evals** (`legal_move_evals` on the search tiers;
+the searchless tier has no MultiPV) — the policy-learning targets:
+
+| Tier | MultiPV evals / game (sampled) | MultiPV evals (extrapolated) |
+|---|---|---|
+| `nodes_0001` | ~745 | ~14.9 B |
+| `nodes_0128` | ~711 | ~14.2 B |
+| `nodes_0256` | ~632 | ~12.6 B |
+| `nodes_1024` | ~652 | ~13.0 B |
+| **Total** | | **≈ 55 billion MultiPV evals** |
+
+Combined, the dataset contains **≈ 458 billion `LegalMoveEval` entries**
+(~404 B raw + ~55 B MultiPV). On-disk size is ~750 GB of zstd-compressed
+parquet.
+
+> Note on the MultiPV counts: although `multi_pv = 5`, the per-game average
+> is ~6–7 evals per ply rather than exactly 5 — the opening plies widen to
+> `opening_multi_pv = 20`, and positions with fewer than 5 legal moves
+> report fewer entries.
+
+## Usage
+
+Each tier is a separate config; pick one with the config name, then a
+split. The eval columns are large nested structures, so prefer **column
+projection** (polars) or **streaming** (`datasets`) over materializing a
+whole tier.
+
+### Polars with column projection
+
+Polars only downloads the columns you select — projecting away the eval
+columns turns a ~750 GB dataset into a tiny moves-only feed:
+
+```python
+import polars as pl
+
+# Moves-only view of the nodes_1024 training split
+df = (
+    pl.scan_parquet(
+        "hf://datasets/thomas-schweich/pawn-stockfish-100m/train/nodes_1024/*.parquet"
+    )
+    .select(["tokens", "uci", "result", "game_length"])
+    .head(50_000)
+    .collect()
+)
+```
+
+Pull the per-move evaluations only when you need them — here, the held-out
+`validation` split of the searchless tier:
+
+```python
+import polars as pl
+
+df = (
+    pl.scan_parquet(
+        "hf://datasets/thomas-schweich/pawn-stockfish-100m/val/tier0_evallegal/*.parquet"
+    )
+    .select(["tokens", "legal_move_evals"])
+    .head(1_000)
+    .collect()
+)
+```
+
+### HuggingFace `datasets`
+
+`name` selects the tier (config); `split` is one of `train` / `validation`
+/ `test`:
+
+```python
+from datasets import load_dataset
+
+# Stream the nodes_0256 training split
+ds = load_dataset(
+    "thomas-schweich/pawn-stockfish-100m",
+    name="nodes_0256",
+    split="train",
+    streaming=True,
+)
+for game in ds.take(3):
+    print(game["tokens"][:10], game["result"], game["game_length"])
+
+# Small held-out split — fine to load fully
+val = load_dataset(
+    "thomas-schweich/pawn-stockfish-100m",
+    name="nodes_0256",
+    split="validation",
+)
+print(len(val), "games")
+```
+
+## File layout
+
+```
+train/
+  <tier_name>/
+    shard-s<NNNNNN>-r<NNNNNN>.parquet   # s000000 .. s009949
+val/
+  <tier_name>/
+    shard-s<NNNNNN>-r<NNNNNN>.parquet   # s009950 .. s009974
+test/
+  <tier_name>/
+    shard-s<NNNNNN>-r<NNNNNN>.parquet   # s009975 .. s009999
+_meta/
+  <tier_name>/
+    _manifest.json        # canonical per-tier manifest (full shard list, fingerprint)
+    _tier_state.json      # canonical per-tier generation state
+```
+
+The `_meta/` manifests describe the *generation* of each tier (all 10,000
+shards, the config fingerprint) and are split-agnostic — the train / val /
+test split is a packaging layer applied on top.
+
+### Shard naming scheme
+
+`shard-s<NNNNNN>-r<NNNNNN>.parquet`
+
+- **`s<NNNNNN>`** — the global **shard id**, zero-padded to 6 digits. Shard
+  `s` owns the contiguous global-game-index range
+  `[s × 2000, (s + 1) × 2000)`. A tier has shards `s000000` … `s009999`,
+  split across the three split directories (`train` holds `s000000`–
+  `s009949`, `validation` `s009950`–`s009974`, `test` `s009975`–`s009999`).
+  Ids are **not** renumbered per split.
+- **`r<NNNNNN>`** — the **row count** of the shard, zero-padded to 6 digits.
+  Every shard in this dataset is `r002000` (2,000 games). The row count is
+  in the filename so tooling can read it from a directory listing without
+  opening parquet metadata.
+
+Example: `train/nodes_0128/shard-s004217-r002000.parquet` is shard 4217 of
+the `nodes=128` tier, holding games with `global_game_index` 8,434,000 …
+8,435,999.
+
+## Schema
+
+Per-row columns (parquet, zstd level 19):
+
+| Column | Type | Notes |
+|---|---|---|
+| `tokens` | `List<int16>` | Played move sequence, one token per ply (variable length, up to 512). The vocabulary is the [searchless_chess action set](https://github.com/google-deepmind/searchless_chess): 1,968 reachable (src, dst[, promo]) tuples. `move_idx` in the eval structs uses this same index space. |
+| `san` | `List<str>` | Same moves in SAN. |
+| `uci` | `List<str>` | Same moves in UCI. |
+| `game_length` | `int32` | Number of plies. |
+| `outcome_token` | `int16` | Granular game outcome token. |
+| `result` | `str` | `1-0` / `0-1` / `1/2-1/2`. |
+| `nodes`, `multi_pv`, `opening_multi_pv`, `opening_plies`, `sample_plies`, `temperature` | scalars | Per-tier search/sampling config, denormalized per row. `null` on the searchless tier where not applicable. |
+| `sample_score` | `str?` | `cp` / `v` — score scale used for sampling. |
+| `net_selection` | `str?` | NNUE net pin — `large` for every row in this dataset. |
+| `global_game_index` | `uint64` | Canonical per-tier game index; with `tier_name` it fully determines the game seed. |
+| `game_seed` | `uint64` | Per-game seed (derived). |
+| `stockfish_version` | `str` | `Stockfish 18`. |
+| `legal_move_evals` | `List<List<Struct>>` | See *Eval columns*. |
+| `static_legal_move_evals` | `List<List<Struct>>?` | See *Eval columns*. `null` on the searchless tier. |
+
+## License
+
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The games and
+evaluations are machine-generated facts. Stockfish itself (and the
+[stockfish-ml-extensions](https://github.com/thomas-schweich/stockfish-ml-extensions)
+fork used to generate this data) is licensed GPLv3 but is not redistributed
+here.
+
+## Citation
+
+If you use this dataset, please cite the PAWN project:
+<https://github.com/thomas-schweich/PAWN>
