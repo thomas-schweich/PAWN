@@ -56,27 +56,23 @@ configs:
 
 # PAWN Stockfish 100M
 
-100,000,000 self-play chess games generated with **Stockfish 18**, each
+100,000,000 self-play chess games generated with Stockfish 18, each
 annotated with per-position, per-legal-move evaluations. Built as training
 data for [PAWN](https://github.com/thomas-schweich/PAWN) — a testbed for
 finetuning and augmentation methods at small scale — but useful for any
 chess policy-learning or NNUE-distillation work.
 
-> **Engine note.** Games and evaluations were produced with a *patched*
+> **Engine note.** Games and evaluations were produced with a patched
 > Stockfish build:
-> [**thomas-schweich/stockfish-ml-extensions**](https://github.com/thomas-schweich/stockfish-ml-extensions).
-> The patch adds two things this dataset depends on: an **`evallegal`**
-> UCI protocol that runs a single raw-NNUE forward pass over *every* legal
-> move and reports the full set of per-move evaluations, and a
-> **`net_selection`** option that pins which NNUE network is used. Without
-> this fork, references below to `evallegal`, `net_selection`, the
-> searchless tier, and the raw per-head score fields (`score_psqt`,
-> `score_positional`) would not make sense — they are all features of the
-> fork, not of vanilla Stockfish.
+> [thomas-schweich/stockfish-ml-extensions](https://github.com/thomas-schweich/stockfish-ml-extensions).
+> The patch adds two things this dataset depends on: an `evallegal` UCI
+> protocol that runs a single raw-NNUE forward pass over every legal move
+> and reports the full set of per-move evaluations, and a `net_selection`
+> option that pins which NNUE network is used.
 
-The dataset is split into **5 tiers of 20,000,000 games each**. The tiers
+The dataset is split into 5 tiers of 20,000,000 games each. The tiers
 share an identical game-sampling policy (temperature-0.5 softmax move
-selection) but differ in how much *search* Stockfish was allowed per move,
+selection) but differ in how much search Stockfish was allowed per move,
 from zero (a pure raw-network tier) up to a 1024-node search. Each tier is
 exposed as a separate dataset config; every config carries `train`,
 `validation`, and `test` splits (see [Splits](#splits)).
@@ -88,8 +84,8 @@ exposed as a separate dataset config; every config carries `train`,
   The version is pinned at generation time — a mismatch aborts before any
   data is written, since different SF releases ship different NNUE nets and
   would silently produce different games from the same seed.
-- **Network**: Stockfish was configured to use **only its large NNUE
-  network**, never the small net (`net_selection = large` on every tier).
+- **Network**: Stockfish was configured to use only its large NNUE
+  network, never the small net (`net_selection = large` on every tier).
   Stockfish 18 normally switches to a smaller, faster net on positions with
   large material imbalance; that switching is disabled here so every
   evaluation in the dataset comes from one and the same network. This makes
@@ -122,7 +118,7 @@ Search depth is the only thing that varies across tiers.
 *Statistics* below.
 
 `nodes = N` is a hard cap on the number of search nodes Stockfish expands
-per move. **`nodes = 1` is equivalent to `depth = 1`**: the search completes
+per move. `nodes = 1` is equivalent to `depth = 1`: the search completes
 exactly the first iteration of iterative deepening — the root's immediate
 one-ply evaluation — and stops. Higher tiers (`128 / 256 / 1024`) let the
 search go progressively deeper. As search deepens, play gets sharper and
@@ -132,13 +128,13 @@ draws toward decisive results.
 
 ### The searchless tier (`tier0_evallegal`)
 
-`tier0_evallegal` does **no search at all**. At each position the patched
+`tier0_evallegal` does no search at all. At each position the patched
 Stockfish runs its `evallegal` protocol: it evaluates *every legal move*
 with a single raw NNUE forward pass (no tree, no lookahead) and returns the
 full set of per-move evaluations.
 
-The move played is then sampled from a **temperature-scaled softmax over
-those raw, centipawn-adjusted network evaluations** — i.e. the policy for
+The move played is then sampled from a temperature-scaled softmax over
+those raw, centipawn-adjusted network evaluations — i.e. the policy for
 this tier is, exactly:
 
 ```
@@ -229,12 +225,11 @@ keep their original high ids (see [Shard naming](#shard-naming-scheme)).
 
 ## Statistics
 
-All counts below are **exact** unless marked *estimated*. The exact figures
-were computed from the parquet file footers alone — every shard's
-per-column `num_values` / `null_count` metadata — without reading a single
-data page (~370 MB of footer metadata across all 50,000 shards). `move_idx`
-is non-nullable inside each `LegalMoveEval`, so a leaf column's
-`num_values − null_count` is the exact entry count.
+All counts below are exact unless marked *estimated*. The exact figures
+were computed from the parquet footer metadata (per-column `num_values` /
+`null_count`), not from the data pages. `move_idx` is non-nullable inside
+each `LegalMoveEval`, so a leaf column's `num_values − null_count` is the
+exact entry count.
 
 ### Games and positions (exact)
 
@@ -296,7 +291,7 @@ Duplicate positions sit entirely in the opening: depth 0 is always the
 start position, depth 1 has 20 distinct positions, depth 2 ~390, and from
 roughly depth 8 onward every position in the sample is distinct.
 
-This **does not extrapolate by a flat ×10,000**: the opening positions form
+This does not extrapolate by a flat ×10,000: the opening positions form
 a small finite universe (a few million board states) shared by all
 100,000,000 games, so adding games multiplies duplicate *instances*, not
 distinct positions — the dataset-wide distinct fraction is therefore lower
@@ -440,11 +435,7 @@ Per-row columns (parquet, zstd level 19):
 
 ## License
 
-[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The games and
-evaluations are machine-generated facts. Stockfish itself (and the
-[stockfish-ml-extensions](https://github.com/thomas-schweich/stockfish-ml-extensions)
-fork used to generate this data) is licensed GPLv3 but is not redistributed
-here.
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
 ## Citation
 

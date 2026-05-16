@@ -202,8 +202,8 @@ pub struct TierConfig {
 
     /// Optional per-tier override of `RunConfig::stockfish_hash_mb`. Lets
     /// the operator drop the TT size on low-`nodes` tiers (where the
-    /// `ucinewgame` memset of a 16 MB table is wasted bandwidth — see
-    /// `ANALYSIS.md`) while keeping a larger TT for high-`nodes` tiers
+    /// `ucinewgame` memset of a 16 MB table is wasted bandwidth) while
+    /// keeping a larger TT for high-`nodes` tiers
     /// where it actually buys search efficiency. The effective per-tier
     /// value (the override OR the top-level default) is part of the
     /// tier's fingerprint, so changing it invalidates that tier's

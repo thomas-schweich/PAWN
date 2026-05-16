@@ -76,5 +76,3 @@ A determinism-safe alternative (a `Hash=0` / `NoTT` mode that
 allocates no TT and treats every probe as a miss) was discussed and
 also passed on: the ~1% residual after the `hash_mb=1` reduction
 isn't worth another fork patch.
-
-See [ANALYSIS.md](../../ANALYSIS.md) for the full reasoning.

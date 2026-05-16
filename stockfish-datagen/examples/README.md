@@ -10,33 +10,35 @@
 
 ## Seed convention
 
-`master_seed` is **deliberately distinct** across configs whose tiers
-overlap in shape. The seed cascade is
+A tier's per-game seeds come from the cascade
 
 ```
-master_seed + tier_index → tier_seed
-tier_seed   + worker_id  → worker_seed
-worker_seed + game_index → game_seed
+master_seed            → tier_seed = mix(master_seed, sha256(tier.name))
+tier_seed + game_index → game_seed = mix(tier_seed, global_game_index)
 ```
 
-— so if two configs put a tier with identical parameters at the same
-`tier_index` and use the same `master_seed`, every per-game seed
-collides and the generated games are byte-for-byte identical (modulo
-tier-name metadata). Running both configs into a shared output
-directory would silently duplicate work.
+A tier's identity is its `name` — not its position in the `tiers:`
+list — and `n_workers` plays no part. Two tiers generate the same games
+when they share a `name`, a `master_seed`, and a tier config (run
+against the same `stockfish_version` and `max_ply`).
 
-The configs whose tier-0 specs are identical to each other
-(`sf_large_distill_20M.json` and `stockfish_100m.json`'s tier 0) use
-**different** master seeds — `142` vs `42` — so a user can run
-`stockfish_100m.json` on one pod and `sf_large_distill_20M.json` on
-another (or sequentially on the same pod) and get genuinely
-non-overlapping data. The `master_seed` field is part of the per-tier
-fingerprint, so a stray seed reset would be caught at resume time
-rather than silently corrupting a tier.
+`sf_large_distill_20M.json` names its tier `large_distill` and uses
+`master_seed = 142`, so it never overlaps the `stockfish_100m.json`
+production ladder in either name or seed.
 
-If you derive a new config from one of these, **change the
-`master_seed`** unless you specifically want to reproduce existing
-output.
+`smoke.json` and `bench_evallegal_14k.json` reuse production tier names
+(`nodes_0001`, `tier0_evallegal`) with `master_seed = 42`. Each writes
+to its own `/tmp` output directory, so neither collides with a
+production run on disk. `smoke.json` also differs in content — its tier
+raises `temperature` and leaves the net unpinned — whereas
+`bench_evallegal_14k.json`'s tier config matches production tier 0
+exactly, making its 14,000 games the leading prefix of that 20M-game
+tier.
+
+If you derive a new config and want its output to be distinct, change
+the `master_seed` or the tier `name`. Both feed the per-tier
+fingerprint, so changing one for a tier already underway is caught at
+resume rather than silently mixing two seedings into one tier.
 
 ## Shard size + memory
 

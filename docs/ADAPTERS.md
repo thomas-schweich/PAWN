@@ -206,7 +206,7 @@ All results below use Lichess games filtered to Elo 1800-1900 with both players 
 | Combo: retro-bn dim=2500 top-4 + d=0.05 sparse | pawn-large | 26.4M | 1 | 51.18% | |
 | Bottleneck dim=1024 dist | pawn-large | 25.6M | 1 | 50.39% | |
 | Bottleneck dim=2500 top-4 | pawn-large | 25.6M | 1 | 50.74% | top-4 +0.35 pp over distributed at ceiling scale |
-| Bottleneck dim=2580 top-4 (decomp test) | pawn-large | 26.4M | 1 | 50.76% | within noise of T29 — extra bottleneck params add ~nothing, isolating the combo's sparse contribution |
+| Bottleneck dim=2580 top-4 (decomp test) | pawn-large | 26.4M | 1 | 50.76% | within noise of the dim=2500 baseline — extra bottleneck params add ~nothing, isolating the combo's sparse contribution |
 | Bottleneck dim=2500 top-4 | pawn-large | 25.6M | 2 | **52.37%** 🥇 | current ceiling on this dataset |
 
 Pareto-optimal points (best val top-1 at their param budget × epoch tier) are in bold.
@@ -254,7 +254,7 @@ At ~25 M with both sides trained for 2 full epochs, the adapter wins by **~3 pp*
 
 - **Bottleneck dominates at matched parameter budgets.** At 524K, bottleneck dim=32 beats LoRA rank=16 qkvo by 4.2 pp — the gap is structural across the whole budget range.
 - **Gradient-informed masks beat random masks.** RoSA retro-sparse (84K) beats random-mask sparse (126K) by 1.27 pp at fewer trainable parameters. The 3-phase training overhead (LoRA warmup → mask generation → sparse-only training) pays for itself.
-- **Combo (top-4 bottleneck + qkvo sparse) adds orthogonal capacity.** Decomposition test at 26.4 M: pure bottleneck dim=2580 lands at 50.76% (within 0.02 pp of the dim=2500 baseline), so the +0.42 pp T43-over-T51 gain is the genuine contribution of the gradient-informed sparse component, not a param-count effect.
+- **Combo (top-4 bottleneck + qkvo sparse) adds orthogonal capacity.** Decomposition test at 26.4 M: pure bottleneck dim=2580 lands at 50.76% (within 0.02 pp of the dim=2500 baseline), so the +0.42 pp gain of the combo over the matched pure-bottleneck run is the genuine contribution of the gradient-informed sparse component, not a param-count effect.
 - **Top-4 layer placement scales.** Sweet spot at ~40% of depth on every backbone tested.
 - **2-epoch extension closes the backbone-size gap.** `pawn-base` top-4 at 8.4 M with two epochs (51.03%) beats `pawn-large` distributed at 13.1 M with one epoch (49.93%). For tight param budgets, training longer on the smaller backbone is competitive.
 

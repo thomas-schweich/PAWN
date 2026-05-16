@@ -85,8 +85,8 @@ index f4cf348a..a7687196 100644
 +    // stockfish-ml-extensions: hint the kernel to back the NNUE weight
 +    // arrays with transparent huge pages. On a 380-worker EPYC datagen
 +    // pod, the 4 KiB-page TLB working set across the 50+ MiB of weights
-+    // dominates feature-transformer cost (see `ANALYSIS.md` in the
-+    // stockfish-datagen repo). MADV_HUGEPAGE asks khugepaged to coalesce
++    // dominates feature-transformer cost. MADV_HUGEPAGE asks the
++    // kernel's khugepaged to coalesce
 +    // 4 KiB pages into 2 MiB ones in the background; the kernel only
 +    // promotes 2 MiB-aligned subregions, so the head/tail of each array
 +    // (~tens of KiB) stays on 4 KiB pages but the bulk goes to THP.
