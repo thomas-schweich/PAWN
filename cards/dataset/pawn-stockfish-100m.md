@@ -5,6 +5,7 @@ task_categories:
   - other
 tags:
   - chess
+  - pawn
   - stockfish
   - nnue
   - distillation
@@ -421,13 +422,13 @@ Per-row columns (parquet, zstd level 19):
 | `tokens` | `List<int16>` | Played move sequence, one token per ply (variable length, up to 512). The vocabulary is the [searchless_chess action set](https://github.com/google-deepmind/searchless_chess): 1,968 reachable (src, dst[, promo]) tuples. `move_idx` in the eval structs uses this same index space. |
 | `san` | `List<str>` | Same moves in SAN. |
 | `uci` | `List<str>` | Same moves in UCI. |
-| `game_length` | `int32` | Number of plies. |
-| `outcome_token` | `int16` | Granular game outcome token. |
+| `game_length` | `uint16` | Number of plies. |
+| `outcome_token` | `uint16` | Granular game outcome token. |
 | `result` | `str` | `1-0` / `0-1` / `1/2-1/2`. |
-| `nodes`, `multi_pv`, `opening_multi_pv`, `opening_plies`, `sample_plies`, `temperature` | scalars | Per-tier search/sampling config, denormalized per row. `null` on the searchless tier where not applicable. |
+| `nodes`, `multi_pv`, `opening_multi_pv`, `opening_plies`, `sample_plies`, `temperature` | scalars | Per-tier search/sampling config, denormalized per row; `null` on the searchless tier where not applicable. `sample_plies` is the number of leading plies that use softmax sampling before play switches to top-1 — `999` on every tier here, so sampling runs the whole game. |
 | `sample_score` | `str?` | `cp` / `v` — score scale used for sampling. |
 | `net_selection` | `str?` | NNUE net pin — `large` for every row in this dataset. |
-| `global_game_index` | `uint64` | Canonical per-tier game index; with `tier_name` it fully determines the game seed. |
+| `global_game_index` | `uint64` | Canonical per-tier game index; together with the tier name (the directory the shard lives in) it fully determines the game seed. |
 | `game_seed` | `uint64` | Per-game seed (derived). |
 | `stockfish_version` | `str` | `Stockfish 18`. |
 | `legal_move_evals` | `List<List<Struct>>` | See *Eval columns*. |
