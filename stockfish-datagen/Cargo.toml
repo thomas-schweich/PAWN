@@ -25,9 +25,10 @@ shakmaty = "0.30"
 rand = "0.8"
 rand_chacha = "0.3"
 
-# Parquet writer.
+# Parquet I/O — writer for datagen, reader for the `unique_positions` bin
+# (the `arrow` feature provides the record-batch reader).
 arrow = "53"
-parquet = { version = "53", features = ["zstd"] }
+parquet = { version = "53", features = ["zstd", "arrow"] }
 
 # CLI / config.
 clap = { version = "4", features = ["derive"] }
@@ -53,6 +54,13 @@ once_cell = "1.19"
 # runtime — both calls are #[cfg(target_os = "linux")] gated.
 core_affinity = "0.8"
 libc = "0.2"
+
+# Used only by the `unique_positions` binary (HyperLogLog++ unique-position
+# counter over the published parquet dataset): HTTP range reads + HLL++.
+bytes = "1"
+ureq = "2"
+rayon = "1"
+hyperloglogplus = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
