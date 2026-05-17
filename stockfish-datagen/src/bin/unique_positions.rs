@@ -201,12 +201,16 @@ impl HttpRangeReader {
             }
             match req.call() {
                 Ok(resp) if resp.status() == 206 => return Ok(resp),
-                // RFC 7233 permits a 200 for a range spanning the whole
-                // resource — fine when offset 0 is what we asked for. For
-                // any other range a 200 means the Range header was ignored
-                // (a proxy/CDN stripping it) and parquet would read at the
-                // wrong offset; retrying won't fix it, so fail loud.
-                Ok(resp) if resp.status() == 200 && range.starts_with("bytes=0-") => {
+                // RFC 7233 permits a 200 for a range that spans the entire
+                // resource. Accept it only for an exact whole-file request
+                // (`bytes=0-{len-1}`), where the body is byte-correct. A
+                // 200 to a bounded, suffix, or non-zero range means the
+                // Range header was ignored — fail loud rather than buffer
+                // the whole shard at the wrong offset.
+                Ok(resp)
+                    if resp.status() == 200
+                        && range == format!("bytes=0-{}", self.len.saturating_sub(1)) =>
+                {
                     return Ok(resp);
                 }
                 Ok(resp) => {
