@@ -215,9 +215,10 @@ packaging layer applied on top.
 
 ### Statistics
 
-All counts here are exact unless marked *estimated*. The exact figures were
-computed from the parquet footer metadata (per-column `num_values` /
-`null_count`), not from the data pages.
+Counts of positions and evaluation entries are exact, computed from the
+parquet footer metadata (per-column `num_values` / `null_count`). The
+unique-position counts are HyperLogLog++ measurements (≈ 0.2% standard
+error).
 
 **Evaluation entries** — total `LegalMoveEval` structs:
 
@@ -239,14 +240,15 @@ number of legal moves).
 **On-disk size:** 987 GB of zstd-compressed parquet (294 GB
 `tier0_evallegal`; 163–182 GB each search tier).
 
-**Unique positions (estimated):** `tokens` stores moves, not board states,
-so distinct-position counts are not recoverable from metadata. Sampling one
-2,000-game shard per tier and hashing each position shows 95–98% of
-positions in a shard are distinct, with duplicates confined to the opening
-(the first ~6–8 plies). Dataset-wide the opening positions form a small
-finite universe shared across all 100 M games, so the distinct fraction is
-somewhat lower: on the order of **15.5 billion distinct evaluated positions
-(~94–95% of the 16.4 billion total)**. Treat this as a rough estimate.
+**Unique positions: 13,447,893,206** distinct board states among the
+16.4 billion evaluated positions — ≈ 82%; the other ~18% are positions
+revisited across games, dominated by shared openings. This is also the
+count of unique raw evaluations, since a raw NNUE eval is a pure function
+of the position. Of these, **8,690,806,916** distinct positions carry a
+MultiPV evaluation (the four search tiers; tier 0 is searchless). Both
+figures were measured by replaying every game and counting distinct
+Zobrist-hashed board states with HyperLogLog++ — `tokens` stores moves,
+not board states, so the count is not recoverable from metadata.
 
 ## Usage
 
@@ -443,9 +445,10 @@ not a uniform or human-frequency opening book.
   dependence.
 - **Game-length cap.** Games are truncated at 512 plies; a truncated game
   carries the `PLY_LIMIT` outcome.
-- **Position overlap.** ~94–95% of evaluated positions are distinct (see
-  [Statistics](#statistics)); the remaining few percent are opening
-  positions shared across many games.
+- **Position overlap.** ~82% of the 16.4 billion evaluated positions are
+  distinct (see [Statistics](#statistics)); the other ~18% are positions
+  revisited across games — mostly shared openings, but also common
+  middlegame and endgame positions.
 
 ## Additional Information
 
