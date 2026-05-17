@@ -10,11 +10,12 @@
 //! Both come from one pass over the same replayed games — the MultiPV
 //! sketch simply ignores tier-0 shards.
 //!
-//! Minimal data transfer: parquet column projection means only the `uci`
-//! column is fetched (~25 GB across the 50,000 shards, not the 987 GB
-//! dataset). Each shard is read through a `ChunkReader` backed by HTTP
-//! range requests, so the parquet crate pulls only the footer + the `uci`
-//! column chunk.
+//! Minimal data transfer: only the `uci` column is read, via parquet
+//! column projection over HTTP range requests. `get_read` streams its
+//! response rather than buffering to EOF, and the parquet reader stops
+//! after the `uci` column — so the large eval columns are never
+//! transferred and a full run moves ~25 GB, not the 987 GB dataset. The
+//! exact bytes transferred are reported at the end.
 //!
 //! Build:   cargo build --release --bin unique_positions
 //! Run:     HF_TOKEN=hf_xxx ./target/release/unique_positions [opts]
@@ -22,17 +23,18 @@
 //!   --threads N          concurrent shards (default 16; lower if HF
 //!                        rate-limits, raise on a fat pod)
 //!   --shards-per-tier N  cap shards/tier — use a small N to smoke-test
-//!                        (default 10000 = the full dataset)
+//!                        (default 10000 = the full dataset). Shard ids
+//!                        count from 0, so a small N covers only `train`.
 //!   --repo OWNER/NAME    dataset repo (default the 100M repo)
 //!
 //! HF_TOKEN is read from the env or ~/.cache/huggingface/token; omit it if
-//! the dataset is public.
+//! the dataset is public. Exits non-zero if any shard fails to download.
 
 use std::hash::{BuildHasher, Hasher};
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Array, ListArray, StringArray};
 use bytes::Bytes;
@@ -55,6 +57,10 @@ const TIERS: [&str; 5] = [
 ];
 const SHARDS_PER_TIER: usize = 10_000;
 const SHARD_ROWS: usize = 2_000;
+
+/// Total HTTP payload bytes pulled from the dataset, tallied across all
+/// threads and reported at the end so a run's transfer volume is visible.
+static DOWNLOADED: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Hashing — feed HLL++ a fully-mixed, deterministic 64-bit key.
@@ -80,10 +86,10 @@ impl Hasher for IdHasher {
     fn finish(&self) -> u64 {
         self.0
     }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = self.0.rotate_left(8) ^ b as u64;
-        }
+    fn write(&mut self, _bytes: &[u8]) {
+        // Only `u64` keys are ever inserted (via `write_u64`); a byte-slice
+        // write would mean a different key type and a silently wrong hash.
+        unreachable!("IdHasher only accepts u64 keys via write_u64");
     }
     fn write_u64(&mut self, i: u64) {
         self.0 = i;
@@ -122,8 +128,9 @@ impl Acc {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP range reader — implements parquet's ChunkReader so the parquet crate
-// fetches only the footer + the projected `uci` column chunk.
+// HTTP range reader — a parquet `ChunkReader` backed by HTTP range requests.
+// `get_read` streams its response rather than buffering to EOF, so a
+// projected read transfers only the bytes the parquet reader consumes.
 // ---------------------------------------------------------------------------
 
 fn agent() -> &'static ureq::Agent {
@@ -131,7 +138,7 @@ fn agent() -> &'static ureq::Agent {
     A.get_or_init(|| {
         ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(30))
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(120))
             .build()
     })
 }
@@ -149,6 +156,21 @@ fn hf_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// A `Read` that streams an HTTP response body and tallies consumed bytes
+/// into `DOWNLOADED`. Used by `get_read`: parquet stops reading after the
+/// projected column chunk and drops this, closing the connection, so only
+/// the consumed prefix — never the rest of the shard — is transferred.
+struct CountingReader<R> {
+    inner: R,
+}
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        DOWNLOADED.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
 struct HttpRangeReader {
     url: String,
     token: Option<String>,
@@ -160,12 +182,13 @@ impl HttpRangeReader {
         let mut r = Self { url, token, len: 0 };
         // A 4-byte suffix range yields `Content-Range: bytes A-B/TOTAL`,
         // which gives us the file length in one cheap request.
-        let (_, total) = r.fetch("bytes=-4")?;
+        let (_, total) = r.fetch_buffered("bytes=-4", 4)?;
         r.len = total.ok_or_else(|| ParquetError::General("no Content-Range header".into()))?;
         Ok(r)
     }
 
-    fn fetch(&self, range: &str) -> Result<(Bytes, Option<u64>), ParquetError> {
+    /// Issue a range GET with retry/backoff, returning the live response.
+    fn request(&self, range: &str) -> Result<ureq::Response, ParquetError> {
         let mut last = String::new();
         for attempt in 0..8u32 {
             let mut req = agent().get(&self.url).set("Range", range);
@@ -173,17 +196,7 @@ impl HttpRangeReader {
                 req = req.set("Authorization", &format!("Bearer {t}"));
             }
             match req.call() {
-                Ok(resp) => {
-                    let total = resp
-                        .header("Content-Range")
-                        .and_then(|cr| cr.rsplit('/').next())
-                        .and_then(|t| t.trim().parse::<u64>().ok());
-                    let mut buf = Vec::new();
-                    resp.into_reader()
-                        .read_to_end(&mut buf)
-                        .map_err(|e| ParquetError::General(format!("body read: {e}")))?;
-                    return Ok((Bytes::from(buf), total));
-                }
+                Ok(resp) => return Ok(resp),
                 Err(ureq::Error::Status(code, _))
                     if matches!(code, 429 | 500 | 502 | 503 | 504) =>
                 {
@@ -192,12 +205,40 @@ impl HttpRangeReader {
                 Err(ureq::Error::Transport(t)) => last = t.to_string(),
                 Err(e) => return Err(ParquetError::General(format!("{e}"))),
             }
-            std::thread::sleep(Duration::from_millis(300u64 << attempt.min(7)));
+            // Exponential backoff with jitter — without the jitter, parallel
+            // workers that hit a 429 together retry in lockstep and
+            // immediately re-trigger the rate limit.
+            let base = 300u64 << attempt.min(7);
+            let jitter = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64 % (base / 2 + 1))
+                .unwrap_or(0);
+            std::thread::sleep(Duration::from_millis(base + jitter));
         }
         Err(ParquetError::General(format!(
             "range {range} on {}: exhausted retries ({last})",
             self.url
         )))
+    }
+
+    /// Buffered range fetch (footer probe + `get_bytes`); `cap` pre-sizes
+    /// the receive buffer to the expected length.
+    fn fetch_buffered(
+        &self,
+        range: &str,
+        cap: usize,
+    ) -> Result<(Bytes, Option<u64>), ParquetError> {
+        let resp = self.request(range)?;
+        let total = resp
+            .header("Content-Range")
+            .and_then(|cr| cr.rsplit('/').next())
+            .and_then(|t| t.trim().parse::<u64>().ok());
+        let mut buf = Vec::with_capacity(cap);
+        resp.into_reader()
+            .read_to_end(&mut buf)
+            .map_err(|e| ParquetError::General(format!("body read: {e}")))?;
+        DOWNLOADED.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        Ok((Bytes::from(buf), total))
     }
 }
 
@@ -208,18 +249,27 @@ impl Length for HttpRangeReader {
 }
 
 impl ChunkReader for HttpRangeReader {
-    type T = Cursor<Bytes>;
+    type T = CountingReader<Box<dyn Read + Send + Sync>>;
 
+    /// Streams `start..EOF`. parquet stops after the projected column
+    /// chunk and drops the reader, closing the connection — so the eval
+    /// columns past `uci` are never transferred, even on the page-by-page
+    /// (no-offset-index) read path.
     fn get_read(&self, start: u64) -> Result<Self::T, ParquetError> {
-        let (b, _) = self.fetch(&format!("bytes={}-{}", start, self.len - 1))?;
-        Ok(Cursor::new(b))
+        let resp = self.request(&format!("bytes={}-{}", start, self.len - 1))?;
+        Ok(CountingReader {
+            inner: resp.into_reader(),
+        })
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes, ParquetError> {
         if length == 0 {
             return Ok(Bytes::new());
         }
-        let (b, _) = self.fetch(&format!("bytes={}-{}", start, start + length as u64 - 1))?;
+        let (b, _) = self.fetch_buffered(
+            &format!("bytes={}-{}", start, start + length as u64 - 1),
+            length,
+        )?;
         Ok(b)
     }
 }
@@ -229,13 +279,12 @@ impl ChunkReader for HttpRangeReader {
 // ---------------------------------------------------------------------------
 
 /// Replay every game in a shard, feeding the Zobrist hash of each evaluated
-/// position into `all` (and, when `is_search_tier`, also into `mpv`).
+/// position into `acc.all` (and, when `is_search_tier`, also `acc.mpv`).
 /// Returns the number of positions seen.
 fn scan_shard(
     url: String,
     token: Option<String>,
-    all: &mut Hll,
-    mpv: &mut Hll,
+    acc: &mut Acc,
     is_search_tier: bool,
 ) -> Result<u64, String> {
     let reader = HttpRangeReader::new(url, token).map_err(|e| e.to_string())?;
@@ -281,9 +330,9 @@ fn scan_shard(
                 // evaluated; the terminal position is never evaluated.
                 let zob: Zobrist64 = pos.zobrist_hash(EnPassantMode::Legal);
                 let h = mix64(zob.0);
-                all.insert(&h);
+                acc.all.insert(&h);
                 if is_search_tier {
-                    mpv.insert(&h);
+                    acc.mpv.insert(&h);
                 }
                 n += 1;
                 let mv = match moves
@@ -344,15 +393,32 @@ fn main() {
             std::process::exit(2);
         })
     };
+    let bad_num = |flag: &str| -> ! {
+        eprintln!("{flag} expects an integer");
+        std::process::exit(2);
+    };
     while i < args.len() {
         match args[i].as_str() {
-            "--precision" => precision = val(&args, &mut i).parse().expect("bad --precision"),
-            "--threads" => threads = val(&args, &mut i).parse().expect("bad --threads"),
-            "--shards-per-tier" => spt = val(&args, &mut i).parse().expect("bad --shards-per-tier"),
+            "--precision" => {
+                precision = val(&args, &mut i)
+                    .parse()
+                    .unwrap_or_else(|_| bad_num("--precision"));
+            }
+            "--threads" => {
+                threads = val(&args, &mut i)
+                    .parse()
+                    .unwrap_or_else(|_| bad_num("--threads"));
+            }
+            "--shards-per-tier" => {
+                spt = val(&args, &mut i)
+                    .parse()
+                    .unwrap_or_else(|_| bad_num("--shards-per-tier"));
+            }
             "--repo" => repo = val(&args, &mut i),
             "-h" | "--help" => {
                 eprintln!("unique_positions — HLL++ unique-position counter for pawn-stockfish-100m");
                 eprintln!("opts: --precision N  --threads N  --shards-per-tier N  --repo OWNER/NAME");
+                eprintln!("(see the file header for details)");
                 return;
             }
             other => {
@@ -361,6 +427,9 @@ fn main() {
             }
         }
         i += 1;
+    }
+    if spt > SHARDS_PER_TIER {
+        eprintln!("note: capping --shards-per-tier at {SHARDS_PER_TIER} (the dataset has that many shards per tier)");
     }
     let spt = spt.min(SHARDS_PER_TIER);
 
@@ -377,6 +446,18 @@ fn main() {
          threads={threads}  shards/tier={spt}  auth={}",
         if token.is_some() { "yes" } else { "no" }
     );
+
+    // Preflight: a systemic failure (bad token, no repo access, no network)
+    // should abort immediately, not surface as 50,000 per-shard failures.
+    let probe = format!(
+        "https://huggingface.co/datasets/{repo}/resolve/main/train/{}/shard-s000000-r002000.parquet",
+        TIERS[0]
+    );
+    if let Err(e) = HttpRangeReader::new(probe, token.clone()) {
+        eprintln!("preflight failed — cannot read the dataset: {e}");
+        eprintln!("check HF_TOKEN and that `{repo}` is accessible.");
+        std::process::exit(1);
+    }
 
     // All five tiers carry positions.
     let shards: Vec<(usize, usize)> = (0..TIERS.len())
@@ -404,7 +485,7 @@ fn main() {
                 let url = format!("https://huggingface.co/datasets/{repo}/resolve/main/{path}");
                 // Tier 0 is searchless — its positions count toward `all`
                 // but never toward the MultiPV sketch.
-                match scan_shard(url, token.clone(), &mut acc.all, &mut acc.mpv, ti >= 1) {
+                match scan_shard(url, token.clone(), &mut acc, ti >= 1) {
                     Ok(c) => {
                         scanned.fetch_add(c, Ordering::Relaxed);
                     }
@@ -433,18 +514,21 @@ fn main() {
     let unique_mpv = acc.mpv.count().round() as u64;
     let fails = fails.load(Ordering::Relaxed);
     let scanned = scanned.load(Ordering::Relaxed);
+    let downloaded = DOWNLOADED.load(Ordering::Relaxed);
 
     println!("\n=========== result (HLL++ p={precision}, ~{rel_err:.2}% std err) ===========");
+    println!("data transferred                 : {:>15} MB", commas(downloaded / 1_000_000));
     println!("positions scanned                : {:>18}", commas(scanned));
     println!("unique positions                 : {:>18}", commas(unique));
     println!("  (= unique raw evaluations — a raw NNUE eval is a pure function of the position)");
-    println!(
-        "unique positions w/ MultiPV eval : {:>18}",
-        commas(unique_mpv)
-    );
+    println!("unique positions w/ MultiPV eval : {:>18}", commas(unique_mpv));
     println!("  (distinct positions across the four search tiers; tier 0 is searchless)");
     if fails > 0 {
-        println!("shards failed                    : {fails}  (counts above exclude them)");
+        println!("shards FAILED                    : {fails}  (result is INCOMPLETE — exit code 1)");
     }
     println!("elapsed: {:.1?}", started.elapsed());
+
+    if fails > 0 {
+        std::process::exit(1);
+    }
 }

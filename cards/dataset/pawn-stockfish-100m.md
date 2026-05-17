@@ -176,7 +176,7 @@ as the `tokens` column (see [Schema](#schema)).
   raw-NNUE fields are `null` (MultiPV reports normalized centipawns, not the
   network's internal head outputs).
 - On the **searchless tier** (`tier0_evallegal`): the **full evallegal
-  output** — *every* legal move, with all five score fields populated.
+  output** — *every* legal move, with all five struct fields populated.
 
 **Use case: policy learning.** On the search tiers this column is the
 search-ranked top-k — a supervised target for "which moves does a real
@@ -186,7 +186,7 @@ it to imitate search-quality move selection.
 ### `static_legal_move_evals` — *raw network evals* (distillation target)
 
 - On the **search tiers**: a *separate* full-legal-move `evallegal` call at
-  every position — every legal move, all five score fields populated,
+  every position — every legal move, all five struct fields populated,
   captured independently of how the move was actually selected.
 - On the **searchless tier**: `null` (it would exactly duplicate
   `legal_move_evals`, which is already the full raw-eval set — see the
@@ -425,7 +425,8 @@ Per-row columns (parquet, zstd level 19):
 | `game_length` | `uint16` | Number of plies. |
 | `outcome_token` | `uint16` | Granular game outcome token. |
 | `result` | `str` | `1-0` / `0-1` / `1/2-1/2`. |
-| `nodes`, `multi_pv`, `opening_multi_pv`, `opening_plies`, `sample_plies`, `temperature` | scalars | Per-tier search/sampling config, denormalized per row; `null` on the searchless tier where not applicable. `sample_plies` is the number of leading plies that use softmax sampling before play switches to top-1 — `999` on every tier here, so sampling runs the whole game. |
+| `nodes`, `multi_pv`, `opening_multi_pv`, `opening_plies`, `sample_plies` | `int32?` | Per-tier search config, denormalized per row; `null` on the searchless tier. `sample_plies` is the number of leading plies that use softmax sampling before play switches to top-1 — `999` on every tier here, so sampling runs the whole game. |
+| `temperature` | `float32` | Softmax sampling temperature; `0.5` on every tier, never null. |
 | `sample_score` | `str?` | `cp` / `v` — score scale used for sampling. |
 | `net_selection` | `str?` | NNUE net pin — `large` for every row in this dataset. |
 | `global_game_index` | `uint64` | Canonical per-tier game index; together with the tier name (the directory the shard lives in) it fully determines the game seed. |

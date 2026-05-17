@@ -29,11 +29,11 @@ production ladder in either name or seed.
 `smoke.json` and `bench_evallegal_14k.json` reuse production tier names
 (`nodes_0001`, `tier0_evallegal`) with `master_seed = 42`. Each writes
 to its own `/tmp` output directory, so neither collides with a
-production run on disk. `smoke.json` also differs in content — its tier
-raises `temperature` and leaves the net unpinned — whereas
-`bench_evallegal_14k.json`'s tier config matches production tier 0
-exactly, making its 14,000 games the leading prefix of that 20M-game
-tier.
+production run on disk. Neither is a production prefix, though:
+`smoke.json` differs in content (its tier raises `temperature` and
+leaves the net unpinned), and `bench_evallegal_14k.json` sets a
+different `stockfish_hash_mb` and `shard_size_games` than production
+tier 0 — so its tier fingerprint and shard layout differ.
 
 If you derive a new config and want its output to be distinct, change
 the `master_seed` or the tier `name`. Both feed the per-tier
