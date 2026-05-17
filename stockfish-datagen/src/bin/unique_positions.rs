@@ -201,11 +201,15 @@ impl HttpRangeReader {
             }
             match req.call() {
                 Ok(resp) if resp.status() == 206 => return Ok(resp),
+                // RFC 7233 permits a 200 for a range spanning the whole
+                // resource — fine when offset 0 is what we asked for. For
+                // any other range a 200 means the Range header was ignored
+                // (a proxy/CDN stripping it) and parquet would read at the
+                // wrong offset; retrying won't fix it, so fail loud.
+                Ok(resp) if resp.status() == 200 && range.starts_with("bytes=0-") => {
+                    return Ok(resp);
+                }
                 Ok(resp) => {
-                    // A 2xx that is not 206 means the server ignored the
-                    // Range header (a proxy/CDN stripping it) and sent the
-                    // whole file from offset 0 — parquet would then read at
-                    // the wrong offset. Retrying won't fix it; fail loud.
                     return Err(ParquetError::General(format!(
                         "range {range} on {}: got HTTP {} (expected 206 \
                          Partial Content) — a proxy/CDN may be stripping \
