@@ -138,7 +138,11 @@ fn agent() -> &'static ureq::Agent {
     A.get_or_init(|| {
         ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(30))
-            .timeout(Duration::from_secs(120))
+            // Per-read inactivity timeout — NOT a whole-request deadline. A
+            // healthy stream keeps resetting it; a genuinely stalled socket
+            // trips it. A whole-request `.timeout()` would spuriously fail a
+            // slow-but-progressing streamed `get_read` body.
+            .timeout_read(Duration::from_secs(120))
             .build()
     })
 }
@@ -196,7 +200,20 @@ impl HttpRangeReader {
                 req = req.set("Authorization", &format!("Bearer {t}"));
             }
             match req.call() {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) if resp.status() == 206 => return Ok(resp),
+                Ok(resp) => {
+                    // A 2xx that is not 206 means the server ignored the
+                    // Range header (a proxy/CDN stripping it) and sent the
+                    // whole file from offset 0 — parquet would then read at
+                    // the wrong offset. Retrying won't fix it; fail loud.
+                    return Err(ParquetError::General(format!(
+                        "range {range} on {}: got HTTP {} (expected 206 \
+                         Partial Content) — a proxy/CDN may be stripping \
+                         Range headers",
+                        self.url,
+                        resp.status()
+                    )));
+                }
                 Err(ureq::Error::Status(code, _))
                     if matches!(code, 429 | 500 | 502 | 503 | 504) =>
                 {
@@ -207,12 +224,19 @@ impl HttpRangeReader {
             }
             // Exponential backoff with jitter — without the jitter, parallel
             // workers that hit a 429 together retry in lockstep and
-            // immediately re-trigger the rate limit.
+            // immediately re-trigger the rate limit. The jitter is salted
+            // with the per-shard URL so concurrent workers stay decorrelated
+            // even when their clocks read the same nanosecond.
             let base = 300u64 << attempt.min(7);
-            let jitter = SystemTime::now()
+            let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.subsec_nanos() as u64 % (base / 2 + 1))
+                .map(|d| d.subsec_nanos() as u64)
                 .unwrap_or(0);
+            let salt = self
+                .url
+                .bytes()
+                .fold(0u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
+            let jitter = mix64(nanos ^ salt ^ attempt as u64) % (base / 2 + 1);
             std::thread::sleep(Duration::from_millis(base + jitter));
         }
         Err(ParquetError::General(format!(
@@ -256,6 +280,14 @@ impl ChunkReader for HttpRangeReader {
     /// columns past `uci` are never transferred, even on the page-by-page
     /// (no-offset-index) read path.
     fn get_read(&self, start: u64) -> Result<Self::T, ParquetError> {
+        if start >= self.len {
+            // Empty read at/past EOF — avoid forming a reversed
+            // `bytes=N-(N-1)` range (answered 416), mirroring get_bytes's
+            // length==0 guard.
+            return Ok(CountingReader {
+                inner: Box::new(std::io::empty()),
+            });
+        }
         let resp = self.request(&format!("bytes={}-{}", start, self.len - 1))?;
         Ok(CountingReader {
             inner: resp.into_reader(),
