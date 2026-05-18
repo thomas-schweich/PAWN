@@ -13,25 +13,26 @@ renames the two eval columns to a tier-uniform scheme:
                    search tiers : was `legal_move_evals`
                    searchless   : absent
 
-The unit of work is a *bin* — the set of small shards that compact into one
-~500 MB output file. Bins are processed by a **process pool** (`--workers`):
-each worker downloads its bin, re-encodes it (the zstd-19 recompression is
-CPU-heavy and single-bin-serial would idle most cores), and the main process
-batches the uploads.
+Two units of work:
 
-Resilience: every download/upload `hf` call retries transient failures with
-backoff (the irreversible `--finalize` ops deliberately do not), and a
-worker never raises — a bin that still fails after retries is returned as a
-failure and re-run in a second pass, so one bad download cannot kill the run.
-Workers also jitter their first download to thin the startup herd.
+  * A *slice* (~`--slice-mb`) is downloaded with a SINGLE `hf download`
+    call. This matters: every `hf download` invocation re-walks the whole
+    50,000-file repo tree, and HF caps API requests at 1000 / 5 min — so
+    downloading per-bin (~1850 tree-walks) blows the quota instantly.
+    Per-slice downloading keeps it to a few dozen tree-walks for the run.
+  * A *bin* (~`--target-mb`) is the set of shards that compact into one
+    output file. Bins of a downloaded slice are compacted in parallel by a
+    process pool (`--workers`) — the workers read LOCAL files only and make
+    no API calls, so the CPU-bound zstd-19 recompression uses all cores
+    without touching the rate limit.
 
-Transfers go through the `hf` CLI. Hub metadata calls — the repo-tree
-listing (also the resume signal) and the final history squash — use the
-huggingface_hub Python API, with retry.
+Per (split, tier) group: list shards, plan bins, group bins into slices,
+then for each slice download -> pool-compact -> batched upload -> delete.
 
 Resume is repo-state-based: a bin is "done" iff its `data-NNNNN-of-MMMMM`
-file is already in the repo, so an interrupted run just re-lists and skips
-(plus a local `.done` marker that short-circuits an already-finished group).
+file is already in the repo (plus a local `.done` marker per finished
+group). Every download/upload `hf` call and Hub listing retries transient
+failures with backoff; the irreversible `--finalize` ops do not.
 
 Prereqs on the pod:
     curl -LsSf https://hf.co/cli/install.sh | bash          # `hf` CLI
@@ -91,6 +92,20 @@ _DATA_RE = re.compile(r"data-(\d+)-of-(\d+)\.parquet$")
 api = HfApi()
 
 
+def hf_retry(cmd: list[str], attempts: int = 6) -> None:
+    """Run an `hf` CLI command, retrying transient failures with backoff."""
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        if attempt == attempts:
+            raise RuntimeError(
+                f"`hf {cmd[1]}` failed after {attempts} attempts: "
+                f"{result.stderr.strip()[-400:]}"
+            )
+        time.sleep(min(120, 5 * 2 ** attempt) + random.uniform(0, 8))
+
+
 def list_repo_tree(path: str, retries: int = 5) -> list:
     """`api.list_repo_tree` with retry — raises on persistent failure.
 
@@ -110,24 +125,6 @@ def list_repo_tree(path: str, retries: int = 5) -> list:
                 raise
             time.sleep(min(60, 2 ** attempt) + random.uniform(0, 4))
     return []  # unreachable
-
-
-def hf_retry(cmd: list[str], attempts: int = 6) -> None:
-    """Run an `hf` CLI command, retrying transient failures with backoff.
-
-    HF returns 429s / transient 5xx under load; without a retry a single
-    blip would abort the whole migration.
-    """
-    for attempt in range(1, attempts + 1):
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            return
-        if attempt == attempts:
-            raise RuntimeError(
-                f"`hf {cmd[1]}` failed after {attempts} attempts: "
-                f"{result.stderr.strip()[-400:]}"
-            )
-        time.sleep(min(90, 2 ** attempt) + random.uniform(0, 6))
 
 
 def run(cmd: list[str]) -> None:
@@ -162,11 +159,7 @@ def list_group_shards(split_dir: str, tier: str) -> list[tuple[str, int]]:
 
 
 def existing_compacted(split_dir: str, tier: str) -> set[int]:
-    """Bin indices already published as `data-NNNNN-of-MMMMM.parquet`.
-
-    Raises (via `list_repo_tree`) on a persistent listing failure rather than
-    reporting a false empty set — the final coverage check depends on this.
-    """
+    """Bin indices already published as `data-NNNNN-of-MMMMM.parquet`."""
     out: set[int] = set()
     for item in list_repo_tree(f"{split_dir}/{tier}"):
         m = _DATA_RE.search(item.path)
@@ -175,17 +168,19 @@ def existing_compacted(split_dir: str, tier: str) -> set[int]:
     return out
 
 
-def plan_bins(shards: list[tuple[str, int]], target_bytes: int) -> list[list[str]]:
+def plan_bins(
+    shards: list[tuple[str, int]], target_bytes: int
+) -> list[list[tuple[str, int]]]:
     """Greedily group sorted shards into bins of ~`target_bytes` each.
 
     Deterministic given the (stable) repo listing, so bin `i` is reproducible
-    across resumed runs.
+    across resumed runs. Each bin keeps (path, size) pairs.
     """
-    bins: list[list[str]] = []
-    cur: list[str] = []
+    bins: list[list[tuple[str, int]]] = []
+    cur: list[tuple[str, int]] = []
     cur_bytes = 0
     for name, size in shards:
-        cur.append(name)
+        cur.append((name, size))
         cur_bytes += size
         if cur_bytes >= target_bytes:
             bins.append(cur)
@@ -201,7 +196,8 @@ def compact_bin(
     """Concatenate one bin's shards into a single parquet file at `out_path`.
 
     Returns (rows_in, rows_out). Shards are buffered only up to
-    `rowgroup_bytes` of input before being flushed as one row group.
+    `rowgroup_bytes` of decompressed Arrow data before being flushed as one
+    row group.
     """
     rows_in = sum(pq.read_metadata(s).num_rows for s in shards)
     writer: pq.ParquetWriter | None = None
@@ -235,42 +231,43 @@ def compact_bin(
 
 
 def _compact_one_bin(
-    task: tuple[int, int, list[str], str, str, str, int, int],
+    task: tuple[int, int, list[str], str, str, str, int],
 ) -> tuple[int, int | None, str | None, str | None]:
-    """Pool worker: download + compact one bin. Never raises.
+    """Pool worker: compact one already-downloaded bin. Never raises.
 
-    Returns (idx, rows_out, out_path, None) on success or
-    (idx, None, None, error) on failure, so one bad bin cannot abort the run.
+    Reads local shards only — no network — so the pool can use every core
+    without touching the HF API rate limit. Returns
+    (idx, rows_out, out_path, None) on success or (idx, None, None, error).
+    Deletes the bin's raw shards once compacted to bound disk.
     """
-    idx, total, bin_names, tier, split_dir, workdir, rowgroup_bytes, dl_workers = task
-    raw_dir = Path(workdir) / "raw" / f"{split_dir}__{tier}__bin{idx:05d}"
+    idx, total, shard_names, tier, raw_root, stage_root, rowgroup_bytes = task
     try:
-        time.sleep(random.uniform(0, 10))  # thin the startup download herd
-        stage_dir = Path(workdir) / "stage" / split_dir / tier
-        raw_dir.mkdir(parents=True, exist_ok=True)
+        stage_dir = Path(stage_root)
         stage_dir.mkdir(parents=True, exist_ok=True)
-
-        includes: list[str] = []
-        for name in bin_names:
-            includes += ["--include", name]
-        hf_retry(
-            [
-                "hf", "download", REPO, "--type", "dataset", *includes,
-                "--local-dir", str(raw_dir),
-                "--max-workers", str(dl_workers), "--quiet",
-            ]
-        )
-
-        shard_paths = [raw_dir / name for name in bin_names]
+        shard_paths = [Path(raw_root) / name for name in shard_names]
         out_path = stage_dir / f"data-{idx:05d}-of-{total:05d}.parquet"
         rows_in, rows_out = compact_bin(shard_paths, out_path, tier, rowgroup_bytes)
         if rows_in != rows_out:
             raise RuntimeError(f"row-count mismatch: in={rows_in} out={rows_out}")
-        shutil.rmtree(raw_dir, ignore_errors=True)
+        for shard in shard_paths:
+            shard.unlink(missing_ok=True)
         return idx, rows_out, str(out_path), None
     except Exception as exc:  # noqa: BLE001 — isolate per-bin failure
-        shutil.rmtree(raw_dir, ignore_errors=True)
         return idx, None, None, repr(exc)
+
+
+def download_slice(shard_names: list[str], raw_root: Path, dl_workers: int) -> None:
+    """Download every shard of a slice in ONE `hf download` call (one tree-walk)."""
+    includes: list[str] = []
+    for name in shard_names:
+        includes += ["--include", name]
+    hf_retry(
+        [
+            "hf", "download", REPO, "--type", "dataset", *includes,
+            "--local-dir", str(raw_root),
+            "--max-workers", str(dl_workers), "--quiet",
+        ]
+    )
 
 
 def upload_staged(
@@ -294,47 +291,8 @@ def upload_staged(
     shutil.rmtree(updir)
 
 
-def _run_bins(
-    todo: list[int],
-    bins: list[list[str]],
-    total: int,
-    tier: str,
-    split_dir: str,
-    workdir: str,
-    rowgroup_bytes: int,
-    args: argparse.Namespace,
-) -> list[tuple[int, str]]:
-    """Compact the given bin indices via the pool; return (idx, error) failures."""
-    tasks = [
-        (i, total, bins[i], tier, split_dir, workdir, rowgroup_bytes,
-         args.download_workers)
-        for i in todo
-    ]
-    staged: list[Path] = []
-    failed: list[tuple[int, str]] = []
-    with mp.Pool(args.workers) as pool:
-        for n, (idx, rows_out, out_path, err) in enumerate(
-            pool.imap_unordered(_compact_one_bin, tasks), 1
-        ):
-            if err is not None or out_path is None:
-                failed.append((idx, err or "unknown"))
-                print(f"  [{n}/{len(todo)}] bin {idx} FAILED: {err}", flush=True)
-                continue
-            staged.append(Path(out_path))
-            print(
-                f"  [{n}/{len(todo)}] bin {idx} compacted ({rows_out} rows)",
-                flush=True,
-            )
-            if len(staged) >= args.upload_batch:
-                upload_staged(staged, split_dir, tier, workdir, f"{len(staged)} files")
-                staged = []
-    if staged:
-        upload_staged(staged, split_dir, tier, workdir, f"{len(staged)} files")
-    return failed
-
-
 def process_group(args: argparse.Namespace, split: str, tier: str) -> None:
-    """Compact one (split, tier) group with a worker pool, batched uploads."""
+    """Compact one (split, tier) group: per-slice download, pooled compaction."""
     workdir = Path(args.workdir)
     done_marker = workdir / ".done" / f"{split}__{tier}"
     split_dir = SPLIT_DIRS[split]
@@ -342,33 +300,78 @@ def process_group(args: argparse.Namespace, split: str, tier: str) -> None:
         print(f"[{split}/{tier}] already done — skipping")
         return
 
-    bins = plan_bins(
-        list_group_shards(split_dir, tier), args.target_mb * 1024 * 1024
-    )
+    shards = list_group_shards(split_dir, tier)
+    size_of = dict(shards)
+    bins = plan_bins(shards, args.target_mb * 1024 * 1024)
     total = len(bins)
     done = existing_compacted(split_dir, tier)
-    todo = [i for i in range(total) if i not in done]
+    todo_bins = [i for i in range(total) if i not in done]
     print(
         f"\n=== {split}/{tier}: {total} files | {len(done)} present | "
-        f"{len(todo)} to build ===",
+        f"{len(todo_bins)} to build ===",
         flush=True,
     )
 
+    # Group the to-do bins into download slices of ~`--slice-mb`.
+    slice_bytes = args.slice_mb * 1024 * 1024
+    slices: list[list[int]] = []
+    cur: list[int] = []
+    cur_bytes = 0
+    for i in todo_bins:
+        cur.append(i)
+        cur_bytes += sum(size for _, size in bins[i])
+        if cur_bytes >= slice_bytes:
+            slices.append(cur)
+            cur, cur_bytes = [], 0
+    if cur:
+        slices.append(cur)
+
+    raw_root = workdir / "raw"
+    stage_root = workdir / "stage" / split_dir / tier
     rowgroup_bytes = args.rowgroup_mb * 1024 * 1024
-    if todo:
-        failed = _run_bins(
-            todo, bins, total, tier, split_dir, str(workdir), rowgroup_bytes, args
+    for sn, slice_idxs in enumerate(slices, 1):
+        if raw_root.exists():
+            shutil.rmtree(raw_root)
+        shard_names = [name for i in slice_idxs for name, _ in bins[i]]
+        print(
+            f"  slice {sn}/{len(slices)}: {len(slice_idxs)} bins / "
+            f"{len(shard_names)} shards — downloading",
+            flush=True,
         )
-        if failed:
-            print(f"  retrying {len(failed)} failed bins ...", flush=True)
-            failed = _run_bins(
-                [i for i, _ in failed], bins, total, tier, split_dir,
-                str(workdir), rowgroup_bytes, args,
+        download_slice(shard_names, raw_root, args.download_workers)
+
+        tasks = [
+            (i, total, [name for name, _ in bins[i]], tier, str(raw_root),
+             str(stage_root), rowgroup_bytes)
+            for i in slice_idxs
+        ]
+        staged: list[Path] = []
+        failures: list[tuple[int, str]] = []
+        with mp.Pool(args.workers) as pool:
+            for idx, rows_out, out_path, err in pool.imap_unordered(
+                _compact_one_bin, tasks
+            ):
+                if err is not None or out_path is None:
+                    failures.append((idx, err or "unknown"))
+                    print(f"  bin {idx} FAILED: {err}", flush=True)
+                    continue
+                staged.append(Path(out_path))
+                print(f"  bin {idx} compacted ({rows_out} rows)", flush=True)
+                if len(staged) >= args.upload_batch:
+                    upload_staged(
+                        staged, split_dir, tier, str(workdir), f"{len(staged)} files"
+                    )
+                    staged = []
+        if staged:
+            upload_staged(
+                staged, split_dir, tier, str(workdir), f"{len(staged)} files"
             )
-        if failed:
+        if failures:
             raise RuntimeError(
-                f"{split}/{tier}: bins still failing after retry: {failed[:5]}"
+                f"{split}/{tier} slice {sn}: bin compaction failed: {failures[:5]}"
             )
+    if raw_root.exists():
+        shutil.rmtree(raw_root)
 
     present = existing_compacted(split_dir, tier)
     if len(present) != total:
@@ -438,6 +441,9 @@ def main() -> int:
         "--workers", type=int, default=48, help="parallel bin-compaction processes"
     )
     parser.add_argument(
+        "--slice-mb", type=int, default=35000, help="approx download slice size"
+    )
+    parser.add_argument(
         "--target-mb", type=int, default=500, help="approx output file size"
     )
     parser.add_argument(
@@ -446,7 +452,9 @@ def main() -> int:
     parser.add_argument(
         "--upload-batch", type=int, default=25, help="output files per commit"
     )
-    parser.add_argument("--download-workers", type=int, default=2)
+    parser.add_argument(
+        "--download-workers", type=int, default=16, help="hf download parallelism"
+    )
     parser.add_argument(
         "--tiers", nargs="+", choices=TIERS, default=TIERS, help="subset of tiers"
     )
