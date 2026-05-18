@@ -45,9 +45,9 @@ marker file records `--target-mb`, and a resume with a different value is
 rejected (bin boundaries would shift). `--finalize` is safely re-runnable —
 it detects an already-merged PR and skips to the post-merge cleanup
 (marker + legacy-branch delete, history squash). `hf` download/upload
-calls and the Hub list / merge / squash calls retry transient failures
-with backoff; the marker file-ops are single-shot, but every `--finalize`
-step is idempotent so a re-run completes whatever a failure left undone.
+calls and every Hub call retry transient failures with backoff, and every
+`--finalize` step is idempotent — a re-run completes whatever a failure
+left undone.
 
 Prereqs on the pod (which has no `uv`):
     curl -LsSf https://hf.co/cli/install.sh | bash          # `hf` CLI
@@ -627,6 +627,23 @@ def _merge_migration_pr(pr_num: int) -> None:
             time.sleep(15 * attempt)
 
 
+def _delete_marker() -> None:
+    """Remove the migration marker from `main`; retried, absence tolerated."""
+    for attempt in range(1, 4):
+        try:
+            api.delete_file(
+                PR_MARKER, REPO, repo_type="dataset",
+                commit_message="remove migration marker",
+            )
+            return
+        except EntryNotFoundError:
+            return  # already removed by an earlier finalize run
+        except Exception:  # noqa: BLE001 — transient HF API error
+            if attempt == 3:
+                raise
+            time.sleep(10 * attempt)
+
+
 def _post_merge_cleanup() -> None:
     """Delete the marker + legacy branch and squash history. Idempotent.
 
@@ -634,13 +651,7 @@ def _post_merge_cleanup() -> None:
     for the whole open-PR lifetime means the `--target-mb` resume guard
     (`_marker_target_mb`) stays enforceable right up to the merge.
     """
-    try:
-        api.delete_file(
-            PR_MARKER, REPO, repo_type="dataset",
-            commit_message="remove migration marker",
-        )
-    except EntryNotFoundError:
-        pass  # already removed by an earlier finalize run
+    _delete_marker()
     branches = {
         b.name
         for b in api_retry(
