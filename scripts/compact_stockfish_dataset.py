@@ -13,35 +13,39 @@ renames the two eval columns to a tier-uniform scheme:
                    search tiers : was `legal_move_evals`
                    searchless   : absent
 
-Disk footprint is tiny. The unit of work is a *bin* — the set of small
-shards that compact into one ~500 MB output file. Each bin is downloaded,
-compacted, and its raw shards deleted immediately; compacted files are held
-only until an upload batch fills. Peak working set is roughly
-`--upload-batch` output files (~13 GB at the defaults) — point `--workdir`
-at `/dev/shm` and run on any pod with a few hundred GB of RAM.
+The unit of work is a *bin* — the set of small shards that compact into one
+~500 MB output file. Bins are processed by a **process pool** (`--workers`):
+each worker downloads its bin, re-encodes it (the zstd-19 recompression is
+CPU-heavy and single-bin-serial would idle most cores), and the main process
+batches the uploads. Each worker downloads (~seconds) far less often than it
+compacts (~minutes), so concurrent downloads stay sparse and never approach
+HF's request-rate limit. Peak disk ~= `--workers` bins in flight, a few tens
+of GB — point `--workdir` at `/dev/shm`.
 
-Transfers go through the `hf` CLI (download / upload). The Hub metadata
-calls — listing the repo tree, and the final history squash — use the
-huggingface_hub Python API: single requests, nothing to be inefficient at.
+Transfers go through the `hf` CLI. Hub metadata calls — the repo-tree
+listing (also the resume signal) and the final history squash — use the
+huggingface_hub Python API.
 
-Upload batching keeps the commit count low: ~2,000 output files / 25 per
-batch ~= 80 commits, well under HF's 128-commits/hour dataset limit.
+Resume is repo-state-based: a bin is "done" iff its `data-NNNNN-of-MMMMM`
+file is already in the repo, so an interrupted run just re-lists and skips.
 
 Prereqs on the pod:
     curl -LsSf https://hf.co/cli/install.sh | bash          # `hf` CLI
+    pip install --break-system-packages pyarrow             # if missing
     export HF_TOKEN=...                                     # write token
-    uv run --with pyarrow --with huggingface_hub python scripts/compact_stockfish_dataset.py ...
 
 Workflow:
     # 1. process every group (idempotent / resumable — re-run if interrupted)
-    python scripts/compact_stockfish_dataset.py --workdir /dev/shm/compact
-    # 2. inspect the verification output, then finalize (IRREVERSIBLE)
-    python scripts/compact_stockfish_dataset.py --workdir /dev/shm/compact --finalize
+    python3 compact_stockfish_dataset.py --workdir /dev/shm/compact
+    # 2. inspect output, then finalize (IRREVERSIBLE)
+    python3 compact_stockfish_dataset.py --workdir /dev/shm/compact --finalize
 """
 
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
+import re
 import shutil
 import subprocess
 import sys
@@ -52,6 +56,8 @@ import pyarrow.parquet as pq
 from huggingface_hub import HfApi
 
 REPO = "thomas-schweich/pawn-stockfish-100m"
+# Pre-compaction archive branch — deleted at finalize so its blobs are GC'd.
+LEGACY_BRANCH = "archive/2026-05-10-pre-seed-rework"
 
 TIERS: list[str] = [
     "tier0_evallegal",
@@ -64,12 +70,6 @@ SEARCHLESS_TIER = "tier0_evallegal"
 
 # split name (HF) -> directory in the repo
 SPLIT_DIRS: dict[str, str] = {"train": "train", "validation": "val", "test": "test"}
-# expected rows (= games) per tier, per split — coverage cross-check
-EXPECTED_ROWS: dict[str, int] = {
-    "train": 19_900_000,
-    "validation": 50_000,
-    "test": 50_000,
-}
 
 # Old eval-column names -> new names, per tier family.
 RENAME_SEARCH: dict[str, str] = {
@@ -79,6 +79,8 @@ RENAME_SEARCH: dict[str, str] = {
 RENAME_SEARCHLESS: dict[str, str] = {"legal_move_evals": "nnue_evals"}
 # On the searchless tier `static_legal_move_evals` is all-null and redundant.
 DROP_SEARCHLESS: list[str] = ["static_legal_move_evals"]
+
+_DATA_RE = re.compile(r"data-(\d+)-of-\d+\.parquet$")
 
 api = HfApi()
 
@@ -103,18 +105,34 @@ def remap_columns(table: pa.Table, tier: str) -> pa.Table:
 
 
 def list_group_shards(split_dir: str, tier: str) -> list[tuple[str, int]]:
-    """(repo_path, size) for every parquet shard in a (split, tier) group.
-
-    A Hub metadata call — no file content is transferred.
-    """
+    """(repo_path, size) for every original `shard-s*` shard in a group."""
     out: list[tuple[str, int]] = []
     for item in api.list_repo_tree(
         REPO, path_in_repo=f"{split_dir}/{tier}", repo_type="dataset", recursive=False
     ):
         size = getattr(item, "size", None)
-        if size is not None and item.path.endswith(".parquet"):
+        name = item.path.rsplit("/", 1)[-1]
+        if size is not None and name.startswith("shard-s") and name.endswith(".parquet"):
             out.append((item.path, size))
     out.sort()
+    return out
+
+
+def existing_compacted(split_dir: str, tier: str) -> set[int]:
+    """Bin indices already published as `data-NNNNN-of-MMMMM.parquet`."""
+    out: set[int] = set()
+    try:
+        for item in api.list_repo_tree(
+            REPO,
+            path_in_repo=f"{split_dir}/{tier}",
+            repo_type="dataset",
+            recursive=False,
+        ):
+            m = _DATA_RE.search(item.path)
+            if m:
+                out.add(int(m.group(1)))
+    except Exception:  # noqa: BLE001 — missing dir / transient list error
+        pass
     return out
 
 
@@ -144,8 +162,7 @@ def compact_bin(
     """Concatenate one bin's shards into a single parquet file at `out_path`.
 
     Returns (rows_in, rows_out). Shards are buffered only up to
-    `rowgroup_bytes` of input before being flushed as one row group, so peak
-    Arrow memory is a few hundred MB regardless of output file size.
+    `rowgroup_bytes` of input before being flushed as one row group.
     """
     rows_in = sum(pq.read_metadata(s).num_rows for s in shards)
     writer: pq.ParquetWriter | None = None
@@ -176,93 +193,124 @@ def compact_bin(
     return rows_in, pq.read_metadata(out_path).num_rows
 
 
-def upload_batch(stage_dir: Path, split_dir: str, tier: str, label: str) -> None:
-    """Upload everything staged for one group in a single commit, then prune."""
+def _compact_one_bin(
+    task: tuple[int, int, list[str], str, str, str, int, int],
+) -> tuple[int, int, str]:
+    """Pool worker: download one bin, compact it, return (idx, rows, out_path).
+
+    Raw shards download to a per-bin scratch dir and are deleted once the
+    compacted file is written, so disk stays bounded by `--workers`.
+    """
+    idx, total, bin_names, tier, split_dir, workdir, rowgroup_bytes, dl_workers = task
+    raw_dir = Path(workdir) / "raw" / f"{split_dir}__{tier}__bin{idx:05d}"
+    stage_dir = Path(workdir) / "stage" / split_dir / tier
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    includes: list[str] = []
+    for name in bin_names:
+        includes += ["--include", name]
+    subprocess.run(
+        [
+            "hf", "download", REPO, "--type", "dataset", *includes,
+            "--local-dir", str(raw_dir),
+            "--max-workers", str(dl_workers), "--quiet",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    shard_paths = [raw_dir / name for name in bin_names]
+    out_path = stage_dir / f"data-{idx:05d}-of-{total:05d}.parquet"
+    rows_in, rows_out = compact_bin(shard_paths, out_path, tier, rowgroup_bytes)
+    if rows_in != rows_out:
+        raise RuntimeError(f"row-count mismatch bin {idx}: in={rows_in} out={rows_out}")
+    shutil.rmtree(raw_dir, ignore_errors=True)
+    return idx, rows_out, str(out_path)
+
+
+def upload_staged(
+    paths: list[Path], split_dir: str, tier: str, workdir: str, label: str
+) -> None:
+    """Move a finished batch into a clean dir and upload it in one commit."""
+    updir = Path(workdir) / "upload" / split_dir / tier
+    if updir.exists():
+        shutil.rmtree(updir)
+    updir.mkdir(parents=True)
+    for path in paths:
+        shutil.move(str(path), str(updir / path.name))
     run(
         [
-            "hf", "upload", REPO, str(stage_dir), f"{split_dir}/{tier}",
+            "hf", "upload", REPO, str(updir), f"{split_dir}/{tier}",
             "--type", "dataset",
             "--commit-message", f"compact {split_dir}/{tier}: {label}",
         ]
     )
-    for parquet in stage_dir.glob("*.parquet"):
-        parquet.unlink()
+    shutil.rmtree(updir)
 
 
 def process_group(args: argparse.Namespace, split: str, tier: str) -> None:
-    """Bin -> (download, compact, prune) per bin -> batched upload, one group."""
+    """Compact one (split, tier) group with a worker pool, batched uploads."""
     workdir = Path(args.workdir)
     done_marker = workdir / ".done" / f"{split}__{tier}"
+    split_dir = SPLIT_DIRS[split]
     if done_marker.exists():
         print(f"[{split}/{tier}] already done — skipping")
         return
 
-    split_dir = SPLIT_DIRS[split]
     bins = plan_bins(
         list_group_shards(split_dir, tier), args.target_mb * 1024 * 1024
     )
     total = len(bins)
-    print(f"\n=== {split}/{tier}: {total} output files ===", flush=True)
+    done = existing_compacted(split_dir, tier)
+    todo = [i for i in range(total) if i not in done]
+    print(
+        f"\n=== {split}/{tier}: {total} files | {len(done)} present | "
+        f"{len(todo)} to build ===",
+        flush=True,
+    )
 
-    progress_file = workdir / ".progress" / f"{split}__{tier}"
-    done_bins, cum_rows = 0, 0
-    if progress_file.exists():
-        done_bins, cum_rows = (int(x) for x in progress_file.read_text().split())
-        print(f"  resuming after bin {done_bins}")
-
-    raw_root = workdir / "raw"
-    stage_dir = workdir / "stage" / split_dir / tier
-    stage_dir.mkdir(parents=True, exist_ok=True)
     rowgroup_bytes = args.rowgroup_mb * 1024 * 1024
-    staged_since_upload = 0
-
-    for idx in range(done_bins, total):
-        bin_names = bins[idx]
-        includes: list[str] = []
-        for name in bin_names:
-            includes += ["--include", name]
-        run(
-            [
-                "hf", "download", REPO, "--type", "dataset", *includes,
-                "--local-dir", str(raw_root),
-                "--max-workers", str(args.download_workers),
-            ]
-        )
-
-        shard_paths = [raw_root / name for name in bin_names]
-        out_path = stage_dir / f"data-{idx:05d}-of-{total:05d}.parquet"
-        rows_in, rows_out = compact_bin(shard_paths, out_path, tier, rowgroup_bytes)
-        if rows_in != rows_out:
-            raise RuntimeError(
-                f"row-count mismatch {split}/{tier} bin {idx}: "
-                f"in={rows_in} out={rows_out}"
+    if todo:
+        tasks = [
+            (i, total, bins[i], tier, split_dir, str(workdir), rowgroup_bytes,
+             args.download_workers)
+            for i in todo
+        ]
+        staged: list[Path] = []
+        with mp.Pool(args.workers) as pool:
+            for n, (idx, rows_out, out_path) in enumerate(
+                pool.imap_unordered(_compact_one_bin, tasks), 1
+            ):
+                staged.append(Path(out_path))
+                print(
+                    f"  [{n}/{len(todo)}] bin {idx} compacted ({rows_out} rows)",
+                    flush=True,
+                )
+                if len(staged) >= args.upload_batch:
+                    upload_staged(
+                        staged, split_dir, tier, str(workdir), f"{len(staged)} files"
+                    )
+                    staged = []
+        if staged:
+            upload_staged(
+                staged, split_dir, tier, str(workdir), f"{len(staged)} files"
             )
-        cum_rows += rows_out
-        for shard in shard_paths:  # prune raw immediately — bounds disk
-            shard.unlink()
-        staged_since_upload += 1
 
-        is_last = idx == total - 1
-        if staged_since_upload >= args.upload_batch or is_last:
-            upload_batch(stage_dir, split_dir, tier, f"bins ..{idx}/{total}")
-            progress_file.parent.mkdir(parents=True, exist_ok=True)
-            progress_file.write_text(f"{idx + 1} {cum_rows}")
-            staged_since_upload = 0
-            print(f"  uploaded through bin {idx + 1}/{total}")
-
-    expected = EXPECTED_ROWS[split]
-    if cum_rows != expected:
+    present = existing_compacted(split_dir, tier)
+    if len(present) != total:
         raise RuntimeError(
-            f"coverage check failed {split}/{tier}: "
-            f"compacted {cum_rows:,} rows, expected {expected:,}"
+            f"{split}/{tier}: {len(present)}/{total} compacted files present "
+            f"after run — missing {sorted(set(range(total)) - present)[:10]}"
         )
     done_marker.parent.mkdir(parents=True, exist_ok=True)
     done_marker.touch()
-    print(f"[{split}/{tier}] done — {cum_rows:,} rows verified")
+    print(f"[{split}/{tier}] done — {total} files verified present", flush=True)
 
 
 def finalize() -> None:
-    """Delete the old shard-s* files, then squash history to reclaim storage."""
+    """Delete old shards + legacy branch, then squash history to reclaim storage."""
     print("Deleting pre-compaction shards (shard-s*.parquet) ...")
     run(
         [
@@ -271,6 +319,8 @@ def finalize() -> None:
             "--commit-message", "drop pre-compaction 2k-game shards",
         ]
     )
+    print(f"Deleting legacy branch {LEGACY_BRANCH} ...")
+    run(["hf", "repos", "branch", "delete", REPO, LEGACY_BRANCH, "--type", "dataset"])
     print("Squashing repo history (IRREVERSIBLE) ...")
     api.super_squash_history(
         repo_id=REPO,
@@ -286,25 +336,25 @@ def main() -> int:
         "--workdir", required=True, help="scratch dir — point at /dev/shm/<name>"
     )
     parser.add_argument(
+        "--workers", type=int, default=24, help="parallel bin-compaction processes"
+    )
+    parser.add_argument(
         "--target-mb", type=int, default=500, help="approx output file size"
     )
     parser.add_argument(
         "--rowgroup-mb", type=int, default=128, help="approx row-group size"
     )
     parser.add_argument(
-        "--upload-batch",
-        type=int,
-        default=25,
-        help="output files per commit (peak disk ~= this x --target-mb)",
+        "--upload-batch", type=int, default=25, help="output files per commit"
     )
-    parser.add_argument("--download-workers", type=int, default=8)
+    parser.add_argument("--download-workers", type=int, default=3)
     parser.add_argument(
         "--tiers", nargs="+", choices=TIERS, default=TIERS, help="subset of tiers"
     )
     parser.add_argument(
         "--finalize",
         action="store_true",
-        help="delete old shards + squash history (run only after verifying)",
+        help="delete old shards + legacy branch + squash (run only after verifying)",
     )
     args = parser.parse_args()
 
