@@ -35,8 +35,12 @@ Two units of work:
     no API calls, so the CPU-bound zstd recompression uses all cores
     without touching the rate limit.
 
-Per (split, tier) group: list shards, plan bins, group bins into slices,
-then for each slice download -> pool-compact -> batched upload -> delete.
+Per (split, tier) group: the PR forks `main`, whose `<split>/<tier>/` dir
+already holds the ~9,950 pre-compaction `shard-s*` files — and HF caps a
+directory at 10,000 files. So each group first clears its old shards from
+the PR, then plans bins, groups them into slices, and for each slice does
+download -> pool-compact -> batched upload. (`main` keeps the shards until
+the PR is merged at finalize, so `load_dataset` is unaffected throughout.)
 
 Resume is repo-state-based: a bin is "done" iff its `data-NNNNN-of-MMMMM`
 file is already on the PR (plus a local `.done` marker that short-circuits
@@ -521,6 +525,17 @@ def _compact_slice(
         raise RuntimeError(f"{split_dir}/{tier}: bin compaction failed: {failures[:5]}")
 
 
+def _group_has_shards(split_dir: str, tier: str, revision: str) -> bool:
+    """True if any `shard-s*` file is still in this group's dir on `revision`."""
+    for item in list_repo_tree(f"{split_dir}/{tier}", revision=revision):
+        if not isinstance(item, RepoFile):
+            continue
+        name = item.path.rsplit("/", 1)[-1]
+        if name.startswith("shard-s") and name.endswith(".parquet"):
+            return True
+    return False
+
+
 def process_group(
     args: argparse.Namespace, split: str, tier: str, pr_revision: str
 ) -> None:
@@ -549,6 +564,23 @@ def process_group(
         f"{len(todo_bins)} to build ===",
         flush=True,
     )
+
+    # The PR forks `main`, whose `<split>/<tier>/` dir holds ~9,950 shard-s*
+    # files. HF caps a directory at 10,000 files, so the old shards must be
+    # cleared from the PR before the data-* files can fill the same dir.
+    if _group_has_shards(split_dir, tier, pr_revision):
+        print(
+            f"  clearing pre-compaction shards from {split_dir}/{tier} on the PR ...",
+            flush=True,
+        )
+        hf_retry(
+            [
+                "hf", "repos", "delete-files", REPO,
+                f"{split_dir}/{tier}/shard-s*.parquet",
+                "--type", "dataset", "--revision", pr_revision,
+                "--commit-message", f"drop pre-compaction shards: {split_dir}/{tier}",
+            ]
+        )
 
     if todo_bins:
         # Group the to-do bins into download slices of ~`--slice-mb`.
