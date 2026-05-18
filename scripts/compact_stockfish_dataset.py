@@ -19,17 +19,19 @@ each worker downloads its bin, re-encodes it (the zstd-19 recompression is
 CPU-heavy and single-bin-serial would idle most cores), and the main process
 batches the uploads.
 
-Resilience: every `hf` call retries transient failures with backoff, and a
+Resilience: every download/upload `hf` call retries transient failures with
+backoff (the irreversible `--finalize` ops deliberately do not), and a
 worker never raises — a bin that still fails after retries is returned as a
 failure and re-run in a second pass, so one bad download cannot kill the run.
 Workers also jitter their first download to thin the startup herd.
 
 Transfers go through the `hf` CLI. Hub metadata calls — the repo-tree
 listing (also the resume signal) and the final history squash — use the
-huggingface_hub Python API.
+huggingface_hub Python API, with retry.
 
 Resume is repo-state-based: a bin is "done" iff its `data-NNNNN-of-MMMMM`
-file is already in the repo, so an interrupted run just re-lists and skips.
+file is already in the repo, so an interrupted run just re-lists and skips
+(plus a local `.done` marker that short-circuits an already-finished group).
 
 Prereqs on the pod:
     curl -LsSf https://hf.co/cli/install.sh | bash          # `hf` CLI
@@ -84,9 +86,30 @@ RENAME_SEARCHLESS: dict[str, str] = {"legal_move_evals": "nnue_evals"}
 # On the searchless tier `static_legal_move_evals` is all-null and redundant.
 DROP_SEARCHLESS: list[str] = ["static_legal_move_evals"]
 
-_DATA_RE = re.compile(r"data-(\d+)-of-\d+\.parquet$")
+_DATA_RE = re.compile(r"data-(\d+)-of-(\d+)\.parquet$")
 
 api = HfApi()
+
+
+def list_repo_tree(path: str, retries: int = 5) -> list:
+    """`api.list_repo_tree` with retry — raises on persistent failure.
+
+    Never returns a silent empty list on error: an empty result must mean the
+    directory genuinely has no matching entries, so callers (including the
+    final coverage check) can trust it.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            return list(
+                api.list_repo_tree(
+                    REPO, path_in_repo=path, repo_type="dataset", recursive=False
+                )
+            )
+        except Exception:  # noqa: BLE001 — transient HF API / network error
+            if attempt == retries:
+                raise
+            time.sleep(min(60, 2 ** attempt) + random.uniform(0, 4))
+    return []  # unreachable
 
 
 def hf_retry(cmd: list[str], attempts: int = 6) -> None:
@@ -129,9 +152,7 @@ def remap_columns(table: pa.Table, tier: str) -> pa.Table:
 def list_group_shards(split_dir: str, tier: str) -> list[tuple[str, int]]:
     """(repo_path, size) for every original `shard-s*` shard in a group."""
     out: list[tuple[str, int]] = []
-    for item in api.list_repo_tree(
-        REPO, path_in_repo=f"{split_dir}/{tier}", repo_type="dataset", recursive=False
-    ):
+    for item in list_repo_tree(f"{split_dir}/{tier}"):
         size = getattr(item, "size", None)
         name = item.path.rsplit("/", 1)[-1]
         if size is not None and name.startswith("shard-s") and name.endswith(".parquet"):
@@ -141,20 +162,16 @@ def list_group_shards(split_dir: str, tier: str) -> list[tuple[str, int]]:
 
 
 def existing_compacted(split_dir: str, tier: str) -> set[int]:
-    """Bin indices already published as `data-NNNNN-of-MMMMM.parquet`."""
+    """Bin indices already published as `data-NNNNN-of-MMMMM.parquet`.
+
+    Raises (via `list_repo_tree`) on a persistent listing failure rather than
+    reporting a false empty set — the final coverage check depends on this.
+    """
     out: set[int] = set()
-    try:
-        for item in api.list_repo_tree(
-            REPO,
-            path_in_repo=f"{split_dir}/{tier}",
-            repo_type="dataset",
-            recursive=False,
-        ):
-            m = _DATA_RE.search(item.path)
-            if m:
-                out.add(int(m.group(1)))
-    except Exception:  # noqa: BLE001 — missing dir / transient list error
-        pass
+    for item in list_repo_tree(f"{split_dir}/{tier}"):
+        m = _DATA_RE.search(item.path)
+        if m:
+            out.add(int(m.group(1)))
     return out
 
 
@@ -199,19 +216,21 @@ def compact_bin(
         writer.write_table(pa.concat_tables(buf) if len(buf) > 1 else buf[0])
         buf, buf_bytes = [], 0
 
-    for shard in shards:
-        table = remap_columns(pq.read_table(shard), tier)
-        if writer is None:
-            writer = pq.ParquetWriter(
-                out_path, table.schema, compression="zstd", compression_level=19
-            )
-        buf.append(table)
-        buf_bytes += shard.stat().st_size
-        if buf_bytes >= rowgroup_bytes:
-            flush()
-    flush()
-    assert writer is not None
-    writer.close()
+    try:
+        for shard in shards:
+            table = remap_columns(pq.read_table(shard), tier)
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    out_path, table.schema, compression="zstd", compression_level=19
+                )
+            buf.append(table)
+            buf_bytes += table.nbytes  # decompressed Arrow size — what's in RAM
+            if buf_bytes >= rowgroup_bytes:
+                flush()
+        flush()
+    finally:
+        if writer is not None:
+            writer.close()
     return rows_in, pq.read_metadata(out_path).num_rows
 
 
@@ -363,8 +382,35 @@ def process_group(args: argparse.Namespace, split: str, tier: str) -> None:
 
 
 def finalize() -> None:
-    """Delete old shards + legacy branch, then squash history to reclaim storage."""
-    print("Deleting pre-compaction shards (shard-s*.parquet) ...")
+    """Delete old shards + legacy branch, then squash history to reclaim storage.
+
+    Refuses to run unless every (split, tier) group is fully compacted — the
+    `data-*` filenames encode their own `-of-MMMMM` total, so completeness is
+    checked against that. The deletes below are otherwise unrecoverable.
+    """
+    print("Verifying all 15 groups are fully compacted ...")
+    for split in SPLIT_DIRS:
+        for tier in TIERS:
+            split_dir = SPLIT_DIRS[split]
+            idxs: set[int] = set()
+            totals: set[int] = set()
+            for item in list_repo_tree(f"{split_dir}/{tier}"):
+                m = _DATA_RE.search(item.path)
+                if m:
+                    idxs.add(int(m.group(1)))
+                    totals.add(int(m.group(2)))
+            if len(totals) != 1:
+                raise RuntimeError(
+                    f"refusing to finalize — {split}/{tier}: {len(idxs)} compacted "
+                    f"files, inconsistent/absent -of- totals {totals or set()}"
+                )
+            total = totals.pop()
+            if idxs != set(range(total)):
+                raise RuntimeError(
+                    f"refusing to finalize — {split}/{tier}: only {len(idxs)}/{total} "
+                    f"compacted files present"
+                )
+    print("All 15 groups verified complete. Deleting pre-compaction shards ...")
     run(
         [
             "hf", "repos", "delete-files", REPO, "**/shard-s*.parquet",
@@ -389,7 +435,7 @@ def main() -> int:
         "--workdir", required=True, help="scratch dir — point at /dev/shm/<name>"
     )
     parser.add_argument(
-        "--workers", type=int, default=24, help="parallel bin-compaction processes"
+        "--workers", type=int, default=48, help="parallel bin-compaction processes"
     )
     parser.add_argument(
         "--target-mb", type=int, default=500, help="approx output file size"
