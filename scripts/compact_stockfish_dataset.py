@@ -40,10 +40,11 @@ then for each slice download -> pool-compact -> batched upload -> delete.
 
 Resume is repo-state-based: a bin is "done" iff its `data-NNNNN-of-MMMMM`
 file is already on the PR (plus a local `.done` marker that short-circuits
-an already-finished group). The PR itself is rediscovered by title on
-resume. Every download/upload `hf` call and Hub listing retries transient
-failures with backoff; the destructive delete/merge/squash ops in
-`--finalize` do not.
+an already-finished group). The PR is rediscovered by title on resume, and
+`--finalize` is safely re-runnable — it detects an already-merged PR and
+skips straight to the history squash. Every download/upload `hf` call and
+Hub API call retries transient failures with backoff; in `--finalize` the
+merge and squash retry too, only the shard-delete does not.
 
 Prereqs on the pod (which has no `uv`):
     curl -LsSf https://hf.co/cli/install.sh | bash          # `hf` CLI
@@ -67,10 +68,11 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.pool import Pool
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, TypeVar
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -113,6 +115,8 @@ _MP = mp.get_context("spawn")
 
 api = HfApi()
 
+_T = TypeVar("_T")
+
 
 class BinResult(NamedTuple):
     """One pool task's outcome. Exactly one of (rows/out_path) or error is set."""
@@ -138,31 +142,20 @@ def hf_retry(cmd: list[str], attempts: int = 6) -> None:
         time.sleep(min(120, 5 * 2 ** attempt) + random.uniform(0, 8))
 
 
-def list_repo_tree(
-    path: str, revision: str | None = None, retries: int = 5
-) -> list[RepoFile | RepoFolder]:
-    """`api.list_repo_tree` with retry — raises on persistent failure.
+def api_retry(produce: Callable[[], _T], retries: int = 5) -> _T:
+    """Call a Hub API thunk, retrying transient failures with backoff.
 
-    Never returns a silent empty list on error: an empty result must mean the
-    directory genuinely has no matching entries, so callers (including the
-    coverage checks) can trust it.
+    `produce` must fully materialize its result (e.g. wrap generator-returning
+    APIs in `list(...)`) so iteration-time errors are caught here too.
     """
     for attempt in range(1, retries + 1):
         try:
-            return list(
-                api.list_repo_tree(
-                    REPO,
-                    path_in_repo=path,
-                    repo_type="dataset",
-                    revision=revision,
-                    recursive=False,
-                )
-            )
+            return produce()
         except Exception:  # noqa: BLE001 — transient HF API / network error
             if attempt == retries:
                 raise
             time.sleep(min(60, 2 ** attempt) + random.uniform(0, 4))
-    return []  # unreachable
+    raise AssertionError("unreachable")
 
 
 def run(cmd: list[str]) -> None:
@@ -171,16 +164,67 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def ensure_pr() -> str:
-    """Return the `refs/pr/N` revision of the migration PR, creating it once.
+def list_repo_tree(
+    path: str, revision: str | None = None
+) -> list[RepoFile | RepoFolder]:
+    """`api.list_repo_tree` with retry — raises on persistent failure.
 
-    Rediscovered by exact title so a resumed run reuses the same PR rather
-    than opening a duplicate.
+    Never returns a silent empty list on error: an empty result must mean the
+    directory genuinely has no matching entries, so callers (including the
+    coverage checks) can trust it.
     """
-    for d in api.get_repo_discussions(REPO, repo_type="dataset"):
-        if d.is_pull_request and d.title == PR_TITLE and d.status == "open":
-            print(f"  using existing migration PR #{d.num}", flush=True)
-            return f"refs/pr/{d.num}"
+    return api_retry(
+        lambda: list(
+            api.list_repo_tree(
+                REPO,
+                path_in_repo=path,
+                repo_type="dataset",
+                revision=revision,
+                recursive=False,
+            )
+        )
+    )
+
+
+def find_migration_pr() -> tuple[int | None, str | None]:
+    """Locate the migration PR by exact title.
+
+    Returns (num, status) where status is "open" or "merged"; prefers the
+    lowest-numbered open PR (deterministic dedup if a resume race opened two),
+    falls back to a merged PR, else (None, None).
+    """
+    open_nums: list[int] = []
+    merged_nums: list[int] = []
+    for d in api_retry(
+        lambda: list(api.get_repo_discussions(REPO, repo_type="dataset"))
+    ):
+        if d.is_pull_request and d.title == PR_TITLE:
+            if d.status == "open":
+                open_nums.append(d.num)
+            elif d.status == "merged":
+                merged_nums.append(d.num)
+    if open_nums:
+        return min(open_nums), "open"
+    if merged_nums:
+        return min(merged_nums), "merged"
+    return None, None
+
+
+def ensure_pr() -> str:
+    """Return the `refs/pr/N` revision of the open migration PR, creating once.
+
+    Rediscovered by title so a resumed run reuses the same PR. Exits if the PR
+    has already been merged (compaction is complete — nothing left to upload).
+    """
+    num, status = find_migration_pr()
+    if status == "merged":
+        raise SystemExit(
+            "migration PR is already merged — compaction is complete; "
+            "run --finalize if history still needs squashing."
+        )
+    if num is not None:
+        print(f"  using existing migration PR #{num}", flush=True)
+        return f"refs/pr/{num}"
     info = api.create_commit(
         repo_id=REPO,
         repo_type="dataset",
@@ -192,8 +236,14 @@ def ensure_pr() -> str:
         ),
         create_pr=True,
     )
-    print(f"  opened migration PR #{info.pr_num}", flush=True)
-    return f"refs/pr/{info.pr_num}"
+    if info.pr_num is None:
+        raise RuntimeError("create_commit(create_pr=True) returned no pr_num")
+    # Re-scan and adopt the lowest open PR: if a concurrent run also created
+    # one, both runs converge on the same PR rather than splitting uploads.
+    num, _ = find_migration_pr()
+    chosen = num if num is not None else info.pr_num
+    print(f"  opened migration PR #{chosen}", flush=True)
+    return f"refs/pr/{chosen}"
 
 
 def remap_columns(table: pa.Table, tier: str) -> pa.Table:
@@ -236,6 +286,8 @@ def existing_compacted(
     idxs: set[int] = set()
     totals: set[int] = set()
     for item in list_repo_tree(f"{split_dir}/{tier}", revision=revision):
+        if not isinstance(item, RepoFile):
+            continue
         m = _DATA_RE.search(item.path)
         if m:
             idxs.add(int(m.group(1)))
@@ -492,20 +544,69 @@ def process_group(
     print(f"[{split}/{tier}] done — {total} files verified present", flush=True)
 
 
+def _merge_migration_pr(pr_num: int) -> None:
+    """Merge the PR into main, retried; a concurrent merge is treated as success."""
+    for attempt in range(1, 4):
+        try:
+            api.merge_pull_request(REPO, pr_num, repo_type="dataset")
+            return
+        except Exception:  # noqa: BLE001 — transient, or already merged
+            _, status = find_migration_pr()
+            if status == "merged":
+                print("  PR is already merged.", flush=True)
+                return
+            if attempt == 3:
+                raise
+            time.sleep(15 * attempt)
+
+
+def _post_merge_cleanup() -> None:
+    """Delete the legacy branch (if present) and squash history. Idempotent."""
+    branches = {
+        b.name
+        for b in api_retry(
+            lambda: api.list_repo_refs(REPO, repo_type="dataset")
+        ).branches
+    }
+    if LEGACY_BRANCH in branches:
+        print(f"Deleting legacy branch {LEGACY_BRANCH} ...")
+        hf_retry(
+            ["hf", "repos", "branch", "delete", REPO, LEGACY_BRANCH, "--type", "dataset"]
+        )
+    else:
+        print(f"Legacy branch {LEGACY_BRANCH} already absent — skipping.")
+    print("Squashing repo history (IRREVERSIBLE) ...")
+    api_retry(
+        lambda: api.super_squash_history(
+            repo_id=REPO,
+            repo_type="dataset",
+            commit_message="compact to ~500MB parquet; rename eval columns",
+        ),
+        retries=3,
+    )
+    print("Done. Old blobs are now unreferenced and will be GC'd by the Hub.")
+
+
 def finalize(args: argparse.Namespace) -> None:
     """Verify the PR, delete old shards on it, merge it, then squash history.
 
-    Refuses to run unless every (split, tier) group is fully compacted on the
-    PR — the expected bin count is recomputed from the still-present source
-    shards, and the published `data-*` set must cover exactly `range(expected)`
-    with one consistent `-of-MMMMM` total. Merging the PR is the single,
-    atomic mutation of `main`; everything before it is unrecoverable only
-    after the merge + squash.
+    Safely re-runnable: if the PR is already merged (a prior run got past the
+    merge), it skips straight to the legacy-branch + squash cleanup. While the
+    PR is still open it refuses unless every (split, tier) group is fully
+    compacted — the expected bin count is recomputed from the still-present
+    source shards on `main`, and the published `data-*` set must cover exactly
+    `range(expected)` with one consistent `-of-MMMMM` total.
     """
-    pr_revision = ensure_pr()
-    pr_num = int(pr_revision.rsplit("/", 1)[-1])
+    pr_num, status = find_migration_pr()
+    if pr_num is None:
+        raise SystemExit("no migration PR found — run the compaction first")
+    if status == "merged":
+        print(f"Migration PR #{pr_num} already merged — finishing cleanup.")
+        _post_merge_cleanup()
+        return
 
-    print("Verifying all 15 groups are fully compacted on the PR ...")
+    pr_revision = f"refs/pr/{pr_num}"
+    print(f"Verifying all 15 groups are fully compacted on PR #{pr_num} ...")
     for split in SPLIT_DIRS:
         for tier in TIERS:
             split_dir = SPLIT_DIRS[split]
@@ -530,29 +631,8 @@ def finalize(args: argparse.Namespace) -> None:
         ]
     )
     print(f"Merging migration PR #{pr_num} into main ...")
-    api.merge_pull_request(REPO, pr_num, repo_type="dataset")
-
-    branches = {b.name for b in api.list_repo_refs(REPO, repo_type="dataset").branches}
-    if LEGACY_BRANCH in branches:
-        print(f"Deleting legacy branch {LEGACY_BRANCH} ...")
-        run(["hf", "repos", "branch", "delete", REPO, LEGACY_BRANCH, "--type", "dataset"])
-    else:
-        print(f"Legacy branch {LEGACY_BRANCH} already absent — skipping.")
-
-    print("Squashing repo history (IRREVERSIBLE) ...")
-    for attempt in range(1, 4):
-        try:
-            api.super_squash_history(
-                repo_id=REPO,
-                repo_type="dataset",
-                commit_message="compact to ~500MB parquet; rename eval columns",
-            )
-            break
-        except Exception:  # noqa: BLE001 — transient API error
-            if attempt == 3:
-                raise
-            time.sleep(15 * attempt)
-    print("Done. Old blobs are now unreferenced and will be GC'd by the Hub.")
+    _merge_migration_pr(pr_num)
+    _post_merge_cleanup()
 
 
 def main() -> int:
@@ -593,8 +673,9 @@ def main() -> int:
         finalize(args)
         return 0
 
-    # Two slices may be on disk at once (current + prefetched), plus staged output.
-    need_gb = args.slice_mb * 2.5 / 1024
+    # Worst case on disk: current raw slice + prefetched next slice + the
+    # staged batch + upload_staged's transient copy of it.
+    need_gb = args.slice_mb * 3.0 / 1024
     free_gb = shutil.disk_usage(Path(args.workdir).parent).free / 1024**3
     if free_gb < need_gb:
         raise SystemExit(
