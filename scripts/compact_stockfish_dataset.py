@@ -137,17 +137,18 @@ class BinResult(NamedTuple):
     error: str | None
 
 
-def hf_retry(cmd: list[str], attempts: int = 6) -> None:
+def hf_retry(cmd: list[str], attempts: int = 8) -> None:
     """Run an `hf` CLI command, retrying transient failures with backoff."""
     for attempt in range(1, attempts + 1):
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
             return
         if attempt == attempts:
-            # Lead of stderr — the actionable line (401, 404, quota) is first.
+            # Tail of stderr — `hf upload`/`download` lead with many lines of
+            # progress bars; the actual error message is at the end.
             raise RuntimeError(
                 f"`hf {cmd[1]}` failed after {attempts} attempts: "
-                f"{result.stderr.strip()[:600]}"
+                f"{result.stderr.strip()[-1800:]}"
             )
         time.sleep(min(120, 5 * 2 ** attempt) + random.uniform(0, 8))
 
