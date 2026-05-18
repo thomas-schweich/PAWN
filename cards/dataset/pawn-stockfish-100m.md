@@ -252,8 +252,8 @@ policy-learning target). On the search tiers `cp_evals` averages ~5.0
 entries per position; `nnue_evals` sets average ~23–27 entries per position
 (the mean number of legal moves).
 
-**On-disk size:** ≈ 1.0 TB of zstd-compressed parquet (level 12), packaged
-as ~500 MB files.
+**On-disk size:** ≈ 1.17 TB of zstd-compressed parquet (level 12),
+packaged as ~500 MB files (1,864 files total).
 
 **Unique positions: 13,447,893,206** distinct board states among the
 16.4 billion evaluated positions — ≈ 82%; the other ~18% are positions
@@ -274,7 +274,7 @@ whole tier.
 ### Polars with column projection
 
 Polars only downloads the columns you select — projecting away the eval
-columns turns the ~1 TB dataset into a small moves-only feed:
+columns turns the ~1.2 TB dataset into a small moves-only feed:
 
 ```python
 import polars as pl
