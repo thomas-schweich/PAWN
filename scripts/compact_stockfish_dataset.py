@@ -44,9 +44,10 @@ an already-finished group). The PR is rediscovered by title on resume; its
 marker file records `--target-mb`, and a resume with a different value is
 rejected (bin boundaries would shift). `--finalize` is safely re-runnable —
 it detects an already-merged PR and skips to the post-merge cleanup
-(legacy-branch delete + history squash). Every download/upload/Hub call,
-and every retry-safe `--finalize` step, retries transient failures with
-backoff; only the source-shard delete-on-PR is gated-but-unretried.
+(marker + legacy-branch delete, history squash). `hf` download/upload
+calls and the Hub list / merge / squash calls retry transient failures
+with backoff; the marker file-ops are single-shot, but every `--finalize`
+step is idempotent so a re-run completes whatever a failure left undone.
 
 Prereqs on the pod (which has no `uv`):
     curl -LsSf https://hf.co/cli/install.sh | bash          # `hf` CLI
@@ -216,19 +217,26 @@ def find_migration_pr() -> tuple[int | None, str | None]:
 
 
 def _marker_target_mb(pr_revision: str) -> int | None:
-    """The `--target-mb` recorded in the PR's marker file, or None if absent."""
+    """The `--target-mb` recorded in the PR's marker file, or None if absent.
+
+    `hf_hub_download` is called directly, not via `api_retry`: a missing
+    marker raises `EntryNotFoundError` — a permanent error that must not be
+    retried. Raises if the marker exists but carries no `target_mb=` line, so
+    a malformed marker can't silently disable the resume guard.
+    """
     try:
-        path = api_retry(
-            lambda: hf_hub_download(
-                REPO, PR_MARKER, repo_type="dataset", revision=pr_revision
-            )
+        path = hf_hub_download(
+            REPO, PR_MARKER, repo_type="dataset", revision=pr_revision
         )
     except EntryNotFoundError:
         return None
     for line in Path(path).read_text().splitlines():
         if line.startswith("target_mb="):
             return int(line.split("=", 1)[1])
-    return None
+    raise RuntimeError(
+        f"migration PR marker {PR_MARKER} has no target_mb= line — refusing "
+        f"to resume against an unrecognized marker"
+    )
 
 
 def ensure_pr(target_mb: int) -> str:
@@ -590,6 +598,16 @@ def process_group(
     print(f"[{split}/{tier}] done — {total} files verified present", flush=True)
 
 
+def _pr_status(pr_num: int) -> str | None:
+    """Status of the PR with this exact number, or None if not found."""
+    for d in api_retry(
+        lambda: list(api.get_repo_discussions(REPO, repo_type="dataset"))
+    ):
+        if d.is_pull_request and d.num == pr_num:
+            return d.status
+    return None
+
+
 def _merge_migration_pr(pr_num: int) -> None:
     """Merge the PR into main, retried; a concurrent merge is treated as success."""
     for attempt in range(1, 4):
@@ -598,11 +616,11 @@ def _merge_migration_pr(pr_num: int) -> None:
             return
         except Exception:  # noqa: BLE001 — transient, or already merged
             try:
-                _, status = find_migration_pr()
+                merged = _pr_status(pr_num) == "merged"
             except Exception:  # noqa: BLE001 — status probe itself flaked
-                status = None
-            if status == "merged":
-                print("  PR is already merged.", flush=True)
+                merged = False
+            if merged:
+                print(f"  PR #{pr_num} is already merged.", flush=True)
                 return
             if attempt == 3:
                 raise
@@ -610,7 +628,19 @@ def _merge_migration_pr(pr_num: int) -> None:
 
 
 def _post_merge_cleanup() -> None:
-    """Delete the legacy branch (if present) and squash history. Idempotent."""
+    """Delete the marker + legacy branch and squash history. Idempotent.
+
+    The marker is removed only here, after the merge — keeping it present
+    for the whole open-PR lifetime means the `--target-mb` resume guard
+    (`_marker_target_mb`) stays enforceable right up to the merge.
+    """
+    try:
+        api.delete_file(
+            PR_MARKER, REPO, repo_type="dataset",
+            commit_message="remove migration marker",
+        )
+    except EntryNotFoundError:
+        pass  # already removed by an earlier finalize run
     branches = {
         b.name
         for b in api_retry(
@@ -691,13 +721,6 @@ def finalize(args: argparse.Namespace) -> None:
         )
     else:
         print(f"All {N_GROUPS} groups verified. Old shards already removed on the PR.")
-    try:
-        api.delete_file(
-            PR_MARKER, REPO, repo_type="dataset", revision=pr_revision,
-            commit_message="remove migration marker",
-        )
-    except EntryNotFoundError:
-        pass
 
     print(f"Merging migration PR #{pr_num} into main ...")
     _merge_migration_pr(pr_num)
