@@ -13,6 +13,13 @@ renames the two eval columns to a tier-uniform scheme:
                    search tiers : was `legal_move_evals`
                    searchless   : absent
 
+Staged on a PR branch. Every compacted file is uploaded to an HF pull
+request (`refs/pr/N`), never to `main` directly — so for the whole
+multi-hour run `main` (what `load_dataset` reads) stays the consistent
+pre-migration dataset. `--finalize` deletes the old shards on the PR,
+merges it (the atomic swap to the compacted layout), then squashes
+history. `main` is mutated exactly once, by the merge.
+
 Two units of work:
 
   * A *slice* (~`--slice-mb`) is downloaded with a SINGLE `hf download`
@@ -32,10 +39,11 @@ Per (split, tier) group: list shards, plan bins, group bins into slices,
 then for each slice download -> pool-compact -> batched upload -> delete.
 
 Resume is repo-state-based: a bin is "done" iff its `data-NNNNN-of-MMMMM`
-file is already in the repo (plus a local `.done` marker that
-short-circuits an already-finished group). Every download/upload `hf` call
-and Hub listing retries transient failures with backoff; the destructive
-delete/squash ops in `--finalize` do not.
+file is already on the PR (plus a local `.done` marker that short-circuits
+an already-finished group). The PR itself is rediscovered by title on
+resume. Every download/upload `hf` call and Hub listing retries transient
+failures with backoff; the destructive delete/merge/squash ops in
+`--finalize` do not.
 
 Prereqs on the pod (which has no `uv`):
     curl -LsSf https://hf.co/cli/install.sh | bash          # `hf` CLI
@@ -45,7 +53,7 @@ Prereqs on the pod (which has no `uv`):
 Workflow:
     # 1. process every group (idempotent / resumable — re-run if interrupted)
     python3 compact_stockfish_dataset.py --workdir /dev/shm/compact
-    # 2. inspect output, then finalize (IRREVERSIBLE)
+    # 2. inspect the PR, then finalize (IRREVERSIBLE)
     python3 compact_stockfish_dataset.py --workdir /dev/shm/compact --finalize
 """
 
@@ -66,12 +74,15 @@ from typing import NamedTuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from huggingface_hub import HfApi
+from huggingface_hub import CommitOperationAdd, HfApi
 from huggingface_hub.hf_api import RepoFile, RepoFolder
 
 REPO = "thomas-schweich/pawn-stockfish-100m"
 # Pre-compaction archive branch — deleted at finalize so its blobs are GC'd.
 LEGACY_BRANCH = "archive/2026-05-10-pre-seed-rework"
+# The migration PR — created once, rediscovered by this exact title on resume.
+PR_TITLE = "Compact to ~500MB parquet + rename eval columns"
+PR_MARKER = "_compact/.migration-pr"
 
 TIERS: list[str] = [
     "tier0_evallegal",
@@ -127,7 +138,9 @@ def hf_retry(cmd: list[str], attempts: int = 6) -> None:
         time.sleep(min(120, 5 * 2 ** attempt) + random.uniform(0, 8))
 
 
-def list_repo_tree(path: str, retries: int = 5) -> list[RepoFile | RepoFolder]:
+def list_repo_tree(
+    path: str, revision: str | None = None, retries: int = 5
+) -> list[RepoFile | RepoFolder]:
     """`api.list_repo_tree` with retry — raises on persistent failure.
 
     Never returns a silent empty list on error: an empty result must mean the
@@ -138,7 +151,11 @@ def list_repo_tree(path: str, retries: int = 5) -> list[RepoFile | RepoFolder]:
         try:
             return list(
                 api.list_repo_tree(
-                    REPO, path_in_repo=path, repo_type="dataset", recursive=False
+                    REPO,
+                    path_in_repo=path,
+                    repo_type="dataset",
+                    revision=revision,
+                    recursive=False,
                 )
             )
         except Exception:  # noqa: BLE001 — transient HF API / network error
@@ -152,6 +169,31 @@ def run(cmd: list[str]) -> None:
     """Run a subprocess, echoing the command, raising on non-zero exit."""
     print(f"  $ {' '.join(cmd)}", flush=True)
     subprocess.run(cmd, check=True)
+
+
+def ensure_pr() -> str:
+    """Return the `refs/pr/N` revision of the migration PR, creating it once.
+
+    Rediscovered by exact title so a resumed run reuses the same PR rather
+    than opening a duplicate.
+    """
+    for d in api.get_repo_discussions(REPO, repo_type="dataset"):
+        if d.is_pull_request and d.title == PR_TITLE and d.status == "open":
+            print(f"  using existing migration PR #{d.num}", flush=True)
+            return f"refs/pr/{d.num}"
+    info = api.create_commit(
+        repo_id=REPO,
+        repo_type="dataset",
+        operations=[CommitOperationAdd(PR_MARKER, b"compaction migration in progress\n")],
+        commit_message=PR_TITLE,
+        commit_description=(
+            "Automated migration: 50k ~20MB shards -> ~2k ~500MB files, "
+            "eval columns renamed to nnue_evals / cp_evals."
+        ),
+        create_pr=True,
+    )
+    print(f"  opened migration PR #{info.pr_num}", flush=True)
+    return f"refs/pr/{info.pr_num}"
 
 
 def remap_columns(table: pa.Table, tier: str) -> pa.Table:
@@ -168,7 +210,10 @@ def remap_columns(table: pa.Table, tier: str) -> pa.Table:
 
 
 def list_group_shards(split_dir: str, tier: str) -> list[tuple[str, int]]:
-    """(repo_path, size) for every original `shard-s*` shard in a group."""
+    """(repo_path, size) for every original `shard-s*` shard in a group.
+
+    Listed on `main` — the source shards live there untouched until finalize.
+    """
     out: list[tuple[str, int]] = []
     for item in list_repo_tree(f"{split_dir}/{tier}"):
         if not isinstance(item, RepoFile):
@@ -180,15 +225,17 @@ def list_group_shards(split_dir: str, tier: str) -> list[tuple[str, int]]:
     return out
 
 
-def existing_compacted(split_dir: str, tier: str) -> tuple[set[int], set[int]]:
-    """(bin indices, `-of-MMMMM` totals) of published `data-*` files.
+def existing_compacted(
+    split_dir: str, tier: str, revision: str
+) -> tuple[set[int], set[int]]:
+    """(bin indices, `-of-MMMMM` totals) of `data-*` files on the PR revision.
 
     A healthy group yields totals == {} (none yet) or {N} (one consistent
     total); anything else means a stale / mismatched prior compaction.
     """
     idxs: set[int] = set()
     totals: set[int] = set()
-    for item in list_repo_tree(f"{split_dir}/{tier}"):
+    for item in list_repo_tree(f"{split_dir}/{tier}", revision=revision):
         m = _DATA_RE.search(item.path)
         if m:
             idxs.add(int(m.group(1)))
@@ -300,9 +347,10 @@ def download_slice(shard_names: list[str], raw_dir: Path, dl_workers: int) -> Pa
 
 
 def upload_staged(
-    paths: list[Path], split_dir: str, tier: str, workdir: str, label: str
+    paths: list[Path], split_dir: str, tier: str, workdir: str, revision: str,
+    label: str,
 ) -> None:
-    """Move a finished batch into a clean dir and upload it in one commit."""
+    """Move a finished batch into a clean dir and upload it to the PR in one commit."""
     updir = Path(workdir) / "upload" / split_dir / tier
     if updir.exists():
         shutil.rmtree(updir)
@@ -313,7 +361,7 @@ def upload_staged(
     hf_retry(
         [
             "hf", "upload", REPO, str(updir), f"{split_dir}/{tier}",
-            "--type", "dataset",
+            "--type", "dataset", "--revision", revision,
             "--commit-message", f"compact {split_dir}/{tier}: {label}",
         ]
     )
@@ -329,10 +377,11 @@ def _compact_slice(
     split_dir: str,
     raw_dir: Path,
     workdir: Path,
+    pr_revision: str,
     rowgroup_bytes: int,
     upload_batch: int,
 ) -> None:
-    """Compact every bin of one downloaded slice; upload in batches."""
+    """Compact every bin of one downloaded slice; upload to the PR in batches."""
     stage_root = workdir / "stage" / split_dir / tier
     tasks = [
         (i, total, [name for name, _ in bins[i]], tier, str(raw_dir),
@@ -349,15 +398,22 @@ def _compact_slice(
         staged.append(Path(res.out_path))
         print(f"  bin {res.idx} compacted ({res.rows} rows)", flush=True)
         if len(staged) >= upload_batch:
-            upload_staged(staged, split_dir, tier, str(workdir), f"{len(staged)} files")
+            upload_staged(
+                staged, split_dir, tier, str(workdir), pr_revision,
+                f"{len(staged)} files",
+            )
             staged = []
     if staged:
-        upload_staged(staged, split_dir, tier, str(workdir), f"{len(staged)} files")
+        upload_staged(
+            staged, split_dir, tier, str(workdir), pr_revision, f"{len(staged)} files"
+        )
     if failures:
         raise RuntimeError(f"{split_dir}/{tier}: bin compaction failed: {failures[:5]}")
 
 
-def process_group(args: argparse.Namespace, split: str, tier: str) -> None:
+def process_group(
+    args: argparse.Namespace, split: str, tier: str, pr_revision: str
+) -> None:
     """Compact one (split, tier) group: prefetched per-slice downloads, pooled."""
     workdir = Path(args.workdir)
     done_marker = workdir / ".done" / f"{split}__{tier}"
@@ -370,10 +426,10 @@ def process_group(args: argparse.Namespace, split: str, tier: str) -> None:
         list_group_shards(split_dir, tier), args.target_mb * 1024 * 1024
     )
     total = len(bins)
-    done_idxs, done_totals = existing_compacted(split_dir, tier)
+    done_idxs, done_totals = existing_compacted(split_dir, tier, pr_revision)
     if done_totals - {total}:
         raise RuntimeError(
-            f"{split}/{tier}: repo has data-* files with total(s) {done_totals}, "
+            f"{split}/{tier}: PR has data-* files with total(s) {done_totals}, "
             f"current plan has {total} — a stale compaction is present; clear the "
             f"data-* files for this group before resuming"
         )
@@ -420,11 +476,11 @@ def process_group(args: argparse.Namespace, split: str, tier: str) -> None:
                     pending = dlx.submit(fetch, sn + 1)
                 _compact_slice(
                     pool, slices[sn], bins, total, tier, split_dir, raw_dir,
-                    workdir, rowgroup_bytes, args.upload_batch,
+                    workdir, pr_revision, rowgroup_bytes, args.upload_batch,
                 )
                 shutil.rmtree(raw_dir, ignore_errors=True)
 
-    present_idxs, present_totals = existing_compacted(split_dir, tier)
+    present_idxs, present_totals = existing_compacted(split_dir, tier, pr_revision)
     if present_idxs != set(range(total)) or present_totals - {total}:
         raise RuntimeError(
             f"{split}/{tier}: coverage check failed — {len(present_idxs)}/{total} "
@@ -437,15 +493,19 @@ def process_group(args: argparse.Namespace, split: str, tier: str) -> None:
 
 
 def finalize(args: argparse.Namespace) -> None:
-    """Delete old shards + legacy branch, then squash history to reclaim storage.
+    """Verify the PR, delete old shards on it, merge it, then squash history.
 
-    Refuses to run unless every (split, tier) group is fully compacted — the
-    expected bin count is recomputed from the still-present source shards, and
-    the published `data-*` set must cover exactly `range(expected)` with one
-    consistent `-of-MMMMM` total. The deletes below are otherwise unrecoverable.
-    Each step is idempotent so a re-run after a transient failure completes.
+    Refuses to run unless every (split, tier) group is fully compacted on the
+    PR — the expected bin count is recomputed from the still-present source
+    shards, and the published `data-*` set must cover exactly `range(expected)`
+    with one consistent `-of-MMMMM` total. Merging the PR is the single,
+    atomic mutation of `main`; everything before it is unrecoverable only
+    after the merge + squash.
     """
-    print("Verifying all 15 groups are fully compacted ...")
+    pr_revision = ensure_pr()
+    pr_num = int(pr_revision.rsplit("/", 1)[-1])
+
+    print("Verifying all 15 groups are fully compacted on the PR ...")
     for split in SPLIT_DIRS:
         for tier in TIERS:
             split_dir = SPLIT_DIRS[split]
@@ -454,26 +514,31 @@ def finalize(args: argparse.Namespace) -> None:
                     list_group_shards(split_dir, tier), args.target_mb * 1024 * 1024
                 )
             )
-            idxs, totals = existing_compacted(split_dir, tier)
+            idxs, totals = existing_compacted(split_dir, tier, pr_revision)
             if idxs != set(range(expected)) or totals - {expected}:
                 raise RuntimeError(
                     f"refusing to finalize — {split}/{tier}: {len(idxs)}/{expected} "
                     f"compacted files present, totals={totals or set()}"
                 )
-    print("All 15 groups verified complete. Deleting pre-compaction shards ...")
+
+    print("All 15 groups verified. Deleting old shards + marker on the PR ...")
     run(
         [
-            "hf", "repos", "delete-files", REPO, "**/shard-s*.parquet",
-            "--type", "dataset",
+            "hf", "repos", "delete-files", REPO, "**/shard-s*.parquet", PR_MARKER,
+            "--type", "dataset", "--revision", pr_revision,
             "--commit-message", "drop pre-compaction 2k-game shards",
         ]
     )
+    print(f"Merging migration PR #{pr_num} into main ...")
+    api.merge_pull_request(REPO, pr_num, repo_type="dataset")
+
     branches = {b.name for b in api.list_repo_refs(REPO, repo_type="dataset").branches}
     if LEGACY_BRANCH in branches:
         print(f"Deleting legacy branch {LEGACY_BRANCH} ...")
         run(["hf", "repos", "branch", "delete", REPO, LEGACY_BRANCH, "--type", "dataset"])
     else:
         print(f"Legacy branch {LEGACY_BRANCH} already absent — skipping.")
+
     print("Squashing repo history (IRREVERSIBLE) ...")
     for attempt in range(1, 4):
         try:
@@ -519,7 +584,7 @@ def main() -> int:
     parser.add_argument(
         "--finalize",
         action="store_true",
-        help="delete old shards + legacy branch + squash; checks ALL tiers "
+        help="delete old shards + merge the PR + squash; checks ALL tiers "
              "regardless of --tiers (run only after every group is verified)",
     )
     args = parser.parse_args()
@@ -538,10 +603,12 @@ def main() -> int:
             f"bigger /dev/shm."
         )
 
+    pr_revision = ensure_pr()
     for split in SPLIT_DIRS:
         for tier in args.tiers:
-            process_group(args, split, tier)
-    print("\nAll groups compacted + uploaded. Verify, then re-run with --finalize.")
+            process_group(args, split, tier, pr_revision)
+    print(f"\nAll groups compacted onto {pr_revision}. "
+          f"Inspect the PR, then re-run with --finalize.")
     return 0
 
 
