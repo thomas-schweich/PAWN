@@ -32,7 +32,7 @@ Two units of work:
   * A *bin* (~`--target-mb`) is the set of shards that compact into one
     output file. Bins of a downloaded slice are compacted in parallel by a
     process pool (`--workers`) — the workers read LOCAL files only and make
-    no API calls, so the CPU-bound zstd-19 recompression uses all cores
+    no API calls, so the CPU-bound zstd recompression uses all cores
     without touching the rate limit.
 
 Per (split, tier) group: list shards, plan bins, group bins into slices,
@@ -89,6 +89,11 @@ LEGACY_BRANCH = "archive/2026-05-10-pre-seed-rework"
 # The migration PR — created once, rediscovered by this exact title on resume.
 PR_TITLE = "Compact to ~500MB parquet + rename eval columns"
 PR_MARKER = "_compact/.migration-pr"
+# zstd level for the re-encoded output. The source shards are level 19;
+# level 12 is ~2-3% larger but compresses far faster (19 is in zstd's slow
+# near-ultra regime). Decompression speed is level-independent, so dataset
+# consumers are unaffected by the choice.
+ZSTD_LEVEL = 12
 
 TIERS: list[str] = [
     "tier0_evallegal",
@@ -396,7 +401,8 @@ def compact_bin(
             rows_in += table.num_rows
             if writer is None:
                 writer = pq.ParquetWriter(
-                    out_path, table.schema, compression="zstd", compression_level=19
+                    out_path, table.schema, compression="zstd",
+                    compression_level=ZSTD_LEVEL,
                 )
             buf.append(table)
             buf_bytes += table.nbytes  # decompressed Arrow size — what's in RAM
