@@ -40,11 +40,13 @@ then for each slice download -> pool-compact -> batched upload -> delete.
 
 Resume is repo-state-based: a bin is "done" iff its `data-NNNNN-of-MMMMM`
 file is already on the PR (plus a local `.done` marker that short-circuits
-an already-finished group). The PR is rediscovered by title on resume, and
-`--finalize` is safely re-runnable — it detects an already-merged PR and
-skips straight to the history squash. Every download/upload `hf` call and
-Hub API call retries transient failures with backoff; in `--finalize` the
-merge and squash retry too, only the shard-delete does not.
+an already-finished group). The PR is rediscovered by title on resume; its
+marker file records `--target-mb`, and a resume with a different value is
+rejected (bin boundaries would shift). `--finalize` is safely re-runnable —
+it detects an already-merged PR and skips to the post-merge cleanup
+(legacy-branch delete + history squash). Every download/upload/Hub call,
+and every retry-safe `--finalize` step, retries transient failures with
+backoff; only the source-shard delete-on-PR is gated-but-unretried.
 
 Prereqs on the pod (which has no `uv`):
     curl -LsSf https://hf.co/cli/install.sh | bash          # `hf` CLI
@@ -76,7 +78,8 @@ from typing import NamedTuple, TypeVar
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from huggingface_hub import CommitOperationAdd, HfApi
+from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError
 from huggingface_hub.hf_api import RepoFile, RepoFolder
 
 REPO = "thomas-schweich/pawn-stockfish-100m"
@@ -97,6 +100,7 @@ SEARCHLESS_TIER = "tier0_evallegal"
 
 # split name (HF) -> directory in the repo
 SPLIT_DIRS: dict[str, str] = {"train": "train", "validation": "val", "test": "test"}
+N_GROUPS = len(SPLIT_DIRS) * len(TIERS)
 
 # Old eval-column names -> new names, per tier family.
 RENAME_SEARCH: dict[str, str] = {
@@ -165,7 +169,7 @@ def run(cmd: list[str]) -> None:
 
 
 def list_repo_tree(
-    path: str, revision: str | None = None
+    path: str, revision: str | None = None, recursive: bool = False
 ) -> list[RepoFile | RepoFolder]:
     """`api.list_repo_tree` with retry — raises on persistent failure.
 
@@ -180,7 +184,7 @@ def list_repo_tree(
                 path_in_repo=path,
                 repo_type="dataset",
                 revision=revision,
-                recursive=False,
+                recursive=recursive,
             )
         )
     )
@@ -189,9 +193,10 @@ def list_repo_tree(
 def find_migration_pr() -> tuple[int | None, str | None]:
     """Locate the migration PR by exact title.
 
-    Returns (num, status) where status is "open" or "merged"; prefers the
-    lowest-numbered open PR (deterministic dedup if a resume race opened two),
-    falls back to a merged PR, else (None, None).
+    Returns (num, status). A *merged* PR is terminal and wins over any stray
+    open PR; `draft` counts as open (resume must adopt it, not duplicate it).
+    Among open PRs the lowest number wins — deterministic dedup if a resume
+    race opened two.
     """
     open_nums: list[int] = []
     merged_nums: list[int] = []
@@ -199,22 +204,40 @@ def find_migration_pr() -> tuple[int | None, str | None]:
         lambda: list(api.get_repo_discussions(REPO, repo_type="dataset"))
     ):
         if d.is_pull_request and d.title == PR_TITLE:
-            if d.status == "open":
-                open_nums.append(d.num)
-            elif d.status == "merged":
+            if d.status == "merged":
                 merged_nums.append(d.num)
-    if open_nums:
-        return min(open_nums), "open"
+            elif d.status in ("open", "draft"):
+                open_nums.append(d.num)
     if merged_nums:
         return min(merged_nums), "merged"
+    if open_nums:
+        return min(open_nums), "open"
     return None, None
 
 
-def ensure_pr() -> str:
+def _marker_target_mb(pr_revision: str) -> int | None:
+    """The `--target-mb` recorded in the PR's marker file, or None if absent."""
+    try:
+        path = api_retry(
+            lambda: hf_hub_download(
+                REPO, PR_MARKER, repo_type="dataset", revision=pr_revision
+            )
+        )
+    except EntryNotFoundError:
+        return None
+    for line in Path(path).read_text().splitlines():
+        if line.startswith("target_mb="):
+            return int(line.split("=", 1)[1])
+    return None
+
+
+def ensure_pr(target_mb: int) -> str:
     """Return the `refs/pr/N` revision of the open migration PR, creating once.
 
     Rediscovered by title so a resumed run reuses the same PR. Exits if the PR
-    has already been merged (compaction is complete — nothing left to upload).
+    has already been merged. Rejects a resume whose `--target-mb` differs from
+    the value recorded when the PR was created — a different value would shift
+    every bin boundary while leaving the `data-*` filenames looking valid.
     """
     num, status = find_migration_pr()
     if status == "merged":
@@ -223,12 +246,21 @@ def ensure_pr() -> str:
             "run --finalize if history still needs squashing."
         )
     if num is not None:
+        pr_revision = f"refs/pr/{num}"
+        marker_mb = _marker_target_mb(pr_revision)
+        if marker_mb is not None and marker_mb != target_mb:
+            raise SystemExit(
+                f"PR #{num} was created with --target-mb={marker_mb}; resuming "
+                f"requires that same value (got {target_mb})."
+            )
         print(f"  using existing migration PR #{num}", flush=True)
-        return f"refs/pr/{num}"
+        return pr_revision
     info = api.create_commit(
         repo_id=REPO,
         repo_type="dataset",
-        operations=[CommitOperationAdd(PR_MARKER, b"compaction migration in progress\n")],
+        operations=[
+            CommitOperationAdd(PR_MARKER, f"target_mb={target_mb}\n".encode())
+        ],
         commit_message=PR_TITLE,
         commit_description=(
             "Automated migration: 50k ~20MB shards -> ~2k ~500MB files, "
@@ -293,6 +325,17 @@ def existing_compacted(
             idxs.add(int(m.group(1)))
             totals.add(int(m.group(2)))
     return idxs, totals
+
+
+def shards_remain(revision: str) -> bool:
+    """True if any pre-compaction `shard-s*` file is still present on `revision`."""
+    for item in list_repo_tree("", revision=revision, recursive=True):
+        if not isinstance(item, RepoFile):
+            continue
+        name = item.path.rsplit("/", 1)[-1]
+        if name.startswith("shard-s") and name.endswith(".parquet"):
+            return True
+    return False
 
 
 def plan_bins(
@@ -519,7 +562,10 @@ def process_group(
             )
             return download_slice(names, raw_dirs[sn % 2], args.download_workers)
 
-        # Prefetch the next slice's download while the pool compacts the current.
+        # Prefetch the next slice's download while the pool compacts the
+        # current one. The single-thread executor + 2-dir ping-pong keeps the
+        # in-flight download and the in-flight compaction on separate dirs;
+        # raising `max_workers` would break that invariant.
         with ThreadPoolExecutor(max_workers=1) as dlx, _MP.Pool(args.workers) as pool:
             pending = dlx.submit(fetch, 0)
             for sn in range(len(slices)):
@@ -551,7 +597,10 @@ def _merge_migration_pr(pr_num: int) -> None:
             api.merge_pull_request(REPO, pr_num, repo_type="dataset")
             return
         except Exception:  # noqa: BLE001 — transient, or already merged
-            _, status = find_migration_pr()
+            try:
+                _, status = find_migration_pr()
+            except Exception:  # noqa: BLE001 — status probe itself flaked
+                status = None
             if status == "merged":
                 print("  PR is already merged.", flush=True)
                 return
@@ -575,15 +624,23 @@ def _post_merge_cleanup() -> None:
         )
     else:
         print(f"Legacy branch {LEGACY_BRANCH} already absent — skipping.")
-    print("Squashing repo history (IRREVERSIBLE) ...")
-    api_retry(
-        lambda: api.super_squash_history(
-            repo_id=REPO,
-            repo_type="dataset",
-            commit_message="compact to ~500MB parquet; rename eval columns",
-        ),
-        retries=3,
+    # Skip the squash if history is already a single commit (a prior finalize
+    # run squashed it but failed/interrupted afterwards).
+    n_commits = len(
+        api_retry(lambda: list(api.list_repo_commits(REPO, repo_type="dataset")))
     )
+    if n_commits <= 1:
+        print("Repo history already squashed — skipping.")
+    else:
+        print("Squashing repo history (IRREVERSIBLE) ...")
+        api_retry(
+            lambda: api.super_squash_history(
+                repo_id=REPO,
+                repo_type="dataset",
+                commit_message="compact to ~500MB parquet; rename eval columns",
+            ),
+            retries=3,
+        )
     print("Done. Old blobs are now unreferenced and will be GC'd by the Hub.")
 
 
@@ -591,10 +648,10 @@ def finalize(args: argparse.Namespace) -> None:
     """Verify the PR, delete old shards on it, merge it, then squash history.
 
     Safely re-runnable: if the PR is already merged (a prior run got past the
-    merge), it skips straight to the legacy-branch + squash cleanup. While the
-    PR is still open it refuses unless every (split, tier) group is fully
-    compacted — the expected bin count is recomputed from the still-present
-    source shards on `main`, and the published `data-*` set must cover exactly
+    merge), it skips to the legacy-branch + squash cleanup. While the PR is
+    still open it refuses unless every (split, tier) group is fully compacted —
+    the expected bin count is recomputed from the still-present source shards
+    on `main`, and the published `data-*` set must cover exactly
     `range(expected)` with one consistent `-of-MMMMM` total.
     """
     pr_num, status = find_migration_pr()
@@ -606,7 +663,7 @@ def finalize(args: argparse.Namespace) -> None:
         return
 
     pr_revision = f"refs/pr/{pr_num}"
-    print(f"Verifying all 15 groups are fully compacted on PR #{pr_num} ...")
+    print(f"Verifying all {N_GROUPS} groups are fully compacted on PR #{pr_num} ...")
     for split in SPLIT_DIRS:
         for tier in TIERS:
             split_dir = SPLIT_DIRS[split]
@@ -622,14 +679,26 @@ def finalize(args: argparse.Namespace) -> None:
                     f"compacted files present, totals={totals or set()}"
                 )
 
-    print("All 15 groups verified. Deleting old shards + marker on the PR ...")
-    run(
-        [
-            "hf", "repos", "delete-files", REPO, "**/shard-s*.parquet", PR_MARKER,
-            "--type", "dataset", "--revision", pr_revision,
-            "--commit-message", "drop pre-compaction 2k-game shards",
-        ]
-    )
+    # Idempotent: skip the delete if the shards are already gone from the PR.
+    if shards_remain(pr_revision):
+        print(f"All {N_GROUPS} groups verified. Deleting old shards on the PR ...")
+        hf_retry(
+            [
+                "hf", "repos", "delete-files", REPO, "**/shard-s*.parquet",
+                "--type", "dataset", "--revision", pr_revision,
+                "--commit-message", "drop pre-compaction 2k-game shards",
+            ]
+        )
+    else:
+        print(f"All {N_GROUPS} groups verified. Old shards already removed on the PR.")
+    try:
+        api.delete_file(
+            PR_MARKER, REPO, repo_type="dataset", revision=pr_revision,
+            commit_message="remove migration marker",
+        )
+    except EntryNotFoundError:
+        pass
+
     print(f"Merging migration PR #{pr_num} into main ...")
     _merge_migration_pr(pr_num)
     _post_merge_cleanup()
@@ -684,7 +753,7 @@ def main() -> int:
             f"bigger /dev/shm."
         )
 
-    pr_revision = ensure_pr()
+    pr_revision = ensure_pr(args.target_mb)
     for split in SPLIT_DIRS:
         for tier in args.tiers:
             process_group(args, split, tier, pr_revision)
