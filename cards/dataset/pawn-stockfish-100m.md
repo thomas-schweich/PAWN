@@ -89,14 +89,26 @@ but differ in how much *search* Stockfish was allowed per move — from zero
 (a pure raw-network tier) up to a 1024-node search. Each tier carries
 `train` / `validation` / `test` splits.
 
+Stockfish ran single-threaded, so its search is fully deterministic —
+left to itself, self-play would replay one fixed game. Variability is
+therefore injected deliberately: each move is sampled from a
+temperature-`T` softmax over the candidate evaluations (`T = 0.5` for all
+tiers). Because that sampler is the only source of randomness and it is
+driven by a per-game seeded PRNG, every game stays exactly reproducible.
+
 ### Supported Tasks
 
 - **Policy learning** — train a policy head to imitate search-quality move
   selection, supervised by the `legal_move_evals` (MultiPV / search-ranked)
-  column.
+  column. Note that on the search tiers `legal_move_evals` ranks only
+  Stockfish's top `multi_pv = 5` moves, so sixth-best-or-worse moves have
+  no search-ranked target there — scoring predictions of them is
+  design-dependent. (`static_legal_move_evals` still covers every legal
+  move on the search tiers, and the searchless tier's `legal_move_evals`
+  covers every move.)
 - **NNUE distillation** — train a student network to reproduce the raw
   network's per-move evaluations, supervised by the `static_legal_move_evals`
-  (raw-eval) column.
+  (raw-eval) column for search tiers and/or the `legal_move_evals` column for the searchless tier. Raw evaluations are provided for every legal move in every position.
 
 ## Dataset Structure
 
@@ -114,15 +126,20 @@ Each row is one complete game. The move-sequence columns (`tokens` / `san` /
   "game_length": 142,
   "result": "1-0",
   "outcome_token": 1969,
-  "nodes": 128, "multi_pv": 5, "temperature": 0.5,
-  "sample_score": "cp", "net_selection": "large",
+  "nodes": 128,
+  "multi_pv": 5,
+  "temperature": 0.5,
+  "sample_score": "cp",
+  "net_selection": "large",
   "stockfish_version": "Stockfish 18",
-  "global_game_index": 8434217, "game_seed": 14072583910256044311,
+  "global_game_index": 8434217,
+  "game_seed": 14072583910256044311,
   "legal_move_evals":        [[{"move_idx": 945, "score_cp": 31}, "..."], "..."],
-  "static_legal_move_evals": [[{"move_idx": 945, "score_cp": 28,
-                                "score_eval_v": 33}, "..."], "..."]
+  "static_legal_move_evals": [[{"move_idx": 945, "score_cp": 28, "score_eval_v": 33}, "..."], "..."]
 }
 ```
+
+Per-position FENs and Zobrist hashes are not included as they would balloon the size of the dataset, but they are fast to compute on-the-fly if needed — see [Computing FENs and Zobrist hashes](#computing-fens-and-zobrist-hashes).
 
 ### Data Fields
 
@@ -130,7 +147,7 @@ Per-row columns (parquet, zstd level 19):
 
 | Column | Type | Notes |
 |---|---|---|
-| `tokens` | `List<int16>` | Played move sequence, one token per ply (variable length, up to 512). The vocabulary is the [searchless_chess action set](https://github.com/google-deepmind/searchless_chess): 1,968 reachable (src, dst[, promo]) tuples. `move_idx` in the eval structs uses this same index space. |
+| `tokens` | `List<int16>` | Played move sequence, one token per ply (variable length, up to 512). The vocabulary is the [searchless_chess](https://github.com/google-deepmind/searchless_chess) action set: 1,968 reachable (src, dst[, promo]) tuples. `move_idx` in the eval structs uses this same index space. See [`searchless_chess_vocabulary.json` in the PAWN project](https://github.com/thomas-schweich/PAWN/blob/main/searchless_chess_vocabulary.json) for the full enumeration. |
 | `san` | `List<str>` | Same moves in SAN. |
 | `uci` | `List<str>` | Same moves in UCI. |
 | `game_length` | `uint16` | Number of plies. |
@@ -246,9 +263,8 @@ revisited across games, dominated by shared openings. This is also the
 count of unique raw evaluations, since a raw NNUE eval is a pure function
 of the position. Of these, **8,690,806,916** distinct positions carry a
 MultiPV evaluation (the four search tiers; tier 0 is searchless). Both
-figures were measured by replaying every game and counting distinct
-Zobrist-hashed board states with HyperLogLog++ — `tokens` stores moves,
-not board states, so the count is not recoverable from metadata.
+figures were measured by replaying every game and estimating distinct
+Zobrist-hashed board states with HyperLogLog++.
 
 ## Usage
 
@@ -270,7 +286,7 @@ df = (
     pl.scan_parquet(
         "hf://datasets/thomas-schweich/pawn-stockfish-100m/train/nodes_1024/*.parquet"
     )
-    .select(["tokens", "uci", "result", "game_length"])
+    .select(["tokens", "result", "game_length"])
     .head(50_000)
     .collect()
 )
@@ -312,6 +328,60 @@ val = load_dataset(
 )
 print(len(val), "games")
 ```
+
+### Computing FENs and Zobrist hashes
+
+The dataset stores moves, not board states (see [Data Instances](#data-instances)),
+so per-position FENs and Zobrist hashes are most easily reconstructed by replaying the `uci` column.
+
+**Python** ([`python-chess`](https://python-chess.readthedocs.io/)):
+
+```python
+import chess
+import chess.polyglot
+
+def evaluated_positions(uci_moves):
+    """Yield (fen, zobrist_key) for each evaluated position in a game."""
+    board = chess.Board()
+    for uci in uci_moves:
+        yield board.fen(), chess.polyglot.zobrist_hash(board)
+        board.push_uci(uci)
+```
+
+**Rust** ([`shakmaty`](https://docs.rs/shakmaty/0.30)):
+
+```rust
+use shakmaty::fen::Fen;
+use shakmaty::uci::UciMove;
+use shakmaty::zobrist::Zobrist64;
+use shakmaty::{Chess, EnPassantMode, Position};
+
+/// (fen, zobrist_key) for each evaluated position in a game.
+fn evaluated_positions(uci_moves: &[String]) -> Vec<(String, u64)> {
+    let mut pos = Chess::default();
+    let mut out = Vec::with_capacity(uci_moves.len());
+    for uci in uci_moves {
+        let fen = Fen::try_from(pos.to_setup(EnPassantMode::Legal))
+            .expect("a legal position always produces a valid FEN")
+            .to_string();
+        let key: Zobrist64 = pos.zobrist_hash(EnPassantMode::Legal);
+        out.push((fen, key.0));
+        let mv = uci
+            .parse::<UciMove>()
+            .expect("dataset uci is well-formed")
+            .to_move(&pos)
+            .expect("dataset uci is legal in-position");
+        pos.play_unchecked(mv);
+    }
+    out
+}
+```
+
+Note: the two hashes are **not interchangeable**: `python-chess` uses Polyglot
+Zobrist keys, `shakmaty` its own `Zobrist64` key set. Either is fine for
+deduplicating positions within your own run, but the
+[unique-position counts](#statistics) were measured with `shakmaty`'s
+`Zobrist64`.
 
 ## Dataset Creation
 
