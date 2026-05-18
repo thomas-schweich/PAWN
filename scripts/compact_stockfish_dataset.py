@@ -471,7 +471,7 @@ def upload_staged(
     hf_retry(
         [
             "hf", "upload", REPO, str(updir), f"{split_dir}/{tier}",
-            "--type", "dataset", "--revision", revision,
+            "--type", "dataset", "--revision", revision, "--quiet",
             "--commit-message", f"compact {split_dir}/{tier}: {label}",
         ]
     )
