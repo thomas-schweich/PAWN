@@ -15,7 +15,7 @@ Each training example is a fixed-length sequence of 512 tokens:
 
 Sequences are pure moves by default. Position 0 holds the first ply; the rest are the game's moves in order, right-padded with PAD tokens. The model is trained with standard next-token prediction: given positions 0 through t, predict the token at position t+1.
 
-The 512-token context fits the vast majority of random games end-to-end. Random play hits truly degenerate game lengths only rarely at this width, so the `PLY_LIMIT` outcome — which dominated the legacy 256-token models — is now a small minority of the training distribution. (See [docs/LEGACY.md](LEGACY.md) for the why-this-changed.)
+The 512-token context fits the vast majority of random games end-to-end. Random play hits truly degenerate game lengths only rarely at this width, so the `PLY_LIMIT` outcome — which dominated the legacy 256-token models — is now a small minority of the training distribution. (See [docs/LEGACY.md](LEGACY.md) for why this changed.)
 
 An optional outcome-conditioning mode — enabled via the `prepend_outcome` training config — prepends a single outcome token at position 0 and shifts all moves right by one. This is useful for downstream tasks that condition on game outcome, at the cost of one ply of context. **The published v1.0.0 checkpoints were trained with `prepend_outcome=False`** (no outcome prefix), which makes them directly comparable to standard chess models like MAIA and the searchless_chess agents.
 

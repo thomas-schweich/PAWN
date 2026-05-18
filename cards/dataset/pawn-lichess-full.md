@@ -102,7 +102,7 @@ uv run python scripts/train.py --run-type adapter --strategy bottleneck \
 
 ### Polars with predicate pushdown
 
-You can easily filter to a specific Elo band without downloading the full dataset. Polars pushes the predicate down into each parquet file's row-group statistics, so only matching row groups get fetched:
+Polars pushes the predicate down into each parquet file's row-group statistics, so filtering to an Elo band fetches only the matching row groups rather than the full dataset:
 
 ```python
 import polars as pl

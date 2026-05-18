@@ -72,7 +72,7 @@ uv run python scripts/train.py --variant base --wandb
 
 `--wandb` streams training metrics to Weights & Biases. The integration is
 metrics-only — checkpoints still go to HuggingFace, and no W&B state is
-persisted to the checkpoint, so pause/resume is unaffected (Option A).
+persisted to the checkpoint, so pause/resume is unaffected.
 
 What lands in `wandb.config`:
 

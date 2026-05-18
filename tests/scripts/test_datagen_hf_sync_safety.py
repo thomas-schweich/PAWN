@@ -3,8 +3,8 @@
 The single most important invariant: **no zero-byte file is ever
 committed to HF**. The previous orchestrator's "upload then truncate"
 pattern silently destroyed remote data when a follow-up sync pushed
-the truncated zero-byte local file over the populated remote (see
-ANALYSIS.md A4). The new orchestrator's `_upload_folder_batch` has
+the truncated zero-byte local file over the populated remote. The new
+orchestrator's `_upload_folder_batch` has
 both a watcher-level filter (zero-byte local files are excluded from
 the upload list) and an explicit at-call-time guard inside
 `_upload_folder_batch`. These tests pin both.

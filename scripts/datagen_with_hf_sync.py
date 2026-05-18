@@ -357,7 +357,7 @@ def _upload_folder_batch(
     exist locally with non-zero size at call time. The previous
     orchestrator's "upload then truncate" pattern silently destroyed
     data when a future sync rebroadcast the truncated zero-byte file
-    over the populated remote (see ANALYSIS.md A4). The watcher's
+    over the populated remote. The watcher's
     filtering already excludes zero-byte placeholders before they
     reach this function; the explicit guard below catches any race or
     refactor regression rather than letting it land as a silent

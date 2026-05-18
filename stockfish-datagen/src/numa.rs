@@ -26,8 +26,6 @@
 //! Single-socket pods see this as a no-op (the policy mask has one node,
 //! interleave degenerates to local). NUMA-unaware hosts (or
 //! `set_mempolicy` returning ENOSYS) are non-fatal: log and continue.
-//!
-//! See `ANALYSIS.md` "Phase 5 — NUMA wrapping" for the full rationale.
 
 // x86_64-specific syscall numbers — Linux's syscall numbering is
 // per-architecture. aarch64 uses 237, riscv uses different numbers, etc.

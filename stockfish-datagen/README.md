@@ -367,9 +367,9 @@ for the full module docstring.
 `execve`, so every spawned stockfish child first-touches its NNUE
 page-cache fills under interleave policy — spreading the ~50 MB of
 weight pages evenly across NUMA nodes. On dual-socket EPYC pods that
-reclaims roughly the half-of-workers-pay-3.2× cross-socket penalty
-identified in `ANALYSIS.md`. On single-socket pods the policy
-collapses to local placement (no-op).
+reclaims roughly the half-of-workers-pay-3.2× cross-socket penalty.
+On single-socket pods the policy collapses to local placement
+(no-op).
 
 If you'd rather avoid the topology question entirely: prefer
 single-socket EPYC 9654 pods (96 cores / 192 threads, ~$0.27/h on
