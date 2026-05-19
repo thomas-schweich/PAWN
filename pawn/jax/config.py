@@ -21,11 +21,6 @@ N_OUTCOMES = 11
 VOCAB_SIZE = 1980
 MAX_SEQ_LEN = 512
 
-# Fixed head dimension for the supernet and all three variants. Keeping it
-# constant is what makes a width slice correspond to dropping whole heads, and
-# leaves RoPE identical across variants.
-HEAD_DIM = 64
-
 
 @dataclass(frozen=True)
 class ModelConfig:
@@ -59,6 +54,10 @@ class ModelConfig:
 SUPERNET = ModelConfig(d_model=640, n_layers=10, n_heads=10, d_ff=2560)
 
 # Variants — nested slices of SUPERNET. All three have head_dim = 64.
+# NOTE: "large" *is* the supernet (10 heads, head_dim 64). The legacy PyTorch
+# pawn-large checkpoint used 8 heads (head_dim 80); a converted legacy
+# checkpoint is therefore a standalone ModelConfig with n_heads=8 — never
+# VARIANTS["large"], and validate_nested() would correctly reject it.
 VARIANTS: dict[str, ModelConfig] = {
     "small": ModelConfig(d_model=256, n_layers=8, n_heads=4, d_ff=1024),
     "base": ModelConfig(d_model=512, n_layers=8, n_heads=8, d_ff=2048),
@@ -68,7 +67,7 @@ VARIANTS: dict[str, ModelConfig] = {
 # Tiny config for tests only — does not nest into SUPERNET.
 TOY = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=256)
 
-_NESTED_EQUAL_FIELDS = ("vocab_size", "max_seq_len", "n_outcomes")
+_NESTED_EQUAL_FIELDS = ("vocab_size", "max_seq_len", "n_outcomes", "rope_base")
 _NESTED_LEQ_FIELDS = ("d_model", "n_layers", "d_ff")
 
 

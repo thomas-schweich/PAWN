@@ -19,6 +19,7 @@ transpose of PyTorch's ``nn.Linear`` ``(out, in)`` layout.
 from __future__ import annotations
 
 import functools
+from typing import NamedTuple
 
 import equinox as eqx
 import jax
@@ -66,10 +67,16 @@ def _decomp_table() -> np.ndarray:
 
 
 def _rmsnorm(x: jax.Array, weight: jax.Array) -> jax.Array:
-    """RMSNorm with an fp32 reduction (mirrors ``pawn.model.RMSNorm``)."""
+    """RMSNorm (mirrors ``pawn.model.RMSNorm``).
+
+    The reduction, normalization, and weight multiply all run in fp32; the
+    result is downcast once to ``x.dtype``. Multiplying by the fp32 ``weight``
+    before the downcast (rather than after) keeps a bf16 residual stream in
+    bf16 instead of letting the fp32 ``weight`` silently promote it.
+    """
     x32 = x.astype(jnp.float32)
     norm = jax.lax.rsqrt(jnp.mean(x32 * x32, axis=-1, keepdims=True) + RMSNORM_EPS)
-    return (x32 * norm).astype(x.dtype) * weight
+    return (x32 * norm * weight).astype(x.dtype)
 
 
 def _rope_tables(
@@ -105,11 +112,12 @@ def _build_attn_mask(attn_mask: jax.Array, seq_len: int) -> jax.Array:
     """Additive (0 / -inf) attention mask of shape ``(B, 1, T, T)``.
 
     Combines a causal lower-triangular mask with the per-position padding mask
-    (``attn_mask`` is True at real, non-padding tokens).
+    (``attn_mask`` is True at real, non-padding tokens). Padding masks *keys*,
+    so a query row keeps every causally-visible real key.
     """
     causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype=bool))
     keep = causal[None, None, :, :] & attn_mask[:, None, None, :]
-    return jnp.where(keep, 0.0, -jnp.inf).astype(jnp.float32)
+    return jnp.where(keep, 0.0, -jnp.inf)
 
 
 def _attention(
@@ -124,7 +132,7 @@ def _attention(
     n_heads: int,
 ) -> jax.Array:
     """Multi-head self-attention with plain (materialized) scores."""
-    b, t, d = x.shape
+    b, t, d = x.shape[0], x.shape[1], x.shape[2]
     head_dim = d // n_heads
 
     def split(proj: jax.Array) -> jax.Array:
@@ -136,6 +144,10 @@ def _attention(
 
     scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * (head_dim**-0.5)
     weights = jax.nn.softmax(scores + mask, axis=-1)
+    # A fully-masked query row (only in a degenerate all-padding sequence —
+    # padding masks keys, and position 0 is normally a real token) softmaxes
+    # 0/0 to NaN; zero those rows, matching recent PyTorch SDPA behaviour.
+    weights = jnp.where(jnp.isnan(weights), 0.0, weights)
     ctx = jnp.einsum("bhqk,bhkd->bhqd", weights, v)
     ctx = ctx.transpose(0, 2, 1, 3).reshape(b, t, d)
     return ctx @ wo
@@ -146,6 +158,25 @@ def _ffn(
 ) -> jax.Array:
     """SwiGLU feed-forward network (mirrors ``pawn.model.SwiGLUFFN``)."""
     return (jax.nn.silu(x @ w_gate) * (x @ w_up)) @ w_down
+
+
+class LayerWeights(NamedTuple):
+    """One transformer layer's weights.
+
+    Used as the per-step ``xs`` element of the ``lax.scan`` over the stacked
+    layer axis in ``PAWNModel.__call__``; as a stacked instance (each field
+    carrying a leading ``n_layers`` axis) it is the scan's full ``xs``.
+    """
+
+    attn_norm: jax.Array
+    wq: jax.Array
+    wk: jax.Array
+    wv: jax.Array
+    wo: jax.Array
+    ffn_norm: jax.Array
+    w_gate: jax.Array
+    w_up: jax.Array
+    w_down: jax.Array
 
 
 # ---------------------------------------------------------------------------
@@ -159,24 +190,25 @@ class PAWNModel(eqx.Module):
     Transformer-layer weights are stacked on a leading axis of size
     ``cfg.n_layers``. The fields are exactly the differentiable parameters;
     the token-decomposition table is a global constant (see ``_decomp_table``).
+    Shapes use d = ``cfg.d_model``, L = ``cfg.n_layers``, F = ``cfg.d_ff``.
     """
 
-    src_embed: jax.Array
-    dst_embed: jax.Array
-    promo_embed: jax.Array
-    pad_embed: jax.Array
-    outcome_embed: jax.Array
-    attn_norm: jax.Array
-    wq: jax.Array
-    wk: jax.Array
-    wv: jax.Array
-    wo: jax.Array
-    ffn_norm: jax.Array
-    w_gate: jax.Array
-    w_up: jax.Array
-    w_down: jax.Array
-    final_norm: jax.Array
-    lm_head: jax.Array
+    src_embed: jax.Array  # (64, d)
+    dst_embed: jax.Array  # (64, d)
+    promo_embed: jax.Array  # (5, d)
+    pad_embed: jax.Array  # (d,)
+    outcome_embed: jax.Array  # (n_outcomes, d)
+    attn_norm: jax.Array  # (L, d)
+    wq: jax.Array  # (L, d, d)
+    wk: jax.Array  # (L, d, d)
+    wv: jax.Array  # (L, d, d)
+    wo: jax.Array  # (L, d, d)
+    ffn_norm: jax.Array  # (L, d)
+    w_gate: jax.Array  # (L, d, F)
+    w_up: jax.Array  # (L, d, F)
+    w_down: jax.Array  # (L, F, d)
+    final_norm: jax.Array  # (d,)
+    lm_head: jax.Array  # (d, vocab_size)
     cfg: ModelConfig = eqx.field(static=True)
 
     def __call__(self, tokens: jax.Array, attn_mask: jax.Array) -> jax.Array:
@@ -191,38 +223,39 @@ class PAWNModel(eqx.Module):
         """
         cfg = self.cfg
         seq_len = tokens.shape[1]
+        if seq_len > cfg.max_seq_len:
+            raise ValueError(
+                f"sequence length {seq_len} exceeds max_seq_len {cfg.max_seq_len}"
+            )
         x = self._embed(tokens)
         cos, sin = _rope_tables(cfg.head_dim, seq_len, cfg.rope_base)
         mask = _build_attn_mask(attn_mask, seq_len)
 
-        layers = (
-            self.attn_norm,
-            self.wq,
-            self.wk,
-            self.wv,
-            self.wo,
-            self.ffn_norm,
-            self.w_gate,
-            self.w_up,
-            self.w_down,
+        layers = LayerWeights(
+            attn_norm=self.attn_norm,
+            wq=self.wq,
+            wk=self.wk,
+            wv=self.wv,
+            wo=self.wo,
+            ffn_norm=self.ffn_norm,
+            w_gate=self.w_gate,
+            w_up=self.w_up,
+            w_down=self.w_down,
         )
 
-        def run_layer(
-            h: jax.Array, lw: tuple[jax.Array, ...]
-        ) -> tuple[jax.Array, None]:
-            attn_norm, wq, wk, wv, wo, ffn_norm, w_gate, w_up, w_down = lw
+        def run_layer(h: jax.Array, lw: LayerWeights) -> tuple[jax.Array, None]:
             h = h + _attention(
-                _rmsnorm(h, attn_norm),
-                wq,
-                wk,
-                wv,
-                wo,
+                _rmsnorm(h, lw.attn_norm),
+                lw.wq,
+                lw.wk,
+                lw.wv,
+                lw.wo,
                 cos,
                 sin,
                 mask,
                 cfg.n_heads,
             )
-            h = h + _ffn(_rmsnorm(h, ffn_norm), w_gate, w_up, w_down)
+            h = h + _ffn(_rmsnorm(h, lw.ffn_norm), lw.w_gate, lw.w_up, lw.w_down)
             return h, None
 
         x, _ = jax.lax.scan(run_layer, x, layers)
@@ -256,10 +289,15 @@ def init_model(cfg: ModelConfig, key: jax.Array) -> PAWNModel:
     ``pad_embed`` is zeros.
     """
     d, n_layers, d_ff = cfg.d_model, cfg.n_layers, cfg.d_ff
-    keys = iter(jax.random.split(key, 12))
+    counter = 0
 
     def normal(shape: tuple[int, ...]) -> jax.Array:
-        return jax.random.normal(next(keys), shape, dtype=jnp.float32) * 0.02
+        # Derive a fresh key per matrix via fold_in, so there is no fixed
+        # split count to keep in sync with the number of initialised arrays.
+        nonlocal counter
+        subkey = jax.random.fold_in(key, counter)
+        counter += 1
+        return jax.random.normal(subkey, shape, dtype=jnp.float32) * 0.02
 
     return PAWNModel(
         src_embed=normal((64, d)),
@@ -286,7 +324,8 @@ def sliced(supernet: PAWNModel, variant: ModelConfig) -> PAWNModel:
     """Extract ``variant`` as a nested slice of ``supernet``.
 
     Width is sliced as a prefix of ``d_model`` / ``d_ff``; depth as a prefix
-    of the stacked layer axis. See ``docs/jax-migration.md`` §5.2.
+    of the stacked layer axis. ``validate_nested`` enforces the nesting
+    invariant. See ``docs/jax-migration.md`` §5.2.
     """
     validate_nested(variant, supernet.cfg)
     d, n_layers, d_ff = variant.d_model, variant.n_layers, variant.d_ff

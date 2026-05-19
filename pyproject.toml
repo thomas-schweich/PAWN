@@ -12,6 +12,11 @@ dependencies = [
     "tqdm~=4.67.0",
     "wandb~=0.25.0",
     "huggingface-hub>=0.20.0",
+    # JAX migration (docs/jax-migration.md). CPU jaxlib by default; the
+    # GPU-jaxlib split into the rocm/cu128 extras is deferred to Phase 2.
+    "jax>=0.6.0",
+    "equinox>=0.13.0",
+    "optax>=0.2.0",
     # Eval + probes
     "seaborn>=0.13.2",
     "matplotlib>=3.10.8",

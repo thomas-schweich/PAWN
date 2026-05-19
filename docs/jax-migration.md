@@ -51,12 +51,12 @@ explicitly out of v1 to de-risk convergence.
 | `pawn/data.py` — corpus generation/loading | `pawn/logging.py` — `MetricsLogger` JSONL contract |
 | `pawn/gpu.py` — device config | `deploy/`, Docker images, `configs/` |
 | `pawn/checkpoint.py` — PyTree serialization | |
-| `pawn/adapters/` — all 8 strategies | |
+| `pawn/adapters/` (6 strategies) + `pawn/specialized_clm.py` + `pawn/adapter_training.py` (`unfreeze`) — all 8 strategies | |
 | `pawn/eval_suite/` — probes, accuracy, generation, diagnostics | |
 | `pawn/lichess_data.py` — Python wrapper | |
 
-`pawn/config.py` (dataclasses: `CLMConfig`, `TrainingConfig`) survives, with the
-variant configs redefined as slices of a `SupernetConfig` (§5.1).
+`pawn/config.py` (dataclasses: `CLMConfig`, `TrainingConfig`) survives; the JAX
+package gets its own `ModelConfig` carrying the supernet/variant specs (§5.1).
 
 ## 3. Shared core
 
@@ -201,15 +201,18 @@ redefining them around a fixed head dimension:
 | base | 512 | 8 | 8 |
 | large (= supernet) | 640 | 10 | 10 |
 
-`head_dim` is fixed at 64 and `n_heads` becomes a derived quantity, not an
-independent config field. The only material redefinition is large's head count
-(8 → 10); this is **parameter-count-neutral** — the q/k/v/o matrices are
+`head_dim` is fixed at 64, so for supernet-nested models `n_heads` is pinned to
+`d_model / 64`. (`n_heads` stays an explicit `ModelConfig` field — standalone
+models such as converted legacy checkpoints keep their own head count.) The only
+material redefinition is large's head count (8 → 10); this is
+**parameter-count-neutral** — the q/k/v/o matrices are
 `d_model × d_model` regardless of how `d_model` is partitioned into heads — and
 it keeps RoPE identical across variants. `d_ff` is sliced alongside `d_model`
 (each variant keeps its SwiGLU ratio; the ratios must nest).
 
-`CLMConfig.{small,base,large}` are redefined as `(d_model, n_layers)` slices of
-a single `SupernetConfig`. Per existing project practice, model cards and
+The variants are `ModelConfig` instances in `pawn/jax/config.py` — a single
+`SUPERNET` config plus a `VARIANTS` dict, distinct from the legacy `CLMConfig`.
+Per existing project practice, model cards and
 published-checkpoint docs derive parameter counts from `config.json` — they are
 not hardcoded, so the slight redefinition does not require manual edits.
 
@@ -227,6 +230,10 @@ width `d_V` and depth `L_V` uses:
 RMSNorm normalizes over the *active* width at run time. Because each variant's
 forward during training uses exactly its slice, the sliced weights are trained
 to function at that width — the slimmable-network / MatFormer property.
+
+`pawn.jax.config.validate_nested()` enforces the nesting invariant — equal
+`head_dim`, identical vocab / context / outcome layout, and no axis exceeding
+the supernet — and is called by `sliced()` before extraction.
 
 ### 5.3 Joint training
 
@@ -390,8 +397,8 @@ The end state replaces the PyTorch modules in place. During the migration
 branch a transient dual-framework state is unavoidable and acceptable; the
 phasing keeps the repo coherent at each phase boundary.
 
-1. **Core.** Equinox `PAWNCLM` supernet, `SupernetConfig` + variant slices,
-   checkpoint serialization, the thin PyTorch loader, and the legacy converter
+1. **Core.** Equinox `PAWNModel` supernet, `ModelConfig` + `SUPERNET`/`VARIANTS`
+   specs, checkpoint serialization, the thin PyTorch loader, and the legacy converter
    for the three already-published checkpoints.
    *Verifiable:* the model instantiates at supernet dims and slices cleanly to
    each variant; the legacy converter's output matches the PyTorch model's
