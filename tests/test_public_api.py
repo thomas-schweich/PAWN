@@ -11,7 +11,17 @@ import pytest
 
 @pytest.mark.unit
 def test_pawn_reexports_stable() -> None:
-    """``from pawn import CLMConfig, TrainingConfig, PAWNCLM`` must work."""
+    """``from pawn import CLMConfig, TrainingConfig, PAWNCLM`` must work
+    when torch is installed.
+
+    ``pawn/__init__.py`` gates the ``PAWNCLM`` re-export on torch being
+    importable so JAX-only consumers can ``import pawn.jax.*`` without
+    pulling torch (see the JAX migration). This test pins the stable
+    surface under the torch-installed configuration that CI exercises;
+    the torch-free configuration is covered by `test_pawn_jax_*` files
+    importing pawn.jax.* without going through pawn.model.
+    """
+    pytest.importorskip("torch")
     import pawn
 
     assert hasattr(pawn, "CLMConfig")

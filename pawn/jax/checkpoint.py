@@ -228,32 +228,40 @@ def read_model_config(path: str | Path) -> ModelConfig:
     built from an unverified file.
 
     Raises ``UnsupportedCheckpointVersionError`` if the checkpoint's
-    ``format_version`` is not understood by this build.
+    ``format_version`` is not understood by this build, ``KeyError`` if
+    ``config.json`` lacks a ``model_config`` entry, and ``ValueError`` if
+    ``model_config`` contains fields ``ModelConfig`` does not recognise
+    (typically a legacy PyTorch checkpoint that hasn't been converted yet).
     """
-    config = json.loads(
-        (Path(path) / _CONFIG_FILE).read_text(encoding="utf-8")
-    )
+    config_path = Path(path) / _CONFIG_FILE
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     version = config.get("format_version")
     if version != CHECKPOINT_FORMAT_VERSION:
         raise UnsupportedCheckpointVersionError(
             f"checkpoint {path} has format_version {version!r}; this build "
             f"reads version {CHECKPOINT_FORMAT_VERSION}"
         )
+    if "model_config" not in config:
+        raise KeyError(
+            f"{config_path} has no 'model_config' key; top-level keys: "
+            f"{sorted(config.keys())}"
+        )
     mc = config["model_config"]
     # Refuse to unpack a config that carries fields ``ModelConfig`` doesn't
     # know about — the most common cause is a legacy PyTorch checkpoint
     # whose ``CLMConfig`` includes ``dropout`` etc. Point the caller at the
     # converter instead of letting them hit a cryptic ``TypeError`` from the
-    # ModelConfig constructor.
+    # ModelConfig constructor. Fields ``ModelConfig`` knows about but the
+    # config doesn't include fall back to ``ModelConfig`` defaults.
     known = {f.name for f in dataclasses.fields(ModelConfig)}
     unknown = sorted(set(mc) - known)
     if unknown:
         raise ValueError(
-            f"{path}/config.json has unexpected fields {unknown}; this looks "
+            f"{config_path} has unexpected fields {unknown}; this looks "
             "like a legacy PyTorch checkpoint — convert it first with "
             "pawn.jax.legacy.convert_legacy_checkpoint."
         )
-    return ModelConfig(**{k: mc[k] for k in known})
+    return ModelConfig(**{k: mc[k] for k in known if k in mc})
 
 
 def load_model(path: str | Path) -> PAWNModel:

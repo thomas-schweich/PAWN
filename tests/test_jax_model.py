@@ -132,6 +132,25 @@ def test_modelconfig_post_init_rejects_odd_head_dim() -> None:
         ModelConfig(d_model=60, n_layers=2, n_heads=4, d_ff=256)
 
 
+def test_grad_through_scan_remat_is_finite() -> None:
+    """``jax.checkpoint(run_layer)`` (the Phase-2 memory-saving wrap on the
+    scan body) must actually compose with autodiff and produce finite
+    gradients. Without this test, the perf fix is unverified end-to-end."""
+    cfg = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=256)
+    model = init_model(cfg, jax.random.PRNGKey(0))
+    tokens = jax.random.randint(jax.random.PRNGKey(1), (1, 8), 0, 1968)
+    mask = jnp.ones((1, 8), dtype=bool)
+
+    def loss(m: PAWNModel, tk: jax.Array, am: jax.Array) -> jax.Array:
+        return m(tk, am).sum()
+
+    grads = eqx.filter_grad(loss)(model, tokens, mask)
+    leaves = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))
+    assert leaves, "expected at least one gradient leaf"
+    for leaf in leaves:
+        assert bool(jnp.all(jnp.isfinite(leaf))), "non-finite gradient"
+
+
 def test_partial_padding_mask_path() -> None:
     """Real-world inputs have trailing PAD; verify logits stay finite and the
     real-token region is independent of the padded tail (causal + key-masking

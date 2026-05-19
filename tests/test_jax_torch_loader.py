@@ -15,9 +15,12 @@ import numpy as np
 import torch
 
 from pawn.config import CLMConfig
+from pawn.jax.checkpoint import _PARAM_FIELDS
 from pawn.jax.legacy import convert_legacy_checkpoint
 from pawn.jax.torch_loader import (
+    _SCHEMA_KEYS,
     CheckpointIntegrityError,
+    TorchModelConfig,
     UnsupportedCheckpointVersionError,
     load_pawn,
 )
@@ -93,26 +96,24 @@ def test_loader_max_seq_len_guard_raises(tmp_path: Path) -> None:
 
 def test_schema_keys_match_checkpoint_param_fields() -> None:
     """``torch_loader._SCHEMA_KEYS`` must stay in lockstep with
-    ``checkpoint._PARAM_FIELDS`` (the model-derived schema).
+    ``checkpoint._PARAM_FIELDS`` (the model-derived schema) — in declaration
+    order, not just set-equality, since the loader docstring claims order is
+    part of the schema contract.
 
     The loader hardcodes its own copy to keep itself JAX-import-free, so a
     test is the only thing that catches drift between the two."""
-    from pawn.jax.checkpoint import _PARAM_FIELDS
-    from pawn.jax.torch_loader import _SCHEMA_KEYS
-    assert set(_SCHEMA_KEYS) == set(_PARAM_FIELDS), (
-        f"schema drift: only in _SCHEMA_KEYS={set(_SCHEMA_KEYS)-set(_PARAM_FIELDS)}, "
-        f"only in _PARAM_FIELDS={set(_PARAM_FIELDS)-set(_SCHEMA_KEYS)}"
+    assert tuple(_SCHEMA_KEYS) == tuple(_PARAM_FIELDS), (
+        f"schema drift: _SCHEMA_KEYS={_SCHEMA_KEYS!r}, "
+        f"_PARAM_FIELDS={_PARAM_FIELDS!r}"
     )
 
 
 def test_torch_model_config_divisibility_guard() -> None:
-    from pawn.jax.torch_loader import TorchModelConfig
     with pytest.raises(ValueError, match="not divisible"):
         TorchModelConfig(d_model=257, n_layers=2, n_heads=4, d_ff=256)
 
 
 def test_torch_model_config_head_dim_even_guard() -> None:
-    from pawn.jax.torch_loader import TorchModelConfig
     # d=60, n_heads=4 -> head_dim=15 (odd) — RoPE would mis-rotate.
     with pytest.raises(ValueError, match="head_dim=15 must be even"):
         TorchModelConfig(d_model=60, n_layers=2, n_heads=4, d_ff=256)

@@ -6,11 +6,14 @@ Transformer layers are stored stacked on a leading axis of size
 ``cfg.n_layers`` and applied with ``jax.lax.scan``; variant extraction
 (``sliced``) is a pure slice of the weight arrays.
 
-Mirrors the PyTorch ``pawn.model.PAWNCLM`` architecture exactly: factored
+Mirrors the PyTorch ``pawn.model.PAWNCLM`` architecture closely: factored
 input embeddings, RMSNorm, RoPE, SwiGLU FFN, untied LM head, pre-norm
-residual blocks. Attention is plain (materialized scores) rather than a fused
-kernel — at seq 512 it is a small fraction of FLOPs and this keeps the code
-backend-portable (see ``docs/jax-migration.md`` §3.1).
+residual blocks. The single intentional divergence is the RMSNorm cast
+order (weight multiply runs in fp32 then downcasts once, vs legacy's
+downcast-then-multiply) so a bf16 residual stream stays bf16 — see
+``_rmsnorm``. Attention is plain (materialized scores) rather than a
+fused kernel — at seq 512 it is a small fraction of FLOPs and this
+keeps the code backend-portable (see ``docs/jax-migration.md`` §3.1).
 
 Linear weights use the JAX ``(in, out)`` convention (``x @ W``), which is the
 transpose of PyTorch's ``nn.Linear`` ``(out, in)`` layout.
@@ -67,12 +70,14 @@ def _decomp_table() -> np.ndarray:
 
 
 def _rmsnorm(x: jax.Array, weight: jax.Array) -> jax.Array:
-    """RMSNorm (mirrors ``pawn.model.RMSNorm``).
+    """RMSNorm — close to ``pawn.model.RMSNorm`` with one intentional change.
 
     The reduction, normalization, and weight multiply all run in fp32; the
     result is downcast once to ``x.dtype``. Multiplying by the fp32 ``weight``
-    before the downcast (rather than after) keeps a bf16 residual stream in
-    bf16 instead of letting the fp32 ``weight`` silently promote it.
+    before the downcast (rather than after, as legacy PyTorch does) keeps a
+    bf16 residual stream in bf16 instead of letting the fp32 ``weight``
+    silently promote it. This is load-bearing for bf16 parity between the
+    JAX model and the thin PyTorch loader.
     """
     x32 = x.astype(jnp.float32)
     norm = jax.lax.rsqrt(jnp.mean(x32 * x32, axis=-1, keepdims=True) + RMSNORM_EPS)
@@ -129,9 +134,17 @@ def _attention(
     cos: jax.Array,
     sin: jax.Array,
     mask: jax.Array,
+    all_masked_query: jax.Array,
     n_heads: int,
 ) -> jax.Array:
-    """Multi-head self-attention with plain (materialized) scores."""
+    """Multi-head self-attention with plain (materialized) scores.
+
+    ``all_masked_query`` is a precomputed ``(B, 1, T, 1)`` bool array marking
+    query positions whose entire key row is masked — passed in instead of
+    derived from ``jnp.isnan(weights)`` so that ``jax.checkpoint`` over the
+    scan-of-layers doesn't rematerialise the ``(B, H, T, T)`` isnan pass per
+    layer during the backward sweep.
+    """
     b, t, d = x.shape[0], x.shape[1], x.shape[2]
     head_dim = d // n_heads
 
@@ -148,8 +161,9 @@ def _attention(
     weights = jax.nn.softmax(scores + mask.astype(scores.dtype), axis=-1)
     # A fully-masked query row (only in a degenerate all-padding sequence —
     # padding masks keys, and position 0 is normally a real token) softmaxes
-    # 0/0 to NaN; zero those rows, matching recent PyTorch SDPA behaviour.
-    weights = jnp.where(jnp.isnan(weights), 0.0, weights)
+    # 0/0 to NaN; zero those rows. ``all_masked_query`` is precomputed once
+    # in ``__call__`` so the backward sweep doesn't re-derive it per layer.
+    weights = jnp.where(all_masked_query, 0.0, weights)
     ctx = jnp.einsum("bhqk,bhkd->bhqd", weights, v)
     ctx = ctx.transpose(0, 2, 1, 3).reshape(b, t, d)
     return ctx @ wo
@@ -232,6 +246,9 @@ class PAWNModel(eqx.Module):
         x = self._embed(tokens)
         cos, sin = _rope_tables(cfg.head_dim, seq_len, cfg.rope_base)
         mask = _build_attn_mask(attn_mask, seq_len)
+        # Precompute the all-masked query rows once; closing it over
+        # ``run_layer`` keeps it out of ``jax.checkpoint``'s rematerialisation.
+        all_masked_query = jnp.all(mask == -jnp.inf, axis=-1, keepdims=True)
 
         layers = LayerWeights(
             attn_norm=self.attn_norm,
@@ -255,6 +272,7 @@ class PAWNModel(eqx.Module):
                 cos,
                 sin,
                 mask,
+                all_masked_query,
                 cfg.n_heads,
             )
             h = h + _ffn(_rmsnorm(h, lw.ffn_norm), lw.w_gate, lw.w_up, lw.w_down)

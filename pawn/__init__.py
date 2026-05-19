@@ -13,5 +13,10 @@ from pawn.config import CLMConfig, TrainingConfig
 try:
     from pawn.model import PAWNCLM
     __all__ = ["CLMConfig", "TrainingConfig", "PAWNCLM"]
-except ImportError:
+except ModuleNotFoundError as exc:
+    # Only swallow a *missing torch*; any other ModuleNotFoundError points at
+    # a real bug in pawn.model (typo, missing optional dep) that should not
+    # silently disappear into a confusing downstream AttributeError.
+    if exc.name != "torch":
+        raise
     __all__ = ["CLMConfig", "TrainingConfig"]

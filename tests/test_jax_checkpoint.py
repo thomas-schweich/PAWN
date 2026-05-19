@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -158,7 +160,6 @@ def test_read_model_config_rejects_legacy_pytorch_config(tmp_path: Path) -> None
     """A legacy PyTorch ``config.json`` (which carries ``dropout``) must raise
     a clear error pointing at the converter, not a cryptic ``TypeError`` from
     the ModelConfig constructor."""
-    import json
     ckpt = tmp_path / "ckpt"
     ckpt.mkdir()
     (ckpt / "config.json").write_text(
@@ -182,7 +183,6 @@ def test_save_recovers_from_stranded_backup(
 ) -> None:
     """A previous interrupt that left a stranded ``.bak`` and no ``target``
     must not destroy the recoverable checkpoint on the next save."""
-    import os
     ckpt = tmp_path / "ckpt"
     save_model(ckpt, small_model)
     # Simulate: prior interrupt between rename(target, backup) and
@@ -195,3 +195,36 @@ def test_save_recovers_from_stranded_backup(
     assert ckpt.exists()
     assert not ckpt.with_name("ckpt.bak").exists()
     load_model(ckpt)  # must load cleanly
+
+
+def test_read_model_config_uses_defaults_for_missing_fields(
+    small_model: PAWNModel, tmp_path: Path
+) -> None:
+    """A field that ``ModelConfig`` has a default for, but the on-disk
+    ``config.json`` omits, must fall back to the default — not KeyError.
+    The round-1 fix iterating ``known`` keys regressed this; the round-2
+    fix iterates ``known & present`` so defaults still apply.
+    """
+    ckpt = tmp_path / "ckpt"
+    save_model(ckpt, small_model)
+    cfg_path = ckpt / "config.json"
+    payload = json.loads(cfg_path.read_text(encoding="utf-8"))
+    payload["model_config"].pop("rope_base", None)
+    cfg_path.write_text(json.dumps(payload), encoding="utf-8")
+    (ckpt / ".complete").unlink()  # bypass sentinel since we mutated config
+    out = read_model_config(ckpt)
+    assert out.rope_base == 10000.0  # ModelConfig default
+
+
+def test_read_model_config_rejects_missing_model_config_key(
+    tmp_path: Path,
+) -> None:
+    """A config.json without ``model_config`` raises a clear KeyError, not
+    an opaque one from dict indexing deep in the function."""
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text(
+        json.dumps({"format_version": 1}), encoding="utf-8"
+    )
+    with pytest.raises(KeyError, match="model_config"):
+        read_model_config(ckpt)

@@ -45,7 +45,11 @@ import jax.numpy as jnp
 import numpy as np
 from safetensors.numpy import load_file
 
-from pawn.jax.checkpoint import save_model, verify_checkpoint
+from pawn.jax.checkpoint import (
+    IncompleteCheckpointError,
+    save_model,
+    verify_checkpoint,
+)
 from pawn.jax.config import (
     MAX_SEQ_LEN,
     N_OUTCOMES,
@@ -189,8 +193,24 @@ def convert_legacy_checkpoint(src: str | Path, dst: str | Path) -> None:
     it exists.
     """
     src_path = Path(src)
-    if (src_path / ".complete").exists():
+    # Sentinel handling: full pretraining checkpoints carry ``.complete`` and
+    # MUST verify; bare HF-format directories (exactly model.safetensors +
+    # config.json) have no sentinel and convert without integrity check.
+    # Refuse any other configuration (e.g. a full checkpoint where the
+    # sentinel was lost in an interrupted save) rather than silently
+    # re-signing potentially corrupt bytes.
+    sentinel = src_path / ".complete"
+    present = {entry.name for entry in src_path.iterdir() if entry.is_file()}
+    bare_hf_files = {"model.safetensors", "config.json"}
+    if sentinel.exists():
         verify_checkpoint(src_path)
+    elif present - bare_hf_files:
+        raise IncompleteCheckpointError(
+            f"{src_path} has files beyond bare HF format ({sorted(present - bare_hf_files)}) "
+            "but no .complete sentinel — looks like a corrupted full "
+            "checkpoint. Restore the sentinel or strip back to "
+            f"{sorted(bare_hf_files)} before converting."
+        )
     config_path = src_path / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if "model_config" not in config:
