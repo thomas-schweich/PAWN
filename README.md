@@ -11,7 +11,7 @@ Feel free to use PAWN in your own experiments. PAWN is developed as a personal p
 
 ## Model Variants
 
-The model comes in three sizes, all trained from scratch on random chess games generated on-the-fly by a Rust-based chess backend. The v1.0.0 weights were trained together for 200K steps at batch size 256 on a single B200 — all three variants see the same random-game batches each step, with one forward/backward pass per variant in sequence on the same GPU (see [cotrain config](configs/cotrain_three_variants.json)). The numbers below come from the best 5K-cadence checkpoint by val loss (step 195,000 ≈ 49.9M sequences) for all three variants:
+The model comes in three sizes, all trained from scratch on random chess games generated on-the-fly by a Rust-based chess backend. The v1.0.0 weights were trained together for 200K steps at batch size 256 on a single GPU — all three variants see the same random-game batches each step, with one forward/backward pass per variant in sequence (see [cotrain config](configs/cotrain_three_variants.json)). The numbers below come from the best 5K-cadence checkpoint by val loss (step 195,000 ≈ 49.9M sequences) for all three variants:
 
 | Variant | d_model | Layers | Heads | Params | Top-1 | Legal rate | Game completion | Download |
 |---------|---------|--------|-------|--------|-------|------------|-----------------|----------|
@@ -120,7 +120,7 @@ The "Lichess Full" dataset below was filtered to matches between players rated 1
 | Dataset | Games | Description | Link |
 |---------|-------|-------------|------|
 | Lichess Full | 286M train + 9.3M val + 9.0M test | Rated games from Q1 2025 (all Elos), holdout from Jan 2026 | [pawn-lichess-full](https://huggingface.co/datasets/thomas-schweich/pawn-lichess-full) |
-| Stockfish nodes=1 | 900K train + 50K val + 50K test | NNUE self-play, 1 node/move | [stockfish-nodes1](https://huggingface.co/datasets/thomas-schweich/stockfish-nodes1) |
+| Stockfish 100M | 99.5M train + 250K val + 250K test | 5-tier Stockfish 18 self-play; every position annotated with per-legal-move NNUE + MultiPV evals | [pawn-stockfish-100m](https://huggingface.co/datasets/thomas-schweich/pawn-stockfish-100m) |
 
 All datasets use pre-tokenized `list[int16]` move sequences (`tokens` column). The Lichess dataset also includes raw `san`/`uci` strings, clock annotations, Elo ratings, and full game metadata. Datasets load directly from HuggingFace via Polars lazy scan. Predicate pushdown makes it so that only the subset of data you select is actually downloaded.
 
