@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -85,7 +86,6 @@ def test_loader_missing_sentinel_is_accepted(tmp_path: Path) -> None:
 def test_loader_rejects_missing_model_config_key(tmp_path: Path) -> None:
     """``load_pawn`` raises a clear KeyError when the source config.json has
     no ``model_config`` entry, mirroring the JAX-side guard."""
-    import json
     dst, _ = _build_jax_checkpoint(tmp_path)
     cfg_path = dst / "config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))

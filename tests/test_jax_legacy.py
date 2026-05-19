@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from pawn.config import CLMConfig
-from pawn.jax.checkpoint import load_model
+from pawn.jax.checkpoint import IncompleteCheckpointError, load_model
 from pawn.jax.legacy import (
     IncompatibleCheckpointError,
     convert_legacy_checkpoint,
@@ -153,19 +153,23 @@ def test_logit_parity_with_pad_and_outcome_tokens(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "payload_name", ["training_state.json", "optimizer.safetensors"]
+)
 def test_convert_rejects_sentinel_missing_full_checkpoint(
-    tmp_path: Path,
+    tmp_path: Path, payload_name: str
 ) -> None:
     """A source directory containing a full-checkpoint payload file
     (optimizer.safetensors / training_state.json) but lacking ``.complete``
-    is a corrupted/interrupted save, not a bare HF snapshot — the
-    converter must refuse rather than silently re-signing the bytes."""
-    from pawn.jax.checkpoint import IncompleteCheckpointError
+    is a corrupted/interrupted save, not a bare HF snapshot — the converter
+    must refuse rather than silently re-signing the bytes. Parametrised so a
+    regression that drops either payload file from the discriminator set
+    surfaces at the test level rather than at runtime."""
     src = tmp_path / "legacy"
     write_legacy_checkpoint(src, CLMConfig.toy())
     # Drop a payload file alongside model.safetensors + config.json, no
     # .complete — mimic an interrupted full-checkpoint save.
-    (src / "training_state.json").write_text("{}", encoding="utf-8")
+    (src / payload_name).write_text("noise", encoding="utf-8")
     with pytest.raises(IncompleteCheckpointError, match="payload"):
         convert_legacy_checkpoint(src, tmp_path / "dst")
 

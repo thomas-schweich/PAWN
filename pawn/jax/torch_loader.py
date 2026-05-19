@@ -224,7 +224,10 @@ class _Attention(nn.Module):
         # the module doesn't get a silent fp32 upcast through `scores + mask`.
         weights = torch.softmax(scores + mask.to(scores.dtype), dim=-1)
         # Zero fully-masked rows (degenerate all-padding sequences whose
-        # softmax would otherwise be NaN), matching the JAX implementation.
+        # softmax would otherwise be NaN). Equivalent to the JAX forward
+        # output; the JAX side additionally avoids NaN BEFORE softmax (via
+        # a pre-softmax mask replacement) for gradient correctness, which
+        # this inference-only loader does not need.
         weights = weights.nan_to_num(nan=0.0)
         ctx = torch.einsum("bhqk,bhkd->bhqd", weights, v)
         ctx = ctx.transpose(1, 2).contiguous().view(b, t, -1)

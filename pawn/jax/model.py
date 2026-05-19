@@ -156,20 +156,23 @@ def _attention(
     v = split(wv)
 
     scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * (head_dim**-0.5)
-    # Cast the mask into the scores' dtype so a bf16 forward isn't promoted
-    # back to fp32 by an always-fp32 mask — keeps the residual stream bf16.
-    cast_mask = mask.astype(scores.dtype)
-    # Neuter the additive mask for fully-masked query rows BEFORE softmax.
-    # If left in place, ``softmax(scores + all_-inf) == 0/0 → NaN`` in the
-    # forward pass, and although the post-softmax ``where`` hides those NaNs
-    # from the output, JAX autodiff propagates NaN gradients back through
-    # every upstream weight — a single all-padding row in a batch would
-    # poison the whole training step. Replacing the row's mask with zeros
-    # gives softmax a valid distribution to differentiate; the row's
-    # context is zeroed below so the output is identical to the
-    # "fully-masked" intent.
-    safe_mask = jnp.where(all_masked_query, jnp.zeros((), cast_mask.dtype), cast_mask)
-    weights = jax.nn.softmax(scores + safe_mask, axis=-1)
+    # For fully-masked query rows, route the raw ``scores`` into softmax (a
+    # finite, differentiable input) so autodiff cannot observe
+    # ``softmax(scores + -inf-row) == 0/0 → NaN`` — a single all-padding
+    # batch element would otherwise poison every upstream gradient. For
+    # normal rows, add the additive mask in the scores' dtype to keep a
+    # bf16 forward in bf16. The single ``where`` over the (B, H, T, T)
+    # scores avoids materialising a separate cast_mask + safe_mask pair
+    # inside the scan body (which would be rematerialised per layer under
+    # ``jax.checkpoint`` during the backward sweep). The row's weights are
+    # zeroed below, so the all-masked output stays semantically "no
+    # context" while gradients remain well-defined.
+    masked_scores = jnp.where(
+        all_masked_query,
+        scores,
+        scores + mask.astype(scores.dtype),
+    )
+    weights = jax.nn.softmax(masked_scores, axis=-1)
     weights = jnp.where(all_masked_query, 0.0, weights)
     ctx = jnp.einsum("bhqk,bhkd->bhqd", weights, v)
     ctx = ctx.transpose(0, 2, 1, 3).reshape(b, t, d)
@@ -259,7 +262,9 @@ class PAWNModel(eqx.Module):
         # a query at position q is fully masked iff its causal window
         # [0..q] contains no real tokens. O(B·T) work and a (B, T) buffer
         # vs O(B·T²) on the materialised (B, 1, T, T) additive mask.
-        real_so_far = jnp.cumsum(attn_mask.astype(jnp.int32), axis=1)
+        # ``jnp.cumsum`` of a bool auto-promotes to an integer accumulator,
+        # so no explicit ``astype`` is needed.
+        real_so_far = jnp.cumsum(attn_mask, axis=1)
         all_masked_query = (real_so_far == 0)[:, None, :, None]
 
         layers = LayerWeights(

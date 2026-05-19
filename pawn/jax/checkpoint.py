@@ -227,11 +227,12 @@ def read_model_config(path: str | Path) -> ModelConfig:
     a ``.tmp`` / partially-written directory; the result would be a config
     built from an unverified file.
 
-    Raises ``UnsupportedCheckpointVersionError`` if the checkpoint's
-    ``format_version`` is not understood by this build, ``KeyError`` if
-    ``config.json`` lacks a ``model_config`` entry, and ``ValueError`` if
-    ``model_config`` contains fields ``ModelConfig`` does not recognise
-    (typically a legacy PyTorch checkpoint that hasn't been converted yet).
+    Raises ``UnsupportedCheckpointVersionError`` on an unknown
+    ``format_version``; ``KeyError`` if ``config.json`` lacks
+    ``model_config`` *or* ``model_config`` is missing a required
+    ``ModelConfig`` field; and ``ValueError`` if ``model_config`` contains
+    fields ``ModelConfig`` does not recognise (typically a legacy PyTorch
+    checkpoint that hasn't been converted yet).
     """
     config_path = Path(path) / _CONFIG_FILE
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -255,7 +256,8 @@ def read_model_config(path: str | Path) -> ModelConfig:
     # config doesn't include fall back to ``ModelConfig`` defaults — except
     # for required fields (no default), where we raise a clear KeyError
     # rather than letting ModelConfig() surface an opaque TypeError.
-    known = {f.name for f in dataclasses.fields(ModelConfig)}
+    fields = dataclasses.fields(ModelConfig)
+    known = {f.name for f in fields}
     unknown = sorted(set(mc) - known)
     if unknown:
         raise ValueError(
@@ -265,7 +267,7 @@ def read_model_config(path: str | Path) -> ModelConfig:
         )
     required = {
         f.name
-        for f in dataclasses.fields(ModelConfig)
+        for f in fields
         if f.default is dataclasses.MISSING
         and f.default_factory is dataclasses.MISSING
     }

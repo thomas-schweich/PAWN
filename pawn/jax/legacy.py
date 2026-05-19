@@ -36,6 +36,7 @@ no torch import) so converting a legacy checkpoint does not require torch.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -86,7 +87,12 @@ _PER_LAYER_KEYS = (
     "ffn.w_down.weight",
 )
 
-_REQUIRED_CFG_FIELDS = ("d_model", "n_layers", "n_heads", "d_ff")
+_REQUIRED_CFG_FIELDS = tuple(
+    f.name
+    for f in dataclasses.fields(ModelConfig)
+    if f.default is dataclasses.MISSING
+    and f.default_factory is dataclasses.MISSING
+)
 
 
 def legacy_to_model_config(
@@ -187,10 +193,14 @@ def convert_legacy_checkpoint(src: str | Path, dst: str | Path) -> None:
     ``model.safetensors`` (the PyTorch state_dict). If ``src/.complete``
     exists (full pretraining checkpoints carry it), the sentinel is verified
     before any weights are read — a corrupt source raises rather than
-    silently producing a "valid"-looking JAX checkpoint of corrupt bytes;
-    bare HF-format directories (``model.safetensors`` + ``config.json``
-    only) are accepted without integrity check. ``dst`` is overwritten if
-    it exists.
+    silently producing a "valid"-looking JAX checkpoint of corrupt bytes.
+    Sentinel-absent directories are accepted without integrity check when
+    they look like an HF-snapshot layout (``model.safetensors`` +
+    ``config.json``, optionally alongside ``README.md`` / ``LICENSE`` /
+    ``.gitattributes``); a directory containing full-checkpoint payload
+    files (``optimizer.safetensors`` / ``training_state.json``) without a
+    sentinel is rejected as a corrupted / interrupted save. ``dst`` is
+    overwritten if it exists.
     """
     src_path = Path(src)
     # Sentinel handling: full pretraining checkpoints carry ``.complete`` and
