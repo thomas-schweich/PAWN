@@ -21,8 +21,14 @@ PyTorch → JAX mapping:
 * PyTorch buffers (``rope_cos`` / ``rope_sin`` / ``causal_mask`` /
   ``embed.decomp_table``) are non-persistent and not serialised in the
   state_dict; they have no JAX-side counterpart in the parameter PyTree.
-* PyTorch ``TrainingConfig`` fields (``dropout`` etc.) are dropped — the
-  JAX ``ModelConfig`` does not carry them.
+* Legacy ``CLMConfig`` fields not present on the JAX ``ModelConfig``
+  (``dropout`` etc.) are dropped.
+
+Pre-vocab-transition checkpoints (the ~60k coordinate-vocabulary trained
+before the searchless_chess 1,968-action transition) are **rejected**: the
+JAX model uses the current ``decomp_table`` so converting old token layouts
+would silently embed every move incorrectly. Use the
+``pre-vocab-transition`` git tag in PyTorch to work with those checkpoints.
 
 The converter is framework-neutral on the read side (``safetensors.numpy``;
 no torch import) so converting a legacy checkpoint does not require torch.
@@ -32,13 +38,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from safetensors.numpy import load_file
 
-from pawn.jax.checkpoint import save_model
+from pawn.jax.checkpoint import save_model, verify_checkpoint
 from pawn.jax.config import (
     MAX_SEQ_LEN,
     N_OUTCOMES,
@@ -47,9 +54,14 @@ from pawn.jax.config import (
 )
 from pawn.jax.model import PAWNModel
 
+
+class IncompatibleCheckpointError(Exception):
+    """Raised when a legacy checkpoint cannot be safely converted to JAX."""
+
+
 # State_dict keys produced by ``pawn.model.PAWNCLM`` (legacy PyTorch model).
-# Listed here so a missing key fails loudly with a clear message rather than
-# at the point of dict indexing inside the layer-stacking helpers.
+# Listed explicitly so a missing key fails loudly with a clear message rather
+# than at the point of dict indexing inside the stacking helper.
 _EMBED_KEYS = (
     "embed.src_embed.weight",
     "embed.dst_embed.weight",
@@ -70,21 +82,44 @@ _PER_LAYER_KEYS = (
     "ffn.w_down.weight",
 )
 
+_REQUIRED_CFG_FIELDS = ("d_model", "n_layers", "n_heads", "d_ff")
 
-def legacy_to_model_config(legacy_model_config: dict) -> ModelConfig:
+
+def legacy_to_model_config(
+    legacy_model_config: dict[str, Any],
+) -> ModelConfig:
     """Build a JAX ``ModelConfig`` from a legacy PyTorch ``model_config`` dict.
 
-    Drops legacy-only fields (``dropout``); fills sensible defaults for fields
-    that older configs may have omitted (``rope_base``).
+    Drops legacy-only fields (``dropout``); fills sensible defaults for
+    fields that older configs may have omitted (``rope_base``,
+    ``max_seq_len``). Rejects pre-vocab-transition checkpoints whose
+    vocabulary layout differs from the current one — the JAX model uses the
+    current decomp table and would embed old tokens incorrectly.
     """
+    missing = [f for f in _REQUIRED_CFG_FIELDS if f not in legacy_model_config]
+    if missing:
+        raise KeyError(
+            f"legacy model_config is missing required fields {missing}; "
+            f"keys present: {sorted(legacy_model_config.keys())}"
+        )
+    vocab_size = legacy_model_config.get("vocab_size", VOCAB_SIZE)
+    n_outcomes = legacy_model_config.get("n_outcomes", N_OUTCOMES)
+    if vocab_size != VOCAB_SIZE or n_outcomes != N_OUTCOMES:
+        raise IncompatibleCheckpointError(
+            f"legacy checkpoint uses vocab_size={vocab_size}, "
+            f"n_outcomes={n_outcomes}; this build only converts the current "
+            f"searchless_chess vocabulary (vocab_size={VOCAB_SIZE}, "
+            f"n_outcomes={N_OUTCOMES}). Pre-vocab-transition checkpoints "
+            "are accessible only via the `pre-vocab-transition` git tag."
+        )
     return ModelConfig(
         d_model=legacy_model_config["d_model"],
         n_layers=legacy_model_config["n_layers"],
         n_heads=legacy_model_config["n_heads"],
         d_ff=legacy_model_config["d_ff"],
-        vocab_size=legacy_model_config.get("vocab_size", VOCAB_SIZE),
+        vocab_size=vocab_size,
         max_seq_len=legacy_model_config.get("max_seq_len", MAX_SEQ_LEN),
-        n_outcomes=legacy_model_config.get("n_outcomes", N_OUTCOMES),
+        n_outcomes=n_outcomes,
         rope_base=legacy_model_config.get("rope_base", 10000.0),
     )
 
@@ -114,17 +149,11 @@ def convert_state_dict(
     _check_keys(state, cfg)
     n_layers = cfg.n_layers
 
-    def stack(suffix: str) -> jax.Array:
-        return jnp.asarray(
-            np.stack([state[f"layers.{i}.{suffix}"] for i in range(n_layers)])
-        )
-
-    def stack_t(suffix: str) -> jax.Array:
-        return jnp.asarray(
-            np.stack(
-                [state[f"layers.{i}.{suffix}"].T for i in range(n_layers)]
-            )
-        )
+    def stack(suffix: str, *, transpose: bool = False) -> jax.Array:
+        arrs = [state[f"layers.{i}.{suffix}"] for i in range(n_layers)]
+        if transpose:
+            arrs = [a.T for a in arrs]
+        return jnp.asarray(np.stack(arrs))
 
     return PAWNModel(
         src_embed=jnp.asarray(state["embed.src_embed.weight"]),
@@ -133,14 +162,14 @@ def convert_state_dict(
         pad_embed=jnp.asarray(state["embed.pad_embed"]),
         outcome_embed=jnp.asarray(state["embed.outcome_embed.weight"]),
         attn_norm=stack("attn_norm.weight"),
-        wq=stack_t("attn.wq.weight"),
-        wk=stack_t("attn.wk.weight"),
-        wv=stack_t("attn.wv.weight"),
-        wo=stack_t("attn.wo.weight"),
+        wq=stack("attn.wq.weight", transpose=True),
+        wk=stack("attn.wk.weight", transpose=True),
+        wv=stack("attn.wv.weight", transpose=True),
+        wo=stack("attn.wo.weight", transpose=True),
         ffn_norm=stack("ffn_norm.weight"),
-        w_gate=stack_t("ffn.w_gate.weight"),
-        w_up=stack_t("ffn.w_up.weight"),
-        w_down=stack_t("ffn.w_down.weight"),
+        w_gate=stack("ffn.w_gate.weight", transpose=True),
+        w_up=stack("ffn.w_up.weight", transpose=True),
+        w_down=stack("ffn.w_down.weight", transpose=True),
         final_norm=jnp.asarray(state["final_norm.weight"]),
         lm_head=jnp.asarray(state["lm_head.weight"].T),
         cfg=cfg,
@@ -151,13 +180,24 @@ def convert_legacy_checkpoint(src: str | Path, dst: str | Path) -> None:
     """Convert a legacy PyTorch checkpoint directory to a JAX checkpoint.
 
     ``src`` must contain ``config.json`` (with a ``model_config`` dict) and
-    ``model.safetensors`` (the PyTorch state_dict). ``dst`` is overwritten if
-    it exists. Reads via ``safetensors.numpy`` so no torch import is needed.
+    ``model.safetensors`` (the PyTorch state_dict). If ``src/.complete``
+    exists (full pretraining checkpoints carry it), the sentinel is verified
+    before any weights are read — a corrupt source raises rather than
+    silently producing a "valid"-looking JAX checkpoint of corrupt bytes;
+    bare HF-format directories (``model.safetensors`` + ``config.json``
+    only) are accepted without integrity check. ``dst`` is overwritten if
+    it exists.
     """
     src_path = Path(src)
-    config = json.loads(
-        (src_path / "config.json").read_text(encoding="utf-8")
-    )
+    if (src_path / ".complete").exists():
+        verify_checkpoint(src_path)
+    config_path = src_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if "model_config" not in config:
+        raise KeyError(
+            f"{config_path} has no 'model_config' key; top-level keys: "
+            f"{sorted(config.keys())}"
+        )
     cfg = legacy_to_model_config(config["model_config"])
     state = load_file(src_path / "model.safetensors")
     model = convert_state_dict(state, cfg)

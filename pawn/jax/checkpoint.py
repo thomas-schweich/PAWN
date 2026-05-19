@@ -146,6 +146,18 @@ def _verify_sentinel(directory: Path) -> None:
             )
 
 
+def verify_checkpoint(path: str | Path) -> None:
+    """Verify a checkpoint directory's ``.complete`` sentinel and file hashes.
+
+    Raises ``IncompleteCheckpointError`` if the sentinel is missing and
+    ``CheckpointIntegrityError`` if any file's hash mismatches or the
+    directory contents disagree with the listed file set. Public wrapper
+    around the internal helper used by ``load_model``; the legacy converter
+    uses it to refuse corrupt source checkpoints.
+    """
+    _verify_sentinel(Path(path))
+
+
 def save_model(path: str | Path, model: PAWNModel) -> None:
     """Atomically write ``model`` to the checkpoint directory ``path``.
 
