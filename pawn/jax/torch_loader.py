@@ -109,6 +109,16 @@ class TorchModelConfig:
     def head_dim(self) -> int:
         return self.d_model // self.n_heads
 
+    def __post_init__(self) -> None:
+        if self.d_model % self.n_heads != 0:
+            raise ValueError(
+                f"d_model={self.d_model} not divisible by n_heads={self.n_heads}"
+            )
+        if self.head_dim % 2 != 0:
+            raise ValueError(
+                f"head_dim={self.head_dim} must be even (RoPE rotates pairs)"
+            )
+
 
 @functools.cache
 def _build_decomp_table() -> torch.Tensor:
@@ -326,9 +336,10 @@ class PAWNTorch(nn.Module):
             torch.ones((t, t), dtype=torch.bool, device=tokens.device)
         )
         keep = causal[None, None, :, :] & attn_mask[:, None, None, :]
-        mask = torch.where(
-            keep, 0.0, float("-inf")
-        ).to(torch.float32)
+        # ``_Attention.forward`` casts ``mask`` into the scores' dtype before
+        # adding, so we can keep it at the default float32 here without an
+        # explicit cast.
+        mask = torch.where(keep, 0.0, float("-inf"))
         for i in range(self.cfg.n_layers):
             x = self.block(i)(x, cos, sin, mask)
         x = self.final_norm(x)

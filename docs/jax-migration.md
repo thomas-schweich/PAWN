@@ -46,7 +46,7 @@ explicitly out of v1 to de-risk convergence.
 
 | Migrates to JAX | Unchanged (framework-agnostic) |
 |---|---|
-| `pawn/model.py` — Equinox `PAWNCLM` supernet | Rust `engine/` — all chess logic, tokenization, legal-mask replay |
+| `pawn/jax/model.py` (→ `pawn/model.py` post-migration) — Equinox `PAWNModel` supernet | Rust `engine/` — all chess logic, tokenization, legal-mask replay |
 | `pawn/trainer.py` — fused training loop | `pawn/dashboard/` — Solara, reads `metrics.jsonl` |
 | `pawn/data.py` — corpus generation/loading | `pawn/logging.py` — `MetricsLogger` JSONL contract |
 | `pawn/gpu.py` — device config | `deploy/`, Docker images, `configs/` |
@@ -65,7 +65,8 @@ evaluation.
 
 ### 3.1 Model — Equinox
 
-`PAWNCLM` becomes an Equinox module (a PyTree of arrays): RMSNorm, SwiGLU, RoPE,
+`PAWNModel` (the JAX-side counterpart to the legacy PyTorch `PAWNCLM`) is an
+Equinox module (a PyTree of arrays): RMSNorm, SwiGLU, RoPE,
 and factored embeddings (`src_embed[s] + dst_embed[d] + promo_embed[p]`). The
 model is stored at the **supernet** dimensions; the three variants are nested
 slices of it (§5).
@@ -381,9 +382,14 @@ porting work but conceptually the simplest — it is mostly forward evaluation.
 
 ## 8. ROCm specifics
 
-- GPU-backend extras mirror today's pattern: `jax[rocm]` vs `jax[cuda12]`. uv
-  cannot co-resolve them from one lockfile, so the `--extra rocm` /
-  `--extra cu128` split is retained.
+- **Phase 1 (current):** `jax`, `equinox`, `optax` are declared as base
+  dependencies in `pyproject.toml`, pulling CPU `jaxlib` by default. This is
+  what makes `uv run pyright pawn/` resolve on CI without an extra and keeps
+  Phase-1 verification (logit-parity tests, checkpoint round-trip) running
+  on CPU JAX.
+- **Phase 2 (deferred):** GPU-backend extras will mirror today's torch
+  pattern: `jax[rocm]` vs `jax[cuda12]`. uv cannot co-resolve them from one
+  lockfile, so the `--extra rocm` / `--extra cu128` split will be retained.
 - `jax.jit` replaces `torch.compile`; there is no SDPA-backend selection to
   manage (plain attention).
 - Port the `configure_gpu()` CPU guard and the `PAWN_ALLOW_CPU=1` escape hatch.

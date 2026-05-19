@@ -143,7 +143,9 @@ def _attention(
     v = split(wv)
 
     scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * (head_dim**-0.5)
-    weights = jax.nn.softmax(scores + mask, axis=-1)
+    # Cast the mask into the scores' dtype so a bf16 forward isn't promoted
+    # back to fp32 by an always-fp32 mask — keeps the residual stream bf16.
+    weights = jax.nn.softmax(scores + mask.astype(scores.dtype), axis=-1)
     # A fully-masked query row (only in a degenerate all-padding sequence —
     # padding masks keys, and position 0 is normally a real token) softmaxes
     # 0/0 to NaN; zero those rows, matching recent PyTorch SDPA behaviour.
@@ -258,7 +260,13 @@ class PAWNModel(eqx.Module):
             h = h + _ffn(_rmsnorm(h, lw.ffn_norm), lw.w_gate, lw.w_up, lw.w_down)
             return h, None
 
-        x, _ = jax.lax.scan(run_layer, x, layers)
+        # Wrap the scan body in ``jax.checkpoint`` so the backward sweep
+        # rematerialises layer activations instead of storing them — without
+        # this, scan stores the full (B, H, T, T) scores and ~(B, T, d_ff)
+        # MLP intermediates per layer (~30–50 GB at B=256/T=512 for the
+        # supernet), which would OOM the moment Phase 2 takes a gradient.
+        # Under plain forward (no grad), remat is a no-op semantically.
+        x, _ = jax.lax.scan(jax.checkpoint(run_layer), x, layers)
         x = _rmsnorm(x, self.final_norm)
         return x @ self.lm_head
 

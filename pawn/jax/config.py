@@ -44,6 +44,13 @@ class ModelConfig:
             raise ValueError(
                 f"d_model={self.d_model} not divisible by n_heads={self.n_heads}"
             )
+        if self.head_dim % 2 != 0:
+            # RoPE rotates pairs of channels, so the per-head dimension must
+            # be even — otherwise ``arange(0, head_dim, 2)`` silently leaves
+            # the last channel un-rotated.
+            raise ValueError(
+                f"head_dim={self.head_dim} must be even (RoPE rotates pairs)"
+            )
 
     @property
     def head_dim(self) -> int:

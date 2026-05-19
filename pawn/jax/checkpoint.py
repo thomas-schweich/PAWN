@@ -198,6 +198,13 @@ def save_model(path: str | Path, model: PAWNModel) -> None:
 
     # Rename-aside overwrite: the previous checkpoint stays on disk (as
     # ``.bak``) until the new directory is in place.
+    #
+    # Recover from a *previous* interrupted overwrite: if a stranded
+    # ``.bak`` exists but ``target`` is gone, the prior save was killed
+    # between rename(target, backup) and rename(tmp, target). Restore the
+    # backup so we never destroy the only good checkpoint on disk.
+    if backup.exists() and not target.exists():
+        os.rename(backup, target)
     if backup.exists():
         shutil.rmtree(backup)
     if target.exists():
@@ -232,7 +239,21 @@ def read_model_config(path: str | Path) -> ModelConfig:
             f"checkpoint {path} has format_version {version!r}; this build "
             f"reads version {CHECKPOINT_FORMAT_VERSION}"
         )
-    return ModelConfig(**config["model_config"])
+    mc = config["model_config"]
+    # Refuse to unpack a config that carries fields ``ModelConfig`` doesn't
+    # know about — the most common cause is a legacy PyTorch checkpoint
+    # whose ``CLMConfig`` includes ``dropout`` etc. Point the caller at the
+    # converter instead of letting them hit a cryptic ``TypeError`` from the
+    # ModelConfig constructor.
+    known = {f.name for f in dataclasses.fields(ModelConfig)}
+    unknown = sorted(set(mc) - known)
+    if unknown:
+        raise ValueError(
+            f"{path}/config.json has unexpected fields {unknown}; this looks "
+            "like a legacy PyTorch checkpoint — convert it first with "
+            "pawn.jax.legacy.convert_legacy_checkpoint."
+        )
+    return ModelConfig(**{k: mc[k] for k in known})
 
 
 def load_model(path: str | Path) -> PAWNModel:

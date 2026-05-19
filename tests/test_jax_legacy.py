@@ -118,6 +118,66 @@ def test_convert_missing_model_config_key(tmp_path: Path) -> None:
         convert_legacy_checkpoint(src, tmp_path / "dst")
 
 
+def test_logit_parity_with_pad_and_outcome_tokens(tmp_path: Path) -> None:
+    """The parity guarantee must hold when the input includes PAD and outcome
+    tokens, exercising the embedding-override branches end-to-end."""
+    src = tmp_path / "legacy"
+    cfg = CLMConfig.toy()
+    torch_model = write_legacy_checkpoint(src, cfg)
+    dst = tmp_path / "jax"
+    convert_legacy_checkpoint(src, dst)
+    jax_model = load_model(dst)
+
+    b, t = 2, 24
+    rng = np.random.default_rng(2)
+    tokens_np = rng.integers(0, 1968, size=(b, t), dtype=np.int64)
+    tokens_np[:, 0] = 1969 + 3       # outcome at position 0
+    tokens_np[:, -3:] = 1968         # trailing PAD
+    mask_np = np.ones((b, t), dtype=bool)
+    mask_np[:, -3:] = False
+    with torch.no_grad():
+        torch_logits, _ = torch_model(
+            torch.from_numpy(tokens_np), torch.from_numpy(mask_np)
+        )
+    jax_logits = jax.jit(lambda m, tk, am: m(tk, am))(
+        jax_model, jnp.asarray(tokens_np), jnp.asarray(mask_np)
+    )
+    # PAD positions diverge by design (legacy SDPA vs JAX plain attention treat
+    # fully-masked-key rows differently); compare only real-token positions.
+    real = mask_np
+    diff = np.abs(
+        torch_logits.cpu().numpy()[real] - np.asarray(jax_logits)[real]
+    ).max()
+    assert diff < 1e-4, (
+        f"PAD/outcome-token parity fail at real positions: max |Δ| = {diff}"
+    )
+
+
+def test_convert_legacy_checkpoint_verifies_source_sentinel(
+    tmp_path: Path,
+) -> None:
+    """When the legacy source carries a ``.complete`` sentinel, the converter
+    refuses to convert a corrupted source rather than re-signing bad bytes
+    into a "valid"-looking JAX checkpoint."""
+    from pawn.jax.checkpoint import (
+        CheckpointIntegrityError,
+        _write_sentinel,
+    )
+    src = tmp_path / "legacy"
+    cfg = CLMConfig.toy()
+    write_legacy_checkpoint(src, cfg)
+    _write_sentinel(src)              # mark the source as integrity-checked
+    # Corrupt the source bytes after the sentinel was written.
+    sf = src / "model.safetensors"
+    with open(sf, "r+b") as f:
+        f.seek(-4, 2)
+        original = f.read(4)
+        f.seek(-4, 2)
+        f.write(bytes(b ^ 0xFF for b in original))
+    with pytest.raises(CheckpointIntegrityError):
+        convert_legacy_checkpoint(src, tmp_path / "dst")
+
+
 def test_convert_state_dict_missing_layer_weight_raises() -> None:
     """``_check_keys`` must surface a missing per-layer tensor with a clear error."""
     cfg = legacy_to_model_config(

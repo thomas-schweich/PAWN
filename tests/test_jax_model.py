@@ -124,3 +124,31 @@ def test_validate_nested_rejects_rope_base_drift() -> None:
 def test_modelconfig_post_init_divisibility() -> None:
     with pytest.raises(ValueError, match="not divisible"):
         ModelConfig(d_model=257, n_layers=2, n_heads=4, d_ff=256)
+
+
+def test_modelconfig_post_init_rejects_odd_head_dim() -> None:
+    # d=60, n_heads=4 -> head_dim=15 (odd); RoPE would mis-rotate the last channel.
+    with pytest.raises(ValueError, match="head_dim=15 must be even"):
+        ModelConfig(d_model=60, n_layers=2, n_heads=4, d_ff=256)
+
+
+def test_partial_padding_mask_path() -> None:
+    """Real-world inputs have trailing PAD; verify logits stay finite and the
+    real-token region is independent of the padded tail (causal + key-masking
+    invariant). Previously every test passed an all-True mask."""
+    cfg = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=256)
+    model = init_model(cfg, jax.random.PRNGKey(0))
+    fwd = eqx.filter_jit(lambda m, t, a: m(t, a))
+
+    real_tokens = jax.random.randint(jax.random.PRNGKey(1), (1, 16), 0, 1968)
+    pad_mask = jnp.ones((1, 16), dtype=bool).at[0, 12:].set(False)
+
+    # Tail beyond position 11 is masked; tokens beyond 11 must not influence
+    # logits at positions <= 11. Compare against a run with different tail tokens.
+    tail_swapped = real_tokens.at[0, 12:].set(0)
+    out_a = fwd(model, real_tokens, pad_mask)
+    out_b = fwd(model, tail_swapped, pad_mask)
+    assert bool(jnp.all(jnp.isfinite(out_a)))
+    assert bool(jnp.array_equal(out_a[:, :12], out_b[:, :12])), (
+        "padded tail tokens leak into earlier positions"
+    )

@@ -143,3 +143,55 @@ def test_verify_checkpoint_public(
     (ckpt / ".complete").unlink()
     with pytest.raises(IncompleteCheckpointError):
         verify_checkpoint(ckpt)
+
+
+def test_read_model_config_happy_path(
+    small_model: PAWNModel, tmp_path: Path
+) -> None:
+    ckpt = tmp_path / "ckpt"
+    save_model(ckpt, small_model)
+    cfg = read_model_config(ckpt)
+    assert cfg == small_model.cfg
+
+
+def test_read_model_config_rejects_legacy_pytorch_config(tmp_path: Path) -> None:
+    """A legacy PyTorch ``config.json`` (which carries ``dropout``) must raise
+    a clear error pointing at the converter, not a cryptic ``TypeError`` from
+    the ModelConfig constructor."""
+    import json
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text(
+        json.dumps({
+            "format_version": 1,
+            "model_config": {
+                "d_model": 512, "n_layers": 8, "n_heads": 8, "d_ff": 2048,
+                "vocab_size": 1980, "max_seq_len": 512, "n_outcomes": 11,
+                "rope_base": 10000.0,
+                "dropout": 0.1,  # legacy CLMConfig field; not on ModelConfig
+            },
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="legacy PyTorch checkpoint"):
+        read_model_config(ckpt)
+
+
+def test_save_recovers_from_stranded_backup(
+    small_model: PAWNModel, tmp_path: Path
+) -> None:
+    """A previous interrupt that left a stranded ``.bak`` and no ``target``
+    must not destroy the recoverable checkpoint on the next save."""
+    import os
+    ckpt = tmp_path / "ckpt"
+    save_model(ckpt, small_model)
+    # Simulate: prior interrupt between rename(target, backup) and
+    # rename(tmp, target) — target is gone, .bak is the only good copy.
+    os.rename(ckpt, ckpt.with_name("ckpt.bak"))
+    assert not ckpt.exists()
+    assert ckpt.with_name("ckpt.bak").exists()
+    # Next save_model must recover, not destroy, the stranded .bak.
+    save_model(ckpt, small_model)
+    assert ckpt.exists()
+    assert not ckpt.with_name("ckpt.bak").exists()
+    load_model(ckpt)  # must load cleanly
