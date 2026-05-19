@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("jax")
 pytest.importorskip("equinox")
+pytest.importorskip("chess_engine")
 
 import jax
 import jax.numpy as jnp
@@ -17,6 +17,7 @@ from pawn.jax.checkpoint import (
     CheckpointIntegrityError,
     IncompleteCheckpointError,
     UnsupportedCheckpointVersionError,
+    _PARAM_FIELDS,
     load_model,
     read_model_config,
     save_model,
@@ -24,16 +25,9 @@ from pawn.jax.checkpoint import (
 )
 from pawn.jax.config import VARIANTS
 from pawn.jax.model import PAWNModel, init_model
+from tests._jax_helpers import corrupt_safetensors, stamp_format_version
 
 pytestmark = pytest.mark.integration
-
-
-_PARAM_FIELDS = (
-    "src_embed", "dst_embed", "promo_embed", "pad_embed", "outcome_embed",
-    "attn_norm", "wq", "wk", "wv", "wo",
-    "ffn_norm", "w_gate", "w_up", "w_down",
-    "final_norm", "lm_head",
-)
 
 
 @pytest.fixture
@@ -92,9 +86,7 @@ def test_corrupted_file_raises(
 ) -> None:
     ckpt = tmp_path / "ckpt"
     save_model(ckpt, small_model)
-    with open(ckpt / "model.safetensors", "r+b") as f:
-        f.seek(-4, 2)
-        f.write(b"\x00\x00\x00\x00")
+    corrupt_safetensors(ckpt)
     with pytest.raises(CheckpointIntegrityError):
         load_model(ckpt)
 
@@ -107,17 +99,27 @@ def test_extra_file_raises(small_model: PAWNModel, tmp_path: Path) -> None:
         load_model(ckpt)
 
 
-def test_unsupported_version_raises(
+def test_unsupported_version_raises_on_read_config(
     small_model: PAWNModel, tmp_path: Path
 ) -> None:
     ckpt = tmp_path / "ckpt"
     save_model(ckpt, small_model)
-    cfg_path = ckpt / "config.json"
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    cfg["format_version"] = 999
-    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    stamp_format_version(ckpt, 999)
     with pytest.raises(UnsupportedCheckpointVersionError):
         read_model_config(ckpt)
+
+
+def test_unsupported_version_raises_on_load_model(
+    small_model: PAWNModel, tmp_path: Path
+) -> None:
+    """``load_model`` re-validates the version even with a valid sentinel."""
+    ckpt = tmp_path / "ckpt"
+    save_model(ckpt, small_model)
+    # stamp_format_version re-signs the sentinel so integrity passes and we
+    # reach the version gate inside load_model.
+    stamp_format_version(ckpt, 999)
+    with pytest.raises(UnsupportedCheckpointVersionError):
+        load_model(ckpt)
 
 
 def test_atomic_overwrite_cleans_up(

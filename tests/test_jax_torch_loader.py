@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -11,10 +9,10 @@ import pytest
 pytest.importorskip("jax")
 pytest.importorskip("equinox")
 pytest.importorskip("torch")
+pytest.importorskip("chess_engine")
 
 import numpy as np
 import torch
-from safetensors.torch import save_file as torch_save_file
 
 from pawn.config import CLMConfig
 from pawn.jax.legacy import convert_legacy_checkpoint
@@ -24,31 +22,20 @@ from pawn.jax.torch_loader import (
     load_pawn,
 )
 from pawn.model import PAWNCLM
+from tests._jax_helpers import (
+    corrupt_safetensors,
+    stamp_format_version,
+    write_legacy_checkpoint,
+)
 
 pytestmark = pytest.mark.integration
 
 
 def _build_jax_checkpoint(tmp_path: Path, seed: int = 0) -> tuple[Path, PAWNCLM]:
-    """Build a fresh PyTorch toy model, convert to JAX format; return (path, ref_model)."""
+    """Build a fresh PyTorch toy model, convert to JAX format."""
     cfg = CLMConfig.toy()
-    torch.manual_seed(seed)
-    model = PAWNCLM(cfg).eval()
     src = tmp_path / "legacy"
-    src.mkdir()
-    state = {
-        k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()
-    }
-    torch_save_file(state, src / "model.safetensors")
-    (src / "config.json").write_text(
-        json.dumps(
-            {
-                "format_version": 1,
-                "checkpoint_type": "pretrain",
-                "model_config": asdict(cfg),
-            }
-        ),
-        encoding="utf-8",
-    )
+    model = write_legacy_checkpoint(src, cfg, seed=seed)
     dst = tmp_path / "jax"
     convert_legacy_checkpoint(src, dst)
     return dst, model
@@ -72,22 +59,15 @@ def test_loader_logit_parity(tmp_path: Path) -> None:
 
 def test_loader_corrupt_safetensors_raises(tmp_path: Path) -> None:
     dst, _ = _build_jax_checkpoint(tmp_path)
-    with open(dst / "model.safetensors", "r+b") as f:
-        f.seek(-4, 2)
-        f.write(b"\x00\x00\x00\x00")
+    corrupt_safetensors(dst)
     with pytest.raises(CheckpointIntegrityError):
         load_pawn(dst)
 
 
 def test_loader_bad_version_raises(tmp_path: Path) -> None:
+    """With a re-signed sentinel, ``load_pawn`` reaches the version gate."""
     dst, _ = _build_jax_checkpoint(tmp_path)
-    # Removing the sentinel makes the loader skip integrity verification so
-    # we can reach the format_version check with a tampered config.json.
-    (dst / ".complete").unlink()
-    cfg_path = dst / "config.json"
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    cfg["format_version"] = 999
-    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    stamp_format_version(dst, 999)
     with pytest.raises(UnsupportedCheckpointVersionError):
         load_pawn(dst)
 
@@ -97,3 +77,15 @@ def test_loader_missing_sentinel_is_accepted(tmp_path: Path) -> None:
     dst, _ = _build_jax_checkpoint(tmp_path)
     (dst / ".complete").unlink()
     load_pawn(dst)  # must not raise
+
+
+def test_loader_max_seq_len_guard_raises(tmp_path: Path) -> None:
+    """``PAWNTorch.forward`` rejects sequences longer than ``cfg.max_seq_len``."""
+    dst, _ = _build_jax_checkpoint(tmp_path)
+    model = load_pawn(dst).eval()
+    too_long = model.cfg.max_seq_len + 1
+    tokens = torch.zeros((1, too_long), dtype=torch.long)
+    mask = torch.ones((1, too_long), dtype=torch.bool)
+    with pytest.raises(ValueError, match="exceeds max_seq_len"):
+        with torch.no_grad():
+            model(tokens, mask)

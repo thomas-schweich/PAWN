@@ -6,6 +6,7 @@ import pytest
 
 pytest.importorskip("jax")
 pytest.importorskip("equinox")
+pytest.importorskip("chess_engine")
 
 import equinox as eqx
 import jax
@@ -102,13 +103,13 @@ def test_validate_nested_accepts_each_variant() -> None:
 def test_validate_nested_rejects_head_dim_mismatch() -> None:
     # SUPERNET head_dim = 64; build a variant with head_dim 32.
     bad = ModelConfig(d_model=256, n_layers=8, n_heads=8, d_ff=1024)
-    with pytest.raises(ValueError, match="head_dim"):
+    with pytest.raises(ValueError, match=r"head_dim=\d+ != supernet"):
         validate_nested(bad, SUPERNET)
 
 
 def test_validate_nested_rejects_too_wide() -> None:
     too_wide = ModelConfig(d_model=768, n_layers=8, n_heads=12, d_ff=2048)
-    with pytest.raises(ValueError, match="d_model"):
+    with pytest.raises(ValueError, match=r"d_model=\d+ exceeds supernet"):
         validate_nested(too_wide, SUPERNET)
 
 
@@ -116,7 +117,7 @@ def test_validate_nested_rejects_rope_base_drift() -> None:
     drifted = ModelConfig(
         d_model=256, n_layers=8, n_heads=4, d_ff=1024, rope_base=50000.0
     )
-    with pytest.raises(ValueError, match="rope_base"):
+    with pytest.raises(ValueError, match=r"rope_base=.* must equal supernet"):
         validate_nested(drifted, SUPERNET)
 
 
