@@ -153,6 +153,38 @@ def test_logit_parity_with_pad_and_outcome_tokens(tmp_path: Path) -> None:
     )
 
 
+def test_convert_rejects_sentinel_missing_full_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """A source directory containing a full-checkpoint payload file
+    (optimizer.safetensors / training_state.json) but lacking ``.complete``
+    is a corrupted/interrupted save, not a bare HF snapshot — the
+    converter must refuse rather than silently re-signing the bytes."""
+    from pawn.jax.checkpoint import IncompleteCheckpointError
+    src = tmp_path / "legacy"
+    write_legacy_checkpoint(src, CLMConfig.toy())
+    # Drop a payload file alongside model.safetensors + config.json, no
+    # .complete — mimic an interrupted full-checkpoint save.
+    (src / "training_state.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(IncompleteCheckpointError, match="payload"):
+        convert_legacy_checkpoint(src, tmp_path / "dst")
+
+
+def test_convert_accepts_hf_snapshot_with_metadata(tmp_path: Path) -> None:
+    """A directory that looks like an ``hf_hub.snapshot_download(...)``
+    result — model.safetensors + config.json plus README / LICENSE — must
+    convert cleanly, not be mistaken for a corrupted full checkpoint."""
+    src = tmp_path / "hf_snapshot"
+    cfg = CLMConfig.toy()
+    write_legacy_checkpoint(src, cfg)
+    for filename in ("README.md", "LICENSE", ".gitattributes"):
+        (src / filename).write_text("noise", encoding="utf-8")
+    dst = tmp_path / "jax"
+    convert_legacy_checkpoint(src, dst)
+    loaded = load_model(dst)
+    assert loaded.cfg.d_model == cfg.d_model
+
+
 def test_convert_legacy_checkpoint_verifies_source_sentinel(
     tmp_path: Path,
 ) -> None:

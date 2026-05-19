@@ -134,12 +134,16 @@ def test_modelconfig_post_init_rejects_odd_head_dim() -> None:
 
 def test_grad_through_scan_remat_is_finite() -> None:
     """``jax.checkpoint(run_layer)`` (the Phase-2 memory-saving wrap on the
-    scan body) must actually compose with autodiff and produce finite
-    gradients. Without this test, the perf fix is unverified end-to-end."""
+    scan body) must compose with autodiff and produce finite gradients —
+    including a batch element with an all-padding mask, which exercises
+    the all-masked-query softmax-NaN-avoidance path under grad."""
     cfg = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=256)
     model = init_model(cfg, jax.random.PRNGKey(0))
-    tokens = jax.random.randint(jax.random.PRNGKey(1), (1, 8), 0, 1968)
-    mask = jnp.ones((1, 8), dtype=bool)
+    tokens = jax.random.randint(jax.random.PRNGKey(1), (2, 8), 0, 1968)
+    # Two batch elements: one all-real, one all-padding (the degenerate
+    # case that previously would have NaN'd softmax forward and poisoned
+    # gradients backward).
+    mask = jnp.ones((2, 8), dtype=bool).at[1].set(False)
 
     def loss(m: PAWNModel, tk: jax.Array, am: jax.Array) -> jax.Array:
         return m(tk, am).sum()

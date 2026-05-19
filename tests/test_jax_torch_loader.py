@@ -82,6 +82,20 @@ def test_loader_missing_sentinel_is_accepted(tmp_path: Path) -> None:
     load_pawn(dst)  # must not raise
 
 
+def test_loader_rejects_missing_model_config_key(tmp_path: Path) -> None:
+    """``load_pawn`` raises a clear KeyError when the source config.json has
+    no ``model_config`` entry, mirroring the JAX-side guard."""
+    import json
+    dst, _ = _build_jax_checkpoint(tmp_path)
+    cfg_path = dst / "config.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg.pop("model_config", None)
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    (dst / ".complete").unlink()  # bypass sentinel since we mutated config
+    with pytest.raises(KeyError, match="model_config"):
+        load_pawn(dst)
+
+
 def test_loader_max_seq_len_guard_raises(tmp_path: Path) -> None:
     """``PAWNTorch.forward`` rejects sequences longer than ``cfg.max_seq_len``."""
     dst, _ = _build_jax_checkpoint(tmp_path)

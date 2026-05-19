@@ -194,22 +194,25 @@ def convert_legacy_checkpoint(src: str | Path, dst: str | Path) -> None:
     """
     src_path = Path(src)
     # Sentinel handling: full pretraining checkpoints carry ``.complete`` and
-    # MUST verify; bare HF-format directories (exactly model.safetensors +
-    # config.json) have no sentinel and convert without integrity check.
-    # Refuse any other configuration (e.g. a full checkpoint where the
-    # sentinel was lost in an interrupted save) rather than silently
-    # re-signing potentially corrupt bytes.
+    # MUST verify; sentinel-absent directories may be either a bare HF
+    # snapshot (model.safetensors + config.json plus the usual README /
+    # LICENSE / .gitattributes from ``huggingface_hub.snapshot_download``)
+    # or a corrupted full checkpoint (the sentinel was lost in an interrupted
+    # save while optimizer / training-state files were already on disk). We
+    # discriminate on the presence of *payload* files specific to a full
+    # training checkpoint — README and similar metadata files are fine.
     sentinel = src_path / ".complete"
+    payload_files = {"optimizer.safetensors", "training_state.json"}
     present = {entry.name for entry in src_path.iterdir() if entry.is_file()}
-    bare_hf_files = {"model.safetensors", "config.json"}
+    present_payload = present & payload_files
     if sentinel.exists():
         verify_checkpoint(src_path)
-    elif present - bare_hf_files:
+    elif present_payload:
         raise IncompleteCheckpointError(
-            f"{src_path} has files beyond bare HF format ({sorted(present - bare_hf_files)}) "
-            "but no .complete sentinel — looks like a corrupted full "
-            "checkpoint. Restore the sentinel or strip back to "
-            f"{sorted(bare_hf_files)} before converting."
+            f"{src_path} has full-checkpoint payload files "
+            f"({sorted(present_payload)}) but no .complete sentinel — "
+            "looks like a corrupted / interrupted save. Restore the "
+            "sentinel or remove the payload files before converting."
         )
     config_path = src_path / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))

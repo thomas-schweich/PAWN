@@ -211,7 +211,9 @@ def test_read_model_config_uses_defaults_for_missing_fields(
     payload = json.loads(cfg_path.read_text(encoding="utf-8"))
     payload["model_config"].pop("rope_base", None)
     cfg_path.write_text(json.dumps(payload), encoding="utf-8")
-    (ckpt / ".complete").unlink()  # bypass sentinel since we mutated config
+    # ``read_model_config`` does not check the sentinel (documented), so
+    # we can leave .complete in place — the test exercises only the
+    # config-deserialisation path.
     out = read_model_config(ckpt)
     assert out.rope_base == 10000.0  # ModelConfig default
 
@@ -227,4 +229,27 @@ def test_read_model_config_rejects_missing_model_config_key(
         json.dumps({"format_version": 1}), encoding="utf-8"
     )
     with pytest.raises(KeyError, match="model_config"):
+        read_model_config(ckpt)
+
+
+def test_read_model_config_rejects_missing_required_field(
+    tmp_path: Path,
+) -> None:
+    """A required ``ModelConfig`` field missing from disk must raise a clear
+    ``KeyError`` naming the field — not a cryptic ``TypeError`` from the
+    ModelConfig constructor's missing-positional-argument."""
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text(
+        json.dumps({
+            "format_version": 1,
+            "model_config": {
+                # ``d_model`` deliberately absent; the other required fields
+                # are present so we isolate the required-fields check.
+                "n_layers": 8, "n_heads": 8, "d_ff": 2048,
+            },
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(KeyError, match=r"missing required fields.*d_model"):
         read_model_config(ckpt)

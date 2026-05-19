@@ -252,7 +252,9 @@ def read_model_config(path: str | Path) -> ModelConfig:
     # whose ``CLMConfig`` includes ``dropout`` etc. Point the caller at the
     # converter instead of letting them hit a cryptic ``TypeError`` from the
     # ModelConfig constructor. Fields ``ModelConfig`` knows about but the
-    # config doesn't include fall back to ``ModelConfig`` defaults.
+    # config doesn't include fall back to ``ModelConfig`` defaults — except
+    # for required fields (no default), where we raise a clear KeyError
+    # rather than letting ModelConfig() surface an opaque TypeError.
     known = {f.name for f in dataclasses.fields(ModelConfig)}
     unknown = sorted(set(mc) - known)
     if unknown:
@@ -260,6 +262,18 @@ def read_model_config(path: str | Path) -> ModelConfig:
             f"{config_path} has unexpected fields {unknown}; this looks "
             "like a legacy PyTorch checkpoint — convert it first with "
             "pawn.jax.legacy.convert_legacy_checkpoint."
+        )
+    required = {
+        f.name
+        for f in dataclasses.fields(ModelConfig)
+        if f.default is dataclasses.MISSING
+        and f.default_factory is dataclasses.MISSING
+    }
+    missing_required = sorted(required - set(mc))
+    if missing_required:
+        raise KeyError(
+            f"{config_path} model_config is missing required fields "
+            f"{missing_required}"
         )
     return ModelConfig(**{k: mc[k] for k in known if k in mc})
 
@@ -269,8 +283,12 @@ def load_model(path: str | Path) -> PAWNModel:
 
     Raises ``IncompleteCheckpointError`` if the ``.complete`` sentinel is
     missing, ``CheckpointIntegrityError`` if any file's hash mismatches or the
-    tensor key set does not match the schema, and
-    ``UnsupportedCheckpointVersionError`` on an unknown format version.
+    tensor key set does not match the schema,
+    ``UnsupportedCheckpointVersionError`` on an unknown format version,
+    ``KeyError`` if ``config.json`` lacks ``model_config`` or
+    ``model_config`` is missing a required ``ModelConfig`` field, and
+    ``ValueError`` if ``model_config`` carries unknown (e.g. legacy
+    PyTorch) fields.
     """
     directory = Path(path)
     _verify_sentinel(directory)
