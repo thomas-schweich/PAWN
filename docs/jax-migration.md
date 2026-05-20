@@ -1,16 +1,43 @@
 # PAWN → JAX migration
 
-> **Status:** **in progress.** Phase 1 (model + checkpoint + legacy
-> converter + thin PyTorch loader + tests) is merged into the
-> `jax_migration` integration branch (PR #101). Phases 2 (pretraining),
-> 3 (adapters), and 4 (eval port + PyTorch removal + flatten) are
-> pending. The final `jax_migration → main` PR is the framework-swap
-> event; `main` never carries the half-migrated state. See §10.
+> **Status:** **feature-complete on `jax_migration`; the final
+> `jax_migration → main` framework-swap PR (#111) is open for human
+> review.** Phases 1–4 (model + checkpoint + converter + pretraining
+> trainer + adapter trainer + the full ported eval suite + PyTorch
+> removal) have all squash-merged into the `jax_migration` integration
+> branch. The remaining trainer-side follow-ups (adapter trainer
+> dispatch glue, KV-cache generation, variable-prefix-length grouping,
+> stale-doc cleanup, deploy-script log-dir flag) land on the
+> integration branch as additional commits before the framework swap.
+> `main` never carries the half-migrated state. See §10.
 >
 > This document describes a from-scratch redesign of PAWN's training stack
 > (pretraining, adapter training, evaluation) onto a single all-JAX pipeline,
 > motivated by compute efficiency and by eliminating the dual-framework
 > maintenance burden.
+
+## Invocation
+
+This document predates the `/review-driven-development` skill, so the
+original phase-by-phase implementation followed an earlier ad-hoc
+cadence. From Phase 4-followup onward the work follows the skill's
+contract; `--resume docs/jax-migration.md` re-enters that workflow.
+
+- Feature slug: `jax-migration`
+- Master feature branch: `jax_migration` (long-lived integration
+  branch, cut once from `main`)
+- Effective flags (after defaults applied):
+  - `--plan-path`: `docs/jax-migration.md`
+  - `--no-review-plan`: `false` (the plan was reviewed inline as
+    Phases were authored)
+  - `--loop-chunks`: `false` (single review wave per chunk; matches the
+    cadence used through Phase 4)
+  - `--loop-sections`: `true`
+  - `--loop-final`: `true`
+  - `--pr-after-fixes`: `false` — the framework-swap PR (#111) was
+    opened manually and stays open per user directive ("don't merge
+    the full PR yet; summarize the work and I'll review the full-fat
+    PR before merging").
 
 ## 1. Motivation
 
@@ -52,17 +79,18 @@ explicitly out of v1 to de-risk convergence.
 
 | Migrates to JAX | Unchanged (framework-agnostic) |
 |---|---|
-| `pawn/jax/model.py` (→ `pawn/model.py` post-migration) — Equinox `PAWNModel` supernet | Rust `engine/` — all chess logic, tokenization, legal-mask replay |
-| `pawn/trainer.py` — fused training loop | `pawn/dashboard/` — Solara, reads `metrics.jsonl` |
-| `pawn/data.py` — corpus generation/loading | `pawn/logging.py` — `MetricsLogger` JSONL contract |
-| `pawn/gpu.py` — device config | `deploy/`, Docker images, `configs/` |
+| `pawn/model.py` — Equinox `PAWNModel` supernet | Rust `engine/` — all chess logic, tokenization, legal-mask replay |
+| `pawn/trainer.py` — fused training loop | `deploy/`, Docker images |
+| `pawn/corpus.py` — corpus generation/loading | |
 | `pawn/checkpoint.py` — PyTree serialization | |
-| `pawn/adapters/` (6 strategies) + `pawn/specialized_clm.py` + `pawn/adapter_training.py` (`unfreeze`) — all 8 strategies | |
-| `pawn/eval_suite/` — probes, accuracy, generation, diagnostics | |
-| `pawn/lichess_data.py` — Python wrapper | |
+| `pawn/adapters/` — all 8 strategies (lora / film / unfreeze / bottleneck / hybrid / sparse / rosa / specialized_clm) | |
+| `pawn/eval.py` (move-accuracy), `pawn/probes.py` (linear probes), `pawn/generation.py` (generation diagnostics), `pawn/lichess_eval.py` (Elo-stratified eval) — ported from `pawn/eval_suite/` | |
 
-`pawn/config.py` (dataclasses: `CLMConfig`, `TrainingConfig`) survives; the JAX
-package gets its own `ModelConfig` carrying the supernet/variant specs (§5.1).
+`pawn/config.py` is the canonical config module post-migration; it
+defines `ModelConfig` plus the `SUPERNET` / `TINY_SUPERNET` / `VARIANTS`
+/ `TINY_VARIANTS` constants (§5.1). The legacy `CLMConfig` /
+`TrainingConfig` dataclasses were removed alongside the PyTorch surface
+in Phase 4.
 
 ## 3. Shared core
 
@@ -143,7 +171,7 @@ format) under a documented canonical parameter-name schema.
 
 The corpus is **pre-generated offline** by the existing Rust engine
 (`generate_random_games()`). The engine returns int16 tokens, int16
-game lengths, and uint8 termination codes; `pawn.jax.corpus` widens
+game lengths, and uint8 termination codes; `pawn.corpus` widens
 them at the boundary to a packed `Corpus` of int32 `tokens [N, T]`,
 bool `attn_mask [N, T]`, int32 `targets [N, T]` (input shifted left by
 one), bool `loss_mask [N, T]`, and uint8 `outcome_offset [N]`. `N =
@@ -223,8 +251,8 @@ material redefinition is large's head count (8 → 10); this is
 it keeps RoPE identical across variants. `d_ff` is sliced alongside `d_model`
 (each variant keeps its SwiGLU ratio; the ratios must nest).
 
-The variants are `ModelConfig` instances in `pawn/jax/config.py` — a single
-`SUPERNET` config plus a `VARIANTS` dict, distinct from the legacy `CLMConfig`.
+The variants are `ModelConfig` instances in `pawn/config.py` — a single
+`SUPERNET` config plus a `VARIANTS` dict.
 Per existing project practice, model cards and
 published-checkpoint docs derive parameter counts from `config.json` — they are
 not hardcoded, so the slight redefinition does not require manual edits.
@@ -244,9 +272,10 @@ RMSNorm normalizes over the *active* width at run time. Because each variant's
 forward during training uses exactly its slice, the sliced weights are trained
 to function at that width — the slimmable-network / MatFormer property.
 
-`pawn.jax.config.validate_nested()` enforces the nesting invariant — equal
-`head_dim`, identical vocab / context / outcome layout, and no axis exceeding
-the supernet — and is called by `sliced()` before extraction.
+`pawn.config.validate_nested(variant, supernet)` enforces the nesting
+invariant — equal `head_dim`, identical vocab / context / outcome
+layout, and no axis exceeding the supernet — and is called by
+`pawn.model.sliced()` before extraction.
 
 ### 5.3 Joint training
 
@@ -445,9 +474,11 @@ PR is the project's only "framework swap" event.
 The invariant: **`main` never carries the half-migrated state.** While JAX
 matures, `main` stays single-framework (the existing PyTorch implementation).
 `jax_migration` is the only branch where JAX and PyTorch coexist, and the
-coexistence is bounded — Phase 4 deletes PyTorch and flattens `pawn/jax/*`
-up into `pawn/` before the final merge. The repo never directly supports
-both implementations at once on `main`.
+coexistence is bounded — Phase 4 deletes PyTorch and flattens what had
+been the transient `pawn/jax/*` namespace up into `pawn/` before the
+final merge. The repo never directly supports both implementations at
+once on `main`. (The flatten landed in PR #106; on the integration
+branch everything is now reachable from the top-level `pawn` package.)
 
 Merge mechanics: per-phase PRs are **squash-merged** into `jax_migration`
 (the repo's policy disallows merge commits). Each phase becomes one commit
@@ -495,7 +526,7 @@ unit-level parity already in the test suite:
 | Phase | Run |
 |---|---|
 | 1 | Convert each of `pawn-{small,base,large}` end-to-end and verify forward parity against the PyTorch reference on a real batch. Phase 1 has no trainer; this is the closest analogue. |
-| 2 | Pretrain the tiny **nested** supernet ``TINY_SUPERNET`` for ≥1000 steps on Rust-generated random games. Verify loss decreases, no NaNs, all sliced variants forward-evaluate cleanly. ``TINY_SUPERNET`` (defined in ``pawn.jax.config``) is ``(d_model=192, n_layers=4, n_heads=3, d_ff=768)`` with ``head_dim=64``, paired with ``TINY_VARIANTS`` at ``d_model ∈ {64, 128, 192}`` — three nested variants. (``pawn.jax.config.TOY`` is *not* a nested supernet — it has ``head_dim=16`` and would fail ``validate_nested`` against ``TINY_SUPERNET``/``SUPERNET``.) The production ``SUPERNET`` is too large for a smoke run on commodity hardware. |
+| 2 | Pretrain the tiny **nested** supernet ``TINY_SUPERNET`` for ≥1000 steps on Rust-generated random games. Verify loss decreases, no NaNs, all sliced variants forward-evaluate cleanly. ``TINY_SUPERNET`` (defined in ``pawn.config``) is ``(d_model=192, n_layers=4, n_heads=3, d_ff=768)`` with ``head_dim=64``, paired with ``TINY_VARIANTS`` at ``d_model ∈ {64, 128, 192}`` — three nested variants. (``pawn.config.TOY`` is *not* a nested supernet — it has ``head_dim=16`` and would fail ``validate_nested`` against ``TINY_SUPERNET``/``SUPERNET``; it is test-internal only.) The production ``SUPERNET`` is too large for a smoke run on commodity hardware. |
 | 3 | Train one adapter strategy (e.g. LoRA rank 4) for one epoch on a small Lichess Elo slice. Verify val loss decreases, no NaNs. |
 | 4 | Run a probe + move-accuracy eval (the ported JAX `eval_suite`) on a converted / published checkpoint. Numbers within tolerance of the PyTorch reference. |
 
@@ -523,7 +554,55 @@ phase already pulled. If a fresh download is genuinely needed (cache
 eviction, format change), do it explicitly and one-time and note it in
 the PR body.
 
-## 12. Resolved decisions
+## 12. Phase-4 followup chunks
+
+After Phase 4 squash-merged into `jax_migration`, a handful of
+trainer-side parity gaps remained — the framework swap was
+feature-complete on the **evaluation** side but the adapter trainer
+driver still only dispatched LoRA, and the generation path lacked a
+KV-cache variant. The follow-ups land as additional chunks on the
+integration branch under `/review-driven-development --resume
+docs/jax-migration.md`. Status is per-chunk:
+
+- **Deploy script log-dir flag (landed).** `deploy/pod.sh` and
+  `deploy/vast.sh` `cmd_launch` now pass `--logs-dir` rather than the
+  legacy `--log-dir` (which matched the now-deleted PyTorch
+  `scripts/train.py`). CLAUDE.md's launch examples updated in lockstep
+  — they no longer mention `--logs-dir` because the wrapper injects it
+  silently; users **should not** pass `--logs-dir` in the command they
+  hand to `pod.sh launch <name> …` or `vast.sh launch <name> …` or
+  argparse will reject the duplicate.
+- **Adapter dispatch glue (pending).** `scripts/train_jax_adapter.py`
+  will gain a `--strategy {lora,film,unfreeze,bottleneck,hybrid,sparse,
+  rosa,specialized_clm}` flag plus per-strategy hyperparameter args.
+  The PyTree contract is the same across strategies —
+  `adapter_filter(model)` returns a Python-bool spec consumed by
+  `eqx.partition`; the `Unfreeze` strategy adds a companion per-layer
+  `unfreeze_gradient_mask` plugged into `optax.masked`. `RoSA` will
+  carry a three-phase host-driven training schedule (LoRA warmup →
+  gradient-magnitude mask → joint training); the phase transitions
+  re-jit naturally because the trainable subtree's bool spec changes
+  between phases.
+- **KV-cache generation (pending).** `pawn.generation.autoregressive_generate`
+  will gain a KV-cached variant alongside the O(N²) recompute path
+  the Phase-4 port currently ships. A bitwise-equivalence regression
+  test against the recompute path pins parity; the KV-cache path is
+  the default for long generations.
+- **Variable-prefix-length grouping (pending).** The `poisoned_prefix`
+  and `impossible_task` §6 generation tests currently inherit a legacy
+  port bug — variable-length prefixes within a batch align under a
+  batch-wide max, leaving PAD gaps in the attended context for rows
+  with shorter prefixes (the engine state is still correct, but the
+  model is conditioned on a PAD-padded context). The fix groups games
+  by prefix length and runs each group as its own generation batch.
+
+These follow-ups do not change any design decision in §1–§11; they
+close out the work the integration branch had left as trainer-side
+TODOs. Each chunk gets its own section branch off `jax_migration`,
+squash-merges into the integration branch on close, and updates this
+section's chunk status to "landed".
+
+## 13. Resolved decisions
 
 | Question | Decision |
 |---|---|

@@ -326,10 +326,10 @@ cmd_launch() {
         echo "Usage: $0 launch <name> <command...>"
         echo ""
         echo "Examples:"
-        echo "  $0 launch exp1 scripts/train.py --variant base"
-        echo "  $0 launch exp1 scripts/train.py --run-type adapter --strategy bottleneck \\"
-        echo "      --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \\"
-        echo "      --elo-min 1800 --elo-max 1900 --bottleneck-dim 32"
+        echo "  $0 launch exp1 scripts/train_jax.py --supernet tiny --total-steps 1000 --batch-size 16 --seq-len 64 --k 50"
+        echo "  $0 launch exp1 scripts/train_jax_adapter.py --supernet tiny --variant base --rank 4 --total-steps 500"
+        echo ""
+        echo "Note: the wrapper appends --logs-dir logs to your command; do NOT pass --logs-dir yourself or argparse will reject the duplicate."
         exit 1
     fi
 
@@ -341,7 +341,7 @@ cmd_launch() {
     echo "Launching on '$name': $cmd"
     ssh $(ssh_opts) "root@$POD_HOST" "cd /workspace/pawn && \
         nohup uv run python $cmd \
-            --log-dir logs \
+            --logs-dir logs \
             > logs/${script_name}.log 2>&1 & \
         sleep 2 && \
         echo 'PID: '\$(pgrep -f '$script_name' | head -1) && \
@@ -389,7 +389,7 @@ case "${1:-}" in
         echo "  $0 create exp1 --gpu a5000"
         echo "  $0 create sweep1 --gpu a100-pcie --count 2 --community"
         echo "  $0 deploy exp1"
-        echo "  $0 launch exp1 scripts/train.py --variant base"
+        echo "  $0 launch exp1 scripts/train_jax.py --supernet tiny --total-steps 1000"
         echo "  $0 stop exp1"
         ;;
 esac
