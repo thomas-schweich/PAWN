@@ -526,7 +526,7 @@ unit-level parity already in the test suite:
 | Phase | Run |
 |---|---|
 | 1 | Convert each of `pawn-{small,base,large}` end-to-end and verify forward parity against the PyTorch reference on a real batch. Phase 1 has no trainer; this is the closest analogue. |
-| 2 | Pretrain the tiny **nested** supernet ``TINY_SUPERNET`` for ≥1000 steps on Rust-generated random games. Verify loss decreases, no NaNs, all sliced variants forward-evaluate cleanly. ``TINY_SUPERNET`` (defined in ``pawn.config``) is ``(d_model=192, n_layers=4, n_heads=3, d_ff=768)`` with ``head_dim=64``, paired with ``TINY_VARIANTS`` at ``d_model ∈ {64, 128, 192}`` — three nested variants. The production ``SUPERNET`` is too large for a smoke run on commodity hardware. |
+| 2 | Pretrain the tiny **nested** supernet ``TINY_SUPERNET`` for ≥1000 steps on Rust-generated random games. Verify loss decreases, no NaNs, all sliced variants forward-evaluate cleanly. ``TINY_SUPERNET`` (defined in ``pawn.config``) is ``(d_model=192, n_layers=4, n_heads=3, d_ff=768)`` with ``head_dim=64``, paired with ``TINY_VARIANTS`` at ``d_model ∈ {64, 128, 192}`` — three nested variants. (``pawn.config.TOY`` is *not* a nested supernet — it has ``head_dim=16`` and would fail ``validate_nested`` against ``TINY_SUPERNET``/``SUPERNET``; it is test-internal only.) The production ``SUPERNET`` is too large for a smoke run on commodity hardware. |
 | 3 | Train one adapter strategy (e.g. LoRA rank 4) for one epoch on a small Lichess Elo slice. Verify val loss decreases, no NaNs. |
 | 4 | Run a probe + move-accuracy eval (the ported JAX `eval_suite`) on a converted / published checkpoint. Numbers within tolerance of the PyTorch reference. |
 
