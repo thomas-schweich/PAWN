@@ -1,4 +1,4 @@
-"""Tests for ``pawn.jax.trainer`` — single-step training primitives."""
+"""Tests for ``pawn.trainer`` — single-step training primitives."""
 
 from __future__ import annotations
 
@@ -15,10 +15,10 @@ pytest.importorskip("chess_engine")
 import jax
 import jax.numpy as jnp
 
-from pawn.jax.config import TINY_SUPERNET, TINY_VARIANTS, VOCAB_SIZE, ModelConfig
-from pawn.jax.corpus import generate_corpus
-from pawn.jax.model import init_model
-from pawn.jax.trainer import (
+from pawn.config import TINY_SUPERNET, TINY_VARIANTS, VOCAB_SIZE, ModelConfig
+from pawn.corpus import generate_corpus
+from pawn.model import init_model
+from pawn.trainer import (
     Batch,
     VariantSpec,
     _variant_key,

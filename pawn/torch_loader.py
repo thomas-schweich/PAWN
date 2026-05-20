@@ -2,18 +2,18 @@
 
 Lets external PyTorch users load a PAWN checkpoint without installing JAX or
 Equinox. Reads the canonical JAX safetensors schema (see
-``pawn.jax.checkpoint``), reverses the JAX ``(in, out)`` Linear convention to
+``pawn.checkpoint``), reverses the JAX ``(in, out)`` Linear convention to
 PyTorch's ``(out, in)``, unstacks the per-layer leading axis into individual
 modules, and returns an inference-only PyTorch ``nn.Module`` mirroring the
 architecture (RMSNorm, RoPE, SwiGLU, plain attention, factored embeddings,
 untied LM head).
 
-This module is self-contained on purpose so non-JAX users can drop it in
-without pulling ``pawn.jax.checkpoint`` (which imports JAX). The atomic
-``.complete`` sentinel verification and the three exception classes mirror
-``pawn.jax.checkpoint``; the duplication is intentional for the migration
-window and will collapse when ``pawn.jax`` becomes the single checkpoint
-module.
+This module imports from ``pawn._sentinel`` (stdlib-only, JAX-free) and
+``pawn.config`` (also JAX-free at the top level for the constants we
+import below). It does NOT import ``pawn.checkpoint`` because that
+module pulls JAX through ``pawn.model``; the loader stays
+torch+safetensors only on the import graph so external non-JAX users
+can drop it in cleanly.
 
 Inference-only: training paths (loss, optimizer state, KV cache) are not
 implemented. ``model.eval()`` and ``torch.no_grad()`` are the caller's
@@ -26,7 +26,6 @@ decomposition table is read once at model construction).
 from __future__ import annotations
 
 import functools
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +35,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
+
+from pawn._sentinel import (
+    SENTINEL_FILE as _SENTINEL_FILE,
+    CheckpointIntegrityError,
+    IncompleteCheckpointError,
+    verify_sentinel as _verify_sentinel,
+)
 
 PAD_TOKEN = 1968
 OUTCOME_TOKEN_BASE = 1969
@@ -52,7 +58,7 @@ assert PAD_TOKEN < OUTCOME_TOKEN_BASE, (
 )
 
 # Canonical safetensors schema (16 keys, declaration order) — must match
-# pawn.jax.checkpoint._PARAM_FIELDS. Hardcoded here so the loader stays
+# pawn.checkpoint._PARAM_FIELDS. Hardcoded here so the loader stays
 # JAX-dependency-free.
 _SCHEMA_KEYS: tuple[str, ...] = (
     "src_embed", "dst_embed", "promo_embed", "pad_embed", "outcome_embed",
@@ -62,25 +68,15 @@ _SCHEMA_KEYS: tuple[str, ...] = (
 )
 
 # Checkpoint format version recognised by this loader. Mirrors
-# ``pawn.jax.checkpoint.CHECKPOINT_FORMAT_VERSION``; bumped together when the
+# ``pawn.checkpoint.CHECKPOINT_FORMAT_VERSION``; bumped together when the
 # schema changes.
 _CHECKPOINT_FORMAT_VERSION = 1
-_SENTINEL_FILE = ".complete"
 
 
-# ---------------------------------------------------------------------------
-# Exceptions (mirror pawn.jax.checkpoint; duplicated to keep the loader
-# self-contained for non-JAX consumers).
-# ---------------------------------------------------------------------------
-
-
-class IncompleteCheckpointError(Exception):
-    """Raised when a checkpoint directory is missing its .complete sentinel."""
-
-
-class CheckpointIntegrityError(Exception):
-    """Raised when a checkpoint's files do not match its .complete sentinel
-    or the safetensors key set does not match the canonical schema."""
+# ``IncompleteCheckpointError`` / ``CheckpointIntegrityError`` are imported
+# from ``pawn._sentinel`` above (shared with ``pawn.checkpoint`` since the
+# post-Phase-4 flatten of ``pawn.jax.*`` into ``pawn.*``). The loader-
+# specific ``UnsupportedCheckpointVersionError`` lives here.
 
 
 class UnsupportedCheckpointVersionError(Exception):
@@ -94,7 +90,7 @@ class UnsupportedCheckpointVersionError(Exception):
 
 @dataclass(frozen=True)
 class TorchModelConfig:
-    """Mirror of ``pawn.jax.config.ModelConfig`` — architecture only."""
+    """Mirror of ``pawn.config.ModelConfig`` — architecture only."""
 
     d_model: int
     n_layers: int
@@ -173,7 +169,7 @@ def _apply_rope(
 
 
 class _RMSNorm(nn.Module):
-    """RMSNorm matching ``pawn.jax.model._rmsnorm``.
+    """RMSNorm matching ``pawn.model._rmsnorm``.
 
     The reduction and the weight multiply both run in fp32, the result is
     downcast once. This intentionally diverges from the legacy
@@ -298,7 +294,7 @@ class _Embedding(nn.Module):
 class PAWNTorch(nn.Module):
     """Inference-only PyTorch PAWN model, loadable from JAX-format checkpoints.
 
-    Architectural mirror of ``pawn.jax.model.PAWNModel``: RMSNorm, RoPE,
+    Architectural mirror of ``pawn.model.PAWNModel``: RMSNorm, RoPE,
     SwiGLU FFN, plain attention, factored embeddings, untied LM head,
     pre-norm residual blocks.
     """
@@ -350,53 +346,13 @@ class PAWNTorch(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Sentinel + load
+# Load
 # ---------------------------------------------------------------------------
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _verify_sentinel(directory: Path) -> None:
-    """Verify ``.complete`` exists and matches the directory file-set + hashes.
-
-    Mirrors ``pawn.jax.checkpoint._verify_sentinel`` exactly; duplicated to
-    keep the loader independent of the JAX-dependent checkpoint module.
-    """
-    sentinel = directory / _SENTINEL_FILE
-    if not sentinel.exists():
-        raise IncompleteCheckpointError(
-            f"{directory} is missing its {_SENTINEL_FILE} sentinel — "
-            "likely a partial write from an interrupted save."
-        )
-    data = json.loads(sentinel.read_text(encoding="utf-8"))
-    if "files" not in data:
-        raise CheckpointIntegrityError(
-            f"{sentinel} is malformed — missing the 'files' key"
-        )
-    listed: dict[str, str] = data["files"]
-    present = {
-        entry.name
-        for entry in directory.iterdir()
-        if entry.is_file() and entry.name != _SENTINEL_FILE
-    }
-    if present != set(listed):
-        raise CheckpointIntegrityError(
-            f"{directory} contains files {sorted(present)} but its "
-            f"{_SENTINEL_FILE} sentinel lists {sorted(listed)}"
-        )
-    for name, expected in listed.items():
-        actual = _sha256_file(directory / name)
-        if actual != expected:
-            raise CheckpointIntegrityError(
-                f"SHA-256 mismatch for {name} in {directory}: "
-                f"expected {expected[:16]}…, got {actual[:16]}…"
-            )
+#
+# Sentinel verification + SHA-256 helpers live in ``pawn._sentinel``
+# (shared with ``pawn.checkpoint``). They were duplicated here during
+# the migration window to keep the loader JAX-free; post-flatten the
+# shared module is also JAX-free, so the duplication is gone.
 
 
 def load_pawn(checkpoint_path: str | Path) -> PAWNTorch:

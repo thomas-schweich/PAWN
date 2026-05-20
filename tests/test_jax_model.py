@@ -1,4 +1,4 @@
-"""Tests for ``pawn.jax.model`` — supernet, variant slicing, forward."""
+"""Tests for ``pawn.model`` — supernet, variant slicing, forward."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from pawn.jax.config import SUPERNET, TOY, VARIANTS, ModelConfig, validate_nested
-from pawn.jax.model import PAWNModel, init_model, sliced
+from pawn.config import SUPERNET, TOY, VARIANTS, ModelConfig, validate_nested
+from pawn.model import PAWNModel, init_model, sliced
 
 pytestmark = pytest.mark.unit
 

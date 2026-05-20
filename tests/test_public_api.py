@@ -1,7 +1,11 @@
-"""Pin the public surface of the ``pawn`` package.
+"""Pin the public surface of the ``pawn`` package post-JAX-migration.
 
-If any partition accidentally breaks a documented re-export, this test
-fails loudly. Owned by the lead — workers should not edit.
+After the PyTorch removal in Phase 4 the package's public surface is
+JAX-only. ``pawn`` re-exports nothing at the top level — JAX consumers
+import from ``pawn.*`` directly; external PyTorch users use the
+thin loader at ``pawn.torch_loader.load_pawn``.
+
+Owned by the lead — workers should not edit.
 """
 
 from __future__ import annotations
@@ -10,24 +14,60 @@ import pytest
 
 
 @pytest.mark.unit
-def test_pawn_reexports_stable() -> None:
-    """``from pawn import CLMConfig, TrainingConfig, PAWNCLM`` must work
-    when torch is installed.
-
-    ``pawn/__init__.py`` gates the ``PAWNCLM`` re-export on torch being
-    importable so JAX-only consumers can ``import pawn.jax.*`` without
-    pulling torch (see the JAX migration). This test pins the stable
-    surface under the torch-installed configuration that CI exercises;
-    the torch-free configuration is covered by `test_pawn_jax_*` files
-    importing pawn.jax.* without going through pawn.model.
-    """
-    pytest.importorskip("torch")
+def test_pawn_top_level_has_no_torch_reexports() -> None:
+    """``pawn`` should not surface any of the legacy torch-only symbols
+    (``CLMConfig``, ``TrainingConfig``, ``PAWNCLM``). A regression that
+    re-introduced one would silently revive the dual-framework era."""
     import pawn
 
-    assert hasattr(pawn, "CLMConfig")
-    assert hasattr(pawn, "TrainingConfig")
-    assert hasattr(pawn, "PAWNCLM")
-    assert set(pawn.__all__) == {"CLMConfig", "TrainingConfig", "PAWNCLM"}
+    for legacy in ("CLMConfig", "TrainingConfig", "PAWNCLM"):
+        assert not hasattr(pawn, legacy), (
+            f"pawn.{legacy} re-introduced — the post-Phase-4 package "
+            f"should not surface legacy torch symbols at the top level"
+        )
+
+
+@pytest.mark.unit
+def test_pawn_jax_public_surface() -> None:
+    """The documented JAX-side public surface is reachable from the
+    ``pawn.jax`` namespace without any extra plumbing."""
+    from pawn.adapters import LoRAConfig, LoRAModel, adapter_filter, init_lora_model
+    from pawn.config import (
+        MAX_SEQ_LEN,
+        NUM_ACTIONS,
+        PAD_TOKEN,
+        SUPERNET,
+        TINY_SUPERNET,
+        TINY_VARIANTS,
+        VARIANTS,
+        ModelConfig,
+        validate_nested,
+    )
+    from pawn.model import PAWNModel, init_model, sliced
+    from pawn.trainer import (
+        Batch,
+        TrainState,
+        VariantSpec,
+        make_lr_schedule,
+        make_optimizer,
+        make_scan_step,
+        make_train_step,
+    )
+
+    # Touch the imports so they don't get tree-shaken by a linter.
+    assert NUM_ACTIONS == 1968
+    assert PAD_TOKEN == 1968
+    assert MAX_SEQ_LEN == 512
+    assert SUPERNET.d_model == 640
+    assert TINY_SUPERNET.d_model == 192
+    assert set(VARIANTS) == {"small", "base", "large"}
+    assert set(TINY_VARIANTS) == {"small", "base", "large"}
+    _ = (
+        LoRAConfig, LoRAModel, adapter_filter, init_lora_model,
+        ModelConfig, validate_nested, PAWNModel, init_model, sliced,
+        Batch, TrainState, VariantSpec, make_lr_schedule,
+        make_optimizer, make_scan_step, make_train_step,
+    )
 
 
 @pytest.mark.unit

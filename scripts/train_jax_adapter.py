@@ -38,23 +38,23 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from pawn.jax.adapter_trainer import (
+from pawn.adapter_trainer import (
     init_adapter_state,
     make_adapter_scan_step,
     make_adapter_train_step,
     make_eval_step,
 )
-from pawn.jax.adapters import LoRAConfig, LoRAModel, init_lora_model
-from pawn.jax.config import (
+from pawn.adapters import LoRAConfig, LoRAModel, init_lora_model
+from pawn.config import (
     SUPERNET,
     TINY_SUPERNET,
     TINY_VARIANTS,
     VARIANTS,
     ModelConfig,
 )
-from pawn.jax.corpus import generate_corpus
-from pawn.jax.model import init_model, sliced
-from pawn.jax.trainer import Batch, make_lr_schedule, make_optimizer
+from pawn.corpus import generate_corpus
+from pawn.model import init_model, sliced
+from pawn.trainer import Batch, make_lr_schedule, make_optimizer
 
 
 def _slug() -> str:

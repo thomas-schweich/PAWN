@@ -10,7 +10,7 @@ later phases to reuse.
 For each variant:
 
   1. ``huggingface_hub.snapshot_download`` (cache-aware; re-runs hit cache).
-  2. ``pawn.jax.legacy.convert_legacy_checkpoint`` → JAX checkpoint dir.
+  2. ``pawn.legacy.convert_legacy_checkpoint`` → JAX checkpoint dir.
   3. Build a PyTorch ``PAWNCLM`` reference from the same state_dict.
   4. Forward on a deterministic batch through both models; report
      ``max |Δlogit|`` and ``mean |Δlogit|``.
@@ -36,11 +36,11 @@ import numpy as np
 import torch
 from safetensors.torch import load_file as torch_load_file
 
-from pawn.config import CLMConfig
-from pawn.jax.checkpoint import load_model
-from pawn.jax.legacy import convert_legacy_checkpoint
-from pawn.jax.model import PAWNModel
-from pawn.model import PAWNCLM
+from pawn._torch_legacy_fixture import CLMConfig
+from pawn.checkpoint import load_model
+from pawn.legacy import convert_legacy_checkpoint
+from pawn.model import PAWNModel
+from pawn._torch_legacy_fixture import PAWNCLM
 
 VARIANTS = ("pawn-small", "pawn-base", "pawn-large")
 HF_OWNER = "thomas-schweich"

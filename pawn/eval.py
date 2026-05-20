@@ -20,9 +20,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from pawn.jax.config import NUM_ACTIONS
-from pawn.jax.corpus import Corpus
-from pawn.jax.model import PAWNModel
+from pawn.config import NUM_ACTIONS
+from pawn.corpus import Corpus
+from pawn.model import PAWNModel
 
 
 @dataclass(frozen=True)

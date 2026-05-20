@@ -2,27 +2,30 @@
 
 A causal transformer trained on random chess games, designed as a testbed for finetuning and augmentation methods at small scales. Apache 2.0.
 
+The training stack is JAX/Equinox + Optax. The legacy PyTorch implementation was removed in Phase 4 of the JAX migration (`docs/jax-migration.md` — the canonical reference for everything below).
+
 ## Repository Structure
 
 ```
 pawn/
-├── engine/          # Rust chess engine with PyO3 bindings (via shakmaty)
-├── pawn/            # Core Python package
-│   ├── config.py    # CLMConfig (small/base/large), TrainingConfig
-│   ├── model.py     # PAWNCLM transformer (RMSNorm, SwiGLU, RoPE, factored embeddings)
-│   ├── data.py      # On-the-fly random game data pipeline (prepend_outcome flag)
-│   ├── lichess_data.py  # Lichess PGN data pipeline + legal mask computation
-│   ├── trainer.py   # Pretraining loop
-│   ├── gpu.py       # GPU auto-detection (compile/AMP/SDPA backend)
-│   ├── logging.py   # MetricsLogger (JSONL output)
-│   ├── checkpoint.py # Atomic save/load, .complete sentinel, HF push
-│   ├── adapters/    # Bottleneck, LoRA, FiLM, sparse, hybrid
-│   ├── eval_suite/  # Probes, generation tests, diagnostics, lichess eval
-│   └── dashboard/   # Solara training dashboard (metrics, charts, runner)
-├── scripts/         # Training and evaluation entry points
-├── tests/           # Unit tests
-├── deploy/          # RunPod + vast.ai deployment scripts
-└── docs/            # Architecture, training, adapter docs
+├── engine/           # Rust chess engine with PyO3 bindings (via shakmaty)
+├── pawn/             # Core Python package (JAX/Equinox)
+│   ├── config.py     # ModelConfig, SUPERNET / TINY_SUPERNET, validate_nested
+│   ├── model.py      # PAWNModel transformer (RMSNorm, SwiGLU, RoPE, factored embeddings, stacked lax.scan layers)
+│   ├── corpus.py     # Rust-engine corpus → trainer-shaped int32/bool arrays
+│   ├── trainer.py    # Pretraining: cross-entropy, AdamW + warmup-cosine, K-step lax.scan, joint multi-variant loss
+│   ├── adapter_trainer.py  # Two-tier frozen/trainable training; scan + eval
+│   ├── adapters/     # LoRA (only adapter strategy ported so far)
+│   ├── eval.py       # Move-prediction accuracy + per-phase breakdown
+│   ├── checkpoint.py # Atomic save/load (.tmp → rename, .complete sentinel)
+│   ├── legacy.py     # PyTorch → JAX checkpoint converter
+│   ├── torch_loader.py        # Thin PyTorch loader for non-JAX consumers
+│   ├── _sentinel.py           # Shared .complete sentinel (no JAX, no torch)
+│   └── _torch_legacy_fixture.py  # Test fixture: legacy PyTorch architecture for converter-parity tests
+├── scripts/          # CLI drivers (train_jax, train_jax_adapter, eval_jax, convert_published_checkpoints)
+├── tests/            # JAX test suite (~190 tests; no PyTorch surface)
+├── deploy/           # RunPod + vast.ai deployment scripts
+└── docs/             # docs/jax-migration.md is authoritative
 ```
 
 ## Building
@@ -33,20 +36,28 @@ This is a uv workspace. The root project is the `pawn` Python package; `engine/`
 # Build the Rust chess engine (required before anything else)
 cd engine && uv run --with maturin maturin develop --release && cd ..
 
-# Install Python deps (dev tools like pytest, seaborn, solara are in base dependencies):
+# Install Python deps. The rocm/cu128 extras add the GPU jaxlib AND the
+# torch dep (used by the thin loader + legacy-converter parity tests).
 uv sync --extra rocm      # AMD (ROCm 7.1)
 uv sync --extra cu128     # NVIDIA (CUDA 12.8)
 
 # Run tests
-uv run pytest tests/
+uv run --extra rocm pytest tests/
 
-# Pretrain from scratch (local dev)
-uv run python scripts/train.py --variant base --local-checkpoints
+# Pretrain from scratch on the tiny nested supernet (verification scale)
+uv run --extra rocm python scripts/train_jax.py \
+    --supernet tiny --total-steps 1000 --batch-size 16 --seq-len 64 --k 50
+
+# Train a LoRA adapter on a frozen sliced backbone
+uv run --extra rocm python scripts/train_jax_adapter.py \
+    --supernet tiny --variant base --rank 4 --total-steps 500
+
+# Evaluate a converted JAX checkpoint
+uv run --extra rocm python scripts/eval_jax.py \
+    --checkpoint ~/.cache/huggingface/pawn-jax-converted/pawn-base
 ```
 
-The only extras are GPU backends (`rocm` or `cu128`). Everything else (pytest, solara, optuna, seaborn, etc.) is in base dependencies. PyTorch lives in the extras because uv can't resolve CPU/CUDA/ROCm from a single lockfile — always specify `--extra rocm` or `--extra cu128`.
-
-**GPU requirement**: `configure_gpu()` (called by every training and eval script) raises `RuntimeError` if no CUDA/ROCm GPU is detected. This prevents accidentally running GPU workloads on CPU, which is almost always a mistake. The environment variable `PAWN_ALLOW_CPU=1` overrides this check as a last resort for the rare case where CPU execution is genuinely intended (e.g. a lightweight backfill script). Unit tests do not call `configure_gpu()` and run fine on CPU without the override.
+CPU jaxlib ships in the base `dependencies`; the `rocm` / `cu128` / `torch-loader` extras add GPU jax / GPU torch as needed. The torch dep is now optional — the JAX training and eval surface installs without it.
 
 ## Engine (`engine/`)
 

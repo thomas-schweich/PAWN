@@ -1,4 +1,4 @@
-"""Tests for ``pawn.jax.legacy`` — PyTorch->JAX converter and logit parity."""
+"""Tests for ``pawn.legacy`` — PyTorch->JAX converter and logit parity."""
 
 from __future__ import annotations
 
@@ -17,9 +17,9 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 
-from pawn.config import CLMConfig
-from pawn.jax.checkpoint import load_model
-from pawn.jax.legacy import (
+from pawn._torch_legacy_fixture import CLMConfig
+from pawn.checkpoint import load_model
+from pawn.legacy import (
     IncompatibleCheckpointError,
     convert_legacy_checkpoint,
     convert_state_dict,
@@ -197,7 +197,7 @@ def test_convert_legacy_checkpoint_verifies_source_sentinel(
     """When the legacy source carries a ``.complete`` sentinel, the converter
     refuses to convert a corrupted source rather than re-signing bad bytes
     into a "valid"-looking JAX checkpoint."""
-    from pawn.jax.checkpoint import (
+    from pawn.checkpoint import (
         CheckpointIntegrityError,
         _write_sentinel,
     )
