@@ -44,7 +44,7 @@ import optax
 from pawn.trainer import Batch, compute_grad_norm, cross_entropy_loss
 
 
-class _AdapterModelProto(Protocol):
+class AdapterModelProto(Protocol):
     """Structural protocol for any adapter ``eqx.Module``.
 
     Every concrete adapter type (``LoRAModel``, ``FiLMModel``, etc.)
@@ -52,10 +52,18 @@ class _AdapterModelProto(Protocol):
     ``eqx.Module`` doesn't declare a callable signature, so pyright
     rejects ``model(tokens, attn_mask)``. This protocol expresses the
     runtime contract — every value flowing through here implements
-    it — without introducing a unifying base class.
+    it — without introducing a unifying base class. Public so that
+    ``scripts/train_jax_adapter.py`` (and any other downstream caller
+    that does ``cast(...)`` around an eqx-combined model) shares the
+    one canonical shape.
     """
 
     def __call__(self, tokens: jax.Array, attn_mask: jax.Array) -> jax.Array: ...
+
+
+# Internal alias kept for back-compat with the original commit that
+# introduced the protocol; new code should import ``AdapterModelProto``.
+_AdapterModelProto = AdapterModelProto
 
 # Type alias: a filter-spec function for any adapter ``eqx.Module``.
 # Returns a tree shaped like ``model`` whose leaves are Python ``bool``

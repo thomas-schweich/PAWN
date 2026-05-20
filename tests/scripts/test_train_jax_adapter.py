@@ -272,6 +272,86 @@ def test_each_strategy_dispatch_runs(strategy: str, tmp_path: Path) -> None:
         assert math.isfinite(r["grad_norm_mean"])
 
 
+def test_rosa_three_phase_writes_transition_log_and_completes(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str],
+) -> None:
+    """RoSA dispatch with --rosa-warmup-frac > 0 runs the three-phase
+    schedule (LoRA warmup → mask gen → joint training) end-to-end.
+
+    Pins:
+      * The Phase 2 → 3 transition log line appears once (announces
+        active-entry count + targets).
+      * The training run completes without raising.
+      * `metrics.jsonl` has rows for both Phase 1 and Phase 3.
+    """
+    _run(
+        [
+            "--strategy", "rosa",
+            "--supernet", "tiny", "--variant", "small",
+            "--rank", "4",
+            "--total-steps", "20", "--k", "5",
+            "--batch-size", "2", "--seq-len", "16",
+            "--warmup-steps", "2", "--val-frac", "0.25",
+            "--val-every", "1",
+            "--rosa-warmup-frac", "0.5",
+            "--rosa-top-k-frac", "0.1",
+        ],
+        tmp_path,
+    )
+    out, _err = capfd.readouterr()
+    # The transition log is exactly one line for a single transition.
+    assert out.count("[rosa] Phase 2 → 3 transition") == 1
+    runs = list(tmp_path.glob("jax_adapter_run_*"))
+    assert len(runs) == 1
+    rows = [
+        json.loads(line)
+        for line in (runs[0] / "metrics.jsonl").read_text().splitlines()
+    ]
+    # 4 chunks total at k=5: 2 Phase-1 + 2 Phase-3.
+    assert len(rows) == 4
+
+
+def test_rosa_zero_warmup_runs_single_phase(tmp_path: Path) -> None:
+    """``--rosa-warmup-frac 0`` skips Phase 1 + Phase 2 entirely and
+    trains jointly from step 0 — matches the C.1 dispatch behaviour
+    pre-three-phase. Useful for runs that want to compare against a
+    pure-joint baseline."""
+    _run(
+        [
+            "--strategy", "rosa",
+            "--supernet", "tiny", "--variant", "small",
+            "--rank", "4",
+            "--total-steps", "10", "--k", "5",
+            "--batch-size", "2", "--seq-len", "16",
+            "--warmup-steps", "1", "--val-frac", "0.5",
+            "--val-every", "1",
+            "--rosa-warmup-frac", "0",
+        ],
+        tmp_path,
+    )
+    runs = list(tmp_path.glob("jax_adapter_run_*"))
+    assert len(runs) == 1
+
+
+def test_rosa_warmup_frac_too_large_rejected(tmp_path: Path) -> None:
+    """``--rosa-warmup-frac`` that leaves no Phase-3 chunks is a
+    user-error and surfaced upfront with a SystemExit so the user
+    knows before any compute spins up."""
+    with pytest.raises(SystemExit, match="Phase 3"):
+        _run(
+            [
+                "--strategy", "rosa",
+                "--supernet", "tiny", "--variant", "small",
+                "--rank", "4",
+                "--total-steps", "10", "--k", "5",
+                "--batch-size", "2", "--seq-len", "16",
+                "--warmup-steps", "1", "--val-frac", "0.5",
+                "--rosa-warmup-frac", "0.95",  # > 2/2 chunks → no joint chunks
+            ],
+            tmp_path,
+        )
+
+
 def test_rejects_bottleneck_dim_zero(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="bottleneck-dim"):
         _run(

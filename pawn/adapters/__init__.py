@@ -92,8 +92,11 @@ from pawn.adapters.rosa import (
     adapter_filter as rosa_adapter_filter,
 )
 from pawn.adapters.rosa import (
+    compute_phase2_mask as rosa_compute_phase2_mask,
     init_rosa_model,
+    lora_only_adapter_filter as rosa_lora_only_adapter_filter,
     set_mask as rosa_set_mask,
+    sparse_only_adapter_filter as rosa_sparse_only_adapter_filter,
 )
 from pawn.adapters.specialized_clm import (
     SpecializedCLMConfig,
@@ -160,7 +163,10 @@ __all__ = [
     "init_sparse_model",
     "init_unfreeze_model",
     "rosa_adapter_filter",
+    "rosa_compute_phase2_mask",
+    "rosa_lora_only_adapter_filter",
     "rosa_set_mask",
+    "rosa_sparse_only_adapter_filter",
     "sparse_adapter_filter",
     "specialized_clm_adapter_filter",
     "unfreeze_adapter_filter",

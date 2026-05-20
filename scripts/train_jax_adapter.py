@@ -45,7 +45,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import equinox as eqx
 import jax
@@ -53,6 +53,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from pawn.adapter_trainer import (
+    AdapterModelProto,
     init_adapter_state,
     make_adapter_scan_step,
     make_adapter_train_step,
@@ -64,6 +65,7 @@ from pawn.adapters import (
     HybridConfig,
     LoRAConfig,
     RoSAConfig,
+    RoSAModel,
     SparseConfig,
     SpecializedCLMConfig,
     UnfreezeConfig,
@@ -80,6 +82,9 @@ from pawn.adapters import (
     init_sparse_model,
     init_unfreeze_model,
     rosa_adapter_filter,
+    rosa_compute_phase2_mask,
+    rosa_lora_only_adapter_filter,
+    rosa_set_mask,
     specialized_clm_adapter_filter,
     sparse_adapter_filter,
     unfreeze_adapter_filter,
@@ -319,6 +324,60 @@ def _validate_strategy_args(args: argparse.Namespace) -> None:
         raise SystemExit(
             f"--n-unfreeze={args.n_unfreeze} must be >= 0"
         )
+    if args.strategy == "rosa":
+        if not 0.0 <= args.rosa_warmup_frac < 1.0:
+            raise SystemExit(
+                f"--rosa-warmup-frac={args.rosa_warmup_frac} must be in [0, 1)"
+            )
+        if not 0.0 < args.rosa_top_k_frac <= 1.0:
+            raise SystemExit(
+                f"--rosa-top-k-frac={args.rosa_top_k_frac} must be in (0, 1]"
+            )
+
+
+def _compute_rosa_phase2_dl_ddelta(
+    rosa_model: RoSAModel, batch: Batch,
+) -> dict[str, jax.Array]:
+    """Compute ``dL/dΔ_q``, ``dL/dΔ_k``, ``dL/dΔ_v``, ``dL/dΔ_o`` on
+    a batch with ``mask = all-True``.
+
+    Δ at this point is still zero (from init); the all-True mask
+    means Δ contributes additively to ``W_eff``, so
+    ``dL/dΔ_{ij} = dL/dW_eff_{ij}`` and is non-zero even though Δ
+    itself is zero. The gradient signal is what Phase-2 ranks by
+    magnitude to pick the top-k entries for the fixed sparse mask.
+
+    Returns ``{target: dL/dΔ_array}`` for each active target in
+    ``rosa_model.rosa.cfg.targets``.
+    """
+    from pawn.adapters.rosa import sparse_only_adapter_filter
+    from pawn.trainer import cross_entropy_loss
+
+    cfg = rosa_model.rosa.cfg
+    n_layers = rosa_model.backbone.cfg.n_layers
+    d = rosa_model.backbone.cfg.d_model
+    all_true = {
+        t: jnp.ones((n_layers, d, d), dtype=jnp.bool_) for t in cfg.targets
+    }
+    primed = rosa_set_mask(rosa_model, all_true)
+    trainable, frozen = eqx.partition(
+        primed, sparse_only_adapter_filter(primed),
+    )
+    tokens, attn_mask, targets, loss_mask = batch
+
+    def loss_fn(trn: eqx.Module) -> jax.Array:
+        # eqx.combine preserves the concrete RoSAModel type at runtime;
+        # cast through the same structural protocol the adapter
+        # trainer uses so pyright accepts ``m(tokens, attn_mask)``
+        # without a suppression.
+        m = cast(AdapterModelProto, eqx.combine(trn, frozen))
+        logits = m(tokens, attn_mask)
+        return cross_entropy_loss(logits, targets, loss_mask)
+
+    grads = eqx.filter_grad(loss_fn)(trainable)
+    return {
+        t: getattr(grads.rosa, f"delta_{t}") for t in cfg.targets
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +473,21 @@ def main(argv: list[str] | None = None) -> int:
         "--rosa-targets", nargs="+", default=["q", "v"],
         choices=["q", "k", "v", "o"],
         help="RoSA: attention projections to wrap.",
+    )
+    parser.add_argument(
+        "--rosa-warmup-frac", type=float, default=0.5,
+        help="RoSA: fraction of total chunks spent in Phase 1 (LoRA "
+             "warmup). The remaining chunks are Phase 3 (joint training); "
+             "Phase 2 (gradient-magnitude mask generation) takes one "
+             "extra batch between them and doesn't consume a training "
+             "chunk. Set to 0 to skip Phases 1 + 2 entirely and run "
+             "single-phase joint training from step 0.",
+    )
+    parser.add_argument(
+        "--rosa-top-k-frac", type=float, default=0.01,
+        help="RoSA: fraction of sparse-leg entries (per layer per "
+             "target) kept active by the Phase-2 mask. Default 0.01 "
+             "= top 1%% by |dL/dΔ| magnitude.",
     )
     # SpecializedCLM args.
     parser.add_argument(
@@ -606,9 +680,23 @@ def main(argv: list[str] | None = None) -> int:
     model, filter_fn, gradient_mask = build_fn(
         backbone, args, jax.random.PRNGKey(model_seed + 1),
     )
+    # RoSA Phase-1 override: when the three-phase schedule is active
+    # (``--rosa-warmup-frac > 0``), the warmup runs with the LoRA-only
+    # filter; only A, B accumulate gradients. The joint filter the
+    # builder returned applies after the Phase-2 mask gen
+    # (which happens inside the training loop). When
+    # ``--rosa-warmup-frac == 0`` the original joint filter is used
+    # from step 0 and the three-phase scheduler is a no-op.
+    rosa_three_phase = (
+        args.strategy == "rosa" and args.rosa_warmup_frac > 0.0
+    )
+    if rosa_three_phase:
+        active_filter_fn: Callable[..., eqx.Module] = rosa_lora_only_adapter_filter
+    else:
+        active_filter_fn = filter_fn
     optimizer = make_optimizer(sched)
     state, frozen = init_adapter_state(
-        model, optimizer, adapter_filter_fn=filter_fn,
+        model, optimizer, adapter_filter_fn=active_filter_fn,
     )
     train_step = make_adapter_train_step(
         optimizer, frozen, gradient_mask=gradient_mask,
@@ -617,7 +705,29 @@ def main(argv: list[str] | None = None) -> int:
     eval_step = make_eval_step(frozen)
 
     n_chunks = args.total_steps // args.k
-    print(f"[train] n_chunks={n_chunks} (K={args.k} steps each)")
+    rosa_warmup_chunks = (
+        max(1, int(round(args.rosa_warmup_frac * n_chunks)))
+        if rosa_three_phase else 0
+    )
+    if rosa_three_phase:
+        # Phase 1 + Phase 3 must each get at least one training chunk
+        # — degenerate splits are caught here so the user knows up
+        # front rather than the loop body silently skipping one phase.
+        if rosa_warmup_chunks >= n_chunks:
+            raise SystemExit(
+                f"--rosa-warmup-frac={args.rosa_warmup_frac} leaves no "
+                f"chunks for Phase 3 joint training (rosa_warmup_chunks="
+                f"{rosa_warmup_chunks}, n_chunks={n_chunks}). Reduce "
+                f"--rosa-warmup-frac or increase --total-steps."
+            )
+        print(
+            f"[train] n_chunks={n_chunks} (K={args.k} steps each); "
+            f"RoSA Phase 1 = {rosa_warmup_chunks} chunks, "
+            f"Phase 3 = {n_chunks - rosa_warmup_chunks} chunks; "
+            f"top-k frac = {args.rosa_top_k_frac}"
+        )
+    else:
+        print(f"[train] n_chunks={n_chunks} (K={args.k} steps each)")
 
     # Pre-shape train corpus into [N_chunks, K, B, T] views.
     chunk_shape = (n_chunks, args.k, args.batch_size, args.seq_len)
@@ -652,6 +762,62 @@ def main(argv: list[str] | None = None) -> int:
         wall0 = time.perf_counter()
         step_start = 0
         for chunk_i in range(n_chunks):
+            # RoSA Phase 2 → Phase 3 transition. Runs once, between
+            # the warmup chunk and the first joint-training chunk.
+            # Computes |dL/dΔ| on the current chunk's data (with
+            # mask=all-True so Δ contributes additively to the
+            # forward), picks the top ``rosa_top_k_frac`` entries per
+            # layer / target, calls ``rosa_set_mask``, then re-inits
+            # the adapter state under the joint filter so A, B, Δ
+            # train together against the fixed mask.
+            if rosa_three_phase and chunk_i == rosa_warmup_chunks:
+                warmed_model = cast(
+                    RoSAModel, eqx.combine(state.trainable, frozen),
+                )
+                # Use chunk 0's first sub-batch as the gradient
+                # estimation source. This is enough signal for a
+                # top-k rank ordering — the legacy implementation
+                # averaged over a handful of batches but the
+                # rank-order saturates quickly.
+                mask_batch: Batch = (
+                    _stage(train_tokens_chunks[0, 0]),
+                    _stage(train_attn_chunks[0, 0]),
+                    _stage(train_targets_chunks[0, 0]),
+                    _stage(train_loss_chunks[0, 0]),
+                )
+                dl_ddelta = _compute_rosa_phase2_dl_ddelta(
+                    warmed_model, mask_batch,
+                )
+                phase2_masks = rosa_compute_phase2_mask(
+                    warmed_model, dl_ddelta, args.rosa_top_k_frac,
+                )
+                final_model = rosa_set_mask(warmed_model, phase2_masks)
+                # Re-init the adapter state under the joint filter.
+                # The new ``optimizer`` shares the LR schedule so
+                # Phase 3 picks up at the Phase-1 step count's LR
+                # (warmup has already cleared by now).
+                state, frozen = init_adapter_state(
+                    final_model, optimizer, adapter_filter_fn=filter_fn,
+                )
+                train_step = make_adapter_train_step(
+                    optimizer, frozen, gradient_mask=gradient_mask,
+                )
+                scan = make_adapter_scan_step(train_step, args.k)
+                eval_step = make_eval_step(frozen)
+                if not args.quiet:
+                    n_active = sum(
+                        int(m.sum()) for m in phase2_masks.values()
+                    )
+                    n_total = sum(m.size for m in phase2_masks.values())
+                    pct = 100.0 * n_active / max(n_total, 1)
+                    print(
+                        f"[rosa] Phase 2 → 3 transition at chunk "
+                        f"{chunk_i + 1}/{n_chunks}: "
+                        f"{n_active}/{n_total} ({pct:.2f}%) sparse-leg "
+                        f"entries active across targets="
+                        f"{list(phase2_masks.keys())}"
+                    )
+
             # Stage chunk to device.
             chunk: Batch = (
                 _stage(train_tokens_chunks[chunk_i]),
