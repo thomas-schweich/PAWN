@@ -5,8 +5,10 @@ order (notable because filesystem side-effects sit between validation
 and the long-running steps):
 
   1. Parse args, resolve supernet config. Validates ``--k > 0``,
-     ``--total-steps % --k == 0``, and ``--seq-len <=
-     supernet.max_seq_len`` upfront.
+     ``--total-steps % --k == 0``, ``--batch-size > 0``,
+     ``--seq-len > 0``, ``--seq-len <= supernet.max_seq_len``, and
+     ``--total-steps > 0`` upfront — all SystemExit before any
+     filesystem write.
   2. Build the LR schedule (catches ``warmup``/``total_steps`` /
      ``end_value`` misconfigs *before* any filesystem write).
   3. Estimate the corpus footprint and abort if it exceeds
@@ -330,6 +332,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[train] n_chunks={n_chunks} (K={args.k} steps each)")
 
     with metrics_path.open("w", encoding="utf-8") as mf:
+        # Reset wall0 just before the chunk loop so ``wall_s`` in
+        # metrics rows reflects training time only — corpus generation
+        # + model init were already timed separately in their own
+        # phases.
         wall0 = time.perf_counter()
         # ``step_start`` is carried across iterations on the host so we
         # never force a D2H read of ``state.step`` BEFORE dispatching

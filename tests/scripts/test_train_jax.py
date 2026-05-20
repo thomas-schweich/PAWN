@@ -9,6 +9,7 @@ Phase-2 verification run that ships with the PR body.
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import sys
 from pathlib import Path
@@ -194,9 +195,7 @@ def test_happy_path_writes_metrics_and_config(tmp_path: Path) -> None:
     state.step matching the row's step_end. Pins the corpus →
     trainer → driver pipeline integration that the per-chunk unit
     tests miss."""
-    import json as _json
-    script = _load_script()
-    script.main(
+    _run(
         [
             "--supernet", "tiny",
             "--total-steps", "10",
@@ -204,20 +203,20 @@ def test_happy_path_writes_metrics_and_config(tmp_path: Path) -> None:
             "--batch-size", "2",
             "--seq-len", "16",
             "--warmup-steps", "1",
-            "--logs-dir", str(tmp_path),
             "--quiet",
-        ]
+        ],
+        tmp_path,
     )
     run_dirs = list(tmp_path.glob("jax_run_*"))
     assert len(run_dirs) == 1, f"expected 1 run_dir, got {run_dirs}"
     rd = run_dirs[0]
-    cfg = _json.loads((rd / "config.json").read_text())
+    cfg = json.loads((rd / "config.json").read_text())
     # config.json carries the full variant dicts (not just names).
     assert isinstance(cfg["variants"], dict)
     assert "small" in cfg["variants"]
     assert cfg["variants"]["small"]["d_model"] == 64
     # metrics.jsonl has one row per chunk = total_steps / k = 2.
-    rows = [_json.loads(l) for l in (rd / "metrics.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (rd / "metrics.jsonl").read_text().splitlines()]
     assert len(rows) == 2
     # Step counters advance monotonically and finish at total_steps.
     assert rows[0]["step_start"] == 0
@@ -243,12 +242,24 @@ def test_validation_failures_do_not_create_run_dir(tmp_path: Path) -> None:
         # --k 0
         ["--supernet", "tiny", "--total-steps", "10", "--k", "0",
          "--batch-size", "2", "--seq-len", "16", "--warmup-steps", "1"],
-        # total_steps not divisible
+        # --batch-size 0
+        ["--supernet", "tiny", "--total-steps", "10", "--k", "5",
+         "--batch-size", "0", "--seq-len", "16", "--warmup-steps", "1"],
+        # --seq-len 0
+        ["--supernet", "tiny", "--total-steps", "10", "--k", "5",
+         "--batch-size", "2", "--seq-len", "0", "--warmup-steps", "1"],
+        # --total-steps 0
+        ["--supernet", "tiny", "--total-steps", "0", "--k", "5",
+         "--batch-size", "2", "--seq-len", "16", "--warmup-steps", "1"],
+        # total_steps not divisible by k
         ["--supernet", "tiny", "--total-steps", "7", "--k", "3",
          "--batch-size", "2", "--seq-len", "16", "--warmup-steps", "1"],
         # seq_len > max_seq_len
         ["--supernet", "tiny", "--total-steps", "10", "--k", "5",
          "--batch-size", "2", "--seq-len", "9999", "--warmup-steps", "1"],
+        # bad LR-schedule (warmup == total) — wraps to SystemExit
+        ["--supernet", "tiny", "--total-steps", "10", "--k", "5",
+         "--batch-size", "2", "--seq-len", "16", "--warmup-steps", "10"],
         # max_corpus_gb too small
         ["--supernet", "tiny", "--total-steps", "1000", "--k", "10",
          "--batch-size", "256", "--seq-len", "512", "--warmup-steps", "10",

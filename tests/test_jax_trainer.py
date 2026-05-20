@@ -138,6 +138,20 @@ def test_supernet_loss_sums_variants() -> None:
     )
 
 
+def test_supernet_loss_rejects_empty_variant_specs() -> None:
+    """``compute_supernet_loss`` with an empty specs tuple would
+    silently produce joint=0 and {} per-variant — backprop yields
+    zero gradients and AdamW's decoupled weight decay still drifts
+    the model. Pin the guard."""
+    key = jax.random.PRNGKey(0)
+    model = init_model(TINY_SUPERNET, key)
+    tokens, attn_mask, targets, loss_mask = _random_batch(
+        jax.random.PRNGKey(11), b=2, t=8
+    )
+    with pytest.raises(ValueError, match="at least one VariantSpec"):
+        compute_supernet_loss(model, (), tokens, attn_mask, targets, loss_mask)
+
+
 def test_supernet_loss_keys_distinguish_same_width_different_depth() -> None:
     """Two specs sharing ``d_model`` but differing in ``n_layers`` must
     produce distinct per-variant keys — otherwise the second
