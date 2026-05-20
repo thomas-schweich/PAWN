@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from pawn.config import CLMConfig
-from pawn.jax.checkpoint import IncompleteCheckpointError, load_model
+from pawn.jax.checkpoint import load_model
 from pawn.jax.legacy import (
     IncompatibleCheckpointError,
     convert_legacy_checkpoint,
@@ -154,24 +154,26 @@ def test_logit_parity_with_pad_and_outcome_tokens(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "payload_name", ["training_state.json", "optimizer.safetensors"]
+    "extra_name",
+    ["training_state.json", "optimizer.safetensors", "metrics.jsonl"],
 )
-def test_convert_rejects_sentinel_missing_full_checkpoint(
-    tmp_path: Path, payload_name: str
+def test_convert_accepts_sentinel_absent_full_checkpoint_layout(
+    tmp_path: Path, extra_name: str
 ) -> None:
-    """A source directory containing a full-checkpoint payload file
-    (optimizer.safetensors / training_state.json) but lacking ``.complete``
-    is a corrupted/interrupted save, not a bare HF snapshot — the converter
-    must refuse rather than silently re-signing the bytes. Parametrised so a
-    regression that drops either payload file from the discriminator set
-    surfaces at the test level rather than at runtime."""
+    """Published HF repos lay out a full training checkpoint at the root
+    (``model.safetensors`` + ``config.json`` + ``optimizer.safetensors`` +
+    ``training_state.json`` + ``metrics.jsonl`` + …) without a ``.complete``
+    sentinel — the sentinel is local-only and never pushed. The converter
+    must accept this layout. Parametrised so a regression that re-tightens
+    the policy on any of those sibling files surfaces at the test level."""
     src = tmp_path / "legacy"
-    write_legacy_checkpoint(src, CLMConfig.toy())
-    # Drop a payload file alongside model.safetensors + config.json, no
-    # .complete — mimic an interrupted full-checkpoint save.
-    (src / payload_name).write_text("noise", encoding="utf-8")
-    with pytest.raises(IncompleteCheckpointError, match="payload"):
-        convert_legacy_checkpoint(src, tmp_path / "dst")
+    cfg = CLMConfig.toy()
+    write_legacy_checkpoint(src, cfg)
+    (src / extra_name).write_text("noise", encoding="utf-8")
+    dst = tmp_path / "dst"
+    convert_legacy_checkpoint(src, dst)
+    loaded = load_model(dst)
+    assert loaded.cfg.d_model == cfg.d_model
 
 
 def test_convert_accepts_hf_snapshot_with_metadata(tmp_path: Path) -> None:

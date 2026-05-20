@@ -46,11 +46,7 @@ import jax.numpy as jnp
 import numpy as np
 from safetensors.numpy import load_file
 
-from pawn.jax.checkpoint import (
-    IncompleteCheckpointError,
-    save_model,
-    verify_checkpoint,
-)
+from pawn.jax.checkpoint import save_model, verify_checkpoint
 from pawn.jax.config import (
     MAX_SEQ_LEN,
     N_OUTCOMES,
@@ -191,39 +187,29 @@ def convert_legacy_checkpoint(src: str | Path, dst: str | Path) -> None:
 
     ``src`` must contain ``config.json`` (with a ``model_config`` dict) and
     ``model.safetensors`` (the PyTorch state_dict). If ``src/.complete``
-    exists (full pretraining checkpoints carry it), the sentinel is verified
+    exists (the trainer writes it locally), the sentinel is verified
     before any weights are read — a corrupt source raises rather than
     silently producing a "valid"-looking JAX checkpoint of corrupt bytes.
-    Sentinel-absent directories are accepted without integrity check when
-    they look like an HF-snapshot layout (``model.safetensors`` +
-    ``config.json``, optionally alongside ``README.md`` / ``LICENSE`` /
-    ``.gitattributes``); a directory containing full-checkpoint payload
-    files (``optimizer.safetensors`` / ``training_state.json``) without a
-    sentinel is rejected as a corrupted / interrupted save. ``dst`` is
-    overwritten if it exists.
+    Sentinel-absent directories are accepted as-is; the converter only
+    reads ``model.safetensors`` and ``config.json``, so any other files
+    (HF-snapshot metadata like ``README.md`` / ``LICENSE``, sibling
+    full-checkpoint payload like ``optimizer.safetensors`` /
+    ``training_state.json``, nested ``checkpoints/`` subdirectories) are
+    simply ignored. ``dst`` is overwritten if it exists.
     """
     src_path = Path(src)
-    # Sentinel handling: full pretraining checkpoints carry ``.complete`` and
-    # MUST verify; sentinel-absent directories may be either a bare HF
-    # snapshot (model.safetensors + config.json plus the usual README /
-    # LICENSE / .gitattributes from ``huggingface_hub.snapshot_download``)
-    # or a corrupted full checkpoint (the sentinel was lost in an interrupted
-    # save while optimizer / training-state files were already on disk). We
-    # discriminate on the presence of *payload* files specific to a full
-    # training checkpoint — README and similar metadata files are fine.
+    # Sentinel handling: if a ``.complete`` is present (local checkpoints
+    # written by ``pawn.jax.checkpoint.save_model`` / the legacy PyTorch
+    # ``save_pretrain_checkpoint``), verify it; otherwise accept the
+    # directory and only read the two files we need. The atomic-write
+    # protocol guarantees a local ``<name>`` is either present-with-sentinel
+    # or absent — there is no "full checkpoint with payload files but no
+    # sentinel" corruption mode on disk. Published HF snapshots routinely
+    # carry the full training-checkpoint layout at the root (the sentinel
+    # is local-only and never pushed); those convert fine.
     sentinel = src_path / ".complete"
-    payload_files = {"optimizer.safetensors", "training_state.json"}
-    present = {entry.name for entry in src_path.iterdir() if entry.is_file()}
-    present_payload = present & payload_files
     if sentinel.exists():
         verify_checkpoint(src_path)
-    elif present_payload:
-        raise IncompleteCheckpointError(
-            f"{src_path} has full-checkpoint payload files "
-            f"({sorted(present_payload)}) but no .complete sentinel — "
-            "looks like a corrupted / interrupted save. Restore the "
-            "sentinel or remove the payload files before converting."
-        )
     config_path = src_path / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if "model_config" not in config:
