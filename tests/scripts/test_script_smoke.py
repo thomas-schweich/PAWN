@@ -75,6 +75,7 @@ ARGPARSE_SCRIPTS = [
     "convert_published_checkpoints.py",
     "datagen_reconcile_tier.py",
     "datagen_with_hf_sync.py",
+    "eval_generation_jax.py",
     "eval_jax.py",
     "eval_probes_jax.py",
     "rename_shards.py",
