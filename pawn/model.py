@@ -218,9 +218,15 @@ def _attention_prefill(
     ctx = jnp.einsum("bhqk,bhkd->bhqd", weights, v)
     ctx = ctx.transpose(0, 2, 1, 3).reshape(b, t, d)
     out = ctx @ wo
-    # Cache K, V in (B, T, H, head_dim) layout so the increment can
-    # `.at[:, pos, :, :].set(...)` along the T axis without transpose.
-    return out, k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)
+    # Cache K, V in (B, H, T, head_dim) layout — the same layout the
+    # attention einsum consumes. Storing K/V in (B, T, H, head_dim)
+    # would force a per-decode-step transpose to (B, H, T_max, head_dim)
+    # for each of the n_layers layers (bytes-moved ~ 2 × n_layers × B
+    # × T_max × H × head_dim × sizeof(dtype) per step); keeping the
+    # cache pre-transposed eliminates that cost. The prefill pays one
+    # transpose at startup (during `_apply_rope` + `split`); the
+    # increment runs entirely in the cached layout.
+    return out, k, v
 
 
 def _attention_incremental(
@@ -240,9 +246,11 @@ def _attention_incremental(
 
     Args:
         x_single: ``(B, 1, d)`` — the new position's input.
-        cached_k / cached_v: ``(B, T_max, n_heads, head_dim)`` — post-RoPE K
+        cached_k / cached_v: ``(B, n_heads, T_max, head_dim)`` — post-RoPE K
             and raw V from prior positions; positions ``[0, pos)`` are
-            populated. The function writes the new K, V at slot ``pos``.
+            populated. The function writes the new K, V at slot ``pos``
+            along the T axis (axis 2). The layout matches the attention
+            einsum so no per-step transpose is needed.
         cos_at_pos / sin_at_pos: ``(1, head_dim // 2)`` — RoPE tables
             sliced to the new position.
         pos: scalar int — the new position. Must be a *traced* scalar
@@ -254,38 +262,43 @@ def _attention_incremental(
     b, _, d = x_single.shape[0], x_single.shape[1], x_single.shape[2]
     head_dim = d // n_heads
 
-    q_new = (x_single @ wq).reshape(b, 1, n_heads, head_dim)
-    k_new = (x_single @ wk).reshape(b, 1, n_heads, head_dim)
-    v_new = (x_single @ wv).reshape(b, 1, n_heads, head_dim)
-    # RoPE on the new Q and K at position ``pos``.
-    q_rope = _apply_rope(q_new.transpose(0, 2, 1, 3), cos_at_pos, sin_at_pos)
-    k_rope = _apply_rope(k_new.transpose(0, 2, 1, 3), cos_at_pos, sin_at_pos)
-    # Write back to the cache in (B, T_max, H, head_dim) layout. Post-RoPE
-    # K means the increment doesn't have to re-RoPE cached entries —
-    # the standard pattern.
-    k_to_cache = k_rope.transpose(0, 2, 1, 3)  # (B, 1, H, head_dim)
+    # Project + reshape directly into (B, H, 1, head_dim) — the einsum-
+    # ready layout — so the cache write below is a single slice (no
+    # transpose).
+    q_rope = _apply_rope(
+        (x_single @ wq).reshape(b, 1, n_heads, head_dim).transpose(0, 2, 1, 3),
+        cos_at_pos, sin_at_pos,
+    )
+    k_rope = _apply_rope(
+        (x_single @ wk).reshape(b, 1, n_heads, head_dim).transpose(0, 2, 1, 3),
+        cos_at_pos, sin_at_pos,
+    )
+    v_new = (x_single @ wv).reshape(b, 1, n_heads, head_dim).transpose(0, 2, 1, 3)
+    # Write at slot ``pos`` along the T axis (axis 2). ``k_rope[:, :, 0, :]``
+    # drops the T=1 axis to give (B, H, head_dim) — the rank-3 update
+    # ``dynamic_update_index_in_dim`` expects.
     new_cached_k = jax.lax.dynamic_update_index_in_dim(
-        cached_k, k_to_cache[:, 0], pos, axis=1,
+        cached_k, k_rope[:, :, 0, :], pos, axis=2,
     )
     new_cached_v = jax.lax.dynamic_update_index_in_dim(
-        cached_v, v_new[:, 0], pos, axis=1,
+        cached_v, v_new[:, :, 0, :], pos, axis=2,
     )
 
-    # Attend the single new query against the full cache + new K.
-    # Reshape cache to (B, H, T_max, head_dim) for the einsum kernel.
-    k_attn = new_cached_k.transpose(0, 2, 1, 3)
-    v_attn = new_cached_v.transpose(0, 2, 1, 3)
-    scores = jnp.einsum("bhqd,bhkd->bhqk", q_rope, k_attn) * (head_dim**-0.5)
+    # Attend the single new query against the full cache + new K, V.
+    # Cache is already (B, H, T_max, head_dim) — no transpose needed.
+    scores = jnp.einsum(
+        "bhqd,bhkd->bhqk", q_rope, new_cached_k,
+    ) * (head_dim**-0.5)
 
     # Mask positions > pos. Positions [0, pos] are real; the rest are
     # the unfilled tail of the pre-allocated cache.
-    T_max = cached_k.shape[1]
+    T_max = cached_k.shape[2]
     positions = jnp.arange(T_max)
     is_real = positions <= pos
     additive_mask = jnp.where(is_real, 0.0, -jnp.inf).astype(scores.dtype)
     scores = scores + additive_mask[None, None, None, :]
     weights = jax.nn.softmax(scores, axis=-1)
-    ctx = jnp.einsum("bhqk,bhkd->bhqd", weights, v_attn)
+    ctx = jnp.einsum("bhqk,bhkd->bhqd", weights, new_cached_v)
     ctx = ctx.transpose(0, 2, 1, 3).reshape(b, 1, d)
     return ctx @ wo, new_cached_k, new_cached_v
 
@@ -307,8 +320,14 @@ class KVCache(NamedTuple):
 
     Shape contract::
 
-        k: (n_layers, B, T_max, n_heads, head_dim)
-        v: (n_layers, B, T_max, n_heads, head_dim)
+        k: (n_layers, B, n_heads, T_max, head_dim)
+        v: (n_layers, B, n_heads, T_max, head_dim)
+
+    The H-before-T layout matches the attention einsum's expected
+    operand layout, so ``_attention_incremental`` reads the cache
+    without a transpose — at production shape (n_layers=10, B=64,
+    T_max=512, n_heads=10, head_dim=64) the savings are ~860 GB of
+    avoided buffer movement across a 512-step decode.
 
     Positions ``[0, current_pos]`` are populated; positions
     ``(current_pos, T_max)`` are filler — the attention mask in
@@ -579,24 +598,25 @@ class PAWNModel(eqx.Module):
         )
         x = _rmsnorm(x, self.final_norm)
         logits = x @ self.lm_head
-        # Pad the cache out to (T_max, ...) so incremental decoding has
-        # one stable shape.
+        # Pad the cache out to (n_layers, B, H, T_max, head_dim) so
+        # incremental decoding has one stable shape. The T axis is
+        # axis 3 in the post-scan stacked tensor.
         T_max = cfg.max_seq_len
         if seq_len == T_max:
             k_full = k_per_layer
             v_full = v_per_layer
         else:
             pad_shape = (
-                cfg.n_layers, tokens.shape[0], T_max - seq_len,
-                cfg.n_heads, cfg.head_dim,
+                cfg.n_layers, tokens.shape[0], cfg.n_heads,
+                T_max - seq_len, cfg.head_dim,
             )
             k_full = jnp.concatenate(
                 [k_per_layer, jnp.zeros(pad_shape, dtype=k_per_layer.dtype)],
-                axis=2,
+                axis=3,
             )
             v_full = jnp.concatenate(
                 [v_per_layer, jnp.zeros(pad_shape, dtype=v_per_layer.dtype)],
-                axis=2,
+                axis=3,
             )
         return logits, KVCache(k=k_full, v=v_full)
 
@@ -607,7 +627,8 @@ class PAWNModel(eqx.Module):
 
         Computes logits at position ``pos`` using the K, V cache for
         positions ``[0, pos)`` plus the new K, V it derives from
-        ``token``. Returns ``(logits[:, pos], updated_cache)``.
+        ``token``. Returns ``(logits, updated_cache)`` — see the
+        ``Returns:`` block below for the exact ``logits`` shape.
 
         ``pos`` is a *traced* scalar — one JIT trace covers every
         decode step.

@@ -231,13 +231,23 @@ def test_autoregressive_generate_variable_prefix_length_grouping() -> None:
 
 def test_autoregressive_generate_kv_cache_matches_full_recompute() -> None:
     """KV-cache path produces the same generated sequences as the
-    full-recompute path.
+    full-recompute path under CPU JAX.
 
-    Bitwise equivalence is the strict promise — the model produces
-    bit-identical logits across both paths (``forward_with_cache`` is
-    a pure superset of ``__call__``; ``forward_incremental`` runs the
-    same layer kernel on a single-position slice with cached K, V).
-    With the same Gumbel noise the argmax must land on the same token.
+    CPU-stability note: this test asserts strict bitwise equality on
+    the sampled sequences. ``forward_with_cache`` is bit-identical to
+    ``__call__`` (pinned by ``test_forward_with_cache_matches_call``);
+    ``forward_incremental`` matches the corresponding ``__call__``
+    slice within ~``1e-5`` (pinned by
+    ``test_forward_incremental_matches_full_forward``). On CPU JIT the
+    reduction order is deterministic across the two paths so the
+    looser bound is in practice exact, and ``argmax`` on the resulting
+    logits lands on the same token. On accelerator backends
+    (ROCm / CUDA) the per-step logits can differ at the
+    floating-point-precision boundary; if the two top candidates are
+    within ~``1e-5``, argmax can pick different tokens between paths,
+    so this strict equality is a CPU-only invariant. The per-step
+    logit equivalence (the GPU-stable invariant) is pinned by
+    ``test_forward_incremental_matches_full_forward``.
 
     The test exercises both no-prefix and with-prefix scenarios so
     the prefill code path and the incremental loop are both
@@ -349,6 +359,43 @@ def test_forward_incremental_matches_full_forward() -> None:
         rtol=1e-5, atol=1e-5,
         err_msg="forward_incremental[pos=5] diverged from __call__[:, 5]",
     )
+
+
+def test_autoregressive_generate_mixed_prefix_kv_cache_matches_recompute() -> None:
+    """Cross-path parity under the variable-prefix-length grouping path.
+
+    Each unique prefix length forms its own ``_generate_batch`` call,
+    which prefills its own KV-cache (sized to ``cfg.max_seq_len`` but
+    populated only to that group's ``prefix_end``). The legacy
+    recompute path traverses the same groups under the same per-batch
+    keys, so the two paths must agree row-for-row even with mixed
+    prefix lengths. The "same per-batch keys" part is what makes this
+    a non-trivial extension of the no-prefix and uniform-prefix
+    equivalence cases: distinct groups consume the outer-loop key in
+    processing order, so this test pins that the cached path doesn't
+    accidentally drop or duplicate a `jax.random.split` along the way.
+    (See the CPU-stability note on
+    ``test_autoregressive_generate_kv_cache_matches_full_recompute``.)
+    """
+    model = _tiny_model()
+    _ids, _t, _lm, move_ids, gls, _tc = engine.generate_clm_batch(
+        6, 16, 251, False, 0.0, False,
+    )
+    mixed_lens = np.array([3, 5, 8, 3, 5, 8], dtype=np.int32)
+    pls = np.minimum(mixed_lens, gls.astype(np.int32))
+    common: dict[str, Any] = dict(
+        outcome_token=OUTCOME_TOKENS["PLY_LIMIT"], n_games=6,
+        mask_illegal=True, max_seq_len=24, batch_size=3, seed=37,
+        prefix_moves=move_ids, prefix_lengths=pls,
+    )
+    gen_full = autoregressive_generate(model, **common, use_kv_cache=False)
+    gen_kv = autoregressive_generate(model, **common, use_kv_cache=True)
+    np.testing.assert_array_equal(
+        gen_kv.sequences, gen_full.sequences,
+        err_msg="mixed-prefix KV-cache and recompute sequences diverged",
+    )
+    np.testing.assert_array_equal(gen_kv.term_codes, gen_full.term_codes)
+    np.testing.assert_array_equal(gen_kv.game_lengths, gen_full.game_lengths)
 
 
 def test_autoregressive_generate_mixed_prefix_post_prefix_continues() -> None:
