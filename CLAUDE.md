@@ -10,7 +10,7 @@ The training stack is JAX/Equinox + Optax. The legacy PyTorch implementation was
 pawn/
 ├── engine/           # Rust chess engine with PyO3 bindings (via shakmaty)
 ├── pawn/             # Core Python package (JAX/Equinox)
-│   ├── config.py     # ModelConfig, SUPERNET / TINY_SUPERNET, VARIANTS, validate_nested
+│   ├── config.py     # ModelConfig, SUPERNET / TINY_SUPERNET, VARIANTS / TINY_VARIANTS, validate_nested
 │   ├── model.py      # PAWNModel transformer (RMSNorm, SwiGLU, RoPE, factored embeddings, stacked lax.scan layers)
 │   ├── corpus.py     # Rust-engine corpus → trainer-shaped int32/bool arrays
 │   ├── trainer.py    # Pretraining: cross-entropy, AdamW + warmup-cosine, K-step lax.scan, joint multi-variant loss
@@ -23,7 +23,7 @@ pawn/
 │   ├── _sentinel.py           # Shared .complete sentinel helpers (stdlib only)
 │   └── _torch_legacy_fixture.py  # Test fixture: legacy PyTorch architecture for converter-parity tests
 ├── scripts/          # CLI drivers (train_jax, train_jax_adapter, eval_jax, convert_published_checkpoints)
-├── tests/            # JAX test suite (no PyTorch surface)
+├── tests/            # JAX test suite (torch surface limited to torch_loader + legacy converter parity tests)
 ├── deploy/           # RunPod + vast.ai deployment scripts
 └── docs/             # docs/jax-migration.md is authoritative
 ```
@@ -100,7 +100,7 @@ The JAX model is a single `PAWNModel` shaped by `pawn.config.ModelConfig`. The s
 |---|---|---|---|---|---|
 | `SUPERNET` (`VARIANTS["large"]`) | 640 | 10 | 10 | 2560 | production supernet |
 | `VARIANTS["base"]` | 512 | 8 | 8 | 2048 | nested slice |
-| `VARIANTS["small"]` | 256 | 4 | 4 | 1024 | nested slice |
+| `VARIANTS["small"]` | 256 | 8 | 4 | 1024 | nested slice |
 | `TINY_SUPERNET` (`TINY_VARIANTS["large"]`) | 192 | 4 | 3 | 768 | verification scale |
 | `TINY_VARIANTS["base"]` | 128 | 3 | 2 | 512 | nested slice |
 | `TINY_VARIANTS["small"]` | 64 | 2 | 1 | 256 | nested slice |
@@ -118,9 +118,12 @@ Drives multi-variant joint training: every step computes loss on the supernet pl
 uv run python scripts/train_jax.py \
     --supernet tiny --total-steps 1000 --batch-size 16 --seq-len 64 --k 50
 
-# Larger run on the production SUPERNET
+# Larger run on the production SUPERNET. The 100K × B=256 × T=512 corpus
+# is ~122 GiB on disk; override the 64 GiB safety guard explicitly so the
+# trainer doesn't abort before generating data.
 uv run python scripts/train_jax.py \
-    --supernet supernet --total-steps 100000 --batch-size 256 --seq-len 512 --k 50
+    --supernet supernet --total-steps 100000 --batch-size 256 --seq-len 512 --k 50 \
+    --max-corpus-gb 128
 ```
 
 Key args (`scripts/train_jax.py --help` for the full surface):
@@ -154,7 +157,7 @@ Key args:
 
 The verification proxy is a Rust-engine random-game corpus; Lichess Elo-slice cache + the broader adapter strategies (bottleneck / FiLM / hybrid / sparse / unfreeze) port in follow-up PRs onto the same two-tier trainer. See `docs/jax-migration.md` Phase 4.
 
-The two-tier optimisation partitions the PyTree via `eqx.partition(model, adapter_filter(model))`. Gradients for the frozen backbone are dropped by XLA dead-code elimination (~33% FLOP cut on the backward pass). The structural invariant — `state.trainable.backbone == None` — is pinned by `test_backbone_weights_are_frozen`.
+The two-tier optimisation partitions the PyTree via `eqx.partition(model, adapter_filter(model))`. Gradients for the frozen backbone are dropped by XLA dead-code elimination (~33% FLOP cut on the backward pass). The structural invariant — every array field of `state.trainable.backbone` is `None` after partitioning (the `PAWNModel` object itself stays, but its leaves are sentinel `None`s) — is pinned by `test_backbone_weights_are_frozen`.
 
 ## Evaluation (`scripts/eval_jax.py`)
 
@@ -203,7 +206,7 @@ The `.complete` sentinel contains SHA-256 hashes of every other file in the chec
 - `IncompleteCheckpointError` — raised when `.complete` sentinel is missing
 - `CheckpointIntegrityError` — raised when any hash mismatches or the file-set diverges
 
-**Never use `kill -9` on training processes.** The trainer handles SIGTERM gracefully (this is the supported path in `pawn.adapter_trainer` / `pawn.trainer`; production HF-backed shutdown handlers add to that loop in follow-up phases).
+**Signal handling is not yet wired in the current JAX drivers.** Phase-2 / Phase-3 entry points (`scripts/train_jax.py`, `scripts/train_jax_adapter.py`) install no SIGTERM handler — the legacy trainer's "save + push + exit" graceful-shutdown loop ports in a later phase along with HF-backed checkpoint pushing. Until then, killing the driver mid-step will drop any in-flight chunk's metrics row and any unsaved model state.
 
 **Never rsync checkpoint files from running pods.** Use the published HF repos or the JAX-converted local cache.
 
@@ -254,7 +257,13 @@ docker build --platform linux/amd64 --target runtime \
 ```bash
 bash deploy/pod.sh create myexp --gpu h100
 bash deploy/pod.sh ssh myexp
-bash deploy/pod.sh launch myexp scripts/train_jax.py --supernet supernet --total-steps 100000
+# Run training directly over ssh (the `pod.sh launch` wrapper currently
+# appends `--log-dir` for legacy compatibility; JAX scripts use `--logs-dir`,
+# so launch via ssh until the wrapper is rewired):
+ssh root@<pod-host> "cd /workspace/pawn && nohup uv run python \
+    scripts/train_jax.py --supernet supernet --total-steps 100000 \
+    --batch-size 256 --seq-len 512 --k 50 --max-corpus-gb 128 \
+    > logs/train.log 2>&1 &"
 bash deploy/pod.sh stop myexp   # preserves volume, stops billing
 bash deploy/pod.sh delete myexp # destroys everything
 ```
@@ -268,7 +277,12 @@ bash deploy/vast.sh search --gpu 4090 --max-price 0.5
 bash deploy/vast.sh create myexp --gpu 4090 --max-price 0.5
 bash deploy/vast.sh deploy myexp   # rsync local checkout to /workspace/pawn
 bash deploy/vast.sh ssh myexp
-bash deploy/vast.sh launch myexp scripts/train_jax.py --supernet supernet --total-steps 100000
+# Same caveat as the RunPod wrapper — `vast.sh launch` appends `--log-dir`
+# (legacy); JAX scripts use `--logs-dir`, so ssh + manual run for now:
+ssh <vast-instance> "cd /workspace/pawn && nohup uv run python \
+    scripts/train_jax.py --supernet supernet --total-steps 100000 \
+    --batch-size 256 --seq-len 512 --k 50 --max-corpus-gb 128 \
+    > logs/train.log 2>&1 &"
 bash deploy/vast.sh stop myexp
 ```
 
@@ -283,16 +297,15 @@ Vast.ai has no separate network volume — instance disk is sized via `--disk` (
 
 ### Instance Safety
 
-- Stop with `bash deploy/pod.sh stop <name>` or `bash deploy/vast.sh stop <name>` — sends SIGTERM; the trainer handles it.
+- `bash deploy/pod.sh stop <name>` / `bash deploy/vast.sh stop <name>` halts billing but **does not yet trigger a graceful trainer shutdown** under the JAX entry points (no signal handler installed yet — see the gotcha below). Stop only when no training is in flight, or accept the in-flight chunk loss.
 - **Never delete/destroy an instance while training is running** — data loss risk on either provider.
-- **Never `kill -9` training processes** — use SIGTERM.
 - **Never rsync checkpoint files from running instances** — load via the published HF repos.
 - On vast.ai with `--interruptible`, the host can preempt you at any time.
 
 ## Key Patterns & Gotchas
 
 - **Single-framework promise.** The training and eval surface is JAX-only. The two torch touchpoints — `pawn.torch_loader` (a thin loader for external non-JAX consumers) and `pawn._torch_legacy_fixture` (a frozen reference architecture used by the legacy-converter parity tests) — exist precisely so the JAX surface stays torch-free under a CPU-jax install. Don't reintroduce torch dependencies into `pawn.{model,trainer,adapter_trainer,adapters,eval,checkpoint}`.
-- **Sentinel logic lives in `pawn._sentinel`.** Stdlib-only. Both `pawn.checkpoint` and `pawn.torch_loader` import from it. Don't duplicate `_sha256_file` / `_verify_sentinel` helpers elsewhere.
+- **Sentinel logic lives in `pawn._sentinel`.** Stdlib-only. Both `pawn.checkpoint` and `pawn.torch_loader` import from it (the callers alias `sha256_file` / `verify_sentinel` to underscore-prefixed local names; the public API on the module itself has no underscores). Don't duplicate that logic elsewhere.
 - **Two-tier PyTree partition** is how adapter training freezes the backbone: `eqx.partition(model, adapter_filter(model))` produces a trainable subtree (adapters) and a frozen subtree (backbone). XLA dead-code-eliminates the backbone weight gradients, which is the source of the ~33% FLOP cut on the backward pass.
 - **K-step `lax.scan` amortises JIT dispatch.** The pretraining + adapter trainers both run `K` inner steps per scan invocation. `K * B` games are consumed per scan call; size `K` so per-step throughput is roughly host-bound rather than launch-bound.
 - **`state.step` must be a JAX scalar inside `jit`.** Storing it as a Python int caused a ~70× slowdown during Phase-2 development by retriggering recompilation every step. The fix is pinned by tests; keep it that way.
