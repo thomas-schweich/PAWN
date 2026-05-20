@@ -310,6 +310,80 @@ class PAWNModel(eqx.Module):
         x = _rmsnorm(x, self.final_norm)
         return x @ self.lm_head
 
+    def hidden_all_layers(
+        self, tokens: jax.Array, attn_mask: jax.Array
+    ) -> jax.Array:
+        """Per-layer hidden states for linear-probe and diagnostic use.
+
+        Mirrors ``__call__``'s forward up to (but not including) the
+        ``final_norm`` + ``lm_head`` projection, and records the hidden
+        state at every layer boundary. The scan now accumulates per-step
+        outputs via its ``ys`` channel; under ``jit`` XLA fuses the
+        accumulation back into the same kernel sequence as ``__call__``,
+        so this costs no extra forward pass when both are called on the
+        same inputs (the typical probe loop calls only this method).
+
+        Args:
+            tokens: ``(B, T)`` int token ids.
+            attn_mask: ``(B, T)`` bool — True at real (non-padding) positions.
+
+        Returns:
+            ``(n_layers + 1, B, T, d_model)`` — index 0 is the embedding
+            output (pre-attention); indices ``1..n_layers`` are the
+            outputs of transformer layers 0..n_layers-1.
+        """
+        cfg = self.cfg
+        seq_len = tokens.shape[1]
+        if seq_len > cfg.max_seq_len:
+            raise ValueError(
+                f"sequence length {seq_len} exceeds max_seq_len {cfg.max_seq_len}"
+            )
+        x = self._embed(tokens)
+        cos, sin = _rope_tables(cfg.head_dim, seq_len, cfg.rope_base)
+        mask = _build_attn_mask(attn_mask, seq_len)
+        real_so_far = jnp.cumsum(attn_mask, axis=1)
+        all_masked_query = (real_so_far == 0)[:, None, :, None]
+
+        layers = LayerWeights(
+            attn_norm=self.attn_norm,
+            wq=self.wq,
+            wk=self.wk,
+            wv=self.wv,
+            wo=self.wo,
+            ffn_norm=self.ffn_norm,
+            w_gate=self.w_gate,
+            w_up=self.w_up,
+            w_down=self.w_down,
+        )
+
+        def run_layer(
+            h: jax.Array, lw: LayerWeights
+        ) -> tuple[jax.Array, jax.Array]:
+            h = h + _attention(
+                _rmsnorm(h, lw.attn_norm),
+                lw.wq,
+                lw.wk,
+                lw.wv,
+                lw.wo,
+                cos,
+                sin,
+                mask,
+                all_masked_query,
+                cfg.n_heads,
+            )
+            h = h + _ffn(_rmsnorm(h, lw.ffn_norm), lw.w_gate, lw.w_up, lw.w_down)
+            return h, h
+
+        # ``run_layer`` returns ``(carry, h_after_layer)`` so ``lax.scan``'s
+        # ``ys`` is the stacked per-layer outputs. No ``jax.checkpoint``
+        # here — this method is for eval and probe training (the latter
+        # only takes gradients on the probe head, not the backbone), so
+        # remat's memory-for-compute trade is a pure loss.
+        _carry, layer_outs = jax.lax.scan(run_layer, x, layers)
+        # ``layer_outs`` is ``(n_layers, B, T, d)``; prepend the embed
+        # output to match the legacy convention.
+        return jnp.concatenate([x[None], layer_outs], axis=0)
+
     def _embed(self, tokens: jax.Array) -> jax.Array:
         """Factored input embedding (mirrors ``pawn.model.CLMEmbedding``)."""
         table = jnp.asarray(_decomp_table())
