@@ -24,18 +24,21 @@ Provides:
   (checkmate-in-very-few-ply, early stalemate).
 
 The port is a faithful behavioural copy of the legacy module's science.
-Three implementation differences are worth flagging:
+Two implementation notes are worth flagging:
 
-  1. **No KV cache.** Each new token is a full forward pass through the
-     growing context. O(N²) in seq_len vs the legacy KV-cached
-     O(N). Acceptable for diagnostic runs (the test sizes in §6 are
-     hundreds-to-thousands of games and complete in minutes on CPU); a
-     KV-cache variant can land later if needed.
+  1. **KV-cache by default.** ``autoregressive_generate(..., use_kv_cache=True)``
+     (the default) runs the model's ``forward_with_cache`` over the
+     prefix once, then advances per-step via ``forward_incremental``.
+     The cache is shape-stable at ``cfg.max_seq_len``, so the JIT
+     trace count is one prefill + one increment regardless of decode
+     length. Set ``use_kv_cache=False`` to fall back to the legacy
+     full-recompute path (one full forward per step); both paths are
+     bitwise-equivalent and the equivalence is pinned by
+     ``test_autoregressive_generate_kv_cache_matches_full_recompute``.
   2. **Legal masking uses ``engine.PyBatchRLEnv.get_legal_token_masks_batch``
      unchanged** — the engine is the single source of truth for
-     legality.
-  3. **Sampling is Gumbel-max** (matches the legacy; equivalent to
-     softmax-then-sample for `temperature=1`).
+     legality. **Sampling is Gumbel-max** (matches the legacy;
+     equivalent to softmax-then-sample for ``temperature=1``).
 
 Prefix-length grouping: ``autoregressive_generate`` groups input rows
 by ``prefix_lengths`` value before dispatching to ``_generate_batch``,
@@ -71,7 +74,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from pawn.config import OUTCOME_TOKEN_BASE, PAD_TOKEN
-from pawn.model import PAWNModel
+from pawn.model import KVCache, PAWNModel
 
 # Outcome offsets — these are 0-indexed within the outcome band; the
 # absolute token id is ``OUTCOME_TOKEN_BASE + offset`` (1969 + offset).
@@ -138,7 +141,23 @@ def _forward(
     return model(ids, attn)
 
 
+def _forward_prefill(
+    model: PAWNModel, ids: jax.Array, attn: jax.Array,
+) -> tuple[jax.Array, KVCache]:
+    """Typed wrapper around ``forward_with_cache`` for ``filter_jit``."""
+    return model.forward_with_cache(ids, attn)
+
+
+def _forward_incremental(
+    model: PAWNModel, token: jax.Array, pos: jax.Array, cache: KVCache,
+) -> tuple[jax.Array, KVCache]:
+    """Typed wrapper around ``forward_incremental`` for ``filter_jit``."""
+    return model.forward_incremental(token, pos, cache)
+
+
 _forward_jit = eqx.filter_jit(_forward, donate="none")
+_forward_prefill_jit = eqx.filter_jit(_forward_prefill, donate="none")
+_forward_incremental_jit = eqx.filter_jit(_forward_incremental, donate="none")
 
 
 def _subseed(seed: int, *parts: object) -> int:
@@ -181,6 +200,7 @@ def autoregressive_generate(
     temperature: float = 1.0,
     batch_size: int = 64,
     seed: int = 0,
+    use_kv_cache: bool = True,
 ) -> GenerationResult:
     """Generate ``n_games`` games from a PAWN model.
 
@@ -203,6 +223,11 @@ def autoregressive_generate(
             = unmodified Gumbel-max sampling.
         batch_size: per-batch concurrency on the engine + model.
         seed: PRNG seed for sampling.
+        use_kv_cache: if ``True`` (default) use the KV-cached incremental
+            decoder; if ``False`` use the legacy full-recompute decoder
+            (one full forward per step). Both produce numerically
+            equivalent samples — the cache path is the default for
+            speed.
     """
     if max_seq_len is None:
         max_seq_len = model.cfg.max_seq_len
@@ -232,6 +257,7 @@ def autoregressive_generate(
             result = _generate_batch(
                 model, outcome_token, e - s, mask_illegal,
                 None, None, max_seq_len, temperature, sub,
+                use_kv_cache=use_kv_cache,
             )
             batches.append(result)
         return GenerationResult(
@@ -263,6 +289,7 @@ def autoregressive_generate(
                 model, outcome_token, e - s, mask_illegal,
                 group_moves[s:e], group_lens[s:e],
                 max_seq_len, temperature, sub,
+                use_kv_cache=use_kv_cache,
             )
             group_results.append(result)
             processing_order.append(group_orig_idx[s:e])
@@ -302,8 +329,24 @@ def _generate_batch(
     max_seq_len: int,
     temperature: float,
     key: jax.Array,
+    *,
+    use_kv_cache: bool = True,
 ) -> GenerationResult:
-    """Single-batch core. Always uses a full repeated forward (no KV cache)."""
+    """Single-batch core.
+
+    If ``use_kv_cache`` (default) is True, runs a prefill via
+    ``forward_with_cache`` then decodes each new position via
+    ``forward_incremental`` — O(T_max) per step, O(T_max²) total. If
+    False, runs a fresh full forward per step (legacy O(T_max²) per
+    step, O(T_max³) total). Both paths share the engine state machine
+    and the legal-mask + termination logic; the only difference is
+    *how* the per-step logits are computed.
+
+    Within a single batch ``prefix_lengths`` is uniform (the caller
+    ``autoregressive_generate`` groups rows by prefix length before
+    dispatching here), so the decode loop starts at a single
+    ``prefix_end`` and no row sees a PAD gap in its attended context.
+    """
     max_move_positions = max_seq_len - 1
     vocab_size = model.cfg.vocab_size
 
@@ -345,27 +388,33 @@ def _generate_batch(
                 term_codes[i] = prefix_tc[i]
         prefix_end = int(clamped_pls.max()) if n_games > 0 else 0
 
-    # Decode loop — single forward per step (O(N²) total). The
-    # context is *always* passed at the full ``max_seq_len`` width and
-    # the attention mask flags valid positions, so the JIT cache
-    # contains exactly one trace per (B, max_seq_len) pair. (An
-    # earlier draft passed a growing prefix to the forward; that
-    # produced ``max_seq_len`` distinct trace shapes and exhausted the
-    # LLVM compile cache on default settings.)
+    if use_kv_cache:
+        next_logits, cache = _cached_prefill(
+            model, sequences, prefix_end, max_seq_len, n_games,
+        )
+    else:
+        next_logits = None  # filled lazily inside the per-step branch
+        cache = None
     full_attn_template = np.zeros((n_games, max_seq_len), dtype=bool)
     for pos in range(prefix_end + 1, max_seq_len):
         if terminated.all():
             break
-        # PAD-fill ``ctx`` to ``max_seq_len``; the model's RoPE +
-        # causal mask + attn_mask together handle the unused tail.
-        ctx = jnp.asarray(sequences, dtype=jnp.int32)
-        full_attn_template[:, :pos] = True
-        full_attn_template[:, pos:] = False
-        attn = jnp.asarray(full_attn_template)
-        logits = _forward_jit(model, ctx, attn)
-        next_logits = np.asarray(logits[:, pos - 1, :])  # (B, V)
+        if use_kv_cache:
+            assert next_logits is not None
+            step_logits = next_logits
+        else:
+            # PAD-fill ``ctx`` to ``max_seq_len``; the model's RoPE +
+            # causal mask + attn_mask together handle the unused tail.
+            # The full-recompute path is kept behind ``use_kv_cache=False``
+            # so the KV-cache path can be regression-tested against it.
+            ctx = jnp.asarray(sequences, dtype=jnp.int32)
+            full_attn_template[:, :pos] = True
+            full_attn_template[:, pos:] = False
+            attn = jnp.asarray(full_attn_template)
+            logits = _forward_jit(model, ctx, attn)
+            step_logits = np.asarray(logits[:, pos - 1, :])
         if temperature != 1.0:
-            next_logits = next_logits / float(temperature)
+            step_logits = step_logits / float(temperature)
 
         if mask_illegal:
             raw_mask = np.asarray(env.get_legal_token_masks_batch(
@@ -376,9 +425,9 @@ def _generate_batch(
             pad_only = np.zeros((1, vocab_size), dtype=bool)
             pad_only[0, PAD_TOKEN] = True
             full_mask = np.where(terminated[:, None], pad_only, raw_mask)
-            next_logits = np.where(full_mask, next_logits, -np.inf)
+            step_logits = np.where(full_mask, step_logits, -np.inf)
 
-        sampled, key = _gumbel_max_argmax(next_logits, key)
+        sampled, key = _gumbel_max_argmax(step_logits, key)
         sequences[:, pos] = sampled
 
         # Premature padding: an active game sampled PAD before a real
@@ -418,6 +467,20 @@ def _generate_batch(
                 terminated_at[idx] = pos
                 term_codes[idx] = step_tc[termed]
 
+        # Advance the cache for the next iteration: the next step's
+        # query needs K, V at the position we just sampled into. Skip
+        # the increment on the final iteration — its logits would be
+        # unused (the loop is about to exit).
+        if use_kv_cache and pos + 1 < max_seq_len and not terminated.all():
+            assert cache is not None
+            sampled_for_inc = jnp.asarray(
+                sequences[:, pos:pos + 1], dtype=jnp.int32,
+            )
+            inc_logits, cache = _forward_incremental_jit(
+                model, sampled_for_inc, jnp.int32(pos), cache,
+            )
+            next_logits = np.asarray(inc_logits[:, 0, :])
+
     # Games that never terminated within the window are PLY_LIMIT.
     still_going = ~terminated
     terminated_at[still_going] = max_move_positions
@@ -429,6 +492,31 @@ def _generate_batch(
         game_lengths=terminated_at.astype(np.int32),
         forfeit_ply=forfeit_ply,
     )
+
+
+def _cached_prefill(
+    model: PAWNModel,
+    sequences: np.ndarray,
+    prefix_end: int,
+    max_seq_len: int,
+    n_games: int,
+) -> tuple[np.ndarray, KVCache]:
+    """Run ``model.forward_with_cache`` over the prefix-filled portion
+    of ``sequences`` and return ``(logits_at_prefix_end, populated_cache)``.
+
+    The input shape is always ``(n_games, max_seq_len)`` — the JIT
+    cache contains exactly one trace per ``(B, max_seq_len)`` pair.
+    The attention mask flags only positions ``[0, prefix_end]`` as
+    real so that PAD-positions beyond the prefix don't influence the
+    cache's "real" K, V entries. Subsequent ``forward_incremental``
+    calls overwrite the cache at each new position.
+    """
+    ctx = jnp.asarray(sequences, dtype=jnp.int32)
+    attn = np.zeros((n_games, max_seq_len), dtype=bool)
+    attn[:, :prefix_end + 1] = True
+    attn_j = jnp.asarray(attn)
+    logits, cache = _forward_prefill_jit(model, ctx, attn_j)
+    return np.asarray(logits[:, prefix_end, :]), cache
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +641,7 @@ def outcome_signal_test(
     batch_size: int = 64,
     seed: int = 0,
     verbose: bool = True,
+    use_kv_cache: bool = True,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """Run the §6.1-6.3 outcome-token signal test.
 
@@ -585,7 +674,7 @@ def outcome_signal_test(
             gen = autoregressive_generate(
                 model, otok, n_per_outcome,
                 mask_illegal=masked, batch_size=batch_size,
-                seed=seed + offset,
+                seed=seed + offset, use_kv_cache=use_kv_cache,
             )
             results[oname][label] = _analyze_generated_games(gen, oname)
             results[oname][label]["elapsed_s"] = time.perf_counter() - t0
@@ -615,6 +704,7 @@ def prefix_continuation_test(
     batch_size: int = 64,
     seed: int = 42,
     verbose: bool = True,
+    use_kv_cache: bool = True,
 ) -> dict[str, Any]:
     """§6.4 prefix continuation test with within-test outcome controls.
 
@@ -660,6 +750,7 @@ def prefix_continuation_test(
                     # RNG to advance state across calls; we make that
                     # explicit. (Bug-detector)
                     seed=_subseed(seed, oname, bucket, cname),
+                    use_kv_cache=use_kv_cache,
                 )
                 bucket_results[cname] = _analyze_generated_games(gen, cname)
             results[oname][bucket] = bucket_results
@@ -679,6 +770,7 @@ def prefix_continuation_test(
                     prefix_moves=move_ids[sub], prefix_lengths=pls,
                     batch_size=batch_size,
                     seed=_subseed(seed, oname, bucket, cname),
+                    use_kv_cache=use_kv_cache,
                 )
                 bucket_results[cname] = _analyze_generated_games(gen, cname)
             results[oname][bucket] = bucket_results
@@ -707,6 +799,7 @@ def poisoned_prefix_test(
     prefix_pct: float = 0.5,
     batch_size: int = 64,
     seed: int = 43,
+    use_kv_cache: bool = True,
 ) -> dict[str, Any]:
     """§6.5 poisoned prefix test.
 
@@ -738,6 +831,7 @@ def poisoned_prefix_test(
             prefix_moves=move_ids[selected], prefix_lengths=pls,
             batch_size=batch_size,
             seed=_subseed(seed, "poisoned", actual, poisoned),
+            use_kv_cache=use_kv_cache,
         )
         analysis = _analyze_generated_games(gen, poisoned)
         # Additionally, track how often the continuation lands on the
@@ -767,6 +861,7 @@ def impossible_task_test(
     n_per_scenario: int = 200,
     batch_size: int = 64,
     seed: int = 44,
+    use_kv_cache: bool = True,
 ) -> dict[str, Any]:
     """§6.6 provably-impossible scenarios:
 
@@ -798,6 +893,7 @@ def impossible_task_test(
             prefix_moves=move_ids[selected], prefix_lengths=pls,
             batch_size=batch_size,
             seed=_subseed(seed, "impossible", "zero_remaining_ply"),
+            use_kv_cache=use_kv_cache,
         )
         results["zero_remaining_ply"] = _analyze_generated_games(
             gen, "WHITE_CHECKMATES",
@@ -810,6 +906,7 @@ def impossible_task_test(
             prefix_moves=move_ids[selected], prefix_lengths=pls,
             batch_size=batch_size,
             seed=_subseed(seed, "impossible", "control_ply_limit"),
+            use_kv_cache=use_kv_cache,
         )
         results["control_ply_limit"] = _analyze_generated_games(
             gen_ctrl, "PLY_LIMIT",
@@ -826,6 +923,7 @@ def impossible_task_test(
             prefix_moves=move_ids[selected], prefix_lengths=pls,
             batch_size=batch_size,
             seed=_subseed(seed, "impossible", "insufficient_material"),
+            use_kv_cache=use_kv_cache,
         )
         results["insufficient_material"] = _analyze_generated_games(
             gen, "WHITE_CHECKMATES",
@@ -846,6 +944,7 @@ def improbable_task_test(
     n_per_scenario: int = 200,
     batch_size: int = 64,
     seed: int = 46,
+    use_kv_cache: bool = True,
 ) -> dict[str, Any]:
     """§6.7 highly-improbable scenarios:
 
@@ -874,6 +973,7 @@ def improbable_task_test(
             prefix_moves=move_ids[selected], prefix_lengths=pls,
             batch_size=batch_size,
             seed=_subseed(seed, "improbable", "checkmate_few_ply"),
+            use_kv_cache=use_kv_cache,
         )
         results["checkmate_few_ply"] = _analyze_generated_games(
             gen, "WHITE_CHECKMATES",
@@ -884,6 +984,7 @@ def improbable_task_test(
             prefix_moves=move_ids[selected], prefix_lengths=pls,
             batch_size=batch_size,
             seed=_subseed(seed, "improbable", "control_few_ply"),
+            use_kv_cache=use_kv_cache,
         )
         results["control_few_ply"] = _analyze_generated_games(
             gen_ctrl, "PLY_LIMIT",
@@ -900,6 +1001,7 @@ def improbable_task_test(
             prefix_moves=move_ids[selected], prefix_lengths=pls,
             batch_size=batch_size,
             seed=_subseed(seed, "improbable", "stalemate_early"),
+            use_kv_cache=use_kv_cache,
         )
         results["stalemate_early"] = _analyze_generated_games(
             gen, "STALEMATE",
@@ -910,6 +1012,7 @@ def improbable_task_test(
             prefix_moves=move_ids[selected], prefix_lengths=pls,
             batch_size=batch_size,
             seed=_subseed(seed, "improbable", "control_early"),
+            use_kv_cache=use_kv_cache,
         )
         results["control_early"] = _analyze_generated_games(
             gen_ctrl, "PLY_LIMIT",

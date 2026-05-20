@@ -179,11 +179,144 @@ def _attention(
     return ctx @ wo
 
 
+def _attention_prefill(
+    x: jax.Array,
+    wq: jax.Array,
+    wk: jax.Array,
+    wv: jax.Array,
+    wo: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
+    mask: jax.Array,
+    all_masked_query: jax.Array,
+    n_heads: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Like ``_attention`` but also returns post-RoPE ``K`` and raw ``V``
+    so the caller can stash them in a KV cache for later incremental
+    decoding. Computed values are bitwise-identical to ``_attention``
+    on the same inputs — the function is a pure superset (no
+    extra ops on the attention output itself).
+    """
+    b, t, d = x.shape[0], x.shape[1], x.shape[2]
+    head_dim = d // n_heads
+
+    def split(proj: jax.Array) -> jax.Array:
+        return (x @ proj).reshape(b, t, n_heads, head_dim).transpose(0, 2, 1, 3)
+
+    q = _apply_rope(split(wq), cos, sin)
+    k = _apply_rope(split(wk), cos, sin)
+    v = split(wv)
+
+    scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * (head_dim**-0.5)
+    masked_scores = jnp.where(
+        all_masked_query,
+        scores,
+        scores + mask.astype(scores.dtype),
+    )
+    weights = jax.nn.softmax(masked_scores, axis=-1)
+    weights = jnp.where(all_masked_query, 0.0, weights)
+    ctx = jnp.einsum("bhqk,bhkd->bhqd", weights, v)
+    ctx = ctx.transpose(0, 2, 1, 3).reshape(b, t, d)
+    out = ctx @ wo
+    # Cache K, V in (B, T, H, head_dim) layout so the increment can
+    # `.at[:, pos, :, :].set(...)` along the T axis without transpose.
+    return out, k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)
+
+
+def _attention_incremental(
+    x_single: jax.Array,
+    wq: jax.Array,
+    wk: jax.Array,
+    wv: jax.Array,
+    wo: jax.Array,
+    cos_at_pos: jax.Array,
+    sin_at_pos: jax.Array,
+    cached_k: jax.Array,
+    cached_v: jax.Array,
+    pos: jax.Array,
+    n_heads: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Single-token incremental attention.
+
+    Args:
+        x_single: ``(B, 1, d)`` — the new position's input.
+        cached_k / cached_v: ``(B, T_max, n_heads, head_dim)`` — post-RoPE K
+            and raw V from prior positions; positions ``[0, pos)`` are
+            populated. The function writes the new K, V at slot ``pos``.
+        cos_at_pos / sin_at_pos: ``(1, head_dim // 2)`` — RoPE tables
+            sliced to the new position.
+        pos: scalar int — the new position. Must be a *traced* scalar
+            so the JIT cache contains one trace for all positions.
+
+    Returns ``(output, updated_cached_k, updated_cached_v)``. ``output``
+    has shape ``(B, 1, d)``.
+    """
+    b, _, d = x_single.shape[0], x_single.shape[1], x_single.shape[2]
+    head_dim = d // n_heads
+
+    q_new = (x_single @ wq).reshape(b, 1, n_heads, head_dim)
+    k_new = (x_single @ wk).reshape(b, 1, n_heads, head_dim)
+    v_new = (x_single @ wv).reshape(b, 1, n_heads, head_dim)
+    # RoPE on the new Q and K at position ``pos``.
+    q_rope = _apply_rope(q_new.transpose(0, 2, 1, 3), cos_at_pos, sin_at_pos)
+    k_rope = _apply_rope(k_new.transpose(0, 2, 1, 3), cos_at_pos, sin_at_pos)
+    # Write back to the cache in (B, T_max, H, head_dim) layout. Post-RoPE
+    # K means the increment doesn't have to re-RoPE cached entries —
+    # the standard pattern.
+    k_to_cache = k_rope.transpose(0, 2, 1, 3)  # (B, 1, H, head_dim)
+    new_cached_k = jax.lax.dynamic_update_index_in_dim(
+        cached_k, k_to_cache[:, 0], pos, axis=1,
+    )
+    new_cached_v = jax.lax.dynamic_update_index_in_dim(
+        cached_v, v_new[:, 0], pos, axis=1,
+    )
+
+    # Attend the single new query against the full cache + new K.
+    # Reshape cache to (B, H, T_max, head_dim) for the einsum kernel.
+    k_attn = new_cached_k.transpose(0, 2, 1, 3)
+    v_attn = new_cached_v.transpose(0, 2, 1, 3)
+    scores = jnp.einsum("bhqd,bhkd->bhqk", q_rope, k_attn) * (head_dim**-0.5)
+
+    # Mask positions > pos. Positions [0, pos] are real; the rest are
+    # the unfilled tail of the pre-allocated cache.
+    T_max = cached_k.shape[1]
+    positions = jnp.arange(T_max)
+    is_real = positions <= pos
+    additive_mask = jnp.where(is_real, 0.0, -jnp.inf).astype(scores.dtype)
+    scores = scores + additive_mask[None, None, None, :]
+    weights = jax.nn.softmax(scores, axis=-1)
+    ctx = jnp.einsum("bhqk,bhkd->bhqd", weights, v_attn)
+    ctx = ctx.transpose(0, 2, 1, 3).reshape(b, 1, d)
+    return ctx @ wo, new_cached_k, new_cached_v
+
+
 def _ffn(
     x: jax.Array, w_gate: jax.Array, w_up: jax.Array, w_down: jax.Array
 ) -> jax.Array:
     """SwiGLU feed-forward network (mirrors ``pawn.model.SwiGLUFFN``)."""
     return (jax.nn.silu(x @ w_gate) * (x @ w_up)) @ w_down
+
+
+class KVCache(NamedTuple):
+    """Per-layer K, V cache for incremental decoding.
+
+    Pre-allocated at ``T_max = cfg.max_seq_len`` so that the JIT trace
+    for ``PAWNModel.forward_incremental`` is shape-stable across every
+    decode step (no recompile per position). K is stored post-RoPE so
+    the increment doesn't have to re-RoPE cached entries; V is raw.
+
+    Shape contract::
+
+        k: (n_layers, B, T_max, n_heads, head_dim)
+        v: (n_layers, B, T_max, n_heads, head_dim)
+
+    Positions ``[0, current_pos]`` are populated; positions
+    ``(current_pos, T_max)`` are filler — the attention mask in
+    ``_attention_incremental`` excludes them.
+    """
+
+    k: jax.Array
+    v: jax.Array
 
 
 class LayerWeights(NamedTuple):
@@ -383,6 +516,150 @@ class PAWNModel(eqx.Module):
         # ``layer_outs`` is ``(n_layers, B, T, d)``; prepend the embed
         # output to match the legacy convention.
         return jnp.concatenate([x[None], layer_outs], axis=0)
+
+    def forward_with_cache(
+        self, tokens: jax.Array, attn_mask: jax.Array,
+    ) -> tuple[jax.Array, KVCache]:
+        """Prefill forward — same logits as ``__call__`` plus a populated
+        ``KVCache`` for incremental decoding.
+
+        The returned cache is shape-stable at ``cfg.max_seq_len`` even if
+        ``tokens.shape[1] < cfg.max_seq_len`` (positions past the input
+        are zero-filled; subsequent ``forward_incremental`` calls write
+        to those slots in order and the attention mask excludes the
+        unfilled tail). ``__call__`` and ``forward_with_cache`` produce
+        bitwise-identical logits on the same input — the only
+        difference is the cache return.
+
+        Args:
+            tokens: ``(B, T)`` int. ``T <= cfg.max_seq_len``.
+            attn_mask: ``(B, T)`` bool.
+
+        Returns:
+            ``(logits, cache)``: ``(B, T, vocab_size)`` and a populated
+            cache shaped ``(n_layers, B, T_max, n_heads, head_dim)``.
+        """
+        cfg = self.cfg
+        seq_len = tokens.shape[1]
+        if seq_len > cfg.max_seq_len:
+            raise ValueError(
+                f"sequence length {seq_len} exceeds max_seq_len {cfg.max_seq_len}"
+            )
+        x = self._embed(tokens)
+        cos, sin = _rope_tables(cfg.head_dim, seq_len, cfg.rope_base)
+        mask = _build_attn_mask(attn_mask, seq_len)
+        real_so_far = jnp.cumsum(attn_mask, axis=1)
+        all_masked_query = (real_so_far == 0)[:, None, :, None]
+
+        layers = LayerWeights(
+            attn_norm=self.attn_norm, wq=self.wq, wk=self.wk, wv=self.wv,
+            wo=self.wo, ffn_norm=self.ffn_norm, w_gate=self.w_gate,
+            w_up=self.w_up, w_down=self.w_down,
+        )
+
+        def run_layer(
+            h: jax.Array, lw: LayerWeights,
+        ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+            attn_out, k_layer, v_layer = _attention_prefill(
+                _rmsnorm(h, lw.attn_norm),
+                lw.wq, lw.wk, lw.wv, lw.wo,
+                cos, sin, mask, all_masked_query, cfg.n_heads,
+            )
+            h = h + attn_out
+            h = h + _ffn(_rmsnorm(h, lw.ffn_norm), lw.w_gate, lw.w_up, lw.w_down)
+            return h, (k_layer, v_layer)
+
+        # No ``jax.checkpoint`` — generation only does forward, no
+        # backward; remat's trade is a pure loss here. Bitwise-identical
+        # to ``__call__`` thanks to plain-attention determinism (the
+        # remat in ``__call__`` is also semantically a no-op under
+        # forward-only).
+        x, (k_per_layer, v_per_layer) = jax.lax.scan(
+            run_layer, x, layers,
+        )
+        x = _rmsnorm(x, self.final_norm)
+        logits = x @ self.lm_head
+        # Pad the cache out to (T_max, ...) so incremental decoding has
+        # one stable shape.
+        T_max = cfg.max_seq_len
+        if seq_len == T_max:
+            k_full = k_per_layer
+            v_full = v_per_layer
+        else:
+            pad_shape = (
+                cfg.n_layers, tokens.shape[0], T_max - seq_len,
+                cfg.n_heads, cfg.head_dim,
+            )
+            k_full = jnp.concatenate(
+                [k_per_layer, jnp.zeros(pad_shape, dtype=k_per_layer.dtype)],
+                axis=2,
+            )
+            v_full = jnp.concatenate(
+                [v_per_layer, jnp.zeros(pad_shape, dtype=v_per_layer.dtype)],
+                axis=2,
+            )
+        return logits, KVCache(k=k_full, v=v_full)
+
+    def forward_incremental(
+        self, token: jax.Array, pos: jax.Array, cache: KVCache,
+    ) -> tuple[jax.Array, KVCache]:
+        """Single-token incremental forward.
+
+        Computes logits at position ``pos`` using the K, V cache for
+        positions ``[0, pos)`` plus the new K, V it derives from
+        ``token``. Returns ``(logits[:, pos], updated_cache)``.
+
+        ``pos`` is a *traced* scalar — one JIT trace covers every
+        decode step.
+
+        Args:
+            token: ``(B, 1)`` int — the new position's token id.
+            pos: scalar int — the new position. Must be
+                ``0 <= pos < cfg.max_seq_len``; the cache must have
+                positions ``[0, pos)`` populated.
+            cache: ``KVCache`` from a prior ``forward_with_cache`` or
+                ``forward_incremental`` call.
+
+        Returns:
+            ``(logits, cache)`` — logits shape ``(B, 1, vocab_size)``,
+            cache updated with K, V at slot ``pos``.
+        """
+        cfg = self.cfg
+        cos_full, sin_full = _rope_tables(
+            cfg.head_dim, cfg.max_seq_len, cfg.rope_base,
+        )
+        # RoPE slice at the new position.
+        cos_at = jax.lax.dynamic_slice_in_dim(cos_full, pos, 1, axis=0)
+        sin_at = jax.lax.dynamic_slice_in_dim(sin_full, pos, 1, axis=0)
+
+        x = self._embed(token)
+
+        layers = LayerWeights(
+            attn_norm=self.attn_norm, wq=self.wq, wk=self.wk, wv=self.wv,
+            wo=self.wo, ffn_norm=self.ffn_norm, w_gate=self.w_gate,
+            w_up=self.w_up, w_down=self.w_down,
+        )
+
+        def run_layer(
+            h: jax.Array,
+            inputs: tuple[LayerWeights, jax.Array, jax.Array],
+        ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+            lw, k_cache_layer, v_cache_layer = inputs
+            attn_out, new_k, new_v = _attention_incremental(
+                _rmsnorm(h, lw.attn_norm),
+                lw.wq, lw.wk, lw.wv, lw.wo,
+                cos_at, sin_at,
+                k_cache_layer, v_cache_layer, pos, cfg.n_heads,
+            )
+            h = h + attn_out
+            h = h + _ffn(_rmsnorm(h, lw.ffn_norm), lw.w_gate, lw.w_up, lw.w_down)
+            return h, (new_k, new_v)
+
+        x, (new_k_cache, new_v_cache) = jax.lax.scan(
+            run_layer, x, (layers, cache.k, cache.v),
+        )
+        x = _rmsnorm(x, self.final_norm)
+        return x @ self.lm_head, KVCache(k=new_k_cache, v=new_v_cache)
 
     def _embed(self, tokens: jax.Array) -> jax.Array:
         """Factored input embedding (mirrors ``pawn.model.CLMEmbedding``)."""

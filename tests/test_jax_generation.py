@@ -229,6 +229,128 @@ def test_autoregressive_generate_variable_prefix_length_grouping() -> None:
         )
 
 
+def test_autoregressive_generate_kv_cache_matches_full_recompute() -> None:
+    """KV-cache path produces the same generated sequences as the
+    full-recompute path.
+
+    Bitwise equivalence is the strict promise — the model produces
+    bit-identical logits across both paths (``forward_with_cache`` is
+    a pure superset of ``__call__``; ``forward_incremental`` runs the
+    same layer kernel on a single-position slice with cached K, V).
+    With the same Gumbel noise the argmax must land on the same token.
+
+    The test exercises both no-prefix and with-prefix scenarios so
+    the prefill code path and the incremental loop are both
+    exercised."""
+    model = _tiny_model()
+
+    # 1. No prefix.
+    gen_full = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=4,
+        mask_illegal=True, max_seq_len=20, batch_size=4, seed=17,
+        use_kv_cache=False,
+    )
+    gen_kv = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=4,
+        mask_illegal=True, max_seq_len=20, batch_size=4, seed=17,
+        use_kv_cache=True,
+    )
+    np.testing.assert_array_equal(
+        gen_kv.sequences, gen_full.sequences,
+        err_msg="no-prefix: KV-cache and full-recompute sequences diverged",
+    )
+    np.testing.assert_array_equal(
+        gen_kv.term_codes, gen_full.term_codes,
+        err_msg="no-prefix: KV-cache and full-recompute term_codes diverged",
+    )
+    np.testing.assert_array_equal(
+        gen_kv.game_lengths, gen_full.game_lengths,
+        err_msg="no-prefix: KV-cache and full-recompute game_lengths diverged",
+    )
+
+    # 2. With a uniform prefix.
+    _ids, _t, _lm, move_ids, gls, _tc = engine.generate_clm_batch(
+        4, 16, 51, False, 0.0, False,
+    )
+    pls = np.minimum(np.full(4, 3, dtype=np.int32), gls.astype(np.int32))
+    gen_full_p = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=4,
+        mask_illegal=True, max_seq_len=20, batch_size=4, seed=29,
+        prefix_moves=move_ids, prefix_lengths=pls, use_kv_cache=False,
+    )
+    gen_kv_p = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=4,
+        mask_illegal=True, max_seq_len=20, batch_size=4, seed=29,
+        prefix_moves=move_ids, prefix_lengths=pls, use_kv_cache=True,
+    )
+    np.testing.assert_array_equal(
+        gen_kv_p.sequences, gen_full_p.sequences,
+        err_msg="with-prefix: KV-cache and full-recompute sequences diverged",
+    )
+
+
+def test_forward_with_cache_matches_call() -> None:
+    """``forward_with_cache`` produces the same logits as ``__call__``
+    on the same input. This is a unit-level pin on the prefill
+    primitive used by KV-cache decoding."""
+    import jax.numpy as jnp
+
+    from pawn.config import TINY_SUPERNET
+
+    model = _tiny_model()
+    rng = np.random.default_rng(0)
+    tokens = jnp.asarray(rng.integers(0, 64, (2, TINY_SUPERNET.max_seq_len)), dtype=jnp.int32)
+    attn = jnp.ones((2, TINY_SUPERNET.max_seq_len), dtype=jnp.bool_)
+    logits_ref = model(tokens, attn)
+    logits, _cache = model.forward_with_cache(tokens, attn)
+    np.testing.assert_array_equal(
+        np.asarray(logits), np.asarray(logits_ref),
+        err_msg="forward_with_cache logits diverged from __call__",
+    )
+
+
+def test_forward_incremental_matches_full_forward() -> None:
+    """``forward_incremental`` at position ``pos`` produces logits that
+    match ``__call__`` at the same position on the same prefix +
+    next-token sequence. This pins the cached-decode invariant at the
+    single-step level."""
+    import jax.numpy as jnp
+
+    from pawn.config import TINY_SUPERNET
+
+    model = _tiny_model()
+    T = TINY_SUPERNET.max_seq_len
+    rng = np.random.default_rng(1)
+    # Sequence: first 5 positions are real tokens, rest PAD.
+    full_tokens = np.full((2, T), 1968, dtype=np.int32)
+    full_tokens[:, :5] = rng.integers(0, 64, (2, 5)).astype(np.int32)
+
+    # Prefill on positions [0..5) → cache + logits at position 4.
+    prefill_tokens = full_tokens.copy()
+    prefill_attn = np.zeros((2, T), dtype=bool)
+    prefill_attn[:, :5] = True
+    logits_pref, cache = model.forward_with_cache(
+        jnp.asarray(prefill_tokens), jnp.asarray(prefill_attn),
+    )
+
+    # Now: at position 5, feed the next token. We need a real (non-PAD)
+    # token to match a full forward over positions [0..6).
+    next_token = rng.integers(0, 64, (2, 1)).astype(np.int32)
+    full_tokens[:, 5:6] = next_token
+    full_attn = np.zeros((2, T), dtype=bool)
+    full_attn[:, :6] = True
+    full_logits = model(jnp.asarray(full_tokens), jnp.asarray(full_attn))
+
+    inc_logits, _cache = model.forward_incremental(
+        jnp.asarray(next_token), jnp.int32(5), cache,
+    )
+    np.testing.assert_allclose(
+        np.asarray(inc_logits[:, 0, :]), np.asarray(full_logits[:, 5, :]),
+        rtol=1e-5, atol=1e-5,
+        err_msg="forward_incremental[pos=5] diverged from __call__[:, 5]",
+    )
+
+
 def test_autoregressive_generate_mixed_prefix_post_prefix_continues() -> None:
     """Variable-prefix-length grouping: every row's positions
     ``[pl + 1, max_seq_len)`` should contain at least one real (non-PAD,
