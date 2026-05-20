@@ -29,7 +29,12 @@ SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 def _load_script() -> ModuleType:
     """Import ``convert_published_checkpoints.py`` as a top-level module
     (``scripts/`` is not a package; this matches the convention used by
-    ``tests/scripts/test_script_smoke.py``)."""
+    ``tests/scripts/test_script_smoke.py``).
+
+    If ``exec_module`` raises (syntax error, import-time exception),
+    remove the half-initialised entry from ``sys.modules`` so a
+    subsequent retry doesn't take the fast-path and return a broken
+    module."""
     name = "convert_published_checkpoints_test_module"
     if name in sys.modules:
         return sys.modules[name]
@@ -39,16 +44,21 @@ def _load_script() -> ModuleType:
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
     return mod
 
 
 def test_convert_one_returns_failure_result_on_snapshot_error(
-    tmp_path: Path,
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     """A network failure in ``snapshot_download`` returns a FAIL row, not
     a raise. ``passed`` is False, ``error`` is populated, downstream
-    fields are NaN/zero placeholders."""
+    fields are NaN/zero placeholders. The FAILED line + traceback +
+    elapsed timing must all land on stderr (CI split-tee invariant)."""
     script = _load_script()
     out_root = tmp_path
     with patch.object(
@@ -68,6 +78,10 @@ def test_convert_one_returns_failure_result_on_snapshot_error(
     # before formatting them.
     assert result["d_model"] == 0
     assert result["max_diff"] != result["max_diff"]  # NaN
+    # Stderr-routing invariant: all three failure diagnostics on stderr.
+    captured = capfd.readouterr()
+    assert "FAILED: ConnectionError: simulated network timeout" in captured.err
+    assert "elapsed:" in captured.err
 
 
 def test_convert_one_flags_stale_dst_in_error(tmp_path: Path) -> None:
@@ -169,3 +183,68 @@ def test_main_exits_zero_when_all_pass(
 
     with patch.object(script, "_convert_one", side_effect=all_pass):
         assert script.main(["--variants", *script.VARIANTS]) == 0
+
+
+def test_main_exits_one_on_parity_breach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parity-breach path: conversion succeeded (no exception, error=None)
+    but ``max_diff >= tol``. The summary should still format the row
+    cleanly, and the overall exit must be 1. This is the most likely
+    production failure mode (all I/O fine, numerical parity degrades);
+    pinning it independently of the snapshot-error path."""
+    script = _load_script()
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+
+    def parity_fail(variant: str, out_root: Path, **kw: object) -> object:
+        return script._VariantResult(
+            variant=variant,
+            d_model=512,
+            n_layers=8,
+            n_heads=8,
+            head_dim=64,
+            max_diff=5e-2,       # well above any reasonable tol
+            mean_diff=1e-3,
+            passed=False,        # parity breach
+            elapsed_s=0.0,
+            error=None,          # conversion itself succeeded
+        )
+
+    with patch.object(script, "_convert_one", side_effect=parity_fail):
+        assert script.main(["--variants", "pawn-base"]) == 1
+
+
+def test_convert_one_succeeds_does_not_label_stale(
+    tmp_path: Path,
+) -> None:
+    """If a prior run wrote ``dst`` and this run's failure happens
+    *after* ``convert_legacy_checkpoint`` overwrites it, the bytes on
+    disk are this run's fresh output — not stale — and the error must
+    NOT carry the ``[stale dst...]`` marker. Pins the
+    ``converted_this_run`` guard."""
+    script = _load_script()
+    out_root = tmp_path
+    stale_dst = out_root / "pawn-small"
+    stale_dst.mkdir()
+
+    # snapshot_download returns a real-looking path; convert_legacy_checkpoint
+    # is a no-op (claims success); _build_torch_reference raises *after*
+    # the no-op overwrite "happened". The test pins that the error in
+    # that scenario does NOT carry the stale-dst marker.
+    with patch.object(
+        script.huggingface_hub, "snapshot_download", return_value=str(tmp_path)
+    ), patch.object(
+        script, "convert_legacy_checkpoint", return_value=None
+    ), patch.object(
+        script,
+        "_build_torch_reference",
+        side_effect=RuntimeError("post-conversion failure"),
+    ):
+        result = script._convert_one(
+            "pawn-small", out_root, batch_size=1, seq_len=4, tol=1e-3
+        )
+    assert result["error"] is not None
+    assert "RuntimeError" in result["error"]
+    assert "stale dst" not in result["error"], (
+        f"converted_this_run guard regressed: error={result['error']!r}"
+    )

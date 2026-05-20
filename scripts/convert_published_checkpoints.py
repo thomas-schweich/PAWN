@@ -120,6 +120,11 @@ def _convert_one(
     # ``$HF_HOME/pawn-jax-converted/<variant>/`` would load it. Snapshot
     # the pre-existing state so the failure handler can flag it.
     dst_preexisted = dst.exists()
+    # Set to True once ``convert_legacy_checkpoint`` returns — at that
+    # point ``dst`` holds *this run's* freshly-converted bytes, not the
+    # stale ones, so a later parity/load failure shouldn't be labelled
+    # "stale dst".
+    converted_this_run = False
     t0 = time.perf_counter()
     print(f"=== {variant} ===")
     try:
@@ -140,28 +145,22 @@ def _convert_one(
         print(f"    cached at {src}")
         print(f"  convert_legacy_checkpoint -> {dst}")
         convert_legacy_checkpoint(src, dst)
+        converted_this_run = True
         print("  build PyTorch reference ...")
         torch_model, torch_cfg = _build_torch_reference(src)
         print(f"  load_model({dst})")
         jax_model = load_model(dst)
         # Bare ``assert`` would be stripped under ``python -O``; use
         # explicit raises so a config mismatch always surfaces with a
-        # readable message.
-        if jax_model.cfg.d_model != torch_cfg.d_model:
-            raise ValueError(
-                f"d_model mismatch after conversion: "
-                f"JAX={jax_model.cfg.d_model} PyTorch={torch_cfg.d_model}"
-            )
-        if jax_model.cfg.n_layers != torch_cfg.n_layers:
-            raise ValueError(
-                f"n_layers mismatch after conversion: "
-                f"JAX={jax_model.cfg.n_layers} PyTorch={torch_cfg.n_layers}"
-            )
-        if jax_model.cfg.n_heads != torch_cfg.n_heads:
-            raise ValueError(
-                f"n_heads mismatch after conversion: "
-                f"JAX={jax_model.cfg.n_heads} PyTorch={torch_cfg.n_heads}"
-            )
+        # readable message. Looped because the three checks differ only
+        # in field name.
+        for field in ("d_model", "n_layers", "n_heads"):
+            jv = getattr(jax_model.cfg, field)
+            tv = getattr(torch_cfg, field)
+            if jv != tv:
+                raise ValueError(
+                    f"{field} mismatch after conversion: JAX={jv} PyTorch={tv}"
+                )
         max_diff, mean_diff = _forward_parity(
             torch_model, jax_model, b=batch_size, t=seq_len
         )
@@ -171,18 +170,19 @@ def _convert_one(
         # KeyboardInterrupt / SystemExit still propagate.
         elapsed = time.perf_counter() - t0
         error_str = f"{type(exc).__name__}: {exc}"
-        # If ``dst`` exists *and* was already there before this run, the
-        # bytes on disk are stale (a prior run's output, not this one's).
-        # Note it in the error so an operator doesn't silently load
-        # last-week's conversion thinking it's current.
-        if dst_preexisted and dst.exists():
+        # If ``dst`` exists, was there before this run, *and* this run
+        # did not overwrite it (the failure happened before
+        # ``convert_legacy_checkpoint`` returned), the bytes on disk are
+        # stale. Note it in the error so an operator doesn't silently
+        # load last-week's conversion thinking it's current.
+        if dst_preexisted and not converted_this_run and dst.exists():
             error_str += " [stale dst on disk from prior run]"
-        # Route both diagnostic lines to stderr so a CI capture that
-        # split-tees stdout/stderr keeps the variant context and the
-        # traceback on the same stream.
+        # Route every diagnostic line in this block to stderr so a CI
+        # capture that split-tees stdout/stderr keeps the variant
+        # context, traceback, and timing on the same stream.
         print(f"  FAILED: {error_str}", file=sys.stderr)
         traceback.print_exc()
-        print(f"  elapsed: {elapsed:.1f}s\n")
+        print(f"  elapsed: {elapsed:.1f}s\n", file=sys.stderr)
         return _VariantResult(
             variant=variant,
             d_model=0,
