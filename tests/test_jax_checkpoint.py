@@ -1,4 +1,4 @@
-"""Tests for ``pawn.jax.checkpoint`` — round-trip and integrity."""
+"""Tests for ``pawn.checkpoint`` — round-trip and integrity."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ pytest.importorskip("chess_engine")
 import jax
 import jax.numpy as jnp
 
-from pawn.jax.checkpoint import (
+from pawn.checkpoint import (
     CheckpointIntegrityError,
     IncompleteCheckpointError,
     UnsupportedCheckpointVersionError,
@@ -25,8 +25,8 @@ from pawn.jax.checkpoint import (
     save_model,
     verify_checkpoint,
 )
-from pawn.jax.config import VARIANTS
-from pawn.jax.model import PAWNModel, init_model
+from pawn.config import VARIANTS
+from pawn.model import PAWNModel, init_model
 from tests._jax_helpers import corrupt_safetensors, stamp_format_version
 
 pytestmark = pytest.mark.integration

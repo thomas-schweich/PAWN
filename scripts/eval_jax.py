@@ -24,11 +24,11 @@ from pathlib import Path
 import jax
 import numpy as np
 
-from pawn.jax.checkpoint import load_model
-from pawn.jax.config import TINY_SUPERNET, TINY_VARIANTS, VARIANTS, SUPERNET
-from pawn.jax.corpus import generate_corpus
-from pawn.jax.eval import evaluate_accuracy
-from pawn.jax.model import PAWNModel, init_model, sliced
+from pawn.checkpoint import load_model
+from pawn.config import TINY_SUPERNET, TINY_VARIANTS, VARIANTS, SUPERNET
+from pawn.corpus import generate_corpus
+from pawn.eval import evaluate_accuracy
+from pawn.model import PAWNModel, init_model, sliced
 
 
 def _slug() -> str:

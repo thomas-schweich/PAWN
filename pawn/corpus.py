@@ -30,7 +30,7 @@ import chess_engine as engine
 import numpy as np
 from numpy.typing import NDArray
 
-from pawn.jax.config import (
+from pawn.config import (
     MAX_SEQ_LEN,
     N_OUTCOMES,
     OUTCOME_TOKEN_BASE,

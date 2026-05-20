@@ -1,4 +1,4 @@
-"""Tests for ``pawn.jax.adapter_trainer`` — Phase-3 chunks 2/3.
+"""Tests for ``pawn.adapter_trainer`` — Phase-3 chunks 2/3.
 
 Pins the load-bearing invariants of the adapter training loop:
 
@@ -30,17 +30,17 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from pawn.jax.adapter_trainer import (
+from pawn.adapter_trainer import (
     init_adapter_state,
     make_adapter_scan_step,
     make_adapter_train_step,
     make_eval_step,
 )
-from pawn.jax.adapters import LoRAConfig, init_lora_model
-from pawn.jax.config import TINY_SUPERNET, TINY_VARIANTS
-from pawn.jax.corpus import generate_corpus
-from pawn.jax.model import init_model, sliced
-from pawn.jax.trainer import Batch, make_optimizer
+from pawn.adapters import LoRAConfig, init_lora_model
+from pawn.config import TINY_SUPERNET, TINY_VARIANTS
+from pawn.corpus import generate_corpus
+from pawn.model import init_model, sliced
+from pawn.trainer import Batch, make_optimizer
 
 
 def _setup(rank: int = 4, lr: float = 3e-3) -> tuple:

@@ -1,4 +1,4 @@
-"""Tests for ``pawn.jax.eval`` — Phase-4 chunk 1 move-accuracy eval."""
+"""Tests for ``pawn.eval`` — Phase-4 chunk 1 move-accuracy eval."""
 
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from pawn.jax.config import NUM_ACTIONS, TINY_SUPERNET
-from pawn.jax.corpus import generate_corpus
-from pawn.jax.eval import AccuracyResult, evaluate_accuracy
-from pawn.jax.model import init_model
+from pawn.config import NUM_ACTIONS, TINY_SUPERNET
+from pawn.corpus import generate_corpus
+from pawn.eval import AccuracyResult, evaluate_accuracy
+from pawn.model import init_model
 
 
 def test_evaluate_accuracy_shape_and_range() -> None:

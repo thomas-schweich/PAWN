@@ -1,4 +1,4 @@
-"""Tests for ``pawn.jax.corpus``."""
+"""Tests for ``pawn.corpus``."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ pytest.importorskip("chess_engine")
 
 import numpy as np
 
-from pawn.jax.config import (
+from pawn.config import (
     N_OUTCOMES,
     OUTCOME_TOKEN_BASE,
     PAD_TOKEN,
@@ -18,7 +18,7 @@ from pawn.jax.config import (
     VARIANTS,
     validate_nested,
 )
-from pawn.jax.corpus import (
+from pawn.corpus import (
     _OFFSET_BLACK_CHECKMATES,
     _OFFSET_DRAW_BY_RULE,
     _OFFSET_PLY_LIMIT,
@@ -184,7 +184,7 @@ def test_production_supernet_variants_still_nest() -> None:
     """Regression guard: the production ``VARIANTS`` must continue to
     nest under ``SUPERNET`` even as we add the tiny variants. The two
     nesting trees are independent but share validation logic."""
-    from pawn.jax.config import SUPERNET
+    from pawn.config import SUPERNET
     for variant in VARIANTS.values():
         validate_nested(variant, SUPERNET)
 

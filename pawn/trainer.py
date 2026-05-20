@@ -1,1353 +1,468 @@
-"""PAWN training loop with checkpointing and monitoring.
+"""JAX pretraining trainer — single-step + K-step ``lax.scan`` primitives.
 
-Uses `AdamW <https://arxiv.org/abs/1711.05101>`_ (Loshchilov & Hutter,
-2017) with cosine LR decay (`Loshchilov & Hutter, 2016
-<https://arxiv.org/abs/1608.03983>`_) and mixed-precision training
-(`Micikevicius et al., 2017 <https://arxiv.org/abs/1710.03740>`_).
+Public API:
+
+* ``cross_entropy_loss`` — masked next-token cross-entropy on logits.
+* ``compute_variant_loss`` — forward a single ``PAWNModel`` (the supernet
+  or a sliced variant) on one batch and return the mean masked CE.
+* ``compute_supernet_loss`` — sum the per-variant losses on a shared
+  batch (the joint-supernet objective from ``docs/jax-migration.md``
+  §5.3).
+* ``make_lr_schedule`` — Optax warmup→cosine schedule with
+  documented decay-step semantics.
+* ``make_optimizer`` — AdamW with gradient clipping and an
+  optional LR schedule.
+* ``init_train_state`` — build the initial ``TrainState`` for a
+  ``PAWNModel`` under a given optimizer.
+* ``make_train_step`` — jitted ``(state, batch) -> (state, metrics)``
+  that applies one optimizer step to the supernet against the joint
+  objective.
+* ``make_scan_step`` — fuses ``train_step`` into a K-step
+  ``jax.lax.scan`` (§4.4).
+* ``TrainState`` / ``VariantSpec`` / ``Batch`` / ``TrainStep`` —
+  type aliases and PyTree state.
 """
 
-import json
-import math
-import os
-import signal
-import sys
-import time
-from datetime import datetime, timezone
+from __future__ import annotations
 
-import numpy as np
-import psutil
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import NamedTuple
 
-import chess_engine as engine
-from pawn.config import CLMConfig, TrainingConfig
-from pawn.model import PAWNCLM
-from pawn.data import (
-    CLMDataset,
-    align_legal_to_preds,
-    create_validation_set,
-)
-from pawn.logging import MetricsLogger
-from pawn.wandb_utils import finish_wandb, init_wandb, log_metrics
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import optax
 
-from pawn.data_utils import unpack_grid
+from pawn.config import ModelConfig
+from pawn.model import PAWNModel, sliced
+
+# A pretraining batch — the four parallel ``[B, T]`` arrays the trainer
+# consumes. Aliased so the trainer signature and any test helpers can
+# share a single shape contract; ``*batch`` unpacking thereby stays
+# type-correct without ``# type: ignore``.
+Batch = tuple[jax.Array, jax.Array, jax.Array, jax.Array]
+TrainStep = Callable[["TrainState", Batch], tuple["TrainState", dict[str, jax.Array]]]
 
 
-class CosineWithWarmup:
-    """Cosine LR schedule with linear warmup.
+class TrainState(NamedTuple):
+    """Per-step training state.
 
-    Based on SGDR (`Loshchilov & Hutter, 2016
-    <https://arxiv.org/abs/1608.03983>`_).
+    ``model`` is the full supernet; ``opt_state`` is Optax's state for
+    the same PyTree. ``step`` is a 0-d ``jnp.int32`` traced into the
+    state PyTree — it MUST be a JAX array, not a Python int, because
+    ``eqx.filter_jit`` would treat a Python int as a static cache key
+    and recompile on every increment (a ~70× per-call slowdown). The
+    host can still read it via ``int(state.step)`` after a step. The
+    convention also lets ``make_scan_step`` fold the same step into a
+    ``jax.lax.scan`` body cleanly.
+
+    Note on padded-batch step accounting: when the trainer skips an
+    update (the all-padding ``loss_mask=False`` case), neither
+    ``state.step`` nor the Optax internal count advance — so the
+    schedule stays in lockstep with the host-side step counter. See
+    ``make_train_step`` for details.
     """
 
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        warmup_steps: int,
-        total_steps: int,
-        min_lr_ratio: float = 0.1,
-    ):
-        self.optimizer = optimizer
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.min_lr_ratio = min_lr_ratio
-        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
-        self._step = 0
-        self._apply_lr(0)
-
-    def _apply_lr(self, step: int) -> None:
-        lr_scale = self._compute_lr_scale(step)
-        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
-            pg["lr"] = base_lr * lr_scale
-
-    def step(self) -> None:
-        self._step += 1
-        self._apply_lr(self._step)
-
-    def _compute_lr_scale(self, step: int) -> float:
-        if step < self.warmup_steps:
-            return step / max(1, self.warmup_steps)
-        progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
-        progress = min(progress, 1.0)
-        return self.min_lr_ratio + 0.5 * (1.0 - self.min_lr_ratio) * (
-            1.0 + math.cos(math.pi * progress)
-        )
-
-    def get_lr(self) -> float:
-        return self.optimizer.param_groups[0]["lr"]
-
-    def state_dict(self) -> dict[str, int]:
-        return {"step": self._step}
-
-    def load_state_dict(self, state: dict[str, int]) -> None:
-        self._step = state["step"]
-        self._apply_lr(self._step)
+    model: PAWNModel
+    opt_state: optax.OptState
+    step: jax.Array
 
 
-class WSDSchedule:
-    """Warmup-Stable-Decay schedule.
+@dataclass(frozen=True)
+class VariantSpec:
+    """One slice of the supernet contributing to the joint loss.
 
-    Three phases: linear warmup → flat peak → linear or cosine decay.
-    The stable phase dominates the schedule, which keeps peak LR for
-    long runs where a cosine tail prematurely cuts gains.
-    ``decay_shape`` controls the decay curve (``"linear"`` or
-    ``"cosine"``).
+    ``cfg`` is the variant's ``ModelConfig`` (must satisfy
+    ``validate_nested`` against the supernet); ``weight`` scales its
+    contribution in the sum. Default weights are 1.0; future
+    sandwich-rule schedules (§5.3) live at the call site, not here.
     """
 
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        warmup_steps: int,
-        decay_steps: int,
-        total_steps: int,
-        min_lr_ratio: float = 0.0,
-        decay_shape: str = "linear",
-    ):
-        if decay_shape not in ("linear", "cosine"):
-            raise ValueError(
-                f"Unknown decay_shape: {decay_shape!r} "
-                "(expected 'linear' or 'cosine')"
-            )
-        self.optimizer = optimizer
-        self.warmup_steps = warmup_steps
-        self.decay_steps = decay_steps
-        self.total_steps = total_steps
-        self.min_lr_ratio = min_lr_ratio
-        self.decay_shape = decay_shape
-        self._stable_end = max(warmup_steps, total_steps - decay_steps)
-        self._decay_window = max(total_steps - self._stable_end, 1)
-        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
-        self._step = 0
-        self._apply_lr(0)
-
-    def _apply_lr(self, step: int) -> None:
-        lr_scale = self._compute_lr_scale(step)
-        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
-            pg["lr"] = base_lr * lr_scale
-
-    def step(self) -> None:
-        self._step += 1
-        self._apply_lr(self._step)
-
-    def _compute_lr_scale(self, step: int) -> float:
-        if step < self.warmup_steps:
-            return step / max(1, self.warmup_steps)
-        if step < self._stable_end:
-            return 1.0
-        progress = min((step - self._stable_end) / self._decay_window, 1.0)
-        if self.decay_shape == "linear":
-            return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * (1.0 - progress)
-        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * 0.5 * (
-            1.0 + math.cos(math.pi * progress)
-        )
-
-    def get_lr(self) -> float:
-        return self.optimizer.param_groups[0]["lr"]
-
-    def state_dict(self) -> dict[str, int]:
-        return {"step": self._step}
-
-    def load_state_dict(self, state: dict[str, int]) -> None:
-        self._step = state["step"]
-        self._apply_lr(self._step)
+    cfg: ModelConfig
+    weight: float = 1.0
 
 
-class ConstantWithWarmup:
-    """Linear warmup → hold peak LR indefinitely.
+def cross_entropy_loss(
+    logits: jax.Array,        # bf16/fp32  [B, T, V]
+    targets: jax.Array,       # int32      [B, T]
+    loss_mask: jax.Array,     # bool       [B, T]
+) -> jax.Array:
+    """Mean masked next-token cross-entropy.
 
-    Mirrors ``CosineWithWarmup``'s state-dict shape for checkpoint
-    compatibility. Pair with patience-based early stopping to actually
-    stop training.
+    Returns a scalar fp32 loss. ``loss_mask=False`` positions
+    contribute zero and do not increment the denominator. An
+    all-False mask returns ``0`` (vs. raising) so the trainer can
+    safely tolerate fully-padded batches in scan padding.
     """
-
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        warmup_steps: int,
-    ):
-        self.optimizer = optimizer
-        self.warmup_steps = warmup_steps
-        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
-        self._step = 0
-        self._apply_lr(0)
-
-    def _apply_lr(self, step: int) -> None:
-        lr_scale = self._compute_lr_scale(step)
-        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
-            pg["lr"] = base_lr * lr_scale
-
-    def step(self) -> None:
-        self._step += 1
-        self._apply_lr(self._step)
-
-    def _compute_lr_scale(self, step: int) -> float:
-        if step < self.warmup_steps:
-            return step / max(1, self.warmup_steps)
-        return 1.0
-
-    def get_lr(self) -> float:
-        return self.optimizer.param_groups[0]["lr"]
-
-    def state_dict(self) -> dict[str, int]:
-        return {"step": self._step}
-
-    def load_state_dict(self, state: dict[str, int]) -> None:
-        self._step = state["step"]
-        self._apply_lr(self._step)
+    # Cast to fp32 for the log-softmax — bf16 logsumexp loses too much
+    # mantissa near the maximum logit. The forward stays bf16; the
+    # loss reduction is fp32.
+    logits_f32 = logits.astype(jnp.float32)
+    log_probs = jax.nn.log_softmax(logits_f32, axis=-1)
+    # Gather log-prob of the target token at each position.
+    target_log_probs = jnp.take_along_axis(
+        log_probs, targets[..., None], axis=-1
+    )[..., 0]
+    mask_f32 = loss_mask.astype(jnp.float32)
+    neg_log_lik = -target_log_probs * mask_f32
+    total = neg_log_lik.sum()
+    n = mask_f32.sum()
+    # Safe divide: when n == 0, total is also 0 (the masked-zero
+    # multiplications are exactly 0), so total / max(n, 1) = 0.
+    # No ``jnp.where`` branch needed and pyright sees a single
+    # ``Array`` rather than the multi-overload union of ``jnp.where``.
+    return total / jnp.maximum(n, 1.0)
 
 
-class InfiniteSchedule:
-    """Infinite / restart-friendly LR schedule.
+def compute_variant_loss(
+    model: PAWNModel,
+    tokens: jax.Array,        # int32  [B, T]
+    attn_mask: jax.Array,     # bool   [B, T]
+    targets: jax.Array,       # int32  [B, T]
+    loss_mask: jax.Array,     # bool   [B, T]
+) -> jax.Array:
+    """Forward ``model`` and return masked CE on the supplied batch."""
+    logits = model(tokens, attn_mask)
+    return cross_entropy_loss(logits, targets, loss_mask)
 
-    Four phases:
-        [0, warmup_steps)                          – linear 0 → 1
-        [warmup_steps, cooldown_end)               – cosine 1 → stable_lr_ratio
-        [cooldown_end, final_decay_start)          – flat stable_lr_ratio
-        [final_decay_start, total_steps]           – stable_lr_ratio → min_lr_ratio
 
-    ``cooldown_end = warmup_steps + cooldown_steps``.
-    ``final_decay_start = total_steps - decay_steps``.
+def _variant_key(cfg: ModelConfig) -> str:
+    """Stable, unique key for a variant in the per-variant metrics dict.
 
-    The key property: during the stable phase the LR depends only on
-    ``stable_lr_ratio`` and not on ``total_steps``. That makes any
-    checkpoint taken during the stable phase a valid resumption point —
-    extend ``total_steps`` in the resumed run and the stable phase
-    simply lasts longer before the final decay kicks in. This is
-    tailored to open-ended training where you only commit to the final
-    decay once you decide to stop.
-
-    ``final_decay_shape`` selects the final-decay curve (``"linear"`` or
-    ``"cosine"``). The peak→stable cooldown is always cosine.
-
-    References:
-        Zhai et al. (2022) "Scaling Vision Transformers"
-        (the original "cooldown → constant → cooldown" shape).
-        Hägele et al. (2024) "Scaling Laws and Compute-Optimal Training
-        Beyond Fixed Training Durations" arXiv:2405.18392.
+    Includes width, depth, and FFN size so two specs that happen to
+    share ``d_model`` but differ in ``n_layers`` or ``d_ff`` (a valid
+    sandwich-rule configuration) don't silently overwrite each other.
     """
-
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        warmup_steps: int,
-        cooldown_steps: int,
-        decay_steps: int,
-        total_steps: int,
-        stable_lr_ratio: float = 0.1,
-        # ``min_lr_ratio`` is intentionally internal-only: there is no
-        # ``TrainingConfig`` / ``BaseRunConfig`` field or CLI flag
-        # exposing it, so production runs always hit the 0.0 default.
-        # Kept on the constructor for tests and for direct callers that
-        # want a non-zero final-decay floor.
-        min_lr_ratio: float = 0.0,
-        # Default matches ``TrainingConfig.wsd_decay_shape`` ("linear"),
-        # which is what ``CLMTrainer`` passes through the config path.
-        # Keeping the default aligned avoids surprising a direct
-        # instantiator with a different final-decay curve than they'd
-        # get via ``--lr-schedule infinite``.
-        final_decay_shape: str = "linear",
-    ):
-        if final_decay_shape not in ("linear", "cosine"):
-            raise ValueError(
-                f"Unknown final_decay_shape: {final_decay_shape!r} "
-                "(expected 'linear' or 'cosine')"
-            )
-        if not 0.0 <= stable_lr_ratio <= 1.0:
-            raise ValueError(
-                f"stable_lr_ratio must be in [0, 1], got {stable_lr_ratio}"
-            )
-        if not 0.0 <= min_lr_ratio <= stable_lr_ratio:
-            raise ValueError(
-                f"min_lr_ratio ({min_lr_ratio}) must be in "
-                f"[0, stable_lr_ratio={stable_lr_ratio}]"
-            )
-        if cooldown_steps < 0 or decay_steps < 0:
-            raise ValueError(
-                "cooldown_steps and decay_steps must be non-negative, "
-                f"got {cooldown_steps}, {decay_steps}"
-            )
-        self.optimizer = optimizer
-        self.warmup_steps = warmup_steps
-        self.cooldown_steps = cooldown_steps
-        self.decay_steps = decay_steps
-        self.total_steps = total_steps
-        self.stable_lr_ratio = stable_lr_ratio
-        self.min_lr_ratio = min_lr_ratio
-        self.final_decay_shape = final_decay_shape
-        self._cooldown_end = warmup_steps + cooldown_steps
-        self._final_decay_start = max(
-            self._cooldown_end, total_steps - decay_steps
-        )
-        self._cooldown_window = max(cooldown_steps, 1)
-        self._final_window = max(total_steps - self._final_decay_start, 1)
-        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
-        self._step = 0
-        self._apply_lr(0)
-
-    def _apply_lr(self, step: int) -> None:
-        lr_scale = self._compute_lr_scale(step)
-        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
-            pg["lr"] = base_lr * lr_scale
-
-    def step(self) -> None:
-        self._step += 1
-        self._apply_lr(self._step)
-
-    def _compute_lr_scale(self, step: int) -> float:
-        if step < self.warmup_steps:
-            return step / max(1, self.warmup_steps)
-        if step < self._cooldown_end:
-            progress = (step - self.warmup_steps) / self._cooldown_window
-            # Cosine fall from 1.0 to stable_lr_ratio.
-            return self.stable_lr_ratio + (1.0 - self.stable_lr_ratio) * 0.5 * (
-                1.0 + math.cos(math.pi * progress)
-            )
-        if step < self._final_decay_start:
-            return self.stable_lr_ratio
-        progress = min(
-            (step - self._final_decay_start) / self._final_window, 1.0
-        )
-        span = self.stable_lr_ratio - self.min_lr_ratio
-        if self.final_decay_shape == "linear":
-            return self.min_lr_ratio + span * (1.0 - progress)
-        return self.min_lr_ratio + span * 0.5 * (
-            1.0 + math.cos(math.pi * progress)
-        )
-
-    def get_lr(self) -> float:
-        return self.optimizer.param_groups[0]["lr"]
-
-    def state_dict(self) -> dict[str, int]:
-        return {"step": self._step}
-
-    def load_state_dict(self, state: dict[str, int]) -> None:
-        self._step = state["step"]
-        self._apply_lr(self._step)
+    return f"d{cfg.d_model}_L{cfg.n_layers}_F{cfg.d_ff}"
 
 
-class OneCycle:
-    """Smith (2018) one-cycle schedule with cosine annealing.
+def compute_supernet_loss(
+    supernet: PAWNModel,
+    variant_specs: tuple[VariantSpec, ...],
+    tokens: jax.Array,
+    attn_mask: jax.Array,
+    targets: jax.Array,
+    loss_mask: jax.Array,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Sum per-variant losses on the shared batch (§5.3).
 
-    Ramps from ``peak_lr / initial_div`` up to ``peak_lr`` over the
-    first ``peak_step`` steps, then decays cosine-wise to
-    ``peak_lr / final_div`` over the remaining steps. No separate
-    warmup phase — the ramp-up is the warmup. ``peak_step`` can be set
-    via ``warmup_steps`` at the call site (~0.3 × total_steps for the
-    canonical Smith shape).
+    Returns ``(joint_loss, per_variant_dict)`` — the joint loss is the
+    weighted sum used for backprop; the per-variant dict is keyed
+    ``d<W>_L<L>_F<F>`` (e.g. ``d192_L4_F768``) so the host can log
+    per-slice convergence and two specs sharing only ``d_model`` stay
+    distinguishable.
 
-    References:
-        Smith (2018) arXiv:1803.09820.
+    Static unroll: each variant has a different width, so they can't
+    ``vmap`` into one batched matmul. Three forward calls per step is
+    the documented cost. The identity-slice shortcut (when
+    ``spec.cfg == supernet.cfg``) saves a trace-time Python pass —
+    no measurable execution-time win, since XLA constant-folds
+    static slicing — but it keeps the trace tree clean.
     """
-
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        peak_step: int,
-        total_steps: int,
-        initial_div: float = 25.0,
-        final_div: float = 1e4,
-    ):
-        if peak_step <= 0:
-            raise ValueError("OneCycle requires peak_step > 0")
-        if peak_step >= total_steps:
-            raise ValueError("OneCycle requires peak_step < total_steps")
-        self.optimizer = optimizer
-        self.peak_step = peak_step
-        self.total_steps = total_steps
-        self.initial_frac = 1.0 / initial_div
-        self.final_frac = 1.0 / final_div
-        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
-        self._step = 0
-        self._apply_lr(0)
-
-    def _apply_lr(self, step: int) -> None:
-        lr_scale = self._compute_lr_scale(step)
-        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
-            pg["lr"] = base_lr * lr_scale
-
-    def step(self) -> None:
-        self._step += 1
-        self._apply_lr(self._step)
-
-    def _compute_lr_scale(self, step: int) -> float:
-        if step <= self.peak_step:
-            progress = step / max(1, self.peak_step)
-            return self.initial_frac + (1.0 - self.initial_frac) * 0.5 * (
-                1.0 - math.cos(math.pi * progress)
-            )
-        progress = min(
-            (step - self.peak_step) / max(1, self.total_steps - self.peak_step),
-            1.0,
+    if not variant_specs:
+        # An empty specs tuple would silently return joint=0 and an
+        # empty per-variant dict — backprop would yield all-zero
+        # gradients, and AdamW's decoupled weight decay would still
+        # drift weights every step. Fail loud.
+        raise ValueError(
+            "compute_supernet_loss requires at least one VariantSpec; "
+            "an empty tuple produces zero gradient and silent weight-decay drift."
         )
-        return self.final_frac + (1.0 - self.final_frac) * 0.5 * (
-            1.0 + math.cos(math.pi * progress)
-        )
-
-    def get_lr(self) -> float:
-        return self.optimizer.param_groups[0]["lr"]
-
-    def state_dict(self) -> dict[str, int]:
-        return {"step": self._step}
-
-    def load_state_dict(self, state: dict[str, int]) -> None:
-        self._step = state["step"]
-        self._apply_lr(self._step)
-
-
-def _build_action_grid_index(n_actions: int) -> list[int]:
-    """Build a mapping from action token to grid index (src*64 + dst).
-
-    Each action in the searchless_chess vocab maps to a (src, dst) pair
-    via the engine's vocabulary export.
-    """
-    import chess_engine
-    from pawn.config import NUM_ACTIONS
-
-    assert n_actions == NUM_ACTIONS, f"Unknown n_actions: {n_actions}"
-    vocab = chess_engine.export_move_vocabulary()
-    token_to_move = vocab["token_to_move"]
-    square_names = vocab["square_names"]
-    name_to_idx = {name: i for i, name in enumerate(square_names)}
-
-    grid_indices = []
-    for action in range(n_actions):
-        uci = token_to_move[action]
-        src_sq = name_to_idx[uci[:2]]
-        dst_sq = name_to_idx[uci[2:4]]
-        grid_indices.append(src_sq * 64 + dst_sq)
-    return grid_indices
+    per_variant: dict[str, jax.Array] = {}
+    joint: jax.Array = jnp.float32(0.0)
+    for spec in variant_specs:
+        if spec.cfg == supernet.cfg:
+            # No-op slice — direct supernet forward.
+            sub = supernet
+        else:
+            sub = sliced(supernet, spec.cfg)
+        ce = compute_variant_loss(sub, tokens, attn_mask, targets, loss_mask)
+        joint = joint + spec.weight * ce
+        per_variant[_variant_key(spec.cfg)] = ce
+    return joint, per_variant
 
 
-# Cache: n_actions -> grid_indices list
-_ACTION_GRID_INDEX_CACHE: dict[int, list[int]] = {}
-# Cache: (n_actions, device) -> tensor
-_ACTION_GRID_TENSOR_CACHE: dict[tuple[int, str], torch.Tensor] = {}
-
-
-def _get_action_grid_index(device: str | torch.device, n_actions: int | None = None) -> torch.Tensor:
-    """Get the action-token-to-grid-index mapping as a tensor on the given device."""
-    from pawn.config import NUM_ACTIONS
-    if n_actions is None:
-        n_actions = NUM_ACTIONS
-    dev_key = (n_actions, str(device))
-    cached = _ACTION_GRID_TENSOR_CACHE.get(dev_key)
-    if cached is not None:
-        return cached
-    if n_actions not in _ACTION_GRID_INDEX_CACHE:
-        _ACTION_GRID_INDEX_CACHE[n_actions] = _build_action_grid_index(n_actions)
-    t = torch.tensor(_ACTION_GRID_INDEX_CACHE[n_actions], dtype=torch.long, device=device)
-    _ACTION_GRID_TENSOR_CACHE[dev_key] = t
-    return t
-
-
-def compute_legal_move_rate(
-    logits: torch.Tensor,
-    legal_grid: torch.Tensor,
-    loss_mask: torch.Tensor,
-    game_lengths: torch.Tensor,
-    n_actions: int | None = None,
-) -> float:
-    """Compute fraction of argmax predictions that are legal moves.
-
-    Wrapper that computes preds from logits for backward compatibility.
-    Prefer compute_legal_move_rate_from_preds when hidden states are available.
-    """
-    preds = logits.argmax(dim=-1)
-    return compute_legal_move_rate_from_preds(
-        preds, legal_grid, loss_mask, game_lengths, n_actions=n_actions,
-    )
-
-
-def compute_legal_move_rate_from_preds(
-    preds: torch.Tensor,
-    legal_grid: torch.Tensor,
-    loss_mask: torch.Tensor,
-    game_lengths: torch.Tensor,
-    min_ply: int = 0,
-    max_ply_limit: int | None = None,
-    n_actions: int | None = None,
-) -> float:
-    """Compute fraction of argmax predictions that are legal moves.
-
-    Evaluated at positions where loss_mask is True, intersected with the
-    ply range [min_ply, max_ply_limit), and further restricted to
-    positions where the legal mask is non-empty. The engine leaves
-    ``legal_grid[p]`` zero for ``p >= game_length`` (it only fills the
-    replay prefix), so a row of all-zero legal moves uniquely identifies
-    a terminal PAD-prediction slot beyond the game's end and should not
-    count toward legality — otherwise every game contributes a
-    guaranteed false negative at its terminal position regardless of
-    whether the model correctly predicted PAD.
+def make_lr_schedule(
+    peak_lr: float,
+    *,
+    total_steps: int,
+    warmup_steps: int = 100,
+    end_value: float | None = None,
+) -> optax.Schedule:
+    """Linear warmup → cosine decay (Optax canonical).
 
     Args:
-        preds: (B, T) argmax token predictions
-        legal_grid: (B, max_ply, 64) bit-packed legal moves from engine
-        loss_mask: (B, T) bool
-        game_lengths: (B,) int
-        min_ply: inclusive lower bound on the ply range (default 0)
-        max_ply_limit: exclusive upper bound on the ply range (default None = all)
-        n_actions: number of action tokens in the vocab (default: NUM_ACTIONS=1968)
+        peak_lr: LR reached at the end of warmup. Must be ``> 0``.
+        total_steps: full schedule length, end-to-end. ``end_value``
+            is reached exactly at ``total_steps``. Must be ``> 0``.
+        warmup_steps: linear ramp from 0 to ``peak_lr``. Must be
+            ``>= 0`` and ``< total_steps``.
+        end_value: floor reached at ``total_steps`` and held past it.
+            Must be ``>= 0`` and ``< peak_lr`` (otherwise the "decay"
+            phase would either increase or invert the sign of the
+            updates). Defaults to ``peak_lr * 0.1``.
+
+    Past ``total_steps`` the schedule plateaus at ``end_value`` so a
+    continuation run won't drive LR negative.
+
+    Implementation note: Optax's ``warmup_cosine_decay_schedule`` takes
+    ``decay_steps`` as the *full* end-to-end length (it internally
+    subtracts ``warmup_steps`` for the cosine span). The earlier
+    version of this function passed ``total_steps - warmup_steps``,
+    which made Optax subtract warmup twice and caused the floor to be
+    reached at step ``total_steps - warmup_steps`` instead of
+    ``total_steps``. Pass ``total_steps`` directly.
     """
-    from pawn.config import NUM_ACTIONS
-    if n_actions is None:
-        n_actions = NUM_ACTIONS
-
-    B, T = preds.shape
-    max_ply = legal_grid.shape[1]
-
-    with torch.no_grad():
-        move_mask = loss_mask.clone()
-
-        if not move_mask.any():
-            return 0.0
-
-        # Unpack legal grid to dense: (B, max_ply, 64, 64) -> flatten to (B, max_ply, 4096)
-        legal_dense = unpack_grid(legal_grid)  # (B, max_ply, 64, 64)
-        legal_flat = legal_dense.reshape(B, max_ply, 4096)  # (B, max_ply, 4096)
-
-        n_plies = min(T, max_ply)
-        upper = min(n_plies, max_ply_limit) if max_ply_limit is not None else n_plies
-        valid_count = 0
-        legal_acc = torch.tensor(0, dtype=torch.long, device=preds.device)
-
-        # Action token -> grid index lookup (lazily built, cached per n_actions)
-        action_grid_idx = _get_action_grid_index(preds.device, n_actions)
-
-        for p in range(min_ply, upper):
-            pos_mask = move_mask[:, p]  # (B,)
-            if not pos_mask.any():
-                continue
-
-            batch_preds = preds[pos_mask, p]  # (N,)
-            batch_legal = legal_flat[pos_mask, p]  # (N, 4096)
-
-            # Skip "past end of game" positions where the engine never
-            # filled a legal mask. Those are terminal PAD-prediction
-            # slots, not real move predictions — counting them would
-            # systematically depress the rate.
-            has_legal_row = batch_legal.any(dim=-1)  # (N,)
-            n_valid = int(has_legal_row.sum().item())
-            if n_valid == 0:
-                continue
-
-            arange_n = torch.arange(len(batch_preds), device=preds.device)
-
-            # Action tokens: look up grid index
-            max_idx = len(action_grid_idx) - 1
-            is_action = batch_preds <= max_idx
-            grid_idx = action_grid_idx[batch_preds.clamp(0, max_idx)]
-            action_legal = batch_legal[arange_n, grid_idx] > 0.5
-            legal_action = is_action & action_legal & has_legal_row
-
-            valid_count += n_valid
-            legal_acc += legal_action.sum()
-
-        if valid_count == 0:
-            return 0.0
-        return legal_acc.item() / valid_count
+    if peak_lr <= 0:
+        raise ValueError(f"peak_lr={peak_lr} must be positive")
+    if total_steps <= 0:
+        raise ValueError(f"total_steps={total_steps} must be positive")
+    if warmup_steps < 0:
+        raise ValueError(f"warmup_steps={warmup_steps} must be non-negative")
+    if warmup_steps >= total_steps:
+        raise ValueError(
+            f"warmup_steps={warmup_steps} must be < total_steps={total_steps}"
+        )
+    if end_value is None:
+        end_value = peak_lr * 0.1
+    if end_value < 0:
+        # Optax happily decays through zero and plateaus at a negative
+        # learning rate — which would reverse AdamW's updates, the
+        # opposite of "decay". Reject upfront (Codex P2).
+        raise ValueError(f"end_value={end_value} must be >= 0")
+    if end_value >= peak_lr:
+        raise ValueError(
+            f"end_value={end_value} must be < peak_lr={peak_lr} (otherwise "
+            "the cosine 'decay' phase would increase instead of decrease)"
+        )
+    return optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=peak_lr,
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps,
+        end_value=end_value,
+    )
 
 
+def make_optimizer(
+    learning_rate: float | optax.Schedule,
+    *,
+    weight_decay: float = 0.01,
+    b1: float = 0.9,
+    b2: float = 0.95,
+    max_grad_norm: float | None = 1.0,
+) -> optax.GradientTransformation:
+    """AdamW (with optional LR schedule + global-norm grad clipping).
 
-def _game_completion_chunk(
-    preds: torch.Tensor,
-    legal_mask: torch.Tensor,
-    loss_mask: torch.Tensor,
-    game_lengths: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Vectorized per-game forfeit lookup for a single chunk.
+    Hyperparameters mirror the legacy pretraining defaults
+    (``b2=0.95``, ``max_grad_norm=1.0``). ``learning_rate`` accepts
+    either a scalar (constant LR — convenient for tests) or an
+    ``optax.Schedule`` (callable ``step -> lr``). For Phase-2
+    pretraining pair this with ``make_lr_schedule`` for the
+    canonical warmup→cosine path.
 
-    Returns (has_forfeit, first_forfeit, gl) each of shape (B,).
+    Gradient clipping is composed BEFORE AdamW so the clipped gradient
+    is the one feeding Adam's moments. A gradient spike on a real
+    batch would otherwise corrupt the Adam state in ways AdamW alone
+    cannot recover from — the legacy PyTorch trainer clipped at 1.0
+    and the JAX path preserves that contract. Pass
+    ``max_grad_norm=None`` to disable clipping (e.g. for debugging a
+    suspected clipping interaction).
     """
-    B, T = preds.shape
-    V = legal_mask.shape[2]
-
-    has_legal = legal_mask.any(dim=-1)                # (B, T)
-    checked = loss_mask.bool() & has_legal            # (B, T)
-
-    preds_clamped = preds.clamp(min=0, max=V - 1).long()
-    in_range = preds < V                              # (B, T)
-
-    legal_at_pred = legal_mask.gather(
-        dim=-1, index=preds_clamped.unsqueeze(-1)
-    ).squeeze(-1)                                      # (B, T)
-
-    illegal = checked & (~in_range | ~legal_at_pred)  # (B, T)
-
-    has_forfeit = illegal.any(dim=-1)                 # (B,)
-    first_forfeit = illegal.int().argmax(dim=-1)      # (B,)
-    gl = game_lengths.long().clamp(max=T)             # (B,)
-    return has_forfeit, first_forfeit, gl
+    base = optax.adamw(
+        learning_rate=learning_rate,
+        b1=b1,
+        b2=b2,
+        weight_decay=weight_decay,
+    )
+    if max_grad_norm is None:
+        return base
+    return optax.chain(optax.clip_by_global_norm(max_grad_norm), base)
 
 
-def _aggregate_game_completion(
-    has_forfeit: torch.Tensor,
-    first_forfeit: torch.Tensor,
-    gl: torch.Tensor,
-) -> dict[str, float]:
-    """Reduce per-game tensors to scalar summary statistics."""
-    n_games = int(has_forfeit.shape[0])
-    if n_games == 0:
-        return {
-            "game_completion_rate": 0.0,
-            "avg_pct_completion": 0.0,
-            "avg_plies_completed": 0.0,
-            "min_forfeit_ply": 0.0,
-            "max_forfeit_ply": 0.0,
-            "median_forfeit_ply": 0.0,
+def init_train_state(
+    model: PAWNModel, optimizer: optax.GradientTransformation
+) -> TrainState:
+    """Build the initial ``TrainState`` for ``model`` under ``optimizer``.
+
+    ``step`` is a 0-d ``jnp.int32`` so it traces as a dynamic array
+    rather than a static Python int (the latter would cause
+    ``eqx.filter_jit`` to recompile on every increment).
+    """
+    # Equinox separates trainable arrays from static attrs via
+    # ``eqx.filter`` (anything that's not a JAX array is treated as
+    # static under JIT). The optimizer state only mirrors the
+    # array-leaf subtree.
+    params = eqx.filter(model, eqx.is_inexact_array)
+    opt_state = optimizer.init(params)
+    return TrainState(
+        model=model, opt_state=opt_state, step=jnp.zeros((), dtype=jnp.int32)
+    )
+
+
+def compute_grad_norm(grads) -> jax.Array:
+    """Global L2 grad-norm via per-leaf vdot then sum (``sqrt(Σ ‖gᵢ‖²)``).
+
+    Cast each leaf to fp32 before squaring; the reduction stays fp32
+    regardless of the source dtype. Returns ``0.0`` for the
+    no-trainable-leaves edge (frozen-everywhere adapters).
+
+    Shared between the pretrain and adapter trainers so a future
+    change to the norm formula (eg adding eps) lands in one place.
+    """
+    leaves = jax.tree_util.tree_leaves(grads)
+    if not leaves:
+        return jnp.float32(0.0)
+    return jnp.sqrt(
+        sum(jnp.sum(jnp.square(g.astype(jnp.float32))) for g in leaves)
+    )
+
+
+def make_scan_step(
+    train_step: TrainStep, k: int
+) -> Callable[
+    [TrainState, Batch], tuple[TrainState, dict[str, jax.Array]]
+]:
+    """Fuse ``train_step`` into a K-step ``lax.scan`` loop (§4.4).
+
+    The returned callable consumes a *chunk* with arrays of shape
+    ``[K, B, T]`` and applies ``train_step`` K times, returning
+    ``(final_state, stacked_metrics)`` where ``stacked_metrics`` is a
+    ``dict[str, jax.Array]`` whose values are each ``[K]``-shaped.
+    ``stacked_metrics["loss"][k]`` is the loss at step ``k``; the host
+    loop unstacks for logging.
+
+    K should be chosen to amortise host overhead — the design doc §4.3
+    targets ``K · B`` games per chunk; the per-token byte cost is 10
+    bytes (int32 tokens + bool attn_mask + int32 targets + bool
+    loss_mask = 4+1+4+1), so at K=200, B=256, T=512 each chunk is
+    ~262 MB. Pick K so that chunk size comfortably fits in device
+    memory.
+
+    Designed for use in the driver: the driver pre-stages each
+    ``[K, ...]`` chunk to device, calls this, then logs / checkpoints
+    based on the host-side step counter ``int(state.step)``.
+
+    Inside the scan body the four chunk arrays are passed directly as
+    ``lax.scan``'s ``xs`` — ``lax.scan`` slices on the leading axis as a
+    static stride, avoiding a per-step dynamic gather that the
+    earlier ``jnp.arange(k)`` + ``tokens_chunk[slice_idx]`` formulation
+    incurred.
+    """
+
+    def scan_step(
+        state: TrainState, chunk: Batch
+    ) -> tuple[TrainState, dict[str, jax.Array]]:
+        # ``train_step`` already has the ``(carry, x) -> (carry, y)``
+        # signature ``lax.scan`` wants; pass it directly. ``lax.scan``
+        # indexes each leaf of ``chunk`` along axis 0, producing a
+        # ``Batch`` (one [B, T] tuple) per iteration. Explicit
+        # ``length=k`` surfaces a chunk-shape mismatch loudly rather
+        # than silently running a different number of steps.
+        return jax.lax.scan(train_step, state, chunk, length=k)
+
+    return eqx.filter_jit(scan_step)
+
+
+def make_train_step(
+    optimizer: optax.GradientTransformation,
+    variant_specs: tuple[VariantSpec, ...],
+) -> TrainStep:
+    """Build a jitted ``train_step(state, batch) -> (state, metrics)``.
+
+    ``batch`` is a 4-tuple ``(tokens, attn_mask, targets, loss_mask)``
+    sized ``[B, T]`` each. ``metrics`` is a dict with keys ``loss``
+    (joint), ``loss_<key>`` per variant (key is ``d<W>_L<L>_F<F>``),
+    ``grad_norm`` (global L2), and ``n_supervised`` (count of
+    True entries in ``loss_mask``).
+
+    A batch whose ``loss_mask`` is entirely False (the scan-padding
+    edge case) bypasses ``optimizer.update`` so neither weights nor
+    optimizer state mutate — AdamW's decoupled weight decay would
+    otherwise still drift weights on zero-gradient padded steps.
+    Returned ``loss`` and ``grad_norm`` are 0 in that case.
+    """
+
+    @eqx.filter_jit
+    def train_step(
+        state: TrainState, batch: Batch
+    ) -> tuple[TrainState, dict[str, jax.Array]]:
+        tokens, attn_mask, targets, loss_mask = batch
+        (joint_loss, per_variant), grads = eqx.filter_value_and_grad(
+            lambda m: compute_supernet_loss(
+                m, variant_specs, tokens, attn_mask, targets, loss_mask
+            ),
+            has_aux=True,
+        )(state.model)
+
+        # Global grad norm via the shared ``compute_grad_norm`` helper
+        # (tree-reduce over the per-leaf squared sum). The
+        # ``eqx.filter_value_and_grad`` PyTree has ``None`` at every
+        # non-inexact-array leaf, so ``tree_leaves`` skips them under
+        # the standard JAX convention.
+        grad_norm = compute_grad_norm(grads)
+
+        n_supervised = loss_mask.sum().astype(jnp.int32)
+        has_supervision = n_supervised > 0
+
+        # Padding-only batch (all ``loss_mask=False``) → joint_loss is
+        # 0 and grads are 0, but AdamW's decoupled weight decay would
+        # still mutate weights and advance optimizer state. Skip the
+        # update entirely in that case; ``jax.lax.cond`` is the
+        # cheapest way under JIT.
+        def _apply_update(
+            args: tuple[PAWNModel, optax.OptState, PAWNModel],
+        ) -> tuple[PAWNModel, optax.OptState]:
+            model_in, opt_state_in, grads_in = args
+            # Filter both the params (``model``) and updates (``grads``)
+            # down to the array-leaf PyTree. Optax's stubs type
+            # ``updates`` / ``params`` as ``Array``-flavoured Updates;
+            # in practice optax accepts any matching PyTree. Filtering
+            # explicitly keeps both pyright happy and the contract
+            # symmetric (params and grads have identical shape).
+            params_in = eqx.filter(model_in, eqx.is_inexact_array)
+            grads_filt = eqx.filter(grads_in, eqx.is_inexact_array)
+            updates_in, new_opt_state_in = optimizer.update(
+                grads_filt, opt_state_in, params_in
+            )
+            new_model_in = eqx.apply_updates(model_in, updates_in)
+            return new_model_in, new_opt_state_in
+
+        def _skip_update(
+            args: tuple[PAWNModel, optax.OptState, PAWNModel],
+        ) -> tuple[PAWNModel, optax.OptState]:
+            model_in, opt_state_in, _ = args
+            return model_in, opt_state_in
+
+        # NOTE: optimizer.update + apply_updates use the same array
+        # subtree shape as grads / state.model, so the two branches of
+        # ``lax.cond`` agree on PyTree structure.
+        new_model, new_opt_state = jax.lax.cond(
+            has_supervision,
+            _apply_update,
+            _skip_update,
+            (state.model, state.opt_state, grads),
+        )
+
+        metrics: dict[str, jax.Array] = {
+            "loss": joint_loss,
+            "grad_norm": grad_norm,
+            "n_supervised": n_supervised,
+            **{f"loss_{name}": v for name, v in per_variant.items()},
         }
-
-    plies_completed = torch.where(has_forfeit, first_forfeit, gl).float()
-    pct = torch.where(
-        has_forfeit & (gl > 0),
-        first_forfeit.float() / gl.clamp(min=1).float(),
-        torch.ones_like(plies_completed),
-    )
-
-    n_complete = int((~has_forfeit).sum().item())
-    forfeit_only = first_forfeit[has_forfeit].float()
-    if forfeit_only.numel() > 0:
-        min_forfeit = float(forfeit_only.min().item())
-        max_forfeit = float(forfeit_only.max().item())
-        median_forfeit = float(forfeit_only.median().item())
-    else:
-        min_forfeit = 0.0
-        max_forfeit = 0.0
-        median_forfeit = 0.0
-
-    return {
-        "game_completion_rate": n_complete / n_games,
-        "avg_pct_completion": float(pct.mean().item()),
-        "avg_plies_completed": float(plies_completed.mean().item()),
-        "min_forfeit_ply": min_forfeit,
-        "max_forfeit_ply": max_forfeit,
-        "median_forfeit_ply": median_forfeit,
-    }
-
-
-@torch.no_grad()
-def eval_game_completion_metrics(
-    model: PAWNCLM,
-    val_data: dict[str, torch.Tensor],
-    batch_size: int,
-    vocab_size: int,
-    device: str,
-    use_amp: bool,
-) -> dict[str, float]:
-    """Run the vectorized game-completion sweep and return ``val/*`` metrics.
-
-    Shared between ``CLMTrainer.evaluate`` and ``cotrain.ModelSlot.evaluate``
-    so cotrain runs surface the same forfeit stats as pretraining.
-
-    Requires ``val_data`` to contain ``input_ids``, ``loss_mask``,
-    ``game_lengths``, and raw ``move_ids`` (as emitted by
-    ``create_validation_set``). The ``prepend_outcome`` flag, if present,
-    selects the legal-mask alignment.
-
-    Returns an empty dict if ``val_data`` lacks the required keys.
-    """
-    if "game_lengths" not in val_data or "move_ids" not in val_data:
-        return {}
-
-    n = val_data["input_ids"].shape[0]
-    gc_batch = max(1, batch_size)
-    prepend_outcome = (
-        bool(val_data["prepend_outcome"].item())
-        if "prepend_outcome" in val_data
-        else False
-    )
-
-    has_forfeit_all: list[torch.Tensor] = []
-    first_forfeit_all: list[torch.Tensor] = []
-    gl_all: list[torch.Tensor] = []
-
-    for start in range(0, n, gc_batch):
-        end = min(start + gc_batch, n)
-        gc_input = val_data["input_ids"][start:end].to(device)
-        gc_loss_mask = val_data["loss_mask"][start:end].to(device)
-        gc_game_lengths = val_data["game_lengths"][start:end].to(device)
-        raw_move_ids = val_data["move_ids"][start:end].numpy().astype(np.int16)
-        gl_np = val_data["game_lengths"][start:end].numpy().astype(np.int16)
-
-        with torch.amp.autocast(device, enabled=use_amp):
-            hidden = model.forward_eval(gc_input, gc_loss_mask)
-            gc_logits = model.lm_head(hidden)
-        gc_preds = gc_logits.argmax(dim=-1)
-
-        legal_tokens = engine.compute_legal_token_masks(
-            raw_move_ids, gl_np, vocab_size,
+        # Step counter advances only when the optimizer update actually
+        # ran. This keeps ``state.step`` in lockstep with the Optax
+        # schedule count (which is held inside ``opt_state`` and only
+        # increments on a real ``optimizer.update`` call) — a padded
+        # batch that returns early via ``_skip_update`` would otherwise
+        # silently desync the host counter from the LR schedule.
+        new_step = state.step + jnp.where(has_supervision, jnp.int32(1), jnp.int32(0))
+        new_state = TrainState(
+            model=new_model,
+            opt_state=new_opt_state,
+            step=new_step,
         )
-        legal_mask_t = torch.from_numpy(
-            align_legal_to_preds(legal_tokens, prepend_outcome)
-        ).to(device)
+        return new_state, metrics
 
-        has_forfeit, first_forfeit, gl = _game_completion_chunk(
-            gc_preds, legal_mask_t, gc_loss_mask, gc_game_lengths,
-        )
-
-        has_forfeit_all.append(has_forfeit.cpu())
-        first_forfeit_all.append(first_forfeit.cpu())
-        gl_all.append(gl.cpu())
-
-        del gc_input, gc_loss_mask, gc_game_lengths, gc_logits, gc_preds
-        del legal_tokens, legal_mask_t
-
-    gc = _aggregate_game_completion(
-        torch.cat(has_forfeit_all),
-        torch.cat(first_forfeit_all),
-        torch.cat(gl_all),
-    )
-
-    if device != "cpu" and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return {
-        "val/game_completion_rate": gc["game_completion_rate"],
-        "val/avg_pct_completion": gc["avg_pct_completion"],
-        "val/avg_plies_completed": gc["avg_plies_completed"],
-        "val/min_forfeit_ply": gc["min_forfeit_ply"],
-        "val/max_forfeit_ply": gc["max_forfeit_ply"],
-        "val/median_forfeit_ply": gc["median_forfeit_ply"],
-    }
-
-
-def compute_game_completion(
-    preds: torch.Tensor,
-    legal_mask: torch.Tensor,
-    loss_mask: torch.Tensor,
-    game_lengths: torch.Tensor,
-) -> dict[str, float]:
-    """Measure how often the model gets through a full game without illegal moves.
-
-    Vectorized: for each game, finds the first ply where the argmax prediction
-    is either out-of-range or marked illegal by the legal_mask.  Games with no
-    illegal prediction are "completed".
-
-    Args:
-        preds: (B, T) argmax token predictions (aligned with targets)
-        legal_mask: (B, T, V) bool — legal token mask (shifted to align with targets)
-        loss_mask: (B, T) bool — which positions are valid
-        game_lengths: (B,) int — number of valid plies per game
-
-    Returns dict with:
-        game_completion_rate: fraction of games with zero illegal moves
-        avg_pct_completion: mean fraction of game completed before forfeit
-        avg_plies_completed: mean plies completed before first illegal move.
-            Games with no illegal moves contribute their full game_length.
-        min_forfeit_ply / max_forfeit_ply / median_forfeit_ply: forfeit ply
-            statistics across games that actually forfeited (0 if none).
-    """
-    with torch.no_grad():
-        has_forfeit, first_forfeit, gl = _game_completion_chunk(
-            preds, legal_mask, loss_mask, game_lengths,
-        )
-    return _aggregate_game_completion(has_forfeit, first_forfeit, gl)
-
-
-def _get_grad_norm(model: nn.Module) -> float:
-    grads = [p.grad.data for p in model.parameters() if p.grad is not None]
-    if not grads:
-        return 0.0
-    total = torch.stack([g.float().norm() for g in grads]).square().sum()
-    return total.sqrt().item()
-
-
-class CLMTrainer:
-    def __init__(
-        self,
-        train_cfg: TrainingConfig,
-        model_cfg: CLMConfig,
-        hf_repo: str | None = None,
-        patience: int | None = None,
-        legality_late_ply: int | None = None,
-        run_config: dict[str, object] | None = None,
-        wandb_tags: list[str] | None = None,
-    ):
-        self.cfg = train_cfg
-        self.model_cfg = model_cfg
-        self.device = train_cfg.device
-        self.global_step = 0
-        self.hf_repo = hf_repo
-        self.hf_branch: str | None = None
-        self._run_config = run_config
-        self._wandb_tags = wandb_tags
-
-        # Compound early stopping state
-        self.patience = patience
-        self.legality_late_ply = (
-            legality_late_ply if legality_late_ply is not None
-            else model_cfg.max_seq_len // 2
-        )
-        self.best_val_loss: float = float("inf")
-        self.best_late_legality: float = 0.0
-        self.best_game_completion: float = 0.0
-        self.best_avg_plies_completed: float = 0.0
-        self.patience_counter: int = 0
-
-        self.logger = MetricsLogger(
-            train_cfg.log_dir, run_prefix="run", device=self.device,
-        )
-        self.run_dir = str(self.logger.run_dir)
-        self.cfg.checkpoint_dir = os.path.join(self.run_dir, "checkpoints")
-        self._jsonl_path = str(self.logger.metrics_path)
-
-        if self.hf_repo:
-            self.hf_branch = f"run/{os.path.basename(self.run_dir)}"
-
-        # Background pusher for HF uploads. Constructed unconditionally so
-        # the shutdown path can ``wait()`` without a ``hf_repo`` guard; the
-        # pool never sees work when ``hf_repo`` is None.
-        from pawn.checkpoint import BackgroundCheckpointPusher
-        self._hf_pusher = BackgroundCheckpointPusher(thread_name_prefix="hf-pretrain")
-
-        self._model = PAWNCLM(model_cfg).to(self.device)
-        self.model = self._model
-        param_count = sum(p.numel() for p in self._model.parameters())
-        print(f"Model parameters: {param_count:,}")
-        print(f"Run directory: {self.run_dir}")
-
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=train_cfg.lr,
-            weight_decay=train_cfg.weight_decay,
-            betas=(0.9, 0.95),
-        )
-        if train_cfg.lr_schedule == "wsd":
-            self.scheduler = WSDSchedule(
-                self.optimizer,
-                warmup_steps=train_cfg.warmup_steps,
-                decay_steps=train_cfg.decay_steps,
-                total_steps=train_cfg.total_steps,
-                decay_shape=train_cfg.wsd_decay_shape,
-            )
-        elif train_cfg.lr_schedule == "infinite":
-            self.scheduler = InfiniteSchedule(
-                self.optimizer,
-                warmup_steps=train_cfg.warmup_steps,
-                cooldown_steps=train_cfg.cooldown_steps,
-                decay_steps=train_cfg.decay_steps,
-                total_steps=train_cfg.total_steps,
-                stable_lr_ratio=train_cfg.stable_lr_ratio,
-                final_decay_shape=train_cfg.wsd_decay_shape,
-            )
-        elif train_cfg.lr_schedule == "constant":
-            self.scheduler = ConstantWithWarmup(
-                self.optimizer, warmup_steps=train_cfg.warmup_steps,
-            )
-        elif train_cfg.lr_schedule == "one_cycle":
-            self.scheduler = OneCycle(
-                self.optimizer,
-                peak_step=train_cfg.warmup_steps,
-                total_steps=train_cfg.total_steps,
-            )
-        else:
-            self.scheduler = CosineWithWarmup(
-                self.optimizer,
-                warmup_steps=train_cfg.warmup_steps,
-                total_steps=train_cfg.total_steps,
-            )
-        self.scaler = torch.amp.GradScaler(self.device, enabled=train_cfg.use_amp)
-
-        self.dataset = CLMDataset(
-            train_cfg.batch_size, train_cfg.max_ply, train_cfg.base_seed,
-            discard_ply_limit=train_cfg.discard_ply_limit,
-            mate_boost=train_cfg.mate_boost,
-            prepend_outcome=train_cfg.prepend_outcome,
-        )
-        print("Generating validation set...")
-        self.val_data = create_validation_set(
-            train_cfg.val_games, train_cfg.max_ply, train_cfg.val_seed,
-            discard_ply_limit=train_cfg.discard_ply_limit,
-            mate_boost=train_cfg.mate_boost,
-            prepend_outcome=train_cfg.prepend_outcome,
-        )
-
-        # W&B (metrics-only; a fresh run per process invocation, Option A).
-        # ``run_config`` is the full user-level RunConfig dump so W&B sees
-        # the CLI-facing knobs — falling back to model+training dicts if the
-        # caller didn't pass one.
-        wandb_config: dict[str, object] = (
-            dict(run_config)
-            if run_config is not None
-            else {"model": model_cfg.__dict__, "training": train_cfg.__dict__}
-        )
-        self.wandb_run = init_wandb(
-            enabled=train_cfg.use_wandb,
-            project=train_cfg.wandb_project,
-            logger=self.logger,
-            run_type="pretrain",
-            config=wandb_config,
-            group=self.logger.slug,
-            job_type="pretrain",
-            tags=wandb_tags,
-        )
-
-        # torch.compile
-        self._compiled = False
-        if self.device != "cpu":
-            try:
-                self.model = torch.compile(self.model, mode="default")
-                self._compiled = True
-                print("torch.compile enabled")
-            except Exception:
-                print("torch.compile not available, using eager mode")
-        else:
-            print("Skipping torch.compile on CPU")
-
-        # Patience and legality_late_ply aren't in TrainingConfig — pass them
-        # alongside so the dashboard and other consumers can see them.
-        training_log = {
-            **train_cfg.__dict__,
-            "patience": self.patience,
-            "legality_late_ply": self.legality_late_ply,
-        }
-        self.logger.log_config(
-            model=model_cfg.__dict__,
-            training=training_log,
-            param_count=param_count,
-            compiled=self._compiled,
-            formulation="clm",
-        )
-        self.logger.write_config_json(
-            model=model_cfg.__dict__,
-            training=training_log,
-            param_count=param_count,
-            compiled=self._compiled,
-            formulation="clm",
-        )
-
-    def seed_logs(self, run_dirs: list[str], max_step: int):
-        """Splice prior run logs into this run's JSONL."""
-        from pathlib import Path
-
-        all_records: list[dict] = []
-        for rd in run_dirs:
-            p = Path(rd) / "metrics.jsonl"
-            if not p.exists():
-                print(f"  WARNING: {p} not found, skipping")
-                continue
-            with open(p, "rb") as f:
-                data = f.read()
-            text = data.rstrip(b"\x00").decode(errors="replace")
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    all_records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-
-        all_records = [r for r in all_records if r.get("step", 0) <= max_step]
-        all_records.sort(key=lambda r: (r.get("step", 0), r.get("type", "")))
-        seen: set[tuple[str, int]] = set()
-        deduped: list[dict] = []
-        for r in all_records:
-            key = (r.get("type", ""), r.get("step", 0))
-            if key not in seen:
-                seen.add(key)
-                deduped.append(r)
-
-        if not deduped:
-            print("  No prior log lines to seed.")
-            return
-
-        with open(self._jsonl_path, "w") as f:
-            for r in deduped:
-                f.write(json.dumps(r, default=str) + "\n")
-
-        first_step = deduped[0].get("step", "?")
-        last_step = deduped[-1].get("step", "?")
-        print(f"Seeded {len(deduped)} log lines from prior runs "
-              f"(steps {first_step}-{last_step})")
-
-    def _log_jsonl(self, record: dict):
-        """Low-level JSONL write for seed_logs compatibility."""
-        self.logger._write(record)
-
-    def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        self.model.train()
-
-        input_ids = batch["input_ids"].to(self.device, non_blocking=True)
-        targets = batch["targets"].to(self.device, non_blocking=True)
-        loss_mask = batch["loss_mask"].to(self.device, non_blocking=True)
-
-        model = self._eager_model()
-
-        with torch.amp.autocast(self.device, enabled=self.cfg.use_amp):
-            loss, metrics = model.forward_train(input_ids, loss_mask, targets)
-
-        scaled_loss = loss / self.cfg.accumulation_steps
-        self.scaler.scale(scaled_loss).backward()
-
-        return metrics
-
-    def optimizer_step(self) -> float:
-        self.scaler.unscale_(self.optimizer)
-        grad_norm = _get_grad_norm(self._model)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.max_grad_norm)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        self.optimizer.zero_grad(set_to_none=True)
-        self.scheduler.step()
-        return grad_norm
-
-    def _eager_model(self) -> PAWNCLM:
-        return self._model
-
-    @torch.no_grad()
-    def evaluate(self) -> dict[str, float]:
-        model = self._eager_model()
-        model.eval()
-
-        n = self.val_data["input_ids"].shape[0]
-        batch_size = self.cfg.batch_size
-        total_metrics: dict[str, float] = {}
-        n_batches = 0
-
-        has_legal = "legal_grid" in self.val_data
-        total_legal_count = 0
-        total_move_count = 0
-
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            input_ids = self.val_data["input_ids"][start:end].to(self.device, non_blocking=True)
-            targets = self.val_data["targets"][start:end].to(self.device, non_blocking=True)
-            loss_mask = self.val_data["loss_mask"][start:end].to(self.device, non_blocking=True)
-
-            with torch.no_grad():
-                with torch.amp.autocast(self.device, enabled=self.cfg.use_amp):
-                    # Get hidden states without materializing full (B,T,V) logits
-                    hidden = model.forward_eval(input_ids, loss_mask)
-
-                    # Sparse projection: only valid positions through lm_head
-                    valid_hidden = hidden[loss_mask]
-                    valid_logits = model.lm_head(valid_hidden)
-                    valid_targets = targets[loss_mask]
-
-                loss = F.cross_entropy(valid_logits, valid_targets)
-                accuracy = (valid_logits.argmax(-1) == valid_targets).float().mean().item()
-                metrics: dict[str, float] = {"loss": loss.item(), "accuracy": accuracy}
-
-                # Top-5 accuracy
-                top5 = valid_logits.topk(5, dim=-1).indices
-                top5_acc = (top5 == valid_targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
-                metrics["top5_accuracy"] = top5_acc
-
-                # Legal move rate: reuse already-computed valid_logits argmax
-                if has_legal:
-                    legal_grid = self.val_data["legal_grid"][start:end].to(self.device, non_blocking=True)
-                    game_lengths = self.val_data["game_lengths"][start:end].to(self.device, non_blocking=True)
-                    preds = torch.zeros_like(loss_mask, dtype=torch.long)
-                    preds[loss_mask] = valid_logits.argmax(dim=-1)
-                    n_act = self._model.embed.n_actions
-                    legal_rate = compute_legal_move_rate_from_preds(
-                        preds, legal_grid, loss_mask, game_lengths,
-                        n_actions=n_act,
-                    )
-                    metrics["legal_move_rate"] = legal_rate
-
-                    # Late-game legality: only plies >= legality_late_ply
-                    late_legal_rate = compute_legal_move_rate_from_preds(
-                        preds, legal_grid, loss_mask, game_lengths,
-                        min_ply=self.legality_late_ply,
-                        n_actions=n_act,
-                    )
-                    metrics["late_legal_move_rate"] = late_legal_rate
-
-            for k, v in metrics.items():
-                total_metrics[k] = total_metrics.get(k, 0.0) + v
-            n_batches += 1
-
-        if self.device != "cpu" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        avg = {f"val/{k}": v / n_batches for k, v in total_metrics.items()}
-        avg["val/perplexity"] = math.exp(min(avg["val/loss"], 20.0))
-
-        avg.update(eval_game_completion_metrics(
-            model, self.val_data,
-            batch_size=self.cfg.batch_size,
-            vocab_size=self.model_cfg.vocab_size,
-            device=self.device,
-            use_amp=self.cfg.use_amp,
-        ))
-
-        return avg
-
-    def train(self):
-        self.dataset.set_start_step(self.global_step)
-        num_workers = self.cfg.num_workers
-        loader = DataLoader(
-            self.dataset,
-            batch_size=None,
-            num_workers=num_workers,
-            pin_memory=(self.device != "cpu"),
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=2 if num_workers > 0 else None,
-        )
-
-        _shutdown_requested = False
-        _shutdown_signal = None
-
-        def _graceful_exit(signum, frame):
-            nonlocal _shutdown_requested, _shutdown_signal
-            _shutdown_requested = True
-            _shutdown_signal = signum
-
-        old_term = signal.signal(signal.SIGTERM, _graceful_exit)
-        old_int = signal.signal(signal.SIGINT, _graceful_exit)
-
-        os.makedirs(self.cfg.checkpoint_dir, exist_ok=True)
-
-        accum_count = 0
-        step_start = time.time()
-        games_per_step = self.cfg.batch_size * self.cfg.accumulation_steps
-
-        print(f"Starting training from step {self.global_step}", flush=True)
-        print(f"JSONL log: {self._jsonl_path}", flush=True)
-
-        wandb_exit_code = 0
-        try:
-            for batch in loader:
-                metrics = self.train_step(batch)
-                accum_count += 1
-
-                if accum_count >= self.cfg.accumulation_steps:
-                    grad_norm = self.optimizer_step()
-                    accum_count = 0
-                    self.global_step += 1
-
-                    step_time = time.time() - step_start
-                    games_per_sec = games_per_step / step_time
-
-                    if self.global_step % self.cfg.log_interval == 0:
-                        # .item() sync only at log intervals (metrics are tensors here)
-                        loss_val = metrics['loss'].item()
-                        acc_val = metrics['accuracy'].item()
-                        lr = self.scheduler.get_lr()
-
-                        print(
-                            f"step {self.global_step:>7d} | "
-                            f"loss {loss_val:.4f} | "
-                            f"acc {acc_val:.3f} | "
-                            f"lr {lr:.2e} | "
-                            f"gn {grad_norm:.2f} | "
-                            f"{games_per_sec:.0f} g/s | "
-                            f"{step_time:.2f}s",
-                            flush=True,
-                        )
-
-                        self.logger.log_train(
-                            step=self.global_step,
-                            lr=lr, grad_norm=grad_norm,
-                            step_time=step_time, games_per_sec=games_per_sec,
-                            **{"train/loss": loss_val, "train/accuracy": acc_val},  # type: ignore[arg-type]
-                        )
-
-                        log_metrics(
-                            self.wandb_run,
-                            {
-                                "train/loss": loss_val, "train/accuracy": acc_val,
-                                "train/lr": lr, "train/grad_norm": grad_norm,
-                                "train/step_time": step_time,
-                                "train/games_per_sec": games_per_sec,
-                            },
-                            step=self.global_step,
-                        )
-
-                    if self.global_step % self.cfg.eval_interval == 0:
-                        val_metrics = self.evaluate()
-                        val_msg = (
-                            f"  val: loss {val_metrics['val/loss']:.4f} | "
-                            f"acc {val_metrics['val/accuracy']:.3f} | "
-                            f"top5 {val_metrics.get('val/top5_accuracy', 0):.3f} | "
-                            f"ppl {val_metrics.get('val/perplexity', 0):.1f}"
-                        )
-                        if "val/legal_move_rate" in val_metrics:
-                            val_msg += f" | legal {val_metrics['val/legal_move_rate']:.3f}"
-                        if "val/late_legal_move_rate" in val_metrics:
-                            val_msg += f" | late_legal {val_metrics['val/late_legal_move_rate']:.3f}"
-                        if "val/game_completion_rate" in val_metrics:
-                            val_msg += (
-                                f" | complete {val_metrics['val/game_completion_rate']:.3f}"
-                                f" | avg_ply {val_metrics['val/avg_plies_completed']:.0f}"
-                            )
-                            if "val/min_forfeit_ply" in val_metrics:
-                                val_msg += (
-                                    f" | forfeit [{val_metrics['val/min_forfeit_ply']:.0f}"
-                                    f"-{val_metrics['val/max_forfeit_ply']:.0f}"
-                                    f" med {val_metrics['val/median_forfeit_ply']:.0f}]"
-                                )
-
-                        # Compound early stopping
-                        extra_log: dict[str, object] = {}
-                        if self.patience is not None:
-                            val_loss = val_metrics["val/loss"]
-                            late_legality = val_metrics.get("val/late_legal_move_rate", 0.0)
-                            game_completion = val_metrics.get("val/game_completion_rate", 0.0)
-                            avg_plies = val_metrics.get("val/avg_plies_completed", 0.0)
-
-                            improved = False
-                            if val_loss < self.best_val_loss:
-                                self.best_val_loss = val_loss
-                                improved = True
-                            if late_legality > self.best_late_legality:
-                                self.best_late_legality = late_legality
-                                improved = True
-                            if game_completion > self.best_game_completion:
-                                self.best_game_completion = game_completion
-                                improved = True
-                            if avg_plies > self.best_avg_plies_completed:
-                                self.best_avg_plies_completed = avg_plies
-                                improved = True
-
-                            if improved:
-                                self.patience_counter = 0
-                            else:
-                                self.patience_counter += 1
-
-                            val_msg += f" | pat {self.patience_counter}/{self.patience}"
-                            extra_log = {
-                                "patience_counter": self.patience_counter,
-                                "best_val_loss": self.best_val_loss,
-                                "best_late_legality": self.best_late_legality,
-                                "best_game_completion": self.best_game_completion,
-                                "best_avg_plies_completed": self.best_avg_plies_completed,
-                            }
-
-                        print(val_msg, flush=True)
-
-                        self.logger.log_val(step=self.global_step, **val_metrics, **extra_log)  # type: ignore[arg-type]
-
-                        log_metrics(
-                            self.wandb_run,
-                            {**val_metrics, **extra_log},
-                            step=self.global_step,
-                        )
-
-                    if self.global_step % self.cfg.checkpoint_interval == 0:
-                        self.save_checkpoint()
-
-                    if self.global_step >= self.cfg.total_steps:
-                        print(f"Training complete at step {self.global_step}")
-                        self.save_checkpoint()
-                        stop_reason = "completed"
-                        break
-
-                    if (self.patience is not None
-                            and self.patience_counter >= self.patience):
-                        print(f"\nEarly stopping at step {self.global_step} "
-                              f"(no improvement for {self.patience} evals)")
-                        self.save_checkpoint()
-                        stop_reason = "patience"
-                        break
-
-                    if (self.cfg.pause_after_steps
-                            and self.global_step >= self.cfg.pause_after_steps):
-                        print(f"\n  Paused at step {self.global_step} "
-                              f"(pause_after_steps={self.cfg.pause_after_steps})")
-                        self.save_checkpoint()
-                        stop_reason = "paused"
-                        break
-
-                    if _shutdown_requested:
-                        print(f"\nShutdown requested (signal {_shutdown_signal}), "
-                              f"saving checkpoint at step {self.global_step}...")
-                        self.save_checkpoint()
-                        stop_reason = "sigterm"
-                        break
-
-                    step_start = time.time()
-            else:
-                # Loop fell off the DataLoader without hitting any of
-                # the explicit ``break`` paths — for an infinite-stream
-                # ``CLMDataset`` this is unreachable, but ``stop_reason``
-                # has to be initialized for the finally block.
-                stop_reason = "loader_exhausted"
-        except BaseException:
-            wandb_exit_code = 1
-            stop_reason = "exception"
-            raise
-        finally:
-            # Initialize ``stop_reason`` if the try block didn't even
-            # enter the for-loop (e.g. exception before first batch).
-            stop_reason = locals().get("stop_reason", "exception")
-            signal.signal(signal.SIGTERM, old_term)
-            signal.signal(signal.SIGINT, old_int)
-
-            # Drain the background HF pusher before exiting so a final
-            # save on shutdown/end isn't lost. No-op when hf_repo is None.
-            self._hf_pusher.wait()
-
-            from pawn.adapter_training import write_schedule_health
-
-            write_schedule_health(
-                self.logger.run_dir,
-                schedule=self.cfg.lr_schedule,
-                planned_total_steps=int(self.cfg.total_steps),
-                actual_total_steps=int(self.global_step),
-                lr_peak=float(self.cfg.lr),
-                actual_final_lr=float(self.scheduler.get_lr()),
-                reason_for_stop=stop_reason,
-            )
-
-            self.logger.close()
-            finish_wandb(self.wandb_run, exit_code=wandb_exit_code)
-
-    def save_checkpoint(self, path: str | None = None):
-        from pawn.checkpoint import save_pretrain_checkpoint
-
-        if path is None:
-            path = os.path.join(
-                self.cfg.checkpoint_dir, f"step_{self.global_step:08d}"
-            )
-
-        model: PAWNCLM = self._eager_model()
-
-        save_pretrain_checkpoint(
-            path,
-            model,
-            self.optimizer,
-            self.scheduler,
-            self.scaler,
-            self.global_step,
-            self.model_cfg.__dict__,
-            self.cfg.__dict__,
-            extra={
-                "best_val_loss": self.best_val_loss,
-                "best_late_legality": self.best_late_legality,
-                "best_game_completion": self.best_game_completion,
-                "best_avg_plies_completed": self.best_avg_plies_completed,
-                "patience_counter": self.patience_counter,
-            },
-        )
-        print(f"Checkpoint saved: {path}")
-
-        if self.hf_repo and self.hf_branch:
-            self._hf_pusher.submit(
-                path, self.hf_repo, self.hf_branch,
-                step=self.global_step, metrics_path=self._jsonl_path,
-            )
-
-    def load_checkpoint(self, path: str):
-        from pawn.checkpoint import load_pretrain_checkpoint
-
-        model: PAWNCLM = self._eager_model()
-
-        meta = load_pretrain_checkpoint(
-            path, model, self.optimizer, self.scheduler, self.scaler,
-            device=self.device,
-        )
-        self.global_step = meta["global_step"]
-        if meta.get("best_val_loss") is not None:
-            self.best_val_loss = meta["best_val_loss"]
-        if meta.get("best_late_legality") is not None:
-            self.best_late_legality = meta["best_late_legality"]
-        if meta.get("best_game_completion") is not None:
-            self.best_game_completion = meta["best_game_completion"]
-        if meta.get("best_avg_plies_completed") is not None:
-            self.best_avg_plies_completed = meta["best_avg_plies_completed"]
-        if meta.get("patience_counter") is not None:
-            self.patience_counter = meta["patience_counter"]
-        print(f"Resumed from step {self.global_step}")
+    return train_step

@@ -15,7 +15,7 @@ deltas per ``docs/jax-migration.md`` §6:
     val-loss to gate checkpointing / early-stop.
 
 The single-step machinery (cross-entropy, gradient clipping, AdamW)
-is reused from ``pawn.jax.trainer`` so the same fixes (Codex P2 grad
+is reused from ``pawn.trainer`` so the same fixes (Codex P2 grad
 clip, padded-batch lockstep, etc.) apply unchanged. This module adds:
   * ``make_adapter_train_step`` — single-step that consumes a
     partitioned ``(trainable, frozen)`` carry.
@@ -33,8 +33,8 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from pawn.jax.adapters import LoRAModel, adapter_filter
-from pawn.jax.trainer import Batch, compute_grad_norm, cross_entropy_loss
+from pawn.adapters import LoRAModel, adapter_filter
+from pawn.trainer import Batch, compute_grad_norm, cross_entropy_loss
 
 
 class AdapterTrainState(NamedTuple):

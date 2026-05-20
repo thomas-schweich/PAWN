@@ -3,7 +3,7 @@
 The three published checkpoints (``pawn-{small,base,large}``) and any other
 PyTorch-format checkpoint produced by the pre-migration codebase can be
 brought across one-time via ``convert_legacy_checkpoint``. The output is a
-standalone JAX checkpoint readable by ``pawn.jax.checkpoint.load_model``; it
+standalone JAX checkpoint readable by ``pawn.checkpoint.load_model``; it
 retains the legacy model's hyperparameters — notably head count (the legacy
 ``pawn-large`` used 8 heads / head_dim 80, which is **not** a supernet
 variant).
@@ -46,14 +46,14 @@ import jax.numpy as jnp
 import numpy as np
 from safetensors.numpy import load_file
 
-from pawn.jax.checkpoint import save_model, verify_checkpoint
-from pawn.jax.config import (
+from pawn.checkpoint import save_model, verify_checkpoint
+from pawn.config import (
     MAX_SEQ_LEN,
     N_OUTCOMES,
     VOCAB_SIZE,
     ModelConfig,
 )
-from pawn.jax.model import PAWNModel
+from pawn.model import PAWNModel
 
 
 class IncompatibleCheckpointError(Exception):
@@ -199,7 +199,7 @@ def convert_legacy_checkpoint(src: str | Path, dst: str | Path) -> None:
     """
     src_path = Path(src)
     # Sentinel handling: if a ``.complete`` is present (local checkpoints
-    # written by ``pawn.jax.checkpoint.save_model`` / the legacy PyTorch
+    # written by ``pawn.checkpoint.save_model`` / the legacy PyTorch
     # ``save_pretrain_checkpoint``), verify it; otherwise accept the
     # directory and only read the two files we actually consume. The
     # atomic-write protocol guarantees a freshly-written local checkpoint

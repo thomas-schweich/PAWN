@@ -10,42 +10,34 @@ dependencies = [
     "psutil>=5.9.0",
     "safetensors>=0.4.0",
     "tqdm~=4.67.0",
-    "wandb~=0.25.0",
     "huggingface-hub>=0.20.0",
-    # JAX migration (docs/jax-migration.md). CPU jaxlib by default; the
-    # GPU-jaxlib split into the rocm/cu128 extras is deferred to Phase 2.
+    # JAX training + eval (docs/jax-migration.md). CPU jaxlib by default;
+    # the GPU-jaxlib lives in the rocm / cu128 extras.
     "jax>=0.6.0",
     "equinox>=0.13.0",
     "optax>=0.2.0",
-    # Eval + probes
-    "seaborn>=0.13.2",
-    "matplotlib>=3.10.8",
-    "polars>=1.39.0",
+    # Datagen tooling (scripts/compact_stockfish_dataset.py).
     "pyarrow>=23.0.1",
-    "zstandard>=0.22.0",  # Lichess PGN extraction
-    # Dashboard
-    "solara>=1.0.0",
-    "plotly>=5.18.0",
-    "pandas>=2.0.0",
-    "anywidget>=0.9.21",
-    # Sweeps
-    "optuna>=4.0.0",
-    "optuna-dashboard>=0.17.0",
-    # Lab manager MCP server
-    "fastmcp>=2.0.0",
-    "starlette<1.0.0",  # solara incompatible with starlette 1.0
     # Dev
     "pyright>=1.1.0",
     "pytest~=9.0.0",
     "pytest-mock>=3.12.0",
     "hypothesis>=6.100.0",
     "syrupy>=4.7.0",
-    "ipykernel>=7.2.0",
 ]
 
 [project.optional-dependencies]
+# torch is kept as an extra alongside the JAX GPU backends because:
+#   (1) the thin PyTorch loader at ``pawn.jax.torch_loader`` ships
+#       alongside published JAX checkpoints for external non-JAX users
+#       (``docs/jax-migration.md`` §3.5);
+#   (2) ``pawn.jax._torch_legacy_fixture`` lets the legacy-converter
+#       parity tests build a torch reference model.
+# Neither path is exercised by ``pawn.jax.{model,trainer,adapters,eval}``,
+# so the JAX surface stays torch-free under a CPU-jax install.
 rocm = ["torch~=2.10.0", "triton-rocm>=3.6.0", "triton>=3.6.0"]
 cu128 = ["torch~=2.10.0"]
+torch-loader = ["torch~=2.10.0"]
 
 [build-system]
 requires = ["hatchling"]

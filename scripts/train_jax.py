@@ -49,16 +49,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from pawn.jax.config import (
+from pawn.config import (
     SUPERNET,
     TINY_SUPERNET,
     TINY_VARIANTS,
     VARIANTS,
     ModelConfig,
 )
-from pawn.jax.corpus import generate_corpus
-from pawn.jax.model import init_model
-from pawn.jax.trainer import (
+from pawn.corpus import generate_corpus
+from pawn.model import init_model
+from pawn.trainer import (
     Batch,
     VariantSpec,
     init_train_state,

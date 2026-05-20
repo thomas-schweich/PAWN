@@ -16,8 +16,8 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file as torch_save_file
 
-from pawn.config import CLMConfig
-from pawn.model import PAWNCLM
+from pawn._torch_legacy_fixture import CLMConfig
+from pawn._torch_legacy_fixture import PAWNCLM
 
 
 def write_legacy_checkpoint(
@@ -77,7 +77,7 @@ def stamp_format_version(ckpt_dir: Path, version: int) -> None:
     the sentinel hash and ``load_model`` / ``load_pawn`` fail on integrity
     long before reaching the version check.
     """
-    from pawn.jax.checkpoint import _write_sentinel
+    from pawn.checkpoint import _write_sentinel
 
     cfg_path = ckpt_dir / "config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))

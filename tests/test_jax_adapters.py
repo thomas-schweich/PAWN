@@ -1,4 +1,4 @@
-"""Tests for ``pawn.jax.adapters`` — Phase-3 chunk 1 (LoRA).
+"""Tests for ``pawn.adapters`` — Phase-3 chunk 1 (LoRA).
 
 Pins the load-bearing invariants the trainer will rely on:
   * LoRA forward at init equals the backbone (B=0 convention)
@@ -21,15 +21,15 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from pawn.jax.adapters import (
+from pawn.adapters import (
     LoRAConfig,
     LoRAModel,
     adapter_filter,
     init_lora_model,
 )
-from pawn.jax.adapters.lora import _VALID_TARGETS, LoRAParams
-from pawn.jax.config import TINY_SUPERNET, TINY_VARIANTS
-from pawn.jax.model import init_model, sliced
+from pawn.adapters.lora import _VALID_TARGETS, LoRAParams
+from pawn.config import TINY_SUPERNET, TINY_VARIANTS
+from pawn.model import init_model, sliced
 
 
 def _toy_batch(b: int = 2, t: int = 8) -> tuple[jax.Array, jax.Array]:

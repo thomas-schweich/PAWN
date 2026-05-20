@@ -1,4 +1,4 @@
-"""Tests for ``pawn.jax.torch_loader`` — load + logit-parity round-trip."""
+"""Tests for ``pawn.torch_loader`` — load + logit-parity round-trip."""
 
 from __future__ import annotations
 
@@ -15,17 +15,17 @@ pytest.importorskip("chess_engine")
 import numpy as np
 import torch
 
-from pawn.config import CLMConfig
-from pawn.jax.checkpoint import _PARAM_FIELDS
-from pawn.jax.legacy import convert_legacy_checkpoint
-from pawn.jax.torch_loader import (
+from pawn._torch_legacy_fixture import CLMConfig
+from pawn.checkpoint import _PARAM_FIELDS
+from pawn.legacy import convert_legacy_checkpoint
+from pawn.torch_loader import (
     _SCHEMA_KEYS,
     CheckpointIntegrityError,
     TorchModelConfig,
     UnsupportedCheckpointVersionError,
     load_pawn,
 )
-from pawn.model import PAWNCLM
+from pawn._torch_legacy_fixture import PAWNCLM
 from tests._jax_helpers import (
     corrupt_safetensors,
     stamp_format_version,
