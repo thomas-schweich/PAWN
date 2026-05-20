@@ -34,7 +34,7 @@ import jax.numpy as jnp
 import optax
 
 from pawn.jax.adapters import LoRAModel, adapter_filter
-from pawn.jax.trainer import Batch, cross_entropy_loss
+from pawn.jax.trainer import Batch, compute_grad_norm, cross_entropy_loss
 
 
 class AdapterTrainState(NamedTuple):
@@ -43,9 +43,13 @@ class AdapterTrainState(NamedTuple):
     Carries the *trainable* subtree of the partitioned ``LoRAModel``
     (the adapter parameters) plus the optimizer state and a 0-d
     ``jnp.int32`` step counter. The frozen backbone subtree lives
-    outside the state — captured at ``make_adapter_train_step`` time
-    so it's hoisted as a static closure under JIT and doesn't ride
-    through the scan carry every iteration.
+    outside the state — captured in the JIT closure of
+    ``make_adapter_train_step``. Under ``eqx.filter_jit`` the
+    closed-over JAX arrays are traced as dynamic constants (not
+    truly static), but they no longer ride through any ``lax.scan``
+    carry — that's the structural win. The real §6.1 saving is that
+    the backbone arrays are not in ``trainable``, so gradient
+    computations for them are dead-code-eliminated by XLA.
     """
 
     trainable: LoRAModel  # partition: lora.* are real arrays, backbone is None
@@ -87,12 +91,15 @@ def make_adapter_train_step(
 ) -> AdapterTrainStep:
     """Build a jitted ``(state, batch) -> (state, metrics)`` callable.
 
-    The ``frozen`` PyTree is hoisted into the JIT closure — captured
-    once at compile time so it doesn't ride through ``lax.scan``
-    carry per iteration. Mirrors the pretraining trainer's behaviour
-    around padded batches (``has_supervision`` gates the optimizer
-    update) and uses the same gradient-clipping composition that
-    ``make_optimizer`` already wires in.
+    The ``frozen`` PyTree is captured in the JIT closure rather than
+    threaded through a scan carry. Under ``eqx.filter_jit`` its array
+    leaves are traced as dynamic constants and are re-traced if the
+    closure object identity changes; the §6.1 win is that they are
+    NOT in ``trainable`` and so XLA dead-code-eliminates their
+    weight-gradient computations. Mirrors the pretraining trainer's
+    behaviour around padded batches (``has_supervision`` gates the
+    optimizer update) and uses the same gradient-clipping
+    composition that ``make_optimizer`` already wires in.
     """
 
     @eqx.filter_jit
@@ -113,18 +120,10 @@ def make_adapter_train_step(
         params = eqx.filter(state.trainable, eqx.is_inexact_array)
         grads_filt = eqx.filter(grads, eqx.is_inexact_array)
 
-        # grad norm via per-leaf vdot; same pattern as the pretrain
-        # trainer (Phase-2 loop r1 finding).
-        grad_leaves = jax.tree_util.tree_leaves(grads)
-        if grad_leaves:
-            grad_norm = jnp.sqrt(
-                sum(
-                    jnp.sum(jnp.square(g.astype(jnp.float32)))
-                    for g in grad_leaves
-                )
-            )
-        else:
-            grad_norm = jnp.float32(0.0)
+        # Global grad norm via the shared helper (same pattern as the
+        # pretrain trainer; centralised so a future change lands in
+        # one place).
+        grad_norm = compute_grad_norm(grads)
 
         n_supervised = loss_mask.sum().astype(jnp.int32)
         has_supervision = n_supervised > 0
@@ -162,6 +161,32 @@ def make_adapter_train_step(
         return new_state, metrics
 
     return adapter_train_step
+
+
+AdapterScanStep = Callable[
+    [AdapterTrainState, Batch],
+    tuple[AdapterTrainState, dict[str, jax.Array]],
+]
+
+
+def make_adapter_scan_step(
+    train_step: AdapterTrainStep, k: int
+) -> AdapterScanStep:
+    """Fuse the adapter ``train_step`` into a K-step ``lax.scan``.
+
+    The driver previously called ``train_step`` K times from a Python
+    loop, paying one XLA dispatch per call (~K × dispatch overhead
+    per chunk). Wrapping in ``lax.scan`` reduces that to one
+    dispatch per chunk and gives XLA the full K-iteration body for
+    fusion. Chunk argument shape: ``[K, B, T]`` per field.
+    """
+
+    def scan_step(
+        state: AdapterTrainState, chunk: Batch
+    ) -> tuple[AdapterTrainState, dict[str, jax.Array]]:
+        return jax.lax.scan(train_step, state, chunk, length=k)
+
+    return eqx.filter_jit(scan_step)
 
 
 EvalStep = Callable[[LoRAModel, Batch], dict[str, jax.Array]]

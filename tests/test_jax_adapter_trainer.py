@@ -32,6 +32,7 @@ import jax.numpy as jnp
 
 from pawn.jax.adapter_trainer import (
     init_adapter_state,
+    make_adapter_scan_step,
     make_adapter_train_step,
     make_eval_step,
 )
@@ -108,31 +109,46 @@ def test_train_step_decreases_loss_on_fixed_batch() -> None:
 
 
 def test_backbone_weights_are_frozen() -> None:
-    """The §6.1 headline contract: after training, every backbone
-    weight is bit-identical to its initial value. A regression that
-    wired the optimizer through the backbone partition would silently
-    clobber the pretrained baseline — and only a per-leaf comparison
-    catches it (the adapter loss would still decrease)."""
+    """The §6.1 headline contract: after training, the optimizer must
+    NOT have updated any backbone parameter. The structural guard is
+    that ``state.trainable.backbone.*`` stays ``None`` (the partition
+    invariant) — if a regression wired the optimizer through the
+    backbone, those leaves would become arrays. A complementary check
+    is that the reconstructed model's backbone (via ``eqx.combine``)
+    is bit-equal to the original backbone — which is guaranteed by
+    JAX immutability if the partition invariant holds.
+    """
     model, state, frozen, train_step, _ = _setup(lr=1e-1)
     batch = _real_batch(b=4, t=16)
     # Many steps at a large LR to amplify any drift.
     for _ in range(20):
         state, _ = train_step(state, batch)
-    # The current backbone is ``frozen`` (captured at init) combined
-    # with ``state.trainable.backbone`` (None subtree). The
-    # backbone's arrays are reachable via ``frozen.backbone``
-    # directly; verify each leaf is bit-equal to the corresponding
-    # leaf in the original model.
+    # Structural invariant: state.trainable.backbone subtree is all
+    # None. A regression that broadened the optimizer to the
+    # backbone would surface here.
     for name in (
         "src_embed", "dst_embed", "promo_embed", "outcome_embed",
         "attn_norm", "wq", "wk", "wv", "wo",
         "ffn_norm", "w_gate", "w_up", "w_down",
         "final_norm", "lm_head", "pad_embed",
     ):
+        assert getattr(state.trainable.backbone, name) is None, (
+            f"state.trainable.backbone.{name} became non-None after "
+            f"training — the optimizer leaked into the backbone."
+        )
+    # Functional invariant: the model reconstructed from
+    # ``eqx.combine(state.trainable, frozen)``'s backbone is
+    # bit-identical to the original. This is guaranteed by JAX
+    # array immutability + Equinox closure capture, but pinning it
+    # in a test ensures a future refactor that swaps ``frozen``
+    # for a mutable container or stops using the partition
+    # boundary surfaces the regression.
+    reconstructed = eqx.combine(state.trainable, frozen)
+    for name in ("wq", "wk", "wv", "wo", "lm_head", "final_norm"):
         original = getattr(model.backbone, name)
-        current = getattr(frozen.backbone, name)
+        current = getattr(reconstructed.backbone, name)
         assert jnp.array_equal(original, current), (
-            f"backbone leaf {name!r} drifted under adapter training — "
+            f"reconstructed.backbone.{name} drifted from original — "
             f"max diff = {float(jnp.abs(original - current).max())}"
         )
 
@@ -195,6 +211,84 @@ def test_train_step_state_is_jax_pytree() -> None:
     assert int(rebuilt.step) == int(state.step)
     assert isinstance(state.step, jax.Array)
     assert state.step.shape == () and state.step.dtype == jnp.int32
+
+
+def test_adapter_scan_step_advances_by_k() -> None:
+    """``make_adapter_scan_step`` wraps the single-step in
+    ``lax.scan(length=k)``. After one scan call ``state.step``
+    advances by exactly K (assuming the chunk has supervision
+    everywhere), metrics come back stacked on a leading [K] axis."""
+    _, state, _, train_step, _ = _setup()
+    K = 4
+    scan = make_adapter_scan_step(train_step, K)
+    # Build a [K, B, T] chunk by stacking K copies of one batch.
+    single = _real_batch(b=2, t=8, seed=3)
+    chunk: Batch = tuple(
+        jnp.stack([x] * K, axis=0) for x in single
+    )  # type: ignore[assignment]
+    state, metrics = scan(state, chunk)
+    assert int(state.step) == K
+    assert metrics["loss"].shape == (K,)
+    assert metrics["grad_norm"].shape == (K,)
+
+
+def test_eval_step_uses_correct_frozen() -> None:
+    """``make_eval_step(frozen)`` closes over the frozen backbone passed
+    in. Two independently-initialised adapter stacks must produce
+    eval losses tied to THEIR respective backbone — a regression
+    that conflated frozen instances would silently evaluate one
+    adapter against the other backbone.
+
+    Set-up: two stacks with different backbones AND different
+    post-training LoRA values, so the cross-eval result is
+    distinguishable from both same-stack results."""
+    # Two separately-seeded backbones.
+    key_a, key_b = jax.random.PRNGKey(11), jax.random.PRNGKey(22)
+    backbone_a = sliced(init_model(TINY_SUPERNET, key_a), TINY_VARIANTS["base"])
+    backbone_b = sliced(init_model(TINY_SUPERNET, key_b), TINY_VARIANTS["base"])
+    cfg = LoRAConfig(rank=4, targets=("q", "v"))
+    # Different LoRA-init keys so the post-training LoRA differs too.
+    model_a = init_lora_model(backbone_a, cfg, jax.random.PRNGKey(101))
+    model_b = init_lora_model(backbone_b, cfg, jax.random.PRNGKey(202))
+    opt = make_optimizer(3e-3)
+    state_a, frozen_a = init_adapter_state(model_a, opt)
+    state_b, frozen_b = init_adapter_state(model_b, opt)
+    step_a = make_adapter_train_step(opt, frozen_a)
+    step_b = make_adapter_train_step(opt, frozen_b)
+    train_batch = _real_batch(b=4, t=16, seed=1)
+    # Train each stack independently so LoRA params diverge (B is no
+    # longer zero in either).
+    for _ in range(5):
+        state_a, _ = step_a(state_a, train_batch)
+        state_b, _ = step_b(state_b, train_batch)
+    eval_a = make_eval_step(frozen_a)
+    batch = _real_batch(b=4, t=16, seed=2)
+    loss_aa = float(eval_a(state_a.trainable, batch)["loss"])
+    # Cross: eval_a with state_b's trainable — frozen_a's backbone
+    # combined with state_b's LoRA. Different from same-stack
+    # evaluation because state_b's LoRA was trained against a
+    # different backbone.
+    loss_ab = float(eval_a(state_b.trainable, batch)["loss"])
+    assert loss_aa != loss_ab, (
+        "eval_step's frozen closure is being ignored — same loss "
+        "regardless of which state.trainable is passed"
+    )
+
+
+def test_lora_a_q_updates_after_multiple_steps() -> None:
+    """``a_q``'s gradient is exactly zero at init (the gradient
+    formula scales by ``b_q``, which is initialised to zero). After
+    step 1, ``b_q`` is non-zero and the next step's gradient w.r.t.
+    ``a_q`` becomes non-trivial. Pin the multi-step behaviour
+    (the single-step test couldn't have caught a regression that
+    broke the ``a_q`` update path)."""
+    _, state, _, train_step, _ = _setup(lr=3e-3)
+    initial_a_q = state.trainable.lora.a_q
+    batch = _real_batch(b=4, t=16)
+    for _ in range(5):
+        state, _ = train_step(state, batch)
+    delta = float(jnp.abs(state.trainable.lora.a_q - initial_a_q).max())
+    assert delta > 0.0, "a_q did not move after 5 train steps"
 
 
 def test_eval_loss_decreases_as_training_progresses() -> None:

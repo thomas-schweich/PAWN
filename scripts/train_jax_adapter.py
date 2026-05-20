@@ -40,10 +40,11 @@ import numpy as np
 
 from pawn.jax.adapter_trainer import (
     init_adapter_state,
+    make_adapter_scan_step,
     make_adapter_train_step,
     make_eval_step,
 )
-from pawn.jax.adapters import LoRAConfig, init_lora_model
+from pawn.jax.adapters import LoRAConfig, LoRAModel, init_lora_model
 from pawn.jax.config import (
     SUPERNET,
     TINY_SUPERNET,
@@ -258,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
     optimizer = make_optimizer(sched)
     state, frozen = init_adapter_state(lora_model, optimizer)
     train_step = make_adapter_train_step(optimizer, frozen)
+    scan = make_adapter_scan_step(train_step, args.k)
     eval_step = make_eval_step(frozen)
 
     n_chunks = args.total_steps // args.k
@@ -270,14 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     train_targets_chunks = train_targets.reshape(chunk_shape)
     train_loss_chunks = train_loss.reshape(chunk_shape)
 
-    # Pre-stage the entire val set to device — the eval is forward-
-    # only so it's well-suited to a single chunk. Shape: [V, T].
-    val_batch: Batch = (
-        _stage(val_tokens), _stage(val_attn),
-        _stage(val_targets), _stage(val_loss),
-    )
-
-    def run_validation(trainable) -> tuple[float, int]:
+    def run_validation(trainable: LoRAModel) -> tuple[float, int]:
         """Iterate the val set in batches, return (mean_loss, total_n).
         We iterate on the host (eval is a one-shot diagnostic, not on
         the critical path) and accumulate weighted by n_supervised."""
@@ -311,27 +306,27 @@ def main(argv: list[str] | None = None) -> int:
                 _stage(train_loss_chunks[chunk_i]),
             )
             t_chunk = time.perf_counter()
-            # Iterate K single-step train calls on the host. (We
-            # avoid lax.scan for the adapter trainer's first
-            # iteration to keep the partition logic simple; a
-            # production driver should scan as in the pretraining
-            # path.)
-            losses = []
-            for k_i in range(args.k):
-                sub: Batch = tuple(arr[k_i] for arr in chunk)  # type: ignore[assignment]
-                state, m = train_step(state, sub)
-                losses.append(float(m["loss"]))
+            # K-step ``lax.scan`` — one XLA dispatch per chunk instead
+            # of K. Per-step metrics come back stacked on a leading
+            # ``[K]`` axis.
+            state, chunk_metrics = scan(state, chunk)
+            jax.block_until_ready((state, chunk_metrics))
             dt = time.perf_counter() - t_chunk
             step_end = int(state.step)
 
+            host_metrics = {
+                mk: np.asarray(v) for mk, v in chunk_metrics.items()
+            }
             row: dict[str, float | int | None] = {
                 "chunk": chunk_i,
                 "step_start": step_start,
                 "step_end": step_end,
                 "wall_s": time.perf_counter() - wall0,
                 "chunk_wall_s": dt,
-                "train_loss_mean": float(np.mean(losses)),
-                "train_loss_last": float(losses[-1]),
+                "train_loss_mean": float(host_metrics["loss"].mean()),
+                "train_loss_last": float(host_metrics["loss"][-1]),
+                "grad_norm_mean": float(host_metrics["grad_norm"].mean()),
+                "grad_norm_max": float(host_metrics["grad_norm"].max()),
                 "val_loss": None,
                 "val_n": None,
             }
@@ -352,7 +347,8 @@ def main(argv: list[str] | None = None) -> int:
                 vs = f" val={row['val_loss']:.4f}" if row["val_loss"] is not None else ""
                 print(
                     f"[chunk {chunk_i + 1}/{n_chunks}] step={step_end} "
-                    f"train_loss={row['train_loss_mean']:.4f}{vs} dt={dt:.2f}s"
+                    f"train_loss={row['train_loss_mean']:.4f}{vs} "
+                    f"grad_norm={row['grad_norm_mean']:.3f} dt={dt:.2f}s"
                 )
             step_start = step_end
     print(
