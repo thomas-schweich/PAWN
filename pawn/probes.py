@@ -36,6 +36,7 @@ preserved).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -340,9 +341,9 @@ class BatchedLinearProbe(eqx.Module):
     weight: jax.Array  # (n_probes, d_model, n_outputs)
     bias: jax.Array    # (n_probes, n_outputs)
 
-    @staticmethod
+    @classmethod
     def init(
-        n_probes: int, d_model: int, n_outputs: int, key: jax.Array
+        cls, n_probes: int, d_model: int, n_outputs: int, key: jax.Array
     ) -> "BatchedLinearProbe":
         # Same initialisation as the legacy torch BatchedLinearProbe:
         # zero-mean normal scaled by ``1/sqrt(d_model)`` for the weight
@@ -350,7 +351,7 @@ class BatchedLinearProbe(eqx.Module):
         scale = 1.0 / float(d_model) ** 0.5
         w = jax.random.normal(key, (n_probes, d_model, n_outputs)) * scale
         b = jnp.zeros((n_probes, n_outputs))
-        return BatchedLinearProbe(weight=w, bias=b)
+        return cls(weight=w, bias=b)
 
     def __call__(self, h: jax.Array) -> jax.Array:
         """``h: (n_probes, N, d_model)`` → ``(n_probes, N, n_outputs)``."""
@@ -369,7 +370,10 @@ def _per_layer_loss(
 
     Shapes:
         * ``ce``: logits ``(L, N, K)``, targets int ``(N,)`` → ``(L,)``
-        * ``ce_per_square``: logits ``(L, N, 64*13)``, targets int ``(N, 64)`` → ``(L,)``
+        * ``ce_per_square``: logits ``(L, N, 64*13)`` reshaped on the host
+          to ``(L, N, 64, 13)`` (square-major: the last axis carries the
+          13 class logits for one of 64 squares), targets int ``(N, 64)``
+          → ``(L,)``
         * ``bce``: logits ``(L, N, K)``, targets float ``(N, K)`` → ``(L,)``
         * ``mse``: logits ``(L, N, K)``, targets float ``(N, K)`` → ``(L,)``
     """
@@ -423,38 +427,41 @@ def _per_layer_accuracy(
 # ---------------------------------------------------------------------------
 
 
-def _forward_and_gather(
-    model: PAWNModel,
-    input_ids: jax.Array,
-    attn_mask: jax.Array,
+def _forward_hidden(
+    model: PAWNModel, input_ids: jax.Array, attn_mask: jax.Array,
+) -> jax.Array:
+    """JIT-shape-stable forward returning ``(n_layers + 1, B, T, d_model)``.
+
+    Codex flagged the previous integer-indexed-gather variant for
+    re-tracing on every distinct ``N_valid`` (per-batch valid-position
+    count). The new layout keeps the JITted forward shape-stable —
+    only ``(B, T)`` parametrise the trace, both fixed across a training
+    run (``T = max_ply``; ``B`` is ``game_batch_size`` except for the
+    final partial batch, so at most two compiles). The caller does the
+    valid-position gather *outside* ``jit`` against the returned
+    on-device tensor; the gather is one op per batch and stays on the
+    device.
+    """
+    return model.hidden_all_layers(input_ids, attn_mask)
+
+
+_forward_hidden_jit = eqx.filter_jit(_forward_hidden, donate="none")
+
+
+def _gather_valid_positions(
+    hidden: jax.Array,
     g_idx: jax.Array,
     seq_idx: jax.Array,
 ) -> jax.Array:
-    """Forward + integer-indexed gather of valid positions.
+    """Outside-``jit`` fancy gather of ``(L, N_valid, d_model)``.
 
-    Returns ``(n_layers + 1, N_valid, d_model)``.
-
-    A bool-indexed flat gather (``hidden[:, mask_flat, :]``) is rejected
-    under ``jit`` — bool indices have to be concrete at trace time. The
-    caller computes ``(b_local, p_local)`` in numpy from the batch's
-    ``valid_mask``, adds the CLM ply-offset on the host, and passes
-    ``(g_idx, seq_idx)`` as int arrays. Fancy integer indexing inside
-    ``jit`` is fine; JAX retraces only when the shape (``N_valid``) or
-    dtype of those arrays changes.
-
-    Args:
-        input_ids: ``(B, T)`` int CLM tokens.
-        attn_mask: ``(B, T)`` bool.
-        g_idx: ``(N_valid,)`` int — game indices within the batch.
-        seq_idx: ``(N_valid,)`` int — CLM-sequence positions
-            (already ``ply_offset + p_local``).
+    ``hidden: (L, B, T, d_model)``; ``g_idx`` is game indices within the
+    batch, ``seq_idx`` is CLM-sequence positions (already ``ply_offset +
+    p_local`` from the caller). Numpy-style advanced indexing on the two
+    middle axes — JAX dispatches it as a single gather op, no
+    re-tracing.
     """
-    hidden = model.hidden_all_layers(input_ids, attn_mask)
-    # hidden: (L, B, T, d).  result[l, n, d] = hidden[l, g_idx[n], seq_idx[n], d]
     return hidden[:, g_idx, seq_idx, :]
-
-
-_forward_and_gather_jit = eqx.filter_jit(_forward_and_gather, donate="none")
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +469,19 @@ _forward_and_gather_jit = eqx.filter_jit(_forward_and_gather, donate="none")
 # ---------------------------------------------------------------------------
 
 
-def _make_step(spec: ProbeSpec):
+_ProbeStep = Callable[
+    [
+        "BatchedLinearProbe",
+        optax.OptState,
+        optax.GradientTransformation,
+        jax.Array,
+        jax.Array,
+    ],
+    tuple["BatchedLinearProbe", optax.OptState, jax.Array],
+]
+
+
+def _make_step(spec: ProbeSpec) -> _ProbeStep:
     """Return a JIT-compiled SGD step closure for one probe."""
 
     def loss_fn(probe: BatchedLinearProbe, h: jax.Array, t: jax.Array) -> jax.Array:
@@ -508,19 +527,6 @@ class _ProbeAccum:
     ss_tot: np.ndarray | None = None       # (L,)
     ae_sum: np.ndarray | None = None       # (L,)
     target_mean: np.ndarray | None = None  # (1, n_outputs)
-
-
-def _gather_targets(
-    data: ProbeData, probe_name: str, batch_game_indices: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per-batch valid (g, p) index pairs + matching target array."""
-    gl = data.game_lengths[batch_game_indices]
-    max_ply = data.max_ply
-    ply_grid = np.arange(max_ply, dtype=np.int32)[None, :]
-    valid_mask = ply_grid < gl[:, None]            # (B, max_ply)
-    b_idx, p_idx = valid_mask.nonzero()
-    g_idx = batch_game_indices[b_idx]
-    return g_idx, p_idx
 
 
 def _compute_val_target_means(
@@ -597,12 +603,14 @@ def _evaluate_streaming(
         if n_valid == 0:
             continue
         b_local, p_local = valid_mask_np.nonzero()
-        # ``seq_idx`` is the CLM-sequence position: per-ply index plus
-        # the outcome-prefix offset. Computed on the host so the
-        # jit-traced gather sees a static-shape int index.
         seq_local = p_local.astype(np.int32) + data.ply_offset
-        h = _forward_and_gather_jit(
-            model, ids, attn,
+        # Jit-shape-stable forward: only ``(B, T)`` parametrise the
+        # trace. The gather of valid positions runs outside ``jit`` so
+        # ``N_valid`` (which varies per batch) doesn't trigger
+        # retracing.
+        hidden_all = _forward_hidden_jit(model, ids, attn)
+        h = _gather_valid_positions(
+            hidden_all,
             jnp.asarray(b_local.astype(np.int32)),
             jnp.asarray(seq_local),
         )
@@ -645,7 +653,14 @@ def _evaluate_streaming(
             entry["accuracy"] = (
                 1.0 - a.ss_res / (a.ss_tot + 1e-8)
             ).astype(np.float64)
-            entry["mae"] = (a.ae_sum / denom).astype(np.float64)
+            # ae_sum was accumulated as |diff|.sum(axis=(positions, outputs)),
+            # so the per-element mean divides by n_positions × n_outputs.
+            # The legacy torch streaming evaluator divided by only n_positions,
+            # which produced an n_outputs-scaled "MAE" for material_count
+            # (n_outputs = 10) — confusing when consumers compared MAE
+            # across probes. Divide by n × n_outputs here so all probes
+            # report MAE on the same per-element scale. (Bug + Type)
+            entry["mae"] = (a.ae_sum / (denom * spec.n_outputs)).astype(np.float64)
         else:
             assert a.correct_sum is not None
             entry["accuracy"] = (a.correct_sum / denom).astype(np.float64)
@@ -698,13 +713,19 @@ def train_probes(
     n_layers_out = n_layers + 1
     layer_names = ["embed"] + [f"layer_{i}" for i in range(n_layers)]
 
-    # One BatchedLinearProbe per probe type. ``key`` is split per probe so
-    # the inits are independent.
-    keys = jax.random.split(key, len(probe_names))
+    # Split the top-level key once: one stream for probe inits, one for
+    # the train-loop permutations. Each downstream consumer then splits
+    # its own stream further so the "use each key exactly once" rule
+    # holds end-to-end. (Bug-detector found that the legacy port reused
+    # the input key for both, which works because JAX random ops are
+    # pairwise-independent on the same key, but couples the streams if a
+    # later refactor reuses one of the ops.)
+    init_key, perm_key = jax.random.split(key)
+    keys = jax.random.split(init_key, len(probe_names))
     probes_dict: dict[str, BatchedLinearProbe] = {}
     opt_states: dict[str, optax.OptState] = {}
     optimizers: dict[str, optax.GradientTransformation] = {}
-    steps = {}
+    steps: dict[str, _ProbeStep] = {}
     for name, k in zip(probe_names, keys):
         spec = PROBES[name]
         probe = BatchedLinearProbe.init(n_layers_out, d_model, spec.n_outputs, k)
@@ -751,8 +772,9 @@ def train_probes(
                 continue
             b_local, p_local = valid_mask_np.nonzero()
             seq_local = p_local.astype(np.int32) + train_data.ply_offset
-            h = _forward_and_gather_jit(
-                model, ids, attn,
+            hidden_all = _forward_hidden_jit(model, ids, attn)
+            h = _gather_valid_positions(
+                hidden_all,
                 jnp.asarray(b_local.astype(np.int32)),
                 jnp.asarray(seq_local),
             )

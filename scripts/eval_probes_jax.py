@@ -189,13 +189,20 @@ def main() -> None:
             f"[probes] generating {args.n_games} train + "
             f"{args.n_val_games} val games"
         )
+    # Legal-move counting is the bulk of the engine work in
+    # ``extract_probe_data``. Skip it unless the active probe set actually
+    # consumes ``legal_move_count``. (Codex P2)
+    active_probes = args.probe if args.probe else list(PROBES.keys())
+    include_legal = "legal_move_count" in active_probes
     train = extract_probe_data(
         n_games=args.n_games, max_ply=max_ply, seed=args.seed,
         prepend_outcome=args.prepend_outcome,
+        include_legal_counts=include_legal,
     )
     val = extract_probe_data(
         n_games=args.n_val_games, max_ply=max_ply, seed=args.seed + 1,
         prepend_outcome=args.prepend_outcome,
+        include_legal_counts=include_legal,
     )
 
     results = train_probes(

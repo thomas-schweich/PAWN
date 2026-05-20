@@ -17,6 +17,7 @@ that's the verification-run job. They pin the *structure* of the port:
 
 from __future__ import annotations
 
+import chess_engine as engine
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -117,9 +118,9 @@ def test_get_probe_targets_castling_bits(small_probe_data: ProbeData) -> None:
     p = np.zeros_like(g)
     t = get_probe_targets("castling_rights", small_probe_data, g, p)
     assert ((t == 0) | (t == 1)).all()
-    # The starting position has all four castling rights — the engine emits
-    # the board at ply 0, which is the position after move 0 (white has
-    # just played); so castling rights still equal 1111.
+    # The engine convention (engine/src/extract.rs — "The state at ply i
+    # is the board BEFORE move_ids[i] is played") puts the starting
+    # position at ply 0, so all four KQkq rights are set.
     assert t[0].tolist() == [1.0, 1.0, 1.0, 1.0]
 
 
@@ -252,3 +253,123 @@ def test_train_probes_smoke() -> None:
                 # negative when the probe is worse than the constant
                 # mean, but cannot exceed 1.
                 assert entry["accuracy"] <= 1.0 + 1e-6
+
+
+def test_train_probes_best_accuracy_invariant() -> None:
+    """``best_accuracy`` tracks the per-epoch maximum across training, so
+    by construction it must be ``>= final_accuracy`` at every (probe,
+    layer) — Test-risk flagged the absence of this structural check."""
+    cfg = TINY_SUPERNET
+    model = init_model(cfg, jax.random.key(0))
+    train = extract_probe_data(n_games=24, max_ply=16, seed=1)
+    val = extract_probe_data(n_games=12, max_ply=16, seed=2)
+    results = train_probes(
+        model, train, val,
+        n_epochs=3, lr=1e-3,
+        game_batch_size=8, inner_batch_size=64,
+        key=jax.random.key(0), verbose=False,
+    )
+    for name, layers in results.items():
+        for lname, entry in layers.items():
+            assert entry["best_accuracy"] >= entry["accuracy"] - 1e-6, (
+                f"{name}/{lname}: best={entry['best_accuracy']} < "
+                f"final={entry['accuracy']}"
+            )
+
+
+def test_train_probes_deterministic() -> None:
+    """Same seed → same metrics within fp tolerance. Catches accidental
+    silent non-determinism (donated buffers, mutated PRNG streams) that
+    a structural test alone misses. (Test-risk)"""
+    cfg = TINY_SUPERNET
+    model = init_model(cfg, jax.random.key(0))
+    train = extract_probe_data(n_games=16, max_ply=16, seed=3)
+    val = extract_probe_data(n_games=8, max_ply=16, seed=4)
+    def _run() -> dict:
+        return train_probes(
+            model, train, val,
+            n_epochs=2, lr=1e-3, game_batch_size=8, inner_batch_size=64,
+            key=jax.random.key(7), verbose=False,
+        )
+    r1 = _run()
+    r2 = _run()
+    for name in PROBES:
+        for lname in r1[name]:
+            assert r1[name][lname]["loss"] == pytest.approx(
+                r2[name][lname]["loss"], abs=1e-5
+            ), f"{name}/{lname} loss is non-deterministic"
+            assert r1[name][lname]["accuracy"] == pytest.approx(
+                r2[name][lname]["accuracy"], abs=1e-5
+            ), f"{name}/{lname} accuracy is non-deterministic"
+
+
+def test_train_probes_learns_side_to_move() -> None:
+    """``side_to_move`` is a trivially-learnable signal (binary toggle).
+    Even on a tiny corpus the probe should land well above 50% chance —
+    catches a sign-flip or axis-transposition in the gather/loss that
+    the shape tests would miss. (Test-risk)"""
+    cfg = TINY_SUPERNET
+    model = init_model(cfg, jax.random.key(0))
+    train = extract_probe_data(n_games=64, max_ply=16, seed=5)
+    val = extract_probe_data(n_games=32, max_ply=16, seed=6)
+    results = train_probes(
+        model, train, val,
+        n_epochs=8, lr=3e-3,
+        game_batch_size=16, inner_batch_size=128,
+        probe_names=["side_to_move"],
+        key=jax.random.key(0), verbose=False,
+    )
+    accs = [
+        results["side_to_move"][lname]["best_accuracy"]
+        for lname in results["side_to_move"]
+    ]
+    best = max(accs)
+    # Side-to-move ≈ (ply % 2) on the unprefixed CLM. The embed output
+    # already encodes the move-index parity, so even on a fresh-init
+    # TINY model the linear probe lands far above chance. 0.80 is a
+    # comfortable floor; observed ~1.0 on multiple seeds during dev.
+    assert best > 0.80, f"side_to_move probe stuck near chance: per-layer accs={accs}"
+
+
+def test_count_legal_moves_starting_position() -> None:
+    """The starting chess position has exactly 20 legal white moves.
+    ``_count_legal_moves`` should report ``20`` at every game's ply 0
+    in a freshly-generated corpus, regardless of which random moves
+    are subsequently played. (Test-risk: closes the gap on the
+    bit-packed grid + promotion-adjustment pipeline.)"""
+    from pawn.probes import _count_legal_moves
+
+    _ids, _t, _lm, move_ids, game_lengths, _tc = (
+        engine.generate_clm_batch(16, 24, 123, False, 0.0, False)
+    )
+    counts = _count_legal_moves(move_ids, game_lengths)
+    # Every game starts with 20 legal moves for white. (game_lengths >= 1
+    # for any non-trivial random game.)
+    for i in range(counts.shape[0]):
+        gl = int(game_lengths[i])
+        if gl == 0:
+            continue
+        assert counts[i, 0] == 20, (
+            f"game {i}: starting-position legal-move count "
+            f"{counts[i, 0]} != 20"
+        )
+
+
+def test_count_legal_moves_within_known_range() -> None:
+    """Sanity bound: legal-move counts at any valid ply land in
+    ``[1, 218]`` (218 is the proven maximum for any legal chess
+    position; ``Edwards 1988``). Catches gross miscount regressions
+    even in positions we don't have an independent reference for."""
+    from pawn.probes import _count_legal_moves
+
+    _ids, _t, _lm, move_ids, game_lengths, _tc = (
+        engine.generate_clm_batch(8, 32, 222, False, 0.0, False)
+    )
+    counts = _count_legal_moves(move_ids, game_lengths)
+    for i in range(counts.shape[0]):
+        gl = int(game_lengths[i])
+        for p in range(gl):
+            c = int(counts[i, p])
+            assert 1 <= c <= 218, (
+                f"game {i} ply {p}: legal-move count {c} outside [1, 218]"
+            )
