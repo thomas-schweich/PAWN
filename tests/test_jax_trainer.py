@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import pytest
 
@@ -18,6 +19,7 @@ from pawn.jax.config import TINY_SUPERNET, TINY_VARIANTS, VOCAB_SIZE, ModelConfi
 from pawn.jax.corpus import generate_corpus
 from pawn.jax.model import init_model
 from pawn.jax.trainer import (
+    Batch,
     VariantSpec,
     _variant_key,
     compute_supernet_loss,
@@ -29,9 +31,6 @@ from pawn.jax.trainer import (
     make_scan_step,
     make_train_step,
 )
-
-
-from pawn.jax.trainer import Batch
 
 
 def _random_batch(key: jax.Array, b: int = 4, t: int = 16) -> Batch:
@@ -204,14 +203,24 @@ def test_train_step_changes_weights() -> None:
     new_state, _ = step(state, batch)
     assert int(new_state.step) == 1
     # Every array-leaf attribute on PAWNModel that contributes to the
-    # forward pass. ``pad_embed`` is exempt (always-masked).
-    leaf_names = (
-        "src_embed", "dst_embed", "promo_embed", "outcome_embed",
+    # forward pass. ``pad_embed`` is exempt because it's initialised
+    # to zero and never indexed by a real move token, so AdamW's
+    # decoupled weight decay doesn't move it. ``outcome_embed`` is
+    # similarly exempt: ``_random_batch`` draws tokens in
+    # ``[0, 1968)`` (move IDs only), so the outcome-embed gather is
+    # never exercised and the parameter receives zero gradient on
+    # this batch. (Weight decay still moves it slightly via AdamW,
+    # but the magnitude is well below the gradient-driven leaves'
+    # delta, and a leaf-by-leaf "any positive change" check is
+    # noisy for it — we prefer to skip rather than blur the test's
+    # intent of catching ``eqx.filter`` boundary bugs.)
+    must_change = (
+        "src_embed", "dst_embed", "promo_embed",
         "attn_norm", "wq", "wk", "wv", "wo",
         "ffn_norm", "w_gate", "w_up", "w_down",
         "final_norm", "lm_head",
     )
-    for name in leaf_names:
+    for name in must_change:
         before = getattr(model, name)
         after = getattr(new_state.model, name)
         delta = float(jnp.abs(after - before).max())
@@ -336,9 +345,12 @@ def test_train_step_skips_update_on_all_padded_batch() -> None:
     # Loss/grad reported as 0 (modulo the safe-divide), n_supervised==0.
     assert float(metrics["loss"]) == 0.0
     assert int(metrics["n_supervised"]) == 0
-    # Step counter still advances — padded steps still count toward
-    # the schedule the host might be tracking.
-    assert int(new_state.step) == 1
+    # Step counter does NOT advance on a fully-padded batch.
+    # ``state.step`` must stay locked to the Optax internal schedule
+    # count — Optax's count only advances on a real ``update`` call,
+    # so advancing the host counter on a skipped step would silently
+    # desync the host-reported step from the LR schedule.
+    assert int(new_state.step) == 0
 
 
 def test_train_state_is_jax_pytree() -> None:
@@ -546,6 +558,76 @@ def test_scan_step_integrates_with_lr_schedule() -> None:
         assert jnp.isfinite(vals).all(), f"{name} has non-finite entries"
 
 
+def test_train_step_gradient_clipping_caps_updates() -> None:
+    """``make_optimizer(max_grad_norm=1.0)`` clips global grad norm
+    before Adam. A pathological logit spike that would otherwise
+    drive AdamW to take a huge step should be tamed by the clipper.
+    Compare a clipped run vs the same run with clipping disabled —
+    the post-step weight delta under clipping must be strictly
+    smaller than without it.
+
+    Pin against a regression that drops the clip from the composed
+    optimizer — Codex P2 finding."""
+    key = jax.random.PRNGKey(0)
+    model = init_model(TINY_SUPERNET, key)
+    specs = tuple(VariantSpec(cfg=v) for v in TINY_VARIANTS.values())
+    batch = _random_batch(jax.random.PRNGKey(99), b=4, t=16)
+
+    # Same lr, same model, same batch. Clip cap of 0.01 forces a
+    # measurable shrink even on a normal gradient; ``None`` disables.
+    opt_clipped = make_optimizer(learning_rate=1e-2, max_grad_norm=0.01)
+    state_c = init_train_state(model, opt_clipped)
+    step_c = make_train_step(opt_clipped, specs)
+    new_c, _ = step_c(state_c, batch)
+
+    opt_raw = make_optimizer(learning_rate=1e-2, max_grad_norm=None)
+    state_r = init_train_state(model, opt_raw)
+    step_r = make_train_step(opt_raw, specs)
+    new_r, _ = step_r(state_r, batch)
+
+    delta_clip = float(jnp.abs(new_c.model.wq - model.wq).max())
+    delta_raw = float(jnp.abs(new_r.model.wq - model.wq).max())
+    assert delta_clip < delta_raw, (
+        f"clipped delta {delta_clip} not strictly less than raw {delta_raw}; "
+        "is the optax.clip_by_global_norm step being composed correctly?"
+    )
+
+
+def test_scan_step_does_not_recompile_per_call() -> None:
+    """The K-step scan must hit the JIT cache after warmup, just like
+    the single-step path. A regression that lifts ``k`` or some other
+    per-chunk value out of the static partition would cause a
+    full retrace per scan call — the dominant cost a real training
+    loop would pay. Mirrors ``test_train_step_does_not_recompile_per_call``
+    at the scan layer."""
+    key = jax.random.PRNGKey(0)
+    model = init_model(TINY_SUPERNET, key)
+    specs = tuple(VariantSpec(cfg=v) for v in TINY_VARIANTS.values())
+    opt = make_optimizer(learning_rate=3e-4)
+    state = init_train_state(model, opt)
+    step = make_train_step(opt, specs)
+    K = 5
+    scan = make_scan_step(step, K)
+    B, T = 2, 8
+    single_batch = _random_batch(jax.random.PRNGKey(30), b=B, t=T)
+    chunk: Batch = tuple(
+        jnp.stack([x] * K, axis=0) for x in single_batch
+    )  # type: ignore[assignment]
+    # Warmup compile.
+    state, _ = scan(state, chunk)
+    t0 = time.perf_counter()
+    state, _ = scan(state, chunk)
+    t1 = time.perf_counter()
+    state, _ = scan(state, chunk)
+    t2 = time.perf_counter()
+    second_call = t1 - t0
+    third_call = t2 - t1
+    assert third_call < 0.5, (
+        f"third scan call took {third_call:.3f}s — likely retracing per "
+        f"call (second={second_call:.3f}s)."
+    )
+
+
 def test_train_step_does_not_recompile_per_call() -> None:
     """The most important perf-correctness contract: repeated calls
     must hit the same JIT cache entry, not retrace. A regression that
@@ -566,7 +648,6 @@ def test_train_step_does_not_recompile_per_call() -> None:
     # access through the wrapper is fragile; instead use a clock-
     # based proxy: the second call must be at least 5x faster than
     # the first (compile-vs-cached gap is typically 100x+).
-    import time
     t0 = time.perf_counter()
     state, _ = step(state, batch)
     t1 = time.perf_counter()

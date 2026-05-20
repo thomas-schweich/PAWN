@@ -1,22 +1,24 @@
-"""JAX pretraining trainer — single-step primitives.
+"""JAX pretraining trainer — single-step + K-step ``lax.scan`` primitives.
 
-This module provides the *primitives* the pretraining loop needs:
+Public API:
 
 * ``cross_entropy_loss`` — masked next-token cross-entropy on logits.
 * ``compute_variant_loss`` — forward a single ``PAWNModel`` (the supernet
   or a sliced variant) on one batch and return the mean masked CE.
 * ``compute_supernet_loss`` — sum the per-variant losses on a shared
-  batch (the joint-supernet objective from
-  ``docs/jax-migration.md`` §5.3).
+  batch (the joint-supernet objective from ``docs/jax-migration.md``
+  §5.3).
+* ``make_lr_schedule`` — Optax warmup→cosine schedule with
+  documented decay-step semantics.
+* ``make_optimizer`` — AdamW with gradient clipping and an
+  optional LR schedule.
 * ``make_train_step`` — jitted ``(state, batch) -> (state, metrics)``
   that applies one optimizer step to the supernet against the joint
   objective.
-
-The K-step ``lax.scan`` outer loop, prefetcher, LR schedule, and metrics
-sink land in subsequent Phase-2 chunks. This chunk is verifiably-correct
-single-step machinery only — a chunked review can scrutinize loss math
-+ gradient flow without dragging in scheduler / metrics / driver
-complexity.
+* ``make_scan_step`` — fuses ``train_step`` into a K-step
+  ``jax.lax.scan`` (§4.4).
+* ``TrainState`` / ``VariantSpec`` / ``Batch`` / ``TrainStep`` —
+  type aliases and PyTree state.
 """
 
 from __future__ import annotations
@@ -49,9 +51,15 @@ class TrainState(NamedTuple):
     state PyTree — it MUST be a JAX array, not a Python int, because
     ``eqx.filter_jit`` would treat a Python int as a static cache key
     and recompile on every increment (a ~70× per-call slowdown). The
-    host can still read it via ``int(state.step)`` after a step.
-    The same convention works seamlessly when ``train_step`` is later
-    folded into a ``jax.lax.scan`` body (chunk 2.3).
+    host can still read it via ``int(state.step)`` after a step. The
+    convention also lets ``make_scan_step`` fold the same step into a
+    ``jax.lax.scan`` body cleanly.
+
+    Note on padded-batch step accounting: when the trainer skips an
+    update (the all-padding ``loss_mask=False`` case), neither
+    ``state.step`` nor the Optax internal count advance — so the
+    schedule stays in lockstep with the host-side step counter. See
+    ``make_train_step`` for details.
     """
 
     model: PAWNModel
@@ -226,22 +234,34 @@ def make_optimizer(
     weight_decay: float = 0.01,
     b1: float = 0.9,
     b2: float = 0.95,
+    max_grad_norm: float | None = 1.0,
 ) -> optax.GradientTransformation:
-    """AdamW with optional LR schedule.
+    """AdamW (with optional LR schedule + global-norm grad clipping).
 
     Hyperparameters mirror the legacy pretraining defaults
-    (``b2=0.95`` from the legacy trainer config). ``learning_rate``
-    accepts either a scalar (constant LR — convenient for tests) or
-    an ``optax.Schedule`` (callable ``step -> lr``). For Phase-2
+    (``b2=0.95``, ``max_grad_norm=1.0``). ``learning_rate`` accepts
+    either a scalar (constant LR — convenient for tests) or an
+    ``optax.Schedule`` (callable ``step -> lr``). For Phase-2
     pretraining pair this with ``make_lr_schedule`` for the
     canonical warmup→cosine path.
+
+    Gradient clipping is composed BEFORE AdamW so the clipped gradient
+    is the one feeding Adam's moments. A gradient spike on a real
+    batch would otherwise corrupt the Adam state in ways AdamW alone
+    cannot recover from — the legacy PyTorch trainer clipped at 1.0
+    and the JAX path preserves that contract. Pass
+    ``max_grad_norm=None`` to disable clipping (e.g. for debugging a
+    suspected clipping interaction).
     """
-    return optax.adamw(
+    base = optax.adamw(
         learning_rate=learning_rate,
         b1=b1,
         b2=b2,
         weight_decay=weight_decay,
     )
+    if max_grad_norm is None:
+        return base
+    return optax.chain(optax.clip_by_global_norm(max_grad_norm), base)
 
 
 def init_train_state(
@@ -299,18 +319,13 @@ def make_scan_step(
     def scan_step(
         state: TrainState, chunk: Batch
     ) -> tuple[TrainState, dict[str, jax.Array]]:
-        def body(inner_state: TrainState, batch: Batch) -> tuple[
-            TrainState, dict[str, jax.Array]
-        ]:
-            new_state, metrics = train_step(inner_state, batch)
-            return new_state, metrics
-
-        # ``lax.scan`` indexes each leaf of ``chunk`` along axis 0,
-        # producing a ``Batch`` (one [B, T] tuple) per iteration.
-        # Pass an explicit ``length=k`` so a shape-only mismatch
-        # between the chunk and the configured K surfaces clearly
-        # rather than silently running a different number of steps.
-        return jax.lax.scan(body, state, chunk, length=k)
+        # ``train_step`` already has the ``(carry, x) -> (carry, y)``
+        # signature ``lax.scan`` wants; pass it directly. ``lax.scan``
+        # indexes each leaf of ``chunk`` along axis 0, producing a
+        # ``Batch`` (one [B, T] tuple) per iteration. Explicit
+        # ``length=k`` surfaces a chunk-shape mismatch loudly rather
+        # than silently running a different number of steps.
+        return jax.lax.scan(train_step, state, chunk, length=k)
 
     return eqx.filter_jit(scan_step)
 
@@ -353,14 +368,19 @@ def make_train_step(
         # JAX pytree convention.
         grad_leaves = jax.tree_util.tree_leaves(grads)
 
-        # Global grad norm via flatten + single dot (one BLAS kernel
-        # vs 16 separate reductions + 15 adds). Cast each leaf to fp32
-        # once during flatten; the dot stays fp32.
+        # Global grad norm via per-leaf dot then sum: ‖x‖² = Σ ‖xᵢ‖².
+        # The earlier formulation allocated a full-parameter flat copy
+        # via ``jnp.concatenate`` (267 MB per step at SUPERNET scale)
+        # only to feed a single ``jnp.dot``. The mathematically-
+        # equivalent tree-reduce avoids that allocation and produces
+        # the same HLO-level fp32 ops.
         if grad_leaves:
-            flat = jnp.concatenate(
-                [g.astype(jnp.float32).ravel() for g in grad_leaves]
+            grad_norm = jnp.sqrt(
+                sum(
+                    jnp.vdot(g.astype(jnp.float32), g.astype(jnp.float32))
+                    for g in grad_leaves
+                )
             )
-            grad_norm = jnp.sqrt(jnp.dot(flat, flat))
         else:
             # Frozen-everywhere edge: no array leaves to backprop into.
             # Shouldn't fire for the supernet but keeps the metric
@@ -413,12 +433,19 @@ def make_train_step(
             "loss": joint_loss,
             "grad_norm": grad_norm,
             "n_supervised": n_supervised,
-            **{f"loss_{k}": v for k, v in per_variant.items()},
+            **{f"loss_{name}": v for name, v in per_variant.items()},
         }
+        # Step counter advances only when the optimizer update actually
+        # ran. This keeps ``state.step`` in lockstep with the Optax
+        # schedule count (which is held inside ``opt_state`` and only
+        # increments on a real ``optimizer.update`` call) — a padded
+        # batch that returns early via ``_skip_update`` would otherwise
+        # silently desync the host counter from the LR schedule.
+        new_step = state.step + jnp.where(has_supervision, jnp.int32(1), jnp.int32(0))
         new_state = TrainState(
             model=new_model,
             opt_state=new_opt_state,
-            step=state.step + jnp.int32(1),
+            step=new_step,
         )
         return new_state, metrics
 

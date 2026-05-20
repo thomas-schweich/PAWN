@@ -1,21 +1,29 @@
 """JAX pretraining driver for the supernet (Phase 2).
 
-Minimal entry point that ties the Phase-2 chunks together:
+Minimal entry point that ties the Phase-2 chunks together. Execution
+order (notable because filesystem side-effects sit between validation
+and the long-running steps):
 
-  1. Generate a Rust-engine corpus (always — no cache reuse here yet).
-  2. Slice the flat ``[N_games, T]`` corpus into ``[K, B, T]`` chunks
-     on-the-fly, one per ``make_scan_step`` invocation.
-  3. Compose the optimizer with ``make_lr_schedule``; init TrainState.
-  4. Train for ``--total-steps``; must be an exact multiple of ``--k``
-     (the script exits with an error otherwise).
-  5. Log per-chunk metrics to
-     ``logs/jax_run_<YYYYMMDD_HHMMSS_µs>_<pid>/metrics.jsonl``.
+  1. Parse args, resolve supernet config.
+  2. Build the LR schedule (catches ``warmup``/``total_steps`` /
+     ``end_value`` misconfigs *before* any filesystem write).
+  3. Generate the Rust-engine corpus (always — no cache reuse path).
+  4. Create the run directory and write
+     ``logs/jax_run_<YYYYMMDD_HHMMSS_µs>_<pid>/config.json`` (only after
+     corpus generation succeeds, so a corpus-time failure does not
+     leave an orphaned run dir).
+  5. Init the model + optimizer + ``TrainState``; build the K-step
+     ``scan`` callable.
+  6. Train for ``--total-steps`` (must be an exact multiple of
+     ``--k``; the script exits with an error otherwise), slicing the
+     flat ``[N_games, T]`` corpus into ``[K, B, T]`` chunks per scan
+     call and writing one ``metrics.jsonl`` row per chunk.
 
-This is the Phase-2 verification driver, not the production pretraining
-loop. Production runs need: HF-backed checkpoints, an LR schedule
-shaped to a real total_steps budget, wandb / dashboard integration,
-preemption-safe resume — those will land in Phase-3 polish or once
-Phase-2 is otherwise green.
+This is the Phase-2 verification driver, not the production
+pretraining loop. Production runs need: HF-backed checkpoints, an LR
+schedule shaped to a real total_steps budget, wandb / dashboard
+integration, preemption-safe resume, double-buffered chunk staging —
+those will land in Phase-3 polish or once Phase-2 is otherwise green.
 """
 
 from __future__ import annotations
@@ -120,13 +128,35 @@ def main(argv: list[str] | None = None) -> int:
         "--k",
         type=int,
         default=10,
-        help="K = number of inner steps per lax.scan invocation. "
-        "Larger K amortises host overhead, but consumes K * B games "
-        "from the corpus per scan call.",
+        help="K = number of inner steps per lax.scan invocation. Must "
+        "be > 0 and divide --total-steps. Larger K amortises host "
+        "overhead but consumes K * B games from the corpus per scan call.",
     )
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--warmup-steps", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--warmup-steps", type=int, default=100,
+        help="linear-warmup span in steps. Must be >= 0 and < --total-steps.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="default seed for both the corpus RNG and the model init "
+        "key. Override individually via --corpus-seed / --model-seed.",
+    )
+    parser.add_argument(
+        "--corpus-seed", type=int, default=None,
+        help="seed for the Rust corpus generator. Defaults to --seed.",
+    )
+    parser.add_argument(
+        "--model-seed", type=int, default=None,
+        help="seed for the JAX model init key. Defaults to --seed.",
+    )
+    parser.add_argument(
+        "--max-corpus-gb", type=float, default=64.0,
+        help="upper bound on host-RAM corpus footprint (GiB). The "
+        "script aborts before generation if the requested corpus "
+        "would exceed this — guards against an OOM kill on a "
+        "misconfigured production run.",
+    )
     parser.add_argument(
         "--logs-dir", type=str, default="logs",
         help="root directory for per-run output (metrics.jsonl, config.json).",
@@ -137,10 +167,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.k <= 0:
+        raise SystemExit(f"--k={args.k} must be a positive integer")
     if args.total_steps % args.k != 0:
         raise SystemExit(
             f"--total-steps={args.total_steps} must be a multiple of --k={args.k}"
         )
+
+    corpus_seed = args.seed if args.corpus_seed is None else args.corpus_seed
+    model_seed = args.seed if args.model_seed is None else args.model_seed
 
     supernet_cfg, variants = _resolve_supernet(args.supernet)
     specs = tuple(VariantSpec(cfg=v) for v in variants.values())
@@ -155,6 +190,44 @@ def main(argv: list[str] | None = None) -> int:
         warmup_steps=args.warmup_steps,
     )
 
+    n_games = args.total_steps * args.batch_size
+    # Per-token byte cost is 10 bytes (int32 tokens + bool attn_mask +
+    # int32 targets + bool loss_mask = 4+1+4+1). Per-game outcome
+    # offset is a single uint8. Estimate before generation so an OOM
+    # at production scale (~131 GB at supernet/100K-steps defaults)
+    # fails fast with a clear message rather than an OOM-kill.
+    bytes_per_game = args.seq_len * 10 + 1
+    estimated_gb = n_games * bytes_per_game / (1024 ** 3)
+    if estimated_gb > args.max_corpus_gb:
+        raise SystemExit(
+            f"corpus would need ~{estimated_gb:.1f} GiB > "
+            f"--max-corpus-gb={args.max_corpus_gb} (n_games={n_games}, "
+            f"seq_len={args.seq_len}). Reduce --total-steps / --batch-size, "
+            "or pass --max-corpus-gb to override after sizing the host."
+        )
+
+    print(
+        f"[setup] supernet={args.supernet} variants={list(variants.keys())} "
+        f"total_steps={args.total_steps} K={args.k} B={args.batch_size} "
+        f"T={args.seq_len} n_games={n_games} estimated_corpus_gib={estimated_gb:.2f}"
+    )
+
+    t0 = time.perf_counter()
+    print(
+        f"[corpus] generating {n_games} games "
+        f"(seed={corpus_seed}, max_ply={args.seq_len})"
+    )
+    corpus = generate_corpus(
+        n_games=n_games,
+        max_ply=args.seq_len,
+        seq_len=args.seq_len,
+        seed=corpus_seed,
+    )
+    print(f"[corpus] done in {time.perf_counter() - t0:.1f}s")
+
+    # Run directory created AFTER corpus succeeds so a corpus-time
+    # OOM / engine panic doesn't leave an orphaned ``jax_run_*``
+    # directory containing only a config.json with no metrics.
     run_dir = Path(args.logs_dir) / f"jax_run_{_slug()}"
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.jsonl"
@@ -168,6 +241,14 @@ def main(argv: list[str] | None = None) -> int:
                 # always a complete record without needing to hand-track the
                 # field list.
                 "supernet_cfg": dataclasses.asdict(supernet_cfg),
+                # Serialise the full per-variant ModelConfig dicts, not
+                # just the variant names: ``TINY_VARIANTS["small"]`` might
+                # be redefined later, and a stale ``config.json`` referencing
+                # only "small" would silently reflect the current definition.
+                "variants": {
+                    name: dataclasses.asdict(cfg)
+                    for name, cfg in variants.items()
+                },
                 "total_steps": args.total_steps,
                 "batch_size": args.batch_size,
                 "seq_len": args.seq_len,
@@ -175,31 +256,16 @@ def main(argv: list[str] | None = None) -> int:
                 "lr": args.lr,
                 "warmup_steps": args.warmup_steps,
                 "seed": args.seed,
-                "variants": list(variants.keys()),
+                "corpus_seed": corpus_seed,
+                "model_seed": model_seed,
+                "estimated_corpus_gib": estimated_gb,
             },
             indent=2,
         ),
         encoding="utf-8",
     )
 
-    n_games = args.total_steps * args.batch_size
-    print(
-        f"[setup] supernet={args.supernet} variants={list(variants.keys())} "
-        f"total_steps={args.total_steps} K={args.k} B={args.batch_size} "
-        f"T={args.seq_len} n_games={n_games}"
-    )
-
-    t0 = time.perf_counter()
-    print(f"[corpus] generating {n_games} games (seed={args.seed}, max_ply={args.seq_len})")
-    corpus = generate_corpus(
-        n_games=n_games,
-        max_ply=args.seq_len,
-        seq_len=args.seq_len,
-        seed=args.seed,
-    )
-    print(f"[corpus] done in {time.perf_counter() - t0:.1f}s")
-
-    key = jax.random.PRNGKey(args.seed)
+    key = jax.random.PRNGKey(model_seed)
     model = init_model(supernet_cfg, key)
     optimizer = make_optimizer(sched)
     state = init_train_state(model, optimizer)
