@@ -622,10 +622,8 @@ cmd_launch() {
         echo "Usage: $0 launch <name> <command...>"
         echo ""
         echo "Examples:"
-        echo "  $0 launch exp1 scripts/train.py --variant base"
-        echo "  $0 launch exp1 scripts/train.py --run-type adapter --strategy bottleneck \\"
-        echo "      --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \\"
-        echo "      --elo-min 1800 --elo-max 1900 --bottleneck-dim 32"
+        echo "  $0 launch exp1 scripts/train_jax.py --supernet tiny --total-steps 1000 --batch-size 16 --seq-len 64 --k 50"
+        echo "  $0 launch exp1 scripts/train_jax_adapter.py --supernet tiny --variant base --strategy lora --rank 4 --total-steps 500"
         exit 1
     fi
 
@@ -637,7 +635,7 @@ cmd_launch() {
     echo "Launching on '$name': $cmd"
     ssh $(ssh_opts) "root@$INSTANCE_HOST" "cd /workspace/pawn && \
         nohup uv run python $cmd \
-            --log-dir logs \
+            --logs-dir logs \
             > logs/${script_name}.log 2>&1 & \
         sleep 2 && \
         echo 'PID: '\$(pgrep -f '$script_name' | head -1) && \

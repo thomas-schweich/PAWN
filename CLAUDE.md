@@ -257,13 +257,9 @@ docker build --platform linux/amd64 --target runtime \
 ```bash
 bash deploy/pod.sh create myexp --gpu h100
 bash deploy/pod.sh ssh myexp
-# Run training directly over ssh (the `pod.sh launch` wrapper currently
-# appends `--log-dir` for legacy compatibility; JAX scripts use `--logs-dir`,
-# so launch via ssh until the wrapper is rewired):
-ssh root@<pod-host> "cd /workspace/pawn && nohup uv run python \
+bash deploy/pod.sh launch myexp \
     scripts/train_jax.py --supernet supernet --total-steps 100000 \
-    --batch-size 256 --seq-len 512 --k 50 --max-corpus-gb 128 \
-    > logs/train.log 2>&1 &"
+    --batch-size 256 --seq-len 512 --k 50 --max-corpus-gb 128
 bash deploy/pod.sh stop myexp   # preserves volume, stops billing
 bash deploy/pod.sh delete myexp # destroys everything
 ```
@@ -277,12 +273,9 @@ bash deploy/vast.sh search --gpu 4090 --max-price 0.5
 bash deploy/vast.sh create myexp --gpu 4090 --max-price 0.5
 bash deploy/vast.sh deploy myexp   # rsync local checkout to /workspace/pawn
 bash deploy/vast.sh ssh myexp
-# Same caveat as the RunPod wrapper — `vast.sh launch` appends `--log-dir`
-# (legacy); JAX scripts use `--logs-dir`, so ssh + manual run for now:
-ssh <vast-instance> "cd /workspace/pawn && nohup uv run python \
+bash deploy/vast.sh launch myexp \
     scripts/train_jax.py --supernet supernet --total-steps 100000 \
-    --batch-size 256 --seq-len 512 --k 50 --max-corpus-gb 128 \
-    > logs/train.log 2>&1 &"
+    --batch-size 256 --seq-len 512 --k 50 --max-corpus-gb 128
 bash deploy/vast.sh stop myexp
 ```
 
