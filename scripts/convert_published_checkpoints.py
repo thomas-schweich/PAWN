@@ -114,6 +114,12 @@ def _convert_one(
     must not skip pawn-base + pawn-large)."""
     repo_id = f"{HF_OWNER}/{variant}"
     dst = out_root / variant
+    # A prior run may have left a JAX checkpoint at ``dst``. If this run
+    # fails before reaching ``convert_legacy_checkpoint``, the stale one
+    # would silently still be there — and downstream tools reading
+    # ``$HF_HOME/pawn-jax-converted/<variant>/`` would load it. Snapshot
+    # the pre-existing state so the failure handler can flag it.
+    dst_preexisted = dst.exists()
     t0 = time.perf_counter()
     print(f"=== {variant} ===")
     try:
@@ -138,17 +144,43 @@ def _convert_one(
         torch_model, torch_cfg = _build_torch_reference(src)
         print(f"  load_model({dst})")
         jax_model = load_model(dst)
-        assert jax_model.cfg.d_model == torch_cfg.d_model
-        assert jax_model.cfg.n_layers == torch_cfg.n_layers
-        assert jax_model.cfg.n_heads == torch_cfg.n_heads
+        # Bare ``assert`` would be stripped under ``python -O``; use
+        # explicit raises so a config mismatch always surfaces with a
+        # readable message.
+        if jax_model.cfg.d_model != torch_cfg.d_model:
+            raise ValueError(
+                f"d_model mismatch after conversion: "
+                f"JAX={jax_model.cfg.d_model} PyTorch={torch_cfg.d_model}"
+            )
+        if jax_model.cfg.n_layers != torch_cfg.n_layers:
+            raise ValueError(
+                f"n_layers mismatch after conversion: "
+                f"JAX={jax_model.cfg.n_layers} PyTorch={torch_cfg.n_layers}"
+            )
+        if jax_model.cfg.n_heads != torch_cfg.n_heads:
+            raise ValueError(
+                f"n_heads mismatch after conversion: "
+                f"JAX={jax_model.cfg.n_heads} PyTorch={torch_cfg.n_heads}"
+            )
         max_diff, mean_diff = _forward_parity(
             torch_model, jax_model, b=batch_size, t=seq_len
         )
-    except Exception as exc:  # noqa: BLE001 — we *do* want bare-except
-        # resilience here: a network blip on one variant should not skip
-        # the other two. The traceback still goes to stderr.
+    except Exception as exc:  # noqa: BLE001
+        # Resilience: a network blip on one variant should not skip the
+        # other two. We catch ``Exception``, not ``BaseException``, so
+        # KeyboardInterrupt / SystemExit still propagate.
         elapsed = time.perf_counter() - t0
-        print(f"  FAILED: {type(exc).__name__}: {exc}")
+        error_str = f"{type(exc).__name__}: {exc}"
+        # If ``dst`` exists *and* was already there before this run, the
+        # bytes on disk are stale (a prior run's output, not this one's).
+        # Note it in the error so an operator doesn't silently load
+        # last-week's conversion thinking it's current.
+        if dst_preexisted and dst.exists():
+            error_str += " [stale dst on disk from prior run]"
+        # Route both diagnostic lines to stderr so a CI capture that
+        # split-tees stdout/stderr keeps the variant context and the
+        # traceback on the same stream.
+        print(f"  FAILED: {error_str}", file=sys.stderr)
         traceback.print_exc()
         print(f"  elapsed: {elapsed:.1f}s\n")
         return _VariantResult(
@@ -161,7 +193,7 @@ def _convert_one(
             mean_diff=float("nan"),
             passed=False,
             elapsed_s=elapsed,
-            error=f"{type(exc).__name__}: {exc}",
+            error=error_str,
         )
     elapsed = time.perf_counter() - t0
     passed = max_diff < tol
