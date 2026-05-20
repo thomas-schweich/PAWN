@@ -45,6 +45,17 @@ def _random_batch(key: jax.Array, b: int = 4, t: int = 16) -> Batch:
     return tokens, attn_mask, targets, loss_mask
 
 
+def _tile_chunk(single_batch: Batch, k: int) -> Batch:
+    """Stack a single ``[B, T]`` batch K times along a new leading axis
+    to produce a ``[K, B, T]`` chunk for ``make_scan_step``. Three
+    scan-layer tests need this idiom and the `tuple(generator)` pattern
+    widens to ``tuple[Any, ...]`` under pyright — collapsing to one
+    helper keeps the ``type: ignore`` localised."""
+    return tuple(  # type: ignore[return-value]
+        jnp.stack([x] * k, axis=0) for x in single_batch
+    )
+
+
 def test_cross_entropy_at_uniform_logits_is_log_vocab() -> None:
     """Sanity: uniform logits → CE = ln(V). Pins the loss math
     against the most basic analytical reference. A future refactor
@@ -443,6 +454,16 @@ def test_lr_schedule_rejects_end_value_geq_peak() -> None:
         )
 
 
+def test_lr_schedule_rejects_negative_end_value() -> None:
+    """``end_value < 0`` would have optax plateau at a negative
+    learning rate (reversing AdamW updates). Pin a clear ValueError
+    (Codex P2)."""
+    with pytest.raises(ValueError, match="end_value"):
+        make_lr_schedule(
+            peak_lr=1e-3, total_steps=100, warmup_steps=10, end_value=-1e-4
+        )
+
+
 def test_lr_schedule_warmup_zero_starts_at_peak() -> None:
     """A warmup of 0 is a valid degenerate case: step 0 already returns
     ``peak_lr``. Pins the boundary so a future tightening of the
@@ -521,9 +542,9 @@ def test_scan_step_loss_decreases_on_fixed_chunk() -> None:
     # Same batch repeated K times along the leading axis.
     B, T = 4, 16
     single_batch = _random_batch(jax.random.PRNGKey(21), b=B, t=T)
-    chunk: Batch = tuple(
-        jnp.stack([x] * K, axis=0) for x in single_batch
-    )  # type: ignore[assignment]
+    chunk = _tile_chunk(single_batch, K)
+
+
     _, metrics = scan(state, chunk)
     losses = metrics["loss"]
     assert float(losses[-1]) < float(losses[0]) * 0.95, (
@@ -546,9 +567,9 @@ def test_scan_step_integrates_with_lr_schedule() -> None:
     scan = make_scan_step(step, K)
     B, T = 2, 8
     single_batch = _random_batch(jax.random.PRNGKey(22), b=B, t=T)
-    chunk: Batch = tuple(
-        jnp.stack([x] * K, axis=0) for x in single_batch
-    )  # type: ignore[assignment]
+    chunk = _tile_chunk(single_batch, K)
+
+
     state, metrics = scan(state, chunk)
     # Past warmup: weights diverge from init (real LR > 0 was applied).
     delta = float(jnp.abs(state.model.lm_head - model.lm_head).max())
@@ -610,9 +631,9 @@ def test_scan_step_does_not_recompile_per_call() -> None:
     scan = make_scan_step(step, K)
     B, T = 2, 8
     single_batch = _random_batch(jax.random.PRNGKey(30), b=B, t=T)
-    chunk: Batch = tuple(
-        jnp.stack([x] * K, axis=0) for x in single_batch
-    )  # type: ignore[assignment]
+    chunk = _tile_chunk(single_batch, K)
+
+
     # Warmup compile.
     state, _ = scan(state, chunk)
     t0 = time.perf_counter()

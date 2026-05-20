@@ -214,6 +214,11 @@ def make_lr_schedule(
         )
     if end_value is None:
         end_value = peak_lr * 0.1
+    if end_value < 0:
+        # Optax happily decays through zero and plateaus at a negative
+        # learning rate — which would reverse AdamW's updates, the
+        # opposite of "decay". Reject upfront (Codex P2).
+        raise ValueError(f"end_value={end_value} must be >= 0")
     if end_value >= peak_lr:
         raise ValueError(
             f"end_value={end_value} must be < peak_lr={peak_lr} (otherwise "
@@ -310,7 +315,7 @@ def make_scan_step(
     based on the host-side step counter ``int(state.step)``.
 
     Inside the scan body the four chunk arrays are passed directly as
-    ``lax.scan``'s ``xs`` — Optax slices on the leading axis as a
+    ``lax.scan``'s ``xs`` — ``lax.scan`` slices on the leading axis as a
     static stride, avoiding a per-step dynamic gather that the
     earlier ``jnp.arange(k)`` + ``tokens_chunk[slice_idx]`` formulation
     incurred.
@@ -375,11 +380,14 @@ def make_train_step(
         # equivalent tree-reduce avoids that allocation and produces
         # the same HLO-level fp32 ops.
         if grad_leaves:
+            # ``jnp.sum(jnp.square(...))`` produces a single upcast +
+            # square + reduction per leaf; XLA fuses it cleanly. The
+            # earlier ``jnp.vdot(g.astype, g.astype)`` formulation
+            # emitted two separate ``convert-element-type`` nodes for
+            # the same input which CSE'd to the same thing but
+            # implied a non-existent ambiguity.
             grad_norm = jnp.sqrt(
-                sum(
-                    jnp.vdot(g.astype(jnp.float32), g.astype(jnp.float32))
-                    for g in grad_leaves
-                )
+                sum(jnp.sum(jnp.square(g.astype(jnp.float32))) for g in grad_leaves)
             )
         else:
             # Frozen-everywhere edge: no array leaves to backprop into.

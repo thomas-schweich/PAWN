@@ -4,20 +4,26 @@ Minimal entry point that ties the Phase-2 chunks together. Execution
 order (notable because filesystem side-effects sit between validation
 and the long-running steps):
 
-  1. Parse args, resolve supernet config.
+  1. Parse args, resolve supernet config. Validates ``--k > 0``,
+     ``--total-steps % --k == 0``, and ``--seq-len <=
+     supernet.max_seq_len`` upfront.
   2. Build the LR schedule (catches ``warmup``/``total_steps`` /
      ``end_value`` misconfigs *before* any filesystem write).
-  3. Generate the Rust-engine corpus (always — no cache reuse path).
-  4. Create the run directory and write
-     ``logs/jax_run_<YYYYMMDD_HHMMSS_µs>_<pid>/config.json`` (only after
-     corpus generation succeeds, so a corpus-time failure does not
-     leave an orphaned run dir).
-  5. Init the model + optimizer + ``TrainState``; build the K-step
+  3. Estimate the corpus footprint and abort if it exceeds
+     ``--max-corpus-gb`` (~131 GiB at SUPERNET / 100K-step defaults
+     would OOM-kill a modest host; the guard makes that fail loudly).
+  4. Generate the Rust-engine corpus (always — no cache reuse path)
+     using ``--corpus-seed`` (defaults to ``--seed``).
+  5. Create the run directory and write
+     ``logs/jax_run_<YYYYMMDD_HHMMSS_µs>_<pid>/config.json`` (only
+     after corpus generation succeeds, so a corpus-time failure does
+     not leave an orphaned run dir). ``config.json`` includes every
+     ``ModelConfig`` field for both the supernet and every variant.
+  6. Init the model with ``--model-seed`` (defaults to ``--seed``),
+     compose the optimizer + ``TrainState``, build the K-step
      ``scan`` callable.
-  6. Train for ``--total-steps`` (must be an exact multiple of
-     ``--k``; the script exits with an error otherwise), slicing the
-     flat ``[N_games, T]`` corpus into ``[K, B, T]`` chunks per scan
-     call and writing one ``metrics.jsonl`` row per chunk.
+  7. Slice the flat ``[N_games, T]`` corpus into ``[K, B, T]`` chunks
+     per scan call; write one ``metrics.jsonl`` row per chunk.
 
 This is the Phase-2 verification driver, not the production
 pretraining loop. Production runs need: HF-backed checkpoints, an LR
@@ -180,6 +186,16 @@ def main(argv: list[str] | None = None) -> int:
     supernet_cfg, variants = _resolve_supernet(args.supernet)
     specs = tuple(VariantSpec(cfg=v) for v in variants.values())
 
+    # Reject overlong sequence lengths upfront — otherwise the
+    # corpus is generated and run files written before the first
+    # JIT trace fails in PAWNModel.__call__ (Codex P2).
+    if args.seq_len > supernet_cfg.max_seq_len:
+        raise SystemExit(
+            f"--seq-len={args.seq_len} exceeds supernet max_seq_len="
+            f"{supernet_cfg.max_seq_len} ({args.supernet}); the model "
+            "cannot attend beyond its RoPE table."
+        )
+
     # Build the LR schedule first so any misconfiguration (warmup
     # >= total, end_value >= peak, non-positive arg) fails BEFORE
     # we create the run directory and write config.json. Otherwise
@@ -193,9 +209,13 @@ def main(argv: list[str] | None = None) -> int:
     n_games = args.total_steps * args.batch_size
     # Per-token byte cost is 10 bytes (int32 tokens + bool attn_mask +
     # int32 targets + bool loss_mask = 4+1+4+1). Per-game outcome
-    # offset is a single uint8. Estimate before generation so an OOM
-    # at production scale (~131 GB at supernet/100K-steps defaults)
-    # fails fast with a clear message rather than an OOM-kill.
+    # offset is a single uint8. The estimate is the FINAL Corpus
+    # footprint; transient peak during ``_pack_clm`` is roughly
+    # 1.5-2× this (int16 engine output + int32 cast + final pack
+    # arrays coexist briefly). Size --max-corpus-gb with that
+    # safety margin in mind (default 64 GiB ≈ 32-43 GiB estimate is
+    # comfortable). At SUPERNET-class defaults (total_steps=100k,
+    # batch_size=256, seq_len=512) the estimate is ~122 GiB.
     bytes_per_game = args.seq_len * 10 + 1
     estimated_gb = n_games * bytes_per_game / (1024 ** 3)
     if estimated_gb > args.max_corpus_gb:
@@ -288,6 +308,11 @@ def main(argv: list[str] | None = None) -> int:
                 args.k,
                 args.batch_size,
             )
+            # Capture step_start BEFORE scan so it always reflects the
+            # actual host-step at chunk entry — robust even when the
+            # trainer's has_supervision guard skips steps in a chunk
+            # (state.step then advances by < args.k).
+            step_start = int(state.step)
             t_chunk = time.perf_counter()
             state, metrics = scan(state, chunk)
             # Block on the full pytree, not just one key — if the
@@ -297,9 +322,10 @@ def main(argv: list[str] | None = None) -> int:
             dt = time.perf_counter() - t_chunk
 
             # Pull metrics off-device — they're [K]-shaped per key.
-            host_metrics = {k: np.asarray(v) for k, v in metrics.items()}
+            # Use ``mk`` as the dict-comp variable so ``args.k`` is not
+            # shadowed inside the loop body.
+            host_metrics = {mk: np.asarray(v) for mk, v in metrics.items()}
             step_end = int(state.step)
-            step_start = step_end - args.k
             # Aggregate per-chunk: mean loss, last grad_norm, etc.
             row = {
                 "chunk": chunk_i,
