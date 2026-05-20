@@ -37,18 +37,24 @@ Three implementation differences are worth flagging:
   3. **Sampling is Gumbel-max** (matches the legacy; equivalent to
      softmax-then-sample for `temperature=1`).
 
-Known limitation (preserved from legacy): when ``prefix_lengths``
-varies *within* a batch (the common case for percentage-based prefix
-buckets in §6.4 / §6.5), the decode loop starts at the batch-wide
-maximum ``prefix_end``. Rows with shorter prefixes therefore see PAD
-gaps in their attended context at positions ``[their_prefix_end + 1,
-max_prefix_end]`` before the model starts sampling for them. The
-engine state machine is still correct (each row's piece positions
-advance per ``load_prefixes``), but the model is conditioned on a
-PAD-padded context rather than the true mid-game context. Codex
-flagged this; a faithful port preserves the legacy behaviour so
-§6.4-6.5 metrics remain comparable. A correctness fix (group rows
-by equal prefix_length, decode per group) is a follow-up.
+Prefix-length grouping: ``autoregressive_generate`` groups input rows
+by ``prefix_lengths`` value before dispatching to ``_generate_batch``,
+so every internal batch sees a uniform prefix length. This fixes a
+correctness gap inherited from the legacy port — when prefix lengths
+varied *within* a batch (the common case for percentage-based prefix
+buckets in §6.4 / §6.5), the legacy decode loop started at the batch-
+wide maximum ``prefix_end``, leaving PAD gaps in the attended context
+of rows with shorter prefixes. The engine state machine was still
+correct, but the model was conditioned on a PAD-padded context rather
+than the true mid-game context. Grouping eliminates that — every row
+in an internal batch shares the same ``prefix_end``, so no row sees a
+PAD gap.
+
+The grouping permutes input rows by prefix length and unpermutes
+results back to the caller's original order; ``GenerationResult``
+remains row-aligned with the inputs. The no-prefix path is
+short-circuited and stays identical to the legacy ungrouped loop, so
+non-prefix tests are bit-stable across this change.
 """
 
 from __future__ import annotations
@@ -214,23 +220,75 @@ def autoregressive_generate(
         raise ValueError(f"temperature must be > 0, got {temperature}")
 
     key = jax.random.key(seed)
-    batches: list[GenerationResult] = []
-    for s in range(0, n_games, batch_size):
-        e = min(s + batch_size, n_games)
-        sub_prefix = prefix_moves[s:e] if prefix_moves is not None else None
-        sub_lens = prefix_lengths[s:e] if prefix_lengths is not None else None
-        key, sub = jax.random.split(key)
-        result = _generate_batch(
-            model, outcome_token, e - s, mask_illegal,
-            sub_prefix, sub_lens, max_seq_len, temperature, sub,
-        )
-        batches.append(result)
 
+    # No-prefix fast path: no grouping needed and the loop is bit-stable
+    # against pre-grouping behaviour so existing prefixless tests keep
+    # their existing sample values.
+    if prefix_moves is None or prefix_lengths is None:
+        batches: list[GenerationResult] = []
+        for s in range(0, n_games, batch_size):
+            e = min(s + batch_size, n_games)
+            key, sub = jax.random.split(key)
+            result = _generate_batch(
+                model, outcome_token, e - s, mask_illegal,
+                None, None, max_seq_len, temperature, sub,
+            )
+            batches.append(result)
+        return GenerationResult(
+            sequences=np.concatenate([b.sequences for b in batches], axis=0),
+            term_codes=np.concatenate([b.term_codes for b in batches], axis=0),
+            game_lengths=np.concatenate([b.game_lengths for b in batches], axis=0),
+            forfeit_ply=np.concatenate([b.forfeit_ply for b in batches], axis=0),
+        )
+
+    # Variable-prefix path: group rows by prefix length so each
+    # ``_generate_batch`` call sees a uniform ``prefix_end``. See the
+    # module docstring for why this matters.
+    pls_np = np.asarray(prefix_lengths, dtype=np.int32)
+    if pls_np.shape[0] != n_games:
+        raise ValueError(
+            f"prefix_lengths has {pls_np.shape[0]} rows but n_games={n_games}"
+        )
+    unique_lens, inverse_idx = np.unique(pls_np, return_inverse=True)
+    group_results: list[GenerationResult] = []
+    processing_order: list[np.ndarray] = []
+    for g in range(len(unique_lens)):
+        group_orig_idx = np.where(inverse_idx == g)[0]
+        group_moves = prefix_moves[group_orig_idx]
+        group_lens = pls_np[group_orig_idx]
+        for s in range(0, len(group_orig_idx), batch_size):
+            e = min(s + batch_size, len(group_orig_idx))
+            key, sub = jax.random.split(key)
+            result = _generate_batch(
+                model, outcome_token, e - s, mask_illegal,
+                group_moves[s:e], group_lens[s:e],
+                max_seq_len, temperature, sub,
+            )
+            group_results.append(result)
+            processing_order.append(group_orig_idx[s:e])
+
+    all_orig_indices = np.concatenate(processing_order)
+    sequences_cat = np.concatenate(
+        [r.sequences for r in group_results], axis=0,
+    )
+    term_codes_cat = np.concatenate(
+        [r.term_codes for r in group_results], axis=0,
+    )
+    game_lengths_cat = np.concatenate(
+        [r.game_lengths for r in group_results], axis=0,
+    )
+    forfeit_ply_cat = np.concatenate(
+        [r.forfeit_ply for r in group_results], axis=0,
+    )
+    # Unpermute: ``np.argsort(all_orig_indices)`` builds the inverse
+    # permutation that puts processed row ``k`` back at original
+    # position ``all_orig_indices[k]``.
+    inverse = np.argsort(all_orig_indices, kind="stable")
     return GenerationResult(
-        sequences=np.concatenate([b.sequences for b in batches], axis=0),
-        term_codes=np.concatenate([b.term_codes for b in batches], axis=0),
-        game_lengths=np.concatenate([b.game_lengths for b in batches], axis=0),
-        forfeit_ply=np.concatenate([b.forfeit_ply for b in batches], axis=0),
+        sequences=sequences_cat[inverse],
+        term_codes=term_codes_cat[inverse],
+        game_lengths=game_lengths_cat[inverse],
+        forfeit_ply=forfeit_ply_cat[inverse],
     )
 
 

@@ -182,6 +182,90 @@ def test_autoregressive_generate_with_prefix() -> None:
         )
 
 
+def test_autoregressive_generate_variable_prefix_length_grouping() -> None:
+    """Variable-prefix-length grouping: rows with distinct ``prefix_lengths``
+    are processed in same-length groups internally, then unpermuted so
+    the returned ``GenerationResult`` row ``i`` corresponds to input row ``i``.
+
+    Contract: for every game ``i``, ``sequences[i, 1 : pl[i] + 1]`` mirrors
+    ``prefix_moves[i, :pl[i]]``. This fails for the legacy ungrouped
+    code path when prefix lengths are mixed because the decode loop
+    starts at the batch-wide max prefix_end, so rows with shorter
+    prefixes see PAD in their attended context at positions
+    ``[pl[i] + 1, max_pl]`` and the engine state is desynchronised from
+    the model's apparent view. The mirror-back invariant in particular
+    is what would break if the unpermute step were wrong.
+    """
+    model = _tiny_model()
+    # Five games, deliberately mixed prefix lengths spanning multiple
+    # group sizes and an internal batch boundary.
+    _ids, _t, _lm, move_ids, gls, _tc = engine.generate_clm_batch(
+        5, 16, 7, False, 0.0, False,
+    )
+    # Lengths chosen to hit three distinct groups (2, 5, 8) and to
+    # straddle a batch boundary inside the longest group.
+    mixed_lens = np.array([2, 5, 8, 2, 5], dtype=np.int32)
+    # Clamp against per-game ply availability.
+    pls = np.minimum(mixed_lens, gls.astype(np.int32))
+    gen = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=5,
+        mask_illegal=True, max_seq_len=24, batch_size=2, seed=11,
+        prefix_moves=move_ids, prefix_lengths=pls,
+    )
+    assert gen.sequences.shape == (5, 24)
+    for i in range(5):
+        pl = int(pls[i])
+        # Position 0: outcome token. Positions 1..pl: original prefix
+        # moves in the caller's order (this would diverge if the
+        # unpermute step lost track of which group output row maps
+        # to which input row).
+        assert gen.sequences[i, 0] == OUTCOME_TOKENS["PLY_LIMIT"], (
+            f"row {i}: outcome token at position 0 not preserved"
+        )
+        np.testing.assert_array_equal(
+            gen.sequences[i, 1:pl + 1],
+            move_ids[i, :pl].astype(np.int32),
+            err_msg=f"row {i}: prefix not mirrored at positions 1..{pl}",
+        )
+
+
+def test_autoregressive_generate_mixed_prefix_post_prefix_continues() -> None:
+    """Variable-prefix-length grouping: every row's positions
+    ``[pl + 1, max_seq_len)`` should contain at least one real (non-PAD,
+    non-outcome) move token. Pre-fix, rows with shorter prefixes would
+    sample under PAD-padded context for ``[pl + 1, max_pl]`` positions
+    before the engine's RL state caught up, often producing immediate
+    PREMATURE_PAD termination at ``pl + 1`` even on rows where the
+    engine's actual position has plenty of legal moves remaining.
+
+    The post-grouping invariant: any row with ``pl < max_seq_len - 2``
+    samples *something* — either a real move (engine state →
+    eventually legal_or_terminate) or a clean termination — rather
+    than collapsing into immediate PREMATURE_PAD purely due to the
+    PAD-padded context.
+    """
+    model = _tiny_model()
+    _ids, _t, _lm, move_ids, gls, _tc = engine.generate_clm_batch(
+        6, 16, 137, False, 0.0, False,
+    )
+    # Mixed prefix lengths spanning two batches at batch_size=3.
+    mixed_lens = np.array([1, 4, 7, 1, 4, 7], dtype=np.int32)
+    pls = np.minimum(mixed_lens, gls.astype(np.int32))
+    gen = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=6,
+        mask_illegal=True, max_seq_len=24, batch_size=3, seed=13,
+        prefix_moves=move_ids, prefix_lengths=pls,
+    )
+    # Every row's game_length must be at least its prefix length —
+    # the engine's RL state already advanced through ``load_prefixes``.
+    for i in range(6):
+        pl = int(pls[i])
+        assert gen.game_lengths[i] >= pl, (
+            f"row {i}: game_length={gen.game_lengths[i]} < pl={pl} — "
+            f"the row terminated before its prefix was fully consumed"
+        )
+
+
 def test_autoregressive_generate_validates_n_games() -> None:
     model = _tiny_model()
     with pytest.raises(ValueError, match="n_games"):
