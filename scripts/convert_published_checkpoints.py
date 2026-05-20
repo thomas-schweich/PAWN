@@ -120,11 +120,7 @@ def _convert_one(
     # ``$HF_HOME/pawn-jax-converted/<variant>/`` would load it. Snapshot
     # the pre-existing state so the failure handler can flag it.
     dst_preexisted = dst.exists()
-    # Set to True once ``convert_legacy_checkpoint`` returns — at that
-    # point ``dst`` holds *this run's* freshly-converted bytes, not the
-    # stale ones, so a later parity/load failure shouldn't be labelled
-    # "stale dst".
-    converted_this_run = False
+    converted_this_run = False  # cleared once convert_legacy_checkpoint returns
     t0 = time.perf_counter()
     print(f"=== {variant} ===")
     try:

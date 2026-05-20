@@ -79,9 +79,15 @@ def test_convert_one_returns_failure_result_on_snapshot_error(
     assert result["d_model"] == 0
     assert result["max_diff"] != result["max_diff"]  # NaN
     # Stderr-routing invariant: all three failure diagnostics on stderr.
+    # The FAILED line and the elapsed line are explicit ``file=sys.stderr``;
+    # the traceback goes through ``traceback.print_exc()`` which defaults
+    # to stderr. Pin all three independently — a future regression that
+    # routes any one of them to stdout would break a CI split-tee.
     captured = capfd.readouterr()
     assert "FAILED: ConnectionError: simulated network timeout" in captured.err
     assert "elapsed:" in captured.err
+    assert "Traceback" in captured.err
+    assert "ConnectionError" in captured.err  # appears in the traceback body
 
 
 def test_convert_one_flags_stale_dst_in_error(tmp_path: Path) -> None:
@@ -186,7 +192,9 @@ def test_main_exits_zero_when_all_pass(
 
 
 def test_main_exits_one_on_parity_breach(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Parity-breach path: conversion succeeded (no exception, error=None)
     but ``max_diff >= tol``. The summary should still format the row
@@ -212,6 +220,15 @@ def test_main_exits_one_on_parity_breach(
 
     with patch.object(script, "_convert_one", side_effect=parity_fail):
         assert script.main(["--variants", "pawn-base"]) == 1
+    # Summary must use the parity-FAIL branch (not the ERROR branch);
+    # max_diff must format. A regression that misroutes a parity-failed
+    # row into the ``error is not None`` branch would print
+    # ``ERROR: None`` and skip the numeric formatting.
+    captured = capsys.readouterr()
+    assert "[FAIL]" in captured.out
+    assert "max |Δ|" in captured.out
+    assert "5.000e-02" in captured.out
+    assert "ERROR:" not in captured.out
 
 
 def test_convert_one_succeeds_does_not_label_stale(
