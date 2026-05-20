@@ -192,7 +192,7 @@ JAX checkpoints are directories:
 step_00065000/
 ├── model.safetensors   # one fp32 tensor per PAWNModel array field, declaration order
 ├── config.json         # {format_version, model_config}
-└── .complete           # integrity sentinel — JSON {files: {name: sha256-hex}}
+└── .complete           # integrity sentinel — JSON {format_version: 1, files: {name: sha256-hex}}
 ```
 
 Central module: `pawn/checkpoint.py`. All save/load goes through this module. Sentinel helpers (`sha256_file`, `write_sentinel`, `verify_sentinel`, `IncompleteCheckpointError`, `CheckpointIntegrityError`) live in `pawn/_sentinel.py` — stdlib-only so the thin PyTorch loader can import them without pulling JAX. In practice only `verify_sentinel` is shared between `pawn.checkpoint` and `pawn.torch_loader`; `pawn.checkpoint` keeps a private `_write_sentinel` that bakes a `format_version` field into the JSON alongside the file-hash map, so it does not call `pawn._sentinel.write_sentinel` directly. The exceptions + `sha256_file` come from `pawn._sentinel` so the schema (`{"files": {...}}`) and integrity rules stay in one place.
