@@ -76,6 +76,7 @@ ARGPARSE_SCRIPTS = [
     "datagen_reconcile_tier.py",
     "datagen_with_hf_sync.py",
     "eval_jax.py",
+    "eval_probes_jax.py",
     "rename_shards.py",
     "train_jax.py",
     "train_jax_adapter.py",
