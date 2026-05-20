@@ -73,6 +73,7 @@ ARGPARSE_SCRIPTS = [
     "benchmark.py",
     "benchmark_stockfish_nodes.py",
     "compute_theoretical_ceiling.py",
+    "convert_published_checkpoints.py",
     "datagen_reconcile_tier.py",
     "datagen_with_hf_sync.py",
     "eval_accuracy.py",

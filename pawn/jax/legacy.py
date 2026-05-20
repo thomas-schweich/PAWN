@@ -201,12 +201,26 @@ def convert_legacy_checkpoint(src: str | Path, dst: str | Path) -> None:
     # Sentinel handling: if a ``.complete`` is present (local checkpoints
     # written by ``pawn.jax.checkpoint.save_model`` / the legacy PyTorch
     # ``save_pretrain_checkpoint``), verify it; otherwise accept the
-    # directory and only read the two files we need. The atomic-write
-    # protocol guarantees a local ``<name>`` is either present-with-sentinel
-    # or absent — there is no "full checkpoint with payload files but no
-    # sentinel" corruption mode on disk. Published HF snapshots routinely
-    # carry the full training-checkpoint layout at the root (the sentinel
-    # is local-only and never pushed); those convert fine.
+    # directory and only read the two files we actually consume. The
+    # atomic-write protocol guarantees a freshly-written local checkpoint
+    # is either present-with-sentinel or absent — there is no "full
+    # checkpoint with payload files but no sentinel" corruption mode at
+    # the moment of save.
+    #
+    # Sentinel-absent directories come up in two real scenarios:
+    #
+    # * an ``hf_hub.snapshot_download(repo_id)`` of a published checkpoint
+    #   (``thomas-schweich/pawn-{small,base,large}``). The published repos
+    #   were uploaded without ``.complete`` (the export step that produced
+    #   them did not push the sentinel along with the payload).
+    # * an ``allow_patterns=["model.safetensors", "config.json"]``
+    #   snapshot — by construction the sentinel was filtered out.
+    #
+    # In both cases the converter ignores every file other than
+    # ``model.safetensors`` and ``config.json``, so files that *would*
+    # have been integrity-checked under the sentinel
+    # (``optimizer.safetensors``, ``training_state.json``, …) are not
+    # consulted and any corruption there is irrelevant to the conversion.
     sentinel = src_path / ".complete"
     if sentinel.exists():
         verify_checkpoint(src_path)
