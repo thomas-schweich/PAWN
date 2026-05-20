@@ -20,8 +20,11 @@ Usage:
         --supernet tiny --variant small \\
         --test outcome_signal --n-per-outcome 8 --batch-size 4
 
-The diagnostics are *streaming* with no KV cache — runtime scales with
-``n_games * max_seq_len``. For larger sweeps, prefer batched cloud runs.
+The diagnostics use ``pawn.generation.autoregressive_generate`` with
+KV-cache enabled by default — runtime scales linearly in
+``max_seq_len`` (the cache is shape-stable at ``cfg.max_seq_len``,
+so the JIT trace cost is paid once per batch shape). Pass
+``--no-kv-cache`` to fall back to the legacy full-recompute path.
 """
 
 from __future__ import annotations
@@ -147,6 +150,13 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--logs-dir", type=Path, default=None)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--no-kv-cache", dest="use_kv_cache", action="store_false",
+        help="disable the KV-cache decoder and use the legacy full-recompute "
+             "path (one full forward per step). Both paths are bitwise-"
+             "equivalent; this flag is for parity-comparison runs.",
+    )
+    parser.set_defaults(use_kv_cache=True)
     args = parser.parse_args()
 
     if args.checkpoint is not None and not args.checkpoint.is_dir():
@@ -187,32 +197,35 @@ def main() -> None:
         results["outcome_signal"] = outcome_signal_test(
             model, n_per_outcome=args.n_per_outcome,
             batch_size=args.batch_size, seed=args.seed,
-            verbose=not args.quiet,
+            verbose=not args.quiet, use_kv_cache=args.use_kv_cache,
         )
     if "prefix_continuation" in tests_to_run:
         assert corpus is not None
         results["prefix_continuation"] = prefix_continuation_test(
             model, corpus, n_per_bucket=args.n_per_bucket,
             batch_size=args.batch_size, seed=args.seed,
-            verbose=not args.quiet,
+            verbose=not args.quiet, use_kv_cache=args.use_kv_cache,
         )
     if "poisoned_prefix" in tests_to_run:
         assert corpus is not None
         results["poisoned_prefix"] = poisoned_prefix_test(
             model, corpus, n_per_pair=args.n_per_pair,
             batch_size=args.batch_size, seed=args.seed,
+            use_kv_cache=args.use_kv_cache,
         )
     if "impossible_task" in tests_to_run:
         assert corpus is not None
         results["impossible_task"] = impossible_task_test(
             model, corpus, n_per_scenario=args.n_per_scenario,
             batch_size=args.batch_size, seed=args.seed,
+            use_kv_cache=args.use_kv_cache,
         )
     if "improbable_task" in tests_to_run:
         assert corpus is not None
         results["improbable_task"] = improbable_task_test(
             model, corpus, n_per_scenario=args.n_per_scenario,
             batch_size=args.batch_size, seed=args.seed,
+            use_kv_cache=args.use_kv_cache,
         )
 
     out_dir = _make_run_dir(Path("logs"), args.checkpoint, args.logs_dir)
@@ -237,6 +250,7 @@ def main() -> None:
             "corpus_size": args.corpus_size if corpus_needed else None,
             "batch_size": args.batch_size,
             "seed": args.seed,
+            "use_kv_cache": args.use_kv_cache,
         },
         "results": results,
     }

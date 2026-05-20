@@ -9,6 +9,8 @@ job — but they pin the structural correctness of the port.
 
 from __future__ import annotations
 
+from typing import Any
+
 import chess_engine as engine
 import numpy as np
 import pytest
@@ -179,6 +181,309 @@ def test_autoregressive_generate_with_prefix() -> None:
             gen.sequences[i, 1:pl + 1],
             move_ids[i, :pl].astype(np.int32),
             err_msg=f"game {i} prefix not mirrored at positions 1..{pl}",
+        )
+
+
+def test_autoregressive_generate_variable_prefix_length_grouping() -> None:
+    """Variable-prefix-length grouping: rows with distinct ``prefix_lengths``
+    are processed in same-length groups internally, then unpermuted so
+    the returned ``GenerationResult`` row ``i`` corresponds to input row ``i``.
+
+    Contract: for every game ``i``, ``sequences[i, 1 : pl[i] + 1]`` mirrors
+    ``prefix_moves[i, :pl[i]]``. This fails for the legacy ungrouped
+    code path when prefix lengths are mixed because the decode loop
+    starts at the batch-wide max prefix_end, so rows with shorter
+    prefixes see PAD in their attended context at positions
+    ``[pl[i] + 1, max_pl]`` and the engine state is desynchronised from
+    the model's apparent view. The mirror-back invariant in particular
+    is what would break if the unpermute step were wrong.
+    """
+    model = _tiny_model()
+    # Five games, deliberately mixed prefix lengths spanning multiple
+    # group sizes and an internal batch boundary.
+    _ids, _t, _lm, move_ids, gls, _tc = engine.generate_clm_batch(
+        5, 16, 7, False, 0.0, False,
+    )
+    # Lengths chosen to hit three distinct groups (2, 5, 8) and to
+    # straddle a batch boundary inside the longest group.
+    mixed_lens = np.array([2, 5, 8, 2, 5], dtype=np.int32)
+    # Clamp against per-game ply availability.
+    pls = np.minimum(mixed_lens, gls.astype(np.int32))
+    gen = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=5,
+        mask_illegal=True, max_seq_len=24, batch_size=2, seed=11,
+        prefix_moves=move_ids, prefix_lengths=pls,
+    )
+    assert gen.sequences.shape == (5, 24)
+    for i in range(5):
+        pl = int(pls[i])
+        # Position 0: outcome token. Positions 1..pl: original prefix
+        # moves in the caller's order (this would diverge if the
+        # unpermute step lost track of which group output row maps
+        # to which input row).
+        assert gen.sequences[i, 0] == OUTCOME_TOKENS["PLY_LIMIT"], (
+            f"row {i}: outcome token at position 0 not preserved"
+        )
+        np.testing.assert_array_equal(
+            gen.sequences[i, 1:pl + 1],
+            move_ids[i, :pl].astype(np.int32),
+            err_msg=f"row {i}: prefix not mirrored at positions 1..{pl}",
+        )
+
+
+def test_autoregressive_generate_kv_cache_matches_full_recompute() -> None:
+    """KV-cache path produces the same generated sequences as the
+    full-recompute path under CPU JAX.
+
+    CPU-stability note: this test asserts strict bitwise equality on
+    the sampled sequences. ``forward_with_cache`` is bit-identical to
+    ``__call__`` (pinned by ``test_forward_with_cache_matches_call``);
+    ``forward_incremental`` matches the corresponding ``__call__``
+    slice within ~``1e-5`` (pinned by
+    ``test_forward_incremental_matches_full_forward``). On CPU JIT the
+    reduction order is deterministic across the two paths so the
+    looser bound is in practice exact, and ``argmax`` on the resulting
+    logits lands on the same token. On accelerator backends
+    (ROCm / CUDA) the per-step logits can differ at the
+    floating-point-precision boundary; if the two top candidates are
+    within ~``1e-5``, argmax can pick different tokens between paths,
+    so this strict equality is a CPU-only invariant. The per-step
+    logit equivalence (the GPU-stable invariant) is pinned by
+    ``test_forward_incremental_matches_full_forward``.
+
+    The test exercises both no-prefix and with-prefix scenarios so
+    the prefill code path and the incremental loop are both
+    exercised."""
+    model = _tiny_model()
+
+    # 1. No prefix.
+    gen_full = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=4,
+        mask_illegal=True, max_seq_len=20, batch_size=4, seed=17,
+        use_kv_cache=False,
+    )
+    gen_kv = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=4,
+        mask_illegal=True, max_seq_len=20, batch_size=4, seed=17,
+        use_kv_cache=True,
+    )
+    np.testing.assert_array_equal(
+        gen_kv.sequences, gen_full.sequences,
+        err_msg="no-prefix: KV-cache and full-recompute sequences diverged",
+    )
+    np.testing.assert_array_equal(
+        gen_kv.term_codes, gen_full.term_codes,
+        err_msg="no-prefix: KV-cache and full-recompute term_codes diverged",
+    )
+    np.testing.assert_array_equal(
+        gen_kv.game_lengths, gen_full.game_lengths,
+        err_msg="no-prefix: KV-cache and full-recompute game_lengths diverged",
+    )
+
+    # 2. With a uniform prefix.
+    _ids, _t, _lm, move_ids, gls, _tc = engine.generate_clm_batch(
+        4, 16, 51, False, 0.0, False,
+    )
+    pls = np.minimum(np.full(4, 3, dtype=np.int32), gls.astype(np.int32))
+    gen_full_p = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=4,
+        mask_illegal=True, max_seq_len=20, batch_size=4, seed=29,
+        prefix_moves=move_ids, prefix_lengths=pls, use_kv_cache=False,
+    )
+    gen_kv_p = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=4,
+        mask_illegal=True, max_seq_len=20, batch_size=4, seed=29,
+        prefix_moves=move_ids, prefix_lengths=pls, use_kv_cache=True,
+    )
+    np.testing.assert_array_equal(
+        gen_kv_p.sequences, gen_full_p.sequences,
+        err_msg="with-prefix: KV-cache and full-recompute sequences diverged",
+    )
+
+
+def test_forward_with_cache_partial_seq_pads_cache_to_max_seq_len() -> None:
+    """``forward_with_cache`` with ``T < cfg.max_seq_len`` zero-pads
+    the cache along the T axis up to ``cfg.max_seq_len`` so the cache
+    can be fed straight into ``forward_incremental`` (which expects
+    a ``T_max``-shaped buffer for shape-stable JIT). The
+    pad-branch in ``forward_with_cache`` was previously untested —
+    `_cached_prefill` always passes the full ``max_seq_len`` width —
+    but the API contract supports arbitrary ``T <= max_seq_len``, so
+    this test pins the padding behaviour.
+    """
+    import jax.numpy as jnp
+
+    from pawn.config import TINY_SUPERNET
+
+    model = _tiny_model()
+    T_max = TINY_SUPERNET.max_seq_len
+    rng = np.random.default_rng(42)
+    short_T = 6
+    tokens = jnp.asarray(rng.integers(0, 64, (2, short_T)), dtype=jnp.int32)
+    attn = jnp.ones((2, short_T), dtype=jnp.bool_)
+    logits, cache = model.forward_with_cache(tokens, attn)
+    # Logits keep the input width.
+    assert logits.shape == (2, short_T, TINY_SUPERNET.vocab_size)
+    # Cache is padded out to T_max along the T axis (axis 3 in the
+    # (n_layers, B, H, T_max, head_dim) layout).
+    assert cache.k.shape == (
+        TINY_SUPERNET.n_layers, 2, TINY_SUPERNET.n_heads,
+        T_max, TINY_SUPERNET.head_dim,
+    )
+    # The pad region is exactly zero — `_attention_incremental`'s
+    # positional mask excludes it anyway, but pinning the zero fill
+    # rules out leakage of garbage K, V into a future cache miss.
+    np.testing.assert_array_equal(
+        np.asarray(cache.k[:, :, :, short_T:, :]),
+        np.zeros_like(np.asarray(cache.k[:, :, :, short_T:, :])),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(cache.v[:, :, :, short_T:, :]),
+        np.zeros_like(np.asarray(cache.v[:, :, :, short_T:, :])),
+    )
+
+
+def test_forward_with_cache_matches_call() -> None:
+    """``forward_with_cache`` produces the same logits as ``__call__``
+    on the same input. This is a unit-level pin on the prefill
+    primitive used by KV-cache decoding."""
+    import jax.numpy as jnp
+
+    from pawn.config import TINY_SUPERNET
+
+    model = _tiny_model()
+    rng = np.random.default_rng(0)
+    tokens = jnp.asarray(rng.integers(0, 64, (2, TINY_SUPERNET.max_seq_len)), dtype=jnp.int32)
+    attn = jnp.ones((2, TINY_SUPERNET.max_seq_len), dtype=jnp.bool_)
+    logits_ref = model(tokens, attn)
+    logits, _cache = model.forward_with_cache(tokens, attn)
+    np.testing.assert_array_equal(
+        np.asarray(logits), np.asarray(logits_ref),
+        err_msg="forward_with_cache logits diverged from __call__",
+    )
+
+
+def test_forward_incremental_matches_full_forward() -> None:
+    """``forward_incremental`` at position ``pos`` produces logits that
+    match ``__call__`` at the same position on the same prefix +
+    next-token sequence. This pins the cached-decode invariant at the
+    single-step level."""
+    import jax.numpy as jnp
+
+    from pawn.config import TINY_SUPERNET
+
+    model = _tiny_model()
+    T = TINY_SUPERNET.max_seq_len
+    rng = np.random.default_rng(1)
+    # Sequence: first 5 positions are real tokens, rest PAD.
+    full_tokens = np.full((2, T), 1968, dtype=np.int32)
+    full_tokens[:, :5] = rng.integers(0, 64, (2, 5)).astype(np.int32)
+
+    # Prefill on positions [0..5) → cache + logits at position 4.
+    prefill_tokens = full_tokens.copy()
+    prefill_attn = np.zeros((2, T), dtype=bool)
+    prefill_attn[:, :5] = True
+    logits_pref, cache = model.forward_with_cache(
+        jnp.asarray(prefill_tokens), jnp.asarray(prefill_attn),
+    )
+
+    # Now: at position 5, feed the next token. We need a real (non-PAD)
+    # token to match a full forward over positions [0..6).
+    next_token = rng.integers(0, 64, (2, 1)).astype(np.int32)
+    full_tokens[:, 5:6] = next_token
+    full_attn = np.zeros((2, T), dtype=bool)
+    full_attn[:, :6] = True
+    full_logits = model(jnp.asarray(full_tokens), jnp.asarray(full_attn))
+
+    inc_logits, _cache = model.forward_incremental(
+        jnp.asarray(next_token), jnp.int32(5), cache,
+    )
+    np.testing.assert_allclose(
+        np.asarray(inc_logits[:, 0, :]), np.asarray(full_logits[:, 5, :]),
+        rtol=1e-5, atol=1e-5,
+        err_msg="forward_incremental[pos=5] diverged from __call__[:, 5]",
+    )
+
+
+def test_autoregressive_generate_mixed_prefix_kv_cache_matches_recompute() -> None:
+    """Cross-path parity under the variable-prefix-length grouping path.
+
+    Each unique prefix length forms its own ``_generate_batch`` call,
+    which prefills its own KV-cache (sized to ``cfg.max_seq_len`` but
+    populated only to that group's ``prefix_end``). The legacy
+    recompute path traverses the same groups under the same per-batch
+    keys, so the two paths must agree row-for-row even with mixed
+    prefix lengths. The "same per-batch keys" part is what makes this
+    a non-trivial extension of the no-prefix and uniform-prefix
+    equivalence cases: distinct groups consume the outer-loop key in
+    processing order, so this test pins that the cached path doesn't
+    accidentally drop or duplicate a `jax.random.split` along the way.
+    (See the CPU-stability note on
+    ``test_autoregressive_generate_kv_cache_matches_full_recompute``.)
+
+    Coverage layout: 6 games at 3 distinct prefix lengths (3 / 5 / 8),
+    two games per length, ``batch_size=3`` — each length forms its
+    own single internal batch, so the test exercises three back-to-back
+    ``_generate_batch`` calls. (An earlier draft claimed an
+    "internal-batch-boundary" — that would need a group of size > 3;
+    the actual coverage is the cross-group key ordering, not a
+    within-group batch boundary.)
+    """
+    model = _tiny_model()
+    _ids, _t, _lm, move_ids, gls, _tc = engine.generate_clm_batch(
+        6, 16, 251, False, 0.0, False,
+    )
+    mixed_lens = np.array([3, 5, 8, 3, 5, 8], dtype=np.int32)
+    pls = np.minimum(mixed_lens, gls.astype(np.int32))
+    common: dict[str, Any] = dict(
+        outcome_token=OUTCOME_TOKENS["PLY_LIMIT"], n_games=6,
+        mask_illegal=True, max_seq_len=24, batch_size=3, seed=37,
+        prefix_moves=move_ids, prefix_lengths=pls,
+    )
+    gen_full = autoregressive_generate(model, **common, use_kv_cache=False)
+    gen_kv = autoregressive_generate(model, **common, use_kv_cache=True)
+    np.testing.assert_array_equal(
+        gen_kv.sequences, gen_full.sequences,
+        err_msg="mixed-prefix KV-cache and recompute sequences diverged",
+    )
+    np.testing.assert_array_equal(gen_kv.term_codes, gen_full.term_codes)
+    np.testing.assert_array_equal(gen_kv.game_lengths, gen_full.game_lengths)
+
+
+def test_autoregressive_generate_mixed_prefix_post_prefix_continues() -> None:
+    """Variable-prefix-length grouping: every row's positions
+    ``[pl + 1, max_seq_len)`` should contain at least one real (non-PAD,
+    non-outcome) move token. Pre-fix, rows with shorter prefixes would
+    sample under PAD-padded context for ``[pl + 1, max_pl]`` positions
+    before the engine's RL state caught up, often producing immediate
+    PREMATURE_PAD termination at ``pl + 1`` even on rows where the
+    engine's actual position has plenty of legal moves remaining.
+
+    The post-grouping invariant: any row with ``pl < max_seq_len - 2``
+    samples *something* — either a real move (engine state →
+    eventually legal_or_terminate) or a clean termination — rather
+    than collapsing into immediate PREMATURE_PAD purely due to the
+    PAD-padded context.
+    """
+    model = _tiny_model()
+    _ids, _t, _lm, move_ids, gls, _tc = engine.generate_clm_batch(
+        6, 16, 137, False, 0.0, False,
+    )
+    # Mixed prefix lengths spanning two batches at batch_size=3.
+    mixed_lens = np.array([1, 4, 7, 1, 4, 7], dtype=np.int32)
+    pls = np.minimum(mixed_lens, gls.astype(np.int32))
+    gen = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=6,
+        mask_illegal=True, max_seq_len=24, batch_size=3, seed=13,
+        prefix_moves=move_ids, prefix_lengths=pls,
+    )
+    # Every row's game_length must be at least its prefix length —
+    # the engine's RL state already advanced through ``load_prefixes``.
+    for i in range(6):
+        pl = int(pls[i])
+        assert gen.game_lengths[i] >= pl, (
+            f"row {i}: game_length={gen.game_lengths[i]} < pl={pl} — "
+            f"the row terminated before its prefix was fully consumed"
         )
 
 
