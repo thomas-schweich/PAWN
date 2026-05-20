@@ -327,7 +327,9 @@ cmd_launch() {
         echo ""
         echo "Examples:"
         echo "  $0 launch exp1 scripts/train_jax.py --supernet tiny --total-steps 1000 --batch-size 16 --seq-len 64 --k 50"
-        echo "  $0 launch exp1 scripts/train_jax_adapter.py --supernet tiny --variant base --strategy lora --rank 4 --total-steps 500"
+        echo "  $0 launch exp1 scripts/train_jax_adapter.py --supernet tiny --variant base --rank 4 --total-steps 500"
+        echo ""
+        echo "Note: the wrapper appends --logs-dir logs to your command; do NOT pass --logs-dir yourself or argparse will reject the duplicate."
         exit 1
     fi
 
@@ -387,7 +389,7 @@ case "${1:-}" in
         echo "  $0 create exp1 --gpu a5000"
         echo "  $0 create sweep1 --gpu a100-pcie --count 2 --community"
         echo "  $0 deploy exp1"
-        echo "  $0 launch exp1 scripts/train.py --variant base"
+        echo "  $0 launch exp1 scripts/train_jax.py --supernet tiny --total-steps 1000"
         echo "  $0 stop exp1"
         ;;
 esac

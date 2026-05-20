@@ -560,37 +560,47 @@ After Phase 4 squash-merged into `jax_migration`, a handful of
 trainer-side parity gaps remained — the framework swap was
 feature-complete on the **evaluation** side but the adapter trainer
 driver still only dispatched LoRA, and the generation path lacked a
-KV-cache variant. These landed as additional chunks on the integration
-branch (resumed via `/review-driven-development --resume
-docs/jax-migration.md`):
+KV-cache variant. The follow-ups land as additional chunks on the
+integration branch under `/review-driven-development --resume
+docs/jax-migration.md`. Status is per-chunk:
 
-- **Adapter dispatch glue.** `scripts/train_jax_adapter.py` learns to
-  pick any of the eight adapter strategies (`lora` / `film` /
-  `unfreeze` / `bottleneck` / `hybrid` / `sparse` / `rosa` /
-  `specialized_clm`). The PyTree contract is the same across
-  strategies — `adapter_filter` returns a Python-bool spec consumed by
+- **Deploy script log-dir flag (landed).** `deploy/pod.sh` and
+  `deploy/vast.sh` `cmd_launch` now pass `--logs-dir` rather than the
+  legacy `--log-dir` (which matched the now-deleted PyTorch
+  `scripts/train.py`). CLAUDE.md's launch examples updated in lockstep
+  — they no longer mention `--logs-dir` because the wrapper injects it
+  silently; users **should not** pass `--logs-dir` in the command they
+  hand to `pod.sh launch <name> …` or `vast.sh launch <name> …` or
+  argparse will reject the duplicate.
+- **Adapter dispatch glue (pending).** `scripts/train_jax_adapter.py`
+  will gain a `--strategy {lora,film,unfreeze,bottleneck,hybrid,sparse,
+  rosa,specialized_clm}` flag plus per-strategy hyperparameter args.
+  The PyTree contract is the same across strategies —
+  `adapter_filter(model)` returns a Python-bool spec consumed by
   `eqx.partition`; the `Unfreeze` strategy adds a companion per-layer
-  `unfreeze_gradient_mask` plugged into `optax.masked`. `RoSA` carries
-  a three-phase host-driven training schedule (LoRA warmup →
+  `unfreeze_gradient_mask` plugged into `optax.masked`. `RoSA` will
+  carry a three-phase host-driven training schedule (LoRA warmup →
   gradient-magnitude mask → joint training); the phase transitions
   re-jit naturally because the trainable subtree's bool spec changes
   between phases.
-- **KV-cache generation.** `pawn.generation.autoregressive_generate`
-  ships a KV-cached variant alongside the O(N²) recompute path the
-  Phase-4 port matched. The two are bitwise-equivalent on a regression
-  test; the KV-cache path is the default for long generations.
-- **Variable-prefix-length grouping** for the `poisoned_prefix` and
-  `impossible_task` §6 generation tests. The legacy port preserved a
-  bug where prefixes of unequal length aligned incorrectly; the fix
-  groups games by prefix length and runs each group as its own
-  generation batch.
-- **Deploy script log-dir flag.** `deploy/pod.sh` / `vast.sh` learn the
-  current `--logs-dir` flag (was `--log-dir` matching the deleted
-  legacy trainer).
+- **KV-cache generation (pending).** `pawn.generation.autoregressive_generate`
+  will gain a KV-cached variant alongside the O(N²) recompute path
+  the Phase-4 port currently ships. A bitwise-equivalence regression
+  test against the recompute path pins parity; the KV-cache path is
+  the default for long generations.
+- **Variable-prefix-length grouping (pending).** The `poisoned_prefix`
+  and `impossible_task` §6 generation tests currently inherit a legacy
+  port bug — variable-length prefixes within a batch align under a
+  batch-wide max, leaving PAD gaps in the attended context for rows
+  with shorter prefixes (the engine state is still correct, but the
+  model is conditioned on a PAD-padded context). The fix groups games
+  by prefix length and runs each group as its own generation batch.
 
 These follow-ups do not change any design decision in §1–§11; they
 close out the work the integration branch had left as trainer-side
-TODOs.
+TODOs. Each chunk gets its own section branch off `jax_migration`,
+squash-merges into the integration branch on close, and updates this
+section's chunk status to "landed".
 
 ## 13. Resolved decisions
 
