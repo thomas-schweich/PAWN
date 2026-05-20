@@ -22,6 +22,11 @@ Ported strategies (``docs/jax-migration.md`` §9 Phase 3):
   (Hu et al. 2021).
 * ``film`` — Per-channel post-layer affine modulation
   (Perez et al. 2017).
+* ``bottleneck`` — Houlsby residual MLP after attention + FFN
+  sublayers (Houlsby et al. 2019).
+* ``hybrid`` — LoRA + FiLM stacked.
+* ``sparse`` — Learnable continuous (or hard, via straight-through
+  estimator) mask on attention projections.
 * ``unfreeze`` — Partial fine-tune of the top ``n_unfreeze`` backbone
   layers. The Python-bool ``adapter_filter`` marks each backbone
   field fully True or fully False at coarse granularity; per-layer
@@ -32,15 +37,22 @@ Ported strategies (``docs/jax-migration.md`` §9 Phase 3):
 Not yet ported (follow-up PRs; see the final migration PR for the
 list and ``docs/jax-migration.md`` for status):
 
-* ``bottleneck`` — Houlsby residual MLP (Houlsby et al. 2019).
-* ``hybrid`` — LoRA + FiLM stacked.
-* ``sparse`` — Learnable mask on backbone weights with
-  straight-through estimator.
 * ``rosa`` — Gradient-informed sparse + LoRA, 3-phase training.
 * ``specialized_clm`` — From-scratch standalone transformer (not
   really an adapter — separate from the backbone entirely).
 """
 
+from pawn.adapters.bottleneck import (
+    BottleneckConfig,
+    BottleneckModel,
+    BottleneckParams,
+)
+from pawn.adapters.bottleneck import (
+    adapter_filter as bottleneck_adapter_filter,
+)
+from pawn.adapters.bottleneck import (
+    init_bottleneck_model,
+)
 from pawn.adapters.film import (
     FiLMConfig,
     FiLMModel,
@@ -52,11 +64,32 @@ from pawn.adapters.film import (
 from pawn.adapters.film import (
     init_film_model,
 )
+from pawn.adapters.hybrid import (
+    HybridConfig,
+    HybridModel,
+)
+from pawn.adapters.hybrid import (
+    adapter_filter as hybrid_adapter_filter,
+)
+from pawn.adapters.hybrid import (
+    init_hybrid_model,
+)
 from pawn.adapters.lora import (
     LoRAConfig,
     LoRAModel,
     adapter_filter,
     init_lora_model,
+)
+from pawn.adapters.sparse import (
+    SparseConfig,
+    SparseModel,
+    SparseParams,
+)
+from pawn.adapters.sparse import (
+    adapter_filter as sparse_adapter_filter,
+)
+from pawn.adapters.sparse import (
+    init_sparse_model,
 )
 from pawn.adapters.unfreeze import (
     UnfreezeConfig,
@@ -71,18 +104,32 @@ from pawn.adapters.unfreeze import (
 )
 
 __all__ = [
+    "BottleneckConfig",
+    "BottleneckModel",
+    "BottleneckParams",
     "FiLMConfig",
     "FiLMModel",
     "FiLMParams",
+    "HybridConfig",
+    "HybridModel",
     "LoRAConfig",
     "LoRAModel",
+    "SparseConfig",
+    "SparseModel",
+    "SparseParams",
     "UnfreezeConfig",
     "UnfreezeModel",
     "adapter_filter",
+    "bottleneck_adapter_filter",
     "film_adapter_filter",
+    "hybrid_adapter_filter",
+    "init_bottleneck_model",
     "init_film_model",
+    "init_hybrid_model",
     "init_lora_model",
+    "init_sparse_model",
     "init_unfreeze_model",
+    "sparse_adapter_filter",
     "unfreeze_adapter_filter",
     "unfreeze_gradient_mask",
 ]

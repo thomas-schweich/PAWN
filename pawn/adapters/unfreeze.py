@@ -35,6 +35,7 @@ strategy is named for.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import equinox as eqx
 import jax
@@ -167,8 +168,12 @@ def make_gradient_mask(model: UnfreezeModel) -> UnfreezeModel:
     # weight leaves; we only ever overwrite under the backbone
     # subtree below.
     def _zero_leaf(leaf: object) -> object:
+        # The ``eqx.is_array`` runtime guard narrows ``leaf`` to a
+        # ``jax.Array``, but pyright doesn't see ``eqx.is_array`` as a
+        # ``TypeGuard``; ``typing.cast`` makes the narrowing explicit
+        # without a noqa.
         if eqx.is_array(leaf):
-            return jnp.zeros_like(leaf, dtype=jnp.bool_)
+            return jnp.zeros_like(cast(jax.Array, leaf), dtype=jnp.bool_)
         return leaf
     false_tree = jax.tree_util.tree_map(_zero_leaf, model)
 
