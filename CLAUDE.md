@@ -155,7 +155,7 @@ Key args:
 - `--total-steps`, `--batch-size`, `--seq-len`, `--k`, `--lr`, `--warmup-steps`
 - `--val-frac`, `--val-every` — held-out validation slice + frequency
 
-The verification proxy is a Rust-engine random-game corpus; Lichess Elo-slice cache + the broader adapter strategies (bottleneck / FiLM / hybrid / sparse / unfreeze) port in follow-up PRs onto the same two-tier trainer. See `docs/jax-migration.md` Phase 4.
+The verification proxy is a Rust-engine random-game corpus; Lichess Elo-slice cache + the broader adapter strategies (bottleneck / FiLM / hybrid / sparse / unfreeze) port in follow-up PRs onto the same two-tier trainer. The broader strategies live in Phase 3 of the migration plan (Phase 3 = "Adapters. Two-tier PyTree, finite-dataset data path, …"); the Lichess data cache lands with Phase 4's eval-suite port. See `docs/jax-migration.md` §9.
 
 The two-tier optimisation partitions the PyTree via `eqx.partition(model, adapter_filter(model))`. Gradients for the frozen backbone are dropped by XLA dead-code elimination (~33% FLOP cut on the backward pass). The structural invariant — every array field of `state.trainable.backbone` is `None` after partitioning (the `PAWNModel` object itself stays, but its leaves are sentinel `None`s) — is pinned by `test_backbone_weights_are_frozen`.
 
@@ -195,7 +195,7 @@ step_00065000/
 └── .complete           # integrity sentinel — JSON {files: {name: sha256-hex}}
 ```
 
-Central module: `pawn/checkpoint.py`. All save/load goes through this module. Shared sentinel helpers (`sha256_file`, `write_sentinel`, `verify_sentinel`, `IncompleteCheckpointError`, `CheckpointIntegrityError`) live in `pawn/_sentinel.py` — stdlib-only so the thin PyTorch loader can import them without pulling JAX.
+Central module: `pawn/checkpoint.py`. All save/load goes through this module. Sentinel helpers (`sha256_file`, `write_sentinel`, `verify_sentinel`, `IncompleteCheckpointError`, `CheckpointIntegrityError`) live in `pawn/_sentinel.py` — stdlib-only so the thin PyTorch loader can import them without pulling JAX. In practice only `verify_sentinel` is shared between `pawn.checkpoint` and `pawn.torch_loader`; `pawn.checkpoint` keeps a private `_write_sentinel` that bakes a `format_version` field into the JSON alongside the file-hash map, so it does not call `pawn._sentinel.write_sentinel` directly. The exceptions + `sha256_file` come from `pawn._sentinel` so the schema (`{"files": {...}}`) and integrity rules stay in one place.
 
 ### Data Integrity
 
@@ -305,7 +305,7 @@ Vast.ai has no separate network volume — instance disk is sized via `--disk` (
 ## Key Patterns & Gotchas
 
 - **Single-framework promise.** The training and eval surface is JAX-only. The two torch touchpoints — `pawn.torch_loader` (a thin loader for external non-JAX consumers) and `pawn._torch_legacy_fixture` (a frozen reference architecture used by the legacy-converter parity tests) — exist precisely so the JAX surface stays torch-free under a CPU-jax install. Don't reintroduce torch dependencies into `pawn.{model,trainer,adapter_trainer,adapters,eval,checkpoint}`.
-- **Sentinel logic lives in `pawn._sentinel`.** Stdlib-only. Both `pawn.checkpoint` and `pawn.torch_loader` import from it (the callers alias `sha256_file` / `verify_sentinel` to underscore-prefixed local names; the public API on the module itself has no underscores). Don't duplicate that logic elsewhere.
+- **Sentinel logic lives in `pawn._sentinel`.** Stdlib-only. Both `pawn.checkpoint` and `pawn.torch_loader` import `verify_sentinel` from it (aliased to a local underscore name on both sides; the public API on the module itself has no underscores). `pawn.checkpoint` *also* has its own private `_write_sentinel` that adds a `format_version` field — `pawn._sentinel.write_sentinel` writes a strict `{"files": ...}` payload and that asymmetry is intentional. Don't duplicate the SHA-256 / verify logic elsewhere; if a new caller needs to write a sentinel, decide explicitly whether to use `_sentinel.write_sentinel` or to keep its own variant.
 - **Two-tier PyTree partition** is how adapter training freezes the backbone: `eqx.partition(model, adapter_filter(model))` produces a trainable subtree (adapters) and a frozen subtree (backbone). XLA dead-code-eliminates the backbone weight gradients, which is the source of the ~33% FLOP cut on the backward pass.
 - **K-step `lax.scan` amortises JIT dispatch.** The pretraining + adapter trainers both run `K` inner steps per scan invocation. `K * B` games are consumed per scan call; size `K` so per-step throughput is roughly host-bound rather than launch-bound.
 - **`state.step` must be a JAX scalar inside `jit`.** Storing it as a Python int caused a ~70× slowdown during Phase-2 development by retriggering recompilation every step. The fix is pinned by tests; keep it that way.
