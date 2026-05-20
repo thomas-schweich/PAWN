@@ -543,8 +543,6 @@ def test_scan_step_loss_decreases_on_fixed_chunk() -> None:
     B, T = 4, 16
     single_batch = _random_batch(jax.random.PRNGKey(21), b=B, t=T)
     chunk = _tile_chunk(single_batch, K)
-
-
     _, metrics = scan(state, chunk)
     losses = metrics["loss"]
     assert float(losses[-1]) < float(losses[0]) * 0.95, (
@@ -568,8 +566,6 @@ def test_scan_step_integrates_with_lr_schedule() -> None:
     B, T = 2, 8
     single_batch = _random_batch(jax.random.PRNGKey(22), b=B, t=T)
     chunk = _tile_chunk(single_batch, K)
-
-
     state, metrics = scan(state, chunk)
     # Past warmup: weights diverge from init (real LR > 0 was applied).
     delta = float(jnp.abs(state.model.lm_head - model.lm_head).max())
@@ -632,8 +628,6 @@ def test_scan_step_does_not_recompile_per_call() -> None:
     B, T = 2, 8
     single_batch = _random_batch(jax.random.PRNGKey(30), b=B, t=T)
     chunk = _tile_chunk(single_batch, K)
-
-
     # Warmup compile.
     state, _ = scan(state, chunk)
     t0 = time.perf_counter()

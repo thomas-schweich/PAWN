@@ -12,6 +12,8 @@ Public API:
   documented decay-step semantics.
 * ``make_optimizer`` — AdamW with gradient clipping and an
   optional LR schedule.
+* ``init_train_state`` — build the initial ``TrainState`` for a
+  ``PAWNModel`` under a given optimizer.
 * ``make_train_step`` — jitted ``(state, batch) -> (state, metrics)``
   that applies one optimizer step to the supernet against the joint
   objective.
@@ -158,6 +160,15 @@ def compute_supernet_loss(
     no measurable execution-time win, since XLA constant-folds
     static slicing — but it keeps the trace tree clean.
     """
+    if not variant_specs:
+        # An empty specs tuple would silently return joint=0 and an
+        # empty per-variant dict — backprop would yield all-zero
+        # gradients, and AdamW's decoupled weight decay would still
+        # drift weights every step. Fail loud.
+        raise ValueError(
+            "compute_supernet_loss requires at least one VariantSpec; "
+            "an empty tuple produces zero gradient and silent weight-decay drift."
+        )
     per_variant: dict[str, jax.Array] = {}
     joint: jax.Array = jnp.float32(0.0)
     for spec in variant_specs:
@@ -188,8 +199,9 @@ def make_lr_schedule(
         warmup_steps: linear ramp from 0 to ``peak_lr``. Must be
             ``>= 0`` and ``< total_steps``.
         end_value: floor reached at ``total_steps`` and held past it.
-            Must be ``< peak_lr`` (otherwise the "decay" phase would
-            increase). Defaults to ``peak_lr * 0.1``.
+            Must be ``>= 0`` and ``< peak_lr`` (otherwise the "decay"
+            phase would either increase or invert the sign of the
+            updates). Defaults to ``peak_lr * 0.1``.
 
     Past ``total_steps`` the schedule plateaus at ``end_value`` so a
     continuation run won't drive LR negative.

@@ -10,7 +10,7 @@ and the long-running steps):
   2. Build the LR schedule (catches ``warmup``/``total_steps`` /
      ``end_value`` misconfigs *before* any filesystem write).
   3. Estimate the corpus footprint and abort if it exceeds
-     ``--max-corpus-gb`` (~131 GiB at SUPERNET / 100K-step defaults
+     ``--max-corpus-gb`` (~122 GiB at SUPERNET / 100K-step defaults
      would OOM-kill a modest host; the guard makes that fail loudly).
   4. Generate the Rust-engine corpus (always — no cache reuse path)
      using ``--corpus-seed`` (defaults to ``--seed``).
@@ -98,6 +98,18 @@ def _stage_chunk(
 ) -> Batch:
     """Pull a [K, B, T] chunk out of the host NumPy corpus."""
     end = offset + k * batch_size
+    if end > np_tokens.shape[0]:
+        # Defensive: the driver consumes exactly n_games = total_steps
+        # * batch_size and validates total_steps % k == 0, so this
+        # never fires under normal use. A future refactor that
+        # changes the corpus-sizing convention (e.g. caps at
+        # --max-games) would otherwise produce a wrong-K chunk or a
+        # confusing reshape error far from the source.
+        raise ValueError(
+            f"chunk end={end} overruns corpus length {np_tokens.shape[0]} "
+            f"(offset={offset}, k={k}, batch_size={batch_size})"
+        )
+
     # Reshape contiguous slice into (K, B, ...).
     def reshape(arr: np.ndarray) -> jax.Array:
         sl = arr[offset:end]
@@ -175,6 +187,21 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.k <= 0:
         raise SystemExit(f"--k={args.k} must be a positive integer")
+    if args.batch_size <= 0:
+        raise SystemExit(
+            f"--batch-size={args.batch_size} must be a positive integer; "
+            "a zero or negative batch otherwise produces an entirely-padded "
+            "no-op run with all-zero metrics."
+        )
+    if args.seq_len <= 0:
+        raise SystemExit(
+            f"--seq-len={args.seq_len} must be a positive integer; "
+            "a zero sequence length crashes in JIT during RoPE reshape."
+        )
+    if args.total_steps <= 0:
+        raise SystemExit(
+            f"--total-steps={args.total_steps} must be a positive integer"
+        )
     if args.total_steps % args.k != 0:
         raise SystemExit(
             f"--total-steps={args.total_steps} must be a multiple of --k={args.k}"
@@ -200,11 +227,18 @@ def main(argv: list[str] | None = None) -> int:
     # >= total, end_value >= peak, non-positive arg) fails BEFORE
     # we create the run directory and write config.json. Otherwise
     # a bad-config invocation leaves an orphaned logs/ dir.
-    sched = make_lr_schedule(
-        peak_lr=args.lr,
-        total_steps=args.total_steps,
-        warmup_steps=args.warmup_steps,
-    )
+    # ``make_lr_schedule`` raises ``ValueError``; wrap into
+    # ``SystemExit`` so all CLI-validation failures surface through
+    # the same exception type (and ``test_validation_failures_do_not_create_run_dir``
+    # catches every guard).
+    try:
+        sched = make_lr_schedule(
+            peak_lr=args.lr,
+            total_steps=args.total_steps,
+            warmup_steps=args.warmup_steps,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"LR-schedule configuration error: {exc}") from exc
 
     n_games = args.total_steps * args.batch_size
     # Per-token byte cost is 10 bytes (int32 tokens + bool attn_mask +
@@ -297,6 +331,10 @@ def main(argv: list[str] | None = None) -> int:
 
     with metrics_path.open("w", encoding="utf-8") as mf:
         wall0 = time.perf_counter()
+        # ``step_start`` is carried across iterations on the host so we
+        # never force a D2H read of ``state.step`` BEFORE dispatching
+        # the next ``scan`` — that would serialise compute / staging.
+        step_start = 0
         for chunk_i in range(n_chunks):
             offset = chunk_i * args.k * args.batch_size
             chunk = _stage_chunk(
@@ -308,17 +346,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.k,
                 args.batch_size,
             )
-            # Capture step_start BEFORE scan so it always reflects the
-            # actual host-step at chunk entry — robust even when the
-            # trainer's has_supervision guard skips steps in a chunk
-            # (state.step then advances by < args.k).
-            step_start = int(state.step)
             t_chunk = time.perf_counter()
             state, metrics = scan(state, chunk)
-            # Block on the full pytree, not just one key — if the
-            # metrics dict ever holds independently-dispatched arrays,
-            # blocking on a single key would silently miss the others.
-            jax.block_until_ready(metrics)
+            # Block on both ``state`` and ``metrics`` — ``state.step``
+            # is needed for step_end below and would otherwise force
+            # an extra D2H sync if only ``metrics`` were waited on.
+            jax.block_until_ready((state, metrics))
             dt = time.perf_counter() - t_chunk
 
             # Pull metrics off-device — they're [K]-shaped per key.
@@ -343,7 +376,12 @@ def main(argv: list[str] | None = None) -> int:
                 if key_.startswith("loss_d"):
                     row[f"{key_}_last"] = float(vals[-1])
             mf.write(json.dumps(row) + "\n")
-            mf.flush()
+            # Flush every 10 chunks (and on the final one) — at the
+            # critical path between scan calls, frequent fsync stalls
+            # can compound on networked filesystems. The buffered
+            # write is still durable on graceful exit.
+            if (chunk_i + 1) % 10 == 0 or chunk_i + 1 == n_chunks:
+                mf.flush()
             if not args.quiet:
                 print(
                     f"[chunk {chunk_i + 1}/{n_chunks}] step={step_end} "
@@ -351,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"grad_norm={row['grad_norm_mean']:.3f} "
                     f"dt={dt:.2f}s"
                 )
+            step_start = step_end
     print(f"[done] total wall = {time.perf_counter() - wall0:.1f}s; run_dir={run_dir}")
     return 0
 

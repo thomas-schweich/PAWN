@@ -166,7 +166,9 @@ distributions, interleave them round-robin instead of consuming sequentially.
 ### 4.3 Data path
 
 The corpus lives in host RAM (or an NVMe memmap). A double-buffered prefetch
-thread stages the next chunk (`K · batch_size` games, ~52 MB at K=200, B=256)
+thread stages the next chunk (`K · batch_size · T · 10` bytes;
+~262 MB at K=200, B=256, T=512 — int32 tokens + bool attn_mask +
+int32 targets + bool loss_mask = 4+1+4+1 bytes per position)
 to the device while the current chunk trains.
 
 The required ingest bandwidth has a closed form, independent of batch and

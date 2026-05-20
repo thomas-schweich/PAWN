@@ -9,6 +9,7 @@ Phase-2 verification run that ships with the PR body.
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -41,8 +42,8 @@ def _load_script() -> ModuleType:
 
 def _run(args: list[str], tmp_path: Path) -> None:
     """Invoke ``main(args)`` with ``--logs-dir`` defaulting under tmp.
-    Returns whatever ``main`` returns (typically 0 on success); raises
-    SystemExit for validation failures."""
+    ``main``'s return value is discarded; the test only cares about
+    side effects + ``SystemExit`` propagation."""
     script = _load_script()
     if "--logs-dir" not in args:
         args = args + ["--logs-dir", str(tmp_path)]
@@ -100,6 +101,74 @@ def test_rejects_seq_len_exceeding_max(tmp_path: Path) -> None:
         )
 
 
+def test_rejects_batch_size_zero(tmp_path: Path) -> None:
+    """``--batch-size 0`` would generate an empty corpus and silently
+    no-op every step. Reject upfront (Codex r3)."""
+    with pytest.raises(SystemExit, match="--batch-size"):
+        _run(
+            [
+                "--supernet", "tiny",
+                "--total-steps", "10",
+                "--k", "5",
+                "--batch-size", "0",
+                "--seq-len", "16",
+                "--warmup-steps", "1",
+            ],
+            tmp_path,
+        )
+
+
+def test_rejects_seq_len_zero(tmp_path: Path) -> None:
+    """``--seq-len 0`` would crash inside RoPE reshape at JIT time
+    (after the corpus has been generated). Reject upfront."""
+    with pytest.raises(SystemExit, match="--seq-len"):
+        _run(
+            [
+                "--supernet", "tiny",
+                "--total-steps", "10",
+                "--k", "5",
+                "--batch-size", "2",
+                "--seq-len", "0",
+                "--warmup-steps", "1",
+            ],
+            tmp_path,
+        )
+
+
+def test_rejects_total_steps_zero(tmp_path: Path) -> None:
+    """``--total-steps 0`` would also fail the ``warmup < total`` LR
+    guard; pin the dedicated guard fires first with a clearer message."""
+    with pytest.raises(SystemExit, match="total-steps"):
+        _run(
+            [
+                "--supernet", "tiny",
+                "--total-steps", "0",
+                "--k", "5",
+                "--batch-size", "2",
+                "--seq-len", "16",
+                "--warmup-steps", "1",
+            ],
+            tmp_path,
+        )
+
+
+def test_rejects_bad_lr_schedule_config(tmp_path: Path) -> None:
+    """``make_lr_schedule``'s ValueError is wrapped into SystemExit so
+    every CLI-validation failure surfaces uniformly."""
+    with pytest.raises(SystemExit, match="LR-schedule"):
+        _run(
+            [
+                "--supernet", "tiny",
+                "--total-steps", "10",
+                "--k", "5",
+                "--batch-size", "2",
+                "--seq-len", "16",
+                "--warmup-steps", "10",  # warmup == total → ValueError
+            ],
+            tmp_path,
+        )
+
+
 def test_rejects_oversized_corpus(tmp_path: Path) -> None:
     """``--max-corpus-gb`` guard fires when the requested corpus
     exceeds the limit. Use a tiny limit to force the guard with a
@@ -117,6 +186,48 @@ def test_rejects_oversized_corpus(tmp_path: Path) -> None:
             ],
             tmp_path,
         )
+
+
+def test_happy_path_writes_metrics_and_config(tmp_path: Path) -> None:
+    """End-to-end smoke: a small TINY-supernet run produces config.json,
+    a metrics.jsonl with one row per chunk, finite losses, and
+    state.step matching the row's step_end. Pins the corpus →
+    trainer → driver pipeline integration that the per-chunk unit
+    tests miss."""
+    import json as _json
+    script = _load_script()
+    script.main(
+        [
+            "--supernet", "tiny",
+            "--total-steps", "10",
+            "--k", "5",
+            "--batch-size", "2",
+            "--seq-len", "16",
+            "--warmup-steps", "1",
+            "--logs-dir", str(tmp_path),
+            "--quiet",
+        ]
+    )
+    run_dirs = list(tmp_path.glob("jax_run_*"))
+    assert len(run_dirs) == 1, f"expected 1 run_dir, got {run_dirs}"
+    rd = run_dirs[0]
+    cfg = _json.loads((rd / "config.json").read_text())
+    # config.json carries the full variant dicts (not just names).
+    assert isinstance(cfg["variants"], dict)
+    assert "small" in cfg["variants"]
+    assert cfg["variants"]["small"]["d_model"] == 64
+    # metrics.jsonl has one row per chunk = total_steps / k = 2.
+    rows = [_json.loads(l) for l in (rd / "metrics.jsonl").read_text().splitlines()]
+    assert len(rows) == 2
+    # Step counters advance monotonically and finish at total_steps.
+    assert rows[0]["step_start"] == 0
+    assert rows[0]["step_end"] == 5
+    assert rows[1]["step_start"] == 5
+    assert rows[1]["step_end"] == 10
+    # Losses are finite (no NaN/Inf at TINY scale).
+    for r in rows:
+        assert math.isfinite(r["loss_mean"])
+        assert math.isfinite(r["grad_norm_mean"])
 
 
 def test_validation_failures_do_not_create_run_dir(tmp_path: Path) -> None:
