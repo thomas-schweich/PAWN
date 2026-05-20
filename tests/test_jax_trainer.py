@@ -24,7 +24,9 @@ from pawn.jax.trainer import (
     compute_variant_loss,
     cross_entropy_loss,
     init_train_state,
+    make_lr_schedule,
     make_optimizer,
+    make_scan_step,
     make_train_step,
 )
 
@@ -359,6 +361,132 @@ def test_train_state_is_jax_pytree() -> None:
     assert isinstance(state.step, jax.Array)
     assert state.step.shape == ()
     assert state.step.dtype == jnp.int32
+
+
+def _sched_at(sched, step: int) -> float:
+    """Helper: evaluate an ``optax.Schedule`` at a step and return a
+    Python float. Wraps the ``ArrayLike`` return through ``jnp.asarray``
+    so pyright sees the narrow ``jax.Array`` type, not the broader
+    ``ArrayLike`` union that includes ``complex``."""
+    return float(jnp.asarray(sched(step)))
+
+
+def test_lr_schedule_warmup_then_decay() -> None:
+    """LR schedule must: start at 0, hit peak at end of warmup, decay
+    to end_value at total_steps, plateau past total_steps."""
+    sched = make_lr_schedule(
+        peak_lr=3e-4, total_steps=1000, warmup_steps=100, end_value=3e-5
+    )
+    assert _sched_at(sched, 0) == 0.0
+    assert math.isclose(_sched_at(sched, 100), 3e-4, rel_tol=1e-5)
+    # Mid-decay: cosine half-period — value is between peak and end.
+    mid = _sched_at(sched, 550)
+    assert 3e-5 < mid < 3e-4
+    # End of schedule lands at end_value.
+    assert math.isclose(_sched_at(sched, 1000), 3e-5, rel_tol=1e-3)
+    # Past schedule: plateau (no negative LR).
+    assert math.isclose(_sched_at(sched, 5000), 3e-5, rel_tol=1e-3)
+
+
+def test_lr_schedule_default_end_value() -> None:
+    """Default end_value is peak_lr * 0.1."""
+    sched = make_lr_schedule(peak_lr=1e-3, total_steps=1000, warmup_steps=50)
+    assert math.isclose(_sched_at(sched, 1000), 1e-4, rel_tol=1e-3)
+
+
+def test_lr_schedule_rejects_warmup_exceeding_total() -> None:
+    """Misconfigured schedule (warmup ≥ total) raises clearly rather
+    than silently producing a degenerate cosine."""
+    with pytest.raises(ValueError, match="warmup_steps"):
+        make_lr_schedule(peak_lr=1e-3, total_steps=100, warmup_steps=100)
+
+
+def test_optimizer_accepts_schedule_callable() -> None:
+    """``make_optimizer`` must accept an ``optax.Schedule`` as
+    ``learning_rate``. Pins the integration before chunk 2.4's
+    driver attempts to compose the two."""
+    sched = make_lr_schedule(peak_lr=3e-4, total_steps=100, warmup_steps=10)
+    opt = make_optimizer(sched)
+    model = init_model(TINY_SUPERNET, jax.random.PRNGKey(0))
+    state = init_train_state(model, opt)
+    assert state.opt_state is not None
+
+
+def test_scan_step_advances_state_by_k_per_call() -> None:
+    """K-step scan: ``state.step`` advances by exactly K per call;
+    metrics are stacked on a leading [K] axis."""
+    key = jax.random.PRNGKey(0)
+    model = init_model(TINY_SUPERNET, key)
+    specs = tuple(VariantSpec(cfg=v) for v in TINY_VARIANTS.values())
+    opt = make_optimizer(learning_rate=3e-4)
+    state = init_train_state(model, opt)
+    step = make_train_step(opt, specs)
+    K = 4
+    scan = make_scan_step(step, K)
+    B, T = 2, 8
+    rng = jax.random.PRNGKey(20)
+    tokens = jax.random.randint(rng, (K, B, T), 0, 1968).astype(jnp.int32)
+    attn = jnp.ones((K, B, T), dtype=jnp.bool_)
+    targets = jax.random.randint(rng, (K, B, T), 0, 1968).astype(jnp.int32)
+    loss_mask = jnp.ones((K, B, T), dtype=jnp.bool_)
+    state, metrics = scan(state, (tokens, attn, targets, loss_mask))
+    assert int(state.step) == K
+    # Metrics are stacked across the scan axis.
+    assert metrics["loss"].shape == (K,)
+    assert metrics["grad_norm"].shape == (K,)
+
+
+def test_scan_step_loss_decreases_on_fixed_chunk() -> None:
+    """The K-step scan on the same repeated batch should produce a
+    monotone-ish loss trajectory — the final step's loss strictly
+    less than the first. Catches a regression where the scan carry
+    silently resets state between iterations."""
+    key = jax.random.PRNGKey(0)
+    model = init_model(TINY_SUPERNET, key)
+    specs = tuple(VariantSpec(cfg=v) for v in TINY_VARIANTS.values())
+    opt = make_optimizer(learning_rate=3e-3)
+    state = init_train_state(model, opt)
+    step = make_train_step(opt, specs)
+    K = 10
+    scan = make_scan_step(step, K)
+    # Same batch repeated K times along the leading axis.
+    B, T = 4, 16
+    single_batch = _random_batch(jax.random.PRNGKey(21), b=B, t=T)
+    chunk: Batch = tuple(
+        jnp.stack([x] * K, axis=0) for x in single_batch
+    )  # type: ignore[assignment]
+    _, metrics = scan(state, chunk)
+    losses = metrics["loss"]
+    assert float(losses[-1]) < float(losses[0]) * 0.95, (
+        f"scan over {K} repeats of the same batch did not reduce loss: "
+        f"first={float(losses[0])}, last={float(losses[-1])}"
+    )
+
+
+def test_scan_step_integrates_with_lr_schedule() -> None:
+    """End-to-end with a real LR schedule: the optimizer's
+    decoupled-LR path must see a non-trivial LR during the scan."""
+    key = jax.random.PRNGKey(0)
+    model = init_model(TINY_SUPERNET, key)
+    specs = tuple(VariantSpec(cfg=v) for v in TINY_VARIANTS.values())
+    sched = make_lr_schedule(peak_lr=3e-3, total_steps=100, warmup_steps=10)
+    opt = make_optimizer(sched)
+    state = init_train_state(model, opt)
+    step = make_train_step(opt, specs)
+    K = 20
+    scan = make_scan_step(step, K)
+    B, T = 2, 8
+    single_batch = _random_batch(jax.random.PRNGKey(22), b=B, t=T)
+    chunk: Batch = tuple(
+        jnp.stack([x] * K, axis=0) for x in single_batch
+    )  # type: ignore[assignment]
+    state, metrics = scan(state, chunk)
+    # Past warmup: weights diverge from init (real LR > 0 was applied).
+    delta = float(jnp.abs(state.model.lm_head - model.lm_head).max())
+    assert delta > 0.0
+    # All-finite metrics across the chunk.
+    for name, vals in metrics.items():
+        assert jnp.isfinite(vals).all(), f"{name} has non-finite entries"
 
 
 def test_train_step_does_not_recompile_per_call() -> None:

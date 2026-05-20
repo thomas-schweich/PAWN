@@ -164,17 +164,55 @@ def compute_supernet_loss(
     return joint, per_variant
 
 
-def make_optimizer(
-    learning_rate: float, *, weight_decay: float = 0.01, b1: float = 0.9, b2: float = 0.95
-) -> optax.GradientTransformation:
-    """Default AdamW. Hyperparameters mirror the legacy pretraining
-    defaults (``b2=0.95`` from the legacy trainer config) so a
-    sane Phase-2 verification run doesn't need any tuning to get
-    well-conditioned gradients.
+def make_lr_schedule(
+    peak_lr: float,
+    *,
+    total_steps: int,
+    warmup_steps: int = 100,
+    end_value: float | None = None,
+) -> optax.Schedule:
+    """Linear warmup → cosine decay (Optax canonical).
 
-    ``learning_rate`` is a fixed scalar here; the LR-schedule integration
-    lands in the next Phase-2 chunk (``optax.chain(optax.adamw(...),
-    optax.scale_by_schedule(...))`` is a one-line swap).
+    Args:
+        peak_lr: LR reached at the end of warmup.
+        total_steps: full schedule length; decay_steps = total - warmup.
+        warmup_steps: linear ramp from 0 to ``peak_lr``.
+        end_value: floor at ``total_steps``; defaults to ``peak_lr * 0.1``.
+
+    Past ``total_steps`` the schedule plateaus at ``end_value``, so
+    going over budget (e.g. a continuation run) won't drive LR
+    negative.
+    """
+    if end_value is None:
+        end_value = peak_lr * 0.1
+    if warmup_steps >= total_steps:
+        raise ValueError(
+            f"warmup_steps={warmup_steps} must be < total_steps={total_steps}"
+        )
+    return optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=peak_lr,
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps - warmup_steps,
+        end_value=end_value,
+    )
+
+
+def make_optimizer(
+    learning_rate: float | optax.Schedule,
+    *,
+    weight_decay: float = 0.01,
+    b1: float = 0.9,
+    b2: float = 0.95,
+) -> optax.GradientTransformation:
+    """AdamW with optional LR schedule.
+
+    Hyperparameters mirror the legacy pretraining defaults
+    (``b2=0.95`` from the legacy trainer config). ``learning_rate``
+    accepts either a scalar (constant LR — convenient for tests) or
+    an ``optax.Schedule`` (callable ``step -> lr``). For Phase-2
+    pretraining pair this with ``make_lr_schedule`` for the
+    canonical warmup→cosine path.
     """
     return optax.adamw(
         learning_rate=learning_rate,
@@ -202,6 +240,49 @@ def init_train_state(
     return TrainState(
         model=model, opt_state=opt_state, step=jnp.zeros((), dtype=jnp.int32)
     )
+
+
+def make_scan_step(
+    train_step: TrainStep, k: int
+) -> Callable[
+    [TrainState, Batch], tuple[TrainState, dict[str, jax.Array]]
+]:
+    """Fuse ``train_step`` into a K-step ``lax.scan`` loop (§4.4).
+
+    The returned callable consumes a *chunk* batch of shape ``[K, B, T]``
+    (per-step batches stacked on a leading axis) and applies
+    ``train_step`` K times, returning ``(final_state, stacked_metrics)``
+    where ``stacked_metrics[k]`` is the metrics dict produced at step
+    ``k``. The host loop unstacks for logging.
+
+    K should be chosen to amortise host overhead — for PAWN-base on a
+    B200 the docs target K=200 (~52 MB per chunk staged to device while
+    the previous chunk trains).
+
+    Designed for use in chunk 2.4's driver: the driver pre-stages each
+    ``[K, ...]`` chunk to device, calls this, then logs / checkpoints
+    based on the host-side step counter ``int(state.step)``.
+    """
+
+    def scan_step(state: TrainState, chunk: Batch) -> tuple[TrainState, dict[str, jax.Array]]:
+        tokens_chunk, attn_chunk, target_chunk, loss_chunk = chunk
+
+        # Each [K, B, T] slice along axis 0 is one batch.
+        def body(
+            inner_state: TrainState, slice_idx: jax.Array
+        ) -> tuple[TrainState, dict[str, jax.Array]]:
+            batch: Batch = (
+                tokens_chunk[slice_idx],
+                attn_chunk[slice_idx],
+                target_chunk[slice_idx],
+                loss_chunk[slice_idx],
+            )
+            new_state, metrics = train_step(inner_state, batch)
+            return new_state, metrics
+
+        return jax.lax.scan(body, state, jnp.arange(k, dtype=jnp.int32))
+
+    return eqx.filter_jit(scan_step)
 
 
 def make_train_step(
