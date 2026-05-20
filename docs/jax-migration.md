@@ -142,9 +142,13 @@ format) under a documented canonical parameter-name schema.
 ### 4.1 Corpus
 
 The corpus is **pre-generated offline** by the existing Rust engine
-(`generate_random_games()`), tokenized to int16 `[N, 512]` plus an
-`outcome_token` column. `N = total_steps × batch_size`, so every step sees a
-fresh game in a single pass.
+(`generate_random_games()`). The engine returns int16 tokens, int16
+game lengths, and uint8 termination codes; `pawn.jax.corpus` widens
+them at the boundary to a packed `Corpus` of int32 `tokens [N, T]`,
+bool `attn_mask [N, T]`, int32 `targets [N, T]` (input shifted left by
+one), bool `loss_mask [N, T]`, and uint8 `outcome_offset [N]`. `N =
+total_steps × batch_size`, so every step sees a fresh game in a
+single pass.
 
 ### 4.2 No shuffling
 
@@ -491,7 +495,7 @@ unit-level parity already in the test suite:
 | Phase | Run |
 |---|---|
 | 1 | Convert each of `pawn-{small,base,large}` end-to-end and verify forward parity against the PyTorch reference on a real batch. Phase 1 has no trainer; this is the closest analogue. |
-| 2 | Pretrain a tiny **nested** supernet for ≥1000 steps on Rust-generated random games. Verify loss decreases, no NaNs, all sliced variants forward-evaluate cleanly. Note: `pawn.jax.config.TOY` is *not* a nested supernet — it has `head_dim=16`, so it does not satisfy `validate_nested` against the production `SUPERNET` (`head_dim=64`). Phase 2's first task is to define a tiny nested supernet (e.g. `SUPERNET=(d_model=192, n_layers=4, n_heads=3)`, `head_dim=64`, with three nested variant slices at `d_model ∈ {64, 128, 192}`) and use that for this run. The production `SUPERNET` is too large for a smoke run on commodity hardware. |
+| 2 | Pretrain the tiny **nested** supernet ``TINY_SUPERNET`` for ≥1000 steps on Rust-generated random games. Verify loss decreases, no NaNs, all sliced variants forward-evaluate cleanly. ``TINY_SUPERNET`` (defined in ``pawn.jax.config``) is ``(d_model=192, n_layers=4, n_heads=3, d_ff=768)`` with ``head_dim=64``, paired with ``TINY_VARIANTS`` at ``d_model ∈ {64, 128, 192}`` — three nested variants. (``pawn.jax.config.TOY`` is *not* a nested supernet — it has ``head_dim=16`` and would fail ``validate_nested`` against ``TINY_SUPERNET``/``SUPERNET``.) The production ``SUPERNET`` is too large for a smoke run on commodity hardware. |
 | 3 | Train one adapter strategy (e.g. LoRA rank 4) for one epoch on a small Lichess Elo slice. Verify val loss decreases, no NaNs. |
 | 4 | Run a probe + move-accuracy eval (the ported JAX `eval_suite`) on a converted / published checkpoint. Numbers within tolerance of the PyTorch reference. |
 

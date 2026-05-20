@@ -89,39 +89,49 @@ def _resolve_supernet(name: str) -> tuple[ModelConfig, dict[str, ModelConfig]]:
     )
 
 
-def _stage_chunk(
-    np_tokens: np.ndarray,
-    np_attn: np.ndarray,
-    np_targets: np.ndarray,
-    np_loss: np.ndarray,
-    offset: int,
-    k: int,
-    batch_size: int,
-) -> Batch:
-    """Pull a [K, B, T] chunk out of the host NumPy corpus."""
-    end = offset + k * batch_size
-    if end > np_tokens.shape[0]:
-        # Defensive: the driver consumes exactly n_games = total_steps
-        # * batch_size and validates total_steps % k == 0, so this
-        # never fires under normal use. A future refactor that
-        # changes the corpus-sizing convention (e.g. caps at
-        # --max-games) would otherwise produce a wrong-K chunk or a
-        # confusing reshape error far from the source.
-        raise ValueError(
-            f"chunk end={end} overruns corpus length {np_tokens.shape[0]} "
-            f"(offset={offset}, k={k}, batch_size={batch_size})"
-        )
+class _ChunkedCorpus:
+    """Pre-shaped corpus arrays: each field reshaped once from
+    ``[N_games, T]`` to ``[N_chunks, K, B, T]`` (or ``[N_chunks, K,
+    B]`` for per-game fields). Per-chunk staging is then a contiguous
+    NumPy view + a single ``jnp.asarray`` per field, with no per-call
+    bounds check needed (the reshape itself fails loudly if the
+    corpus is mis-sized).
 
-    # Reshape contiguous slice into (K, B, ...).
-    def reshape(arr: np.ndarray) -> jax.Array:
-        sl = arr[offset:end]
-        return jnp.asarray(sl.reshape((k, batch_size) + arr.shape[1:]))
-    return (
-        reshape(np_tokens),
-        reshape(np_attn),
-        reshape(np_targets),
-        reshape(np_loss),
-    )
+    Replaces the per-chunk slice+reshape path in ``_stage_chunk``;
+    the reshape is one-time and zero-copy because ``generate_corpus``
+    produces contiguous C-order arrays."""
+
+    tokens: np.ndarray
+    attn_mask: np.ndarray
+    targets: np.ndarray
+    loss_mask: np.ndarray
+
+    def __init__(
+        self,
+        tokens: np.ndarray,
+        attn_mask: np.ndarray,
+        targets: np.ndarray,
+        loss_mask: np.ndarray,
+        *,
+        n_chunks: int,
+        k: int,
+        batch_size: int,
+    ) -> None:
+        new_shape = (n_chunks, k, batch_size, tokens.shape[1])
+        self.tokens = tokens.reshape(new_shape)
+        self.attn_mask = attn_mask.reshape(new_shape)
+        self.targets = targets.reshape(new_shape)
+        self.loss_mask = loss_mask.reshape(new_shape)
+
+    def stage(self, chunk_i: int) -> Batch:
+        """Return the [K, B, T] chunk for index ``chunk_i`` staged to
+        device."""
+        return (
+            jnp.asarray(self.tokens[chunk_i]),
+            jnp.asarray(self.attn_mask[chunk_i]),
+            jnp.asarray(self.targets[chunk_i]),
+            jnp.asarray(self.loss_mask[chunk_i]),
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -331,6 +341,20 @@ def main(argv: list[str] | None = None) -> int:
     n_chunks = args.total_steps // args.k
     print(f"[train] n_chunks={n_chunks} (K={args.k} steps each)")
 
+    # One-time reshape of the flat corpus into per-chunk views. The
+    # reshape is zero-copy on the contiguous C-order arrays the engine
+    # produces; per-chunk staging then becomes a single contiguous
+    # slice + jnp.asarray per field.
+    chunked_corpus = _ChunkedCorpus(
+        corpus.tokens,
+        corpus.attn_mask,
+        corpus.targets,
+        corpus.loss_mask,
+        n_chunks=n_chunks,
+        k=args.k,
+        batch_size=args.batch_size,
+    )
+
     with metrics_path.open("w", encoding="utf-8") as mf:
         # Reset wall0 just before the chunk loop so ``wall_s`` in
         # metrics rows reflects training time only — corpus generation
@@ -342,16 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         # the next ``scan`` — that would serialise compute / staging.
         step_start = 0
         for chunk_i in range(n_chunks):
-            offset = chunk_i * args.k * args.batch_size
-            chunk = _stage_chunk(
-                corpus.tokens,
-                corpus.attn_mask,
-                corpus.targets,
-                corpus.loss_mask,
-                offset,
-                args.k,
-                args.batch_size,
-            )
+            chunk = chunked_corpus.stage(chunk_i)
             t_chunk = time.perf_counter()
             state, metrics = scan(state, chunk)
             # Block on both ``state`` and ``metrics`` — ``state.step``
