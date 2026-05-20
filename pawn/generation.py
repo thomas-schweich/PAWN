@@ -36,10 +36,24 @@ Three implementation differences are worth flagging:
      legality.
   3. **Sampling is Gumbel-max** (matches the legacy; equivalent to
      softmax-then-sample for `temperature=1`).
+
+Known limitation (preserved from legacy): when ``prefix_lengths``
+varies *within* a batch (the common case for percentage-based prefix
+buckets in §6.4 / §6.5), the decode loop starts at the batch-wide
+maximum ``prefix_end``. Rows with shorter prefixes therefore see PAD
+gaps in their attended context at positions ``[their_prefix_end + 1,
+max_prefix_end]`` before the model starts sampling for them. The
+engine state machine is still correct (each row's piece positions
+advance per ``load_prefixes``), but the model is conditioned on a
+PAD-padded context rather than the true mid-game context. Codex
+flagged this; a faithful port preserves the legacy behaviour so
+§6.4-6.5 metrics remain comparable. A correctness fix (group rows
+by equal prefix_length, decode per group) is a follow-up.
 """
 
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -109,10 +123,29 @@ class GenerationResult:
 # ---------------------------------------------------------------------------
 
 
-_forward_jit = eqx.filter_jit(
-    lambda model, ids, attn: model(ids, attn),
-    donate="none",
-)
+def _forward(
+    model: PAWNModel, ids: jax.Array, attn: jax.Array,
+) -> jax.Array:
+    """Typed wrapper so ``filter_jit`` preserves the call signature
+    (the previous bare lambda was inferred as ``Unknown`` by pyright,
+    poisoning every downstream expression). (Type-correctness)"""
+    return model(ids, attn)
+
+
+_forward_jit = eqx.filter_jit(_forward, donate="none")
+
+
+def _subseed(seed: int, *parts: object) -> int:
+    """Deterministic process-stable per-call seed derived from
+    ``seed`` and the variadic key parts. Used by §6.4-6.7 tests to
+    give every inner ``autoregressive_generate`` call independent
+    Gumbel noise without relying on Python's process-randomised
+    ``hash()``. The derivation is SHA-256 over the encoded parts;
+    the high 32 bits are XOR'd onto ``seed``.
+    """
+    payload = "|".join(str(p) for p in parts).encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return (seed ^ int.from_bytes(digest[:4], "little")) & 0x7FFFFFFF
 
 
 def _gumbel_max_argmax(
@@ -169,6 +202,14 @@ def autoregressive_generate(
         max_seq_len = model.cfg.max_seq_len
     if n_games <= 0:
         raise ValueError(f"n_games must be > 0, got {n_games}")
+    # Asymmetric prefix args silently dropped both — surface the
+    # misuse so a downstream test that forgets one half doesn't
+    # quietly generate from-scratch. (Test-risk)
+    if (prefix_moves is None) != (prefix_lengths is None):
+        raise ValueError(
+            "prefix_moves and prefix_lengths must be passed together "
+            "(both or neither)"
+        )
     if temperature <= 0:
         raise ValueError(f"temperature must be > 0, got {temperature}")
 
@@ -227,7 +268,8 @@ def _generate_batch(
         # lengths.
         padded = np.zeros((n_games, max_move_positions), dtype=np.uint16)
         clamped_pls = np.minimum(
-            np.asarray(prefix_lengths, dtype=np.int32), max_move_positions,
+            np.asarray(prefix_lengths, dtype=np.int32),
+            min(max_move_positions, int(prefix_moves.shape[1])),
         )
         for i in range(n_games):
             pl = int(clamped_pls[i])
@@ -472,10 +514,20 @@ def outcome_signal_test(
                     f"generating {n_per_outcome} games"
                 )
             t0 = time.perf_counter()
+            # Process-stable per-(outcome, mask) seed offset. Python's
+            # built-in ``hash`` of a string is randomised per process
+            # (PYTHONHASHSEED), which would silently make
+            # ``outcome_signal_test`` non-reproducible across runs —
+            # SHA-256 over the encoded key gives a deterministic
+            # 32-bit offset instead. (Test-risk)
+            digest = hashlib.sha256(
+                f"{oname}:{masked}".encode("utf-8")
+            ).digest()
+            offset = int.from_bytes(digest[:4], "little") % 10_000
             gen = autoregressive_generate(
                 model, otok, n_per_outcome,
                 mask_illegal=masked, batch_size=batch_size,
-                seed=seed + hash((oname, masked)) % 10_000,
+                seed=seed + offset,
             )
             results[oname][label] = _analyze_generated_games(gen, oname)
             results[oname][label]["elapsed_s"] = time.perf_counter() - t0
@@ -540,7 +592,16 @@ def prefix_continuation_test(
                     model, ctok, n_per_bucket,
                     mask_illegal=True,
                     prefix_moves=move_ids[selected], prefix_lengths=pls,
-                    batch_size=batch_size, seed=seed,
+                    batch_size=batch_size,
+                    # Per-(oname, bucket, cname) subseed so every inner
+                    # generation draws independent Gumbel noise — passing
+                    # ``seed=seed`` to every inner call would collapse
+                    # cross-condition variance (every condition draws the
+                    # same noise; only the logit difference distinguishes
+                    # them). The legacy torch port relied on the global
+                    # RNG to advance state across calls; we make that
+                    # explicit. (Bug-detector)
+                    seed=_subseed(seed, oname, bucket, cname),
                 )
                 bucket_results[cname] = _analyze_generated_games(gen, cname)
             results[oname][bucket] = bucket_results
@@ -552,13 +613,14 @@ def prefix_continuation_test(
                 continue
             sub = long_enough[:n_per_bucket]
             pls = np.full(len(sub), abs_ply, dtype=np.int32)
-            bucket_results = {}
+            bucket_results: dict[str, Any] = {}
             for cname, ctok in OUTCOME_TOKENS.items():
                 gen = autoregressive_generate(
                     model, ctok, len(sub),
                     mask_illegal=True,
                     prefix_moves=move_ids[sub], prefix_lengths=pls,
-                    batch_size=batch_size, seed=seed,
+                    batch_size=batch_size,
+                    seed=_subseed(seed, oname, bucket, cname),
                 )
                 bucket_results[cname] = _analyze_generated_games(gen, cname)
             results[oname][bucket] = bucket_results
@@ -571,7 +633,7 @@ def prefix_continuation_test(
 # ---------------------------------------------------------------------------
 
 
-POISONING_PAIRS = (
+POISONING_PAIRS: tuple[tuple[str, str], ...] = (
     ("WHITE_CHECKMATES", "BLACK_CHECKMATES"),
     ("WHITE_CHECKMATES", "DRAW_BY_RULE"),
     ("DRAW_BY_RULE", "WHITE_CHECKMATES"),
@@ -616,7 +678,8 @@ def poisoned_prefix_test(
             model, OUTCOME_TOKENS[poisoned], n_per_pair,
             mask_illegal=True,
             prefix_moves=move_ids[selected], prefix_lengths=pls,
-            batch_size=batch_size, seed=seed,
+            batch_size=batch_size,
+            seed=_subseed(seed, "poisoned", actual, poisoned),
         )
         analysis = _analyze_generated_games(gen, poisoned)
         # Additionally, track how often the continuation lands on the
@@ -675,7 +738,8 @@ def impossible_task_test(
             model, OUTCOME_TOKENS["WHITE_CHECKMATES"], n_per_scenario,
             mask_illegal=True,
             prefix_moves=move_ids[selected], prefix_lengths=pls,
-            batch_size=batch_size, seed=seed,
+            batch_size=batch_size,
+            seed=_subseed(seed, "impossible", "zero_remaining_ply"),
         )
         results["zero_remaining_ply"] = _analyze_generated_games(
             gen, "WHITE_CHECKMATES",
@@ -686,7 +750,8 @@ def impossible_task_test(
             model, OUTCOME_TOKENS["PLY_LIMIT"], n_per_scenario,
             mask_illegal=True,
             prefix_moves=move_ids[selected], prefix_lengths=pls,
-            batch_size=batch_size, seed=seed,
+            batch_size=batch_size,
+            seed=_subseed(seed, "impossible", "control_ply_limit"),
         )
         results["control_ply_limit"] = _analyze_generated_games(
             gen_ctrl, "PLY_LIMIT",
@@ -701,7 +766,8 @@ def impossible_task_test(
             model, OUTCOME_TOKENS["WHITE_CHECKMATES"], n_per_scenario,
             mask_illegal=True,
             prefix_moves=move_ids[selected], prefix_lengths=pls,
-            batch_size=batch_size, seed=seed,
+            batch_size=batch_size,
+            seed=_subseed(seed, "impossible", "insufficient_material"),
         )
         results["insufficient_material"] = _analyze_generated_games(
             gen, "WHITE_CHECKMATES",
@@ -748,7 +814,8 @@ def improbable_task_test(
             model, OUTCOME_TOKENS["WHITE_CHECKMATES"], n_per_scenario,
             mask_illegal=True,
             prefix_moves=move_ids[selected], prefix_lengths=pls,
-            batch_size=batch_size, seed=seed,
+            batch_size=batch_size,
+            seed=_subseed(seed, "improbable", "checkmate_few_ply"),
         )
         results["checkmate_few_ply"] = _analyze_generated_games(
             gen, "WHITE_CHECKMATES",
@@ -757,7 +824,8 @@ def improbable_task_test(
             model, OUTCOME_TOKENS["PLY_LIMIT"], n_per_scenario,
             mask_illegal=True,
             prefix_moves=move_ids[selected], prefix_lengths=pls,
-            batch_size=batch_size, seed=seed,
+            batch_size=batch_size,
+            seed=_subseed(seed, "improbable", "control_few_ply"),
         )
         results["control_few_ply"] = _analyze_generated_games(
             gen_ctrl, "PLY_LIMIT",
@@ -772,7 +840,8 @@ def improbable_task_test(
             model, OUTCOME_TOKENS["STALEMATE"], n_per_scenario,
             mask_illegal=True,
             prefix_moves=move_ids[selected], prefix_lengths=pls,
-            batch_size=batch_size, seed=seed,
+            batch_size=batch_size,
+            seed=_subseed(seed, "improbable", "stalemate_early"),
         )
         results["stalemate_early"] = _analyze_generated_games(
             gen, "STALEMATE",
@@ -781,7 +850,8 @@ def improbable_task_test(
             model, OUTCOME_TOKENS["PLY_LIMIT"], n_per_scenario,
             mask_illegal=True,
             prefix_moves=move_ids[selected], prefix_lengths=pls,
-            batch_size=batch_size, seed=seed,
+            batch_size=batch_size,
+            seed=_subseed(seed, "improbable", "control_early"),
         )
         results["control_early"] = _analyze_generated_games(
             gen_ctrl, "PLY_LIMIT",

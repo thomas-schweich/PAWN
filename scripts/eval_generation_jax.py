@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+from typing import Any
 import json
 import os
 from pathlib import Path
@@ -180,7 +181,7 @@ def main() -> None:
             args.corpus_size, args.corpus_max_ply, args.corpus_seed,
         )
 
-    results: dict[str, dict] = {}
+    results: dict[str, dict[str, Any]] = {}
 
     if "outcome_signal" in tests_to_run:
         results["outcome_signal"] = outcome_signal_test(

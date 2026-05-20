@@ -18,7 +18,6 @@ import jax
 from pawn.config import OUTCOME_TOKEN_BASE, PAD_TOKEN, TINY_SUPERNET
 from pawn.generation import (
     OUTCOME_TOKENS,
-    POISONING_PAIRS,
     GenerationResult,
     _analyze_generated_games,
     _outcome_mask,
