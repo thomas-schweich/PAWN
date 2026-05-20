@@ -74,6 +74,26 @@ VARIANTS: dict[str, ModelConfig] = {
 # Tiny config for tests only — does not nest into SUPERNET.
 TOY = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=256)
 
+
+# Tiny nested supernet for Phase-2 verification runs and slicing tests.
+# All four configs share ``head_dim = 64`` so the nesting invariant holds.
+# The production ``SUPERNET`` is too big for a smoke run on commodity GPUs;
+# this gives the same supernet→variants structure at roughly 4-5% of the
+# production FLOPs per step (less width, fewer layers, smaller FFN — but
+# the same 512-token context, since attention's T^2 term dominates).
+#
+# - TINY_SUPERNET:  d=192, L=4, H=3, d_ff= 768   (~2.8M params total)
+# - TINY_VARIANTS["small"]:  d= 64, L=2, H=1, d_ff= 256
+# - TINY_VARIANTS["base"]:   d=128, L=3, H=2, d_ff= 512
+# - TINY_VARIANTS["large"]:  d=192, L=4, H=3, d_ff= 768  (= TINY_SUPERNET)
+TINY_SUPERNET = ModelConfig(d_model=192, n_layers=4, n_heads=3, d_ff=768)
+
+TINY_VARIANTS: dict[str, ModelConfig] = {
+    "small": ModelConfig(d_model=64, n_layers=2, n_heads=1, d_ff=256),
+    "base": ModelConfig(d_model=128, n_layers=3, n_heads=2, d_ff=512),
+    "large": TINY_SUPERNET,
+}
+
 _NESTED_EQUAL_FIELDS = ("vocab_size", "max_seq_len", "n_outcomes", "rope_base")
 _NESTED_LEQ_FIELDS = ("d_model", "n_layers", "d_ff")
 
