@@ -23,8 +23,11 @@ Ported strategies (``docs/jax-migration.md`` §9 Phase 3):
 * ``film`` — Per-channel post-layer affine modulation
   (Perez et al. 2017).
 * ``unfreeze`` — Partial fine-tune of the top ``n_unfreeze`` backbone
-  layers (no new parameters; trainable subtree is a per-layer mask
-  applied to the existing backbone leaves).
+  layers. The Python-bool ``adapter_filter`` marks each backbone
+  field fully True or fully False at coarse granularity; per-layer
+  slicing (top-N only) is layered on top via the companion
+  ``unfreeze_gradient_mask`` which returns the per-element bool
+  mask the trainer plugs into ``optax.masked``.
 
 Not yet ported (follow-up PRs; see the final migration PR for the
 list and ``docs/jax-migration.md`` for status):
@@ -64,6 +67,7 @@ from pawn.adapters.unfreeze import (
 )
 from pawn.adapters.unfreeze import (
     init_unfreeze_model,
+    make_gradient_mask as unfreeze_gradient_mask,
 )
 
 __all__ = [
@@ -80,4 +84,5 @@ __all__ = [
     "init_lora_model",
     "init_unfreeze_model",
     "unfreeze_adapter_filter",
+    "unfreeze_gradient_mask",
 ]

@@ -41,7 +41,6 @@ import jax.numpy as jnp
 from pawn.model import (
     LayerWeights,
     PAWNModel,
-    _apply_rope,  # noqa: F401 — re-exported indirectly via private helpers
     _attention,
     _build_attn_mask,
     _ffn,
@@ -126,7 +125,14 @@ class FiLMModel(eqx.Module):
             )
             h = h + _ffn(_rmsnorm(h, lw.ffn_norm), lw.w_gate, lw.w_up, lw.w_down)
             # FiLM is per-channel, broadcast over (B, T):
-            #   h_b_t_d ← gamma_l_d · h_b_t_d + beta_l_d
+            #   h_b_t_d ← γ_l_d · h_b_t_d + β_l_d
+            # Cast γ/β to the carry dtype before the multiply so a bf16
+            # backbone doesn't have its carry silently promoted to fp32
+            # — ``lax.scan`` rejects the carry-dtype mismatch on the
+            # next iteration. (Same dtype-promotion fix the Phase-3
+            # LoRA chunk applied to its delta cast.) (Codex P2)
+            gamma = gamma.astype(h.dtype)
+            beta = beta.astype(h.dtype)
             h = gamma[None, None, :] * h + beta[None, None, :]
             return h, None
 

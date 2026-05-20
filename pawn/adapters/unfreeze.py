@@ -1,31 +1,35 @@
 """Partial-unfreeze strategy: fine-tune the top ``n_unfreeze`` transformer
 layers of a PAWN backbone directly, leave the rest frozen.
 
-Unlike LoRA / FiLM / bottleneck, this strategy adds *no* new parameters —
-it just changes which existing backbone parameters get gradients. The
-"adapter" PyTree is therefore just the backbone itself wrapped in a
-config-carrying module; ``adapter_filter`` builds the True-only-on-
-top-N-layer-slices spec.
+Unlike LoRA / FiLM, this strategy adds *no* new parameters — it
+selects a subset of existing backbone parameters as trainable.
 
-Filter semantics:
+Two pieces fit together so per-layer "top N" slicing works without
+violating Equinox's filter-spec contract ("leaves must be Python
+bools or callables only"):
 
-* For each stacked layer-axis array (``wq``, ``wk``, ``wv``, ``wo``,
-  ``attn_norm``, ``ffn_norm``, ``w_gate``, ``w_up``, ``w_down``), the
-  per-layer leaves are *all* True (i.e. the full array is trainable).
-  Per-layer fine-grained masking (e.g. only layers 6..8 of an 8-layer
-  model) is handled by passing a 0-gradient mask through the per-layer
-  axis in the trainer; the lift here just builds a stacked-True array
-  the optimizer chains can multiply by a per-layer mask.
-* ``final_norm`` + ``lm_head`` follow ``cfg.include_lm_head``.
-* Embedding tables (``src_embed`` / ``dst_embed`` / ``promo_embed`` /
-  ``pad_embed`` / ``outcome_embed``) follow ``cfg.include_embeddings``.
+* ``adapter_filter(model)`` — returns a Python-bool filter spec.
+  Layer-stacked weights are marked ``True`` *as a whole* iff
+  ``cfg.n_unfreeze > 0``; ``final_norm`` + ``lm_head`` follow
+  ``cfg.include_lm_head``; embedding tables follow
+  ``cfg.include_embeddings``. ``eqx.partition`` consumes this to
+  produce a fully-trainable layer-stack subtree.
 
-Because the per-layer mask is the active dimension, ``UnfreezeConfig``
-also carries the integer range ``(first_unfrozen_layer..n_layers - 1)``;
-``adapter_filter`` builds a stacked True/False array for the leading
-n_layers axis of every layer-stacked weight, set True for layer indices
-``>= first_unfrozen_layer``. Per-layer linear-projection arrays therefore
-get gradients only on the unfrozen layers.
+* ``make_gradient_mask(model)`` — returns a PyTree of per-element
+  bool *arrays* shaped like the corresponding backbone weights.
+  Layer-stacked weights get a leading-axis mask True only on the
+  unfrozen layer indices (``>= n_layers - n_unfreeze``); head +
+  embedding leaves get full-True / full-False masks per the config
+  flags. The adapter trainer multiplies gradients by this mask
+  before the optimizer step, or wraps the optimizer with
+  ``optax.masked(opt, mask=...)``. Either way the backbone PyTree
+  shape stays identical to the model's.
+
+Codex / bug-detector / type-correctness all flagged the prior
+array-valued ``adapter_filter`` as breaking ``eqx.partition``:
+filter-spec leaves must be ``bool`` / callable, never ``jax.Array``.
+This split fixes that without losing the per-layer slicing the
+strategy is named for.
 """
 
 from __future__ import annotations
@@ -45,9 +49,9 @@ class UnfreezeConfig:
 
     Args:
         n_unfreeze: number of *top* transformer layers to unfreeze.
-            Must be in ``[0, n_layers]``. ``0`` = freeze everything
-            (only lm_head / embeddings depending on the flags);
-            ``n_layers`` = full fine-tune.
+            Must be in ``[0, n_layers]``. ``0`` = freeze every layer
+            (only lm_head / embeddings remain trainable, depending on
+            the flags); ``n_layers`` = full fine-tune.
         include_lm_head: also unfreeze ``final_norm`` + ``lm_head``.
         include_embeddings: also unfreeze the input embedding tables.
     """
@@ -102,64 +106,97 @@ _HEAD_FIELDS = ("final_norm", "lm_head")
 
 
 def adapter_filter(model: UnfreezeModel) -> UnfreezeModel:
-    """Build the True-on-trainable filter spec for partial unfreeze.
+    """Python-bool filter spec for ``eqx.partition``.
 
-    For each layer-stacked weight, the returned tree replaces the
-    array leaf with a *bool array* of shape ``(n_layers, ...)`` set
-    True on layer indices ``>= first_unfrozen_layer``. Equinox's
-    partition machinery treats arbitrary leaves matching the original
-    shape as the filter spec, so the optimizer + gradient
-    transformations see per-layer slicing without any special-case
-    code in the trainer.
+    Coarse granularity: each backbone field is fully True or fully
+    False. Per-layer slicing (top-N layers only) is layered on top
+    via ``make_gradient_mask`` + ``optax.masked``.
 
-    Note: this means downstream code must handle the case where some
-    leaves are bool arrays (the trainable axis) and others are bare
-    Python bools (the always-frozen / always-trainable scalars). The
-    standard ``eqx.partition`` call handles this correctly.
+    Layer-stacked weights are True iff ``cfg.n_unfreeze > 0`` (i.e.
+    at least one layer is unfrozen). ``final_norm`` + ``lm_head``
+    follow ``cfg.include_lm_head``; embedding tables follow
+    ``cfg.include_embeddings``.
+    """
+    cfg = model.cfg
+    layers_trainable = cfg.n_unfreeze > 0
+    false_tree = jax.tree_util.tree_map(lambda _: False, model)
+
+    def _set(tree: UnfreezeModel, name: str, value: bool) -> UnfreezeModel:
+        return eqx.tree_at(
+            lambda t, n=name: getattr(t.backbone, n),
+            tree, replace=value,
+        )
+
+    tree = false_tree
+    for name in _LAYER_STACKED_FIELDS:
+        tree = _set(tree, name, layers_trainable)
+    if cfg.include_lm_head:
+        for name in _HEAD_FIELDS:
+            tree = _set(tree, name, True)
+    if cfg.include_embeddings:
+        for name in _EMBED_FIELDS:
+            tree = _set(tree, name, True)
+    return tree
+
+
+def make_gradient_mask(model: UnfreezeModel) -> UnfreezeModel:
+    """Per-element bool-mask PyTree for ``optax.masked``.
+
+    Returns a tree shaped like ``model`` whose array leaves are bool
+    arrays of the *same shape* as the corresponding backbone
+    weight. Layer-stacked weights get a leading-axis bool mask True
+    only on layer indices ``>= n_layers - n_unfreeze``. Head +
+    embedding leaves get full-True / full-False masks per the
+    config flags. Non-array leaves (the config object, ``None``
+    leaves on the trainable partition, etc.) are left as-is.
+
+    The trainer then either multiplies gradients element-wise by
+    this mask, or wraps the optimizer with ``optax.masked(opt,
+    mask)`` — both produce the same result: backbone PyTree shape
+    stays identical, but only the unfrozen layer slices get
+    optimizer updates.
     """
     bb = model.backbone
     cfg = model.cfg
     n_layers = bb.cfg.n_layers
     first_unfrozen = n_layers - cfg.n_unfreeze
-
-    # Bool mask along the leading layer axis.
     layer_mask = (jnp.arange(n_layers) >= first_unfrozen)  # (n_layers,) bool
 
-    # Start with everything = False.
-    false_tree = jax.tree_util.tree_map(lambda _: False, model)
+    # Start from a tree of zeros-shaped-like-leaves for arrays,
+    # passthrough for everything else. ``eqx.is_array`` covers the
+    # weight leaves; we only ever overwrite under the backbone
+    # subtree below.
+    def _zero_leaf(leaf: object) -> object:
+        if eqx.is_array(leaf):
+            return jnp.zeros_like(leaf, dtype=jnp.bool_)
+        return leaf
+    false_tree = jax.tree_util.tree_map(_zero_leaf, model)
 
-    # Replace each layer-stacked weight with a per-layer broadcast of
-    # ``layer_mask``. The shape matches the weight so partition can
-    # split element-wise.
-    def _replace_layer_stacked(tree: UnfreezeModel) -> UnfreezeModel:
-        for name in _LAYER_STACKED_FIELDS:
-            weight = getattr(bb, name)
-            broadcast_shape = (n_layers,) + (1,) * (weight.ndim - 1)
-            mask = jnp.broadcast_to(
-                layer_mask.reshape(broadcast_shape), weight.shape,
-            )
-            tree = eqx.tree_at(
-                lambda t, n=name: getattr(t.backbone, n),
-                tree, mask,
-            )
-        return tree
+    def _set_array(tree: UnfreezeModel, name: str, mask: jax.Array) -> UnfreezeModel:
+        return eqx.tree_at(
+            lambda t, n=name: getattr(t.backbone, n),
+            tree, replace=mask,
+        )
 
-    tree = _replace_layer_stacked(false_tree)
+    tree = false_tree
+    for name in _LAYER_STACKED_FIELDS:
+        weight = getattr(bb, name)
+        broadcast_shape = (n_layers,) + (1,) * (weight.ndim - 1)
+        mask = jnp.broadcast_to(
+            layer_mask.reshape(broadcast_shape), weight.shape,
+        )
+        tree = _set_array(tree, name, mask)
 
     if cfg.include_lm_head:
         for name in _HEAD_FIELDS:
             weight = getattr(bb, name)
-            tree = eqx.tree_at(
-                lambda t, n=name: getattr(t.backbone, n),
-                tree, jnp.ones(weight.shape, dtype=bool),
+            tree = _set_array(
+                tree, name, jnp.ones(weight.shape, dtype=jnp.bool_),
             )
-
     if cfg.include_embeddings:
         for name in _EMBED_FIELDS:
             weight = getattr(bb, name)
-            tree = eqx.tree_at(
-                lambda t, n=name: getattr(t.backbone, n),
-                tree, jnp.ones(weight.shape, dtype=bool),
+            tree = _set_array(
+                tree, name, jnp.ones(weight.shape, dtype=jnp.bool_),
             )
-
     return tree
