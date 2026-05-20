@@ -77,6 +77,7 @@ ARGPARSE_SCRIPTS = [
     "datagen_reconcile_tier.py",
     "datagen_with_hf_sync.py",
     "eval_accuracy.py",
+    "eval_jax.py",
     "eval_probes.py",
     "eval_vs_stockfish.py",
     "export_hf_repo.py",
