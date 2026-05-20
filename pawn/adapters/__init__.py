@@ -34,12 +34,15 @@ Ported strategies (``docs/jax-migration.md`` §9 Phase 3):
   ``unfreeze_gradient_mask`` which returns the per-element bool
   mask the trainer plugs into ``optax.masked``.
 
-Not yet ported (follow-up PRs; see the final migration PR for the
-list and ``docs/jax-migration.md`` for status):
-
-* ``rosa`` — Gradient-informed sparse + LoRA, 3-phase training.
+* ``rosa`` — Gradient-informed sparse + LoRA (Nikdan et al. 2024).
+  This module ships the parameterisation + ``set_mask`` helper; the
+  legacy three-phase training schedule itself is a trainer-side
+  concern that lands when the adapter trainer driver picks up RoSA
+  dispatch.
 * ``specialized_clm`` — From-scratch standalone transformer (not
-  really an adapter — separate from the backbone entirely).
+  really an adapter — separate from the backbone entirely; the
+  module is a thin wrapper around ``pawn.model.init_model`` for
+  dispatch parity with the legacy ``--strategy`` table).
 """
 
 from pawn.adapters.bottleneck import (
@@ -80,6 +83,27 @@ from pawn.adapters.lora import (
     adapter_filter,
     init_lora_model,
 )
+from pawn.adapters.rosa import (
+    RoSAConfig,
+    RoSAModel,
+    RoSAParams,
+)
+from pawn.adapters.rosa import (
+    adapter_filter as rosa_adapter_filter,
+)
+from pawn.adapters.rosa import (
+    init_rosa_model,
+    set_mask as rosa_set_mask,
+)
+from pawn.adapters.specialized_clm import (
+    SpecializedCLMConfig,
+)
+from pawn.adapters.specialized_clm import (
+    adapter_filter as specialized_clm_adapter_filter,
+)
+from pawn.adapters.specialized_clm import (
+    init_specialized_clm,
+)
 from pawn.adapters.sparse import (
     SparseConfig,
     SparseModel,
@@ -114,9 +138,13 @@ __all__ = [
     "HybridModel",
     "LoRAConfig",
     "LoRAModel",
+    "RoSAConfig",
+    "RoSAModel",
+    "RoSAParams",
     "SparseConfig",
     "SparseModel",
     "SparseParams",
+    "SpecializedCLMConfig",
     "UnfreezeConfig",
     "UnfreezeModel",
     "adapter_filter",
@@ -127,9 +155,14 @@ __all__ = [
     "init_film_model",
     "init_hybrid_model",
     "init_lora_model",
+    "init_rosa_model",
+    "init_specialized_clm",
     "init_sparse_model",
     "init_unfreeze_model",
+    "rosa_adapter_filter",
+    "rosa_set_mask",
     "sparse_adapter_filter",
+    "specialized_clm_adapter_filter",
     "unfreeze_adapter_filter",
     "unfreeze_gradient_mask",
 ]
