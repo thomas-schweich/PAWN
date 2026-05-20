@@ -191,11 +191,14 @@ def test_happy_path_writes_metrics_and_config(tmp_path: Path) -> None:
     assert len(runs) == 1
     rd = runs[0]
     cfg = json.loads((rd / "config.json").read_text())
-    # Config carries full per-variant ModelConfig dicts.
+    # Config carries full per-variant ModelConfig dicts. The
+    # multi-strategy dispatch refactor moved per-strategy hyperparams
+    # under ``strategy_config`` keyed by ``strategy``.
     assert cfg["variant"] == "base"
     assert cfg["variant_cfg"]["d_model"] == 128  # TINY_VARIANTS["base"]
-    assert cfg["lora"]["rank"] == 4
-    assert cfg["lora"]["targets"] == ["q", "v"]
+    assert cfg["strategy"] == "lora"
+    assert cfg["strategy_config"]["rank"] == 4
+    assert cfg["strategy_config"]["targets"] == ["q", "v"]
     rows = [
         json.loads(line)
         for line in (rd / "metrics.jsonl").read_text().splitlines()
@@ -209,6 +212,94 @@ def test_happy_path_writes_metrics_and_config(tmp_path: Path) -> None:
         assert math.isfinite(r["grad_norm_mean"])
         if r["val_loss"] is not None:
             assert math.isfinite(r["val_loss"])
+
+
+_STRATEGY_EXTRA_ARGS: dict[str, list[str]] = {
+    "lora": ["--rank", "4"],
+    "film": [],
+    "unfreeze": ["--n-unfreeze", "1"],
+    "bottleneck": ["--bottleneck-dim", "8"],
+    "hybrid": ["--rank", "4"],
+    "sparse": ["--sparse-density", "0.1"],
+    "rosa": ["--rank", "4"],
+    "specialized_clm": [
+        "--specialized-d-model", "64",
+        "--specialized-n-layers", "2",
+        "--specialized-n-heads", "2",
+        "--specialized-d-ff", "128",
+    ],
+}
+
+
+@pytest.mark.parametrize("strategy", list(_STRATEGY_EXTRA_ARGS))
+def test_each_strategy_dispatch_runs(strategy: str, tmp_path: Path) -> None:
+    """Smoke-test the per-strategy dispatch path. Each strategy
+    builds its own model + adapter_filter + (optional) gradient mask
+    and runs through ``init_adapter_state`` →
+    ``make_adapter_train_step`` → 10 training steps + 1 val pass
+    without raising. The 8th strategy (``specialized_clm``) is the
+    only one that doesn't slice a supernet — its dispatch ignores
+    ``--variant`` and builds a from-scratch model from the
+    ``--specialized-*`` hyperparams."""
+    args = [
+        "--strategy", strategy,
+        "--supernet", "tiny", "--variant", "base",
+        "--total-steps", "10", "--k", "5",
+        "--batch-size", "2", "--seq-len", "16",
+        "--warmup-steps", "1", "--val-frac", "0.1",
+        "--val-every", "1", "--quiet",
+        *_STRATEGY_EXTRA_ARGS[strategy],
+    ]
+    _run(args, tmp_path)
+    runs = list(tmp_path.glob("jax_adapter_run_*"))
+    assert len(runs) == 1
+    cfg = json.loads((runs[0] / "config.json").read_text())
+    assert cfg["strategy"] == strategy
+    if strategy == "specialized_clm":
+        # specialized_clm doesn't use the supernet/variant pipeline.
+        assert cfg["variant"] == "from-scratch"
+        assert cfg["variant_cfg"] is None
+    else:
+        assert cfg["variant"] == "base"
+    # At least one training row + one val row.
+    rows = [
+        json.loads(line)
+        for line in (runs[0] / "metrics.jsonl").read_text().splitlines()
+    ]
+    assert len(rows) == 2
+    for r in rows:
+        assert math.isfinite(r["train_loss_mean"])
+        assert math.isfinite(r["grad_norm_mean"])
+
+
+def test_rejects_bottleneck_dim_zero(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="bottleneck-dim"):
+        _run(
+            [
+                "--strategy", "bottleneck",
+                "--supernet", "tiny", "--variant", "base",
+                "--total-steps", "10", "--k", "5",
+                "--batch-size", "2", "--seq-len", "16",
+                "--warmup-steps", "1", "--val-frac", "0.1",
+                "--bottleneck-dim", "0",
+            ],
+            tmp_path,
+        )
+
+
+def test_rejects_sparse_density_out_of_range(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="sparse-density"):
+        _run(
+            [
+                "--strategy", "sparse",
+                "--supernet", "tiny", "--variant", "base",
+                "--total-steps", "10", "--k", "5",
+                "--batch-size", "2", "--seq-len", "16",
+                "--warmup-steps", "1", "--val-frac", "0.1",
+                "--sparse-density", "1.5",
+            ],
+            tmp_path,
+        )
 
 
 def test_validation_failures_do_not_create_run_dir(tmp_path: Path) -> None:

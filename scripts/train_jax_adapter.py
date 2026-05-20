@@ -1,26 +1,37 @@
-"""JAX adapter training driver — Phase 3 verification.
+"""JAX adapter training driver.
 
-Trains a LoRA adapter on a finite corpus (Rust-engine random games
-serve as the verification proxy for the production Lichess
-Elo-slice cache; the cache itself lands in Phase 4 cleanup).
+Trains one of the eight adapter strategies
+(``lora`` / ``film`` / ``unfreeze`` / ``bottleneck`` / ``hybrid`` /
+``sparse`` / ``rosa`` / ``specialized_clm``) on a finite corpus
+(Rust-engine random games serve as the verification proxy for the
+production Lichess Elo-slice cache).
 
 Execution order:
 
-  1. Parse args. Validates ``--rank > 0``, ``--total-steps > 0``,
+  1. Parse args; resolve the strategy. Validates ``--total-steps > 0``,
      ``--total-steps % --k == 0``, ``--batch-size > 0``, ``--seq-len
-     > 0``, ``--seq-len <= supernet.max_seq_len``.
+     > 0``, ``--seq-len <= supernet.max_seq_len``, plus per-strategy
+     argument constraints (e.g. ``--rank > 0`` for LoRA / RoSA;
+     ``--bottleneck-dim > 0`` for Bottleneck).
   2. Build the LR schedule (catches misconfigs before any filesystem
      write).
   3. Estimate corpus memory; abort if it exceeds ``--max-corpus-gb``.
   4. Generate the Rust-engine corpus (treat as a finite dataset:
      train + val split).
   5. Create the run directory and write ``config.json``.
-  6. Init the supernet, slice to ``--variant``, wrap with LoRA, init
-     two-tier optimizer state, build the K-step scan + eval callable.
+  6. Init the supernet, slice to ``--variant`` (or build a from-
+     scratch model for ``specialized_clm``), wrap with the chosen
+     adapter, init two-tier optimizer state, build the K-step scan +
+     eval callable.
   7. Train for ``--total-steps`` chunks; eval every ``--val-every``
      chunks; log per-chunk train + val metrics to ``metrics.jsonl``.
 
 The eval split is the last ``--val-frac`` of the generated corpus.
+
+RoSA dispatch ships the parameterisation + a single-phase joint
+training schedule for verification-scale runs; the legacy three-
+phase schedule (LoRA warmup → gradient-mask gen → joint training)
+lands in a follow-up chunk — see ``docs/jax-migration.md`` §12.
 """
 
 from __future__ import annotations
@@ -32,8 +43,11 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -44,7 +58,33 @@ from pawn.adapter_trainer import (
     make_adapter_train_step,
     make_eval_step,
 )
-from pawn.adapters import LoRAConfig, LoRAModel, init_lora_model
+from pawn.adapters import (
+    BottleneckConfig,
+    FiLMConfig,
+    HybridConfig,
+    LoRAConfig,
+    RoSAConfig,
+    SparseConfig,
+    SpecializedCLMConfig,
+    UnfreezeConfig,
+    adapter_filter,
+    bottleneck_adapter_filter,
+    film_adapter_filter,
+    hybrid_adapter_filter,
+    init_bottleneck_model,
+    init_film_model,
+    init_hybrid_model,
+    init_lora_model,
+    init_rosa_model,
+    init_specialized_clm,
+    init_sparse_model,
+    init_unfreeze_model,
+    rosa_adapter_filter,
+    specialized_clm_adapter_filter,
+    sparse_adapter_filter,
+    unfreeze_adapter_filter,
+    unfreeze_gradient_mask,
+)
 from pawn.config import (
     SUPERNET,
     TINY_SUPERNET,
@@ -53,8 +93,13 @@ from pawn.config import (
     ModelConfig,
 )
 from pawn.corpus import generate_corpus
-from pawn.model import init_model, sliced
+from pawn.model import PAWNModel, init_model, sliced
 from pawn.trainer import Batch, make_lr_schedule, make_optimizer
+
+STRATEGIES = (
+    "lora", "film", "unfreeze", "bottleneck",
+    "hybrid", "sparse", "rosa", "specialized_clm",
+)
 
 
 def _slug() -> str:
@@ -77,22 +122,317 @@ def _stage(arr: np.ndarray) -> jax.Array:
     return jnp.asarray(arr)
 
 
+# ---------------------------------------------------------------------------
+# Per-strategy build dispatch
+# ---------------------------------------------------------------------------
+
+
+# Each build function returns a 3-tuple:
+#   (model, adapter_filter_fn, gradient_mask | None)
+# ``gradient_mask`` is only non-None for strategies that need per-
+# element gradient gating (``unfreeze``: per-layer slicing of layer-
+# stacked weights).
+BuildResult = tuple[
+    eqx.Module,
+    # See ``pawn.adapter_trainer.AdapterFilterFn`` for why this uses
+    # variadic-arg typing instead of ``Callable[[eqx.Module],
+    # eqx.Module]``.
+    Callable[..., eqx.Module],
+    eqx.Module | None,
+]
+
+
+def _build_lora(
+    backbone: PAWNModel, args: argparse.Namespace, key: jax.Array,
+) -> BuildResult:
+    cfg = LoRAConfig(
+        rank=args.rank, targets=tuple(args.lora_targets),
+        alpha=args.lora_alpha,
+    )
+    return init_lora_model(backbone, cfg, key), adapter_filter, None
+
+
+def _build_film(
+    backbone: PAWNModel, args: argparse.Namespace, key: jax.Array,
+) -> BuildResult:
+    cfg = FiLMConfig(use_output_film=args.film_output)
+    return init_film_model(backbone, cfg, key), film_adapter_filter, None
+
+
+def _build_unfreeze(
+    backbone: PAWNModel, args: argparse.Namespace, key: jax.Array,
+) -> BuildResult:
+    cfg = UnfreezeConfig(
+        n_unfreeze=args.n_unfreeze,
+        include_lm_head=args.include_lm_head,
+        include_embeddings=args.include_embeddings,
+    )
+    model = init_unfreeze_model(backbone, cfg, key)
+    return model, unfreeze_adapter_filter, unfreeze_gradient_mask(model)
+
+
+def _build_bottleneck(
+    backbone: PAWNModel, args: argparse.Namespace, key: jax.Array,
+) -> BuildResult:
+    cfg = BottleneckConfig(
+        bottleneck_dim=args.bottleneck_dim,
+        n_hidden=args.bottleneck_n_hidden,
+        adapt_attn=not args.bottleneck_no_attn,
+        adapt_ffn=not args.bottleneck_no_ffn,
+    )
+    return init_bottleneck_model(backbone, cfg, key), bottleneck_adapter_filter, None
+
+
+def _build_hybrid(
+    backbone: PAWNModel, args: argparse.Namespace, key: jax.Array,
+) -> BuildResult:
+    cfg = HybridConfig(
+        lora=LoRAConfig(
+            rank=args.rank, targets=tuple(args.lora_targets),
+            alpha=args.lora_alpha,
+        ),
+        film=FiLMConfig(use_output_film=args.film_output),
+    )
+    return init_hybrid_model(backbone, cfg, key), hybrid_adapter_filter, None
+
+
+def _build_sparse(
+    backbone: PAWNModel, args: argparse.Namespace, key: jax.Array,
+) -> BuildResult:
+    cfg = SparseConfig(
+        targets=tuple(args.sparse_targets),
+        density=args.sparse_density,
+        hard=args.sparse_hard,
+    )
+    return init_sparse_model(backbone, cfg, key), sparse_adapter_filter, None
+
+
+def _build_rosa(
+    backbone: PAWNModel, args: argparse.Namespace, key: jax.Array,
+) -> BuildResult:
+    cfg = RoSAConfig(
+        rank=args.rank, targets=tuple(args.rosa_targets),
+        alpha=args.lora_alpha,
+    )
+    # NOTE: RoSA's three-phase training schedule (LoRA warmup →
+    # gradient-mask gen → joint training) is a deferred follow-up
+    # — see docs/jax-migration.md §12. This dispatch path trains the
+    # full parameterisation jointly from step 0 with the mask at its
+    # init value (all-False, so sparse Δ contributes 0 at init and
+    # gets trained jointly with LoRA A/B). Trainer-side phase
+    # scheduling lands in a separate chunk.
+    return init_rosa_model(backbone, cfg, key), rosa_adapter_filter, None
+
+
+def _build_specialized_clm(
+    backbone: PAWNModel, args: argparse.Namespace, key: jax.Array,
+) -> BuildResult:
+    # specialized_clm doesn't wrap a backbone — it's a from-scratch
+    # PAWNModel at the small-baseline scale. We discard the
+    # sliced-backbone argument and use the strategy's config to
+    # build a fresh model.
+    del backbone
+    cfg = SpecializedCLMConfig(
+        d_model=args.specialized_d_model,
+        n_layers=args.specialized_n_layers,
+        n_heads=args.specialized_n_heads,
+        d_ff=args.specialized_d_ff,
+    )
+    return init_specialized_clm(cfg, key), specialized_clm_adapter_filter, None
+
+
+_BUILDERS: dict[str, Callable[[PAWNModel, argparse.Namespace, jax.Array], BuildResult]] = {
+    "lora": _build_lora,
+    "film": _build_film,
+    "unfreeze": _build_unfreeze,
+    "bottleneck": _build_bottleneck,
+    "hybrid": _build_hybrid,
+    "sparse": _build_sparse,
+    "rosa": _build_rosa,
+    "specialized_clm": _build_specialized_clm,
+}
+
+
+def _strategy_config_dict(args: argparse.Namespace) -> dict[str, Any]:
+    """Return a JSON-serialisable dict of the strategy's per-run config
+    for inclusion in ``config.json``."""
+    s = args.strategy
+    if s == "lora" or s == "hybrid":
+        d: dict[str, Any] = {
+            "rank": args.rank,
+            "targets": list(args.lora_targets),
+            "alpha": args.lora_alpha,
+        }
+        if s == "hybrid":
+            d["film_output"] = args.film_output
+        return d
+    if s == "film":
+        return {"use_output_film": args.film_output}
+    if s == "unfreeze":
+        return {
+            "n_unfreeze": args.n_unfreeze,
+            "include_lm_head": args.include_lm_head,
+            "include_embeddings": args.include_embeddings,
+        }
+    if s == "bottleneck":
+        return {
+            "bottleneck_dim": args.bottleneck_dim,
+            "n_hidden": args.bottleneck_n_hidden,
+            "adapt_attn": not args.bottleneck_no_attn,
+            "adapt_ffn": not args.bottleneck_no_ffn,
+        }
+    if s == "sparse":
+        return {
+            "targets": list(args.sparse_targets),
+            "density": args.sparse_density,
+            "hard": args.sparse_hard,
+        }
+    if s == "rosa":
+        return {
+            "rank": args.rank,
+            "targets": list(args.rosa_targets),
+            "alpha": args.lora_alpha,
+        }
+    if s == "specialized_clm":
+        return {
+            "d_model": args.specialized_d_model,
+            "n_layers": args.specialized_n_layers,
+            "n_heads": args.specialized_n_heads,
+            "d_ff": args.specialized_d_ff,
+        }
+    raise ValueError(f"unknown strategy {s!r}")  # pragma: no cover — argparse guards
+
+
+def _validate_strategy_args(args: argparse.Namespace) -> None:
+    """Per-strategy argument sanity checks."""
+    if args.strategy in ("lora", "hybrid", "rosa") and args.rank <= 0:
+        raise SystemExit(f"--rank={args.rank} must be positive for {args.strategy}")
+    if args.strategy == "bottleneck" and args.bottleneck_dim <= 0:
+        raise SystemExit(
+            f"--bottleneck-dim={args.bottleneck_dim} must be positive"
+        )
+    if args.strategy == "sparse" and not 0.0 < args.sparse_density <= 1.0:
+        raise SystemExit(
+            f"--sparse-density={args.sparse_density} must be in (0, 1]"
+        )
+    if args.strategy == "unfreeze" and args.n_unfreeze < 0:
+        raise SystemExit(
+            f"--n-unfreeze={args.n_unfreeze} must be >= 0"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--strategy", choices=STRATEGIES, default="lora",
+        help="adapter strategy to dispatch.",
+    )
     parser.add_argument(
         "--supernet", choices=["tiny", "supernet"], default="tiny",
     )
     parser.add_argument(
         "--variant", default="base",
         help="which sliced variant to train the adapter on (one of "
-        "the keys of the supernet's VARIANTS dict).",
+        "the keys of the supernet's VARIANTS dict). Ignored when "
+        "--strategy=specialized_clm (which trains a from-scratch model).",
     )
-    parser.add_argument("--rank", type=int, default=4)
+    # LoRA / Hybrid / RoSA shared args.
+    parser.add_argument(
+        "--rank", type=int, default=4,
+        help="LoRA / Hybrid / RoSA rank.",
+    )
     parser.add_argument(
         "--lora-targets", nargs="+", default=["q", "v"],
         choices=["q", "k", "v", "o"],
+        help="LoRA / Hybrid target attention projections.",
     )
-    parser.add_argument("--lora-alpha", type=float, default=None)
+    parser.add_argument(
+        "--lora-alpha", type=float, default=None,
+        help="LoRA / Hybrid / RoSA scaling. ``None`` → alpha = rank.",
+    )
+    # FiLM / Hybrid shared args.
+    parser.add_argument(
+        "--film-output", action="store_true",
+        help="FiLM / Hybrid: also modulate the lm_head output.",
+    )
+    # Unfreeze args.
+    parser.add_argument(
+        "--n-unfreeze", type=int, default=2,
+        help="Unfreeze: number of top transformer layers to unfreeze.",
+    )
+    parser.add_argument(
+        "--include-lm-head", action="store_true", default=True,
+        help="Unfreeze: also train final_norm + lm_head.",
+    )
+    parser.add_argument(
+        "--no-include-lm-head", dest="include_lm_head",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--include-embeddings", action="store_true",
+        help="Unfreeze: also train input embedding tables.",
+    )
+    # Bottleneck args.
+    parser.add_argument(
+        "--bottleneck-dim", type=int, default=32,
+        help="Bottleneck: hidden dimension of the Houlsby MLP.",
+    )
+    parser.add_argument(
+        "--bottleneck-n-hidden", type=int, default=0,
+        help="Bottleneck: extra hidden layers (0 = single-projection).",
+    )
+    parser.add_argument(
+        "--bottleneck-no-attn", action="store_true",
+        help="Bottleneck: skip the attention-side adapter.",
+    )
+    parser.add_argument(
+        "--bottleneck-no-ffn", action="store_true",
+        help="Bottleneck: skip the FFN-side adapter.",
+    )
+    # Sparse args.
+    parser.add_argument(
+        "--sparse-targets", nargs="+", default=["q", "v"],
+        choices=["q", "k", "v", "o"],
+        help="Sparse: attention projections to wrap.",
+    )
+    parser.add_argument(
+        "--sparse-density", type=float, default=0.01,
+        help="Sparse: initial density (fraction of unmasked entries).",
+    )
+    parser.add_argument(
+        "--sparse-hard", action="store_true",
+        help="Sparse: use the straight-through-estimator hard mask "
+             "(default: soft sigmoid).",
+    )
+    # RoSA args.
+    parser.add_argument(
+        "--rosa-targets", nargs="+", default=["q", "v"],
+        choices=["q", "k", "v", "o"],
+        help="RoSA: attention projections to wrap.",
+    )
+    # SpecializedCLM args.
+    parser.add_argument(
+        "--specialized-d-model", type=int, default=84,
+        help="SpecializedCLM: model width.",
+    )
+    parser.add_argument(
+        "--specialized-n-layers", type=int, default=2,
+        help="SpecializedCLM: number of transformer layers.",
+    )
+    parser.add_argument(
+        "--specialized-n-heads", type=int, default=2,
+        help="SpecializedCLM: number of attention heads.",
+    )
+    parser.add_argument(
+        "--specialized-d-ff", type=int, default=192,
+        help="SpecializedCLM: FFN hidden dim.",
+    )
+    # Training args.
     parser.add_argument("--total-steps", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seq-len", type=int, default=64)
@@ -128,22 +468,28 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             f"--total-steps={args.total_steps} must be a multiple of --k={args.k}"
         )
-    if args.rank <= 0:
-        raise SystemExit(f"--rank={args.rank} must be positive")
     if not 0.0 < args.val_frac < 1.0:
         raise SystemExit(
             f"--val-frac={args.val_frac} must be in (0, 1)"
         )
+    _validate_strategy_args(args)
 
     corpus_seed = args.seed if args.corpus_seed is None else args.corpus_seed
     model_seed = args.seed if args.model_seed is None else args.model_seed
 
     supernet_cfg, variants = _resolve_supernet(args.supernet)
-    if args.variant not in variants:
-        raise SystemExit(
-            f"--variant={args.variant!r} not in {list(variants.keys())}"
-        )
-    variant_cfg = variants[args.variant]
+    # specialized_clm doesn't use the supernet/variant scaffold — it
+    # trains a from-scratch model at its own --specialized-* shape.
+    # For every other strategy --variant gates into the slicing
+    # machinery as before.
+    if args.strategy != "specialized_clm":
+        if args.variant not in variants:
+            raise SystemExit(
+                f"--variant={args.variant!r} not in {list(variants.keys())}"
+            )
+        variant_cfg: ModelConfig | None = variants[args.variant]
+    else:
+        variant_cfg = None
 
     if args.seq_len > supernet_cfg.max_seq_len:
         raise SystemExit(
@@ -181,12 +527,12 @@ def main(argv: list[str] | None = None) -> int:
             f"--max-corpus-gb={args.max_corpus_gb}"
         )
 
+    variant_label = "from-scratch" if args.strategy == "specialized_clm" else args.variant
     print(
-        f"[setup] supernet={args.supernet} variant={args.variant} "
-        f"rank={args.rank} targets={args.lora_targets} "
-        f"total_steps={args.total_steps} K={args.k} B={args.batch_size} "
-        f"T={args.seq_len} n_train_games={n_train_games} "
-        f"n_val_games={n_val_games}"
+        f"[setup] strategy={args.strategy} supernet={args.supernet} "
+        f"variant={variant_label} total_steps={args.total_steps} "
+        f"K={args.k} B={args.batch_size} T={args.seq_len} "
+        f"n_train_games={n_train_games} n_val_games={n_val_games}"
     )
 
     t0 = time.perf_counter()
@@ -218,15 +564,14 @@ def main(argv: list[str] | None = None) -> int:
     config_path.write_text(
         json.dumps(
             {
+                "strategy": args.strategy,
+                "strategy_config": _strategy_config_dict(args),
                 "supernet": args.supernet,
-                "variant": args.variant,
+                "variant": variant_label,
                 "supernet_cfg": dataclasses.asdict(supernet_cfg),
-                "variant_cfg": dataclasses.asdict(variant_cfg),
-                "lora": {
-                    "rank": args.rank,
-                    "targets": list(args.lora_targets),
-                    "alpha": args.lora_alpha,
-                },
+                "variant_cfg": (
+                    dataclasses.asdict(variant_cfg) if variant_cfg is not None else None
+                ),
                 "total_steps": args.total_steps,
                 "batch_size": args.batch_size,
                 "seq_len": args.seq_len,
@@ -246,19 +591,28 @@ def main(argv: list[str] | None = None) -> int:
         encoding="utf-8",
     )
 
-    # Init: slice → wrap with LoRA → partition for adapter training.
+    # Init: slice → wrap with the chosen adapter → partition for
+    # adapter training. The backbone is unused for specialized_clm
+    # (which builds a from-scratch model); the builder discards it.
     key = jax.random.PRNGKey(model_seed)
     supernet = init_model(supernet_cfg, key)
-    backbone = sliced(supernet, variant_cfg)
-    lora_cfg = LoRAConfig(
-        rank=args.rank,
-        targets=tuple(args.lora_targets),
-        alpha=args.lora_alpha,
+    if variant_cfg is not None:
+        backbone = sliced(supernet, variant_cfg)
+    else:
+        # Pass the supernet through; specialized_clm's builder
+        # ignores it.
+        backbone = supernet
+    build_fn = _BUILDERS[args.strategy]
+    model, filter_fn, gradient_mask = build_fn(
+        backbone, args, jax.random.PRNGKey(model_seed + 1),
     )
-    lora_model = init_lora_model(backbone, lora_cfg, jax.random.PRNGKey(model_seed + 1))
     optimizer = make_optimizer(sched)
-    state, frozen = init_adapter_state(lora_model, optimizer)
-    train_step = make_adapter_train_step(optimizer, frozen)
+    state, frozen = init_adapter_state(
+        model, optimizer, adapter_filter_fn=filter_fn,
+    )
+    train_step = make_adapter_train_step(
+        optimizer, frozen, gradient_mask=gradient_mask,
+    )
     scan = make_adapter_scan_step(train_step, args.k)
     eval_step = make_eval_step(frozen)
 
@@ -272,7 +626,7 @@ def main(argv: list[str] | None = None) -> int:
     train_targets_chunks = train_targets.reshape(chunk_shape)
     train_loss_chunks = train_loss.reshape(chunk_shape)
 
-    def run_validation(trainable: LoRAModel) -> tuple[float, int]:
+    def run_validation(trainable: eqx.Module) -> tuple[float, int]:
         """Iterate the val set in batches, return (mean_loss, total_n).
         We iterate on the host (eval is a one-shot diagnostic, not on
         the critical path) and accumulate weighted by n_supervised."""

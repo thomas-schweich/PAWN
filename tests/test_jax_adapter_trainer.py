@@ -36,7 +36,7 @@ from pawn.adapter_trainer import (
     make_adapter_train_step,
     make_eval_step,
 )
-from pawn.adapters import LoRAConfig, init_lora_model
+from pawn.adapters import LoRAConfig, adapter_filter, init_lora_model
 from pawn.config import TINY_SUPERNET, TINY_VARIANTS
 from pawn.corpus import generate_corpus
 from pawn.model import init_model, sliced
@@ -52,7 +52,9 @@ def _setup(rank: int = 4, lr: float = 3e-3) -> tuple:
         backbone, LoRAConfig(rank=rank, targets=("q", "v")), jax.random.PRNGKey(1)
     )
     opt = make_optimizer(lr)
-    state, frozen = init_adapter_state(model, opt)
+    state, frozen = init_adapter_state(
+        model, opt, adapter_filter_fn=adapter_filter,
+    )
     train_step = make_adapter_train_step(opt, frozen)
     eval_step = make_eval_step(frozen)
     return model, state, frozen, train_step, eval_step
@@ -251,8 +253,12 @@ def test_eval_step_uses_correct_frozen() -> None:
     model_a = init_lora_model(backbone_a, cfg, jax.random.PRNGKey(101))
     model_b = init_lora_model(backbone_b, cfg, jax.random.PRNGKey(202))
     opt = make_optimizer(3e-3)
-    state_a, frozen_a = init_adapter_state(model_a, opt)
-    state_b, frozen_b = init_adapter_state(model_b, opt)
+    state_a, frozen_a = init_adapter_state(
+        model_a, opt, adapter_filter_fn=adapter_filter,
+    )
+    state_b, frozen_b = init_adapter_state(
+        model_b, opt, adapter_filter_fn=adapter_filter,
+    )
     step_a = make_adapter_train_step(opt, frozen_a)
     step_b = make_adapter_train_step(opt, frozen_b)
     train_batch = _real_batch(b=4, t=16, seed=1)
