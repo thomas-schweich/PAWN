@@ -9,6 +9,8 @@ job — but they pin the structural correctness of the port.
 
 from __future__ import annotations
 
+from typing import Any
+
 import chess_engine as engine
 import numpy as np
 import pytest
@@ -299,6 +301,48 @@ def test_autoregressive_generate_kv_cache_matches_full_recompute() -> None:
     )
 
 
+def test_forward_with_cache_partial_seq_pads_cache_to_max_seq_len() -> None:
+    """``forward_with_cache`` with ``T < cfg.max_seq_len`` zero-pads
+    the cache along the T axis up to ``cfg.max_seq_len`` so the cache
+    can be fed straight into ``forward_incremental`` (which expects
+    a ``T_max``-shaped buffer for shape-stable JIT). The
+    pad-branch in ``forward_with_cache`` was previously untested —
+    `_cached_prefill` always passes the full ``max_seq_len`` width —
+    but the API contract supports arbitrary ``T <= max_seq_len``, so
+    this test pins the padding behaviour.
+    """
+    import jax.numpy as jnp
+
+    from pawn.config import TINY_SUPERNET
+
+    model = _tiny_model()
+    T_max = TINY_SUPERNET.max_seq_len
+    rng = np.random.default_rng(42)
+    short_T = 6
+    tokens = jnp.asarray(rng.integers(0, 64, (2, short_T)), dtype=jnp.int32)
+    attn = jnp.ones((2, short_T), dtype=jnp.bool_)
+    logits, cache = model.forward_with_cache(tokens, attn)
+    # Logits keep the input width.
+    assert logits.shape == (2, short_T, TINY_SUPERNET.vocab_size)
+    # Cache is padded out to T_max along the T axis (axis 3 in the
+    # (n_layers, B, H, T_max, head_dim) layout).
+    assert cache.k.shape == (
+        TINY_SUPERNET.n_layers, 2, TINY_SUPERNET.n_heads,
+        T_max, TINY_SUPERNET.head_dim,
+    )
+    # The pad region is exactly zero — `_attention_incremental`'s
+    # positional mask excludes it anyway, but pinning the zero fill
+    # rules out leakage of garbage K, V into a future cache miss.
+    np.testing.assert_array_equal(
+        np.asarray(cache.k[:, :, :, short_T:, :]),
+        np.zeros_like(np.asarray(cache.k[:, :, :, short_T:, :])),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(cache.v[:, :, :, short_T:, :]),
+        np.zeros_like(np.asarray(cache.v[:, :, :, short_T:, :])),
+    )
+
+
 def test_forward_with_cache_matches_call() -> None:
     """``forward_with_cache`` produces the same logits as ``__call__``
     on the same input. This is a unit-level pin on the prefill
@@ -376,6 +420,14 @@ def test_autoregressive_generate_mixed_prefix_kv_cache_matches_recompute() -> No
     accidentally drop or duplicate a `jax.random.split` along the way.
     (See the CPU-stability note on
     ``test_autoregressive_generate_kv_cache_matches_full_recompute``.)
+
+    Coverage layout: 6 games at 3 distinct prefix lengths (3 / 5 / 8),
+    two games per length, ``batch_size=3`` — each length forms its
+    own single internal batch, so the test exercises three back-to-back
+    ``_generate_batch`` calls. (An earlier draft claimed an
+    "internal-batch-boundary" — that would need a group of size > 3;
+    the actual coverage is the cross-group key ordering, not a
+    within-group batch boundary.)
     """
     model = _tiny_model()
     _ids, _t, _lm, move_ids, gls, _tc = engine.generate_clm_batch(

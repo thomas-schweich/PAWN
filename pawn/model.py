@@ -556,7 +556,7 @@ class PAWNModel(eqx.Module):
 
         Returns:
             ``(logits, cache)``: ``(B, T, vocab_size)`` and a populated
-            cache shaped ``(n_layers, B, T_max, n_heads, head_dim)``.
+            cache shaped ``(n_layers, B, n_heads, T_max, head_dim)``.
         """
         cfg = self.cfg
         seq_len = tokens.shape[1]
