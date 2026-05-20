@@ -301,6 +301,24 @@ def init_train_state(
     )
 
 
+def compute_grad_norm(grads) -> jax.Array:
+    """Global L2 grad-norm via per-leaf vdot then sum (``sqrt(Σ ‖gᵢ‖²)``).
+
+    Cast each leaf to fp32 before squaring; the reduction stays fp32
+    regardless of the source dtype. Returns ``0.0`` for the
+    no-trainable-leaves edge (frozen-everywhere adapters).
+
+    Shared between the pretrain and adapter trainers so a future
+    change to the norm formula (eg adding eps) lands in one place.
+    """
+    leaves = jax.tree_util.tree_leaves(grads)
+    if not leaves:
+        return jnp.float32(0.0)
+    return jnp.sqrt(
+        sum(jnp.sum(jnp.square(g.astype(jnp.float32))) for g in leaves)
+    )
+
+
 def make_scan_step(
     train_step: TrainStep, k: int
 ) -> Callable[
@@ -378,34 +396,12 @@ def make_train_step(
             has_aux=True,
         )(state.model)
 
-        # ``eqx.filter_value_and_grad`` returns grads as a PyTree with
-        # ``None`` at every non-inexact-array leaf. Treat that as the
-        # canonical array subtree — no second ``eqx.filter`` needed.
-        # ``jax.tree_util.tree_leaves`` skips ``None`` by the standard
-        # JAX pytree convention.
-        grad_leaves = jax.tree_util.tree_leaves(grads)
-
-        # Global grad norm via per-leaf dot then sum: ‖x‖² = Σ ‖xᵢ‖².
-        # The earlier formulation allocated a full-parameter flat copy
-        # via ``jnp.concatenate`` (267 MB per step at SUPERNET scale)
-        # only to feed a single ``jnp.dot``. The mathematically-
-        # equivalent tree-reduce avoids that allocation and produces
-        # the same HLO-level fp32 ops.
-        if grad_leaves:
-            # ``jnp.sum(jnp.square(...))`` produces a single upcast +
-            # square + reduction per leaf; XLA fuses it cleanly. The
-            # earlier ``jnp.vdot(g.astype, g.astype)`` formulation
-            # emitted two separate ``convert-element-type`` nodes for
-            # the same input which CSE'd to the same thing but
-            # implied a non-existent ambiguity.
-            grad_norm = jnp.sqrt(
-                sum(jnp.sum(jnp.square(g.astype(jnp.float32))) for g in grad_leaves)
-            )
-        else:
-            # Frozen-everywhere edge: no array leaves to backprop into.
-            # Shouldn't fire for the supernet but keeps the metric
-            # well-typed for the future adapter path.
-            grad_norm = jnp.float32(0.0)
+        # Global grad norm via the shared ``compute_grad_norm`` helper
+        # (tree-reduce over the per-leaf squared sum). The
+        # ``eqx.filter_value_and_grad`` PyTree has ``None`` at every
+        # non-inexact-array leaf, so ``tree_leaves`` skips them under
+        # the standard JAX convention.
+        grad_norm = compute_grad_norm(grads)
 
         n_supervised = loss_mask.sum().astype(jnp.int32)
         has_supervision = n_supervised > 0
