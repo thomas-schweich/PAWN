@@ -21,6 +21,7 @@ complexity.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -32,19 +33,30 @@ import optax
 from pawn.jax.config import ModelConfig
 from pawn.jax.model import PAWNModel, sliced
 
+# A pretraining batch — the four parallel ``[B, T]`` arrays the trainer
+# consumes. Aliased so the trainer signature and any test helpers can
+# share a single shape contract; ``*batch`` unpacking thereby stays
+# type-correct without ``# type: ignore``.
+Batch = tuple[jax.Array, jax.Array, jax.Array, jax.Array]
+TrainStep = Callable[["TrainState", Batch], tuple["TrainState", dict[str, jax.Array]]]
+
 
 class TrainState(NamedTuple):
     """Per-step training state.
 
     ``model`` is the full supernet; ``opt_state`` is Optax's state for
-    the same PyTree. ``step`` is a plain Python int that JIT closes over
-    via the metrics return — it is *not* a JAX array so the host can
-    decide when to log / checkpoint / decay without recompiling.
+    the same PyTree. ``step`` is a 0-d ``jnp.int32`` traced into the
+    state PyTree — it MUST be a JAX array, not a Python int, because
+    ``eqx.filter_jit`` would treat a Python int as a static cache key
+    and recompile on every increment (a ~70× per-call slowdown). The
+    host can still read it via ``int(state.step)`` after a step.
+    The same convention works seamlessly when ``train_step`` is later
+    folded into a ``jax.lax.scan`` body (chunk 2.3).
     """
 
     model: PAWNModel
     opt_state: optax.OptState
-    step: int
+    step: jax.Array
 
 
 @dataclass(frozen=True)
@@ -105,6 +117,16 @@ def compute_variant_loss(
     return cross_entropy_loss(logits, targets, loss_mask)
 
 
+def _variant_key(cfg: ModelConfig) -> str:
+    """Stable, unique key for a variant in the per-variant metrics dict.
+
+    Includes width, depth, and FFN size so two specs that happen to
+    share ``d_model`` but differ in ``n_layers`` or ``d_ff`` (a valid
+    sandwich-rule configuration) don't silently overwrite each other.
+    """
+    return f"d{cfg.d_model}_L{cfg.n_layers}_F{cfg.d_ff}"
+
+
 def compute_supernet_loss(
     supernet: PAWNModel,
     variant_specs: tuple[VariantSpec, ...],
@@ -116,26 +138,29 @@ def compute_supernet_loss(
     """Sum per-variant losses on the shared batch (§5.3).
 
     Returns ``(joint_loss, per_variant_dict)`` — the joint loss is the
-    weighted sum used for backprop; the dict has one entry per variant
-    keyed by ``str(cfg.d_model)`` so the host can log per-slice
-    convergence.
+    weighted sum used for backprop; the per-variant dict is keyed
+    ``d<W>_L<L>_F<F>`` (e.g. ``d192_L4_F768``) so the host can log
+    per-slice convergence and two specs sharing only ``d_model`` stay
+    distinguishable.
 
     Static unroll: each variant has a different width, so they can't
     ``vmap`` into one batched matmul. Three forward calls per step is
-    the documented cost.
+    the documented cost. The identity-slice shortcut (when
+    ``spec.cfg == supernet.cfg``) saves a trace-time Python pass —
+    no measurable execution-time win, since XLA constant-folds
+    static slicing — but it keeps the trace tree clean.
     """
     per_variant: dict[str, jax.Array] = {}
     joint: jax.Array = jnp.float32(0.0)
     for spec in variant_specs:
         if spec.cfg == supernet.cfg:
-            # No-op slice — call the supernet directly to avoid the
-            # PyTree shape-copy and keep the trace pure.
+            # No-op slice — direct supernet forward.
             sub = supernet
         else:
             sub = sliced(supernet, spec.cfg)
         ce = compute_variant_loss(sub, tokens, attn_mask, targets, loss_mask)
         joint = joint + spec.weight * ce
-        per_variant[f"d{spec.cfg.d_model}"] = ce
+        per_variant[_variant_key(spec.cfg)] = ce
     return joint, per_variant
 
 
@@ -162,70 +187,127 @@ def make_optimizer(
 def init_train_state(
     model: PAWNModel, optimizer: optax.GradientTransformation
 ) -> TrainState:
-    """Build the initial ``TrainState`` for ``model`` under ``optimizer``."""
+    """Build the initial ``TrainState`` for ``model`` under ``optimizer``.
+
+    ``step`` is a 0-d ``jnp.int32`` so it traces as a dynamic array
+    rather than a static Python int (the latter would cause
+    ``eqx.filter_jit`` to recompile on every increment).
+    """
     # Equinox separates trainable arrays from static attrs via
     # ``eqx.filter`` (anything that's not a JAX array is treated as
     # static under JIT). The optimizer state only mirrors the
     # array-leaf subtree.
     params = eqx.filter(model, eqx.is_inexact_array)
     opt_state = optimizer.init(params)
-    return TrainState(model=model, opt_state=opt_state, step=0)
+    return TrainState(
+        model=model, opt_state=opt_state, step=jnp.zeros((), dtype=jnp.int32)
+    )
 
 
 def make_train_step(
     optimizer: optax.GradientTransformation,
     variant_specs: tuple[VariantSpec, ...],
-):
+) -> TrainStep:
     """Build a jitted ``train_step(state, batch) -> (state, metrics)``.
 
     ``batch`` is a 4-tuple ``(tokens, attn_mask, targets, loss_mask)``
     sized ``[B, T]`` each. ``metrics`` is a dict with keys ``loss``
-    (joint), ``loss_d<N>`` per variant, and ``grad_norm`` (global).
-    """
+    (joint), ``loss_<key>`` per variant (key is ``d<W>_L<L>_F<F>``),
+    ``grad_norm`` (global L2), and ``n_supervised`` (count of
+    True entries in ``loss_mask``).
 
-    def loss_fn(
-        model: PAWNModel,
-        batch: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
-    ) -> tuple[jax.Array, dict[str, jax.Array]]:
-        tokens, attn_mask, targets, loss_mask = batch
-        joint, per_variant = compute_supernet_loss(
-            model, variant_specs, tokens, attn_mask, targets, loss_mask
-        )
-        return joint, per_variant
+    A batch whose ``loss_mask`` is entirely False (the scan-padding
+    edge case) bypasses ``optimizer.update`` so neither weights nor
+    optimizer state mutate — AdamW's decoupled weight decay would
+    otherwise still drift weights on zero-gradient padded steps.
+    Returned ``loss`` and ``grad_norm`` are 0 in that case.
+    """
 
     @eqx.filter_jit
     def train_step(
-        state: TrainState,
-        batch: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        state: TrainState, batch: Batch
     ) -> tuple[TrainState, dict[str, jax.Array]]:
+        tokens, attn_mask, targets, loss_mask = batch
         (joint_loss, per_variant), grads = eqx.filter_value_and_grad(
-            loss_fn, has_aux=True
-        )(state.model, batch)
-        # Pass only the array-leaf PyTree to Optax. Optax's stubs type
-        # ``params`` as ``Array | None`` but in practice accept any
-        # PyTree; ``eqx.filter`` produces a tree of arrays + None where
-        # the static-attribute leaves were, which matches the stub.
-        params = eqx.filter(state.model, eqx.is_inexact_array)
-        updates, new_opt_state = optimizer.update(
-            grads, state.opt_state, params
-        )
-        new_model = eqx.apply_updates(state.model, updates)
+            lambda m: compute_supernet_loss(
+                m, variant_specs, tokens, attn_mask, targets, loss_mask
+            ),
+            has_aux=True,
+        )(state.model)
 
-        # Global grad norm — only over the array leaves Optax saw.
-        grad_arrays = jax.tree_util.tree_leaves(
-            eqx.filter(grads, eqx.is_inexact_array)
-        )
-        grad_norm = jnp.sqrt(
-            sum(jnp.sum(g.astype(jnp.float32) ** 2) for g in grad_arrays)
+        # ``eqx.filter_value_and_grad`` returns grads as a PyTree with
+        # ``None`` at every non-inexact-array leaf. Treat that as the
+        # canonical array subtree — no second ``eqx.filter`` needed.
+        # ``jax.tree_util.tree_leaves`` skips ``None`` by the standard
+        # JAX pytree convention.
+        grad_leaves = jax.tree_util.tree_leaves(grads)
+
+        # Global grad norm via flatten + single dot (one BLAS kernel
+        # vs 16 separate reductions + 15 adds). Cast each leaf to fp32
+        # once during flatten; the dot stays fp32.
+        if grad_leaves:
+            flat = jnp.concatenate(
+                [g.astype(jnp.float32).ravel() for g in grad_leaves]
+            )
+            grad_norm = jnp.sqrt(jnp.dot(flat, flat))
+        else:
+            # Frozen-everywhere edge: no array leaves to backprop into.
+            # Shouldn't fire for the supernet but keeps the metric
+            # well-typed for the future adapter path.
+            grad_norm = jnp.float32(0.0)
+
+        n_supervised = loss_mask.sum().astype(jnp.int32)
+        has_supervision = n_supervised > 0
+
+        # Padding-only batch (all ``loss_mask=False``) → joint_loss is
+        # 0 and grads are 0, but AdamW's decoupled weight decay would
+        # still mutate weights and advance optimizer state. Skip the
+        # update entirely in that case; ``jax.lax.cond`` is the
+        # cheapest way under JIT.
+        def _apply_update(
+            args: tuple[PAWNModel, optax.OptState, PAWNModel],
+        ) -> tuple[PAWNModel, optax.OptState]:
+            model_in, opt_state_in, grads_in = args
+            # Filter both the params (``model``) and updates (``grads``)
+            # down to the array-leaf PyTree. Optax's stubs type
+            # ``updates`` / ``params`` as ``Array``-flavoured Updates;
+            # in practice optax accepts any matching PyTree. Filtering
+            # explicitly keeps both pyright happy and the contract
+            # symmetric (params and grads have identical shape).
+            params_in = eqx.filter(model_in, eqx.is_inexact_array)
+            grads_filt = eqx.filter(grads_in, eqx.is_inexact_array)
+            updates_in, new_opt_state_in = optimizer.update(
+                grads_filt, opt_state_in, params_in
+            )
+            new_model_in = eqx.apply_updates(model_in, updates_in)
+            return new_model_in, new_opt_state_in
+
+        def _skip_update(
+            args: tuple[PAWNModel, optax.OptState, PAWNModel],
+        ) -> tuple[PAWNModel, optax.OptState]:
+            model_in, opt_state_in, _ = args
+            return model_in, opt_state_in
+
+        # NOTE: optimizer.update + apply_updates use the same array
+        # subtree shape as grads / state.model, so the two branches of
+        # ``lax.cond`` agree on PyTree structure.
+        new_model, new_opt_state = jax.lax.cond(
+            has_supervision,
+            _apply_update,
+            _skip_update,
+            (state.model, state.opt_state, grads),
         )
 
         metrics: dict[str, jax.Array] = {
             "loss": joint_loss,
             "grad_norm": grad_norm,
+            "n_supervised": n_supervised,
             **{f"loss_{k}": v for k, v in per_variant.items()},
         }
         new_state = TrainState(
-            model=new_model, opt_state=new_opt_state, step=state.step + 1
+            model=new_model,
+            opt_state=new_opt_state,
+            step=state.step + jnp.int32(1),
         )
         return new_state, metrics
 
