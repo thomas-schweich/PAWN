@@ -1,6 +1,12 @@
-# PAWN → JAX migration proposal
+# PAWN → JAX migration
 
-> **Status:** proposal / design. Not yet greenlit for implementation.
+> **Status:** **in progress.** Phase 1 (model + checkpoint + legacy
+> converter + thin PyTorch loader + tests) is merged into the
+> `jax_migration` integration branch (PR #101). Phases 2 (pretraining),
+> 3 (adapters), and 4 (eval port + PyTorch removal + flatten) are
+> pending. The final `jax_migration → main` PR is the framework-swap
+> event; `main` never carries the half-migrated state. See §10.
+>
 > This document describes a from-scratch redesign of PAWN's training stack
 > (pretraining, adapter training, evaluation) onto a single all-JAX pipeline,
 > motivated by compute efficiency and by eliminating the dual-framework
@@ -483,7 +489,7 @@ unit-level parity already in the test suite:
 | Phase | Run |
 |---|---|
 | 1 | Convert each of `pawn-{small,base,large}` end-to-end and verify forward parity against the PyTorch reference on a real batch. Phase 1 has no trainer; this is the closest analogue. |
-| 2 | Pretrain the toy supernet for ≥1000 steps on Rust-generated random games. Verify loss decreases, no NaNs, all three sliced variants forward-evaluate cleanly. |
+| 2 | Pretrain a tiny **nested** supernet for ≥1000 steps on Rust-generated random games. Verify loss decreases, no NaNs, all sliced variants forward-evaluate cleanly. Note: `pawn.jax.config.TOY` is *not* a nested supernet — it has `head_dim=16`, so it does not satisfy `validate_nested` against the production `SUPERNET` (`head_dim=64`). Phase 2's first task is to define a tiny nested supernet (e.g. `SUPERNET=(d_model=128, n_layers=4, n_heads=2)`, `head_dim=64`, with two or three nested variant slices) and use that for this run. The production `SUPERNET` is too large for a smoke run on commodity hardware. |
 | 3 | Train one adapter strategy (e.g. LoRA rank 4) for one epoch on a small Lichess Elo slice. Verify val loss decreases, no NaNs. |
 | 4 | Run a probe + move-accuracy eval (the ported JAX `eval_suite`) on a converted / published checkpoint. Numbers within tolerance of the PyTorch reference. |
 
