@@ -418,9 +418,100 @@ phasing keeps the repo coherent at each phase boundary.
 4. **Eval.** Port `eval_suite`; **remove PyTorch.** Single framework achieved.
 
 PyTorch remains a dependency transiently through Phases 2–3 (eval still loads
-converted checkpoints) and is removed only at the end of Phase 4.
+converted checkpoints) and is removed only at the end of Phase 4. The phases
+never appear on `main`; they accumulate on a long-lived integration branch
+(§10), and the per-phase work cadence is fixed (§11).
 
-## 10. Resolved decisions
+## 10. Integration branch and merge strategy
+
+The migration uses a long-lived integration branch **`jax_migration`**, cut
+once from `main`. All four phases land as their own PRs targeted at
+`jax_migration`, never at `main`. When all four phases have merged into
+`jax_migration`, a single final PR merges `jax_migration` into `main` — that
+PR is the project's only "framework swap" event.
+
+The invariant: **`main` never carries the half-migrated state.** While JAX
+matures, `main` stays single-framework (the existing PyTorch implementation).
+`jax_migration` is the only branch where JAX and PyTorch coexist, and the
+coexistence is bounded — Phase 4 deletes PyTorch and flattens `pawn/jax/*`
+up into `pawn/` before the final merge. The repo never directly supports
+both implementations at once on `main`.
+
+Merge mechanics: per-phase PRs are **squash-merged** into `jax_migration`
+(the repo's policy disallows merge commits). Each phase becomes one commit
+on `jax_migration`; the squash body preserves the per-chunk + per-round
+iteration table the PR description carries. The final `jax_migration → main`
+PR likewise squash-merges, so `main` ultimately gains one commit per phase
+plus one final consolidation commit.
+
+## 11. Per-phase review and verification process
+
+Each phase decomposes into **chunks** — logical, independently-reviewable
+units of work (Phase 1's chunks were: ModelConfig + Equinox `PAWNModel`,
+checkpoint serializer, legacy converter, thin PyTorch loader, pytest
+suite). The cadence within a phase is fixed:
+
+1. **Implement one chunk.** Commit + push to the phase branch.
+2. **Single full subagent review wave on that chunk.** Spawn the six
+   review lanes in parallel — `review-bug-detector`,
+   `review-performance-analyzer`, `review-type-correctness`,
+   `review-test-risk`, `review-simplification`, `review-doc-accuracy` —
+   plus `codex review` via Bash. All backgrounded; the lanes operate
+   read-only. Synthesize findings, apply fixes that meet the "would a
+   careful reviewer block the PR" bar (Critical / Important /
+   SIGNIFICANT), skip nits. Commit + push the fixes as
+   `fix(jax): round-1 review fixes (<chunk>)`. **One review wave per
+   chunk** — no within-chunk iteration.
+3. **Repeat for the next chunk.**
+4. **Full-phase `--loop` review.** Once every chunk has landed, re-run
+   the six lanes + Codex across the whole phase diff. Apply fixes,
+   commit + push, re-run only the lanes that flagged significant issues
+   last round; iterate until every running lane returns clean.
+   Convergence typically takes 3–6 rounds. (Phase 1 converged on round
+   5; see PR #101's iteration table.)
+5. **Open the PR against `jax_migration`.** The body includes the
+   per-chunk + per-loop-round commit history and the training-run
+   output (below).
+
+### Training run on PR open
+
+Every phase PR includes a **small training run** appropriate to the
+branch's current state, executed when the PR is opened. The point is to
+exercise the new code on a real (if tiny) workload beyond the
+unit-level parity already in the test suite:
+
+| Phase | Run |
+|---|---|
+| 1 | Convert each of `pawn-{small,base,large}` end-to-end and verify forward parity against the PyTorch reference on a real batch. Phase 1 has no trainer; this is the closest analogue. |
+| 2 | Pretrain the toy supernet for ≥1000 steps on Rust-generated random games. Verify loss decreases, no NaNs, all three sliced variants forward-evaluate cleanly. |
+| 3 | Train one adapter strategy (e.g. LoRA rank 4) for one epoch on a small Lichess Elo slice. Verify val loss decreases, no NaNs. |
+| 4 | Run a probe + move-accuracy eval (the ported JAX `eval_suite`) on a converted / published checkpoint. Numbers within tolerance of the PyTorch reference. |
+
+The run's output — loss curves, final metrics, wall-time — is attached
+to the PR body.
+
+### Data caching
+
+Data and weights downloaded for one phase's verification are cached and
+reused by later phases. Cache locations:
+
+- **HuggingFace artifacts** — published checkpoints
+  (`pawn-{small,base,large}`), Stockfish / Lichess data repos, and any
+  JAX-converted variants once published: `$HF_HOME` (default
+  `~/.cache/huggingface`). Always use
+  `huggingface_hub.hf_hub_download` / `snapshot_download`; both cache by
+  content hash and never re-download an unchanged artifact.
+- **Tokenized Lichess cache** — `$HF_HOME/pawn-lichess-cache/<key>/`
+  (existing convention from the legacy pipeline).
+- **Rust-engine random games** — generated on-the-fly per phase; not
+  downloaded, not cached.
+
+Phase verification scripts must not re-download an artifact a previous
+phase already pulled. If a fresh download is genuinely needed (cache
+eviction, format change), do it explicitly and one-time and note it in
+the PR body.
+
+## 12. Resolved decisions
 
 | Question | Decision |
 |---|---|
