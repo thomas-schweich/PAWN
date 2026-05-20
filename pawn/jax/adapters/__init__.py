@@ -7,6 +7,10 @@ partition (frozen backbone / trainable adapter) lets
 parameters; XLA dead-code-eliminates the backbone weight-gradients
 for the ~33% FLOP cut described in ``docs/jax-migration.md`` §6.1.
 
+The canonical adapter-only partition is:
+
+    trainable, frozen = eqx.partition(model, adapter_filter(model))
+
 Phase-3 chunk-1 ships LoRA only. Bottleneck/FiLM/Hybrid land in
 subsequent chunks.
 """
@@ -14,13 +18,13 @@ subsequent chunks.
 from pawn.jax.adapters.lora import (
     LoRAConfig,
     LoRAModel,
+    adapter_filter,
     init_lora_model,
-    is_adapter_leaf,
 )
 
 __all__ = [
     "LoRAConfig",
     "LoRAModel",
+    "adapter_filter",
     "init_lora_model",
-    "is_adapter_leaf",
 ]

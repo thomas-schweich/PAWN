@@ -20,15 +20,14 @@ pytest.importorskip("chess_engine")
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
 
-from pawn.jax.adapters import LoRAConfig, LoRAModel, init_lora_model
-from pawn.jax.adapters.lora import (
-    _VALID_TARGETS,
-    LoRAParams,
+from pawn.jax.adapters import (
+    LoRAConfig,
+    LoRAModel,
     adapter_filter,
-    is_adapter_leaf,
+    init_lora_model,
 )
+from pawn.jax.adapters.lora import _VALID_TARGETS, LoRAParams
 from pawn.jax.config import TINY_SUPERNET, TINY_VARIANTS
 from pawn.jax.model import init_model, sliced
 
@@ -40,7 +39,8 @@ def _toy_batch(b: int = 2, t: int = 8) -> tuple[jax.Array, jax.Array]:
 
 
 def test_lora_config_rejects_invalid() -> None:
-    """rank <= 0, empty targets, and unknown target names all fail loud."""
+    """rank <= 0, empty targets, unknown target names, non-positive
+    alpha, and bare-string targets all fail loud."""
     with pytest.raises(ValueError, match="rank"):
         LoRAConfig(rank=0)
     with pytest.raises(ValueError, match="rank"):
@@ -49,6 +49,14 @@ def test_lora_config_rejects_invalid() -> None:
         LoRAConfig(rank=4, targets=())
     with pytest.raises(ValueError, match="unknown LoRA target"):
         LoRAConfig(rank=4, targets=("q", "bogus"))
+    # Bare ``str`` slip-through (would iterate chars).
+    with pytest.raises(ValueError, match="bare str"):
+        LoRAConfig(rank=4, targets="qv")  # type: ignore[arg-type]
+    # alpha=0 nullifies the LoRA path silently; alpha<0 inverts updates.
+    with pytest.raises(ValueError, match="alpha"):
+        LoRAConfig(rank=4, alpha=0.0)
+    with pytest.raises(ValueError, match="alpha"):
+        LoRAConfig(rank=4, alpha=-1.0)
 
 
 def test_lora_config_scale_default_is_one() -> None:
@@ -164,51 +172,93 @@ def test_adapter_filter_targets_only_lora_leaves() -> None:
 
 
 def test_gradient_flows_only_into_lora_params() -> None:
-    """The trainer-critical contract: ``eqx.filter_grad`` with
-    ``adapter_filter`` produces a grad tree where backbone leaves are
-    None (no gradient) and LoRA leaves are arrays."""
+    """The trainer-critical §6.1 contract: under the two-tier
+    partition (trainable=LoRA, frozen=backbone), the gradient w.r.t.
+    the trainable subtree carries arrays at LoRA leaves and ``None``
+    at every backbone leaf. The ``None`` half is what lets XLA DCE
+    the backbone weight-gradient computations for the documented
+    33% FLOP cut."""
     backbone = init_model(TINY_SUPERNET, jax.random.PRNGKey(0))
     model = init_lora_model(
         backbone, LoRAConfig(rank=4, targets=("q", "v")), jax.random.PRNGKey(1)
     )
     tokens, mask = _toy_batch()
 
-    def loss_fn(m: LoRAModel) -> jax.Array:
-        out = m(tokens, mask)
-        return out.mean()
-
-    flt = adapter_filter(model)
-    grads = eqx.filter_grad(loss_fn, has_aux=False)(model)
-    # The grad PyTree has the same structure as ``model``; backbone
-    # subtree should have None at every array leaf (because
-    # filter_grad respects eqx.filter's default partitioning by
-    # is_inexact_array, which catches everything — so we apply the
-    # adapter filter to verify the contract holds).
-    # Easier check: backbone weight gradients are exactly zero (since
-    # they didn't flow through the gradient computation — but they
-    # would here unless we wrap in filter_grad with the adapter
-    # filter spec).
-    del flt, grads
-    # The direct two-tier pattern: partition first, then grad on the
-    # trainable subtree.
     trainable, frozen = eqx.partition(model, adapter_filter(model))
 
     def loss_on_trainable(trn: LoRAModel) -> jax.Array:
         return eqx.combine(trn, frozen)(tokens, mask).mean()
 
     adapter_grads = eqx.filter_grad(loss_on_trainable)(trainable)
-    # Adapter grads: every LoRA array leaf is a real gradient (non-None);
-    # backbone leaves remain None (carried from the filter).
-    # b_q: backprop from output → effective_backbone → wq → forward;
-    # since out.mean() depends on wq (and wq depends on b_q via the
-    # LoRA delta), gradient must reach b_q.
+    # LoRA leaves carry real gradients.
     assert adapter_grads.lora.b_q is not None
     assert jnp.abs(adapter_grads.lora.b_q).sum() > 0
-    # a_q has B=0 at init → gradient is zero (∂out/∂a = a's contribution
-    # is scaled by B=0). Other targets also see zero a-grad at init.
-    # This is correct LoRA behavior, not a bug. Just check the leaf is
-    # an array (not None).
     assert isinstance(adapter_grads.lora.a_q, jax.Array)
+    # Backbone leaves: every array leaf must be None (the trainable
+    # half of the partition has None at the backbone positions; the
+    # gradient tree inherits that structure). A regression that
+    # widened the filter to include the backbone would silently
+    # populate these and defeat the §6.1 DCE.
+    for name in (
+        "src_embed", "dst_embed", "promo_embed", "outcome_embed",
+        "attn_norm", "wq", "wk", "wv", "wo",
+        "ffn_norm", "w_gate", "w_up", "w_down",
+        "final_norm", "lm_head", "pad_embed",
+    ):
+        leaf = getattr(adapter_grads.backbone, name)
+        assert leaf is None, (
+            f"backbone leaf {name!r} should be None in adapter_grads "
+            f"(found {type(leaf).__name__}). adapter_filter is leaking."
+        )
+
+
+def test_jit_compiled_forward_matches_eager() -> None:
+    """The trainer will JIT the LoRA forward. ``eqx.tree_at`` should
+    produce a backbone whose updated leaves connect through XLA
+    tracing — i.e. compiled forward == eager forward. Pins the
+    JIT-vs-eager bit-equivalence at LoRA-init."""
+    backbone = init_model(TINY_SUPERNET, jax.random.PRNGKey(0))
+    model = init_lora_model(
+        backbone, LoRAConfig(rank=4, targets=("q", "v")), jax.random.PRNGKey(1)
+    )
+    tokens, mask = _toy_batch()
+    eager = model(tokens, mask)
+
+    @eqx.filter_jit
+    def fwd(m: LoRAModel, t: jax.Array, am: jax.Array) -> jax.Array:
+        return m(t, am)
+
+    jitted = fwd(model, tokens, mask)
+    # XLA may fuse + reorder fp32 reductions vs the eager path, so
+    # bit-equality is too strict. Tight ``allclose`` is the
+    # documented JAX guarantee.
+    assert jnp.allclose(eager, jitted, rtol=1e-5, atol=1e-5)
+
+
+def test_effective_backbone_skips_nontarget_adds() -> None:
+    """Perf-correctness: targets not in ``cfg.targets`` use a zero-
+    width sentinel and the ``effective_backbone`` skip-path returns
+    the unmodified backbone weight (``backbone.wk is effective.wk``
+    when k is not targeted). Pins the perf-significant guard
+    against the ~131 MB/step waste that XLA's algebraic simplifier
+    may not always eliminate."""
+    backbone = init_model(TINY_SUPERNET, jax.random.PRNGKey(0))
+    # Only target q. k, v, o are non-targets.
+    model = init_lora_model(
+        backbone, LoRAConfig(rank=4, targets=("q",)), jax.random.PRNGKey(1)
+    )
+    effective = model.effective_backbone()
+    # Non-targeted attention projections must be IDENTICAL (not just
+    # bit-equal) to the backbone — the skip-path returns the same
+    # array object, not ``backbone + 0``.
+    assert effective.wk is backbone.wk, (
+        "k was not targeted but effective.wk diverged from backbone.wk"
+    )
+    assert effective.wv is backbone.wv
+    assert effective.wo is backbone.wo
+    # The targeted projection: B=0 at init → effective.wq == backbone.wq,
+    # but allocated through the add path (not the skip-path).
+    assert jnp.array_equal(effective.wq, backbone.wq)
 
 
 def test_lora_on_sliced_backbone_works() -> None:
