@@ -2,12 +2,14 @@
 
 Minimal entry point that ties the Phase-2 chunks together:
 
-  1. Generate a Rust-engine corpus (or reuse a previously-generated one).
-  2. Reshape the corpus into ``[N_chunks, K, B, T]`` chunks where each
-     chunk is one ``make_scan_step`` invocation.
+  1. Generate a Rust-engine corpus (always — no cache reuse here yet).
+  2. Slice the flat ``[N_games, T]`` corpus into ``[K, B, T]`` chunks
+     on-the-fly, one per ``make_scan_step`` invocation.
   3. Compose the optimizer with ``make_lr_schedule``; init TrainState.
-  4. Train for ``--total-steps`` (a multiple of K is recommended).
-  5. Log per-chunk metrics to ``logs/jax_run_<ts>_<slug>/metrics.jsonl``.
+  4. Train for ``--total-steps``; must be an exact multiple of ``--k``
+     (the script exits with an error otherwise).
+  5. Log per-chunk metrics to
+     ``logs/jax_run_<YYYYMMDD_HHMMSS_µs>_<pid>/metrics.jsonl``.
 
 This is the Phase-2 verification driver, not the production pretraining
 loop. Production runs need: HF-backed checkpoints, an LR schedule
@@ -19,6 +21,7 @@ Phase-2 is otherwise green.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime
 import json
 import os
@@ -51,9 +54,13 @@ from pawn.jax.trainer import (
 
 
 def _slug() -> str:
-    """A short timestamp-only slug — enough to disambiguate concurrent
-    runs without needing a random word generator."""
-    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    """Collision-resistant run slug: timestamp at microsecond
+    resolution plus PID. Two concurrent runs from the same user
+    on the same host within the same second still get distinct
+    directories (PIDs differ); the microsecond suffix also covers
+    the rare same-PID sub-second loop case."""
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"{ts}_{os.getpid()}"
 
 
 def _resolve_supernet(name: str) -> tuple[ModelConfig, dict[str, ModelConfig]]:
@@ -138,6 +145,16 @@ def main(argv: list[str] | None = None) -> int:
     supernet_cfg, variants = _resolve_supernet(args.supernet)
     specs = tuple(VariantSpec(cfg=v) for v in variants.values())
 
+    # Build the LR schedule first so any misconfiguration (warmup
+    # >= total, end_value >= peak, non-positive arg) fails BEFORE
+    # we create the run directory and write config.json. Otherwise
+    # a bad-config invocation leaves an orphaned logs/ dir.
+    sched = make_lr_schedule(
+        peak_lr=args.lr,
+        total_steps=args.total_steps,
+        warmup_steps=args.warmup_steps,
+    )
+
     run_dir = Path(args.logs_dir) / f"jax_run_{_slug()}"
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.jsonl"
@@ -146,12 +163,11 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             {
                 "supernet": args.supernet,
-                "supernet_cfg": {
-                    "d_model": supernet_cfg.d_model,
-                    "n_layers": supernet_cfg.n_layers,
-                    "n_heads": supernet_cfg.n_heads,
-                    "d_ff": supernet_cfg.d_ff,
-                },
+                # ``asdict`` captures every ``ModelConfig`` field — vocab_size,
+                # max_seq_len, n_outcomes, rope_base — so the config file is
+                # always a complete record without needing to hand-track the
+                # field list.
+                "supernet_cfg": dataclasses.asdict(supernet_cfg),
                 "total_steps": args.total_steps,
                 "batch_size": args.batch_size,
                 "seq_len": args.seq_len,
@@ -185,11 +201,6 @@ def main(argv: list[str] | None = None) -> int:
 
     key = jax.random.PRNGKey(args.seed)
     model = init_model(supernet_cfg, key)
-    sched = make_lr_schedule(
-        peak_lr=args.lr,
-        total_steps=args.total_steps,
-        warmup_steps=args.warmup_steps,
-    )
     optimizer = make_optimizer(sched)
     state = init_train_state(model, optimizer)
     train_step = make_train_step(optimizer, specs)
@@ -213,8 +224,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             t_chunk = time.perf_counter()
             state, metrics = scan(state, chunk)
-            # Block on the first metric so wall-time is real.
-            metrics["loss"].block_until_ready()
+            # Block on the full pytree, not just one key — if the
+            # metrics dict ever holds independently-dispatched arrays,
+            # blocking on a single key would silently miss the others.
+            jax.block_until_ready(metrics)
             dt = time.perf_counter() - t_chunk
 
             # Pull metrics off-device — they're [K]-shaped per key.

@@ -85,6 +85,7 @@ ARGPARSE_SCRIPTS = [
     "generate_model_cards.py",
     "rename_shards.py",
     "run_evals_backbone.py",
+    "train_jax.py",
     "vastai_score.py",
 ]
 

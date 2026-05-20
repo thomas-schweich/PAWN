@@ -174,26 +174,48 @@ def make_lr_schedule(
     """Linear warmup → cosine decay (Optax canonical).
 
     Args:
-        peak_lr: LR reached at the end of warmup.
-        total_steps: full schedule length; decay_steps = total - warmup.
-        warmup_steps: linear ramp from 0 to ``peak_lr``.
-        end_value: floor at ``total_steps``; defaults to ``peak_lr * 0.1``.
+        peak_lr: LR reached at the end of warmup. Must be ``> 0``.
+        total_steps: full schedule length, end-to-end. ``end_value``
+            is reached exactly at ``total_steps``. Must be ``> 0``.
+        warmup_steps: linear ramp from 0 to ``peak_lr``. Must be
+            ``>= 0`` and ``< total_steps``.
+        end_value: floor reached at ``total_steps`` and held past it.
+            Must be ``< peak_lr`` (otherwise the "decay" phase would
+            increase). Defaults to ``peak_lr * 0.1``.
 
-    Past ``total_steps`` the schedule plateaus at ``end_value``, so
-    going over budget (e.g. a continuation run) won't drive LR
-    negative.
+    Past ``total_steps`` the schedule plateaus at ``end_value`` so a
+    continuation run won't drive LR negative.
+
+    Implementation note: Optax's ``warmup_cosine_decay_schedule`` takes
+    ``decay_steps`` as the *full* end-to-end length (it internally
+    subtracts ``warmup_steps`` for the cosine span). The earlier
+    version of this function passed ``total_steps - warmup_steps``,
+    which made Optax subtract warmup twice and caused the floor to be
+    reached at step ``total_steps - warmup_steps`` instead of
+    ``total_steps``. Pass ``total_steps`` directly.
     """
-    if end_value is None:
-        end_value = peak_lr * 0.1
+    if peak_lr <= 0:
+        raise ValueError(f"peak_lr={peak_lr} must be positive")
+    if total_steps <= 0:
+        raise ValueError(f"total_steps={total_steps} must be positive")
+    if warmup_steps < 0:
+        raise ValueError(f"warmup_steps={warmup_steps} must be non-negative")
     if warmup_steps >= total_steps:
         raise ValueError(
             f"warmup_steps={warmup_steps} must be < total_steps={total_steps}"
+        )
+    if end_value is None:
+        end_value = peak_lr * 0.1
+    if end_value >= peak_lr:
+        raise ValueError(
+            f"end_value={end_value} must be < peak_lr={peak_lr} (otherwise "
+            "the cosine 'decay' phase would increase instead of decrease)"
         )
     return optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=peak_lr,
         warmup_steps=warmup_steps,
-        decay_steps=total_steps - warmup_steps,
+        decay_steps=total_steps,
         end_value=end_value,
     )
 
@@ -249,38 +271,46 @@ def make_scan_step(
 ]:
     """Fuse ``train_step`` into a K-step ``lax.scan`` loop (§4.4).
 
-    The returned callable consumes a *chunk* batch of shape ``[K, B, T]``
-    (per-step batches stacked on a leading axis) and applies
-    ``train_step`` K times, returning ``(final_state, stacked_metrics)``
-    where ``stacked_metrics[k]`` is the metrics dict produced at step
-    ``k``. The host loop unstacks for logging.
+    The returned callable consumes a *chunk* with arrays of shape
+    ``[K, B, T]`` and applies ``train_step`` K times, returning
+    ``(final_state, stacked_metrics)`` where ``stacked_metrics`` is a
+    ``dict[str, jax.Array]`` whose values are each ``[K]``-shaped.
+    ``stacked_metrics["loss"][k]`` is the loss at step ``k``; the host
+    loop unstacks for logging.
 
-    K should be chosen to amortise host overhead — for PAWN-base on a
-    B200 the docs target K=200 (~52 MB per chunk staged to device while
-    the previous chunk trains).
+    K should be chosen to amortise host overhead — the design doc §4.3
+    targets ``K · B`` games per chunk; the per-token byte cost is 10
+    bytes (int32 tokens + bool attn_mask + int32 targets + bool
+    loss_mask = 4+1+4+1), so at K=200, B=256, T=512 each chunk is
+    ~262 MB. Pick K so that chunk size comfortably fits in device
+    memory.
 
-    Designed for use in chunk 2.4's driver: the driver pre-stages each
+    Designed for use in the driver: the driver pre-stages each
     ``[K, ...]`` chunk to device, calls this, then logs / checkpoints
     based on the host-side step counter ``int(state.step)``.
+
+    Inside the scan body the four chunk arrays are passed directly as
+    ``lax.scan``'s ``xs`` — Optax slices on the leading axis as a
+    static stride, avoiding a per-step dynamic gather that the
+    earlier ``jnp.arange(k)`` + ``tokens_chunk[slice_idx]`` formulation
+    incurred.
     """
 
-    def scan_step(state: TrainState, chunk: Batch) -> tuple[TrainState, dict[str, jax.Array]]:
-        tokens_chunk, attn_chunk, target_chunk, loss_chunk = chunk
-
-        # Each [K, B, T] slice along axis 0 is one batch.
-        def body(
-            inner_state: TrainState, slice_idx: jax.Array
-        ) -> tuple[TrainState, dict[str, jax.Array]]:
-            batch: Batch = (
-                tokens_chunk[slice_idx],
-                attn_chunk[slice_idx],
-                target_chunk[slice_idx],
-                loss_chunk[slice_idx],
-            )
+    def scan_step(
+        state: TrainState, chunk: Batch
+    ) -> tuple[TrainState, dict[str, jax.Array]]:
+        def body(inner_state: TrainState, batch: Batch) -> tuple[
+            TrainState, dict[str, jax.Array]
+        ]:
             new_state, metrics = train_step(inner_state, batch)
             return new_state, metrics
 
-        return jax.lax.scan(body, state, jnp.arange(k, dtype=jnp.int32))
+        # ``lax.scan`` indexes each leaf of ``chunk`` along axis 0,
+        # producing a ``Batch`` (one [B, T] tuple) per iteration.
+        # Pass an explicit ``length=k`` so a shape-only mismatch
+        # between the chunk and the configured K surfaces clearly
+        # rather than silently running a different number of steps.
+        return jax.lax.scan(body, state, chunk, length=k)
 
     return eqx.filter_jit(scan_step)
 

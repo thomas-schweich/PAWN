@@ -401,6 +401,63 @@ def test_lr_schedule_rejects_warmup_exceeding_total() -> None:
         make_lr_schedule(peak_lr=1e-3, total_steps=100, warmup_steps=100)
 
 
+def test_lr_schedule_rejects_non_positive_total_or_peak() -> None:
+    """Non-positive ``total_steps`` or ``peak_lr`` fail loudly with a
+    targeted message rather than emitting a degenerate optax schedule."""
+    with pytest.raises(ValueError, match="total_steps"):
+        make_lr_schedule(peak_lr=1e-3, total_steps=0, warmup_steps=10)
+    with pytest.raises(ValueError, match="peak_lr"):
+        make_lr_schedule(peak_lr=0.0, total_steps=100, warmup_steps=10)
+
+
+def test_lr_schedule_rejects_negative_warmup() -> None:
+    """``warmup_steps < 0`` would feed a negative slope into optax;
+    pin a clear ValueError instead."""
+    with pytest.raises(ValueError, match="warmup_steps"):
+        make_lr_schedule(peak_lr=1e-3, total_steps=100, warmup_steps=-1)
+
+
+def test_lr_schedule_rejects_end_value_geq_peak() -> None:
+    """``end_value >= peak_lr`` would make the cosine *increase* through
+    the "decay" phase — almost certainly a misconfiguration. Pin a
+    clear ValueError so it doesn't silently corrupt a long run."""
+    with pytest.raises(ValueError, match="end_value"):
+        make_lr_schedule(
+            peak_lr=1e-3, total_steps=100, warmup_steps=10, end_value=1e-3
+        )
+    with pytest.raises(ValueError, match="end_value"):
+        make_lr_schedule(
+            peak_lr=1e-4, total_steps=100, warmup_steps=10, end_value=1e-3
+        )
+
+
+def test_lr_schedule_warmup_zero_starts_at_peak() -> None:
+    """A warmup of 0 is a valid degenerate case: step 0 already returns
+    ``peak_lr``. Pins the boundary so a future tightening of the
+    ``warmup_steps >= 0`` guard to ``> 0`` doesn't silently break this."""
+    sched = make_lr_schedule(
+        peak_lr=1e-3, total_steps=100, warmup_steps=0
+    )
+    assert math.isclose(_sched_at(sched, 0), 1e-3, rel_tol=1e-5)
+
+
+def test_lr_schedule_floor_reached_exactly_at_total_steps() -> None:
+    """The cosine decay must hit ``end_value`` AT ``total_steps``, not
+    earlier. Pins the optax ``decay_steps`` semantics fix: optax's
+    parameter is the *end-to-end* schedule length and it subtracts
+    warmup internally — passing ``total_steps - warmup`` (the previous
+    bug) made end_value land at ``total_steps - warmup`` instead.
+    Concretely test that just before total_steps the schedule is
+    strictly above end_value and at total_steps it equals end_value."""
+    sched = make_lr_schedule(
+        peak_lr=1e-3, total_steps=1000, warmup_steps=100, end_value=1e-4
+    )
+    # Just-before-end is still in the decay region (above floor).
+    assert _sched_at(sched, 999) > 1e-4
+    # Floor hit at exactly total_steps.
+    assert math.isclose(_sched_at(sched, 1000), 1e-4, rel_tol=1e-3)
+
+
 def test_optimizer_accepts_schedule_callable() -> None:
     """``make_optimizer`` must accept an ``optax.Schedule`` as
     ``learning_rate``. Pins the integration before chunk 2.4's
