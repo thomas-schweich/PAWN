@@ -1,0 +1,318 @@
+"""Structural tests for ``pawn.generation``.
+
+Targets: the autoregressive sampler runs end-to-end on TINY, produces
+valid sequences shaped per the contract, and the §6.1-6.3 outcome
+signal test returns the documented metrics dict layout. These don't
+aim for "the model achieves X% match" — that's the verification-run
+job — but they pin the structural correctness of the port.
+"""
+
+from __future__ import annotations
+
+import chess_engine as engine
+import numpy as np
+import pytest
+
+import jax
+
+from pawn.config import OUTCOME_TOKEN_BASE, PAD_TOKEN, TINY_SUPERNET
+from pawn.generation import (
+    OUTCOME_TOKENS,
+    POISONING_PAIRS,
+    GenerationResult,
+    _analyze_generated_games,
+    _outcome_mask,
+    _term_code_to_outcome_name,
+    autoregressive_generate,
+    impossible_task_test,
+    improbable_task_test,
+    outcome_signal_test,
+    poisoned_prefix_test,
+    prefix_continuation_test,
+)
+from pawn.model import init_model
+
+
+# ---------------------------------------------------------------------------
+# Outcome-token constants
+# ---------------------------------------------------------------------------
+
+
+def test_outcome_tokens_match_outcome_band() -> None:
+    """All five OUTCOME_TOKENS land inside the outcome band starting at
+    OUTCOME_TOKEN_BASE (1969). They are distinct and in canonical order."""
+    expected = {
+        "WHITE_CHECKMATES": OUTCOME_TOKEN_BASE + 0,
+        "BLACK_CHECKMATES": OUTCOME_TOKEN_BASE + 1,
+        "STALEMATE": OUTCOME_TOKEN_BASE + 2,
+        "DRAW_BY_RULE": OUTCOME_TOKEN_BASE + 3,
+        "PLY_LIMIT": OUTCOME_TOKEN_BASE + 4,
+    }
+    assert OUTCOME_TOKENS == expected
+    assert len(set(OUTCOME_TOKENS.values())) == 5
+    assert min(OUTCOME_TOKENS.values()) >= OUTCOME_TOKEN_BASE
+
+
+# ---------------------------------------------------------------------------
+# Term-code mapping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tc,gl,expected",
+    [
+        (0, 1, "WHITE_CHECKMATES"),
+        (0, 2, "BLACK_CHECKMATES"),
+        (1, 13, "STALEMATE"),
+        (2, 100, "DRAW_BY_RULE"),
+        (3, 100, "DRAW_BY_RULE"),
+        (4, 100, "DRAW_BY_RULE"),
+        (5, 255, "PLY_LIMIT"),
+        (-2, 50, "PREMATURE_PAD"),
+        (-3, 50, "FORFEIT"),
+    ],
+)
+def test_term_code_to_outcome_name(tc: int, gl: int, expected: str) -> None:
+    assert _term_code_to_outcome_name(tc, gl) == expected
+
+
+def test_outcome_mask_recovers_term_codes() -> None:
+    """``_outcome_mask`` correctly partitions a corpus by outcome.
+
+    The five outcome buckets must be mutually disjoint and together
+    cover every game in a synthetic corpus with every legal term code.
+    """
+    term_codes = np.array([0, 0, 1, 2, 3, 4, 5], dtype=np.int8)
+    game_lengths = np.array([7, 8, 30, 100, 100, 100, 255], dtype=np.int32)
+    seen = np.zeros(len(term_codes), dtype=bool)
+    for name in OUTCOME_TOKENS:
+        mask = _outcome_mask(term_codes, game_lengths, name)
+        assert not (seen & mask).any(), (
+            f"outcome {name} overlaps an earlier bucket"
+        )
+        seen |= mask
+    assert seen.all(), "some game wasn't classified by any outcome bucket"
+
+
+# ---------------------------------------------------------------------------
+# Autoregressive generation contract
+# ---------------------------------------------------------------------------
+
+
+def _tiny_model():
+    return init_model(TINY_SUPERNET, jax.random.key(0))
+
+
+def test_autoregressive_generate_shapes() -> None:
+    """``autoregressive_generate`` returns the documented shapes + dtypes."""
+    model = _tiny_model()
+    gen = autoregressive_generate(
+        model, OUTCOME_TOKENS["WHITE_CHECKMATES"], n_games=4,
+        mask_illegal=True, max_seq_len=24, batch_size=4, seed=0,
+    )
+    assert isinstance(gen, GenerationResult)
+    assert gen.sequences.shape == (4, 24)
+    assert gen.sequences.dtype == np.int32
+    assert gen.term_codes.shape == (4,)
+    assert gen.game_lengths.shape == (4,)
+    assert gen.forfeit_ply.shape == (4,)
+
+
+def test_autoregressive_generate_outcome_token_at_pos_0() -> None:
+    """Position 0 always carries the conditioning outcome token."""
+    model = _tiny_model()
+    for name, tok in OUTCOME_TOKENS.items():
+        gen = autoregressive_generate(
+            model, tok, n_games=2,
+            mask_illegal=True, max_seq_len=16, batch_size=2, seed=0,
+        )
+        assert (gen.sequences[:, 0] == tok).all(), f"outcome {name} not at pos 0"
+
+
+def test_autoregressive_generate_masked_no_forfeits() -> None:
+    """With ``mask_illegal=True`` no game can forfeit — the engine's
+    legal-token mask precludes sampling an illegal move."""
+    model = _tiny_model()
+    gen = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=8,
+        mask_illegal=True, max_seq_len=24, batch_size=8, seed=1,
+    )
+    assert (gen.forfeit_ply == -1).all(), (
+        f"forfeit_ply={gen.forfeit_ply.tolist()} despite mask_illegal=True"
+    )
+
+
+def test_autoregressive_generate_termination_within_window() -> None:
+    """Every game terminates within the seq-len window — even
+    PLY_LIMIT games hit the synthetic ply limit at the end."""
+    model = _tiny_model()
+    gen = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=4,
+        mask_illegal=True, max_seq_len=16, batch_size=4, seed=2,
+    )
+    # max_move_positions = 15, so game_lengths in [0, 15].
+    assert (gen.game_lengths <= 15).all()
+    assert (gen.game_lengths >= 0).all()
+    # term_codes are all valid engine codes or sentinels.
+    valid_codes = {0, 1, 2, 3, 4, 5, -2, -3}
+    for tc in gen.term_codes:
+        assert int(tc) in valid_codes, f"unknown term_code={tc}"
+
+
+def test_autoregressive_generate_with_prefix() -> None:
+    """Loaded prefixes are mirrored into the output sequences at
+    positions ``1..pl``."""
+    model = _tiny_model()
+    # Generate a small corpus to source legal prefixes.
+    _ids, _t, _lm, move_ids, gls, _tc = engine.generate_clm_batch(
+        4, 16, 999, False, 0.0, False,
+    )
+    prefix_lens = np.minimum(np.full(4, 4, dtype=np.int32), gls.astype(np.int32))
+    gen = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=4,
+        mask_illegal=True, max_seq_len=20, batch_size=4, seed=3,
+        prefix_moves=move_ids, prefix_lengths=prefix_lens,
+    )
+    for i in range(4):
+        pl = int(prefix_lens[i])
+        # Position 0 is the outcome token; prefix moves at 1..pl.
+        np.testing.assert_array_equal(
+            gen.sequences[i, 1:pl + 1],
+            move_ids[i, :pl].astype(np.int32),
+            err_msg=f"game {i} prefix not mirrored at positions 1..{pl}",
+        )
+
+
+def test_autoregressive_generate_validates_n_games() -> None:
+    model = _tiny_model()
+    with pytest.raises(ValueError, match="n_games"):
+        autoregressive_generate(
+            model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=0,
+        )
+
+
+def test_autoregressive_generate_validates_temperature() -> None:
+    model = _tiny_model()
+    with pytest.raises(ValueError, match="temperature"):
+        autoregressive_generate(
+            model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=2,
+            temperature=0.0, max_seq_len=12,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Analysis function
+# ---------------------------------------------------------------------------
+
+
+def test_analyze_generated_games_metric_keys() -> None:
+    model = _tiny_model()
+    gen = autoregressive_generate(
+        model, OUTCOME_TOKENS["PLY_LIMIT"], n_games=6,
+        mask_illegal=True, max_seq_len=16, batch_size=6, seed=4,
+    )
+    metrics = _analyze_generated_games(gen, "PLY_LIMIT")
+    assert metrics["n_games"] == 6
+    assert 0.0 <= metrics["outcome_match_rate"] <= 1.0
+    assert 0.0 <= metrics["forfeit_rate"] <= 1.0
+    assert 0.0 <= metrics["post_terminal_padding_rate"] <= 1.0
+    assert metrics["mean_game_length"] >= 0.0
+    assert "outcome_distribution" in metrics
+    assert sum(metrics["outcome_distribution"].values()) == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# §6.1-6.3 outcome signal test smoke
+# ---------------------------------------------------------------------------
+
+
+def test_outcome_signal_test_smoke() -> None:
+    """``outcome_signal_test`` returns ``{outcome: {label: metrics}}``
+    for every conditioning outcome and every mask condition."""
+    model = _tiny_model()
+    results = outcome_signal_test(
+        model, n_per_outcome=4, mask_conditions=(False, True),
+        batch_size=4, seed=0, verbose=False,
+    )
+    assert set(results.keys()) == set(OUTCOME_TOKENS.keys())
+    for oname, by_mask in results.items():
+        assert set(by_mask.keys()) == {"masked", "unmasked"}
+        for label, metrics in by_mask.items():
+            for k in (
+                "n_games", "outcome_match_rate", "outcome_distribution",
+                "mean_game_length", "forfeit_rate",
+                "post_terminal_padding_rate", "post_terminal_move_count",
+                "premature_padding_rate", "elapsed_s",
+            ):
+                assert k in metrics, f"{oname}/{label} missing {k}"
+
+
+# ---------------------------------------------------------------------------
+# Prefix + poisoned + impossible + improbable smoke
+# ---------------------------------------------------------------------------
+
+
+def _small_corpus(n_games: int = 64, max_ply: int = 32, seed: int = 1234):
+    _ids, _t, _lm, move_ids, gls, tcs = engine.generate_clm_batch(
+        n_games, max_ply, seed, False, 0.0, False,
+    )
+    return {
+        "move_ids": move_ids,
+        "game_lengths": gls,
+        "termination_codes": tcs,
+    }
+
+
+def test_prefix_continuation_test_smoke() -> None:
+    """Run on a small corpus; verify the result dict structure for at
+    least one outcome bucket that has enough games."""
+    model = _tiny_model()
+    corpus = _small_corpus(n_games=64)
+    results = prefix_continuation_test(
+        model, corpus,
+        n_per_bucket=2, prefix_pcts=(0.5,), absolute_plies=(10,),
+        batch_size=4, seed=42, verbose=False,
+    )
+    # At least one outcome bucket should have completed (random games
+    # are dominated by PLY_LIMIT, so that one is guaranteed in a corpus
+    # of 64 games).
+    assert any(results.values()), "no outcome buckets produced results"
+
+
+def test_poisoned_prefix_test_smoke() -> None:
+    model = _tiny_model()
+    corpus = _small_corpus(n_games=64)
+    results = poisoned_prefix_test(
+        model, corpus, n_per_pair=2, prefix_pct=0.5,
+        batch_size=4, seed=43,
+    )
+    # ``results`` may be empty (rare outcomes in 64 games), but every
+    # entry must carry the required keys.
+    for label, metrics in results.items():
+        assert "->" in label
+        assert "original_outcome_match_rate" in metrics
+        assert "actual_outcome" in metrics
+        assert "poisoned_outcome" in metrics
+
+
+def test_impossible_task_test_smoke() -> None:
+    """Smoke-run the §6.6 impossible-task scenarios on a small corpus.
+    May skip individual scenarios that don't have enough games — only
+    the structure of returned entries is validated."""
+    model = _tiny_model()
+    corpus = _small_corpus(n_games=32)
+    results = impossible_task_test(
+        model, corpus, n_per_scenario=2, batch_size=2, seed=44,
+    )
+    for scenario, metrics in results.items():
+        assert "outcome_match_rate" in metrics
+
+
+def test_improbable_task_test_smoke() -> None:
+    model = _tiny_model()
+    corpus = _small_corpus(n_games=32)
+    results = improbable_task_test(
+        model, corpus, n_per_scenario=2, batch_size=2, seed=46,
+    )
+    for scenario, metrics in results.items():
+        assert "outcome_match_rate" in metrics
