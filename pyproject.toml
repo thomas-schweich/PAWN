@@ -86,7 +86,6 @@ reportMissingTypeStubs = false
 reportPrivateImportUsage = false
 reportMissingImports = "error"
 include = ["pawn"]
-exclude = ["pawn/dashboard"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

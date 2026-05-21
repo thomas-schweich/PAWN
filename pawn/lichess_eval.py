@@ -347,13 +347,35 @@ def filter_elo_slice(
     elo_max: int,
     side: str = "both",
 ) -> LichessCorpus:
-    """Filter games whose Elo lands in ``[elo_min, elo_max)``.
+    """Filter to games whose side-to-move Elo lands in ``[elo_min, elo_max)``.
+
+    Two-stage filter:
+
+    1. **Game-level**: keep games where the relevant Elo(s) are
+       in band. With ``side='white'`` / ``'black'`` that means
+       only that side; with ``side='both'`` (default) games are kept
+       iff either side is in band.
+    2. **Per-ply**: the returned slice's ``loss_mask`` is restricted
+       to positions where the *mover* (the player whose move is the
+       prediction target at that position) is in band. A 1500-vs-2500
+       game in the 1500 bucket therefore contributes only the
+       1500-player's plies — not the 2500-player's contaminating
+       moves. This matches the side-to-move Elo bucketing the legacy
+       Maia-style eval used (and what the module docstring at the top
+       of this file claims). Codex P2 (rounds 3/4/6) caught the
+       earlier whole-game-only filter as biasing reported accuracy.
+
+    The mover-parity logic depends on ``prepend_outcome``:
+
+    * Layout ``[m1, m2, ..., mN, PAD]`` (``prepend_outcome=False``):
+      ``target[i] = m_{i+2}``. Even positions predict black's moves;
+      odd positions predict white's.
+    * Layout ``[outcome, m1, m2, ..., mN, PAD]``
+      (``prepend_outcome=True``): ``target[i] = m_{i+1}``. Even
+      positions predict white's moves; odd positions predict black's.
 
     Args:
-        side: ``"white"`` / ``"black"`` / ``"both"``. With ``"both"``
-            (default), games are kept iff *either* side's Elo falls in
-            the range — matches the legacy Maia-eval default. With
-            ``"white"`` / ``"black"``, only that side's Elo is checked.
+        side: ``"white"`` / ``"black"`` / ``"both"``.
     """
     if side not in ("white", "black", "both"):
         raise ValueError(f"side={side!r} must be 'white', 'black', or 'both'")
@@ -362,24 +384,62 @@ def filter_elo_slice(
             f"elo_min={elo_min} must be < elo_max={elo_max}"
         )
 
-    w = (corpus.white_elo >= elo_min) & (corpus.white_elo < elo_max)
-    b = (corpus.black_elo >= elo_min) & (corpus.black_elo < elo_max)
+    w_in = (corpus.white_elo >= elo_min) & (corpus.white_elo < elo_max)
+    b_in = (corpus.black_elo >= elo_min) & (corpus.black_elo < elo_max)
     if side == "white":
-        keep = w
+        keep = w_in
     elif side == "black":
-        keep = b
+        keep = b_in
     else:
-        keep = w | b
+        keep = w_in | b_in
+
+    # Slice arrays first; per-ply mask construction works on the
+    # already-filtered subset.
+    sliced_tokens = corpus.tokens[keep]
+    sliced_attn = corpus.attn_mask[keep]
+    sliced_targets = corpus.targets[keep]
+    sliced_loss_mask = corpus.loss_mask[keep].copy()
+    sliced_white_elo = corpus.white_elo[keep]
+    sliced_black_elo = corpus.black_elo[keep]
+    sliced_result = corpus.result[keep]
+    sliced_w_in = w_in[keep]
+    sliced_b_in = b_in[keep]
+
+    # Per-position side-to-move parity (white = ``is_white_pos``).
+    seq_len = corpus.seq_len
+    pos = np.arange(seq_len, dtype=np.int32)[None, :]
+    if corpus.prepend_outcome:
+        is_white_pos = (pos % 2 == 0)
+    else:
+        is_white_pos = (pos % 2 == 1)
+    is_black_pos = ~is_white_pos
+
+    # Eligible-by-mover-Elo mask. For ``side='white'`` only white
+    # plies are scoreable (because the bucket is "white Elo in band"
+    # — black plies don't represent the bucket's player). Likewise
+    # for ``'black'``. For ``'both'``, a ply is scored iff the
+    # mover for that ply is in band: a game with white_elo=1500 and
+    # black_elo=2500 in the 1500 bucket contributes only its white
+    # plies.
+    if side == "white":
+        per_ply_keep = np.broadcast_to(is_white_pos, sliced_loss_mask.shape)
+    elif side == "black":
+        per_ply_keep = np.broadcast_to(is_black_pos, sliced_loss_mask.shape)
+    else:
+        w_keep = sliced_w_in[:, None] & is_white_pos
+        b_keep = sliced_b_in[:, None] & is_black_pos
+        per_ply_keep = w_keep | b_keep
+    sliced_loss_mask &= per_ply_keep
 
     return LichessCorpus(
-        tokens=corpus.tokens[keep],
-        attn_mask=corpus.attn_mask[keep],
-        targets=corpus.targets[keep],
-        loss_mask=corpus.loss_mask[keep],
+        tokens=sliced_tokens,
+        attn_mask=sliced_attn,
+        targets=sliced_targets,
+        loss_mask=sliced_loss_mask,
         game_lengths=corpus.game_lengths[keep],
-        white_elo=corpus.white_elo[keep],
-        black_elo=corpus.black_elo[keep],
-        result=corpus.result[keep],
+        white_elo=sliced_white_elo,
+        black_elo=sliced_black_elo,
+        result=sliced_result,
         seq_len=corpus.seq_len,
         prepend_outcome=corpus.prepend_outcome,
     )

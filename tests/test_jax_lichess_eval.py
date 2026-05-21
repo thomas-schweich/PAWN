@@ -99,6 +99,48 @@ def test_filter_elo_slice_empty_range_returns_empty_corpus() -> None:
     assert sliced.seq_len == corpus.seq_len
 
 
+def test_filter_elo_slice_masks_out_of_band_mover_plies() -> None:
+    """Per-ply masking by mover-Elo (Codex P2 rounds 3/4/6). A game
+    with one side in band + one out of band should contribute only
+    the in-band side's plies to the resulting ``loss_mask``, not all
+    plies. The whole-game-only filter the earlier code did was
+    contaminating reported per-Elo accuracy with the out-of-band
+    opponent's moves.
+
+    Fixture: white_elo=1450 (in band [1400, 1500)), black_elo=1500
+    (out of band — slice is half-open ``[lo, hi)``). The mover for
+    even positions is black (prepend_outcome=False layout: i % 2 == 1
+    → white). So white plies are at odd positions; the resulting
+    loss_mask should be True only on odd positions for this game.
+    """
+    # Single-game corpus with deliberately asymmetric Elos. ply=6 →
+    # positions 0..5 supervised in the pre-filter loss_mask.
+    corpus = _make_lichess_corpus(n=4, ply=6)
+    # game 1: white=1450, black=1500 — only white in [1400, 1500).
+    # Filter to that band; verify only odd positions remain True for
+    # game 1.
+    sliced = filter_elo_slice(corpus, elo_min=1400, elo_max=1500)
+    assert sliced.tokens.shape[0] == 1
+    assert int(sliced.white_elo[0]) == 1450
+    assert int(sliced.black_elo[0]) == 1500
+    # Under prepend_outcome=False, target[i] = m_{i+2}; even i →
+    # black's move, odd i → white's. White-only → keep odd positions.
+    pos = np.arange(sliced.seq_len, dtype=np.int32)
+    white_pos = pos % 2 == 1
+    pre_filter_loss_mask = corpus.loss_mask[1]   # game index 1 in original
+    expected = pre_filter_loss_mask & white_pos
+    np.testing.assert_array_equal(sliced.loss_mask[0], expected)
+    # And a regression to the old whole-game behavior would yield
+    # ``sliced.loss_mask[0] == pre_filter_loss_mask`` — strictly more
+    # True positions than expected. Verify the new mask is a proper
+    # subset.
+    assert int(sliced.loss_mask[0].sum()) < int(pre_filter_loss_mask.sum()), (
+        f"masked loss has {int(sliced.loss_mask[0].sum())} positions; "
+        f"unfiltered had {int(pre_filter_loss_mask.sum())} — the "
+        f"out-of-band black plies should have been dropped"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Accuracy eval
 # ---------------------------------------------------------------------------

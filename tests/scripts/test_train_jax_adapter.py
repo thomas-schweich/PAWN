@@ -145,6 +145,29 @@ def test_rejects_val_frac_out_of_range(tmp_path: Path) -> None:
             )
 
 
+def test_rejects_val_every_zero(tmp_path: Path) -> None:
+    """``--val-every 0`` is used as a modulo divisor inside the chunk
+    loop; without an upfront guard it would crash with
+    ZeroDivisionError after corpus generation + JIT trace had paid
+    their cost (Codex round 5 P3). The guard must fire before any
+    filesystem side effect so no orphan run dir lands on disk."""
+    with pytest.raises(SystemExit, match="--val-every"):
+        _run(
+            [
+                "--supernet", "tiny", "--variant", "base", "--rank", "4",
+                "--total-steps", "10", "--k", "5",
+                "--batch-size", "2", "--seq-len", "16",
+                "--warmup-steps", "1", "--val-frac", "0.1",
+                "--val-every", "0",
+            ],
+            tmp_path,
+        )
+    leaked = list(tmp_path.glob("jax_adapter_run_*"))
+    assert not leaked, (
+        f"--val-every=0 validation leaked a run directory: {leaked}"
+    )
+
+
 def test_rejects_seq_len_exceeding_max(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="seq-len"):
         _run(
