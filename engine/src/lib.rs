@@ -1019,7 +1019,12 @@ fn parse_pgn_lichess<'py>(
 
     // Tokens: (N, seq_len). With `prepend_outcome`, slot 0 is the outcome
     // token and moves start at slot 1; otherwise slot 0 is the first move.
-    let mut flat_tokens = vec![0i16; n * seq_len];
+    // Pad slots are PAD_TOKEN, NOT 0 — 0 is a valid action id (the first
+    // entry in the searchless_chess action table), so a 0-filled buffer
+    // would make the Python-side derivation
+    // ``attn_mask = tokens != PAD_TOKEN`` think every pad slot still
+    // carried a real move.
+    let mut flat_tokens = vec![vocab::PAD_TOKEN as i16; n * seq_len];
     // Clocks are parallel to the move positions only (no outcome slot),
     // so their width tracks `effective_max_ply`.
     let mut flat_clocks = vec![0u16; n * effective_max_ply];

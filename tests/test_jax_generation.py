@@ -617,6 +617,7 @@ def test_impossible_task_test_smoke() -> None:
     corpus = _small_corpus(n_games=32)
     results = impossible_task_test(
         model, corpus, n_per_scenario=2, batch_size=2, seed=44,
+        outcome_prefix_trained=True,
     )
     for scenario, metrics in results.items():
         assert "outcome_match_rate" in metrics
@@ -627,6 +628,40 @@ def test_improbable_task_test_smoke() -> None:
     corpus = _small_corpus(n_games=32)
     results = improbable_task_test(
         model, corpus, n_per_scenario=2, batch_size=2, seed=46,
+        outcome_prefix_trained=True,
     )
     for scenario, metrics in results.items():
         assert "outcome_match_rate" in metrics
+
+
+def test_impossible_task_skipped_without_outcome_prefix() -> None:
+    """When ``outcome_prefix_trained=False`` the test returns a
+    structured sentinel rather than running. Pins the gating contract
+    so a regression that ran the scenarios anyway on a non-prefix
+    model would surface here."""
+    model = _tiny_model()
+    corpus = _small_corpus(n_games=32)
+    results = impossible_task_test(
+        model, corpus, n_per_scenario=2, batch_size=2, seed=44,
+        outcome_prefix_trained=False,
+    )
+    assert "_skipped" in results
+    assert "outcome-token" in results["_skipped"].lower() or "prefix" in results["_skipped"].lower()
+    # No scenario entries should be present alongside the sentinel.
+    for k in results:
+        if k != "_skipped":
+            pytest.fail(f"unexpected scenario key {k!r} on a skipped run")
+
+
+def test_improbable_task_skipped_without_outcome_prefix() -> None:
+    """Same gating contract for ``improbable_task_test``."""
+    model = _tiny_model()
+    corpus = _small_corpus(n_games=32)
+    results = improbable_task_test(
+        model, corpus, n_per_scenario=2, batch_size=2, seed=46,
+        outcome_prefix_trained=False,
+    )
+    assert "_skipped" in results
+    for k in results:
+        if k != "_skipped":
+            pytest.fail(f"unexpected scenario key {k!r} on a skipped run")

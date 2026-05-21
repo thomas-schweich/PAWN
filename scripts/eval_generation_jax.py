@@ -157,6 +157,17 @@ def main() -> None:
              "equivalent; this flag is for parity-comparison runs.",
     )
     parser.set_defaults(use_kv_cache=True)
+    parser.add_argument(
+        "--no-outcome-prefix-trained", dest="outcome_prefix_trained",
+        action="store_false",
+        help="skip the impossible_task / improbable_task scenarios "
+             "(they only have interpretable meaning on models trained "
+             "with prepend_outcome=True data packing — outcome-token "
+             "conditioning at sequence position 0). Default assumes "
+             "the model is outcome-prefix-trained, matching the "
+             "legacy published checkpoints.",
+    )
+    parser.set_defaults(outcome_prefix_trained=True)
     args = parser.parse_args()
 
     if args.checkpoint is not None and not args.checkpoint.is_dir():
@@ -219,6 +230,7 @@ def main() -> None:
             model, corpus, n_per_scenario=args.n_per_scenario,
             batch_size=args.batch_size, seed=args.seed,
             use_kv_cache=args.use_kv_cache,
+            outcome_prefix_trained=args.outcome_prefix_trained,
         )
     if "improbable_task" in tests_to_run:
         assert corpus is not None
@@ -226,6 +238,7 @@ def main() -> None:
             model, corpus, n_per_scenario=args.n_per_scenario,
             batch_size=args.batch_size, seed=args.seed,
             use_kv_cache=args.use_kv_cache,
+            outcome_prefix_trained=args.outcome_prefix_trained,
         )
 
     out_dir = _make_run_dir(Path("logs"), args.checkpoint, args.logs_dir)

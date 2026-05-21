@@ -862,20 +862,55 @@ def impossible_task_test(
     model: PAWNModel,
     corpus: dict[str, np.ndarray],
     *,
+    outcome_prefix_trained: bool,
     n_per_scenario: int = 200,
     batch_size: int = 64,
     seed: int = 44,
     use_kv_cache: bool = True,
 ) -> dict[str, Any]:
-    """§6.6 provably-impossible scenarios:
+    """§6.6 provably-impossible scenarios.
 
-    * zero_remaining_ply: PLY_LIMIT games loaded as full-game prefixes,
-      conditioned on WHITE_CHECKMATES.
-    * insufficient_material: games that ended on insufficient material,
-      conditioned on WHITE_CHECKMATES at 90% prefix.
-    * control_ply_limit: same PLY_LIMIT prefixes but conditioned on
-      PLY_LIMIT (the "correct" / most-likely outcome).
+    Every scenario conditions the model on an outcome token at sequence
+    position 0 and asks whether the model abandons its prefix-grounded
+    distribution in response. This only has interpretable meaning when
+    the model was actually trained to condition on the outcome token —
+    i.e., trained with ``prepend_outcome=True`` data packing. On a
+    model trained without the outcome prefix, position 0's outcome
+    token is just an out-of-distribution input and the resulting
+    metrics measure nothing. Pass ``outcome_prefix_trained=True`` to
+    opt in; the function returns a structured ``{"_skipped": ...}``
+    sentinel otherwise.
+
+    Scenarios:
+
+    * ``zero_remaining_ply``: prefixes filled to within one move of
+      the model's context window. The model has no room to produce a
+      checkmate yet is conditioned on WHITE_CHECKMATES. Requires the
+      corpus to carry games at least ``model.cfg.max_seq_len - 1``
+      plies long — generate the diagnostic corpus with
+      ``corpus_max_ply >= model.cfg.max_seq_len - 1`` for this to be
+      meaningful. The scenario is silently skipped if no game in the
+      corpus is that long, so an under-sized corpus produces no
+      ``zero_remaining_ply`` entry rather than misleading numbers.
+    * ``insufficient_material``: games that ended in
+      insufficient-material draws, conditioned on WHITE_CHECKMATES at
+      90% prefix.
+    * ``control_ply_limit``: same prefixes as ``zero_remaining_ply``
+      but conditioned on PLY_LIMIT (the natural / most-likely outcome).
     """
+    if not outcome_prefix_trained:
+        return {
+            "_skipped": (
+                "impossible_task_test only has interpretable meaning on "
+                "models trained with prepend_outcome=True (outcome-token "
+                "conditioning at sequence position 0). The current model "
+                "wasn't, so the conditioning signal at position 0 is "
+                "out-of-distribution and the scenarios would measure "
+                "nothing. Re-run with --outcome-prefix-trained on a "
+                "compatible checkpoint."
+            )
+        }
+
     move_ids = corpus["move_ids"]
     game_lengths = corpus["game_lengths"]
     term_codes = corpus["termination_codes"]
@@ -883,14 +918,22 @@ def impossible_task_test(
     rng = np.random.default_rng(seed)
     results: dict[str, Any] = {}
 
-    # Scenario 1: zero remaining ply
-    ply_limit_idx = np.where(term_codes == 5)[0]
-    if len(ply_limit_idx) >= n_per_scenario:
+    # Scenario 1: zero remaining ply. Target prefix = max_seq_len - 1
+    # (with the outcome prepended at position 0, this fills positions
+    # 0..max_seq_len-1, leaving the decode loop's
+    # ``range(prefix_end + 1, max_seq_len)`` empty — zero plies of
+    # generation room). The candidate set is filtered to games that
+    # are actually long enough to fill that prefix; under-sized
+    # corpora silently skip the scenario rather than emit prefixes
+    # that don't realise the "zero remaining" semantics.
+    target_prefix = model.cfg.max_seq_len - 1
+    corpus_can_fill = int(move_ids.shape[1]) >= target_prefix
+    ply_limit_idx = np.where(
+        (term_codes == 5) & (game_lengths >= target_prefix)
+    )[0]
+    if corpus_can_fill and len(ply_limit_idx) >= n_per_scenario:
         selected = rng.choice(ply_limit_idx, n_per_scenario, replace=False)
-        pls = np.minimum(
-            game_lengths[selected].astype(np.int32),
-            int(move_ids.shape[1]) - 1,
-        )
+        pls = np.full(n_per_scenario, target_prefix, dtype=np.int32)
         gen = autoregressive_generate(
             model, OUTCOME_TOKENS["WHITE_CHECKMATES"], n_per_scenario,
             mask_illegal=True,
@@ -945,18 +988,42 @@ def improbable_task_test(
     model: PAWNModel,
     corpus: dict[str, np.ndarray],
     *,
+    outcome_prefix_trained: bool,
     n_per_scenario: int = 200,
     batch_size: int = 64,
     seed: int = 46,
     use_kv_cache: bool = True,
 ) -> dict[str, Any]:
-    """§6.7 highly-improbable scenarios:
+    """§6.7 highly-improbable scenarios.
 
-    * checkmate_few_ply: 245-ply prefixes from games of length >= 240,
-      conditioned on WHITE_CHECKMATES (very few ply remaining).
-    * stalemate_early: 20-ply prefixes conditioned on STALEMATE.
+    Same outcome-conditioning dependency as ``impossible_task_test``:
+    the scenarios condition on improbable outcomes at sequence
+    position 0 and only have interpretable meaning when the model
+    was trained with ``prepend_outcome=True`` data packing. Pass
+    ``outcome_prefix_trained=True`` to opt in; the function returns
+    ``{"_skipped": ...}`` otherwise.
+
+    Scenarios:
+
+    * ``checkmate_few_ply``: 245-ply prefixes from games of length
+      >= 240, conditioned on WHITE_CHECKMATES (very few ply
+      remaining).
+    * ``stalemate_early``: 20-ply prefixes conditioned on STALEMATE.
     * Controls condition on PLY_LIMIT.
     """
+    if not outcome_prefix_trained:
+        return {
+            "_skipped": (
+                "improbable_task_test only has interpretable meaning on "
+                "models trained with prepend_outcome=True (outcome-token "
+                "conditioning at sequence position 0). The current model "
+                "wasn't, so the conditioning signal at position 0 is "
+                "out-of-distribution and the scenarios would measure "
+                "nothing. Re-run with --outcome-prefix-trained on a "
+                "compatible checkpoint."
+            )
+        }
+
     move_ids = corpus["move_ids"]
     game_lengths = corpus["game_lengths"]
 

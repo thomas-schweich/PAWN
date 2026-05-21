@@ -33,10 +33,9 @@ fi
 # ── Dashboard + Caddy reverse proxy removed in Phase 4 ────────────
 # The Solara dashboard (``pawn.dashboard``) and its Caddy proxy on
 # port 8888 were removed when the eval surface flattened onto the
-# JAX trainer's per-run ``metrics.jsonl``. The Caddyfile + the Caddy
-# binary still ship in the image for now (Dockerfile change deferred);
-# nothing is launched against them. Setting ``PAWN_DASHBOARD`` has no
-# effect.
+# JAX trainer's per-run ``metrics.jsonl``. The Caddyfile, the Caddy
+# install stage in the Dockerfile, and the ``EXPOSE 8888`` directives
+# are all gone too. Setting ``PAWN_DASHBOARD`` has no effect.
 
 # ── Configure and start SSH as the foreground process ────────────────
 # tini (PID 1) reaps zombies and forwards signals.
