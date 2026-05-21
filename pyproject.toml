@@ -10,37 +10,70 @@ dependencies = [
     "psutil>=5.9.0",
     "safetensors>=0.4.0",
     "tqdm~=4.67.0",
-    "wandb~=0.25.0",
     "huggingface-hub>=0.20.0",
-    # Eval + probes
-    "seaborn>=0.13.2",
-    "matplotlib>=3.10.8",
-    "polars>=1.39.0",
+    # JAX training + eval (docs/jax-migration.md). CPU jaxlib by default;
+    # the GPU-jaxlib lives in the rocm / cu128 extras.
+    "jax>=0.6.0",
+    "equinox>=0.13.0",
+    "optax>=0.2.0",
+    # Datagen tooling (scripts/compact_stockfish_dataset.py).
     "pyarrow>=23.0.1",
-    "zstandard>=0.22.0",  # Lichess PGN extraction
-    # Dashboard
-    "solara>=1.0.0",
-    "plotly>=5.18.0",
-    "pandas>=2.0.0",
-    "anywidget>=0.9.21",
-    # Sweeps
-    "optuna>=4.0.0",
-    "optuna-dashboard>=0.17.0",
-    # Lab manager MCP server
-    "fastmcp>=2.0.0",
-    "starlette<1.0.0",  # solara incompatible with starlette 1.0
     # Dev
     "pyright>=1.1.0",
     "pytest~=9.0.0",
     "pytest-mock>=3.12.0",
     "hypothesis>=6.100.0",
     "syrupy>=4.7.0",
-    "ipykernel>=7.2.0",
 ]
 
 [project.optional-dependencies]
+# torch is kept as an extra alongside the JAX GPU backends because:
+#   (1) the thin PyTorch loader at ``pawn.jax.torch_loader`` ships
+#       alongside published JAX checkpoints for external non-JAX users
+#       (``docs/jax-migration.md`` §3.5);
+#   (2) ``pawn.jax._torch_legacy_fixture`` lets the legacy-converter
+#       parity tests build a torch reference model.
+# Neither path is exercised by ``pawn.jax.{model,trainer,adapters,eval}``,
+# so the JAX surface stays torch-free under a CPU-jax install.
 rocm = ["torch~=2.10.0", "triton-rocm>=3.6.0", "triton>=3.6.0"]
 cu128 = ["torch~=2.10.0"]
+torch-loader = ["torch~=2.10.0"]
+# Dashboard (`pawn.dashboard`) — Solara web UI that reads
+# ``logs/<run>/metrics.jsonl`` and renders per-run / per-trial
+# charts. Optional: the training + eval surface doesn't depend on it.
+# Launched via ``python -m pawn.dashboard --host 127.0.0.1 --port 8765 \
+#   --log-dir logs``; on the Docker images Caddy reverse-proxies it
+# on port 8888 (gated by ``PAWN_DASHBOARD`` env var; default on).
+dashboard = [
+    "solara>=1.0.0",
+    "plotly>=5.18.0",
+    "anywidget>=0.9.21",
+    "pandas>=2.0.0",
+    "starlette<1.0.0",  # solara incompatible with starlette 1.0
+]
+# Lab MCP server (``pawn.lab``) — FastMCP daemon that spawns
+# GPU-isolated training subprocesses, polls their ``metrics.jsonl``,
+# and drives Optuna sweeps. Optional: training + eval surface
+# doesn't depend on it. Launched via ``python -m pawn.lab`` (stdio
+# MCP) or used programmatically via ``pawn.lab.TrialRunner``.
+lab = [
+    "fastmcp>=2.0.0",
+    "optuna>=4.0.0",
+    "optuna-dashboard>=0.16.0",
+]
+# W&B (Weights & Biases) metrics-only integration (``pawn.wandb_utils``).
+# Optional: the trainers run without it, writing only the local
+# ``metrics.jsonl``. Enable per run via ``--wandb-mode online`` on
+# either training driver.
+wandb = ["wandb>=0.16.0"]
+# Data-pipeline scripts (Lichess parquet extraction, LC0 generation,
+# model-card rendering). Only the data-tool scripts in ``scripts/``
+# need these — the training + eval surface doesn't pull them in.
+data-tools = [
+    "polars>=1.0.0",
+    "jinja2>=3.0.0",
+    "zstandard>=0.20.0",  # extract_lichess_parquet reads zst archives
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -89,7 +122,11 @@ reportMissingTypeStubs = false
 reportPrivateImportUsage = false
 reportMissingImports = "error"
 include = ["pawn"]
-exclude = ["pawn/dashboard"]
+# Dashboard uses dynamic Solara/plotly patterns pyright can't reason
+# about (reactive `solara.use_state`, `px.line` chained kwargs, etc.).
+# The module is an optional ``dashboard`` extra and never on the
+# training / eval critical path; exclude from the default lint pass.
+exclude = ["pawn/dashboard", "pawn/lab"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

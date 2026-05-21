@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
-"""Play a PAWN adapter-on-backbone model against Stockfish (UCI_LimitStrength).
+"""Play a JAX PAWN model against Stockfish (UCI_LimitStrength).
 
 Usage:
     uv run --extra rocm python scripts/eval_vs_stockfish.py \\
-        --checkpoint thomas-schweich/pawn-base \\
-        --adapter-checkpoint runs/logs/trial_0022/bottleneck_.../checkpoints/step_00020000 \\
+        --checkpoint ~/.cache/huggingface/pawn-jax-converted/pawn-base \\
         --stockfish ~/bin/stockfish --stockfish-elo 1320 \\
         --games 100 --movetime-ms 1 \\
-        --output runs/eval/stockfish_vs_dim512.json
+        --output runs/eval/stockfish_vs_pawn-base.json
 
 Goal
 ----
-Triangulate the effective playing strength of the adapted backbone: a
+Triangulate the effective playing strength of a PAWN checkpoint: a
 win rate near 50% against Stockfish at a given UCI_Elo approximates the
 model's Elo at that time control.
 
 Notes
 -----
-- PAWN plays greedy (argmax) over legal moves at every ply. The
-  v1.0.0 ``prepend_outcome=False`` sequence format can't predict the
-  very first move (no training supervision at position 0), so when
-  PAWN plays white we open with ``e2e4`` and let the model take over
-  from move 2.
+- PAWN samples one move at a time under ``--temperatures``. ``T=0`` is
+  greedy (argmax over legal logits). The current canonical CLM
+  packing supervises position 0 to predict m_2 from m_1, so move 1
+  is never a training target — when PAWN plays white we open from a
+  rotated ``--first-moves`` book and let the model take over from
+  move 2.
 - Stockfish is constrained via ``UCI_LimitStrength=true`` + ``UCI_Elo``
   and ``go movetime <ms>``. Both limits apply — per-move time stays
   low so games complete in reasonable wall time.
@@ -38,7 +38,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-import torch
+import jax
+import jax.numpy as jnp
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -119,14 +121,12 @@ class StockfishEngine:
 # ---------------------------------------------------------------------------
 
 
-@torch.no_grad()
 def pawn_pick_move(
-    model: torch.nn.Module,
+    model: Any,
     history_tokens: list[int],
     legal_tokens: list[int],
-    device: str,
     temperature: float,
-    rng: torch.Generator,
+    rng: np.random.Generator,
 ) -> int:
     """Return the token id of a legal move under ``temperature`` sampling.
 
@@ -134,25 +134,44 @@ def pawn_pick_move(
     ``temperature > 0`` samples from ``softmax(logits / T)`` restricted
     to legal moves.
 
-    With ``prepend_outcome=False`` the v1.0.0 data layout supervises
-    position 0 to predict move 2 from move 1. That means move 1 is
-    never a training target, so this function requires ``history_tokens``
-    to be non-empty; the caller handles the first-move case (book).
+    The canonical CLM packing supervises position 0 to predict m_2
+    from m_1, so move 1 is never a training target — this function
+    requires ``history_tokens`` to be non-empty; the caller handles
+    the first-move case (book opening).
     """
+    from pawn.config import PAD_TOKEN  # noqa: PLC0415
+
     assert history_tokens, "pawn_pick_move needs at least one prior move"
-    ids = torch.tensor([history_tokens], dtype=torch.long, device=device)
-    if hasattr(model, "forward_hidden"):
-        hidden = model.forward_hidden(ids)  # type: ignore[operator]
-        logits = model.project_head(hidden[:, -1, :])  # type: ignore[operator]
-    else:
-        logits = model(ids)[:, -1, :]
-    legal = torch.tensor(legal_tokens, dtype=torch.long, device=device)
-    legal_logits = logits[0, legal].float()
+
+    seq_len = model.cfg.max_seq_len
+    n = len(history_tokens)
+    if n > seq_len:
+        # Truncate to the most recent ``seq_len`` tokens — keeps the
+        # model's window full. The trained context window is fixed; if
+        # the game runs longer than that the model has to forget the
+        # opening.
+        history_tokens = history_tokens[-seq_len:]
+        n = seq_len
+
+    tokens = np.full((1, seq_len), PAD_TOKEN, dtype=np.int32)
+    tokens[0, :n] = history_tokens
+    attn_mask = np.zeros((1, seq_len), dtype=np.bool_)
+    attn_mask[0, :n] = True
+
+    logits = np.asarray(
+        model(jnp.asarray(tokens), jnp.asarray(attn_mask))
+    )[0, n - 1]  # next-token logits from the last-real-position row
+    legal_arr = np.asarray(legal_tokens, dtype=np.int64)
+    legal_logits = logits[legal_arr].astype(np.float32)
+
     if temperature <= 0.0:
-        return int(legal[legal_logits.argmax()].item())
-    probs = torch.softmax(legal_logits / temperature, dim=-1)
-    idx = int(torch.multinomial(probs, num_samples=1, generator=rng).item())
-    return int(legal[idx].item())
+        return int(legal_arr[int(legal_logits.argmax())])
+    scaled = legal_logits / temperature
+    scaled -= scaled.max()  # numerical-stability shift
+    probs = np.exp(scaled)
+    probs /= probs.sum()
+    idx = int(rng.choice(len(legal_arr), p=probs))
+    return int(legal_arr[idx])
 
 
 # ---------------------------------------------------------------------------
@@ -168,17 +187,16 @@ DRAW_CODES = {1, 2, 3, 4, 5}
 
 
 def play_one_game(
-    model: torch.nn.Module,
+    model: Any,
     sf: StockfishEngine,
     pawn_plays_white: bool,
-    device: str,
     uci_to_token: dict[str, int],
     token_to_uci: list[str],
     movetime_ms: int,
     max_ply: int,
     first_move_uci: str | None,
     temperature: float,
-    rng: torch.Generator,
+    rng: np.random.Generator,
 ) -> dict[str, Any]:
     """Play one game. Return result dict with outcome from PAWN's POV."""
     import chess_engine
@@ -233,7 +251,7 @@ def play_one_game(
                     # No legal moves; termination should have fired.
                     break
                 tok = pawn_pick_move(
-                    model, moves_tokens, legal_tokens, device,
+                    model, moves_tokens, legal_tokens,
                     temperature=temperature, rng=rng,
                 )
                 uci = token_to_uci[tok]
@@ -291,9 +309,8 @@ def _find_token_for_uci(
 
 
 def run_match(
-    model: torch.nn.Module,
+    model: Any,
     sf: StockfishEngine,
-    device: str,
     uci_to_token: dict[str, int],
     token_to_uci: list[str],
     movetime_ms: int,
@@ -301,7 +318,7 @@ def run_match(
     first_moves: list[str],
     n_games: int,
     temperature: float,
-    rng: torch.Generator,
+    rng: np.random.Generator,
     label: str = "",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Play ``n_games`` PAWN-vs-Stockfish with alternating colors.
@@ -331,7 +348,6 @@ def run_match(
             first_move = None
         g = play_one_game(
             model=model, sf=sf, pawn_plays_white=pawn_white,
-            device=device,
             uci_to_token=uci_to_token,
             token_to_uci=token_to_uci,
             movetime_ms=movetime_ms,
@@ -393,9 +409,8 @@ def run_match(
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True,
-                   help="HF repo id or local path to PAWN backbone")
-    p.add_argument("--adapter-checkpoint", required=True,
-                   help="Path to adapter checkpoint directory")
+                   help="path to a JAX checkpoint directory (e.g. one "
+                        "produced by scripts/convert_published_checkpoints.py).")
     p.add_argument("--stockfish", default=str(Path.home() / "bin" / "stockfish"))
     p.add_argument("--stockfish-elo", type=int, default=1320)
     p.add_argument("--movetime-ms", type=int, default=1)
@@ -407,11 +422,11 @@ def main() -> None:
                         "book moves. When PAWN plays white the book "
                         "move rotates across this list so each opening "
                         "gets an equal share of the white games. Move 1 "
-                        "is untrained with prepend_outcome=False.")
+                        "is untrained under the canonical no-prepend "
+                        "CLM layout (targets[0] = m_2 from m_1).")
     p.add_argument("--temperatures", default="0.0,0.5,1.0",
                    help="Comma-separated list of sampling temperatures. "
                         "0 = greedy argmax.")
-    p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output", default=None,
                    help="Write per-game JSON here (default: stdout summary only)")
@@ -422,26 +437,14 @@ def main() -> None:
     if not first_moves:
         raise SystemExit("--first-moves must contain at least one UCI move")
 
-    torch.manual_seed(args.seed)
-    rng = torch.Generator(device=args.device)
-    rng.manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
 
-    print(f"loading backbone: {args.checkpoint}", flush=True)
-    print(f"loading adapter : {args.adapter_checkpoint}", flush=True)
-    from scripts.eval_accuracy import load_model
-    from pawn.gpu import apply_gpu_config, configure_gpu
-
-    gpu_cfg = configure_gpu(args.device, no_compile=False, no_amp=False)
-    model, adapter_type = load_model(
-        args.checkpoint, args.adapter_checkpoint, args.device,
-    )
-    print(f"adapter type: {adapter_type}", flush=True)
-
-    from pawn import model as model_module
-    model.forward_hidden = apply_gpu_config(  # type: ignore[method-assign]
-        gpu_cfg, model_module, model.forward_hidden,  # type: ignore[attr-defined]
-    )
-    model.eval()
+    print(f"loading checkpoint: {args.checkpoint}", flush=True)
+    from pawn.checkpoint import load_model  # noqa: PLC0415
+    model = load_model(args.checkpoint)
+    # JAX devices auto-detect — print which backend is in use so the
+    # operator can confirm the eval ran on the expected accelerator.
+    print(f"jax backend: {jax.default_backend()} ({jax.devices()})", flush=True)
 
     import chess_engine
     vocab = chess_engine.export_move_vocabulary()
@@ -461,7 +464,7 @@ def main() -> None:
         for temp in temperatures:
             print(f"\n=== Temperature {temp} ===", flush=True)
             summary, games = run_match(
-                model=model, sf=sf, device=args.device,
+                model=model, sf=sf,
                 uci_to_token=uci_to_token, token_to_uci=token_to_uci,
                 movetime_ms=args.movetime_ms, max_ply=args.max_ply,
                 first_moves=first_moves, n_games=args.games,
@@ -497,7 +500,6 @@ def main() -> None:
         out_path.write_text(json.dumps({
             "config": {
                 "checkpoint": args.checkpoint,
-                "adapter_checkpoint": args.adapter_checkpoint,
                 "stockfish_elo": args.stockfish_elo,
                 "movetime_ms": args.movetime_ms,
                 "games_per_temperature": args.games,

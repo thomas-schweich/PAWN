@@ -44,7 +44,7 @@ async def lab_status(ctx: Context) -> dict[str, Any]:
 
 @mcp.tool
 async def lab_launch(config: dict[str, Any], ctx: Context, tags: list[str] | None = None) -> dict[str, Any]:
-    """Launch a trial from a RunConfig dict. Use lab_schema to discover all fields. The config must include run_type ('pretrain', 'adapter', or 'cotrain'). Optionally pass tags for grouping (e.g. ["phase1", "mate-boost"])."""
+    """Launch a trial. The config must include ``run_type`` ('pretrain' or 'adapter' — 'cotrain' was removed in v2.0.0; the supernet's multi-variant joint loss subsumes it). For pretrain, set ``supernet`` ('tiny'|'supernet'); for adapter, set ``strategy`` (one of lora|film|unfreeze|bottleneck|hybrid|sparse|rosa|specialized_clm) plus ``variant`` ('small'|'base'|'large'). Every other field maps 1:1 to the corresponding ``scripts/train_jax{,_adapter}.py`` argparse flag (underscores in keys → dashes on the CLI). Use ``lab_schema`` to discover the full allowed flag list. Optionally pass tags for grouping (e.g. ["phase1", "mate-boost"])."""
     try:
         tid = await _runner(ctx).launch(config, tags=tags)
         return _runner(ctx).trials[tid].to_dict()
@@ -105,13 +105,61 @@ async def lab_set_cost(cost_per_hour: float, ctx: Context) -> dict[str, Any]:
 
 @mcp.tool
 async def lab_schema(ctx: Context) -> dict[str, Any]:
-    """Return the JSON Schema for RunConfig (PretrainConfig, AdapterConfig, CotrainConfig). Use this to discover all available parameters before calling lab_launch."""
-    from pawn.run_config import AdapterConfig, CotrainConfig, PretrainConfig
-
+    """List the allowed trial-config keys per ``run_type``. v2 doesn't
+    use a pydantic schema (``pawn.run_config`` was removed); the keys
+    here mirror the argparse surface of ``scripts/train_jax.py`` and
+    ``scripts/train_jax_adapter.py``. Pass these as keys in
+    ``lab_launch(config=...)``; the runner translates them to
+    ``--flag value`` argv."""
+    pretrain_keys = {
+        "supernet": "'tiny' | 'supernet'",
+        "total_steps": "int (multiple of k)",
+        "batch_size": "int",
+        "seq_len": "int (≤ supernet.max_seq_len)",
+        "k": "int (K-step lax.scan size)",
+        "lr": "float",
+        "warmup_steps": "int",
+        "seed": "int",
+        "corpus_seed": "int",
+        "model_seed": "int",
+        "max_corpus_gb": "int (abort-upfront guard)",
+    }
+    adapter_keys = {
+        **pretrain_keys,
+        "variant": "'small' | 'base' | 'large' (ignored for specialized_clm)",
+        "strategy": "lora|film|unfreeze|bottleneck|hybrid|sparse|rosa|specialized_clm",
+        "val_frac": "float in (0, 1)",
+        "val_every": "int > 0",
+        "rank": "int (lora|hybrid|rosa)",
+        "lora_alpha": "float | None (lora|hybrid|rosa)",
+        "lora_targets": "list[str] from {q,k,v,o} (lora|hybrid)",
+        "rosa_targets": "list[str] from {q,k,v,o} (rosa)",
+        "rosa_warmup_frac": "float in [0, 1) (rosa)",
+        "rosa_top_k_frac": "float in (0, 1] (rosa)",
+        "n_unfreeze": "int ≥ 0 (unfreeze)",
+        "include_lm_head": "bool (unfreeze)",
+        "include_embeddings": "bool (unfreeze)",
+        "bottleneck_dim": "int (bottleneck)",
+        "bottleneck_n_hidden": "int ≥ 0 (bottleneck)",
+        "bottleneck_no_attn": "bool (bottleneck)",
+        "bottleneck_no_ffn": "bool (bottleneck)",
+        "sparse_density": "float in (0, 1] (sparse)",
+        "sparse_targets": "list[str] from {q,k,v,o} (sparse)",
+        "sparse_hard": "bool (sparse)",
+        "film_output": "bool (film|hybrid)",
+        "specialized_d_model": "int (specialized_clm)",
+        "specialized_n_layers": "int (specialized_clm)",
+        "specialized_n_heads": "int (specialized_clm)",
+        "specialized_d_ff": "int (specialized_clm)",
+    }
     return {
-        "pretrain": PretrainConfig.model_json_schema(),
-        "adapter": AdapterConfig.model_json_schema(),
-        "cotrain": CotrainConfig.model_json_schema(),
+        "pretrain": pretrain_keys,
+        "adapter": adapter_keys,
+        "cotrain": {
+            "_removed": "cotrain trial type was removed in v2.0.0. The "
+                        "supernet's multi-variant joint loss replaces it — "
+                        "use run_type='pretrain' against the supernet."
+        },
     }
 
 

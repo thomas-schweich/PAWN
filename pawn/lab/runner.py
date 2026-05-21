@@ -29,27 +29,52 @@ from pawn.lab.state import Trial, _format_duration, _now_iso
 log = logging.getLogger("pawn.lab")
 
 
+_V2_ADAPTER_STRATEGIES = (
+    "lora", "film", "unfreeze", "bottleneck",
+    "hybrid", "sparse", "rosa", "specialized_clm",
+)
+
+
 def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Validate a config dict against RunConfig and return the normalized dict.
+    """Validate a trial-config dict against the v2 JAX-trainer surface.
 
-    Raises ``pydantic.ValidationError`` on bad input.
+    The v2 trainers (``scripts/train_jax.py`` / ``scripts/train_jax_adapter.py``)
+    use argparse, not the deleted ``pawn.run_config`` pydantic schema.
+    This validator checks the load-bearing shape: ``run_type`` is one of
+    ``pretrain`` / ``adapter`` (no more ``cotrain``), and the per-type
+    required fields are present. The trainers themselves do the
+    deep-argparse validation when the subprocess fires; surface the
+    obvious-misuse cases here.
+
+    Returns ``config`` (shallow-copied) so callers can extend without
+    mutating their input.
     """
-    from pydantic import TypeAdapter
-
-    from pawn.run_config import AdapterConfig, CotrainConfig, PretrainConfig
-
     run_type = config.get("run_type")
-    config_cls = {
-        "pretrain": PretrainConfig,
-        "adapter": AdapterConfig,
-        "cotrain": CotrainConfig,
-    }.get(run_type)  # type: ignore[arg-type]
-    if config_cls is None:
+    if run_type == "cotrain":
         raise ValueError(
-            f"run_type must be 'pretrain', 'adapter', or 'cotrain', got {run_type!r}"
+            "run_type='cotrain' was removed in v2.0.0 — the supernet's "
+            "multi-variant joint loss replaces the cotrain harness. Use "
+            "run_type='pretrain' against the supernet, which trains all "
+            "nested variants jointly."
         )
-    ta = TypeAdapter(config_cls)
-    return ta.validate_python(config).model_dump()
+    if run_type not in ("pretrain", "adapter"):
+        raise ValueError(
+            f"run_type must be 'pretrain' or 'adapter', got {run_type!r}"
+        )
+
+    cfg = dict(config)
+    # Defaults that mirror the train_jax* argparse defaults so a
+    # minimal trial config is enough.
+    cfg.setdefault("supernet", "tiny")
+    cfg.setdefault("k", 50)
+    if run_type == "adapter":
+        if cfg.get("strategy") not in _V2_ADAPTER_STRATEGIES:
+            raise ValueError(
+                f"adapter trial requires strategy in {list(_V2_ADAPTER_STRATEGIES)}, "
+                f"got {cfg.get('strategy')!r}"
+            )
+        cfg.setdefault("variant", "base")
+    return cfg
 
 
 class TrialRunner:
@@ -117,38 +142,60 @@ class TrialRunner:
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
     def _discover_gpus(self) -> None:
-        """Detect GPUs via a subprocess to avoid loading torch into this process.
-
-        Torch's ROCm/HIP runtime spawns background threads that busy-spin,
-        burning ~30% CPU permanently. Running discovery in a subprocess
-        keeps the MCP server process clean.
+        """Detect GPUs via ``nvidia-smi`` / ``rocm-smi`` shell-out so the
+        MCP server stays framework-agnostic (the v2 trainer is JAX,
+        and JAX's GPU detection still spawns persistent worker
+        threads — same anti-pattern that the old torch-based discovery
+        ran in a subprocess to avoid).
         """
         if self._gpus_discovered:
             return
         self._gpus_discovered = True
+
+        gpus: list[dict[str, Any]] = []
+        # Try nvidia-smi first (CUDA pods), then rocm-smi (ROCm pods).
         try:
             out = subprocess.check_output(
-                [
-                    self.python.split()[0], "-c",
-                    "import json, torch; "
-                    "gpus = [{"
-                    "'name': torch.cuda.get_device_name(i), "
-                    "'vram_mb': torch.cuda.get_device_properties(i).total_memory // (1024*1024)"
-                    "} for i in range(torch.cuda.device_count())]; "
-                    "print(json.dumps(gpus))",
-                ],
-                text=True, timeout=30,
+                ["nvidia-smi",
+                 "--query-gpu=name,memory.total",
+                 "--format=csv,noheader,nounits"],
+                text=True, timeout=10,
             )
-            gpus = json.loads(out.strip())
-            self.gpu_count = len(gpus)
-            for i, g in enumerate(gpus):
-                self.gpu_names.append(g["name"])
-                self.gpu_vram_mb.append(g["vram_mb"])
-                self.gpu_assignments.setdefault(i, None)
-            log.info("Found %d GPUs: %s", self.gpu_count, self.gpu_names)
-        except Exception as e:
-            log.warning("GPU discovery failed: %s", e)
-            self.gpu_count = 0
+            for line in out.strip().splitlines():
+                name, vram = line.split(",", 1)
+                gpus.append({
+                    "name": name.strip(),
+                    "vram_mb": int(vram.strip()),
+                })
+        except (subprocess.SubprocessError, FileNotFoundError, OSError, ValueError):
+            try:
+                out = subprocess.check_output(
+                    ["rocm-smi", "--showproductname",
+                     "--showmeminfo", "vram", "--json"],
+                    text=True, timeout=10,
+                )
+                data = json.loads(out)
+                for card_id, info in data.items():
+                    if not card_id.startswith("card"):
+                        continue
+                    name = info.get("Card Series") or info.get("Card model") or card_id
+                    vram_bytes = int(info.get("VRAM Total Memory (B)", 0))
+                    gpus.append({
+                        "name": str(name),
+                        "vram_mb": vram_bytes // (1024 * 1024),
+                    })
+            except (
+                subprocess.SubprocessError, FileNotFoundError, OSError, ValueError,
+                json.JSONDecodeError,
+            ):
+                log.warning("GPU discovery failed: nvidia-smi and rocm-smi both unavailable")
+
+        self.gpu_count = len(gpus)
+        for i, g in enumerate(gpus):
+            self.gpu_names.append(g["name"])
+            self.gpu_vram_mb.append(g["vram_mb"])
+            self.gpu_assignments.setdefault(i, None)
+        log.info("Found %d GPUs: %s", self.gpu_count, self.gpu_names)
 
     # =======================================================================
     # State persistence
@@ -272,15 +319,12 @@ class TrialRunner:
         config.setdefault("log_dir", trial_log_dir)
         config.setdefault("local_checkpoints", True)
 
-        # Validate via Pydantic
         validated = _validate_config(config)
         cmd = self._build_command(validated, trial_id)
 
-        if validated.get("run_type") == "cotrain":
-            variant_names = [v["name"] for v in validated.get("variants", [])]
-            strategy_display = "cotrain:" + "+".join(variant_names)
-        else:
-            strategy_display = validated.get("strategy") or validated.get("variant", "pretrain")
+        # ``cotrain`` was rejected by _validate_config; only pretrain
+        # and adapter trial types reach here.
+        strategy_display = validated.get("strategy") or validated.get("variant", "pretrain")
         trial = Trial(
             trial_id=trial_id,
             strategy=strategy_display,
@@ -324,11 +368,10 @@ class TrialRunner:
         new_config = dict(old.config)
         new_config.pop("pause_after_steps", None)
 
-        if (old.config or {}).get("run_type") == "cotrain":
-            self._resolve_cotrain_resume(old, new_config)
-        else:
-            ckpt_dir = self._find_latest_checkpoint(Path(old.run_dir))
-            new_config["resume"] = str(ckpt_dir)
+        # Cotrain support was removed in v2.0.0; only pretrain + adapter
+        # trial types persist, both single-run-dir.
+        ckpt_dir = self._find_latest_checkpoint(Path(old.run_dir))
+        new_config["resume"] = str(ckpt_dir)
 
         if total_steps is not None:
             new_config["total_steps"] = total_steps
@@ -357,10 +400,18 @@ class TrialRunner:
             raise RuntimeError(f"No checkpoint found under {run_dir}")
         return ckpt_dir
 
-    def _resolve_cotrain_resume(
+    def _resolve_cotrain_resume_DEAD(
         self, old: "Trial", new_config: dict[str, Any],
     ) -> None:
-        """Set per-variant resume paths for a cotrain trial."""
+        """DEAD CODE: v2 dropped cotrain trials. Retained as a stub
+        so callers still get a clear NotImplementedError if they
+        somehow reach this branch (they shouldn't — _validate_config
+        rejects run_type='cotrain' upfront)."""
+        raise NotImplementedError(
+            "cotrain resume is unsupported in v2 — the supernet "
+            "replaces cotrain"
+        )
+        # Unreachable below — kept to satisfy module-level imports.
         if not old.variants:
             raise RuntimeError(
                 f"Trial {old.trial_id} is cotrain but has no variant state. "
@@ -391,14 +442,103 @@ class TrialRunner:
     def _build_command(
         self, config: dict[str, Any], trial_id: int,
     ) -> list[str]:
-        script = str(self.code_dir / "scripts" / "train.py")
+        """Build a v2 train-script argv from a validated trial config.
+
+        The v1 ``scripts/train.py --config <json>`` interface is gone;
+        the v2 trainers use argparse and don't read a unified JSON
+        config. This translates the trial dict to ``--flag value``
+        argv. Unknown keys (anything outside the curated v2 surface)
+        raise — silent passthrough would mask trial-config typos.
+        """
+        run_type = config["run_type"]
         config_dir = self.log_dir / f"trial_{trial_id:04d}"
         config_dir.mkdir(parents=True, exist_ok=True)
-        config_path = config_dir / "run_config.json"
-        config_path.write_text(json.dumps(config, indent=2, default=str))
+        # Snapshot the config alongside the trial for reproducibility,
+        # even though the v2 trainer doesn't read it back.
+        (config_dir / "trial_config.json").write_text(
+            json.dumps(config, indent=2, default=str)
+        )
 
-        cmd = [*self.python.split(), script, "--config", str(config_path)]
-        return cmd
+        if run_type == "pretrain":
+            script = str(self.code_dir / "scripts" / "train_jax.py")
+            argv: list[str] = [*self.python.split(), script]
+            allowed = {
+                "supernet", "total_steps", "batch_size", "seq_len", "k",
+                "lr", "warmup_steps", "seed", "corpus_seed", "model_seed",
+                "max_corpus_gb", "logs_dir",
+            }
+        else:  # adapter
+            script = str(self.code_dir / "scripts" / "train_jax_adapter.py")
+            argv = [
+                *self.python.split(), script,
+                "--strategy", str(config["strategy"]),
+            ]
+            allowed = {
+                "supernet", "variant", "total_steps", "batch_size", "seq_len",
+                "k", "lr", "warmup_steps", "seed", "corpus_seed", "model_seed",
+                "max_corpus_gb", "logs_dir", "val_frac", "val_every",
+                # adapter-shape flags
+                "rank", "lora_alpha",
+                "rosa_warmup_frac", "rosa_top_k_frac",
+                "n_unfreeze", "bottleneck_dim", "bottleneck_n_hidden",
+                "sparse_density",
+                "specialized_d_model", "specialized_n_layers",
+                "specialized_n_heads", "specialized_d_ff",
+            }
+            # list-valued flags handled below
+            list_flags = {"lora_targets", "rosa_targets", "sparse_targets"}
+            allowed |= list_flags
+            # bool-flag pairs (CLI inverts the dest name)
+            bool_flag_pairs = {
+                "include_lm_head": ("--include-lm-head", "--no-include-lm-head"),
+                "include_embeddings": ("--include-embeddings", "--no-include-embeddings"),
+                "film_output": ("--film-output", "--no-film-output"),
+                "sparse_hard": ("--sparse-hard", "--no-sparse-hard"),
+                "bottleneck_no_attn": ("--bottleneck-no-attn", None),
+                "bottleneck_no_ffn": ("--bottleneck-no-ffn", None),
+                "quiet": ("--quiet", None),
+            }
+
+        # Ignore lab-bookkeeping keys.
+        skip = {"run_type", "strategy", "log_dir"}
+
+        for key, value in config.items():
+            if key in skip:
+                continue
+            if key not in allowed:
+                raise ValueError(
+                    f"unknown v2 trainer flag {key!r} in trial config; "
+                    f"allowed: {sorted(allowed)}"
+                )
+            cli = "--" + key.replace("_", "-")
+            if run_type == "adapter" and key in list_flags:
+                # ``--lora-targets q v`` shape. Accept either an
+                # explicit list/tuple of letters or the concatenated
+                # shorthand (``"qkvo"``) the sweep distributions
+                # emit, since Optuna's CategoricalDistribution rejects
+                # non-scalar choices on persistable storage.
+                if isinstance(value, str):
+                    letters: list[str] = list(value)
+                else:
+                    letters = [str(t) for t in value]
+                for letter in letters:
+                    if letter not in ("q", "k", "v", "o"):
+                        raise ValueError(
+                            f"{key}={value!r}: unexpected target letter "
+                            f"{letter!r}; expected subset of qkvo"
+                        )
+                argv.append(cli)
+                argv.extend(letters)
+            elif run_type == "adapter" and key in bool_flag_pairs:
+                pos, neg = bool_flag_pairs[key]
+                if value:
+                    argv.append(pos)
+                elif neg is not None:
+                    argv.append(neg)
+                # else: bool false on a no-negation flag → omit
+            else:
+                argv.extend([cli, str(value)])
+        return argv
 
     async def _spawn(self, trial: Trial) -> None:
         """Start the training process, with GPU isolation unless MPS is active."""

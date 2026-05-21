@@ -42,7 +42,7 @@ from pathlib import Path
 import numpy as np
 
 import chess_engine as engine
-from pawn.config import CLMConfig, PAD_TOKEN
+from pawn.config import MAX_SEQ_LEN, PAD_TOKEN, VOCAB_SIZE
 
 
 def bootstrap_ci_clustered(
@@ -169,7 +169,7 @@ def main():
     parser.add_argument("--n-games", type=int, default=20_000,
                         help="Number of random games to generate.")
     parser.add_argument("--max-ply", type=int, default=None,
-                        help="Maximum game length (default: CLMConfig().max_seq_len).")
+                        help=f"Maximum game length (default: MAX_SEQ_LEN = {MAX_SEQ_LEN}).")
     parser.add_argument("--seed", type=int, default=77777)
     parser.add_argument("--output", type=str, default="cards/theoretical_ceiling.json",
                         help="Where to save the JSON artifact. Defaults to "
@@ -184,9 +184,8 @@ def main():
                              "accuracy to the computed ceiling.")
     args = parser.parse_args()
 
-    cfg = CLMConfig()
-    max_ply = args.max_ply if args.max_ply is not None else cfg.max_seq_len
-    vocab_size = cfg.vocab_size
+    max_ply = args.max_ply if args.max_ply is not None else MAX_SEQ_LEN
+    vocab_size = VOCAB_SIZE
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

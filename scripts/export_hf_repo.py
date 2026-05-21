@@ -2,12 +2,18 @@
 """Export a training run to HuggingFace repo format.
 
 Finds the best checkpoint by val loss and packages files for HF upload:
-  - Root: best checkpoint (model.safetensors, config.json, metrics.jsonl, README.md)
+  - Root: best checkpoint (model.safetensors, config.json, .complete,
+    metrics.jsonl, README.md)
   - checkpoints/step_NNNN/: other checkpoints with truncated metrics
+
+The v2 trainer writes one ``metrics.jsonl`` row per scan chunk;
+val rows are detected by ``row["val_loss"] is not None`` (no separate
+``type`` field). The exported README's usage snippet loads via
+``pawn.checkpoint.load_model`` (the v2 JAX path).
 
 Usage:
     python scripts/export_hf_repo.py \
-        --run-dir logs/run_20260322_182707 \
+        --run-dir logs/jax_adapter_run_20260520_140000_123456_789 \
         --output-dir export/pawn-base \
         --repo-name pawn-base \
         --github-url https://github.com/thomas-schweich/PAWN
@@ -20,49 +26,52 @@ import json
 import shutil
 from pathlib import Path
 
-from pawn.checkpoint import _write_complete_sentinel
+from pawn._sentinel import write_sentinel
 
 
 def find_best_step(metrics_path: Path) -> int | None:
-    """Find the step with lowest val loss from metrics.jsonl."""
+    """Find the step (from ``step_end``) with the lowest val loss.
+
+    v2 ``metrics.jsonl`` has one row per scan chunk; val chunks carry
+    ``val_loss`` (a float), non-val chunks carry ``null``. Pretrain
+    runs never write ``val_loss`` and will fall through to
+    ``None`` — only adapter runs have val data.
+    """
     best_loss = float("inf")
-    best_step = None
+    best_step: int | None = None
     with open(metrics_path) as f:
         for line in f:
-            record = json.loads(line)
-            if record.get("type") != "val":
+            row = json.loads(line)
+            vloss = row.get("val_loss")
+            step = row.get("step_end")
+            if vloss is None or step is None:
                 continue
-            loss = record.get("val/loss", float("inf"))
-            step = record.get("step")
-            if loss < best_loss and step is not None:
-                best_loss = loss
+            if vloss < best_loss:
+                best_loss = vloss
                 best_step = step
     return best_step
 
 
 def truncate_metrics(metrics_path: Path, up_to_step: int) -> list[str]:
-    """Return metrics lines up to and including the given step."""
+    """Return metrics lines whose ``step_end`` is ≤ ``up_to_step``."""
     lines: list[str] = []
     with open(metrics_path) as f:
         for line in f:
-            record = json.loads(line)
-            if (
-                record.get("type") in ("train", "val")
-                and record.get("step", 0) > up_to_step
-            ):
+            row = json.loads(line)
+            step = row.get("step_end")
+            if step is not None and step > up_to_step:
                 break
             lines.append(line)
     return lines
 
 
 def copy_checkpoint(src: Path, dst: Path) -> None:
-    """Copy a directory-format checkpoint into the HF export layout.
+    """Copy a directory-format JAX checkpoint into the HF export layout.
 
     The source's ``.complete`` sentinel is dropped during copy (its
-    hashes are keyed to the source directory's file order) and a fresh
-    sentinel is written for ``dst`` so the exported checkpoint is
-    loadable via every ``pawn.checkpoint`` load path, including
-    ``load_pretrain_checkpoint`` which insists on a valid sentinel.
+    SHA-256 hashes are keyed to the source's file set) and a fresh
+    sentinel is written for ``dst`` so the exported checkpoint loads
+    cleanly via ``pawn.checkpoint.load_model``.
     """
     dst.mkdir(parents=True, exist_ok=True)
     for item in src.iterdir():
@@ -73,19 +82,19 @@ def copy_checkpoint(src: Path, dst: Path) -> None:
             shutil.copytree(item, target, dirs_exist_ok=True)
         else:
             shutil.copy2(item, target)
-    _write_complete_sentinel(dst)
+    write_sentinel(dst)
 
 
 def generate_readme(
     repo_name: str, model_config: dict, training_config: dict,
-    best_step: int, val_loss: float, val_acc: float,
+    best_step: int, val_loss: float,
     github_url: str, extra_desc: str = "",
 ) -> str:
     """Generate a HuggingFace model card README.
 
     All architecture fields come from the checkpoint's saved
     ``model_config``, so the card stays correct regardless of whether
-    the checkpoint was trained with a named preset or custom arch.
+    the checkpoint was trained as a supernet or a sliced variant.
     """
     d_model = model_config.get("d_model", "?")
     n_layers = model_config.get("n_layers", "?")
@@ -94,18 +103,16 @@ def generate_readme(
     vocab_size = model_config.get("vocab_size", "?")
     max_seq_len = model_config.get("max_seq_len", "?")
 
-    # `CLMConfig(**model_config)` reconstructs the exact trained
-    # architecture from the saved dict regardless of whether it matches
-    # a named preset, so the usage snippet below is always correct.
-
     return f"""---
 license: apache-2.0
-library_name: pytorch
+library_name: jax
 tags:
   - chess
   - transformer
   - causal-lm
   - world-model
+  - jax
+  - equinox
 datasets:
   - random-self-play
 model-index:
@@ -117,9 +124,6 @@ model-index:
           - name: Val Loss
             type: loss
             value: {val_loss}
-          - name: Val Accuracy
-            type: accuracy
-            value: {val_acc}
 ---
 
 # {repo_name.upper()}
@@ -131,7 +135,7 @@ A causal transformer trained on random chess games, designed as a testbed for fi
 
 | | |
 |---|---|
-| **Architecture** | Decoder-only transformer (RMSNorm, SwiGLU, RoPE) |
+| **Architecture** | Decoder-only transformer (RMSNorm, SwiGLU, RoPE), JAX/Equinox |
 | **d_model** | {d_model} |
 | **Layers** | {n_layers} |
 | **Heads** | {n_heads} |
@@ -139,25 +143,20 @@ A causal transformer trained on random chess games, designed as a testbed for fi
 | **Vocabulary size** | {vocab_size} |
 | **Sequence length** | {max_seq_len} |
 | **Best val loss** | {val_loss:.4f} (step {best_step:,}) |
-| **Best val accuracy** | {val_acc:.1%} |
 
 ## Usage
 
 ```python
-import json
-from safetensors.torch import load_file
-from pawn.config import CLMConfig
-from pawn.model import PAWNCLM
+from pawn.checkpoint import load_model
 
-# Reconstruct the exact architecture this checkpoint was trained with
-with open("config.json") as f:
-    model_config = json.load(f)["model_config"]
-cfg = CLMConfig(**model_config)
-
-model = PAWNCLM(cfg)
-model.load_state_dict(load_file("model.safetensors"))
-model.eval()
+# load_model verifies the .complete SHA-256 sentinel and rebuilds
+# the PAWNModel from the saved ModelConfig.
+model = load_model("path/to/exported_checkpoint")
+# model(tokens, attn_mask) -> [B, T, vocab_size] logits
 ```
+
+A thin PyTorch loader for non-JAX consumers ships at
+``pawn.torch_loader.load_pawn`` (requires the ``torch-loader`` extra).
 
 ## Training
 
@@ -170,7 +169,7 @@ Apache 2.0
 """
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Export training run to HF repo format")
     parser.add_argument("--run-dir", required=True, help="Training run directory")
     parser.add_argument("--output-dir", required=True, help="Output directory for HF repo")
@@ -190,17 +189,21 @@ def main():
 
     best_step = find_best_step(metrics_path)
     if best_step is None:
-        print("ERROR: No val records found in metrics.jsonl")
+        print(
+            "ERROR: No val records found in metrics.jsonl — only "
+            "adapter runs (train_jax_adapter.py) produce val_loss "
+            "rows. Pretrain runs have no val pass; use the final "
+            "checkpoint manually."
+        )
         return
     print(f"Best val step: {best_step}")
 
-    best_val_loss, best_val_acc = float("inf"), 0.0
+    best_val_loss = float("inf")
     with open(metrics_path) as f:
         for line in f:
             r = json.loads(line)
-            if r.get("type") == "val" and r.get("step") == best_step:
-                best_val_loss = r.get("val/loss", float("inf"))
-                best_val_acc = r.get("val/accuracy", 0.0)
+            if r.get("step_end") == best_step and r.get("val_loss") is not None:
+                best_val_loss = r["val_loss"]
                 break
 
     ckpt_dir = run_dir / "checkpoints"
@@ -228,7 +231,7 @@ def main():
 
     readme = generate_readme(
         args.repo_name, model_config, training_config,
-        best_step, best_val_loss, best_val_acc,
+        best_step, best_val_loss,
         args.github_url, args.extra_desc,
     )
     with open(output_dir / "README.md", "w") as f:
@@ -249,7 +252,7 @@ def main():
                 f.writelines(truncated)
 
     print(f"\nExport complete: {output_dir}")
-    print("  Best: model.safetensors, config.json, metrics.jsonl, README.md")
+    print("  Best: model.safetensors, config.json, .complete, metrics.jsonl, README.md")
     if not args.best_only:
         print(f"  Checkpoints: {len(checkpoints) - 1} in checkpoints/")
 

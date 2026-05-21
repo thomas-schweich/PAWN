@@ -1,14 +1,26 @@
-"""Optuna search space definitions for PAWN adapter strategies."""
+"""Optuna search space definitions for PAWN adapter strategies.
+
+Distributions are keyed by the v2 ``--strategy`` flag names + use the
+v2 trainer's argparse flag shapes (see ``scripts/train_jax_adapter.py``):
+- ``lora_targets`` / ``rosa_targets`` / ``sparse_targets`` are
+  space-separated *lists* (``["q", "v"]``), not concatenated strings.
+- ``rank`` replaces ``lora_rank`` (the v2 CLI flag is ``--rank``).
+- ``rosa`` is a single strategy now — the v1 ``retro-sparse`` /
+  ``retro-bottleneck`` ablation modes were not ported.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
-from pawn.sweep import BOTTLENECK_N_HIDDEN_CHOICES
+# In-sync with the v2 trainer's argparse choice list. v1 lived in
+# ``pawn.sweep`` which was deleted; restating here so the lab is
+# self-contained.
+BOTTLENECK_N_HIDDEN_CHOICES: tuple[int, ...] = (0, 1, 2)
 
 
 def builtin_distributions(strategy: str) -> dict[str, Any]:
-    """Return Optuna distributions for a PAWN adapter strategy."""
+    """Return Optuna distributions for a PAWN v2 adapter strategy."""
     import optuna.distributions as d
     Cat = d.CategoricalDistribution
     Float = d.FloatDistribution
@@ -17,66 +29,60 @@ def builtin_distributions(strategy: str) -> dict[str, Any]:
     common: dict[str, Any] = {
         "lr": Float(1e-5, 1e-2, log=True),
         "batch_size": Cat([32, 64, 128, 256]),
-        "weight_decay": Float(0.0, 0.1),
-        "warmup_frac": Float(0.0, 0.15),
+        # ``warmup_steps`` rather than v1's ``warmup_frac`` — v2 takes
+        # an absolute step count via ``--warmup-steps``.
+        "warmup_steps": Int(0, 1000, step=50),
     }
     spaces: dict[str, dict[str, Any]] = {
         "lora": {**common,
-            "lora_rank": Cat([2, 4, 8, 16, 32]),
-            "lora_targets": Cat(["qkvo", "qv", "qkv"]),
-            "lora_ffn": Cat([True, False]),
+            "rank": Cat([2, 4, 8, 16, 32]),
+            "lora_targets": Cat(["qv", "qkv", "qkvo"]),  # concatenated letters; runner splits
+            "lora_alpha": Cat([None, 8.0, 16.0, 32.0]),
         },
         "bottleneck": {**common,
-            "bottleneck_dim": Cat([4, 8, 16, 32, 64, 128, 256]),
+            "bottleneck_dim": Cat([4, 8, 16, 32, 64, 128]),
             "bottleneck_n_hidden": Cat(list(BOTTLENECK_N_HIDDEN_CHOICES)),
-            "no_adapt_attn": Cat([True, False]),
-            "no_adapt_ffn": Cat([True, False]),
+            "bottleneck_no_attn": Cat([True, False]),
+            "bottleneck_no_ffn": Cat([True, False]),
         },
         "film": {**common,
-            "use_output_film": Cat([True, False]),
+            "film_output": Cat([True, False]),
         },
         "sparse": {**common,
-            "density": Float(0.001, 0.1, log=True),
-            "sparse_targets": Cat(["qkvo", "qv", "qkv"]),
-            "sparse_ffn": Cat([True, False]),
+            "sparse_density": Float(0.001, 0.1, log=True),
+            "sparse_targets": Cat(["qv", "qkv", "qkvo"]),  # concatenated letters; runner splits
+            "sparse_hard": Cat([True, False]),
         },
         "hybrid": {**common,
-            "lora_rank": Cat([2, 4, 8, 16]),
-            "lora_targets": Cat(["qkvo", "qv", "qkv"]),
-            "use_output_film": Cat([True, False]),
+            "rank": Cat([2, 4, 8, 16]),
+            "lora_targets": Cat(["qv", "qkv", "qkvo"]),  # concatenated letters; runner splits
+            "film_output": Cat([True, False]),
         },
         "specialized_clm": {**common,
-            "d_model": Cat([32, 48, 84, 128, 192]),
-            "n_layers": Int(1, 4),
-            "n_heads": Cat([1, 2, 4, 8]),
+            "specialized_d_model": Cat([32, 48, 64, 128, 192]),
+            "specialized_n_layers": Int(1, 4),
+            "specialized_n_heads": Cat([1, 2, 4, 8]),
+            "specialized_d_ff": Cat([128, 256, 512, 768]),
         },
         "unfreeze": {**common,
-            "unfreeze_layers": Cat(["6,7", "5,6,7", "4,5,6,7"]),
+            "n_unfreeze": Int(1, 4),
+            "include_lm_head": Cat([True, False]),
+            "include_embeddings": Cat([True, False]),
         },
-    }
-    rosa_common: dict[str, Any] = {**common,
-        "density": Float(0.001, 0.1, log=True),
-        "lora_rank": Cat([2, 4, 8, 16]),
-        "lora_targets": Cat(["qkvo", "qv", "qkv"]),
-        "rosa_warmup_steps": Int(32, 256, step=32),
-        "mask_samples": Cat([16, 32, 64]),
-        "grad_alpha": Cat([1, 2]),
-    }
-    spaces["rosa"] = rosa_common
-    spaces["retro-sparse"] = rosa_common
-    spaces["retro-bottleneck"] = {
-        **rosa_common,
-        "bottleneck_dim": Cat([4, 8, 16]),
-        "bottleneck_n_hidden": Cat(list(BOTTLENECK_N_HIDDEN_CHOICES)),
-    }
-    spaces["pretrain"] = {
-        "lr": Float(1e-5, 1e-3, log=True),
-        "batch_size": Cat([64, 128, 256]),
-        "weight_decay": Float(0.0, 0.1),
-        "warmup_frac": Float(0.0, 0.15),
-        "d_model": Cat([256, 384, 512, 640]),
-        "n_layers": Cat([6, 8, 10, 12]),
-        "n_heads": Cat([4, 8]),
+        "rosa": {**common,
+            "rank": Cat([2, 4, 8, 16]),
+            "rosa_targets": Cat(["qv", "qkv", "qkvo"]),  # concatenated letters; runner splits
+            "rosa_warmup_frac": Float(0.1, 0.6),
+            "rosa_top_k_frac": Float(0.001, 0.1, log=True),
+        },
+        "pretrain": {
+            "lr": Float(1e-5, 1e-3, log=True),
+            "batch_size": Cat([64, 128, 256]),
+            "warmup_steps": Int(0, 2000, step=100),
+            # supernet selection (variant size lives in the variant
+            # validator inside the trainer, not as a sweep axis).
+            "supernet": Cat(["tiny", "supernet"]),
+        },
     }
 
     if strategy not in spaces:

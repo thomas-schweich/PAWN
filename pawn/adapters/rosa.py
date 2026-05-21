@@ -1,723 +1,371 @@
-"""RoSA (Robust Sparse Adaptation) for PAWN.
+"""RoSA (Robust Sparse Adaptation) — JAX port of `Nikdan et al. 2024
+<https://arxiv.org/abs/2401.04679>`_.
 
-Implements the method from `Nikdan et al., 2024
-<https://arxiv.org/abs/2401.04679>`_ ("RoSA: Accurate Parameter-Efficient
-Fine-Tuning via Robust Adaptation").
+Combines a low-rank adapter (LoRA) and a gradient-informed sparse
+adapter on each frozen attention projection::
 
-Combines a low-rank adapter (LoRA) with a gradient-informed sparse adapter
-on each frozen projection matrix:
+    W_eff = W + (scale · A @ B) + (Δ ⊙ mask)
 
-    output = frozen(x) + (x @ A^T) @ B^T * scaling + F.linear(x, delta * mask)
+The legacy module ran a three-phase training procedure:
 
-Training follows three phases:
-  1. LoRA warm-up (sparse disabled)
-  2. Gradient-based mask generation (Algorithm 1)
-  3. Joint LoRA + sparse training (or sparse-only in retrospective modes)
+1. **LoRA warm-up.** Sparse delta is zero + mask is all-False;
+   train only LoRA.
+2. **Mask generation.** Compute per-parameter gradient magnitudes
+   under the warmed-up LoRA, then take the top-k by absolute
+   gradient and freeze that mask.
+3. **Joint training.** Train LoRA + sparse delta together; the
+   mask is fixed at this point.
 
-Also provides RetroBottleneckCLM for the retrospective sparse + bottleneck
-ablation, combining gradient-informed sparse masks with nonlinear bottleneck
-adapters.
+This JAX port ships the *parameterisation* (RoSAModel +
+RoSAParams + adapter_filter) and a deterministic mask-setting
+helper (``set_mask(model, target → bool-mask)``). The three-phase
+training schedule itself is a trainer-side concern — the adapter
+trainer driver picks which subset of leaves to update at each
+phase via ``adapter_filter`` + optax's masked-gradient surface.
+A "RoSA training" follow-up PR wires up the phase scheduler.
+
+PyTree layout::
+
+  RoSAModel
+  ├── backbone: PAWNModel    (frozen)
+  └── rosa: RoSAParams
+       ├── a_q, a_k, a_v, a_o            ([n_layers, d, rank])
+       ├── b_q, b_k, b_v, b_o            ([n_layers, rank, d])
+       ├── delta_q, delta_k, delta_v, delta_o   ([n_layers, d, d])
+       └── mask_q, mask_k, mask_v, mask_o       ([n_layers, d, d] bool)
+
+Identity-at-init: B=0, Δ=0, mask=all-False — the wrapped forward
+is bit-identical to the bare backbone.
 """
 
 from __future__ import annotations
 
-import math
-from typing import Iterator
+from dataclasses import dataclass
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import equinox as eqx
+import jax
+import jax.numpy as jnp
 
-from pawn.config import CLMConfig
-from pawn.model import PAWNCLM, Attention
-from pawn.adapters.lora import ATTN_PRESETS, _FFN_TARGETS
-from pawn.adapters.sparse import SparseLinear, SparseCLM
-from pawn.adapters.bottleneck import BottleneckAdapter
+from pawn.model import PAWNModel
 
+_VALID_TARGETS = ("q", "k", "v", "o")
 
-# ---------------------------------------------------------------------------
-# RoSALinear -- compound LoRA + sparse linear
-# ---------------------------------------------------------------------------
 
-class RoSALinear(nn.Module):
-    """Frozen linear with both a low-rank and a sparse additive adapter.
-
-    output = frozen(x) + lora(x) + F.linear(x, delta * mask)
-
-    LoRA starts with B=0 (identity init). Sparse starts with delta=0 and
-    mask=all-False (disabled). Call ``set_mask`` to activate the sparse branch.
-    """
-
-    mask: torch.Tensor
-
-    def __init__(
-        self,
-        frozen_linear: nn.Linear,
-        rank: int,
-        alpha: float | None = None,
-        lora_enabled: bool = True,
-        sparse_enabled: bool = False,
-    ):
-        super().__init__()
-        self.frozen = frozen_linear
-        self.rank = rank
-        self.alpha = alpha if alpha is not None else float(rank)
-        self.scaling = self.alpha / self.rank
-        self.lora_enabled = lora_enabled
-        self.sparse_enabled = sparse_enabled
-
-        in_features = frozen_linear.in_features
-        out_features = frozen_linear.out_features
-
-        # LoRA branch
-        self.lora_A = nn.Parameter(torch.empty(rank, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-
-        # Sparse branch
-        self.delta = nn.Parameter(torch.zeros(out_features, in_features))
-        self.register_buffer("mask", torch.zeros(out_features, in_features, dtype=torch.bool))
-
-        # Sparse delta starts frozen (no grad until mask is set)
-        if not sparse_enabled:
-            self.delta.requires_grad = False
-
-    def set_mask(self, new_mask: torch.Tensor):
-        """Set the sparse mask and enable the sparse branch."""
-        self.mask.copy_(new_mask)
-        self.sparse_enabled = True
-        self.delta.requires_grad = True
-
-    @property
-    def n_active(self) -> int:
-        return int(self.mask.sum().item())
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.frozen(x)
-        if self.lora_enabled:
-            out = out + (x @ self.lora_A.T) @ self.lora_B.T * self.scaling
-        if self.sparse_enabled:
-            out = out + F.linear(x, self.delta * self.mask)
-        return out
-
-
-# ---------------------------------------------------------------------------
-# RoSACLM -- wrapper around frozen PAWNCLM
-# ---------------------------------------------------------------------------
-
-class RoSACLM(nn.Module):
-    """Frozen PAWN backbone with RoSA adapters (LoRA + gradient-informed sparse).
-
-    Injects ``RoSALinear`` into attention (and optionally FFN) projections.
-    During warm-up, only the LoRA branch is active. After mask generation,
-    both branches train jointly.
-    """
-
-    def __init__(
-        self,
-        backbone: PAWNCLM,
-        rank: int = 4,
-        alpha: float | None = None,
-        attn_targets: str | tuple[str, ...] = "qkvo",
-        adapt_ffn: bool = False,
-        layers: tuple[int, ...] | None = None,
-        lora_enabled: bool = True,
-        sparse_enabled: bool = False,
-    ):
-        super().__init__()
-        self.backbone = backbone
-        self.rank = rank
-        self._alpha = alpha if alpha is not None else float(rank)
-        self.adapt_ffn = adapt_ffn
-
-        if isinstance(attn_targets, str):
-            self.attn_targets = ATTN_PRESETS[attn_targets]
-        else:
-            self.attn_targets = tuple(attn_targets)
-
-        n_layers = len(backbone.layers)
-        self.adapted_layers = set(layers if layers is not None else range(n_layers))
-
-        # Freeze the entire backbone
-        for p in backbone.parameters():
-            p.requires_grad = False
-
-        # Inject RoSA adapters
-        for layer_idx in range(n_layers):
-            if layer_idx not in self.adapted_layers:
-                continue
-            block = backbone.get_block(layer_idx)
-
-            attn: Attention = block.attn
-            for proj_name in self.attn_targets:
-                original = getattr(attn, proj_name)
-                setattr(attn, proj_name, RoSALinear(
-                    original, rank, self._alpha,
-                    lora_enabled=lora_enabled,
-                    sparse_enabled=sparse_enabled,
-                ))
-
-            if adapt_ffn:
-                ffn = block.ffn
-                for proj_name in _FFN_TARGETS:
-                    original = getattr(ffn, proj_name)
-                    setattr(ffn, proj_name, RoSALinear(
-                        original, rank, self._alpha,
-                        lora_enabled=lora_enabled,
-                        sparse_enabled=sparse_enabled,
-                    ))
-
-    @property
-    def cfg(self) -> CLMConfig:
-        return self.backbone.cfg
-
-    # --- Module iteration helpers ---
-
-    def _rosa_modules(self) -> Iterator[tuple[str, RoSALinear]]:
-        """Iterate (key, module) for all RoSALinear modules."""
-        for layer_idx in sorted(self.adapted_layers):
-            block = self.backbone.get_block(layer_idx)
-            for proj_name in self.attn_targets:
-                module = getattr(block.attn, proj_name)
-                if isinstance(module, RoSALinear):
-                    yield f"layer{layer_idx}.{proj_name}", module
-            if self.adapt_ffn:
-                for proj_name in _FFN_TARGETS:
-                    module = getattr(block.ffn, proj_name)
-                    if isinstance(module, RoSALinear):
-                        yield f"layer{layer_idx}.{proj_name}", module
-
-    # --- Forward methods ---
-
-    def forward_hidden(self, input_ids: torch.Tensor,
-                       attention_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """Run backbone layers (with RoSA), return normed hidden states."""
-        bb = self.backbone
-        x = bb.embed(input_ids)
-
-        T = input_ids.shape[1]
-        if attention_mask is not None:
-            causal = bb.causal_mask[:T, :T]
-            padding = attention_mask.unsqueeze(1).unsqueeze(2)
-            mask = causal.unsqueeze(0) & padding
-        else:
-            mask = None
-
-        rope_cos = bb.rope_cos[:, :, :T, :]
-        rope_sin = bb.rope_sin[:, :, :T, :]
-
-        for layer in bb.layers:
-            x = layer(x, rope_cos, rope_sin, mask)
-
-        return bb.final_norm(x)
-
-    def project_head(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone.lm_head(x)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        bb = self.backbone
-        x = bb.embed(input_ids)
-
-        T = input_ids.shape[1]
-        if attention_mask is not None:
-            causal = bb.causal_mask[:T, :T]
-            padding = attention_mask.unsqueeze(1).unsqueeze(2)
-            mask = causal.unsqueeze(0) & padding
-        else:
-            mask = None
-
-        rope_cos = bb.rope_cos[:, :, :T, :]
-        rope_sin = bb.rope_sin[:, :, :T, :]
-
-        for layer in bb.layers:
-            x = layer(x, rope_cos, rope_sin, mask)
-
-        x = bb.final_norm(x)
-        return self.project_head(x)
-
-    def forward_generate(
-        self,
-        input_ids: torch.Tensor,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-        bb = self.backbone
-        x = bb.embed(input_ids)
-
-        T_new = input_ids.shape[1]
-        if kv_cache is not None:
-            T_cached = kv_cache[0][0].shape[2]
-            rope_cos = bb.rope_cos[:, :, T_cached:T_cached + T_new, :]
-            rope_sin = bb.rope_sin[:, :, T_cached:T_cached + T_new, :]
-        else:
-            rope_cos = bb.rope_cos[:, :, :T_new, :]
-            rope_sin = bb.rope_sin[:, :, :T_new, :]
-
-        new_kv_cache = []
-        for i in range(len(bb.layers)):
-            layer_cache = kv_cache[i] if kv_cache is not None else None
-            x, new_cache = bb.get_block(i).forward_kv(x, rope_cos, rope_sin, layer_cache)
-            new_kv_cache.append(new_cache)
-
-        x = bb.final_norm(x[:, -1:, :])
-        logits = bb.lm_head(x)
-        return logits, new_kv_cache
-
-    # --- Mask management ---
-
-    def set_masks(self, masks: dict[str, torch.Tensor]):
-        """Apply gradient-derived masks to all RoSALinear modules."""
-        for key, module in self._rosa_modules():
-            if key in masks:
-                module.set_mask(masks[key])
-
-    def enable_sparse(self):
-        """Enable sparse branch on all RoSALinear modules."""
-        for _, module in self._rosa_modules():
-            module.sparse_enabled = True
-            module.delta.requires_grad = True
-
-    def disable_lora(self):
-        """Disable and freeze the LoRA branch on all RoSALinear modules."""
-        for _, module in self._rosa_modules():
-            module.lora_enabled = False
-            module.lora_A.requires_grad = False
-            module.lora_B.requires_grad = False
-
-    def reinit_lora(self):
-        """Re-initialize LoRA weights (A to kaiming, B to zero)."""
-        for _, module in self._rosa_modules():
-            nn.init.kaiming_uniform_(module.lora_A, a=math.sqrt(5))
-            module.lora_B.data.zero_()
-
-    # --- Parameter management ---
-
-    def lora_parameters(self) -> list[nn.Parameter]:
-        """Return only LoRA A/B parameters."""
-        params = []
-        for _, module in self._rosa_modules():
-            params.append(module.lora_A)
-            params.append(module.lora_B)
-        return params
-
-    def sparse_parameters(self) -> list[nn.Parameter]:
-        """Return only sparse delta parameters."""
-        return [module.delta for _, module in self._rosa_modules()]
-
-    def adapter_parameters(self) -> list[nn.Parameter]:
-        """Return all trainable adapter parameters."""
-        return [p for p in self.parameters() if p.requires_grad]
-
-    def n_active_sparse_params(self) -> int:
-        """Count of mask-selected (active) sparse parameters."""
-        return sum(module.n_active for _, module in self._rosa_modules())
-
-    def adapter_state_dict(self) -> dict[str, torch.Tensor]:
-        """Extract all trainable weights plus masks for saving."""
-        state = {
-            name: param.data.clone()
-            for name, param in self.named_parameters()
-            if param.requires_grad
-        }
-        # Also save masks for reproducibility
-        for key, module in self._rosa_modules():
-            state[f"mask/{key}"] = module.mask.clone()
-        return state
-
-    def load_adapter_state_dict(self, state: dict[str, torch.Tensor]):
-        """Load adapter weights and masks.
-
-        Masks with no active entries are stored but don't enable the sparse
-        branch (preserves LoRA-only state from warmup checkpoints).
-        """
-        params = dict(self.named_parameters())
-        for k, v in state.items():
-            if k.startswith("mask/"):
-                mask_key = k[5:]  # strip "mask/"
-                for key, module in self._rosa_modules():
-                    if key == mask_key:
-                        if v.any():
-                            module.set_mask(v)
-                        else:
-                            # Store the empty mask but don't enable sparse
-                            module.mask.copy_(v)
-                        break
-            elif k in params:
-                params[k].data.copy_(v)
-
-    def adapter_weight_report(self) -> dict[str, float]:
-        """Per-layer weight norms for monitoring."""
-        report = {}
-        for key, module in self._rosa_modules():
-            report[f"rosa/{key}.lora_B"] = module.lora_B.data.norm().item()
-            if module.sparse_enabled:
-                masked = module.delta.data * module.mask
-                report[f"rosa/{key}.delta"] = masked.norm().item()
-        return report
-
-
-# ---------------------------------------------------------------------------
-# RetroBottleneckCLM -- sparse (gradient masks) + bottleneck adapters
-# ---------------------------------------------------------------------------
-
-class RetroBottleneckCLM(nn.Module):
-    """Frozen PAWN backbone with gradient-informed sparse projections and
-    bottleneck adapters after each sublayer.
-
-    The sparse projections use masks derived from a LoRA warm-up phase
-    (applied via SparseCLM with overwritten mask buffers). Bottleneck
-    adapters add nonlinearity that sparse-only adaptation cannot express.
-    """
-
-    def __init__(
-        self,
-        backbone: PAWNCLM,
-        bottleneck_dim: int = 8,
-        adapt_attn: bool = True,
-        adapt_ffn: bool = True,
-        layers: tuple[int, ...] | None = None,
-        n_hidden: int = 0,
-    ):
-        super().__init__()
-        self.backbone = backbone
-        self.bottleneck_dim = bottleneck_dim
-        self.n_hidden = n_hidden
-        cfg = backbone.cfg
-        n_layers = len(backbone.layers)
-        adapted = set(layers if layers is not None else range(n_layers))
-
-        # Freeze backbone (may already be frozen by SparseCLM, but be explicit)
-        for p in backbone.parameters():
-            p.requires_grad = False
-
-        # Bottleneck adapters (same pattern as BottleneckCLM)
-        self.attn_adapters = nn.ModuleList()
-        self.ffn_adapters = nn.ModuleList()
-        for i in range(n_layers):
-            if i in adapted and adapt_attn:
-                self.attn_adapters.append(
-                    BottleneckAdapter(cfg.d_model, bottleneck_dim, n_hidden=n_hidden)
-                )
-            else:
-                self.attn_adapters.append(nn.Identity())
-            if i in adapted and adapt_ffn:
-                self.ffn_adapters.append(
-                    BottleneckAdapter(cfg.d_model, bottleneck_dim, n_hidden=n_hidden)
-                )
-            else:
-                self.ffn_adapters.append(nn.Identity())
-
-    @property
-    def cfg(self) -> CLMConfig:
-        return self.backbone.cfg
-
-    def forward_hidden(self, input_ids: torch.Tensor,
-                       attention_mask: torch.Tensor | None = None) -> torch.Tensor:
-        bb = self.backbone
-        x = bb.embed(input_ids)
-
-        T = input_ids.shape[1]
-        if attention_mask is not None:
-            causal = bb.causal_mask[:T, :T]
-            padding = attention_mask.unsqueeze(1).unsqueeze(2)
-            mask = causal.unsqueeze(0) & padding
-        else:
-            mask = None
-
-        rope_cos = bb.rope_cos[:, :, :T, :]
-        rope_sin = bb.rope_sin[:, :, :T, :]
-
-        for i in range(len(bb.layers)):
-            block = bb.get_block(i)
-            x = x + block.attn(block.attn_norm(x), rope_cos, rope_sin, mask)
-            x = self.attn_adapters[i](x)
-            x = x + block.ffn(block.ffn_norm(x))
-            x = self.ffn_adapters[i](x)
-
-        return bb.final_norm(x)
-
-    def project_head(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone.lm_head(x)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        bb = self.backbone
-        x = bb.embed(input_ids)
-
-        T = input_ids.shape[1]
-        if attention_mask is not None:
-            causal = bb.causal_mask[:T, :T]
-            padding = attention_mask.unsqueeze(1).unsqueeze(2)
-            mask = causal.unsqueeze(0) & padding
-        else:
-            mask = None
-
-        rope_cos = bb.rope_cos[:, :, :T, :]
-        rope_sin = bb.rope_sin[:, :, :T, :]
-
-        for i in range(len(bb.layers)):
-            block = bb.get_block(i)
-            x = x + block.attn(block.attn_norm(x), rope_cos, rope_sin, mask)
-            x = self.attn_adapters[i](x)
-            x = x + block.ffn(block.ffn_norm(x))
-            x = self.ffn_adapters[i](x)
-
-        x = bb.final_norm(x)
-        return self.project_head(x)
-
-    def forward_generate(
-        self,
-        input_ids: torch.Tensor,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-        bb = self.backbone
-        x = bb.embed(input_ids)
-
-        T_new = input_ids.shape[1]
-        if kv_cache is not None:
-            T_cached = kv_cache[0][0].shape[2]
-            rope_cos = bb.rope_cos[:, :, T_cached:T_cached + T_new, :]
-            rope_sin = bb.rope_sin[:, :, T_cached:T_cached + T_new, :]
-        else:
-            rope_cos = bb.rope_cos[:, :, :T_new, :]
-            rope_sin = bb.rope_sin[:, :, :T_new, :]
-
-        new_kv_cache = []
-        for i in range(len(bb.layers)):
-            block = bb.get_block(i)
-            layer_cache = kv_cache[i] if kv_cache is not None else None
-            attn_out, new_cache = block.attn.forward_kv(
-                block.attn_norm(x), rope_cos, rope_sin, layer_cache,
-            )
-            x = x + attn_out
-            x = self.attn_adapters[i](x)
-            new_kv_cache.append(new_cache)
-            x = x + block.ffn(block.ffn_norm(x))
-            x = self.ffn_adapters[i](x)
-
-        x = bb.final_norm(x[:, -1:, :])
-        logits = bb.lm_head(x)
-        return logits, new_kv_cache
-
-    # --- Parameter management ---
-
-    def adapter_parameters(self) -> list[nn.Parameter]:
-        """All trainable parameters (sparse deltas + bottleneck weights)."""
-        return [p for p in self.parameters() if p.requires_grad]
-
-    def sparse_parameters(self) -> list[nn.Parameter]:
-        """Only sparse delta parameters (from SparseLinear modules)."""
-        params = []
-        for layer_idx in range(len(self.backbone.layers)):
-            block = self.backbone.get_block(layer_idx)
-            for proj_name in ("wq", "wk", "wv", "wo"):
-                module = getattr(block.attn, proj_name, None)
-                if isinstance(module, SparseLinear):
-                    params.append(module.delta)
-            for proj_name in _FFN_TARGETS:
-                module = getattr(block.ffn, proj_name, None)
-                if isinstance(module, SparseLinear):
-                    params.append(module.delta)
-        return params
-
-    def bottleneck_parameters(self) -> list[nn.Parameter]:
-        """Only bottleneck adapter parameters."""
-        params = []
-        for adapter in self.attn_adapters:
-            if isinstance(adapter, BottleneckAdapter):
-                params.extend(adapter.parameters())
-        for adapter in self.ffn_adapters:
-            if isinstance(adapter, BottleneckAdapter):
-                params.extend(adapter.parameters())
-        return params
-
-    def adapter_state_dict(self) -> dict[str, torch.Tensor]:
-        state = {
-            name: param.data.clone()
-            for name, param in self.named_parameters()
-            if param.requires_grad
-        }
-        # Also save sparse masks for reproducibility
-        for layer_idx in range(len(self.backbone.layers)):
-            block = self.backbone.get_block(layer_idx)
-            for proj_name in ("wq", "wk", "wv", "wo"):
-                module = getattr(block.attn, proj_name, None)
-                if isinstance(module, SparseLinear):
-                    state[f"mask/layer{layer_idx}.{proj_name}"] = module.mask.clone()
-            for proj_name in _FFN_TARGETS:
-                module = getattr(block.ffn, proj_name, None)
-                if isinstance(module, SparseLinear):
-                    state[f"mask/layer{layer_idx}.{proj_name}"] = module.mask.clone()
-        return state
-
-    def load_adapter_state_dict(self, state: dict[str, torch.Tensor]):
-        params = dict(self.named_parameters())
-        for k, v in state.items():
-            if k.startswith("mask/"):
-                # Restore sparse mask: "mask/layer{i}.{proj}" -> layer i, proj
-                mask_key = k[5:]  # strip "mask/"
-                parts = mask_key.split(".")
-                layer_idx = int(parts[0].replace("layer", ""))
-                proj_name = parts[1]
-                block = self.backbone.get_block(layer_idx)
-                for container in (block.attn, block.ffn):
-                    module = getattr(container, proj_name, None)
-                    if isinstance(module, SparseLinear):
-                        module.mask.copy_(v)
-                        break
-            elif k in params:
-                params[k].data.copy_(v)
-
-    def adapter_weight_report(self) -> dict[str, float]:
-        report = {}
-        # Sparse delta norms
-        for layer_idx in range(len(self.backbone.layers)):
-            block = self.backbone.get_block(layer_idx)
-            for proj_name in ("wq", "wk", "wv", "wo"):
-                module = getattr(block.attn, proj_name, None)
-                if isinstance(module, SparseLinear):
-                    masked = module.delta.data * module.mask
-                    report[f"sparse/layer{layer_idx}.{proj_name}.delta"] = masked.norm().item()
-        # Bottleneck norms
-        for i, adapter in enumerate(self.attn_adapters):
-            if isinstance(adapter, BottleneckAdapter):
-                report[f"bottleneck/layer{i}.attn.up"] = adapter.up.weight.data.norm().item()
-        for i, adapter in enumerate(self.ffn_adapters):
-            if isinstance(adapter, BottleneckAdapter):
-                report[f"bottleneck/layer{i}.ffn.up"] = adapter.up.weight.data.norm().item()
-        return report
-
-
-# ---------------------------------------------------------------------------
-# Gradient-based mask generation (Algorithm 1 from the paper)
-# ---------------------------------------------------------------------------
-
-def generate_gradient_masks(
-    model: RoSACLM,
-    dataloader,
-    mask_builder,
-    density: float,
-    alpha: int = 2,
-    device: str = "cuda",
-    use_amp: bool = False,
-    max_batches: int = 32,
-    apply_legal_mask: bool = True,
-    illegal_penalty: float = 0.0,
-) -> dict[str, torch.Tensor]:
-    """Generate sparse masks via gradient accumulation on a warmed-up model.
-
-    Temporarily enables sparse on all RoSALinear modules with all-True masks
-    to capture full gradients, accumulates ``|grad|^alpha``, and selects the
-    top-k positions per weight matrix at the target density.
+@dataclass(frozen=True)
+class RoSAConfig:
+    """RoSA hyperparameters.
 
     Args:
-        model: RoSACLM after LoRA warm-up.
-        dataloader: Training data (only ``max_batches`` batches are used).
-        mask_builder: LegalMaskBuilder for computing legal move masks.
-        density: Target fraction of weight elements to select (0.0-1.0).
-        alpha: Gradient accumulation exponent (1=mean magnitude, 2=Fisher).
-        device: Device string.
-        use_amp: Whether to use AMP for forward pass.
-        max_batches: Number of batches for gradient accumulation.
+        rank: LoRA-leg rank.
+        targets: attention projections to wrap. Subset of
+            ``("q", "k", "v", "o")``.
+        alpha: LoRA scaling; effective scale is ``alpha / rank``.
+            ``None`` → ``alpha = rank`` (scale 1.0).
+    """
+
+    rank: int
+    targets: tuple[str, ...] = ("q", "k", "v", "o")
+    alpha: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.rank <= 0:
+            raise ValueError(f"rank={self.rank} must be positive")
+        if isinstance(self.targets, str):
+            raise ValueError(
+                f"targets must be a tuple of strings, not a bare str "
+                f"({self.targets!r}); use e.g. ('q', 'v')"
+            )
+        if not self.targets:
+            raise ValueError("RoSA needs at least one target projection")
+        for t in self.targets:
+            if t not in _VALID_TARGETS:
+                raise ValueError(
+                    f"unknown RoSA target {t!r}; expected subset of "
+                    f"{_VALID_TARGETS}"
+                )
+        if self.alpha is not None and self.alpha <= 0:
+            raise ValueError(
+                f"alpha={self.alpha} must be positive (or None)"
+            )
+
+    @property
+    def scale(self) -> float:
+        a = self.alpha if self.alpha is not None else float(self.rank)
+        return a / self.rank
+
+
+class RoSAParams(eqx.Module):
+    """Per-target stacked LoRA A/B + sparse Δ + boolean mask."""
+
+    a_q: jax.Array
+    a_k: jax.Array
+    a_v: jax.Array
+    a_o: jax.Array
+    b_q: jax.Array
+    b_k: jax.Array
+    b_v: jax.Array
+    b_o: jax.Array
+    delta_q: jax.Array
+    delta_k: jax.Array
+    delta_v: jax.Array
+    delta_o: jax.Array
+    mask_q: jax.Array
+    mask_k: jax.Array
+    mask_v: jax.Array
+    mask_o: jax.Array
+    cfg: RoSAConfig = eqx.field(static=True)
+
+
+class RoSAModel(eqx.Module):
+    """Frozen PAWN backbone composed with LoRA + sparse RoSA adapter."""
+
+    backbone: PAWNModel
+    rosa: RoSAParams
+
+    def __call__(self, tokens: jax.Array, attn_mask: jax.Array) -> jax.Array:
+        return self.effective_backbone()(tokens, attn_mask)
+
+    def effective_backbone(self) -> PAWNModel:
+        """``W + (scale · A @ B) + (Δ ⊙ mask)`` folded into each target.
+
+        Inactive targets (zero-width sentinel ``A`` / ``B``) skip the
+        LoRA delta entirely; the sparse leg is similarly skipped when
+        mask is all-zero.
+        """
+        scale = jnp.float32(self.rosa.cfg.scale)
+        backbone_dtype = self.backbone.wq.dtype
+
+        deltas: dict[str, jax.Array] = {}
+        for tgt in _VALID_TARGETS:
+            a = getattr(self.rosa, f"a_{tgt}")
+            b = getattr(self.rosa, f"b_{tgt}")
+            d = getattr(self.rosa, f"delta_{tgt}")
+            m = getattr(self.rosa, f"mask_{tgt}")
+            sparse_delta = (d * m.astype(d.dtype)).astype(backbone_dtype)
+            if a.shape[-1] == 0:
+                # Inactive target: LoRA leg vanishes; skip the
+                # ``jnp.zeros_like(d)`` allocation entirely (a 16 MB
+                # fp32 buffer per call at SUPERNET scale, since XLA
+                # can't elide the zeros-of-a-traced-array). The
+                # sparse leg starts at Δ=0 + mask=False so it
+                # naturally contributes zero pre-Phase-2.
+                deltas[tgt] = sparse_delta
+            else:
+                lora_delta = (scale * jnp.einsum("lir,lro->lio", a, b)).astype(
+                    backbone_dtype,
+                )
+                deltas[tgt] = lora_delta + sparse_delta
+
+        return eqx.tree_at(
+            lambda m: (m.wq, m.wk, m.wv, m.wo),
+            self.backbone,
+            (
+                self.backbone.wq + deltas["q"],
+                self.backbone.wk + deltas["k"],
+                self.backbone.wv + deltas["v"],
+                self.backbone.wo + deltas["o"],
+            ),
+        )
+
+
+def _init_pair(
+    n_layers: int, d_in: int, d_out: int, rank: int,
+    *, is_target: bool, key: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """LoRA A/B init: A ~ N(0, 0.02²); B = 0. Inactive → zero-width."""
+    if not is_target:
+        return (
+            jnp.zeros((n_layers, d_in, 0), dtype=jnp.float32),
+            jnp.zeros((n_layers, 0, d_out), dtype=jnp.float32),
+        )
+    a = jax.random.normal(key, (n_layers, d_in, rank), dtype=jnp.float32) * 0.02
+    b = jnp.zeros((n_layers, rank, d_out), dtype=jnp.float32)
+    return a, b
+
+
+def init_rosa_model(
+    backbone: PAWNModel, cfg: RoSAConfig, key: jax.Array,
+) -> RoSAModel:
+    """Initialise RoSA. LoRA B = 0, sparse Δ = 0, mask = False — so
+    the wrapped forward is bit-identical to the bare backbone at
+    step 0. Per-target keys are split independently so a single-target
+    run produces the same A as a corresponding subset run."""
+    d = backbone.cfg.d_model
+    n_layers = backbone.cfg.n_layers
+    rank = cfg.rank
+    is_t = {t: (t in cfg.targets) for t in _VALID_TARGETS}
+    keys = jax.random.split(key, len(_VALID_TARGETS))
+    pairs = {
+        t: _init_pair(n_layers, d, d, rank, is_target=is_t[t], key=keys[i])
+        for i, t in enumerate(_VALID_TARGETS)
+    }
+    zeros_dd = jnp.zeros((n_layers, d, d), dtype=jnp.float32)
+    false_dd = jnp.zeros((n_layers, d, d), dtype=jnp.bool_)
+    rosa = RoSAParams(
+        a_q=pairs["q"][0], a_k=pairs["k"][0],
+        a_v=pairs["v"][0], a_o=pairs["o"][0],
+        b_q=pairs["q"][1], b_k=pairs["k"][1],
+        b_v=pairs["v"][1], b_o=pairs["o"][1],
+        delta_q=zeros_dd, delta_k=zeros_dd, delta_v=zeros_dd, delta_o=zeros_dd,
+        mask_q=false_dd, mask_k=false_dd, mask_v=false_dd, mask_o=false_dd,
+        cfg=cfg,
+    )
+    return RoSAModel(backbone=backbone, rosa=rosa)
+
+
+def set_mask(
+    model: RoSAModel, masks: dict[str, jax.Array],
+) -> RoSAModel:
+    """Replace the sparse-leg masks with caller-computed bool arrays.
+
+    Phase-2 of the legacy training procedure (Algorithm 1 in Nikdan
+    et al.) computes per-parameter gradient magnitudes under a
+    warmed-up LoRA, then sets the mask to True on the top-k entries.
+    This helper exposes the mask-swap API for the trainer to plug
+    those masks in once they're computed. Targets absent from
+    ``masks`` keep their previous mask.
+
+    Args:
+        masks: ``{"q": bool_array_of_shape_(n_layers, d, d), ...}``.
+    """
+    rosa = model.rosa
+    for tgt in _VALID_TARGETS:
+        if tgt in masks:
+            new = masks[tgt]
+            expected = getattr(rosa, f"mask_{tgt}").shape
+            if new.shape != expected:
+                raise ValueError(
+                    f"mask for {tgt!r} has shape {new.shape}, "
+                    f"expected {expected}"
+                )
+            rosa = eqx.tree_at(
+                lambda r, n=f"mask_{tgt}": getattr(r, n),
+                rosa, new.astype(jnp.bool_),
+            )
+    return eqx.tree_at(lambda m: m.rosa, model, rosa)
+
+
+def _filter_with(
+    model: RoSAModel,
+    *,
+    lora_trainable: bool,
+    delta_trainable: bool,
+) -> RoSAModel:
+    """Build a Python-bool filter spec for one of the three RoSA
+    training phases.
+
+    Only ``model.rosa.cfg.targets`` get marked trainable — inactive
+    targets' ``delta_*`` arrays (full-shape ``(L, d, d)`` zeros,
+    structurally unused in the forward) stay frozen, so Adam doesn't
+    allocate moment buffers for them. Inactive targets' ``a_*`` /
+    ``b_*`` are zero-width sentinels (no buffer cost regardless) but
+    we exclude them too for symmetry.
+
+    Bool ``mask_*`` arrays are always False (they're not
+    differentiable parameters; the trainer rewrites them via
+    ``set_mask`` between phases).
+    """
+    false_tree = jax.tree_util.tree_map(lambda _: False, model)
+    active_targets = model.rosa.cfg.targets
+
+    def _set(tree: RoSAModel, field: str) -> RoSAModel:
+        return eqx.tree_at(
+            lambda t, f=field: getattr(t.rosa, f),
+            tree, replace=True,
+        )
+
+    tree = false_tree
+    for tgt in active_targets:
+        if lora_trainable:
+            tree = _set(tree, f"a_{tgt}")
+            tree = _set(tree, f"b_{tgt}")
+        if delta_trainable:
+            tree = _set(tree, f"delta_{tgt}")
+    return tree
+
+
+def adapter_filter(model: RoSAModel) -> RoSAModel:
+    """Phase-3 joint filter: ``True`` on every active-target
+    ``model.rosa.{a,b,delta}_*`` inexact array, ``False`` on the
+    bool ``mask_*`` arrays and on every inactive-target leaf.
+
+    The phase-1 (LoRA warmup) and phase-2 (sparse mask gen) filters
+    are exposed as ``lora_only_adapter_filter`` and
+    ``sparse_only_adapter_filter`` — see the module docstring for the
+    three-phase RoSA training schedule."""
+    return _filter_with(model, lora_trainable=True, delta_trainable=True)
+
+
+def lora_only_adapter_filter(model: RoSAModel) -> RoSAModel:
+    """RoSA Phase 1 filter: ``True`` only on the active-target LoRA
+    A, B leaves.
+
+    Used during the LoRA warmup phase — sparse Δ stays at its init
+    value (zeros) and doesn't accumulate gradient updates. ``mask_*``
+    arrays are False (always not-trainable; rewritten via
+    ``set_mask``)."""
+    return _filter_with(model, lora_trainable=True, delta_trainable=False)
+
+
+def sparse_only_adapter_filter(model: RoSAModel) -> RoSAModel:
+    """RoSA Phase 2 filter: ``True`` only on the active-target sparse
+    Δ leaves.
+
+    The trainer never actually optimises with this filter — Phase 2 is
+    a single forward+backward to extract ``|dL/dΔ|`` per target. The
+    filter is exposed so the gradient is computed against only the Δ
+    leaves (XLA dead-code-eliminates dL/dA, dL/dB for the §6.1
+    backward-pass FLOP cut, even though we're not training)."""
+    return _filter_with(model, lora_trainable=False, delta_trainable=True)
+
+
+def compute_phase2_mask(
+    model: RoSAModel, dl_ddelta: dict[str, jax.Array], top_k_frac: float,
+) -> dict[str, jax.Array]:
+    """Build Phase-2 sparse-leg masks from the per-target gradient
+    magnitudes.
+
+    Picks the top ``top_k_frac`` entries by ``|dL/dΔ_{ij}|`` per
+    target and returns ``{target: bool_array_of_shape_(L, d, d)}`` for
+    the active targets in ``model.rosa.cfg.targets``. Inactive targets
+    aren't returned (the caller skips them in ``rosa_set_mask``).
+
+    Args:
+        model: the warmed-up RoSA model from Phase 1.
+        dl_ddelta: ``{target: dL/dΔ_array}`` for each active target,
+            same shape as the corresponding ``model.rosa.delta_*``
+            array.
+        top_k_frac: fraction of entries to keep (e.g. ``0.01`` for
+            top 1% by magnitude).
 
     Returns:
-        Dictionary mapping ``"layer{i}.{proj}"`` to boolean mask tensors.
+        ``{target: bool_array}`` — pass to ``rosa_set_mask`` to apply.
     """
-    model.train()
-
-    # Save original state and temporarily set all-True masks
-    original_states: list[tuple[RoSALinear, bool, bool]] = []
-    accumulators: dict[str, torch.Tensor] = {}
-
-    for key, module in model._rosa_modules():
-        original_states.append((module, module.sparse_enabled, module.delta.requires_grad))
-        # Enable sparse with all-True mask so delta.grad captures full weight gradient
-        module.mask.fill_(True)
-        module.sparse_enabled = True
-        module.delta.requires_grad = True
-        # Initialize accumulator
-        accumulators[key] = torch.zeros_like(module.delta)
-
-    # Clear any stale gradients before accumulation
-    model.zero_grad(set_to_none=True)
-
-    # Accumulate gradients
-    n_batches = 0
-    for batch in dataloader:
-        if n_batches >= max_batches:
-            break
-
-        ids = batch["input_ids"].to(device, non_blocking=True)
-        tgt = batch["targets"].to(device, non_blocking=True)
-        msk = batch["loss_mask"].to(device, non_blocking=True)
-
-        # Build legal mask
-        if "legal_indices" in batch:
-            legal_mask = mask_builder.scatter(batch["legal_indices"], ids.shape[0])
-        else:
-            legal_mask = mask_builder(batch)
-
-        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-            hidden = model.forward_hidden(ids, msk)
-            valid_hidden = hidden[msk]
-            valid_logits = model.project_head(valid_hidden)
-
-        valid_legal = legal_mask[msk]
-        valid_logits = valid_logits.float()
-        if apply_legal_mask:
-            valid_logits.masked_fill_(~valid_legal, float("-inf"))
-        valid_targets = tgt[msk]
-
-        if valid_targets.shape[0] == 0:
-            continue
-
-        # Shared helper avoids duplicating the softmax/masked-sum
-        # formulation and keeps the illegal-mass semantics aligned
-        # with the adapter training loop.
-        from pawn.adapter_training import illegal_probability_mass
-
-        loss = F.cross_entropy(valid_logits, valid_targets)
-        if illegal_penalty > 0:
-            loss = loss + illegal_penalty * illegal_probability_mass(
-                valid_logits, valid_legal
-            )
-        loss.backward()
-
-        # Accumulate |grad|^alpha
-        with torch.no_grad():
-            for key, module in model._rosa_modules():
-                if module.delta.grad is not None:
-                    accumulators[key] += module.delta.grad.abs().pow(alpha)
-                    module.delta.grad = None
-
-        # Also zero LoRA grads
-        for p in model.lora_parameters():
-            if p.grad is not None:
-                p.grad = None
-
-        n_batches += 1
-
-    # Restore original state and zero out deltas
-    for module, orig_sparse, orig_requires_grad in original_states:
-        module.mask.zero_()
-        module.sparse_enabled = orig_sparse
-        module.delta.requires_grad = orig_requires_grad
-        module.delta.data.zero_()
-
-    # Generate masks: top-k by accumulated gradient magnitude
-    masks: dict[str, torch.Tensor] = {}
-    for key, acc in accumulators.items():
-        flat = acc.flatten()
-        k = max(1, int(density * flat.numel()))
-        _, top_indices = flat.topk(k)
-        mask = torch.zeros_like(flat, dtype=torch.bool)
-        mask[top_indices] = True
-        masks[key] = mask.reshape(acc.shape)
-
+    if not 0.0 < top_k_frac <= 1.0:
+        raise ValueError(f"top_k_frac={top_k_frac} must be in (0, 1]")
+    masks: dict[str, jax.Array] = {}
+    for tgt in model.rosa.cfg.targets:
+        grad = dl_ddelta[tgt]
+        # Magnitude-rank per layer (rather than globally across L *
+        # d * d) so each layer contributes its own top-k. The legacy
+        # implementation rank-ordered per-layer; preserving that.
+        n_layers = grad.shape[0]
+        flat = jnp.abs(grad).reshape(n_layers, -1)  # (L, d * d)
+        n_entries = flat.shape[1]
+        k = max(1, int(n_entries * top_k_frac))
+        # Pick exactly the top ``k`` indices per layer via argsort
+        # rather than a >= threshold comparison. A threshold-based
+        # selection over-counts when many entries tie at the
+        # boundary value — pathologically, all-zero gradients tie
+        # at 0 and ``>= 0`` selects every entry, producing
+        # density=1.0 and defeating the sparsity guarantee. The
+        # argsort path gives exactly ``k`` entries per layer
+        # regardless of ties (ties are broken by index order, which
+        # is fine — the legacy behaviour was identical in this
+        # respect).
+        top_k_indices = jnp.argsort(flat, axis=1)[:, n_entries - k:]
+        layer_idx = jnp.arange(n_layers)[:, None].repeat(k, axis=1)
+        mask_flat = jnp.zeros_like(flat, dtype=jnp.bool_)
+        mask_flat = mask_flat.at[layer_idx, top_k_indices].set(True)
+        masks[tgt] = mask_flat.reshape(grad.shape)
     return masks

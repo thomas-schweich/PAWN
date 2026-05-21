@@ -129,7 +129,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
 # ── Deps (CUDA) ──────────────────────────────────────────────────────
 FROM deps-common AS deps
 RUN uv venv && \
-    uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
+    uv sync --extra cu128 --extra dashboard --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl ${UV_CACHE_DIR}
 
 # ── Runtime (CUDA) ───────────────────────────────────────────────────
@@ -159,7 +159,7 @@ CMD ["/opt/pawn/deploy/entrypoint.sh"]
 # ── Deps (ROCm) ──────────────────────────────────────────────────────
 FROM deps-common AS deps-rocm
 RUN uv venv && \
-    uv sync --extra rocm --no-dev --frozen --no-install-workspace && \
+    uv sync --extra rocm --extra dashboard --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl ${UV_CACHE_DIR}
 
 # ── Runtime (ROCm) ───────────────────────────────────────────────────
@@ -308,7 +308,7 @@ COPY --chown=pawn:pawn . .
 
 # Build the engine so uv run doesn't trigger a rebuild on first use
 RUN PATH="/home/pawn/.cargo/bin:${PATH}" \
-    uv sync --extra cu128 --frozen
+    uv sync --extra cu128 --extra dashboard --frozen
 
 ARG GIT_HASH=""
 ARG GIT_TAG=""
@@ -333,7 +333,7 @@ COPY --chown=pawn:pawn . .
 
 # Build the engine so uv run doesn't trigger a rebuild on first use
 RUN PATH="/home/pawn/.cargo/bin:${PATH}" \
-    uv sync --extra rocm --frozen
+    uv sync --extra rocm --extra dashboard --frozen
 
 ARG GIT_HASH=""
 ARG GIT_TAG=""
