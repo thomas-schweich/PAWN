@@ -195,6 +195,17 @@ def main(argv: list[str] | None = None) -> int:
         "--quiet", action="store_true",
         help="suppress per-chunk stdout prints (still writes to metrics.jsonl).",
     )
+    parser.add_argument(
+        "--wandb", action="store_true",
+        help="log per-chunk metrics to Weights & Biases. Requires the "
+             "``wandb`` extra (uv sync --extra wandb). Honours the "
+             "``PAWN_WANDB_MODE`` env var (online | offline | disabled).",
+    )
+    parser.add_argument(
+        "--wandb-project", type=str, default="pawn",
+        help="W&B project name; ignored unless --wandb is set. The "
+             "``WANDB_PROJECT`` env var overrides this.",
+    )
     args = parser.parse_args(argv)
 
     if args.k <= 0:
@@ -341,6 +352,37 @@ def main(argv: list[str] | None = None) -> int:
     n_chunks = args.total_steps // args.k
     print(f"[train] n_chunks={n_chunks} (K={args.k} steps each)")
 
+    # Initialise W&B before the chunk loop so the run is registered
+    # before any metrics are pushed. The import is local so the base
+    # install (no ``wandb`` extra) doesn't pay an unused import.
+    wandb_run = None
+    if args.wandb:
+        from pawn.wandb_utils import init_wandb  # noqa: PLC0415
+        wandb_run = init_wandb(
+            enabled=True,
+            project=args.wandb_project,
+            slug=run_dir.name,
+            run_dir=run_dir,
+            run_type="pretrain",
+            config={
+                "supernet": args.supernet,
+                "total_steps": args.total_steps,
+                "batch_size": args.batch_size,
+                "seq_len": args.seq_len,
+                "k": args.k,
+                "lr": args.lr,
+                "warmup_steps": args.warmup_steps,
+                "seed": args.seed,
+                "corpus_seed": corpus_seed,
+                "model_seed": model_seed,
+                "supernet_cfg": dataclasses.asdict(supernet_cfg),
+                "variants": {
+                    name: dataclasses.asdict(cfg)
+                    for name, cfg in variants.items()
+                },
+            },
+        )
+
     # One-time reshape of the flat corpus into per-chunk views. The
     # reshape is zero-copy on the contiguous C-order arrays the engine
     # produces; per-chunk staging then becomes a single contiguous
@@ -403,6 +445,9 @@ def main(argv: list[str] | None = None) -> int:
             # write is still durable on graceful exit.
             if (chunk_i + 1) % 10 == 0 or chunk_i + 1 == n_chunks:
                 mf.flush()
+            if wandb_run is not None:
+                from pawn.wandb_utils import log_metrics  # noqa: PLC0415
+                log_metrics(wandb_run, row, step=step_end)
             if not args.quiet:
                 print(
                     f"[chunk {chunk_i + 1}/{n_chunks}] step={step_end} "
@@ -411,6 +456,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"dt={dt:.2f}s"
                 )
             step_start = step_end
+    if wandb_run is not None:
+        from pawn.wandb_utils import finish_wandb  # noqa: PLC0415
+        finish_wandb(wandb_run, exit_code=0)
     print(f"[done] total wall = {time.perf_counter() - wall0:.1f}s; run_dir={run_dir}")
     return 0
 

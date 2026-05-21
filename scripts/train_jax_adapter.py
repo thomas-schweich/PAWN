@@ -634,6 +634,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-corpus-gb", type=float, default=8.0)
     parser.add_argument("--logs-dir", default="logs")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--wandb", action="store_true",
+        help="log per-chunk metrics to Weights & Biases. Requires the "
+             "``wandb`` extra. Honours the ``PAWN_WANDB_MODE`` env var.",
+    )
+    parser.add_argument(
+        "--wandb-project", type=str, default="pawn",
+        help="W&B project name; ignored unless --wandb is set.",
+    )
     args = parser.parse_args(argv)
 
     # Upfront guards — same shape as the pretrain driver.
@@ -896,6 +905,32 @@ def main(argv: list[str] | None = None) -> int:
             total_n += ns
         return (total_loss / max(total_n, 1), total_n)
 
+    # W&B init (local import keeps base install dependency-clean).
+    wandb_run = None
+    if args.wandb:
+        from pawn.wandb_utils import init_wandb  # noqa: PLC0415
+        wandb_run = init_wandb(
+            enabled=True,
+            project=args.wandb_project,
+            slug=run_dir.name,
+            run_dir=run_dir,
+            run_type="adapter",
+            config={
+                "strategy": args.strategy,
+                "supernet": args.supernet,
+                "variant": args.variant if args.strategy != "specialized_clm" else None,
+                "total_steps": args.total_steps,
+                "batch_size": args.batch_size,
+                "seq_len": args.seq_len,
+                "k": args.k,
+                "lr": args.lr,
+                "warmup_steps": args.warmup_steps,
+                "val_frac": args.val_frac,
+                "val_every": args.val_every,
+                "strategy_config": _strategy_config_dict(args),
+            },
+        )
+
     best_val = float("inf")
     with metrics_path.open("w", encoding="utf-8") as mf:
         wall0 = time.perf_counter()
@@ -1033,6 +1068,9 @@ def main(argv: list[str] | None = None) -> int:
             mf.write(json.dumps(row) + "\n")
             if (chunk_i + 1) % 10 == 0 or chunk_i + 1 == n_chunks:
                 mf.flush()
+            if wandb_run is not None:
+                from pawn.wandb_utils import log_metrics  # noqa: PLC0415
+                log_metrics(wandb_run, row, step=step_end)
             if not args.quiet:
                 vs = f" val={row['val_loss']:.4f}" if row["val_loss"] is not None else ""
                 print(
@@ -1041,6 +1079,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"grad_norm={row['grad_norm_mean']:.3f} dt={dt:.2f}s"
                 )
             step_start = step_end
+    if wandb_run is not None:
+        from pawn.wandb_utils import finish_wandb  # noqa: PLC0415
+        finish_wandb(wandb_run, exit_code=0)
     print(
         f"[done] total wall = {time.perf_counter() - wall0:.1f}s; "
         f"best_val={best_val:.4f}; run_dir={run_dir}"

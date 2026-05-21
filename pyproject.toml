@@ -61,6 +61,11 @@ lab = [
     "optuna>=4.0.0",
     "optuna-dashboard>=0.16.0",
 ]
+# W&B (Weights & Biases) metrics-only integration (``pawn.wandb_utils``).
+# Optional: the trainers run without it, writing only the local
+# ``metrics.jsonl``. Enable per run via ``--wandb-mode online`` on
+# either training driver.
+wandb = ["wandb>=0.16.0"]
 
 [build-system]
 requires = ["hatchling"]
