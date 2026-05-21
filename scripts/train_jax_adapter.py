@@ -350,7 +350,7 @@ def _validate_strategy_args(
             raise SystemExit(
                 f"--lora-alpha={args.lora_alpha} must be positive (or None)"
             )
-    if args.strategy == "bottleneck":
+    if args.strategy in ("bottleneck", "hybrid"):
         if args.bottleneck_dim <= 0:
             raise SystemExit(
                 f"--bottleneck-dim={args.bottleneck_dim} must be positive"
@@ -360,12 +360,14 @@ def _validate_strategy_args(
                 f"--bottleneck-n-hidden={args.bottleneck_n_hidden} must be >= 0"
             )
         # At least one of attn / FFN must be enabled or the adapter
-        # contributes nothing. Codex round-4 P2.
+        # contributes nothing. Applies to both bottleneck AND hybrid
+        # (hybrid wraps a bottleneck block too), matching the pydantic
+        # ``AdapterConfig._check_strategy_args`` constraint.
         if args.no_adapt_attn and args.no_adapt_ffn:
             raise SystemExit(
                 "--no-adapt-attn and --no-adapt-ffn cannot both be "
-                "set — that disables the adapter entirely (no trainable "
-                "parameters)"
+                f"set — that disables {args.strategy!r}'s Houlsby "
+                "block (no trainable parameters left in the bottleneck)"
             )
     if args.strategy == "sparse" and not 0.0 < args.density <= 1.0:
         raise SystemExit(
