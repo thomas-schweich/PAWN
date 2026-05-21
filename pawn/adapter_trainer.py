@@ -213,31 +213,9 @@ def make_adapter_train_step(
         params = eqx.filter(state.trainable, eqx.is_inexact_array)
         grads_filt = eqx.filter(grads, eqx.is_inexact_array)
 
-        if mask_filt is not None:
-            # Element-wise gradient mask. ``unfreeze`` uses this to
-            # zero gradients for the frozen layers' slices of layer-
-            # stacked weights (``adapter_filter`` only operates at
-            # leaf granularity); ``rosa`` uses this for phase-
-            # specific gating. ``grads_filt`` carries ``None`` at
-            # leaves the partition spec marked frozen, but the
-            # full-model gradient mask still has bool arrays at
-            # those positions — so we treat ``None`` as a leaf and
-            # short-circuit it through unchanged. The JAX 0.4
-            # tree-map-None-prefix deprecation guidance recommends
-            # this pattern exactly.
-            grads_filt = jax.tree.map(
-                lambda g, m: (
-                    g if g is None or m is None
-                    else g * m.astype(g.dtype)
-                ),
-                grads_filt, mask_filt,
-                is_leaf=lambda x: x is None,
-            )
-
         # Global grad norm via the shared helper (same pattern as the
         # pretrain trainer; centralised so a future change lands in
-        # one place). Computed after masking so the reported norm
-        # reflects the actually-applied gradients.
+        # one place).
         grad_norm = compute_grad_norm(grads_filt)
 
         n_supervised = loss_mask.sum().astype(jnp.int32)
@@ -248,6 +226,28 @@ def make_adapter_train_step(
         ]:
             trn_in, opt_in = args
             updates, new_opt = optimizer.update(grads_filt, opt_in, params)
+            if mask_filt is not None:
+                # Element-wise mask applied to the OPTIMIZER UPDATE,
+                # not the gradient. Masking pre-optimizer would still
+                # let AdamW's weight-decay term move the params (decay
+                # is independent of the gradient), so frozen layers
+                # would slowly drift even though their gradients were
+                # zeroed. Masking post-optimizer zeros the entire
+                # update on frozen positions — weight decay included —
+                # so the params at those positions are bit-stable
+                # across training. The ``is_leaf=lambda x: x is None``
+                # guard handles the case where the partition spec
+                # produced ``None`` leaves (frozen at leaf
+                # granularity); the mask passes them through
+                # unchanged.
+                updates = jax.tree.map(
+                    lambda u, m: (
+                        u if u is None or m is None
+                        else u * m.astype(u.dtype)
+                    ),
+                    updates, mask_filt,
+                    is_leaf=lambda x: x is None,
+                )
             new_trn = eqx.apply_updates(trn_in, updates)
             return new_trn, new_opt
 

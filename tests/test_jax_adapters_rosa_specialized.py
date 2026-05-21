@@ -209,11 +209,11 @@ def test_rosa_sparse_only_filter_freezes_lora() -> None:
     assert trainable.rosa.delta_q is not None
 
 
-def test_rosa_compute_phase2_mask_picks_top_k_per_layer() -> None:
-    """``rosa_compute_phase2_mask`` returns bool masks shaped like the
-    delta arrays, with exactly ``ceil(top_k_frac * d * d)`` True
-    entries per layer per target (with ties broken by mask >=
-    threshold so the count can be ≥, not exactly equal, to k)."""
+def test_rosa_compute_phase2_mask_picks_exactly_top_k_per_layer() -> None:
+    """``rosa_compute_phase2_mask`` returns bool masks with *exactly*
+    ``max(1, int(top_k_frac * d * d))`` True entries per layer per
+    target — independent of ties at the threshold value. The
+    argsort-based picker ties-break by index order, which is fine."""
     cfg = TINY_SUPERNET
     backbone = init_model(cfg, jax.random.key(0))
     model = init_rosa_model(
@@ -236,13 +236,80 @@ def test_rosa_compute_phase2_mask_picks_top_k_per_layer() -> None:
         assert m.dtype == jnp.bool_
         for layer in range(n_layers):
             n_active = int(m[layer].sum())
-            # The threshold-based ranking can include ties at the
-            # boundary, so we get at least ``k`` entries (and rarely
-            # more).
-            assert n_active >= k, (
-                f"target={tgt} layer={layer}: {n_active} active "
-                f"< k={k}"
+            assert n_active == k, (
+                f"target={tgt} layer={layer}: {n_active} != {k}"
             )
+
+
+def test_rosa_compute_phase2_mask_handles_degenerate_all_zero_grads() -> None:
+    """All-zero gradients should still produce exactly-k masks
+    (ties broken by index order) — the threshold-based picker
+    pathologically returned density=1.0 on this input.
+    """
+    cfg = TINY_SUPERNET
+    backbone = init_model(cfg, jax.random.key(0))
+    model = init_rosa_model(
+        backbone, RoSAConfig(rank=2, targets=("q",)), jax.random.key(1),
+    )
+    n_layers = cfg.n_layers
+    d = cfg.d_model
+    zero_grads = {"q": jnp.zeros((n_layers, d, d), dtype=jnp.float32)}
+    masks = rosa_compute_phase2_mask(model, zero_grads, top_k_frac=0.01)
+    expected_k = max(1, int(d * d * 0.01))
+    for layer in range(n_layers):
+        assert int(masks["q"][layer].sum()) == expected_k, (
+            "all-zero-grad layer: expected exactly k entries; got "
+            f"density-1.0 (the >= threshold regression)"
+        )
+
+
+def test_rosa_delta_trains_under_dense_mask() -> None:
+    """With ``mask=all-True``, ``dL/dΔ`` is the full ``dL/dW_eff``
+    — Δ should accumulate updates under joint training. This pins the
+    `--rosa-warmup-frac 0` single-phase fallback: the dense mask
+    primer in `_build_rosa` (scripts/train_jax_adapter.py) is what
+    keeps the sparse leg actually trainable in zero-warmup mode.
+
+    Pre-fix (codex P2 finding), the model carried `mask=all-False`
+    even in zero-warmup mode, so `delta * mask = 0` and `dL/dΔ` was
+    zero everywhere — Δ never trained, silently degrading to
+    LoRA-only.
+    """
+    from typing import cast
+
+    import optax
+    from pawn.adapter_trainer import (
+        init_adapter_state, make_adapter_train_step,
+    )
+
+    cfg = TINY_SUPERNET
+    backbone = init_model(cfg, jax.random.key(0))
+    model = init_rosa_model(
+        backbone, RoSAConfig(rank=2, targets=("q",)), jax.random.key(1),
+    )
+    # Prime with all-True mask (mirrors the zero-warmup-frac dispatch
+    # path).
+    n_layers = cfg.n_layers
+    d = cfg.d_model
+    all_true = {"q": jnp.ones((n_layers, d, d), dtype=jnp.bool_)}
+    model = rosa_set_mask(model, all_true)
+    initial_delta_q = model.rosa.delta_q.copy()
+
+    opt = optax.adamw(3e-2)
+    state, frozen = init_adapter_state(
+        model, opt, adapter_filter_fn=rosa_adapter_filter,
+    )
+    train_step = make_adapter_train_step(opt, frozen)
+    tokens, attn = _tiny_inputs(B=4, T=12)
+    targets = jnp.asarray(np.random.default_rng(0).integers(0, 64, (4, 12)), dtype=jnp.int32)
+    loss_mask = jnp.ones((4, 12), dtype=jnp.bool_)
+    for _ in range(3):
+        state, _ = train_step(state, (tokens, attn, targets, loss_mask))
+    final_delta_q = cast(RoSAModel, state.trainable).rosa.delta_q
+    delta_diff = float(jnp.abs(final_delta_q - initial_delta_q).max())
+    assert delta_diff > 0.0, (
+        f"Δ_q failed to train under dense mask: max-abs-diff = {delta_diff}"
+    )
 
 
 def test_rosa_compute_phase2_mask_rejects_bad_top_k_frac() -> None:

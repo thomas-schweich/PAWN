@@ -219,14 +219,29 @@ def _build_rosa(
         rank=args.rank, targets=tuple(args.rosa_targets),
         alpha=args.lora_alpha,
     )
-    # NOTE: RoSA's three-phase training schedule (LoRA warmup →
-    # gradient-mask gen → joint training) is a deferred follow-up
-    # — see docs/jax-migration.md §12. This dispatch path trains the
-    # full parameterisation jointly from step 0 with the mask at its
-    # init value (all-False, so sparse Δ contributes 0 at init and
-    # gets trained jointly with LoRA A/B). Trainer-side phase
-    # scheduling lands in a separate chunk.
-    return init_rosa_model(backbone, cfg, key), rosa_adapter_filter, None
+    model = init_rosa_model(backbone, cfg, key)
+    # Default ``init_rosa_model`` sets every mask to all-False so the
+    # identity-at-init invariant holds (B = 0, Δ = 0, mask = False →
+    # W_eff = W, sparse leg vanishes). For the three-phase schedule
+    # (``--rosa-warmup-frac > 0``) that's the right initial condition
+    # — Phase 2 computes the real mask before Phase 3 starts using
+    # Δ. For ``--rosa-warmup-frac == 0`` (single-phase joint training)
+    # the mask never gets computed by the trainer, and an all-False
+    # mask leaves ``delta * mask = 0`` so ``dL/dΔ`` is zero
+    # everywhere and Δ never trains — silently defeating the
+    # documented joint-training semantics. Prime the mask to
+    # all-True so Δ trains dense alongside A, B (the user explicitly
+    # opted out of sparsity by setting warmup-frac to 0; the dense
+    # joint mode is the legitimate fallback).
+    if args.rosa_warmup_frac == 0.0:
+        n_layers = backbone.cfg.n_layers
+        d = backbone.cfg.d_model
+        all_true_masks = {
+            t: jnp.ones((n_layers, d, d), dtype=jnp.bool_)
+            for t in cfg.targets
+        }
+        model = rosa_set_mask(model, all_true_masks)
+    return model, rosa_adapter_filter, None
 
 
 def _build_specialized_clm(
@@ -774,16 +789,21 @@ def main(argv: list[str] | None = None) -> int:
                 warmed_model = cast(
                     RoSAModel, eqx.combine(state.trainable, frozen),
                 )
-                # Use chunk 0's first sub-batch as the gradient
-                # estimation source. This is enough signal for a
-                # top-k rank ordering — the legacy implementation
-                # averaged over a handful of batches but the
-                # rank-order saturates quickly.
+                # Gradient-estimation source: the LAST sub-batch of
+                # the LAST Phase-1 chunk. Using chunk 0's first
+                # sub-batch (an earlier draft of this code) silently
+                # discarded the informational value of warmup — the
+                # gradient signal was sampled against unseen data.
+                # The last-Phase-1-sub-batch is the freshest
+                # post-warmup data the model has encountered; the
+                # legacy implementation averaged over a handful of
+                # batches but the per-layer rank-order saturates
+                # quickly so one batch is sufficient.
                 mask_batch: Batch = (
-                    _stage(train_tokens_chunks[0, 0]),
-                    _stage(train_attn_chunks[0, 0]),
-                    _stage(train_targets_chunks[0, 0]),
-                    _stage(train_loss_chunks[0, 0]),
+                    _stage(train_tokens_chunks[chunk_i - 1, -1]),
+                    _stage(train_attn_chunks[chunk_i - 1, -1]),
+                    _stage(train_targets_chunks[chunk_i - 1, -1]),
+                    _stage(train_loss_chunks[chunk_i - 1, -1]),
                 )
                 dl_ddelta = _compute_rosa_phase2_dl_ddelta(
                     warmed_model, mask_batch,
@@ -793,9 +813,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 final_model = rosa_set_mask(warmed_model, phase2_masks)
                 # Re-init the adapter state under the joint filter.
-                # The new ``optimizer`` shares the LR schedule so
-                # Phase 3 picks up at the Phase-1 step count's LR
-                # (warmup has already cleared by now).
+                # The optimizer instance is shared with Phase 1, but
+                # ``optimizer.init`` produces a fresh ``opt_state``
+                # whose internal step counter starts at 0 — so the
+                # LR schedule replays its warmup ramp at the start
+                # of Phase 3. This is a known design choice (Phase 3
+                # gets its own warmup, which can help stabilise the
+                # newly-active Δ gradients) rather than a strict
+                # match for any production schedule. Callers who want
+                # a continuous LR across phases should set
+                # ``--warmup-steps`` small relative to
+                # ``--total-steps`` * (1 - ``--rosa-warmup-frac``) so
+                # the replayed warmup is a small fraction of Phase 3.
                 state, frozen = init_adapter_state(
                     final_model, optimizer, adapter_filter_fn=filter_fn,
                 )
@@ -808,13 +837,18 @@ def main(argv: list[str] | None = None) -> int:
                     n_active = sum(
                         int(m.sum()) for m in phase2_masks.values()
                     )
-                    n_total = sum(m.size for m in phase2_masks.values())
-                    pct = 100.0 * n_active / max(n_total, 1)
+                    # Local name avoids shadowing the outer
+                    # ``n_total`` (= n_train_games + n_val_games)
+                    # used during corpus sizing.
+                    n_mask_total = sum(
+                        m.size for m in phase2_masks.values()
+                    )
+                    pct = 100.0 * n_active / max(n_mask_total, 1)
                     print(
                         f"[rosa] Phase 2 → 3 transition at chunk "
                         f"{chunk_i + 1}/{n_chunks}: "
-                        f"{n_active}/{n_total} ({pct:.2f}%) sparse-leg "
-                        f"entries active across targets="
+                        f"{n_active}/{n_mask_total} ({pct:.2f}%) sparse-"
+                        f"leg entries active across targets="
                         f"{list(phase2_masks.keys())}"
                     )
 

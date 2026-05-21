@@ -243,21 +243,28 @@ def set_mask(
     return eqx.tree_at(lambda m: m.rosa, model, rosa)
 
 
-_LORA_FIELDS = tuple(
-    f"{prefix}_{tgt}" for prefix in ("a", "b") for tgt in _VALID_TARGETS
-)
-_DELTA_FIELDS = tuple(f"delta_{tgt}" for tgt in _VALID_TARGETS)
-
-
 def _filter_with(
-    model: RoSAModel, trainable_fields: tuple[str, ...],
+    model: RoSAModel,
+    *,
+    lora_trainable: bool,
+    delta_trainable: bool,
 ) -> RoSAModel:
-    """Build a Python-bool filter spec marking only the named
-    ``model.rosa.*`` fields as trainable. Bool ``mask_*`` arrays are
-    always False (they're not differentiable parameters; the trainer
-    rewrites them via ``set_mask`` between phases)."""
+    """Build a Python-bool filter spec for one of the three RoSA
+    training phases.
+
+    Only ``model.rosa.cfg.targets`` get marked trainable — inactive
+    targets' ``delta_*`` arrays (full-shape ``(L, d, d)`` zeros,
+    structurally unused in the forward) stay frozen, so Adam doesn't
+    allocate moment buffers for them. Inactive targets' ``a_*`` /
+    ``b_*`` are zero-width sentinels (no buffer cost regardless) but
+    we exclude them too for symmetry.
+
+    Bool ``mask_*`` arrays are always False (they're not
+    differentiable parameters; the trainer rewrites them via
+    ``set_mask`` between phases).
+    """
     false_tree = jax.tree_util.tree_map(lambda _: False, model)
-    rosa = model.rosa
+    active_targets = model.rosa.cfg.targets
 
     def _set(tree: RoSAModel, field: str) -> RoSAModel:
         return eqx.tree_at(
@@ -266,50 +273,48 @@ def _filter_with(
         )
 
     tree = false_tree
-    for field in trainable_fields:
-        leaf = getattr(rosa, field)
-        # Skip zero-width sentinel A/B (inactive targets) — they're
-        # zero-rank-axis arrays that should stay frozen even when the
-        # filter says "trainable", because their gradient is
-        # structurally zero. ``eqx.partition`` is happy with this:
-        # marking a real array as True puts it on the trainable side;
-        # marking a zero-width array as True does the same (an empty
-        # trainable leaf is just an empty array).
-        del leaf
-        tree = _set(tree, field)
+    for tgt in active_targets:
+        if lora_trainable:
+            tree = _set(tree, f"a_{tgt}")
+            tree = _set(tree, f"b_{tgt}")
+        if delta_trainable:
+            tree = _set(tree, f"delta_{tgt}")
     return tree
 
 
 def adapter_filter(model: RoSAModel) -> RoSAModel:
-    """Phase-3 joint filter: ``True`` on every ``model.rosa.*`` inexact
-    array (A, B, Δ), ``False`` on the bool ``mask_*`` arrays.
+    """Phase-3 joint filter: ``True`` on every active-target
+    ``model.rosa.{a,b,delta}_*`` inexact array, ``False`` on the
+    bool ``mask_*`` arrays and on every inactive-target leaf.
 
     The phase-1 (LoRA warmup) and phase-2 (sparse mask gen) filters
     are exposed as ``lora_only_adapter_filter`` and
     ``sparse_only_adapter_filter`` — see the module docstring for the
     three-phase RoSA training schedule."""
-    return _filter_with(model, _LORA_FIELDS + _DELTA_FIELDS)
+    return _filter_with(model, lora_trainable=True, delta_trainable=True)
 
 
 def lora_only_adapter_filter(model: RoSAModel) -> RoSAModel:
-    """RoSA Phase 1 filter: ``True`` only on the LoRA A, B leaves.
+    """RoSA Phase 1 filter: ``True`` only on the active-target LoRA
+    A, B leaves.
 
     Used during the LoRA warmup phase — sparse Δ stays at its init
     value (zeros) and doesn't accumulate gradient updates. ``mask_*``
     arrays are False (always not-trainable; rewritten via
     ``set_mask``)."""
-    return _filter_with(model, _LORA_FIELDS)
+    return _filter_with(model, lora_trainable=True, delta_trainable=False)
 
 
 def sparse_only_adapter_filter(model: RoSAModel) -> RoSAModel:
-    """RoSA Phase 2 filter: ``True`` only on the sparse Δ leaves.
+    """RoSA Phase 2 filter: ``True`` only on the active-target sparse
+    Δ leaves.
 
     The trainer never actually optimises with this filter — Phase 2 is
     a single forward+backward to extract ``|dL/dΔ|`` per target. The
     filter is exposed so the gradient is computed against only the Δ
     leaves (XLA dead-code-eliminates dL/dA, dL/dB for the §6.1
     backward-pass FLOP cut, even though we're not training)."""
-    return _filter_with(model, _DELTA_FIELDS)
+    return _filter_with(model, lora_trainable=False, delta_trainable=True)
 
 
 def compute_phase2_mask(
@@ -346,11 +351,19 @@ def compute_phase2_mask(
         flat = jnp.abs(grad).reshape(n_layers, -1)  # (L, d * d)
         n_entries = flat.shape[1]
         k = max(1, int(n_entries * top_k_frac))
-        # Per-layer threshold = k-th largest magnitude.
-        # ``jnp.sort`` is ascending; the k-th largest is at index
-        # ``n_entries - k``.
-        sorted_flat = jnp.sort(flat, axis=1)
-        threshold = sorted_flat[:, n_entries - k][:, None]  # (L, 1)
-        mask_flat = flat >= threshold  # (L, d * d)
-        masks[tgt] = mask_flat.reshape(grad.shape).astype(jnp.bool_)
+        # Pick exactly the top ``k`` indices per layer via argsort
+        # rather than a >= threshold comparison. A threshold-based
+        # selection over-counts when many entries tie at the
+        # boundary value — pathologically, all-zero gradients tie
+        # at 0 and ``>= 0`` selects every entry, producing
+        # density=1.0 and defeating the sparsity guarantee. The
+        # argsort path gives exactly ``k`` entries per layer
+        # regardless of ties (ties are broken by index order, which
+        # is fine — the legacy behaviour was identical in this
+        # respect).
+        top_k_indices = jnp.argsort(flat, axis=1)[:, n_entries - k:]
+        layer_idx = jnp.arange(n_layers)[:, None].repeat(k, axis=1)
+        mask_flat = jnp.zeros_like(flat, dtype=jnp.bool_)
+        mask_flat = mask_flat.at[layer_idx, top_k_indices].set(True)
+        masks[tgt] = mask_flat.reshape(grad.shape)
     return masks
