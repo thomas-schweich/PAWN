@@ -236,6 +236,74 @@ def test_gradient_mask_freezes_layers_through_train_step() -> None:
     )
 
 
+def test_gradient_mask_lm_head_unfrozen_under_include_lm_head() -> None:
+    """When ``include_lm_head=True`` (the argparser default), Unfreeze
+    must train ``lm_head`` even if ``n_unfreeze=0`` (no layer-stacked
+    weights trainable). The `_HEAD_FIELDS` branch in
+    `unfreeze.make_gradient_mask` is what makes this work; this test
+    pins that branch from end-to-end through `make_adapter_train_step`.
+
+    Production runs default to `include_lm_head=True`, so without
+    this pin a future refactor that drops the `_HEAD_FIELDS` branch
+    would silently freeze the head — invisible at the "doesn't
+    crash" granularity the strategy smoke-test gives.
+    """
+    from typing import cast
+
+    from pawn.adapters import (
+        UnfreezeConfig, UnfreezeModel, init_unfreeze_model,
+        unfreeze_adapter_filter, unfreeze_gradient_mask,
+    )
+    from pawn.adapter_trainer import (
+        init_adapter_state as init_state,
+        make_adapter_train_step as make_step,
+    )
+
+    key = jax.random.PRNGKey(0)
+    supernet = init_model(TINY_SUPERNET, key)
+    backbone = sliced(supernet, TINY_VARIANTS["base"])
+    # n_unfreeze=0 → every layer frozen. include_lm_head=True →
+    # final_norm + lm_head are the only trainable bits.
+    model = init_unfreeze_model(
+        backbone, UnfreezeConfig(n_unfreeze=0, include_lm_head=True),
+        jax.random.PRNGKey(1),
+    )
+    opt = make_optimizer(3e-2)
+    grad_mask = unfreeze_gradient_mask(model)
+    state, frozen = init_state(
+        model, opt, adapter_filter_fn=unfreeze_adapter_filter,
+    )
+    train_step = make_step(opt, frozen, gradient_mask=grad_mask)
+    # ``state.trainable.backbone.wq`` is None here — n_unfreeze=0
+    # marks every layer-stacked field as frozen, so the partition
+    # puts wq on the ``frozen`` side. Read the initial wq from the
+    # bare backbone (which is what gets combined back at forward).
+    initial_lm_head = cast(UnfreezeModel, state.trainable).backbone.lm_head.copy()
+    initial_wq = backbone.wq.copy()
+    batch = _real_batch(b=4, t=16)
+    for _ in range(3):
+        state, _ = train_step(state, batch)
+    final_trainable = cast(UnfreezeModel, state.trainable)
+    lm_head_diff = float(
+        jnp.abs(final_trainable.backbone.lm_head - initial_lm_head).max()
+    )
+    # ``final_trainable.backbone.wq`` is still None (the layer-stacked
+    # fields were never trainable in this run). Recompose the full
+    # model and read wq from there.
+    combined = cast(UnfreezeModel, eqx.combine(state.trainable, frozen))
+    wq_diff = float(jnp.abs(combined.backbone.wq - initial_wq).max())
+    # lm_head must train.
+    assert lm_head_diff > 0.0, (
+        f"lm_head should have trained under include_lm_head=True but "
+        f"max-abs-delta = {lm_head_diff}"
+    )
+    # Every layer of wq must stay frozen (n_unfreeze=0).
+    assert wq_diff == 0.0, (
+        f"wq should have been frozen (n_unfreeze=0) but max-abs-"
+        f"delta = {wq_diff}"
+    )
+
+
 def test_eval_step_is_forward_only() -> None:
     """``eval_step`` returns metrics without mutating state. Pins the
     forward-only contract — the eval result must be a function of

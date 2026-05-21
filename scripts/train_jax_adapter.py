@@ -563,6 +563,28 @@ def main(argv: list[str] | None = None) -> int:
         )
     _validate_strategy_args(args)
 
+    # RoSA: pre-compute the warmup-chunk split here (before any
+    # corpus generation or filesystem write) so a degenerate
+    # rosa-warmup-frac that leaves no Phase-3 chunks fails fast
+    # without leaking an orphan ``jax_adapter_run_*`` directory.
+    # (Codex round-2 P3 + the test_validation_failures_do_not_create_run_dir
+    # invariant from the original driver port.)
+    n_chunks_for_validation = args.total_steps // args.k
+    rosa_three_phase = (
+        args.strategy == "rosa" and args.rosa_warmup_frac > 0.0
+    )
+    if rosa_three_phase:
+        rosa_warmup_chunks = max(
+            1, int(round(args.rosa_warmup_frac * n_chunks_for_validation)),
+        )
+        if rosa_warmup_chunks >= n_chunks_for_validation:
+            raise SystemExit(
+                f"--rosa-warmup-frac={args.rosa_warmup_frac} leaves no "
+                f"chunks for Phase 3 joint training (rosa_warmup_chunks="
+                f"{rosa_warmup_chunks}, n_chunks={n_chunks_for_validation}). "
+                f"Reduce --rosa-warmup-frac or increase --total-steps."
+            )
+
     corpus_seed = args.seed if args.corpus_seed is None else args.corpus_seed
     model_seed = args.seed if args.model_seed is None else args.model_seed
 
@@ -702,9 +724,8 @@ def main(argv: list[str] | None = None) -> int:
     # (which happens inside the training loop). When
     # ``--rosa-warmup-frac == 0`` the original joint filter is used
     # from step 0 and the three-phase scheduler is a no-op.
-    rosa_three_phase = (
-        args.strategy == "rosa" and args.rosa_warmup_frac > 0.0
-    )
+    # ``rosa_three_phase`` was pre-computed above as part of the
+    # validation pass.
     if rosa_three_phase:
         active_filter_fn: Callable[..., eqx.Module] = rosa_lora_only_adapter_filter
     else:
@@ -720,21 +741,12 @@ def main(argv: list[str] | None = None) -> int:
     eval_step = make_eval_step(frozen)
 
     n_chunks = args.total_steps // args.k
-    rosa_warmup_chunks = (
-        max(1, int(round(args.rosa_warmup_frac * n_chunks)))
-        if rosa_three_phase else 0
-    )
+    # ``rosa_warmup_chunks`` was pre-computed during the upfront
+    # validation pass when ``rosa_three_phase`` was True; for non-RoSA
+    # or zero-warmup runs it's 0 (no phase transition).
+    if not rosa_three_phase:
+        rosa_warmup_chunks = 0
     if rosa_three_phase:
-        # Phase 1 + Phase 3 must each get at least one training chunk
-        # — degenerate splits are caught here so the user knows up
-        # front rather than the loop body silently skipping one phase.
-        if rosa_warmup_chunks >= n_chunks:
-            raise SystemExit(
-                f"--rosa-warmup-frac={args.rosa_warmup_frac} leaves no "
-                f"chunks for Phase 3 joint training (rosa_warmup_chunks="
-                f"{rosa_warmup_chunks}, n_chunks={n_chunks}). Reduce "
-                f"--rosa-warmup-frac or increase --total-steps."
-            )
         print(
             f"[train] n_chunks={n_chunks} (K={args.k} steps each); "
             f"RoSA Phase 1 = {rosa_warmup_chunks} chunks, "
@@ -825,9 +837,21 @@ def main(argv: list[str] | None = None) -> int:
                 # ``--warmup-steps`` small relative to
                 # ``--total-steps`` * (1 - ``--rosa-warmup-frac``) so
                 # the replayed warmup is a small fraction of Phase 3.
+                #
+                # We do preserve the FRAMEWORK-LEVEL step counter
+                # (``state.step``) across the transition by manually
+                # setting it after re-init — that's what the
+                # metrics-log step column reads, so dropping it
+                # would produce non-monotonic step counts and an
+                # underreported total step count in the final row
+                # (Codex round-2 P2). The Optax-internal step
+                # counter (inside opt_state) still resets, by
+                # design.
+                phase1_step = state.step
                 state, frozen = init_adapter_state(
                     final_model, optimizer, adapter_filter_fn=filter_fn,
                 )
+                state = state._replace(step=phase1_step)
                 train_step = make_adapter_train_step(
                     optimizer, frozen, gradient_mask=gradient_mask,
                 )

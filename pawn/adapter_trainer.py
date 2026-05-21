@@ -60,11 +60,6 @@ class AdapterModelProto(Protocol):
 
     def __call__(self, tokens: jax.Array, attn_mask: jax.Array) -> jax.Array: ...
 
-
-# Internal alias kept for back-compat with the original commit that
-# introduced the protocol; new code should import ``AdapterModelProto``.
-_AdapterModelProto = AdapterModelProto
-
 # Type alias: a filter-spec function for any adapter ``eqx.Module``.
 # Returns a tree shaped like ``model`` whose leaves are Python ``bool``
 # values (``eqx.partition`` consumes these directly) or callables.
@@ -202,7 +197,7 @@ def make_adapter_train_step(
         tokens, attn_mask, targets, loss_mask = batch
 
         def loss_fn(trn: eqx.Module) -> jax.Array:
-            model = cast(_AdapterModelProto, eqx.combine(trn, frozen))
+            model = cast(AdapterModelProto, eqx.combine(trn, frozen))
             logits = model(tokens, attn_mask)
             return cross_entropy_loss(logits, targets, loss_mask)
 
@@ -213,9 +208,40 @@ def make_adapter_train_step(
         params = eqx.filter(state.trainable, eqx.is_inexact_array)
         grads_filt = eqx.filter(grads, eqx.is_inexact_array)
 
+        # Element-wise gradient mask applied in TWO places:
+        #
+        # 1. PRE-optimizer (here): zero gradients at frozen positions
+        #    so they don't pollute ``clip_by_global_norm`` (which
+        #    operates on the global L2 norm across all leaves —
+        #    large frozen-layer grads would inflate the norm and
+        #    cause the actually-trainable grads to be clipped too
+        #    aggressively) and Adam's moment estimates.
+        # 2. POST-optimizer (inside ``_apply``): zero the final
+        #    update at frozen positions so AdamW's decoupled
+        #    weight-decay term (which is independent of the
+        #    gradient) cannot move frozen params either.
+        #
+        # The two masks are redundant only at trainable positions
+        # (where multiplying by 1 is a no-op); at frozen positions
+        # the pre-mask handles gradient-norm leakage and the
+        # post-mask handles weight-decay leakage. Removing either
+        # leaves the corresponding leak path open (Codex P2 + test-
+        # risk HIGH on round-1: post-only let weight decay through;
+        # pre-only let weight decay through).
+        if mask_filt is not None:
+            grads_filt = jax.tree.map(
+                lambda g, m: (
+                    g if g is None or m is None
+                    else g * m.astype(g.dtype)
+                ),
+                grads_filt, mask_filt,
+                is_leaf=lambda x: x is None,
+            )
+
         # Global grad norm via the shared helper (same pattern as the
         # pretrain trainer; centralised so a future change lands in
-        # one place).
+        # one place). Computed after the pre-mask so the reported
+        # norm reflects the actually-applied gradients.
         grad_norm = compute_grad_norm(grads_filt)
 
         n_supervised = loss_mask.sum().astype(jnp.int32)
@@ -227,19 +253,11 @@ def make_adapter_train_step(
             trn_in, opt_in = args
             updates, new_opt = optimizer.update(grads_filt, opt_in, params)
             if mask_filt is not None:
-                # Element-wise mask applied to the OPTIMIZER UPDATE,
-                # not the gradient. Masking pre-optimizer would still
-                # let AdamW's weight-decay term move the params (decay
-                # is independent of the gradient), so frozen layers
-                # would slowly drift even though their gradients were
-                # zeroed. Masking post-optimizer zeros the entire
-                # update on frozen positions — weight decay included —
-                # so the params at those positions are bit-stable
-                # across training. The ``is_leaf=lambda x: x is None``
-                # guard handles the case where the partition spec
-                # produced ``None`` leaves (frozen at leaf
-                # granularity); the mask passes them through
-                # unchanged.
+                # Post-optimizer mask zeros the final update at
+                # frozen positions so AdamW's decoupled weight decay
+                # cannot move them. The pre-mask above already
+                # zeroed the gradient signal feeding Adam's moments
+                # and the global-norm clipper.
                 updates = jax.tree.map(
                     lambda u, m: (
                         u if u is None or m is None
@@ -319,7 +337,7 @@ def make_eval_step(frozen: eqx.Module) -> EvalStep:
     @eqx.filter_jit
     def eval_step(trn: eqx.Module, batch: Batch) -> dict[str, jax.Array]:
         tokens, attn_mask, targets, loss_mask = batch
-        model = cast(_AdapterModelProto, eqx.combine(trn, frozen))
+        model = cast(AdapterModelProto, eqx.combine(trn, frozen))
         logits = model(tokens, attn_mask)
         loss = cross_entropy_loss(logits, targets, loss_mask)
         n_supervised = loss_mask.sum().astype(jnp.int32)

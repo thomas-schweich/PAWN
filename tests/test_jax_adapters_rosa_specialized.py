@@ -263,6 +263,40 @@ def test_rosa_compute_phase2_mask_handles_degenerate_all_zero_grads() -> None:
         )
 
 
+def test_rosa_inactive_targets_excluded_from_adam_moments() -> None:
+    """`_filter_with` iterates only ``cfg.targets`` — inactive
+    targets' full-shape ``(L, d, d)`` Δ arrays stay on the frozen
+    side of the partition spec, so ``optimizer.init`` doesn't
+    allocate Adam moments for them.
+
+    Pre-fix (round-1, before the `cfg.targets`-only iteration),
+    Adam allocated `2 × (L × d × d × float32)` per inactive target —
+    at SUPERNET scale (L=10, d=640) that's ~50 MB per target wasted,
+    ~150 MB for a single-active-target run.
+
+    Verifies the partition: trainable.rosa.delta_q is a real array
+    (active), trainable.rosa.delta_k/v/o are None (inactive). The
+    inactive deltas live on the frozen side.
+    """
+    cfg = TINY_SUPERNET
+    backbone = init_model(cfg, jax.random.key(0))
+    model = init_rosa_model(
+        backbone, RoSAConfig(rank=2, targets=("q",)), jax.random.key(1),
+    )
+    spec = rosa_adapter_filter(model)
+    trainable, frozen = eqx.partition(model, spec)
+    # Active target: real array on trainable side.
+    assert trainable.rosa.delta_q is not None
+    # Inactive targets: None on trainable side, real on frozen side.
+    for tgt in ("k", "v", "o"):
+        assert getattr(trainable.rosa, f"delta_{tgt}") is None, (
+            f"inactive target {tgt!r}: delta_{tgt} leaked onto "
+            f"trainable side; pre-fix this allocated wasted Adam "
+            f"moments at production scale"
+        )
+        assert getattr(frozen.rosa, f"delta_{tgt}") is not None
+
+
 def test_rosa_delta_trains_under_dense_mask() -> None:
     """With ``mask=all-True``, ``dL/dΔ`` is the full ``dL/dW_eff``
     — Δ should accumulate updates under joint training. This pins the

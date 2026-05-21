@@ -336,7 +336,13 @@ def test_rosa_zero_warmup_runs_single_phase(tmp_path: Path) -> None:
 def test_rosa_warmup_frac_too_large_rejected(tmp_path: Path) -> None:
     """``--rosa-warmup-frac`` that leaves no Phase-3 chunks is a
     user-error and surfaced upfront with a SystemExit so the user
-    knows before any compute spins up."""
+    knows before any compute spins up *and* before any filesystem
+    side-effect (no orphan ``jax_adapter_run_*`` directory).
+
+    Codex round-2 P3: pre-fix the check fired only after
+    ``run_dir.mkdir`` + ``config.json`` write, leaking an orphan
+    directory on validation failure — unlike every other validation
+    path."""
     with pytest.raises(SystemExit, match="Phase 3"):
         _run(
             [
@@ -350,6 +356,10 @@ def test_rosa_warmup_frac_too_large_rejected(tmp_path: Path) -> None:
             ],
             tmp_path,
         )
+    leaked = list(tmp_path.glob("jax_adapter_run_*"))
+    assert not leaked, (
+        f"RoSA warmup-frac validation leaked run dirs: {leaked}"
+    )
 
 
 def test_rejects_bottleneck_dim_zero(tmp_path: Path) -> None:
