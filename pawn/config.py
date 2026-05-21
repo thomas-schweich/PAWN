@@ -1,159 +1,124 @@
-"""PAWN model and training configuration."""
+"""Architecture configuration for the JAX/Equinox PAWN model.
+
+PAWN trains a single shared-weight *supernet*; the small/base/large variants
+are nested slices of it (see ``docs/jax-migration.md`` §5). Every variant fixes
+``head_dim = 64`` so the width slices are exact and RoPE is variant-invariant.
+
+``ModelConfig`` is the generic per-model architecture description. It also
+describes standalone (non-supernet) models — e.g. a legacy PyTorch checkpoint
+converted to JAX keeps its original head count and need not nest.
+"""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
-
-# ---- New vocabulary (searchless_chess) ----
-# Token layout: actions [0, 1967], PAD [1968], outcomes [1969, 1979]
-# Must match engine/src/vocab.rs
-
+# Token vocabulary — must match engine/src/vocab.rs and pawn.config.
+NUM_ACTIONS = 1968
 PAD_TOKEN = 1968
 OUTCOME_TOKEN_BASE = 1969
-NUM_ACTIONS = 1968
-
-# Pretraining outcomes (random games — natural terminations)
-WHITE_CHECKMATES = 1969
-BLACK_CHECKMATES = 1970
-STALEMATE = 1971
-DRAW_BY_RULE = 1972       # 75-move, fivefold repetition, insufficient material
-PLY_LIMIT = 1973          # Hit max plies (also used for truncated Lichess games)
-
-# Lichess-specific outcomes (finetuning data)
-WHITE_RESIGNS = 1974      # Normal termination, white wins, no checkmate
-BLACK_RESIGNS = 1975      # Normal termination, black wins, no checkmate
-DRAW_BY_AGREEMENT = 1976  # Normal termination, draw, not stalemate
-WHITE_WINS_ON_TIME = 1977 # Time forfeit, white wins
-BLACK_WINS_ON_TIME = 1978 # Time forfeit, black wins
-DRAW_BY_TIME = 1979       # Time forfeit, draw (insufficient mating material)
-
-N_PRETRAINING_OUTCOMES = 5  # Tokens 1969-1973
-N_TOTAL_OUTCOMES = 11       # Tokens 1969-1979
+N_OUTCOMES = 11
+VOCAB_SIZE = 1980
+MAX_SEQ_LEN = 512
 
 
-@dataclass
-class CLMConfig:
-    """Model architecture hyperparameters."""
+@dataclass(frozen=True)
+class ModelConfig:
+    """Architecture hyperparameters for one PAWN model.
 
-    # Vocabulary: 1968 actions + 1 PAD + 11 outcomes = 1980
-    vocab_size: int = 1980
-    max_seq_len: int = 512
-    n_outcomes: int = N_TOTAL_OUTCOMES
+    Used for the supernet, for each sliced variant, and for standalone models
+    such as converted legacy checkpoints.
+    """
 
-    # Transformer
-    d_model: int = 512
-    n_layers: int = 8
-    n_heads: int = 8
-    d_ff: int = 2048  # 4x expansion
-    dropout: float = 0.0
-
-    # RoPE
+    d_model: int
+    n_layers: int
+    n_heads: int
+    d_ff: int
+    vocab_size: int = VOCAB_SIZE
+    max_seq_len: int = MAX_SEQ_LEN
+    n_outcomes: int = N_OUTCOMES
     rope_base: float = 10000.0
 
-    @classmethod
-    def small(cls) -> "CLMConfig":
-        """~9.5M parameters."""
-        return cls(d_model=256, n_layers=8, n_heads=4, d_ff=1024)
+    def __post_init__(self) -> None:
+        if self.d_model % self.n_heads != 0:
+            raise ValueError(
+                f"d_model={self.d_model} not divisible by n_heads={self.n_heads}"
+            )
+        if self.head_dim % 2 != 0:
+            # RoPE rotates pairs of channels, so the per-head dimension must
+            # be even — otherwise ``arange(0, head_dim, 2)`` silently leaves
+            # the last channel un-rotated.
+            raise ValueError(
+                f"head_dim={self.head_dim} must be even (RoPE rotates pairs)"
+            )
 
-    @classmethod
-    def base(cls) -> "CLMConfig":
-        """~35.8M parameters (default)."""
-        return cls()
+    @property
+    def head_dim(self) -> int:
+        return self.d_model // self.n_heads
 
-    @classmethod
-    def large(cls) -> "CLMConfig":
-        """~68.4M parameters."""
-        return cls(d_model=640, n_layers=10, n_heads=8, d_ff=2560)
 
-    @classmethod
-    def toy(cls) -> "CLMConfig":
-        return cls(
-            d_model=64,
-            n_layers=2,
-            n_heads=4,
-            d_ff=256,
+# The supernet — large's dimensions. head_dim = 640 / 10 = 64.
+SUPERNET = ModelConfig(d_model=640, n_layers=10, n_heads=10, d_ff=2560)
+
+# Variants — nested slices of SUPERNET. All three have head_dim = 64.
+# NOTE: "large" *is* the supernet (10 heads, head_dim 64). The legacy PyTorch
+# pawn-large checkpoint used 8 heads (head_dim 80); a converted legacy
+# checkpoint is therefore a standalone ModelConfig with n_heads=8 — never
+# VARIANTS["large"], and validate_nested() would correctly reject it.
+VARIANTS: dict[str, ModelConfig] = {
+    "small": ModelConfig(d_model=256, n_layers=8, n_heads=4, d_ff=1024),
+    "base": ModelConfig(d_model=512, n_layers=8, n_heads=8, d_ff=2048),
+    "large": SUPERNET,
+}
+
+# Tiny config for tests only — does not nest into SUPERNET.
+TOY = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=256)
+
+
+# Tiny nested supernet for Phase-2 verification runs and slicing tests.
+# All four configs share ``head_dim = 64`` so the nesting invariant holds.
+# The production ``SUPERNET`` is too big for a smoke run on commodity GPUs;
+# this gives the same supernet→variants structure at roughly 4-5% of the
+# production FLOPs per step (less width, fewer layers, smaller FFN — but
+# the same 512-token context, since attention's T^2 term dominates).
+#
+# - TINY_SUPERNET:  d=192, L=4, H=3, d_ff= 768   (~2.8M params total)
+# - TINY_VARIANTS["small"]:  d= 64, L=2, H=1, d_ff= 256
+# - TINY_VARIANTS["base"]:   d=128, L=3, H=2, d_ff= 512
+# - TINY_VARIANTS["large"]:  d=192, L=4, H=3, d_ff= 768  (= TINY_SUPERNET)
+TINY_SUPERNET = ModelConfig(d_model=192, n_layers=4, n_heads=3, d_ff=768)
+
+TINY_VARIANTS: dict[str, ModelConfig] = {
+    "small": ModelConfig(d_model=64, n_layers=2, n_heads=1, d_ff=256),
+    "base": ModelConfig(d_model=128, n_layers=3, n_heads=2, d_ff=512),
+    "large": TINY_SUPERNET,
+}
+
+_NESTED_EQUAL_FIELDS = ("vocab_size", "max_seq_len", "n_outcomes", "rope_base")
+_NESTED_LEQ_FIELDS = ("d_model", "n_layers", "d_ff")
+
+
+def validate_nested(variant: ModelConfig, supernet: ModelConfig) -> None:
+    """Raise ``ValueError`` unless ``variant`` is a valid slice of ``supernet``.
+
+    A variant slices cleanly only if it shares the supernet's head dimension
+    (so a width slice drops whole heads), keeps the vocab / context / outcome
+    layout identical, and is no larger than the supernet on any sliced axis.
+    """
+    if variant.head_dim != supernet.head_dim:
+        raise ValueError(
+            f"variant head_dim={variant.head_dim} != supernet "
+            f"head_dim={supernet.head_dim}; width slices would not align to heads"
         )
-
-
-@dataclass
-class TrainingConfig:
-    """Training hyperparameters."""
-
-    # Optimization
-    lr: float = 3e-4
-    weight_decay: float = 0.01
-    max_grad_norm: float = 1.0
-    warmup_steps: int = 1000
-    total_steps: int = 100_000
-    # LR schedule: ``"cosine"`` (default), ``"wsd"``, ``"constant"``,
-    # ``"one_cycle"``, or ``"infinite"``. See ``pawn.trainer`` for the
-    # class implementations and ``pawn.run_config.BaseRunConfig.lr_schedule``
-    # for semantics.
-    lr_schedule: Literal[
-        "cosine", "wsd", "constant", "one_cycle", "infinite"
-    ] = "cosine"
-    # WSD / infinite final-decay-phase length (in steps). Used when
-    # ``lr_schedule`` is ``"wsd"`` or ``"infinite"`` (ignored otherwise).
-    decay_steps: int = 10_000
-    # Decay-phase curve shape for WSD's single decay and for the final
-    # decay of the ``"infinite"`` schedule: ``"linear"`` or ``"cosine"``.
-    # Ignored for schedules without a final decay.
-    wsd_decay_shape: Literal["linear", "cosine"] = "linear"
-    # Infinite-schedule cooldown length (peak → stable_lr_ratio via
-    # cosine). Ignored unless ``lr_schedule == "infinite"``.
-    cooldown_steps: int = 20_000
-    # Infinite-schedule stable plateau LR, as a fraction of peak LR.
-    # Ignored unless ``lr_schedule == "infinite"``.
-    stable_lr_ratio: float = 0.1
-
-    # Batch
-    batch_size: int = 256
-    max_ply: int = 512  # Matches max_seq_len (no outcome prefix by default)
-    discard_ply_limit: bool = False  # Only train on games that ended naturally
-    num_workers: int = 4
-
-    # Precision
-    use_amp: bool = True
-
-    # Gradient accumulation
-    accumulation_steps: int = 1
-
-    # Logging
-    log_interval: int = 10
-    eval_interval: int = 500
-    checkpoint_interval: int = 5000
-
-    # Pause (for LR exploration — stop early without killing)
-    pause_after_steps: int | None = None
-
-    # Ablations
-    prepend_outcome: bool = False  # Prepend outcome token at position 0 for outcome-conditioned training
-    mate_boost: float = 0.0  # Probability of taking mate-in-1 (0.0=random, 1.0=always)
-
-    # Seeds
-    base_seed: int = 42
-    val_seed: int = (2**63) - 1
-    val_games: int = 512
-
-    # Paths
-    checkpoint_dir: str = "checkpoints"
-    log_dir: str = "logs"
-    use_wandb: bool = False
-    wandb_project: str = "pawn"
-
-    # Device
-    device: str = "cuda"
-
-    @classmethod
-    def toy(cls) -> "TrainingConfig":
-        return cls(
-            lr=1e-3,
-            batch_size=32,
-            total_steps=5000,
-            warmup_steps=100,
-            eval_interval=100,
-            checkpoint_interval=1000,
-            num_workers=2,
-            use_amp=False,
-            val_games=64,
-        )
+    for field in _NESTED_EQUAL_FIELDS:
+        if getattr(variant, field) != getattr(supernet, field):
+            raise ValueError(
+                f"variant {field}={getattr(variant, field)} must equal supernet "
+                f"{field}={getattr(supernet, field)}"
+            )
+    for field in _NESTED_LEQ_FIELDS:
+        if getattr(variant, field) > getattr(supernet, field):
+            raise ValueError(
+                f"variant {field}={getattr(variant, field)} exceeds supernet "
+                f"{field}={getattr(supernet, field)}"
+            )
