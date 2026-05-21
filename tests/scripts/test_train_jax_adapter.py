@@ -362,6 +362,82 @@ def test_rosa_warmup_frac_too_large_rejected(tmp_path: Path) -> None:
     )
 
 
+def test_film_default_preserves_output_modulation(tmp_path: Path) -> None:
+    """Default `--strategy film` and `--strategy hybrid` invocations
+    (no `--no-film-output` flag) preserve the library default:
+    ``FiLMConfig.use_output_film == True``. Pre-fix (Codex round-5 P2),
+    the driver's `--film-output` flag was store_true with default
+    False — inverting the library default and silently shrinking the
+    adapter for the common no-flag invocation."""
+    for strat in ("film", "hybrid"):
+        _run(
+            [
+                "--strategy", strat,
+                "--supernet", "tiny", "--variant", "base",
+                "--rank", "4",
+                "--total-steps", "5", "--k", "5",
+                "--batch-size", "2", "--seq-len", "16",
+                "--warmup-steps", "1", "--val-frac", "0.5",
+                "--val-every", "1", "--quiet",
+            ],
+            tmp_path,
+        )
+        runs = list(tmp_path.glob("jax_adapter_run_*"))
+        # Most recent run is the one we just made.
+        latest = max(runs, key=lambda p: p.stat().st_mtime)
+        cfg = json.loads((latest / "config.json").read_text())
+        # Both film and hybrid records use_output_film / film_output
+        # under different keys.
+        if strat == "film":
+            assert cfg["strategy_config"]["use_output_film"] is True
+        else:  # hybrid
+            assert cfg["strategy_config"]["film_output"] is True
+
+
+def test_film_no_output_opt_out(tmp_path: Path) -> None:
+    """The opt-out flag ``--no-film-output`` disables output FiLM. Pins
+    the user-facing toggle works as the round-5 fix advertises."""
+    _run(
+        [
+            "--strategy", "film",
+            "--supernet", "tiny", "--variant", "base",
+            "--no-film-output",
+            "--total-steps", "5", "--k", "5",
+            "--batch-size", "2", "--seq-len", "16",
+            "--warmup-steps", "1", "--val-frac", "0.5",
+            "--val-every", "1", "--quiet",
+        ],
+        tmp_path,
+    )
+    runs = list(tmp_path.glob("jax_adapter_run_*"))
+    assert len(runs) == 1
+    cfg = json.loads((runs[0] / "config.json").read_text())
+    assert cfg["strategy_config"]["use_output_film"] is False
+
+
+def test_rejects_no_op_unfreeze_upfront(tmp_path: Path) -> None:
+    """``--n-unfreeze 0 --no-include-lm-head`` with default
+    ``--include-embeddings=False`` leaves zero trainable parameters
+    — the run would burn full compute updating nothing. Pre-fix
+    (Codex round-5 P2), the script accepted this and ran. The
+    upfront check rejects it with no orphan run-dir."""
+    with pytest.raises(SystemExit, match="zero parameters"):
+        _run(
+            [
+                "--strategy", "unfreeze",
+                "--supernet", "tiny", "--variant", "base",
+                "--n-unfreeze", "0",
+                "--no-include-lm-head",
+                "--total-steps", "10", "--k", "5",
+                "--batch-size", "2", "--seq-len", "16",
+                "--warmup-steps", "1", "--val-frac", "0.1",
+            ],
+            tmp_path,
+        )
+    leaked = list(tmp_path.glob("jax_adapter_run_*"))
+    assert not leaked, f"no-op unfreeze validation leaked: {leaked}"
+
+
 def test_rejects_negative_lora_alpha_upfront(tmp_path: Path) -> None:
     """``--lora-alpha`` <= 0 is invalid for LoRA / Hybrid / RoSA.
     Pre-fix (Codex round-4 P2), this raised inside

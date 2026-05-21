@@ -415,6 +415,20 @@ def _validate_strategy_args(
                 f"--n-unfreeze={args.n_unfreeze} exceeds the chosen "
                 f"variant's n_layers={variant_cfg.n_layers}"
             )
+        # At least one of (layer-stacked / lm_head / embeddings) must
+        # be trainable, else the adapter is a no-op (the run would
+        # spend full compute updating zero parameters). Codex round-5
+        # P2.
+        if (
+            args.n_unfreeze == 0
+            and not args.include_lm_head
+            and not args.include_embeddings
+        ):
+            raise SystemExit(
+                "Unfreeze configuration would train zero parameters: "
+                "set at least one of --n-unfreeze > 0, --include-lm-head, "
+                "or --include-embeddings."
+            )
     if args.strategy == "rosa":
         if not 0.0 <= args.rosa_warmup_frac < 1.0:
             raise SystemExit(
@@ -505,11 +519,16 @@ def main(argv: list[str] | None = None) -> int:
         "--lora-alpha", type=float, default=None,
         help="LoRA / Hybrid / RoSA scaling. ``None`` → alpha = rank.",
     )
-    # FiLM / Hybrid shared args.
+    # FiLM / Hybrid shared args. ``FiLMConfig.use_output_film``
+    # defaults to True in the library; expose the opt-OUT flag here
+    # so default-flagless invocations preserve the legacy / library
+    # default (Codex round-5 P2).
     parser.add_argument(
-        "--film-output", action="store_true",
-        help="FiLM / Hybrid: also modulate the lm_head output.",
+        "--no-film-output", dest="film_output", action="store_false",
+        help="FiLM / Hybrid: disable lm_head output modulation "
+             "(default: enabled, matching FiLMConfig's library default).",
     )
+    parser.set_defaults(film_output=True)
     # Unfreeze args.
     parser.add_argument(
         "--n-unfreeze", type=int, default=2,
