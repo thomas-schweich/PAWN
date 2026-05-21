@@ -99,6 +99,86 @@ def test_filter_elo_slice_empty_range_returns_empty_corpus() -> None:
     assert sliced.seq_len == corpus.seq_len
 
 
+def test_filter_elo_slice_side_white_masks_to_white_plies() -> None:
+    """``side='white'`` keeps games where white's Elo is in band and
+    scores only white's plies. Pinned because the existing
+    ``test_filter_elo_slice_side_white_only`` only checked row count
+    (test-risk round 7 MEDIUM).
+    """
+    corpus = _make_lichess_corpus(n=4, ply=6)
+    sliced = filter_elo_slice(
+        corpus, elo_min=1700, elo_max=1900, side="white",
+    )
+    # Game 2 (white=1800) is the only one in band.
+    assert sliced.tokens.shape[0] == 1
+    pos = np.arange(sliced.seq_len, dtype=np.int32)
+    # prepend_outcome=False → odd positions predict white's moves.
+    white_pos = pos % 2 == 1
+    expected = corpus.loss_mask[2] & white_pos
+    np.testing.assert_array_equal(sliced.loss_mask[0], expected)
+    # Black plies must NOT be scored.
+    assert not bool((sliced.loss_mask[0] & (pos % 2 == 0)).any())
+
+
+def test_filter_elo_slice_side_black_masks_to_black_plies() -> None:
+    """``side='black'`` is otherwise entirely untested (test-risk round 7
+    MEDIUM). Mirrors the white-side check above; pins both game
+    selection and per-ply masking.
+    """
+    corpus = _make_lichess_corpus(n=4, ply=6)
+    # Pick a band that captures exactly one black Elo (game 2's
+    # black=1700; game 1 is 1500 below, game 3 is 2100 above).
+    sliced = filter_elo_slice(
+        corpus, elo_min=1700, elo_max=1900, side="black",
+    )
+    assert sliced.tokens.shape[0] == 1
+    assert int(sliced.black_elo[0]) == 1700
+    pos = np.arange(sliced.seq_len, dtype=np.int32)
+    # prepend_outcome=False → even positions predict black's moves.
+    black_pos = pos % 2 == 0
+    expected = corpus.loss_mask[2] & black_pos
+    np.testing.assert_array_equal(sliced.loss_mask[0], expected)
+    assert not bool((sliced.loss_mask[0] & (pos % 2 == 1)).any())
+
+
+def test_filter_elo_slice_prepend_outcome_true_inverts_parity() -> None:
+    """``filter_elo_slice`` must read ``corpus.prepend_outcome`` to
+    pick the right mover parity. Under ``[outcome, m1, m2, ..., mN]``
+    layout, white's moves land at *even* positions (i=0 predicts m1).
+    A bug that hard-coded the prepend_outcome=False parity would
+    silently flip the per-side attribution for every outcome-
+    conditioned eval. Test-risk round 7 MEDIUM.
+    """
+    base = _make_lichess_corpus(n=4, ply=6)
+    # Build an otherwise-identical corpus with prepend_outcome=True.
+    corpus = LichessCorpus(
+        tokens=base.tokens, attn_mask=base.attn_mask,
+        targets=base.targets, loss_mask=base.loss_mask,
+        game_lengths=base.game_lengths,
+        white_elo=base.white_elo, black_elo=base.black_elo,
+        result=base.result, seq_len=base.seq_len,
+        prepend_outcome=True,
+    )
+    # side='white' with a band that captures only game 2's white=1800.
+    sliced = filter_elo_slice(
+        corpus, elo_min=1700, elo_max=1900, side="white",
+    )
+    assert sliced.tokens.shape[0] == 1
+    pos = np.arange(sliced.seq_len, dtype=np.int32)
+    # prepend_outcome=True → even positions predict white's moves.
+    white_pos_under_prepend = pos % 2 == 0
+    expected = corpus.loss_mask[2] & white_pos_under_prepend
+    np.testing.assert_array_equal(sliced.loss_mask[0], expected)
+    # And the prepend=False parity (odd=white) would give the
+    # complement — assert it's NOT the result, so a parity-inversion
+    # regression surfaces.
+    wrong_parity = corpus.loss_mask[2] & (pos % 2 == 1)
+    assert not np.array_equal(sliced.loss_mask[0], wrong_parity), (
+        "filter_elo_slice ignored prepend_outcome and used the "
+        "non-prepend parity"
+    )
+
+
 def test_filter_elo_slice_masks_out_of_band_mover_plies() -> None:
     """Per-ply masking by mover-Elo (Codex P2 rounds 3/4/6). A game
     with one side in band + one out of band should contribute only
