@@ -770,7 +770,10 @@ fn uci_to_tokens<'py>(
 )> {
     let n = games.len();
     let (flat, lengths) = py.allow_threads(|| {
-        let mut flat = vec![0i16; n * max_ply];
+        // PAD_TOKEN-seeded so a game shorter than max_ply reads back
+        // as PAD in its tail rather than as the legal-move 0
+        // (``docs/jax-migration.md`` §13 S13).
+        let mut flat = vec![vocab::PAD_TOKEN as i16; n * max_ply];
         let mut lengths = Vec::with_capacity(n);
         // Convert in parallel
         let results: Vec<(Vec<u16>, usize)> = games
@@ -875,8 +878,13 @@ fn parse_pgn_enriched<'py>(
     let n = games.len();
     let dict = PyDict::new(py);
 
-    // Flat 0-padded arrays for tokens, clocks, evals (N * max_ply)
-    let mut flat_tokens = vec![0i16; n * max_ply];
+    // Flat arrays for tokens, clocks, evals (N * max_ply). Tokens are
+    // seeded with PAD_TOKEN (not 0!) — a 0 in the token stream would
+    // be a legal action under the searchless_chess vocabulary, so a
+    // downstream consumer reading the un-filled tail would interpret
+    // it as a real move. Matches the fix applied to ``parse_pgn_lichess``
+    // (``docs/jax-migration.md`` §13 S13).
+    let mut flat_tokens = vec![vocab::PAD_TOKEN as i16; n * max_ply];
     let mut flat_clocks = vec![0u16; n * max_ply];
     let mut flat_evals = vec![0i16; n * max_ply];
 
@@ -1019,7 +1027,10 @@ fn parse_pgn_lichess<'py>(
 
     // Tokens: (N, seq_len). With `prepend_outcome`, slot 0 is the outcome
     // token and moves start at slot 1; otherwise slot 0 is the first move.
-    let mut flat_tokens = vec![0i16; n * seq_len];
+    // Seeded with PAD_TOKEN so any unfilled tail (game shorter than
+    // seq_len) reads back as PAD, not as the legal-move 0
+    // (``docs/jax-migration.md`` §13 S13).
+    let mut flat_tokens = vec![vocab::PAD_TOKEN as i16; n * seq_len];
     // Clocks are parallel to the move positions only (no outcome slot),
     // so their width tracks `effective_max_ply`.
     let mut flat_clocks = vec![0u16; n * effective_max_ply];
@@ -1195,7 +1206,10 @@ fn parse_pgn_sampled<'py>(
     let n = games.len();
     let dict = PyDict::new(py);
 
-    let mut flat_tokens = vec![0i16; n * max_ply];
+    // PAD_TOKEN-seeded so a game shorter than max_ply reads back as
+    // PAD in its tail, not as the legal-move 0 (``docs/jax-migration.md``
+    // §13 S13).
+    let mut flat_tokens = vec![vocab::PAD_TOKEN as i16; n * max_ply];
     let mut flat_clocks = vec![0u16; n * max_ply];
     let mut flat_evals = vec![0i16; n * max_ply];
     let mut lengths_out = Vec::with_capacity(n);
