@@ -390,11 +390,9 @@ cmd_create() {
     # Public keys contain spaces and HF tokens may contain shell metachars, so each
     # value MUST be shell-quoted before concatenation. printf %q produces output
     # that round-trips through shell parsing.
-    # Only SSH (22) is forwarded. The Phase-4 dashboard previously
-    # consumed port 8888 via a Caddy reverse-proxy; the dashboard +
-    # proxy were both removed from the entrypoint when the eval
-    # surface flattened onto the trainer's metrics.jsonl.
-    local env_str="-p 22:22"
+    # SSH on 22; dashboard's Caddy reverse-proxy on 8888 (gated by
+    # PAWN_DASHBOARD in the entrypoint).
+    local env_str="-p 22:22 -p 8888:8888"
     # Resolve HF token: env var takes precedence; fall back to the
     # huggingface CLI's saved token at ~/.cache/huggingface/token.
     local hf_token="${HF_TOKEN:-}"

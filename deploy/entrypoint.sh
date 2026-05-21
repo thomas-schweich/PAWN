@@ -30,12 +30,23 @@ if command -v nvidia-cuda-mps-control &>/dev/null; then
         || echo "CUDA MPS already running or unavailable"
 fi
 
-# ── Dashboard + Caddy reverse proxy removed in Phase 4 ────────────
-# The Solara dashboard (``pawn.dashboard``) and its Caddy proxy on
-# port 8888 were removed when the eval surface flattened onto the
-# JAX trainer's per-run ``metrics.jsonl``. The Caddyfile, the Caddy
-# install stage in the Dockerfile, and the ``EXPOSE 8888`` directives
-# are all gone too. Setting ``PAWN_DASHBOARD`` has no effect.
+# ── Dashboard + Caddy reverse proxy (port 8888 → Solara 8765) ──────
+# Gated by ``PAWN_DASHBOARD`` (default 1). The dashboard reads each
+# run's ``metrics.jsonl`` and renders charts under
+# /opt/pawn/logs (symlinked to /workspace/logs above). The
+# ``dashboard`` extra ships solara/plotly/anywidget; the production
+# CUDA + ROCm images install it, so this works out of the box.
+if [ "${PAWN_DASHBOARD:-1}" != "0" ]; then
+    if python -c "import pawn.dashboard" 2>/dev/null; then
+        echo "Starting dashboard on 127.0.0.1:8765..."
+        python -m pawn.dashboard --host 127.0.0.1 --port 8765 --log-dir /opt/pawn/logs &
+        caddy run --config /opt/pawn/deploy/Caddyfile &
+        echo "Dashboard proxied on port 8888"
+    else
+        echo "PAWN_DASHBOARD=1 but pawn.dashboard not importable " \
+             "(install with the ``dashboard`` extra); skipping."
+    fi
+fi
 
 # ── Configure and start SSH as the foreground process ────────────────
 # tini (PID 1) reaps zombies and forwards signals.

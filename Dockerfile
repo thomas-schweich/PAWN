@@ -20,6 +20,17 @@
 #
 # IMPORTANT: Always attach a network volume. Set HF_TOKEN as a pod env var.
 
+# ── Caddy: single static binary for reverse-proxying the dashboard ──
+FROM python:3.12-slim AS caddy
+ARG CADDY_VERSION=2.11.2
+ARG CADDY_SHA256=6d07b9bda92ac46e3b874e90dabc33192eca7e64c4b36ea661f4fd7dd27a5129
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64&version=v${CADDY_VERSION}" \
+       -o /usr/local/bin/caddy \
+    && echo "${CADDY_SHA256}  /usr/local/bin/caddy" | sha256sum -c \
+    && chmod +x /usr/local/bin/caddy \
+    && rm -rf /var/lib/apt/lists/*
+
 # ── tmux: build from source ──────────────────────────────────────────
 # Debian's packaged tmux lags the releases we need for the custom mouse
 # click targets in deploy/.tmux.conf (`bind -T root MouseDown1Status {...}`
@@ -106,7 +117,8 @@ COPY pyproject.toml uv.lock ./
 COPY --from=builder /build/target/wheels/*.whl /tmp/
 
 # External binaries last — they don't depend on our layers, so placing
-# them here avoids invalidating the layers above on a uv release.
+# them here avoids invalidating the layers above on a caddy/uv release.
+COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
 COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
 
 
@@ -117,7 +129,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
 # ── Deps (CUDA) ──────────────────────────────────────────────────────
 FROM deps-common AS deps
 RUN uv venv && \
-    uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
+    uv sync --extra cu128 --extra dashboard --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl ${UV_CACHE_DIR}
 
 # ── Runtime (CUDA) ───────────────────────────────────────────────────
@@ -133,6 +145,7 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
     PATH="/opt/pawn/.venv/bin:${PATH}"
 
 RUN chmod +x deploy/entrypoint.sh
+EXPOSE 8888
 ENTRYPOINT ["tini", "--"]
 CMD ["/opt/pawn/deploy/entrypoint.sh"]
 
@@ -146,7 +159,7 @@ CMD ["/opt/pawn/deploy/entrypoint.sh"]
 # ── Deps (ROCm) ──────────────────────────────────────────────────────
 FROM deps-common AS deps-rocm
 RUN uv venv && \
-    uv sync --extra rocm --no-dev --frozen --no-install-workspace && \
+    uv sync --extra rocm --extra dashboard --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl ${UV_CACHE_DIR}
 
 # ── Runtime (ROCm) ───────────────────────────────────────────────────
@@ -162,6 +175,7 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
     PATH="/opt/pawn/.venv/bin:${PATH}"
 
 RUN chmod +x deploy/entrypoint.sh
+EXPOSE 8888
 ENTRYPOINT ["tini", "--"]
 CMD ["/opt/pawn/deploy/entrypoint.sh"]
 
@@ -268,6 +282,7 @@ COPY --chmod=755 deploy/claude-dev.sh /usr/local/bin/claude-dev
 COPY --chmod=755 deploy/pod-gpu-stats.sh /usr/local/bin/pod-gpu-stats
 
 # External binaries last (same rationale as deps-common)
+COPY --from=caddy /usr/local/bin/caddy /usr/local/bin/caddy
 COPY --from=tmux-build /usr/local/bin/tmux /usr/local/bin/tmux
 COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
 
@@ -293,7 +308,7 @@ COPY --chown=pawn:pawn . .
 
 # Build the engine so uv run doesn't trigger a rebuild on first use
 RUN PATH="/home/pawn/.cargo/bin:${PATH}" \
-    uv sync --extra cu128 --frozen
+    uv sync --extra cu128 --extra dashboard --frozen
 
 ARG GIT_HASH=""
 ARG GIT_TAG=""
@@ -304,6 +319,7 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
 
 USER root
 RUN chmod +x /opt/pawn/deploy/entrypoint-dev.sh /opt/pawn/deploy/entrypoint.sh
+EXPOSE 8888
 ENTRYPOINT ["tini", "--"]
 CMD ["/opt/pawn/deploy/entrypoint-dev.sh"]
 
@@ -317,7 +333,7 @@ COPY --chown=pawn:pawn . .
 
 # Build the engine so uv run doesn't trigger a rebuild on first use
 RUN PATH="/home/pawn/.cargo/bin:${PATH}" \
-    uv sync --extra rocm --frozen
+    uv sync --extra rocm --extra dashboard --frozen
 
 ARG GIT_HASH=""
 ARG GIT_TAG=""
@@ -328,5 +344,6 @@ ENV PAWN_GIT_HASH=${GIT_HASH} \
 
 USER root
 RUN chmod +x /opt/pawn/deploy/entrypoint-dev.sh /opt/pawn/deploy/entrypoint.sh
+EXPOSE 8888
 ENTRYPOINT ["tini", "--"]
 CMD ["/opt/pawn/deploy/entrypoint-dev.sh"]
