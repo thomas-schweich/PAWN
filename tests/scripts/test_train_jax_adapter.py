@@ -362,6 +362,33 @@ def test_rosa_warmup_frac_too_large_rejected(tmp_path: Path) -> None:
     )
 
 
+def test_rejects_n_unfreeze_exceeding_n_layers_upfront(tmp_path: Path) -> None:
+    """``--n-unfreeze > variant.n_layers`` is rejected upfront, before
+    corpus generation and run-dir creation. Pre-fix (Codex round-3 P2),
+    this fired only inside ``init_unfreeze_model`` after the corpus
+    had been generated and the run dir was written.
+
+    TINY_VARIANTS["base"].n_layers is 3, so --n-unfreeze 999 is
+    invalid and must fail fast.
+    """
+    with pytest.raises(SystemExit, match="n-unfreeze=999"):
+        _run(
+            [
+                "--strategy", "unfreeze",
+                "--supernet", "tiny", "--variant", "base",
+                "--n-unfreeze", "999",
+                "--total-steps", "10", "--k", "5",
+                "--batch-size", "2", "--seq-len", "16",
+                "--warmup-steps", "1", "--val-frac", "0.1",
+            ],
+            tmp_path,
+        )
+    leaked = list(tmp_path.glob("jax_adapter_run_*"))
+    assert not leaked, (
+        f"upfront --n-unfreeze validation leaked run dirs: {leaked}"
+    )
+
+
 def test_rejects_bottleneck_dim_zero(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="bottleneck-dim"):
         _run(

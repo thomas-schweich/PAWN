@@ -312,6 +312,12 @@ def _strategy_config_dict(args: argparse.Namespace) -> dict[str, Any]:
             "rank": args.rank,
             "targets": list(args.rosa_targets),
             "alpha": args.lora_alpha,
+            # RoSA-schedule hyperparameters — without these the
+            # saved config can't be used to re-run the same training
+            # behavior (single-phase dense vs three-phase sparse,
+            # top-k density).
+            "warmup_frac": args.rosa_warmup_frac,
+            "top_k_frac": args.rosa_top_k_frac,
         }
     if s == "specialized_clm":
         return {
@@ -323,22 +329,41 @@ def _strategy_config_dict(args: argparse.Namespace) -> dict[str, Any]:
     raise ValueError(f"unknown strategy {s!r}")  # pragma: no cover — argparse guards
 
 
-def _validate_strategy_args(args: argparse.Namespace) -> None:
-    """Per-strategy argument sanity checks."""
+def _validate_strategy_args(
+    args: argparse.Namespace, variant_cfg: ModelConfig | None,
+) -> None:
+    """Per-strategy argument sanity checks. ``variant_cfg`` is the
+    sliced backbone config for non-specialized_clm strategies, or
+    ``None`` for specialized_clm — needed for variant-aware checks
+    like ``--n-unfreeze <= n_layers``."""
     if args.strategy in ("lora", "hybrid", "rosa") and args.rank <= 0:
         raise SystemExit(f"--rank={args.rank} must be positive for {args.strategy}")
-    if args.strategy == "bottleneck" and args.bottleneck_dim <= 0:
-        raise SystemExit(
-            f"--bottleneck-dim={args.bottleneck_dim} must be positive"
-        )
+    if args.strategy == "bottleneck":
+        if args.bottleneck_dim <= 0:
+            raise SystemExit(
+                f"--bottleneck-dim={args.bottleneck_dim} must be positive"
+            )
+        if args.bottleneck_n_hidden < 0:
+            raise SystemExit(
+                f"--bottleneck-n-hidden={args.bottleneck_n_hidden} must be >= 0"
+            )
     if args.strategy == "sparse" and not 0.0 < args.sparse_density <= 1.0:
         raise SystemExit(
             f"--sparse-density={args.sparse_density} must be in (0, 1]"
         )
-    if args.strategy == "unfreeze" and args.n_unfreeze < 0:
-        raise SystemExit(
-            f"--n-unfreeze={args.n_unfreeze} must be >= 0"
-        )
+    if args.strategy == "unfreeze":
+        if args.n_unfreeze < 0:
+            raise SystemExit(
+                f"--n-unfreeze={args.n_unfreeze} must be >= 0"
+            )
+        # Variant-aware check: n_unfreeze can't exceed the chosen
+        # backbone's depth. Fired upfront so the user doesn't burn
+        # corpus generation only to crash inside ``init_unfreeze_model``.
+        if variant_cfg is not None and args.n_unfreeze > variant_cfg.n_layers:
+            raise SystemExit(
+                f"--n-unfreeze={args.n_unfreeze} exceeds the chosen "
+                f"variant's n_layers={variant_cfg.n_layers}"
+            )
     if args.strategy == "rosa":
         if not 0.0 <= args.rosa_warmup_frac < 1.0:
             raise SystemExit(
@@ -561,7 +586,26 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             f"--val-frac={args.val_frac} must be in (0, 1)"
         )
-    _validate_strategy_args(args)
+
+    # Variant resolution upfront so strategy validation (e.g.
+    # --n-unfreeze ≤ variant.n_layers) can see the variant config
+    # before any filesystem side-effect (Codex round-3 P2).
+    supernet_cfg, variants = _resolve_supernet(args.supernet)
+    if args.strategy != "specialized_clm":
+        if args.variant not in variants:
+            raise SystemExit(
+                f"--variant={args.variant!r} not in {list(variants.keys())}"
+            )
+        variant_cfg: ModelConfig | None = variants[args.variant]
+    else:
+        variant_cfg = None
+    if args.seq_len > supernet_cfg.max_seq_len:
+        raise SystemExit(
+            f"--seq-len={args.seq_len} exceeds supernet.max_seq_len="
+            f"{supernet_cfg.max_seq_len}"
+        )
+
+    _validate_strategy_args(args, variant_cfg)
 
     # RoSA: pre-compute the warmup-chunk split here (before any
     # corpus generation or filesystem write) so a degenerate
@@ -587,26 +631,6 @@ def main(argv: list[str] | None = None) -> int:
 
     corpus_seed = args.seed if args.corpus_seed is None else args.corpus_seed
     model_seed = args.seed if args.model_seed is None else args.model_seed
-
-    supernet_cfg, variants = _resolve_supernet(args.supernet)
-    # specialized_clm doesn't use the supernet/variant scaffold — it
-    # trains a from-scratch model at its own --specialized-* shape.
-    # For every other strategy --variant gates into the slicing
-    # machinery as before.
-    if args.strategy != "specialized_clm":
-        if args.variant not in variants:
-            raise SystemExit(
-                f"--variant={args.variant!r} not in {list(variants.keys())}"
-            )
-        variant_cfg: ModelConfig | None = variants[args.variant]
-    else:
-        variant_cfg = None
-
-    if args.seq_len > supernet_cfg.max_seq_len:
-        raise SystemExit(
-            f"--seq-len={args.seq_len} exceeds supernet.max_seq_len="
-            f"{supernet_cfg.max_seq_len}"
-        )
 
     try:
         sched = make_lr_schedule(
@@ -703,20 +727,32 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # Init: slice → wrap with the chosen adapter → partition for
-    # adapter training. The backbone is unused for specialized_clm
-    # (which builds a from-scratch model); the builder discards it.
+    # adapter training. specialized_clm doesn't need a backbone at
+    # all (it builds a from-scratch model from its `--specialized-*`
+    # args), so we dispatch it without ever calling ``init_model`` on
+    # the supernet — at SUPERNET scale this saves ~200 MB of needless
+    # allocation that init_model would otherwise burn just to be
+    # discarded by ``_build_specialized_clm``. Codex round-3 P2.
     key = jax.random.PRNGKey(model_seed)
-    supernet = init_model(supernet_cfg, key)
-    if variant_cfg is not None:
-        backbone = sliced(supernet, variant_cfg)
+    builder_key = jax.random.PRNGKey(model_seed + 1)
+    if args.strategy == "specialized_clm":
+        cfg = SpecializedCLMConfig(
+            d_model=args.specialized_d_model,
+            n_layers=args.specialized_n_layers,
+            n_heads=args.specialized_n_heads,
+            d_ff=args.specialized_d_ff,
+        )
+        model: eqx.Module = init_specialized_clm(cfg, builder_key)
+        filter_fn: Callable[..., eqx.Module] = specialized_clm_adapter_filter
+        gradient_mask: eqx.Module | None = None
     else:
-        # Pass the supernet through; specialized_clm's builder
-        # ignores it.
-        backbone = supernet
-    build_fn = _BUILDERS[args.strategy]
-    model, filter_fn, gradient_mask = build_fn(
-        backbone, args, jax.random.PRNGKey(model_seed + 1),
-    )
+        assert variant_cfg is not None  # guarded above; specialized_clm is the only None case
+        supernet = init_model(supernet_cfg, key)
+        backbone = sliced(supernet, variant_cfg)
+        build_fn = _BUILDERS[args.strategy]
+        model, filter_fn, gradient_mask = build_fn(
+            backbone, args, builder_key,
+        )
     # RoSA Phase-1 override: when the three-phase schedule is active
     # (``--rosa-warmup-frac > 0``), the warmup runs with the LoRA-only
     # filter; only A, B accumulate gradients. The joint filter the
