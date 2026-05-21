@@ -28,10 +28,12 @@ Execution order:
 
 The eval split is the last ``--val-frac`` of the generated corpus.
 
-RoSA dispatch ships the parameterisation + a single-phase joint
-training schedule for verification-scale runs; the legacy three-
-phase schedule (LoRA warmup → gradient-mask gen → joint training)
-lands in a follow-up chunk — see ``docs/jax-migration.md`` §12.
+RoSA dispatch ships the full three-phase training schedule (LoRA
+warmup → gradient-magnitude mask gen via ``compute_phase2_mask`` →
+joint training under the fixed mask) controlled by
+``--rosa-warmup-frac`` and ``--rosa-top-k-frac``. Setting
+``--rosa-warmup-frac 0`` falls back to single-phase joint training
+with a pre-primed dense mask.
 """
 
 from __future__ import annotations
