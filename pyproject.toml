@@ -51,6 +51,16 @@ dashboard = [
     "pandas>=2.0.0",
     "starlette<1.0.0",  # solara incompatible with starlette 1.0
 ]
+# Lab MCP server (``pawn.lab``) — FastMCP daemon that spawns
+# GPU-isolated training subprocesses, polls their ``metrics.jsonl``,
+# and drives Optuna sweeps. Optional: training + eval surface
+# doesn't depend on it. Launched via ``python -m pawn.lab`` (stdio
+# MCP) or used programmatically via ``pawn.lab.TrialRunner``.
+lab = [
+    "fastmcp>=2.0.0",
+    "optuna>=4.0.0",
+    "optuna-dashboard>=0.16.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -103,7 +113,7 @@ include = ["pawn"]
 # about (reactive `solara.use_state`, `px.line` chained kwargs, etc.).
 # The module is an optional ``dashboard`` extra and never on the
 # training / eval critical path; exclude from the default lint pass.
-exclude = ["pawn/dashboard"]
+exclude = ["pawn/dashboard", "pawn/lab"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
