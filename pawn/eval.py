@@ -53,8 +53,14 @@ def evaluate_accuracy(
 
     Argmax(logits) restricted to the legal action vocab ``[0,
     NUM_ACTIONS)`` is compared against the next-token target at every
-    ``loss_mask=True`` position. Per-phase breakdown uses fixed ply
-    boundaries (opening < 20, midgame 20-59, endgame ≥ 60).
+    position where ``loss_mask=True`` AND ``target < NUM_ACTIONS``.
+    The terminal ``move_{N-1} → PAD`` slot is supervised under the CLM
+    packing (the "game over" signal feeds training loss) but excluded
+    from move-accuracy scoring — argmax can't reach the PAD token, so
+    a bare ``loss_mask`` would count one guaranteed-wrong row per
+    game and bias overall accuracy down by ~1/avg_game_length.
+    Per-phase breakdown uses fixed ply boundaries (opening < 20,
+    midgame 20-59, endgame ≥ 60).
 
     Args:
         model: forward callable taking ``(tokens, attn_mask) -> [B,

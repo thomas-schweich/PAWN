@@ -277,21 +277,23 @@ def _materialise(
     targets = np.full_like(tokens, PAD_TOKEN, dtype=np.int32)
     targets[:, :-1] = tokens[:, 1:]
 
-    # loss_mask: positions 0..game_length-1 (the last supervised
-    # transition is from move N-1 → PAD at position N). For
-    # prepend_outcome=True the outcome at position 0 isn't a
-    # supervised transition; mask it off.
+    # loss_mask spans every supervised next-token transition.
     pos = np.arange(seq_len, dtype=np.int32)[None, :]
     if prepend_outcome:
-        # Game holds game_lengths[i] moves at positions 1..game_lengths[i].
-        # Supervised positions are [1, game_lengths[i]] inclusive (predicting
-        # m_t from positions 1..N gives transitions m_1→m_2 etc., plus the
-        # terminal m_N→PAD).
-        gl = game_lengths
-        loss_mask = (pos >= 1) & (pos <= gl[:, None])
+        # Layout: [outcome, m1, m2, ..., mN, PAD, PAD, ...]. Supervised
+        # positions are 0..N inclusive: position 0 predicts m1 *from*
+        # the outcome token (outcome conditioning's whole point —
+        # tokens[0] is the predict-from input, targets[0] = m1), and
+        # position N predicts the terminal PAD from mN. An earlier
+        # cut at pos>=1 was wrong: it dropped the outcome→m1 step
+        # silently, biasing first-move accuracy / loss for every
+        # outcome-prefixed eval (Codex round 4 P2).
+        loss_mask = pos <= game_lengths[:, None]
     else:
-        gl = game_lengths
-        loss_mask = pos < gl[:, None]
+        # Layout: [m1, m2, ..., mN, PAD, ...]. Supervised positions
+        # are 0..N-1 inclusive — N rows total — predicting m2..mN
+        # then the terminal PAD.
+        loss_mask = pos < game_lengths[:, None]
 
     # Coerce metadata into per-game numpy arrays.
     white_elo = np.asarray(parsed.get("white_elo", [0] * n_games), dtype=np.int32)

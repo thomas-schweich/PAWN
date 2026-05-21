@@ -97,3 +97,63 @@ def test_evaluate_accuracy_zero_corpus_edge() -> None:
     result = evaluate_accuracy(model, corpus, batch_size=1)
     assert result.n_supervised > 0
     assert 0.0 <= result.overall <= 1.0
+
+
+def test_evaluate_accuracy_excludes_terminal_pad_positions() -> None:
+    """The eval mask must drop the terminal ``move_{N-1} → PAD`` step
+    from move-accuracy scoring. ``argmax`` is restricted to
+    ``[0, NUM_ACTIONS)``, so on the terminal slot ``pred`` is always
+    in the action band but ``target == PAD_TOKEN`` — every non-empty
+    game would otherwise contribute one guaranteed-wrong row,
+    biasing reported accuracy downward by ~1/avg_game_length.
+
+    Concrete check: construct a synthetic corpus with known
+    ``game_lengths``. CLM packing's ``loss_mask`` spans positions
+    ``0..game_length-1`` inclusive (``game_length`` rows per game),
+    of which the last has ``target == PAD``. The new eval mask
+    therefore counts ``game_length - 1`` rows per game. A regression
+    that removed the ``targets < NUM_ACTIONS`` AND would count
+    ``game_length`` rows per game instead.
+    """
+    from pawn.config import PAD_TOKEN
+    from pawn.corpus import Corpus
+
+    seq_len = 8
+    # Two short games: 3 and 4 moves. tokens carry the moves
+    # left-aligned and PAD-pad the tail; targets = tokens shifted left
+    # with PAD at the terminal slot. loss_mask covers positions
+    # 0..game_length-1 inclusive (the standard CLM packing).
+    game_lengths = np.array([3, 4], dtype=np.int32)
+    tokens = np.full((2, seq_len), PAD_TOKEN, dtype=np.int32)
+    tokens[0, :3] = [10, 11, 12]
+    tokens[1, :4] = [20, 21, 22, 23]
+    attn_mask = np.zeros((2, seq_len), dtype=np.bool_)
+    attn_mask[0, :3] = True
+    attn_mask[1, :4] = True
+    targets = np.full((2, seq_len), PAD_TOKEN, dtype=np.int32)
+    targets[:, :-1] = tokens[:, 1:]
+    loss_mask = np.zeros((2, seq_len), dtype=np.bool_)
+    loss_mask[0, :3] = True   # positions 0,1,2 — last predicts PAD
+    loss_mask[1, :4] = True   # positions 0,1,2,3 — last predicts PAD
+    corpus = Corpus(
+        tokens=tokens,
+        attn_mask=attn_mask,
+        targets=targets,
+        loss_mask=loss_mask,
+        outcome_offset=np.zeros(2, dtype=np.uint8),
+    )
+
+    model = init_model(TINY_SUPERNET, jax.random.PRNGKey(0))
+    result = evaluate_accuracy(model, corpus, batch_size=2)
+
+    # Expected: sum(game_length - 1) — drop one terminal slot per game.
+    # Concretely 2 + 3 = 5. A regression yields sum(game_length) = 7.
+    expected_supervised = int((game_lengths - 1).sum())
+    biased_supervised = int(game_lengths.sum())
+    assert result.n_supervised == expected_supervised, (
+        f"n_supervised={result.n_supervised} != "
+        f"sum(game_lengths - 1)={expected_supervised}. A regression "
+        f"that removed the ``targets < NUM_ACTIONS`` AND on the eval "
+        f"mask would count the terminal PAD slot and yield "
+        f"{biased_supervised} instead."
+    )

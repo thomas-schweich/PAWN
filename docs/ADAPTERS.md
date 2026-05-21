@@ -1,8 +1,24 @@
 # Adapter Methods
 
+> **⚠️ Stale legacy document.** This file describes the pre-Phase-4
+> PyTorch implementation (`scripts/train.py --run-type adapter`,
+> `PAWNCLM` backbone, `--rosa-mode retro-*`, `LegalMaskBuilder`,
+> DataLoader patterns). The JAX migration removed all of those.
+> For the current adapter surface, see:
+> - `CLAUDE.md` § *Adapter Training (`scripts/train_jax_adapter.py`)*
+>   — supported strategies, flags, defaults.
+> - `scripts/train_jax_adapter.py --help` — CLI reference.
+> - `pawn/adapters/*.py` — implementation.
+>
+> The high-level method descriptions below (Houlsby Bottleneck, LoRA,
+> FiLM, RoSA, etc.) remain accurate as conceptual references, but every
+> flag / driver / parameter-default claim should be cross-checked
+> against the JAX code before use. A full rewrite is out of scope for
+> the migration PR.
+
 PAWN is designed as a testbed for parameter-efficient fine-tuning. The frozen ~36M-parameter backbone provides learned chess representations from pretraining on random games; adapters specialize those representations for downstream tasks like predicting human moves at a given Elo level.
 
-All adapter implementations live in `pawn/adapters/`. Each wraps a frozen `PAWNCLM` backbone and exposes a uniform interface: `forward_hidden()`, `project_head()`, `forward()`, and `forward_generate()` (with KV-cache).
+All adapter implementations live in `pawn/adapters/`. Under the JAX migration each wraps a frozen `PAWNModel` backbone via `eqx.partition` and is dispatched by `scripts/train_jax_adapter.py --strategy <name>`.
 
 ## Bottleneck ([Houlsby et al., 2019](https://arxiv.org/abs/1902.00751))
 
