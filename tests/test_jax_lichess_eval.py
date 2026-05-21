@@ -285,15 +285,22 @@ def _make_lichess_pgn(games: list[dict]) -> str:
         parts.append('[Opening "X"]\n')
         parts.append('[TimeControl "120+1"]\n')
         parts.append('[Termination "Normal"]\n\n')
-        # Each move carries a clock annotation in a comment.
+        # Each move carries a clock annotation in a comment. Format as
+        # full H:MM:SS so the helper survives longer fixtures and
+        # longer starting clocks — the earlier ``0:0{m}:...`` form
+        # silently produced malformed strings (``0:010:00`` for ≥ 10
+        # min, ``0:0-1:59`` for clocks that decremented past zero).
         moves = g["moves"]
-        clock_s = 120
+        clock_s = max(120, len(moves) + 10)
         line = []
         for ply, mv in enumerate(moves):
+            h, rem = divmod(clock_s, 3600)
+            m, s = divmod(rem, 60)
+            clk = f"{h}:{m:02d}:{s:02d}"
             if ply % 2 == 0:
-                line.append(f"{ply // 2 + 1}. {mv} {{ [%clk 0:0{clock_s // 60}:{clock_s % 60:02d}] }}")
+                line.append(f"{ply // 2 + 1}. {mv} {{ [%clk {clk}] }}")
             else:
-                line.append(f"{ply // 2 + 1}... {mv} {{ [%clk 0:0{clock_s // 60}:{clock_s % 60:02d}] }}")
+                line.append(f"{ply // 2 + 1}... {mv} {{ [%clk {clk}] }}")
             clock_s -= 1
         parts.append(" ".join(line) + f" {g['result']}\n\n")
     return "".join(parts)
