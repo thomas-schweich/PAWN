@@ -15,7 +15,10 @@ dependencies = [
     # for every training parameter (``docs/jax-migration.md`` §8.1).
     "pydantic>=2.5.0",
     # JAX training + eval (``docs/jax-migration.md``). CPU jaxlib by
-    # default; the GPU jaxlib lives in the rocm / cu128 extras.
+    # default. GPU jaxlib is installed manually after ``uv sync``
+    # (the ROCm / CUDA wheel indexes do not co-resolve cleanly with
+    # the PyTorch extras under uv yet — see the comment above the
+    # ``rocm`` / ``cu128`` extras below for the manual step).
     "jax>=0.6.0",
     "equinox>=0.13.0",
     "optax>=0.2.0",
@@ -24,8 +27,13 @@ dependencies = [
     "pyarrow>=23.0.1",
     # Optuna powers ``pawn.sweep`` (standalone Optuna driver — see
     # ``docs/jax-migration.md`` §13 S10). v1 carried it in base for
-    # the same reason; keep it here so ``uv sync`` (no extras)
-    # produces a working sweep driver.
+    # the same reason; once S3-S10 replace the v1 surface, a bare
+    # ``uv sync`` will produce a working sweep driver (no torch
+    # transitively pulled — ``pawn.sweep`` only needs optuna +
+    # subprocess + json, and the new ``pawn/__init__.py`` won't
+    # eager-import the JAX model module). During the migration the
+    # v1 ``pawn/__init__.py`` still imports the v1 PyTorch model so
+    # bare ``uv sync`` is broken until S3 lands.
     "optuna>=4.0.0",
     # Dev
     "pyright>=1.1.0",

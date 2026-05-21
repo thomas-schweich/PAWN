@@ -50,17 +50,20 @@ This is a uv workspace. The root project is the `pawn` Python package; `engine/`
 # Build the Rust chess engine (required before anything else)
 cd engine && uv run --with maturin maturin develop --release && cd ..
 
-# Install Python deps. The base install ships CPU jaxlib; the rocm /
-# cu128 extras add the GPU jaxlib AND the torch dep used by the thin
-# loader + legacy-converter parity tests. The torch-loader extra adds
+# Install Python deps. The base install ships CPU jaxlib. The
+# rocm / cu128 extras add the torch dep used by the thin loader +
+# legacy-converter parity tests, but they do NOT pull GPU jaxlib
+# (see the comment in pyproject.toml above the extras — GPU jaxlib
+# is installed manually after sync). The torch-loader extra adds
 # only torch (useful if you want the thin loader without GPU jaxlib).
-uv sync --extra rocm          # AMD (ROCm 7.1)
-uv sync --extra cu128         # NVIDIA (CUDA 12.8)
+uv sync --extra rocm          # AMD (torch + triton-rocm)
+uv sync --extra cu128         # NVIDIA (torch + cu128 index)
 uv sync --extra torch-loader  # CPU jax + torch (thin loader only)
 
 # Optional extras (compose as needed):
 #   --extra dashboard   solara dashboard
-#   --extra lab         pawn-lab MCP server (fastmcp + optuna)
+#   --extra lab         pawn-lab MCP server (fastmcp + optuna-dashboard;
+#                       optuna itself is base, shared with pawn.sweep)
 #   --extra wandb       W&B integration
 #   --extra data-tools  polars / jinja2 / zstandard / matplotlib / seaborn
 #                       (for the legacy eval_suite pipeline and the data scripts)
