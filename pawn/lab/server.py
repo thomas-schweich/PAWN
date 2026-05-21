@@ -44,7 +44,7 @@ async def lab_status(ctx: Context) -> dict[str, Any]:
 
 @mcp.tool
 async def lab_launch(config: dict[str, Any], ctx: Context, tags: list[str] | None = None) -> dict[str, Any]:
-    """Launch a trial from a RunConfig dict. Use lab_schema to discover all fields. The config must include run_type ('pretrain', 'adapter', or 'cotrain'). Optionally pass tags for grouping (e.g. ["phase1", "mate-boost"])."""
+    """Launch a trial. The config must include ``run_type`` ('pretrain' or 'adapter' — 'cotrain' was removed in v2.0.0; the supernet's multi-variant joint loss subsumes it). For pretrain, set ``supernet`` ('tiny'|'supernet'); for adapter, set ``strategy`` (one of lora|film|unfreeze|bottleneck|hybrid|sparse|rosa|specialized_clm) plus ``variant`` ('small'|'base'|'large'). Every other field maps 1:1 to the corresponding ``scripts/train_jax{,_adapter}.py`` argparse flag (underscores in keys → dashes on the CLI). Use ``lab_schema`` to discover the full allowed flag list. Optionally pass tags for grouping (e.g. ["phase1", "mate-boost"])."""
     try:
         tid = await _runner(ctx).launch(config, tags=tags)
         return _runner(ctx).trials[tid].to_dict()
@@ -105,13 +105,33 @@ async def lab_set_cost(cost_per_hour: float, ctx: Context) -> dict[str, Any]:
 
 @mcp.tool
 async def lab_schema(ctx: Context) -> dict[str, Any]:
-    """Return the JSON Schema for RunConfig (PretrainConfig, AdapterConfig, CotrainConfig). Use this to discover all available parameters before calling lab_launch."""
-    from pawn.run_config import AdapterConfig, CotrainConfig, PretrainConfig
+    """JSON Schema for the allowed trial-config keys per ``run_type``.
+
+    Auto-derived from ``pawn.run_config`` (the pydantic source of truth
+    — see ``docs/jax-migration.md`` §8.1). v1 canonical field names
+    apply per §8.3: ``lora_rank`` (not ``rank``), ``density`` (not
+    ``sparse_density``), ``use_output_film`` (not ``film_output``),
+    ``no_adapt_attn`` / ``no_adapt_ffn`` (not the ``bottleneck_``
+    prefix), and bare ``d_model`` / ``n_layers`` / ``n_heads`` /
+    ``d_ff`` inside the ``specialized_clm`` nested config (no
+    ``specialized_`` prefix). ``cotrain`` was removed in v2.0.0; the
+    supernet's multi-variant joint loss replaces it.
+
+    Pass these as keys in ``lab_launch(config=...)``; the runner
+    validates the config through pydantic (``extra="forbid"``) and
+    translates the validated fields to ``--flag value`` argv on the
+    subprocess command line.
+    """
+    from pawn.run_config import AdapterConfig, PretrainConfig
 
     return {
         "pretrain": PretrainConfig.model_json_schema(),
         "adapter": AdapterConfig.model_json_schema(),
-        "cotrain": CotrainConfig.model_json_schema(),
+        "cotrain": {
+            "_removed": "cotrain trial type was removed in v2.0.0. The "
+                        "supernet's multi-variant joint loss replaces it — "
+                        "use run_type='pretrain' against the supernet."
+        },
     }
 
 

@@ -1,18 +1,22 @@
-"""Metrics-only W&B integration for PAWN training runs.
+"""Metrics-only W&B integration for PAWN v2 training runs.
 
-Every training entry point (pretrain, cotrain, adapter) funnels through
-:func:`init_wandb` / :func:`log_metrics` / :func:`finish_wandb` so run
-naming, reproducibility metadata, and lifecycle are consistent.
+Both training entry points (``scripts/train_jax.py``,
+``scripts/train_jax_adapter.py``) call :func:`init_wandb` once at run
+start, :func:`log_metrics` per chunk, and :func:`finish_wandb` at
+exit. The interface mirrors the v1 ``pawn.wandb_utils`` so any
+downstream consumer that was previously reading W&B runs sees the
+same metric shape.
 
 Design notes:
 
-- **Metrics-only.** We forward every ``logger.log_train`` / ``logger.log_val``
-  to ``wandb.log``. No artifact uploads, no checkpoint lineage.
-- **Option A resume.** Each process invocation creates a fresh W&B run.
-  Resumes join sibling runs via ``group=<slug>`` and ``tags=["git:<hash>"]``.
-  Nothing about W&B state is persisted to checkpoints.
-- **No silent swallow.** If the user asks for W&B and ``wandb.init`` fails,
-  the training job fails loudly.
+- **Metrics-only.** Forwards each metrics dict to ``wandb.log``. No
+  artifact uploads, no checkpoint lineage.
+- **No silent swallow.** If the user opts in to W&B and ``wandb.init``
+  fails, the training job fails loudly.
+- **No torch / no MetricsLogger dependency.** v1 pulled in torch for
+  GPU info and ``MetricsLogger`` for slug/run_dir/git plumbing — both
+  removed in Phase 4. v2 reads GPU info from JAX and accepts the
+  run-dir path + slug directly from the caller.
 
 The ``PAWN_WANDB_MODE`` env var (``online`` / ``offline`` / ``disabled``)
 is honored at init time; tests and CI default to ``disabled``.
@@ -23,45 +27,98 @@ from __future__ import annotations
 import os
 import platform
 import socket
+import subprocess
 import sys
+from pathlib import Path
 from typing import Any, Literal, Mapping
 
-import torch
 import wandb
 from wandb import Run
 
-from pawn.logging import MetricsLogger, get_git_info
-
-__all__ = ["init_wandb", "log_metrics", "finish_wandb"]
+__all__ = ["init_wandb", "log_metrics", "finish_wandb", "get_git_info"]
 
 Mode = Literal["online", "offline", "disabled"]
 
 
+_git_info_cache: dict[str, str | None] | None = None
+
+
+def get_git_info() -> dict[str, str | None]:
+    """Return ``{"git_hash": ..., "git_tag": ...}`` for the working tree.
+
+    Honors ``PAWN_GIT_HASH`` / ``PAWN_GIT_TAG`` env vars (set on the
+    Docker images where the container is built outside a git
+    checkout). Cached after the first call.
+    """
+    global _git_info_cache
+    if _git_info_cache is not None:
+        return _git_info_cache
+
+    git_hash = os.environ.get("PAWN_GIT_HASH")
+    git_tag = os.environ.get("PAWN_GIT_TAG")
+    if not git_hash:
+        try:
+            git_hash = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                stderr=subprocess.DEVNULL, text=True,
+            ).strip() or None
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            git_hash = None
+    if not git_tag:
+        try:
+            git_tag = subprocess.check_output(
+                ["git", "tag", "--points-at", "HEAD"],
+                stderr=subprocess.DEVNULL, text=True,
+            ).strip() or None
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            git_tag = None
+    _git_info_cache = {"git_hash": git_hash, "git_tag": git_tag}
+    return _git_info_cache
+
+
 def _gpu_info() -> dict[str, Any]:
-    if not torch.cuda.is_available():
-        return {"gpu_name": None, "gpu_count": 0}
-    idx = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(idx)
+    """Probe JAX for accelerator details. Returns ``{gpu_name, gpu_count, ...}``.
+
+    Falls back to CPU-only metadata on a CPU-jaxlib install (the
+    base v2 install). ``platform``-name is used as a stable backend
+    identifier (``"cpu"`` / ``"cuda"`` / ``"rocm"``).
+    """
+    try:
+        import jax  # local import — keep wandb_utils importable on
+                    # the (rare) install without jax in scope.
+    except ImportError:
+        return {"gpu_name": None, "gpu_count": 0, "jax_backend": None}
+
+    try:
+        devices = jax.devices()
+    except RuntimeError:
+        return {"gpu_name": None, "gpu_count": 0, "jax_backend": None}
+
+    if not devices:
+        return {"gpu_name": None, "gpu_count": 0, "jax_backend": None}
+
+    backend = devices[0].platform  # "cpu" / "gpu" (cuda or rocm)
+    if backend == "cpu":
+        return {"gpu_name": None, "gpu_count": 0, "jax_backend": "cpu"}
+    # JAX's per-device `device_kind` is the human-readable accelerator
+    # name (e.g. ``"NVIDIA H100 80GB HBM3"`` or ``"AMD Instinct MI300X"``).
+    name = getattr(devices[0], "device_kind", None) or str(devices[0])
     return {
-        "gpu_name": props.name,
-        "gpu_count": torch.cuda.device_count(),
-        "gpu_total_memory_gb": round(props.total_memory / (1024**3), 2),
-        "cuda_version": torch.version.cuda,
-        "hip_version": getattr(torch.version, "hip", None),
+        "gpu_name": name,
+        "gpu_count": len(devices),
+        "jax_backend": backend,
     }
 
 
-def _reproducibility_config(logger: MetricsLogger) -> dict[str, Any]:
-    git = get_git_info()
+def _reproducibility_config(*, slug: str, run_dir: Path) -> dict[str, Any]:
     cfg: dict[str, Any] = {
-        "slug": logger.slug,
-        "run_dir": str(logger.run_dir),
+        "slug": slug,
+        "run_dir": str(run_dir),
         "hostname": socket.gethostname(),
         "command_line": " ".join(sys.argv),
         "python_version": platform.python_version(),
-        "torch_version": torch.__version__,
     }
-    cfg.update(git)
+    cfg.update(get_git_info())
     cfg.update(_gpu_info())
     return cfg
 
@@ -70,31 +127,33 @@ def init_wandb(
     *,
     enabled: bool,
     project: str,
-    logger: MetricsLogger,
+    slug: str,
+    run_dir: Path,
     run_type: str,
     config: Mapping[str, Any],
     group: str | None = None,
     job_type: str | None = None,
     tags: list[str] | None = None,
 ) -> Run | None:
-    """Initialize a W&B run for a training invocation.
+    """Initialise a W&B run for a training invocation.
 
     Returns ``None`` when ``enabled`` is False, so callers can pass the
-    return value straight into :func:`log_metrics` and :func:`finish_wandb`.
+    return value straight into :func:`log_metrics` / :func:`finish_wandb`
+    without an extra branch.
 
-    The W&B run name matches ``logger.run_dir.name`` so the W&B UI and the
-    local run directory cross-reference trivially. ``wandb.config`` is
-    populated with the caller's ``config`` plus reproducibility metadata
-    (slug, git hash/tag, hostname, command line, python/torch versions,
-    GPU info).
+    The W&B run name matches ``run_dir.name`` so the local logs
+    directory and the W&B UI cross-reference trivially. ``wandb.config``
+    is populated with the caller's ``config`` dict plus reproducibility
+    metadata (slug, git hash/tag, hostname, command line, Python
+    version, JAX backend + GPU info).
     """
     if not enabled:
         return None
 
     mode: Mode | None = None
     env_mode = os.environ.get("PAWN_WANDB_MODE")
-    if env_mode == "online" or env_mode == "offline" or env_mode == "disabled":
-        mode = env_mode
+    if env_mode in ("online", "offline", "disabled"):
+        mode = env_mode  # type: ignore[assignment]
     elif env_mode is not None and env_mode != "":
         # Fail loud on a typo like "ONLINE" or "dryrun" — silently
         # ignoring it would be confusing during debugging.
@@ -105,7 +164,7 @@ def init_wandb(
             file=sys.stderr,
         )
 
-    repro = _reproducibility_config(logger)
+    repro = _reproducibility_config(slug=slug, run_dir=run_dir)
     full_config: dict[str, Any] = {**dict(config), **repro, "run_type": run_type}
 
     all_tags = list(tags) if tags else []
@@ -114,28 +173,23 @@ def init_wandb(
         all_tags.append(f"git:{git_hash[:8]}")
     all_tags.append(f"run_type:{run_type}")
 
-    # ``WANDB_PROJECT`` takes precedence over the caller's ``project``
-    # so users can redirect runs to a different project without touching
-    # ``TrainingConfig.wandb_project``. This mirrors wandb's own env-var
-    # fallback — we restore it here because we always pass ``project=``
-    # explicitly, which would otherwise disable the fallback.
+    # ``WANDB_PROJECT`` takes precedence over ``project`` so users can
+    # redirect runs without touching the CLI flag. Mirrors wandb's own
+    # env fallback (which we'd otherwise disable by always passing
+    # ``project=`` explicitly).
     effective_project = os.environ.get("WANDB_PROJECT") or project
 
     run = wandb.init(
         project=effective_project,
-        name=logger.run_dir.name,
+        name=run_dir.name,
         group=group,
         job_type=job_type,
         tags=all_tags,
         config=full_config,
-        dir=str(logger.run_dir),
+        dir=str(run_dir),
         mode=mode,
         reinit=True,
     )
-    # wandb.init's stub declares ``Run | None``, but in practice it either
-    # returns a Run (online/offline) or a RunDisabled that quacks the same
-    # (disabled mode) — never None. The narrowing check is defense in depth
-    # against a future stub/behavior change.
     if run is None:
         raise RuntimeError(
             "wandb.init() unexpectedly returned None; aborting to avoid "
