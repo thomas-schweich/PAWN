@@ -601,6 +601,7 @@ These changed v1 semantics on purpose. They are documented under
 |---|---|---|
 | `lora_targets: Literal["qkvo","qv","qkv"]` | `lora_targets: list[str]` | More flexible; arbitrary subsets of `{q,k,v,o}`. |
 | `sparse_targets: Literal[...]` | `sparse_targets: list[str]` | Same. |
+| (no equivalent in v1) | `rosa_targets: list[str]` | New in v2; RoSA wraps LoRA + a per-weight Phase-2 mask, so it inherits the same per-sublayer target selection knob LoRA / Sparse have. |
 | `rosa_warmup_steps: int` | `rosa_warmup_frac: float` | Scales with `--total-steps`. |
 | `rosa_mode: "rosa" \| "retro-sparse" \| "retro-bottleneck"` | only `"rosa"` | Retro-ablation modes weren't ported. |
 | `mask_samples`, `grad_alpha` | removed | RoSA mask-gen algorithm changed (v1 averaged grad magnitudes over `mask_samples` batches with `grad_alpha`-power weighting; v2 uses single forward+backward with all-True mask). |
