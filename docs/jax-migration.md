@@ -560,47 +560,58 @@ After Phase 4 squash-merged into `jax_migration`, a handful of
 trainer-side parity gaps remained — the framework swap was
 feature-complete on the **evaluation** side but the adapter trainer
 driver still only dispatched LoRA, and the generation path lacked a
-KV-cache variant. The follow-ups land as additional chunks on the
+KV-cache variant. The follow-ups landed as additional chunks on the
 integration branch under `/review-driven-development --resume
-docs/jax-migration.md`. Status is per-chunk:
+docs/jax-migration.md`. All four chunks are now landed:
 
 - **Deploy script log-dir flag (landed).** `deploy/pod.sh` and
-  `deploy/vast.sh` `cmd_launch` now pass `--logs-dir` rather than the
+  `deploy/vast.sh` `cmd_launch` pass `--logs-dir` rather than the
   legacy `--log-dir` (which matched the now-deleted PyTorch
-  `scripts/train.py`). CLAUDE.md's launch examples updated in lockstep
-  — they no longer mention `--logs-dir` because the wrapper injects it
-  silently; users **should not** pass `--logs-dir` in the command they
-  hand to `pod.sh launch <name> …` or `vast.sh launch <name> …` or
-  argparse will reject the duplicate.
-- **Adapter dispatch glue (pending).** `scripts/train_jax_adapter.py`
-  will gain a `--strategy {lora,film,unfreeze,bottleneck,hybrid,sparse,
-  rosa,specialized_clm}` flag plus per-strategy hyperparameter args.
-  The PyTree contract is the same across strategies —
-  `adapter_filter(model)` returns a Python-bool spec consumed by
-  `eqx.partition`; the `Unfreeze` strategy adds a companion per-layer
-  `unfreeze_gradient_mask` plugged into `optax.masked`. `RoSA` will
-  carry a three-phase host-driven training schedule (LoRA warmup →
-  gradient-magnitude mask → joint training); the phase transitions
-  re-jit naturally because the trainable subtree's bool spec changes
-  between phases.
-- **KV-cache generation (pending).** `pawn.generation.autoregressive_generate`
-  will gain a KV-cached variant alongside the O(N²) recompute path
-  the Phase-4 port currently ships. A bitwise-equivalence regression
-  test against the recompute path pins parity; the KV-cache path is
-  the default for long generations.
-- **Variable-prefix-length grouping (pending).** The `poisoned_prefix`
-  and `impossible_task` §6 generation tests currently inherit a legacy
-  port bug — variable-length prefixes within a batch align under a
-  batch-wide max, leaving PAD gaps in the attended context for rows
-  with shorter prefixes (the engine state is still correct, but the
-  model is conditioned on a PAD-padded context). The fix groups games
-  by prefix length and runs each group as its own generation batch.
+  `scripts/train.py`). CLAUDE.md's launch examples were updated in
+  lockstep — they no longer mention `--logs-dir` because the wrapper
+  injects it silently; users **should not** pass `--logs-dir` in the
+  command they hand to `pod.sh launch <name> …` or `vast.sh launch
+  <name> …` or argparse will reject the duplicate. Stale
+  `pawn.jax.*` / `pawn/jax/*` references in this doc and CLAUDE.md
+  were cleaned up in the same section.
+- **Variable-prefix-length grouping (landed).** `pawn.generation.autoregressive_generate`
+  groups input rows by their `prefix_lengths` value before dispatching
+  to `_generate_batch`, so each internal batch sees a uniform
+  `prefix_end`. The §6.4/5 generation tests no longer inherit the
+  legacy port's PAD-gap-in-attended-context bug. Caller-order row
+  alignment is preserved by an `np.argsort(all_orig_indices,
+  kind="stable")` unpermute after concatenation.
+- **KV-cache generation (landed).** `pawn.generation.autoregressive_generate`
+  defaults to a KV-cached decoder; `use_kv_cache=False` (CLI:
+  `--no-kv-cache`) falls back to the legacy full-recompute path.
+  New `PAWNModel.forward_with_cache` (prefill) and
+  `PAWNModel.forward_incremental(token, pos, cache)` (single-step
+  decode) primitives back the cache. The cache layout is
+  `(n_layers, B, n_heads, T_max, head_dim)` to match the attention
+  einsum without a per-step transpose. The two paths are
+  CPU-bitwise-equivalent on identical seeds; per-step logits match
+  within `1e-5` atol/rtol on accelerators (`test_forward_incremental_matches_full_forward`).
+- **Adapter dispatch glue + RoSA three-phase schedule (landed).**
+  `scripts/train_jax_adapter.py` dispatches every ported adapter
+  strategy (`lora` / `film` / `unfreeze` / `bottleneck` / `hybrid`
+  / `sparse` / `rosa` / `specialized_clm`) via the new `--strategy`
+  flag plus per-strategy hyperparameter args. The adapter trainer
+  (`pawn.adapter_trainer`) is strategy-agnostic — it takes an
+  `adapter_filter_fn` callable and an optional `gradient_mask`
+  PyTree (used by `unfreeze` for per-layer slicing and by `rosa`
+  for phase-specific gating). RoSA carries the legacy three-phase
+  training schedule (`--rosa-warmup-frac`, `--rosa-top-k-frac`):
+  Phase 1 (LoRA warmup) → Phase 2 (one-shot gradient-magnitude
+  mask gen via `compute_phase2_mask`) → Phase 3 (joint training
+  under the fixed mask). Phase boundaries re-init the adapter
+  state but preserve the framework-level `state.step` counter so
+  the metrics log stays monotonic. The Optax-internal step counter
+  resets at the Phase 2 → 3 boundary by design — Phase 3 gets its
+  own warmup ramp.
 
 These follow-ups do not change any design decision in §1–§11; they
 close out the work the integration branch had left as trainer-side
-TODOs. Each chunk gets its own section branch off `jax_migration`,
-squash-merges into the integration branch on close, and updates this
-section's chunk status to "landed".
+TODOs.
 
 ## 13. Resolved decisions
 
