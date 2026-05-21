@@ -336,8 +336,20 @@ def _validate_strategy_args(
     sliced backbone config for non-specialized_clm strategies, or
     ``None`` for specialized_clm — needed for variant-aware checks
     like ``--n-unfreeze <= n_layers``."""
-    if args.strategy in ("lora", "hybrid", "rosa") and args.rank <= 0:
-        raise SystemExit(f"--rank={args.rank} must be positive for {args.strategy}")
+    if args.strategy in ("lora", "hybrid", "rosa"):
+        if args.rank <= 0:
+            raise SystemExit(
+                f"--rank={args.rank} must be positive for {args.strategy}"
+            )
+        # LoRA / Hybrid / RoSA share --lora-alpha. Pre-fix (Codex
+        # round-4 P2), invalid alpha was caught inside
+        # `LoRAConfig.__post_init__` AFTER corpus generation +
+        # run_dir creation, leaving orphan dirs on validation
+        # failure.
+        if args.lora_alpha is not None and args.lora_alpha <= 0:
+            raise SystemExit(
+                f"--lora-alpha={args.lora_alpha} must be positive (or None)"
+            )
     if args.strategy == "bottleneck":
         if args.bottleneck_dim <= 0:
             raise SystemExit(
@@ -347,10 +359,49 @@ def _validate_strategy_args(
             raise SystemExit(
                 f"--bottleneck-n-hidden={args.bottleneck_n_hidden} must be >= 0"
             )
+        # At least one of attn / FFN must be enabled or the adapter
+        # contributes nothing. Codex round-4 P2.
+        if args.bottleneck_no_attn and args.bottleneck_no_ffn:
+            raise SystemExit(
+                "--bottleneck-no-attn and --bottleneck-no-ffn cannot both be "
+                "set — that disables the adapter entirely (no trainable "
+                "parameters)"
+            )
     if args.strategy == "sparse" and not 0.0 < args.sparse_density <= 1.0:
         raise SystemExit(
             f"--sparse-density={args.sparse_density} must be in (0, 1]"
         )
+    if args.strategy == "specialized_clm":
+        # --specialized-* shape constraints. Pre-fix (Codex round-4
+        # P2), invalid shapes were caught inside
+        # `ModelConfig.__post_init__` AFTER corpus generation +
+        # run_dir creation.
+        if args.specialized_d_model <= 0 or args.specialized_n_heads <= 0:
+            raise SystemExit(
+                f"--specialized-d-model={args.specialized_d_model} and "
+                f"--specialized-n-heads={args.specialized_n_heads} must be "
+                f"positive"
+            )
+        if args.specialized_d_model % args.specialized_n_heads != 0:
+            raise SystemExit(
+                f"--specialized-d-model={args.specialized_d_model} must be "
+                f"divisible by --specialized-n-heads={args.specialized_n_heads}"
+            )
+        head_dim = args.specialized_d_model // args.specialized_n_heads
+        if head_dim % 2 != 0:
+            raise SystemExit(
+                f"specialized head_dim = d_model / n_heads = {head_dim} "
+                f"must be even (RoPE rotates pairs)"
+            )
+        if args.specialized_d_ff <= 0:
+            raise SystemExit(
+                f"--specialized-d-ff={args.specialized_d_ff} must be positive"
+            )
+        if args.specialized_n_layers <= 0:
+            raise SystemExit(
+                f"--specialized-n-layers={args.specialized_n_layers} must "
+                f"be positive"
+            )
     if args.strategy == "unfreeze":
         if args.n_unfreeze < 0:
             raise SystemExit(

@@ -362,6 +362,78 @@ def test_rosa_warmup_frac_too_large_rejected(tmp_path: Path) -> None:
     )
 
 
+def test_rejects_negative_lora_alpha_upfront(tmp_path: Path) -> None:
+    """``--lora-alpha`` <= 0 is invalid for LoRA / Hybrid / RoSA.
+    Pre-fix (Codex round-4 P2), this raised inside
+    ``LoRAConfig.__post_init__`` only after corpus generation and
+    run_dir creation, leaving an orphan dir. The upfront check
+    rejects negative / zero alpha and produces no run-dir."""
+    for strat in ("lora", "hybrid", "rosa"):
+        with pytest.raises(SystemExit, match="lora-alpha"):
+            _run(
+                [
+                    "--strategy", strat,
+                    "--supernet", "tiny", "--variant", "base",
+                    "--rank", "4", "--lora-alpha", "-1",
+                    "--total-steps", "10", "--k", "5",
+                    "--batch-size", "2", "--seq-len", "16",
+                    "--warmup-steps", "1", "--val-frac", "0.1",
+                ],
+                tmp_path,
+            )
+    leaked = list(tmp_path.glob("jax_adapter_run_*"))
+    assert not leaked, f"lora-alpha validation leaked: {leaked}"
+
+
+def test_rejects_bottleneck_no_attn_no_ffn_upfront(tmp_path: Path) -> None:
+    """``--bottleneck-no-attn --bottleneck-no-ffn`` together is a
+    no-op adapter and rejected upfront. Pre-fix (Codex round-4 P2),
+    this raised inside ``BottleneckConfig.__post_init__`` after
+    corpus generation + run_dir creation."""
+    with pytest.raises(SystemExit, match="bottleneck-no-attn and "):
+        _run(
+            [
+                "--strategy", "bottleneck",
+                "--supernet", "tiny", "--variant", "base",
+                "--bottleneck-dim", "8",
+                "--bottleneck-no-attn", "--bottleneck-no-ffn",
+                "--total-steps", "10", "--k", "5",
+                "--batch-size", "2", "--seq-len", "16",
+                "--warmup-steps", "1", "--val-frac", "0.1",
+            ],
+            tmp_path,
+        )
+    leaked = list(tmp_path.glob("jax_adapter_run_*"))
+    assert not leaked, f"bottleneck no-attn/no-ffn validation leaked: {leaked}"
+
+
+def test_rejects_specialized_clm_odd_head_dim_upfront(tmp_path: Path) -> None:
+    """specialized_clm with odd ``head_dim = d_model / n_heads`` is
+    rejected upfront. Pre-fix (Codex round-4 P2), this raised inside
+    ``ModelConfig.__post_init__`` after corpus generation +
+    run_dir creation. ``d_model=65, n_heads=2`` is the smallest
+    case: 65 isn't divisible by 2 at all, but ``d_model=70,
+    n_heads=2`` gives ``head_dim=35`` which IS odd."""
+    # d_model=70, n_heads=2 → head_dim=35 (odd, RoPE-incompatible).
+    with pytest.raises(SystemExit, match="head_dim"):
+        _run(
+            [
+                "--strategy", "specialized_clm",
+                "--supernet", "tiny", "--variant", "base",
+                "--specialized-d-model", "70",
+                "--specialized-n-heads", "2",
+                "--specialized-n-layers", "2",
+                "--specialized-d-ff", "128",
+                "--total-steps", "10", "--k", "5",
+                "--batch-size", "2", "--seq-len", "16",
+                "--warmup-steps", "1", "--val-frac", "0.1",
+            ],
+            tmp_path,
+        )
+    leaked = list(tmp_path.glob("jax_adapter_run_*"))
+    assert not leaked, f"specialized_clm head_dim validation leaked: {leaked}"
+
+
 def test_rejects_n_unfreeze_exceeding_n_layers_upfront(tmp_path: Path) -> None:
     """``--n-unfreeze > variant.n_layers`` is rejected upfront, before
     corpus generation and run-dir creation. Pre-fix (Codex round-3 P2),
