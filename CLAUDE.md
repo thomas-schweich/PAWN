@@ -164,7 +164,7 @@ Key args:
 - `--supernet {tiny,supernet}`, `--variant` — backbone selection (ignored for `specialized_clm`)
 - `--rank`, `--lora-targets {q,k,v,o ...}`, `--lora-alpha` — LoRA / Hybrid shape
 - `--rank`, `--rosa-targets {q,k,v,o ...}`, `--lora-alpha`, `--rosa-warmup-frac`, `--rosa-top-k-frac` — RoSA shape + phase boundaries + sparsity
-- `--no-film-output` — FiLM / Hybrid: disable γ⊙h+β modulation on the lm_head output (default: enabled)
+- `--no-film-output` — FiLM / Hybrid: disable the γ⊙logits+β post-`lm_head` modulation (default: enabled; per-layer γ⊙h+β stays on either way)
 - `--n-unfreeze`, `--include-lm-head`, `--include-embeddings` — Unfreeze
 - `--bottleneck-dim`, `--bottleneck-n-hidden` — Bottleneck
 - `--sparse-targets {q,k,v,o ...}`, `--sparse-density`, `--sparse-hard` — Sparse
@@ -229,7 +229,10 @@ The `.complete` sentinel contains SHA-256 hashes of every other file in the chec
 
 ## Logs
 
-Training metrics in `logs/` (gitignored). Each run gets a timestamped directory with `metrics.jsonl`. The slug is `jax_run_<YYYYMMDD>_<HHMMSS>_<microseconds>_<pid>/` (e.g., `jax_run_20260520_140000_123456_78901/`).
+Training metrics in `logs/` (gitignored). Each run gets a timestamped directory with `metrics.jsonl`. The slug prefix depends on the driver:
+- `jax_run_<YYYYMMDD>_<HHMMSS>_<microseconds>_<pid>/` — `scripts/train_jax.py` (pretraining)
+- `jax_adapter_run_<...>/` — `scripts/train_jax_adapter.py`
+- `jax_eval_run_<...>/` — `scripts/eval_jax.py`
 
 The trainer writes one JSON record per scan chunk. The config record at the top of the file includes every `ModelConfig` field for both the supernet and every variant, the run seed, and the resolved CLI flags.
 

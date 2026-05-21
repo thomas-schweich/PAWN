@@ -17,11 +17,13 @@ deltas per ``docs/jax-migration.md`` §6:
 The trainer is *strategy-agnostic*: it works for any adapter type
 that exposes an ``adapter_filter(model)`` returning a Python-bool
 partition spec for ``eqx.partition``. Strategies that need
-per-element gradient masking (``unfreeze``'s per-layer slicing,
-``rosa``'s phase-dependent gradient gating) pass an optional
-``gradient_mask`` PyTree to ``make_adapter_train_step``; the trainer
-multiplies gradients by the mask element-wise before the optimizer
-step. ``make_adapter_train_step`` and ``make_eval_step`` close over
+per-element gradient masking on top of the partition (today only
+``unfreeze``'s per-layer slicing) pass an optional ``gradient_mask``
+PyTree to ``make_adapter_train_step``; the trainer multiplies
+gradients by the mask element-wise before the optimizer step. RoSA's
+phase-dependent gating works by swapping the ``adapter_filter``
+itself at the Phase 2 → 3 boundary, not via ``gradient_mask``.
+``make_adapter_train_step`` and ``make_eval_step`` close over
 ``frozen`` (a captured JIT closure) rather than threading it through
 a ``lax.scan`` carry — the structural win documented in
 ``AdapterTrainState``.
@@ -177,8 +179,8 @@ def make_adapter_train_step(
             like the trainable subtree's array leaves. When provided,
             gradients are multiplied by the mask element-wise before
             the optimizer step — used by ``unfreeze`` for per-layer
-            slicing of layer-stacked weights, and by ``rosa`` for
-            gating phase-specific gradients.
+            slicing of layer-stacked weights. RoSA's phase gating
+            uses an ``adapter_filter`` swap instead, not this mask.
     """
 
     # Pre-filter the gradient mask once (outside the JIT) so the inner
@@ -249,11 +251,12 @@ def make_adapter_train_step(
 
         # Thread ``grads_filt`` through the ``lax.cond`` operand tuple
         # rather than capturing it by closure. ``grads_filt`` is
-        # mutated by the pre-mask branch above (lines 231-239); a
+        # reassigned by the pre-mask branch above (lines 231-239); a
         # future refactor that moved the masking below the ``_apply``
         # definition would silently feed unmasked grads to the
         # optimizer if the closure pattern stayed. ``params`` is
-        # pure-functional w.r.t. the inputs, so it stays as a closure.
+        # read-only inside ``_apply`` (no later mutation), so the
+        # closure capture is safe.
         def _apply(args: tuple[
             eqx.Module, optax.OptState, optax.Updates,
         ]) -> tuple[eqx.Module, optax.OptState]:

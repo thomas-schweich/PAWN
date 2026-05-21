@@ -231,6 +231,11 @@ def test_autoregressive_generate_variable_prefix_length_grouping() -> None:
         )
 
 
+@pytest.mark.skipif(
+    jax.default_backend() != "cpu",
+    reason="bitwise argmax-equivalence is a CPU-only invariant; "
+           "accelerator reduction order can flip ties at ~1e-5",
+)
 def test_autoregressive_generate_kv_cache_matches_full_recompute() -> None:
     """KV-cache path produces the same generated sequences as the
     full-recompute path under CPU JAX.
@@ -405,6 +410,11 @@ def test_forward_incremental_matches_full_forward() -> None:
     )
 
 
+@pytest.mark.skipif(
+    jax.default_backend() != "cpu",
+    reason="bitwise argmax-equivalence is a CPU-only invariant; "
+           "accelerator reduction order can flip ties at ~1e-5",
+)
 def test_autoregressive_generate_mixed_prefix_kv_cache_matches_recompute() -> None:
     """Cross-path parity under the variable-prefix-length grouping path.
 

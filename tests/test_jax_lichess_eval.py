@@ -195,3 +195,59 @@ def test_load_lichess_corpus_round_trips_through_cache(
         use_cache=False,
     )
     np.testing.assert_array_equal(corpus1.tokens, corpus3.tokens)
+
+
+def test_load_lichess_corpus_reparses_when_metadata_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The load-side cache hit requires *both* ``games.npz`` and
+    ``metadata.json``. Pins the ``and`` guard against accidental
+    weakening to ``or`` — a refactor that read a partial write would
+    silently load an .npz next to stale or missing metadata.
+
+    Setup: prime the cache, then delete only ``metadata.json``. The
+    next call must re-parse (not load the orphan .npz).
+    """
+    monkeypatch.setenv("PAWN_DATA_CACHE", str(tmp_path / "cache"))
+    pgn = """\
+[Event "t"]
+[White "a"]
+[Black "b"]
+[Result "1-0"]
+[WhiteElo "1800"]
+[BlackElo "1750"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 1-0
+"""
+    pgn_path = tmp_path / "games.pgn"
+    pgn_path.write_text(pgn)
+
+    corpus1 = load_lichess_corpus(
+        pgn_path, max_ply=64, min_ply=1, prepend_outcome=False,
+    )
+    if corpus1.tokens.shape[0] == 0:
+        pytest.skip("Rust parser returned 0 games for inline PGN")
+
+    # Locate the cache dir from the public root + the same key the
+    # loader would derive. There's exactly one subdir under the
+    # cache root after the first load.
+    cache_root = tmp_path / "cache"
+    cache_dirs = list(cache_root.iterdir())
+    assert len(cache_dirs) == 1
+    cache_dir = cache_dirs[0]
+    npz = cache_dir / "games.npz"
+    meta = cache_dir / "metadata.json"
+    assert npz.exists() and meta.exists(), (
+        "expected both cache files after first load"
+    )
+    # Orphan: delete metadata only. games.npz remains.
+    meta.unlink()
+
+    # Second load must re-parse (and rewrite both files), not crash
+    # on the orphan .npz nor silently load it.
+    corpus2 = load_lichess_corpus(
+        pgn_path, max_ply=64, min_ply=1, prepend_outcome=False,
+    )
+    np.testing.assert_array_equal(corpus1.tokens, corpus2.tokens)
+    # The metadata file should have been rewritten by the re-parse.
+    assert meta.exists()

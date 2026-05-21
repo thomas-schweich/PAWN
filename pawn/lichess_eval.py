@@ -12,7 +12,7 @@ on-disk cache + DataLoader wrappers. This port stays at the raw
 numpy + Rust-engine level — the cache is a single
 ``games.npz`` file written under
 ``$HF_HOME/pawn-lichess-cache/<key>/``. Re-running the same
-``(pgn_path, max_ply, min_ply, prepend_outcome)`` combination
+``(pgn_path, max_ply, min_ply, prepend_outcome, max_games)`` combination
 re-uses the cache.
 
 Per-Elo bucketing matches the legacy convention: an "Elo slice" of
@@ -44,6 +44,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -145,9 +146,9 @@ def load_lichess_corpus(
     """Parse a Lichess PGN into a ``LichessCorpus``.
 
     On first call with a given ``(pgn_path, max_ply, min_ply,
-    prepend_outcome)`` tuple, this parses + caches the corpus under
-    ``$HF_HOME/pawn-lichess-cache/<key>/``. Subsequent calls mmap the
-    cache.
+    prepend_outcome, max_games)`` tuple, this parses + caches the
+    corpus under ``$HF_HOME/pawn-lichess-cache/<key>/``. Subsequent
+    calls mmap the cache.
 
     Args:
         max_ply: CLM sequence length. Capped at the model's max_seq_len
@@ -191,16 +192,22 @@ def load_lichess_corpus(
 
     if use_cache:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        # Atomic write: stage both files under .tmp siblings, fsync
-        # via os.replace, then rename metadata last. The load-side
-        # check requires *both* files to exist, so a kill between the
-        # two renames leaves the cache as a miss (which re-parses) —
-        # never a corrupt-but-readable .npz next to stale metadata.
-        # NB: np.savez_compressed appends ``.npz`` to filenames that
-        # don't already end in ``.npz``, so the tmp name keeps the
-        # extension to avoid landing as ``games.npz.tmp.npz``.
-        npz_tmp = cache_dir / "games.tmp.npz"
-        meta_tmp = cache_dir / "metadata.json.tmp"
+        # Atomic write: stage both files under per-process tmp
+        # siblings, then atomically rename via os.replace. Order is
+        # npz first, metadata last: the load-side check requires
+        # *both* files to exist, so a kill between the renames leaves
+        # the cache as a miss (which re-parses) — never a
+        # corrupt-but-readable .npz next to stale metadata. The
+        # tmp names embed pid + uuid so two concurrent writers (eg a
+        # multi-pod eval) can't interleave their .savez writes into
+        # one corrupt-but-syntactically-valid archive and then both
+        # promote it via the same os.replace path. np.savez_compressed
+        # appends ``.npz`` to filenames that don't already end in
+        # ``.npz``, so the tmp name keeps the extension to avoid
+        # landing as ``games.npz.tmp.npz``.
+        suffix = f"{os.getpid()}.{uuid.uuid4().hex}"
+        npz_tmp = cache_dir / f"games.tmp.{suffix}.npz"
+        meta_tmp = cache_dir / f"metadata.json.tmp.{suffix}"
         np.savez_compressed(
             npz_tmp,
             tokens=corpus.tokens.astype(np.int32),

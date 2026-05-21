@@ -216,7 +216,11 @@ def _make_strategy_setup(strategy: str) -> tuple:
         )
         filter_fn = sparse_adapter_filter
     elif strategy == "rosa":
-        # Phase 1 partition is rosa_adapter_filter (LoRA + sparse legs).
+        # The joint (Phase 3) partition is ``rosa_adapter_filter`` —
+        # LoRA + sparse legs both trainable. We use that here rather
+        # than Phase 1's LoRA-only filter so the test broadens
+        # coverage to every trainable RoSA leaf (a regression that
+        # admitted a backbone leaf into either leg surfaces).
         # Sparse leg starts with mask=False so it can't move backbone
         # values; LoRA leg moves W_eff but never the underlying field.
         model = init_rosa_model(
@@ -250,6 +254,7 @@ def test_backbone_weights_are_frozen_all_strategies(strategy: str) -> None:
     ``specialized_clm`` (no wrapped backbone — it's from-scratch).
     """
     model, state, frozen, train_step = _make_strategy_setup(strategy)
+    initial_trainable = state.trainable
     batch = _real_batch(b=4, t=16)
     for _ in range(20):
         state, _ = train_step(state, batch)
@@ -276,6 +281,31 @@ def test_backbone_weights_are_frozen_all_strategies(strategy: str) -> None:
             f"from original — max diff = "
             f"{float(jnp.abs(original - current).max())}"
         )
+
+    # Liveness invariant: at least one trainable leaf must have
+    # changed. Without this, a regression where ``adapter_filter``
+    # returns an all-False spec would silently pass both invariants
+    # above (the trainable subtree would be empty, so no leaf could
+    # leak into the backbone or drift away from the original) while
+    # also no gradient ever fires.
+    leaves_before = jax.tree_util.tree_leaves(
+        eqx.filter(initial_trainable, eqx.is_array)
+    )
+    leaves_after = jax.tree_util.tree_leaves(
+        eqx.filter(state.trainable, eqx.is_array)
+    )
+    assert len(leaves_before) > 0, (
+        f"[{strategy}] no trainable array leaves at init — "
+        f"adapter_filter selected nothing"
+    )
+    any_moved = any(
+        not jnp.array_equal(a, b)
+        for a, b in zip(leaves_before, leaves_after, strict=True)
+    )
+    assert any_moved, (
+        f"[{strategy}] no trainable leaf changed after 20 steps — "
+        f"adapter_filter selected leaves but no gradient flowed"
+    )
 
 
 def test_lora_weights_actually_update() -> None:

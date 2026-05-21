@@ -598,8 +598,8 @@ docs/jax-migration.md`. All four chunks are now landed:
   flag plus per-strategy hyperparameter args. The adapter trainer
   (`pawn.adapter_trainer`) is strategy-agnostic — it takes an
   `adapter_filter_fn` callable and an optional `gradient_mask`
-  PyTree (used by `unfreeze` for per-layer slicing and by `rosa`
-  for phase-specific gating). RoSA carries the legacy three-phase
+  PyTree (currently only `unfreeze` passes one, for per-layer
+  slicing of layer-stacked weights). RoSA carries the legacy three-phase
   training schedule (`--rosa-warmup-frac`, `--rosa-top-k-frac`):
   Phase 1 (LoRA warmup) → Phase 2 (one-shot gradient-magnitude
   mask gen via `compute_phase2_mask`) → Phase 3 (joint training
