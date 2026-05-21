@@ -36,7 +36,7 @@ from pawn.adapter_trainer import (
     make_adapter_train_step,
     make_eval_step,
 )
-from pawn.adapters import LoRAConfig, init_lora_model
+from pawn.adapters import LoRAConfig, adapter_filter, init_lora_model
 from pawn.config import TINY_SUPERNET, TINY_VARIANTS
 from pawn.corpus import generate_corpus
 from pawn.model import init_model, sliced
@@ -52,7 +52,9 @@ def _setup(rank: int = 4, lr: float = 3e-3) -> tuple:
         backbone, LoRAConfig(rank=rank, targets=("q", "v")), jax.random.PRNGKey(1)
     )
     opt = make_optimizer(lr)
-    state, frozen = init_adapter_state(model, opt)
+    state, frozen = init_adapter_state(
+        model, opt, adapter_filter_fn=adapter_filter,
+    )
     train_step = make_adapter_train_step(opt, frozen)
     eval_step = make_eval_step(frozen)
     return model, state, frozen, train_step, eval_step
@@ -164,6 +166,144 @@ def test_lora_weights_actually_update() -> None:
     assert delta > 0.0, "b_q did not move after one train step"
 
 
+def test_gradient_mask_freezes_layers_through_train_step() -> None:
+    """``make_adapter_train_step(gradient_mask=...)`` zeroes
+    gradients per-element through the trainer path.
+
+    The unfreeze strategy's per-layer slicing relies on this — the
+    `adapter_filter` partition is coarse (every layer-stacked field
+    is fully True or fully False), and per-layer "top N unfrozen"
+    selection happens via the gradient mask. This test pins the
+    contract: after training, layer-stacked weight slices that the
+    mask gates to False must not have moved, even though the trainer
+    sees them as "trainable" via the partition spec.
+
+    Pre-fix (before C.1), this path was unused (only LoRA had a
+    trainer). The C.1 mask-multiplication code is exercised by
+    ``test_each_strategy_dispatch_runs[strategy=unfreeze]`` but only
+    at the "doesn't crash" granularity. This unit-level test pins
+    the actual weight-freeze invariant the dispatch relies on.
+    """
+    from typing import cast
+
+    from pawn.adapters import (
+        UnfreezeConfig, UnfreezeModel, init_unfreeze_model,
+        unfreeze_adapter_filter, unfreeze_gradient_mask,
+    )
+    from pawn.adapter_trainer import (
+        init_adapter_state as init_state,
+        make_adapter_train_step as make_step,
+    )
+
+    key = jax.random.PRNGKey(0)
+    supernet = init_model(TINY_SUPERNET, key)
+    backbone = sliced(supernet, TINY_VARIANTS["base"])
+    # n_unfreeze=1 over backbone.cfg.n_layers=3 → layers [0, 1]
+    # frozen, layer [2] unfrozen.
+    model = init_unfreeze_model(
+        backbone, UnfreezeConfig(n_unfreeze=1, include_lm_head=False),
+        jax.random.PRNGKey(1),
+    )
+    n_layers = backbone.cfg.n_layers
+    assert n_layers >= 2, "Test needs >=2 layers to distinguish frozen vs unfrozen"
+    opt = make_optimizer(3e-2)  # Strong LR so any leak is unmissable.
+    grad_mask = unfreeze_gradient_mask(model)
+    state, frozen = init_state(
+        model, opt, adapter_filter_fn=unfreeze_adapter_filter,
+    )
+    train_step = make_step(opt, frozen, gradient_mask=grad_mask)
+    # ``state.trainable`` is statically typed ``eqx.Module``; cast to
+    # the concrete adapter type so attribute access on the partition
+    # tree is type-checked.
+    initial_wq = cast(UnfreezeModel, state.trainable).backbone.wq.copy()
+    batch = _real_batch(b=4, t=16)
+    for _ in range(3):
+        state, _ = train_step(state, batch)
+    diff = jnp.abs(
+        cast(UnfreezeModel, state.trainable).backbone.wq - initial_wq,
+    )
+    # Layers [0..n_layers-1] frozen, layer [n_layers-1] unfrozen.
+    # The frozen layers' deltas must be exactly zero (the mask zeroed
+    # those gradients before the optimizer step).
+    for layer in range(n_layers - 1):
+        assert float(diff[layer].max()) == 0.0, (
+            f"layer {layer} should have stayed frozen but max-abs "
+            f"delta = {float(diff[layer].max())}"
+        )
+    # The unfrozen layer's delta must be > 0.
+    assert float(diff[n_layers - 1].max()) > 0.0, (
+        f"unfrozen layer {n_layers - 1} did not change after 3 steps"
+    )
+
+
+def test_gradient_mask_lm_head_unfrozen_under_include_lm_head() -> None:
+    """When ``include_lm_head=True`` (the argparser default), Unfreeze
+    must train ``lm_head`` even if ``n_unfreeze=0`` (no layer-stacked
+    weights trainable). The `_HEAD_FIELDS` branch in
+    `unfreeze.make_gradient_mask` is what makes this work; this test
+    pins that branch from end-to-end through `make_adapter_train_step`.
+
+    Production runs default to `include_lm_head=True`, so without
+    this pin a future refactor that drops the `_HEAD_FIELDS` branch
+    would silently freeze the head — invisible at the "doesn't
+    crash" granularity the strategy smoke-test gives.
+    """
+    from typing import cast
+
+    from pawn.adapters import (
+        UnfreezeConfig, UnfreezeModel, init_unfreeze_model,
+        unfreeze_adapter_filter, unfreeze_gradient_mask,
+    )
+    from pawn.adapter_trainer import (
+        init_adapter_state as init_state,
+        make_adapter_train_step as make_step,
+    )
+
+    key = jax.random.PRNGKey(0)
+    supernet = init_model(TINY_SUPERNET, key)
+    backbone = sliced(supernet, TINY_VARIANTS["base"])
+    # n_unfreeze=0 → every layer frozen. include_lm_head=True →
+    # final_norm + lm_head are the only trainable bits.
+    model = init_unfreeze_model(
+        backbone, UnfreezeConfig(n_unfreeze=0, include_lm_head=True),
+        jax.random.PRNGKey(1),
+    )
+    opt = make_optimizer(3e-2)
+    grad_mask = unfreeze_gradient_mask(model)
+    state, frozen = init_state(
+        model, opt, adapter_filter_fn=unfreeze_adapter_filter,
+    )
+    train_step = make_step(opt, frozen, gradient_mask=grad_mask)
+    # ``state.trainable.backbone.wq`` is None here — n_unfreeze=0
+    # marks every layer-stacked field as frozen, so the partition
+    # puts wq on the ``frozen`` side. Read the initial wq from the
+    # bare backbone (which is what gets combined back at forward).
+    initial_lm_head = cast(UnfreezeModel, state.trainable).backbone.lm_head.copy()
+    initial_wq = backbone.wq.copy()
+    batch = _real_batch(b=4, t=16)
+    for _ in range(3):
+        state, _ = train_step(state, batch)
+    final_trainable = cast(UnfreezeModel, state.trainable)
+    lm_head_diff = float(
+        jnp.abs(final_trainable.backbone.lm_head - initial_lm_head).max()
+    )
+    # ``final_trainable.backbone.wq`` is still None (the layer-stacked
+    # fields were never trainable in this run). Recompose the full
+    # model and read wq from there.
+    combined = cast(UnfreezeModel, eqx.combine(state.trainable, frozen))
+    wq_diff = float(jnp.abs(combined.backbone.wq - initial_wq).max())
+    # lm_head must train.
+    assert lm_head_diff > 0.0, (
+        f"lm_head should have trained under include_lm_head=True but "
+        f"max-abs-delta = {lm_head_diff}"
+    )
+    # Every layer of wq must stay frozen (n_unfreeze=0).
+    assert wq_diff == 0.0, (
+        f"wq should have been frozen (n_unfreeze=0) but max-abs-"
+        f"delta = {wq_diff}"
+    )
+
+
 def test_eval_step_is_forward_only() -> None:
     """``eval_step`` returns metrics without mutating state. Pins the
     forward-only contract — the eval result must be a function of
@@ -251,8 +391,12 @@ def test_eval_step_uses_correct_frozen() -> None:
     model_a = init_lora_model(backbone_a, cfg, jax.random.PRNGKey(101))
     model_b = init_lora_model(backbone_b, cfg, jax.random.PRNGKey(202))
     opt = make_optimizer(3e-3)
-    state_a, frozen_a = init_adapter_state(model_a, opt)
-    state_b, frozen_b = init_adapter_state(model_b, opt)
+    state_a, frozen_a = init_adapter_state(
+        model_a, opt, adapter_filter_fn=adapter_filter,
+    )
+    state_b, frozen_b = init_adapter_state(
+        model_b, opt, adapter_filter_fn=adapter_filter,
+    )
     step_a = make_adapter_train_step(opt, frozen_a)
     step_b = make_adapter_train_step(opt, frozen_b)
     train_batch = _real_batch(b=4, t=16, seed=1)

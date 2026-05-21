@@ -24,7 +24,10 @@ from pawn.adapters import (
     init_rosa_model,
     init_specialized_clm,
     rosa_adapter_filter,
+    rosa_compute_phase2_mask,
+    rosa_lora_only_adapter_filter,
     rosa_set_mask,
+    rosa_sparse_only_adapter_filter,
     specialized_clm_adapter_filter,
 )
 from pawn.config import TINY_SUPERNET
@@ -160,6 +163,201 @@ def test_rosa_mask_affects_forward() -> None:
     got = updated(tokens, attn)
     diff = float(jnp.abs(got - bare).sum())
     assert diff > 0.0, "RoSA sparse leg failed to affect the forward"
+
+
+# ---------------------------------------------------------------------------
+# RoSA three-phase primitives
+# ---------------------------------------------------------------------------
+
+
+def test_rosa_lora_only_filter_freezes_delta() -> None:
+    """Phase 1 filter: A, B are trainable; Δ stays frozen.
+
+    After ``eqx.partition``, only the LoRA ``a_*`` / ``b_*`` leaves
+    appear under ``trainable.rosa``; the sparse-Δ ``delta_*`` leaves
+    are ``None``. Mirrors the structural invariant used by the
+    Phase-1 warmup loop in
+    ``scripts/train_jax_adapter.py``.
+    """
+    cfg = TINY_SUPERNET
+    backbone = init_model(cfg, jax.random.key(0))
+    model = init_rosa_model(
+        backbone, RoSAConfig(rank=2, targets=("q",)), jax.random.key(1),
+    )
+    spec = rosa_lora_only_adapter_filter(model)
+    trainable, frozen = eqx.partition(model, spec)
+    assert trainable.rosa.a_q is not None
+    assert trainable.rosa.b_q is not None
+    assert trainable.rosa.delta_q is None
+    assert frozen.rosa.delta_q is not None
+
+
+def test_rosa_sparse_only_filter_freezes_lora() -> None:
+    """Phase 2 filter (used for gradient extraction): only Δ is on
+    the trainable side; A, B are frozen. The trainer never optimises
+    with this filter — it's used to compute ``dL/dΔ`` on a batch
+    while ensuring XLA dead-code-eliminates dL/dA, dL/dB."""
+    cfg = TINY_SUPERNET
+    backbone = init_model(cfg, jax.random.key(0))
+    model = init_rosa_model(
+        backbone, RoSAConfig(rank=2, targets=("q",)), jax.random.key(1),
+    )
+    spec = rosa_sparse_only_adapter_filter(model)
+    trainable, frozen = eqx.partition(model, spec)
+    assert trainable.rosa.a_q is None
+    assert trainable.rosa.b_q is None
+    assert trainable.rosa.delta_q is not None
+
+
+def test_rosa_compute_phase2_mask_picks_exactly_top_k_per_layer() -> None:
+    """``rosa_compute_phase2_mask`` returns bool masks with *exactly*
+    ``max(1, int(top_k_frac * d * d))`` True entries per layer per
+    target — independent of ties at the threshold value. The
+    argsort-based picker ties-break by index order, which is fine."""
+    cfg = TINY_SUPERNET
+    backbone = init_model(cfg, jax.random.key(0))
+    model = init_rosa_model(
+        backbone, RoSAConfig(rank=2, targets=("q", "v")), jax.random.key(1),
+    )
+    n_layers = cfg.n_layers
+    d = cfg.d_model
+    rng = np.random.default_rng(7)
+    fake_grads = {
+        "q": jnp.asarray(rng.standard_normal((n_layers, d, d)), dtype=jnp.float32),
+        "v": jnp.asarray(rng.standard_normal((n_layers, d, d)), dtype=jnp.float32),
+    }
+    masks = rosa_compute_phase2_mask(model, fake_grads, top_k_frac=0.05)
+    assert set(masks.keys()) == {"q", "v"}
+    n_per_layer = d * d
+    k = max(1, int(n_per_layer * 0.05))
+    for tgt in ("q", "v"):
+        m = masks[tgt]
+        assert m.shape == (n_layers, d, d)
+        assert m.dtype == jnp.bool_
+        for layer in range(n_layers):
+            n_active = int(m[layer].sum())
+            assert n_active == k, (
+                f"target={tgt} layer={layer}: {n_active} != {k}"
+            )
+
+
+def test_rosa_compute_phase2_mask_handles_degenerate_all_zero_grads() -> None:
+    """All-zero gradients should still produce exactly-k masks
+    (ties broken by index order) — the threshold-based picker
+    pathologically returned density=1.0 on this input.
+    """
+    cfg = TINY_SUPERNET
+    backbone = init_model(cfg, jax.random.key(0))
+    model = init_rosa_model(
+        backbone, RoSAConfig(rank=2, targets=("q",)), jax.random.key(1),
+    )
+    n_layers = cfg.n_layers
+    d = cfg.d_model
+    zero_grads = {"q": jnp.zeros((n_layers, d, d), dtype=jnp.float32)}
+    masks = rosa_compute_phase2_mask(model, zero_grads, top_k_frac=0.01)
+    expected_k = max(1, int(d * d * 0.01))
+    for layer in range(n_layers):
+        assert int(masks["q"][layer].sum()) == expected_k, (
+            "all-zero-grad layer: expected exactly k entries; got "
+            f"density-1.0 (the >= threshold regression)"
+        )
+
+
+def test_rosa_inactive_targets_excluded_from_adam_moments() -> None:
+    """`_filter_with` iterates only ``cfg.targets`` — inactive
+    targets' full-shape ``(L, d, d)`` Δ arrays stay on the frozen
+    side of the partition spec, so ``optimizer.init`` doesn't
+    allocate Adam moments for them.
+
+    Pre-fix (round-1, before the `cfg.targets`-only iteration),
+    Adam allocated `2 × (L × d × d × float32)` per inactive target —
+    at SUPERNET scale (L=10, d=640) that's ~50 MB per target wasted,
+    ~150 MB for a single-active-target run.
+
+    Verifies the partition: trainable.rosa.delta_q is a real array
+    (active), trainable.rosa.delta_k/v/o are None (inactive). The
+    inactive deltas live on the frozen side.
+    """
+    cfg = TINY_SUPERNET
+    backbone = init_model(cfg, jax.random.key(0))
+    model = init_rosa_model(
+        backbone, RoSAConfig(rank=2, targets=("q",)), jax.random.key(1),
+    )
+    spec = rosa_adapter_filter(model)
+    trainable, frozen = eqx.partition(model, spec)
+    # Active target: real array on trainable side.
+    assert trainable.rosa.delta_q is not None
+    # Inactive targets: None on trainable side, real on frozen side.
+    for tgt in ("k", "v", "o"):
+        assert getattr(trainable.rosa, f"delta_{tgt}") is None, (
+            f"inactive target {tgt!r}: delta_{tgt} leaked onto "
+            f"trainable side; pre-fix this allocated wasted Adam "
+            f"moments at production scale"
+        )
+        assert getattr(frozen.rosa, f"delta_{tgt}") is not None
+
+
+def test_rosa_delta_trains_under_dense_mask() -> None:
+    """With ``mask=all-True``, ``dL/dΔ`` is the full ``dL/dW_eff``
+    — Δ should accumulate updates under joint training. This pins the
+    `--rosa-warmup-frac 0` single-phase fallback: the dense mask
+    primer in `_build_rosa` (scripts/train_jax_adapter.py) is what
+    keeps the sparse leg actually trainable in zero-warmup mode.
+
+    Pre-fix (codex P2 finding), the model carried `mask=all-False`
+    even in zero-warmup mode, so `delta * mask = 0` and `dL/dΔ` was
+    zero everywhere — Δ never trained, silently degrading to
+    LoRA-only.
+    """
+    from typing import cast
+
+    import optax
+    from pawn.adapter_trainer import (
+        init_adapter_state, make_adapter_train_step,
+    )
+
+    cfg = TINY_SUPERNET
+    backbone = init_model(cfg, jax.random.key(0))
+    model = init_rosa_model(
+        backbone, RoSAConfig(rank=2, targets=("q",)), jax.random.key(1),
+    )
+    # Prime with all-True mask (mirrors the zero-warmup-frac dispatch
+    # path).
+    n_layers = cfg.n_layers
+    d = cfg.d_model
+    all_true = {"q": jnp.ones((n_layers, d, d), dtype=jnp.bool_)}
+    model = rosa_set_mask(model, all_true)
+    initial_delta_q = model.rosa.delta_q.copy()
+
+    opt = optax.adamw(3e-2)
+    state, frozen = init_adapter_state(
+        model, opt, adapter_filter_fn=rosa_adapter_filter,
+    )
+    train_step = make_adapter_train_step(opt, frozen)
+    tokens, attn = _tiny_inputs(B=4, T=12)
+    targets = jnp.asarray(np.random.default_rng(0).integers(0, 64, (4, 12)), dtype=jnp.int32)
+    loss_mask = jnp.ones((4, 12), dtype=jnp.bool_)
+    for _ in range(3):
+        state, _ = train_step(state, (tokens, attn, targets, loss_mask))
+    final_delta_q = cast(RoSAModel, state.trainable).rosa.delta_q
+    delta_diff = float(jnp.abs(final_delta_q - initial_delta_q).max())
+    assert delta_diff > 0.0, (
+        f"Δ_q failed to train under dense mask: max-abs-diff = {delta_diff}"
+    )
+
+
+def test_rosa_compute_phase2_mask_rejects_bad_top_k_frac() -> None:
+    cfg = TINY_SUPERNET
+    backbone = init_model(cfg, jax.random.key(0))
+    model = init_rosa_model(
+        backbone, RoSAConfig(rank=2, targets=("q",)), jax.random.key(1),
+    )
+    n_layers = cfg.n_layers
+    d = cfg.d_model
+    grads = {"q": jnp.zeros((n_layers, d, d), dtype=jnp.float32)}
+    for bad in (0.0, -0.1, 1.5):
+        with pytest.raises(ValueError, match="top_k_frac"):
+            rosa_compute_phase2_mask(model, grads, top_k_frac=bad)
 
 
 # ---------------------------------------------------------------------------
