@@ -9,9 +9,10 @@ metadata), filters by Elo range, and computes
 
 The legacy module dragged in ``polars`` + ``torch.utils.data`` for the
 on-disk cache + DataLoader wrappers. This port stays at the raw
-numpy + Rust-engine level — the cache is a single
-``games.npz`` file written under
-``$HF_HOME/pawn-lichess-cache/<key>/``. Re-running the same
+numpy + Rust-engine level — the cache is a single ``games.npz`` file
++ ``metadata.json`` sibling, written under the cache root (see
+``_cache_root``: defaults to ``$HF_HOME/pawn-lichess-cache/``; honour
+``PAWN_DATA_CACHE`` as a direct override). Re-running the same
 ``(pgn_path, max_ply, min_ply, prepend_outcome, max_games)`` combination
 re-uses the cache.
 
@@ -147,8 +148,9 @@ def load_lichess_corpus(
 
     On first call with a given ``(pgn_path, max_ply, min_ply,
     prepend_outcome, max_games)`` tuple, this parses + caches the
-    corpus under ``$HF_HOME/pawn-lichess-cache/<key>/``. Subsequent
-    calls mmap the cache.
+    corpus under the cache root (``_cache_root()``; see the module
+    docstring for the env-var precedence). Subsequent calls mmap the
+    cache.
 
     Args:
         max_ply: CLM sequence length. Capped at the model's max_seq_len
@@ -208,31 +210,42 @@ def load_lichess_corpus(
         suffix = f"{os.getpid()}.{uuid.uuid4().hex}"
         npz_tmp = cache_dir / f"games.tmp.{suffix}.npz"
         meta_tmp = cache_dir / f"metadata.json.tmp.{suffix}"
-        np.savez_compressed(
-            npz_tmp,
-            tokens=corpus.tokens.astype(np.int32),
-            attn_mask=corpus.attn_mask,
-            targets=corpus.targets.astype(np.int32),
-            loss_mask=corpus.loss_mask,
-            game_lengths=corpus.game_lengths.astype(np.int32),
-            white_elo=corpus.white_elo.astype(np.int32),
-            black_elo=corpus.black_elo.astype(np.int32),
-            result=corpus.result.astype(np.int8),
-        )
-        with open(meta_tmp, "w", encoding="utf-8") as fh:
-            json.dump(
-                {
-                    "pgn_path": str(pgn_path.resolve()),
-                    "max_ply": int(max_ply),
-                    "min_ply": int(min_ply),
-                    "prepend_outcome": bool(prepend_outcome),
-                    "max_games": int(max_games),
-                    "n_games": int(corpus.tokens.shape[0]),
-                },
-                fh, indent=2,
+        # try/finally guarantees the per-process tmp files are cleaned
+        # up even on exception (out-of-disk during savez, json.dump
+        # failure, KeyboardInterrupt). Without this, every interrupted
+        # write leaks a unique-named tmp file forever — the next run
+        # can't find or reuse it because pid + uuid never repeats.
+        # os.replace removes the source path on success, so unlink
+        # below is a no-op on the happy path.
+        try:
+            np.savez_compressed(
+                npz_tmp,
+                tokens=corpus.tokens.astype(np.int32),
+                attn_mask=corpus.attn_mask,
+                targets=corpus.targets.astype(np.int32),
+                loss_mask=corpus.loss_mask,
+                game_lengths=corpus.game_lengths.astype(np.int32),
+                white_elo=corpus.white_elo.astype(np.int32),
+                black_elo=corpus.black_elo.astype(np.int32),
+                result=corpus.result.astype(np.int8),
             )
-        os.replace(npz_tmp, npz_path)
-        os.replace(meta_tmp, meta_path)
+            with open(meta_tmp, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "pgn_path": str(pgn_path.resolve()),
+                        "max_ply": int(max_ply),
+                        "min_ply": int(min_ply),
+                        "prepend_outcome": bool(prepend_outcome),
+                        "max_games": int(max_games),
+                        "n_games": int(corpus.tokens.shape[0]),
+                    },
+                    fh, indent=2,
+                )
+            os.replace(npz_tmp, npz_path)
+            os.replace(meta_tmp, meta_path)
+        finally:
+            npz_tmp.unlink(missing_ok=True)
+            meta_tmp.unlink(missing_ok=True)
     return corpus
 
 

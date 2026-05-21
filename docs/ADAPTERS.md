@@ -62,7 +62,7 @@ logits_adapted = gamma * logits + beta  (output, dim = vocab_size)
 Identity-initialized: gamma=1, beta=0.
 
 **Key parameters:**
-- `use_output_film` -- apply FiLM to output logits as well (default: False)
+- `use_output_film` -- apply FiLM to output logits as well (default: True; toggle off via `--no-film-output`)
 
 **Param count:** `n_layers * 2 * d_model + 2 * vocab_size` = ~17K. The lightest adapter by far -- only diagonal (per-channel) modulation with no cross-channel mixing.
 
@@ -133,7 +133,7 @@ Combines LoRA and FiLM on a single frozen backbone. LoRA modifies attention proj
 
 **Key parameters:** Union of LoRA and FiLM parameters, plus:
 - `lora_layers` / `film_layers` -- independent layer selection for each method
-- `use_output_film` -- FiLM on logits (default: False)
+- `use_output_film` -- FiLM on logits (default: True; toggle off via `--no-film-output`)
 
 Supports separate learning rates for LoRA and FiLM parameters via the training script (`--lora-lr`, `--film-lr`).
 

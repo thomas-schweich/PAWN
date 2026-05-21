@@ -251,12 +251,12 @@ def make_adapter_train_step(
 
         # Thread ``grads_filt`` through the ``lax.cond`` operand tuple
         # rather than capturing it by closure. ``grads_filt`` is
-        # reassigned by the pre-mask branch above (lines 231-239); a
-        # future refactor that moved the masking below the ``_apply``
-        # definition would silently feed unmasked grads to the
-        # optimizer if the closure pattern stayed. ``params`` is
-        # read-only inside ``_apply`` (no later mutation), so the
-        # closure capture is safe.
+        # reassigned by the ``if mask_filt is not None`` block above
+        # (the pre-optimizer grad-mask path); a future refactor that
+        # moved that masking below the ``_apply`` definition would
+        # silently feed unmasked grads to the optimizer if the closure
+        # pattern stayed. ``params`` is read-only inside ``_apply``
+        # (no later mutation), so the closure capture is safe.
         def _apply(args: tuple[
             eqx.Module, optax.OptState, optax.Updates,
         ]) -> tuple[eqx.Module, optax.OptState]:

@@ -68,7 +68,7 @@ def evaluate_accuracy(
         m: PAWNModel, tokens: jax.Array, attn_mask: jax.Array,
         targets: jax.Array, loss_mask: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Per-batch reduction; returns (correct[B,T], target_in_band[B,T],
+        """Per-batch reduction; returns (correct[B,T], move_mask[B,T],
         position_grid[1,T])."""
         logits = m(tokens, attn_mask)
         # Restrict argmax to legal move tokens — the model's vocab
@@ -76,11 +76,18 @@ def evaluate_accuracy(
         # at a supervised position.
         action_logits = logits[..., :NUM_ACTIONS]
         pred = jnp.argmax(action_logits, axis=-1)
-        # ``targets`` may contain PAD/outcome tokens at positions
-        # outside loss_mask; the loss_mask gates whether we count
-        # the comparison. We use ``equal`` directly — PAD targets
-        # land outside the comparison via loss_mask.
-        return pred == targets, loss_mask, jnp.arange(
+        # ``loss_mask`` covers every supervised next-token slot,
+        # including the terminal ``move_N → PAD`` step (the "game
+        # over" supervision signal). For *move* accuracy we only
+        # score positions whose target is itself a move (target <
+        # NUM_ACTIONS). Without this AND, every non-empty game adds
+        # one guaranteed-wrong row at the terminal slot (pred is
+        # always in the action band, target is PAD), biasing reported
+        # accuracy downward by ~1/avg_game_length. The same loss_mask
+        # remains correct for training cross-entropy because the
+        # full vocab is in scope there.
+        move_mask = loss_mask & (targets < NUM_ACTIONS)
+        return pred == targets, move_mask, jnp.arange(
             tokens.shape[1], dtype=jnp.int32
         )[None, :]
 

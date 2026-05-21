@@ -229,12 +229,10 @@ The `.complete` sentinel contains SHA-256 hashes of every other file in the chec
 
 ## Logs
 
-Training metrics in `logs/` (gitignored). Each run gets a timestamped directory with `metrics.jsonl`. The slug prefix depends on the driver:
-- `jax_run_<YYYYMMDD>_<HHMMSS>_<microseconds>_<pid>/` — `scripts/train_jax.py` (pretraining)
-- `jax_adapter_run_<...>/` — `scripts/train_jax_adapter.py`
-- `jax_eval_run_<...>/` — `scripts/eval_jax.py`
-
-The trainer writes one JSON record per scan chunk. The config record at the top of the file includes every `ModelConfig` field for both the supernet and every variant, the run seed, and the resolved CLI flags.
+Per-run output lands in `logs/` (gitignored). The slug prefix + per-run files depend on the driver:
+- `jax_run_<YYYYMMDD>_<HHMMSS>_<microseconds>_<pid>/` — `scripts/train_jax.py` (pretraining). Writes `metrics.jsonl` (one JSON record per scan chunk, plus a leading config record carrying every `ModelConfig` field for the supernet + variants, the run seed, and the resolved CLI flags) and `config.json`.
+- `jax_adapter_run_<...>/` — `scripts/train_jax_adapter.py`. Same `metrics.jsonl` + `config.json` shape (adapter-strategy-specific config keys included).
+- `jax_eval_run_<...>/` — `scripts/eval_jax.py`. Writes a single-shot `eval_result.json` with overall + per-phase accuracy; no `metrics.jsonl`.
 
 ## Cloud GPU Operations
 

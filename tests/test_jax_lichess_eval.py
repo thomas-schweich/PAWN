@@ -139,6 +139,44 @@ def test_evaluate_elo_accuracy_returns_finite_overall() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _make_lichess_pgn(games: list[dict]) -> str:
+    """Build a Lichess-format PGN string with the headers + per-move
+    clock annotations the Rust parser requires. Without ``Site``,
+    ``UTCDate``, ``UTCTime``, ``TimeControl``, ``Termination``, and
+    ``[%clk ...]`` move comments, the parser silently drops the game,
+    making any cache-layout test inadvertently skip.
+    """
+    parts: list[str] = []
+    for i, g in enumerate(games):
+        parts.append(f'[Event "test{i}"]\n')
+        parts.append(f'[Site "https://lichess.org/abc{i}1"]\n')
+        parts.append(f'[White "{g.get("white", "alice")}"]\n')
+        parts.append(f'[Black "{g.get("black", "bob")}"]\n')
+        parts.append(f'[Result "{g["result"]}"]\n')
+        parts.append('[UTCDate "2023.01.01"]\n')
+        parts.append('[UTCTime "00:00:01"]\n')
+        parts.append(f'[WhiteElo "{g["white_elo"]}"]\n')
+        parts.append(f'[BlackElo "{g["black_elo"]}"]\n')
+        parts.append('[WhiteRatingDiff "+5"]\n')
+        parts.append('[BlackRatingDiff "-5"]\n')
+        parts.append('[ECO "C60"]\n')
+        parts.append('[Opening "X"]\n')
+        parts.append('[TimeControl "120+1"]\n')
+        parts.append('[Termination "Normal"]\n\n')
+        # Each move carries a clock annotation in a comment.
+        moves = g["moves"]
+        clock_s = 120
+        line = []
+        for ply, mv in enumerate(moves):
+            if ply % 2 == 0:
+                line.append(f"{ply // 2 + 1}. {mv} {{ [%clk 0:0{clock_s // 60}:{clock_s % 60:02d}] }}")
+            else:
+                line.append(f"{ply // 2 + 1}... {mv} {{ [%clk 0:0{clock_s // 60}:{clock_s % 60:02d}] }}")
+            clock_s -= 1
+        parts.append(" ".join(line) + f" {g['result']}\n\n")
+    return "".join(parts)
+
+
 def test_load_lichess_corpus_round_trips_through_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -147,41 +185,28 @@ def test_load_lichess_corpus_round_trips_through_cache(
     round-trip equivalence."""
     monkeypatch.setenv("PAWN_DATA_CACHE", str(tmp_path / "cache"))
 
-    pgn = """\
-[Event "test"]
-[White "alice"]
-[Black "bob"]
-[Result "1-0"]
-[WhiteElo "1800"]
-[BlackElo "1750"]
-
-1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 1-0
-
-[Event "test2"]
-[White "carol"]
-[Black "dan"]
-[Result "0-1"]
-[WhiteElo "1500"]
-[BlackElo "1550"]
-
-1. d4 d5 2. c4 e6 3. Nc3 Nf6 4. Bg5 Be7 5. e3 O-O 0-1
-"""
+    pgn = _make_lichess_pgn([
+        {
+            "white": "alice", "black": "bob", "result": "1-0",
+            "white_elo": 1800, "black_elo": 1750,
+            "moves": ["e4", "e5", "Nf3", "Nc6", "Bb5", "a6", "Ba4", "Nf6", "O-O", "Be7"],
+        },
+        {
+            "white": "carol", "black": "dan", "result": "0-1",
+            "white_elo": 1500, "black_elo": 1550,
+            "moves": ["d4", "d5", "c4", "e6", "Nc3", "Nf6", "Bg5", "Be7", "e3", "O-O"],
+        },
+    ])
     pgn_path = tmp_path / "games.pgn"
     pgn_path.write_text(pgn)
 
     corpus1 = load_lichess_corpus(
         pgn_path, max_ply=64, min_ply=1, prepend_outcome=False,
     )
-    # The Rust parser ships PGN strings through a tokeniser; the inline
-    # PGN above has at least 5 half-moves per game (the parser also
-    # truncates at the engine's first-illegal-move guard). If the
-    # parser yielded zero games, skip the round-trip check — the test
-    # is then a smoke for the cache layout itself.
-    if corpus1.tokens.shape[0] == 0:
-        pytest.skip(
-            "Rust parser returned 0 games for the inline PGN — cache "
-            "round-trip can't be verified without a non-empty corpus"
-        )
+    assert corpus1.tokens.shape[0] >= 1, (
+        "Lichess-format PGN should parse at least one game; if this "
+        "fails the fixture is wrong, not the cache code"
+    )
     # Re-load: comes from cache (path exists). Result is identical.
     corpus2 = load_lichess_corpus(
         pgn_path, max_ply=64, min_ply=1, prepend_outcome=False,
@@ -209,24 +234,20 @@ def test_load_lichess_corpus_reparses_when_metadata_missing(
     next call must re-parse (not load the orphan .npz).
     """
     monkeypatch.setenv("PAWN_DATA_CACHE", str(tmp_path / "cache"))
-    pgn = """\
-[Event "t"]
-[White "a"]
-[Black "b"]
-[Result "1-0"]
-[WhiteElo "1800"]
-[BlackElo "1750"]
-
-1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 1-0
-"""
+    pgn = _make_lichess_pgn([
+        {
+            "white": "alice", "black": "bob", "result": "1-0",
+            "white_elo": 1800, "black_elo": 1750,
+            "moves": ["e4", "e5", "Nf3", "Nc6", "Bb5", "a6", "Ba4", "Nf6", "O-O", "Be7"],
+        },
+    ])
     pgn_path = tmp_path / "games.pgn"
     pgn_path.write_text(pgn)
 
     corpus1 = load_lichess_corpus(
         pgn_path, max_ply=64, min_ply=1, prepend_outcome=False,
     )
-    if corpus1.tokens.shape[0] == 0:
-        pytest.skip("Rust parser returned 0 games for inline PGN")
+    assert corpus1.tokens.shape[0] >= 1, "fixture should parse 1 game"
 
     # Locate the cache dir from the public root + the same key the
     # loader would derive. There's exactly one subdir under the
