@@ -97,21 +97,34 @@ def _cache_root() -> Path:
 
 
 def _cache_key(
-    pgn_path: Path, max_ply: int, min_ply: int, prepend_outcome: bool,
+    pgn_path: Path,
+    max_ply: int,
+    min_ply: int,
+    prepend_outcome: bool,
+    max_games: int,
 ) -> str:
     """Stable per-(pgn, params) cache key. Hashed so the path doesn't
-    leak source basenames + isn't filesystem-sensitive."""
+    leak source basenames + isn't filesystem-sensitive.
+
+    ``max_games`` is part of the key because the Rust parser truncates
+    at that count — a smaller call would otherwise silently hit a
+    larger-call cache (or vice versa).
+    """
     payload = (
         f"{pgn_path.resolve()}|max_ply={max_ply}|min_ply={min_ply}"
-        f"|prepend_outcome={prepend_outcome}"
+        f"|prepend_outcome={prepend_outcome}|max_games={max_games}"
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
 def _cache_dir(
-    pgn_path: Path, max_ply: int, min_ply: int, prepend_outcome: bool,
+    pgn_path: Path,
+    max_ply: int,
+    min_ply: int,
+    prepend_outcome: bool,
+    max_games: int,
 ) -> Path:
-    key = _cache_key(pgn_path, max_ply, min_ply, prepend_outcome)
+    key = _cache_key(pgn_path, max_ply, min_ply, prepend_outcome, max_games)
     return _cache_root() / key
 
 
@@ -149,7 +162,9 @@ def load_lichess_corpus(
     if not pgn_path.exists():
         raise FileNotFoundError(pgn_path)
 
-    cache_dir = _cache_dir(pgn_path, max_ply, min_ply, prepend_outcome)
+    cache_dir = _cache_dir(
+        pgn_path, max_ply, min_ply, prepend_outcome, max_games,
+    )
     npz_path = cache_dir / "games.npz"
     meta_path = cache_dir / "metadata.json"
 
@@ -176,8 +191,18 @@ def load_lichess_corpus(
 
     if use_cache:
         cache_dir.mkdir(parents=True, exist_ok=True)
+        # Atomic write: stage both files under .tmp siblings, fsync
+        # via os.replace, then rename metadata last. The load-side
+        # check requires *both* files to exist, so a kill between the
+        # two renames leaves the cache as a miss (which re-parses) —
+        # never a corrupt-but-readable .npz next to stale metadata.
+        # NB: np.savez_compressed appends ``.npz`` to filenames that
+        # don't already end in ``.npz``, so the tmp name keeps the
+        # extension to avoid landing as ``games.npz.tmp.npz``.
+        npz_tmp = cache_dir / "games.tmp.npz"
+        meta_tmp = cache_dir / "metadata.json.tmp"
         np.savez_compressed(
-            npz_path,
+            npz_tmp,
             tokens=corpus.tokens.astype(np.int32),
             attn_mask=corpus.attn_mask,
             targets=corpus.targets.astype(np.int32),
@@ -187,17 +212,20 @@ def load_lichess_corpus(
             black_elo=corpus.black_elo.astype(np.int32),
             result=corpus.result.astype(np.int8),
         )
-        with open(meta_path, "w", encoding="utf-8") as fh:
+        with open(meta_tmp, "w", encoding="utf-8") as fh:
             json.dump(
                 {
                     "pgn_path": str(pgn_path.resolve()),
                     "max_ply": int(max_ply),
                     "min_ply": int(min_ply),
                     "prepend_outcome": bool(prepend_outcome),
+                    "max_games": int(max_games),
                     "n_games": int(corpus.tokens.shape[0]),
                 },
                 fh, indent=2,
             )
+        os.replace(npz_tmp, npz_path)
+        os.replace(meta_tmp, meta_path)
     return corpus
 
 

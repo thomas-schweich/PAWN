@@ -377,7 +377,7 @@ class PAWNCLM(nn.Module):
         """Typed accessor for transformer layers (avoids ModuleList type erasure)."""
         return self.layers[i]  # type: ignore[return-value]
 
-    def _init_weights(self):
+    def _init_weights(self) -> None:
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.normal_(p, mean=0.0, std=0.02)

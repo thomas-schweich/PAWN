@@ -301,7 +301,7 @@ def init_train_state(
     )
 
 
-def compute_grad_norm(grads) -> jax.Array:
+def compute_grad_norm(grads: eqx.Module) -> jax.Array:
     """Global L2 grad-norm via per-leaf vdot then sum (``sqrt(Σ ‖gᵢ‖²)``).
 
     Cast each leaf to fp32 before squaring; the reduction stays fp32

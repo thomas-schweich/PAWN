@@ -247,11 +247,18 @@ def make_adapter_train_step(
         n_supervised = loss_mask.sum().astype(jnp.int32)
         has_supervision = n_supervised > 0
 
-        def _apply(args: tuple[eqx.Module, optax.OptState]) -> tuple[
-            eqx.Module, optax.OptState
-        ]:
-            trn_in, opt_in = args
-            updates, new_opt = optimizer.update(grads_filt, opt_in, params)
+        # Thread ``grads_filt`` through the ``lax.cond`` operand tuple
+        # rather than capturing it by closure. ``grads_filt`` is
+        # mutated by the pre-mask branch above (lines 231-239); a
+        # future refactor that moved the masking below the ``_apply``
+        # definition would silently feed unmasked grads to the
+        # optimizer if the closure pattern stayed. ``params`` is
+        # pure-functional w.r.t. the inputs, so it stays as a closure.
+        def _apply(args: tuple[
+            eqx.Module, optax.OptState, optax.Updates,
+        ]) -> tuple[eqx.Module, optax.OptState]:
+            trn_in, opt_in, grads_in = args
+            updates, new_opt = optimizer.update(grads_in, opt_in, params)
             if mask_filt is not None:
                 # Post-optimizer mask zeros the final update at
                 # frozen positions so AdamW's decoupled weight decay
@@ -269,13 +276,15 @@ def make_adapter_train_step(
             new_trn = eqx.apply_updates(trn_in, updates)
             return new_trn, new_opt
 
-        def _skip(args: tuple[eqx.Module, optax.OptState]) -> tuple[
-            eqx.Module, optax.OptState
-        ]:
-            return args
+        def _skip(args: tuple[
+            eqx.Module, optax.OptState, optax.Updates,
+        ]) -> tuple[eqx.Module, optax.OptState]:
+            trn_in, opt_in, _grads_in = args
+            return trn_in, opt_in
 
         new_trainable, new_opt_state = jax.lax.cond(
-            has_supervision, _apply, _skip, (state.trainable, state.opt_state)
+            has_supervision, _apply, _skip,
+            (state.trainable, state.opt_state, grads_filt),
         )
 
         new_step = state.step + jnp.where(

@@ -135,24 +135,26 @@ class RoSAModel(eqx.Module):
         scale = jnp.float32(self.rosa.cfg.scale)
         backbone_dtype = self.backbone.wq.dtype
 
-        deltas: dict[str, jax.Array | None] = {}
+        deltas: dict[str, jax.Array] = {}
         for tgt in _VALID_TARGETS:
             a = getattr(self.rosa, f"a_{tgt}")
             b = getattr(self.rosa, f"b_{tgt}")
             d = getattr(self.rosa, f"delta_{tgt}")
             m = getattr(self.rosa, f"mask_{tgt}")
+            sparse_delta = (d * m.astype(d.dtype)).astype(backbone_dtype)
             if a.shape[-1] == 0:
-                # Inactive target: LoRA delta vanishes; the sparse
-                # leg also has shape (L, d, d) but Δ = 0 + mask =
-                # False at init → contributes 0. Compose anyway so
-                # the forward shape stays uniform.
-                lora_delta = jnp.zeros_like(d)
+                # Inactive target: LoRA leg vanishes; skip the
+                # ``jnp.zeros_like(d)`` allocation entirely (a 16 MB
+                # fp32 buffer per call at SUPERNET scale, since XLA
+                # can't elide the zeros-of-a-traced-array). The
+                # sparse leg starts at Δ=0 + mask=False so it
+                # naturally contributes zero pre-Phase-2.
+                deltas[tgt] = sparse_delta
             else:
                 lora_delta = (scale * jnp.einsum("lir,lro->lio", a, b)).astype(
                     backbone_dtype,
                 )
-            sparse_delta = (d * m.astype(d.dtype)).astype(backbone_dtype)
-            deltas[tgt] = lora_delta + sparse_delta
+                deltas[tgt] = lora_delta + sparse_delta
 
         return eqx.tree_at(
             lambda m: (m.wq, m.wk, m.wv, m.wo),

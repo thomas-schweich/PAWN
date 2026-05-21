@@ -87,6 +87,7 @@ from pawn.adapters import (
     rosa_compute_phase2_mask,
     rosa_lora_only_adapter_filter,
     rosa_set_mask,
+    rosa_sparse_only_adapter_filter,
     specialized_clm_adapter_filter,
     sparse_adapter_filter,
     unfreeze_adapter_filter,
@@ -101,7 +102,12 @@ from pawn.config import (
 )
 from pawn.corpus import generate_corpus
 from pawn.model import PAWNModel, init_model, sliced
-from pawn.trainer import Batch, make_lr_schedule, make_optimizer
+from pawn.trainer import (
+    Batch,
+    cross_entropy_loss,
+    make_lr_schedule,
+    make_optimizer,
+)
 
 STRATEGIES = (
     "lora", "film", "unfreeze", "bottleneck",
@@ -246,23 +252,6 @@ def _build_rosa(
     return model, rosa_adapter_filter, None
 
 
-def _build_specialized_clm(
-    backbone: PAWNModel, args: argparse.Namespace, key: jax.Array,
-) -> BuildResult:
-    # specialized_clm doesn't wrap a backbone — it's a from-scratch
-    # PAWNModel at the small-baseline scale. We discard the
-    # sliced-backbone argument and use the strategy's config to
-    # build a fresh model.
-    del backbone
-    cfg = SpecializedCLMConfig(
-        d_model=args.specialized_d_model,
-        n_layers=args.specialized_n_layers,
-        n_heads=args.specialized_n_heads,
-        d_ff=args.specialized_d_ff,
-    )
-    return init_specialized_clm(cfg, key), specialized_clm_adapter_filter, None
-
-
 _BUILDERS: dict[str, Callable[[PAWNModel, argparse.Namespace, jax.Array], BuildResult]] = {
     "lora": _build_lora,
     "film": _build_film,
@@ -271,8 +260,12 @@ _BUILDERS: dict[str, Callable[[PAWNModel, argparse.Namespace, jax.Array], BuildR
     "hybrid": _build_hybrid,
     "sparse": _build_sparse,
     "rosa": _build_rosa,
-    "specialized_clm": _build_specialized_clm,
 }
+# ``specialized_clm`` is intentionally absent from ``_BUILDERS``: it
+# doesn't wrap a backbone, so ``main`` handles it via a special-case
+# branch that skips the ``init_model(supernet_cfg, ...)`` allocation
+# the builder pattern would otherwise require. See the dispatch site
+# below.
 
 
 def _strategy_config_dict(args: argparse.Namespace) -> dict[str, Any]:
@@ -462,9 +455,6 @@ def _compute_rosa_phase2_dl_ddelta(
     Returns ``{target: dL/dΔ_array}`` for each active target in
     ``rosa_model.rosa.cfg.targets``.
     """
-    from pawn.adapters.rosa import sparse_only_adapter_filter
-    from pawn.trainer import cross_entropy_loss
-
     cfg = rosa_model.rosa.cfg
     n_layers = rosa_model.backbone.cfg.n_layers
     d = rosa_model.backbone.cfg.d_model
@@ -473,7 +463,7 @@ def _compute_rosa_phase2_dl_ddelta(
     }
     primed = rosa_set_mask(rosa_model, all_true)
     trainable, frozen = eqx.partition(
-        primed, sparse_only_adapter_filter(primed),
+        primed, rosa_sparse_only_adapter_filter(primed),
     )
     tokens, attn_mask, targets, loss_mask = batch
 
@@ -808,8 +798,8 @@ def main(argv: list[str] | None = None) -> int:
     # all (it builds a from-scratch model from its `--specialized-*`
     # args), so we dispatch it without ever calling ``init_model`` on
     # the supernet — at SUPERNET scale this saves ~200 MB of needless
-    # allocation that init_model would otherwise burn just to be
-    # discarded by ``_build_specialized_clm``. Codex round-3 P2.
+    # allocation that the dispatch-table path would otherwise burn
+    # just to be discarded. Codex round-3 P2.
     key = jax.random.PRNGKey(model_seed)
     builder_key = jax.random.PRNGKey(model_seed + 1)
     if args.strategy == "specialized_clm":

@@ -162,11 +162,12 @@ uv run python scripts/train_jax_adapter.py --strategy specialized_clm \
 Key args:
 - `--strategy {lora,film,unfreeze,bottleneck,hybrid,sparse,rosa,specialized_clm}` — adapter strategy
 - `--supernet {tiny,supernet}`, `--variant` — backbone selection (ignored for `specialized_clm`)
-- `--rank`, `--lora-targets {q,k,v,o ...}`, `--lora-alpha` — LoRA / Hybrid / RoSA shape
-- `--rosa-warmup-frac`, `--rosa-top-k-frac` — RoSA phase boundaries + sparsity
+- `--rank`, `--lora-targets {q,k,v,o ...}`, `--lora-alpha` — LoRA / Hybrid shape
+- `--rank`, `--rosa-targets {q,k,v,o ...}`, `--lora-alpha`, `--rosa-warmup-frac`, `--rosa-top-k-frac` — RoSA shape + phase boundaries + sparsity
+- `--no-film-output` — FiLM / Hybrid: disable γ⊙h+β modulation on the lm_head output (default: enabled)
 - `--n-unfreeze`, `--include-lm-head`, `--include-embeddings` — Unfreeze
 - `--bottleneck-dim`, `--bottleneck-n-hidden` — Bottleneck
-- `--sparse-density`, `--sparse-hard` — Sparse
+- `--sparse-targets {q,k,v,o ...}`, `--sparse-density`, `--sparse-hard` — Sparse
 - `--specialized-d-model`, `--specialized-n-layers`, `--specialized-n-heads`, `--specialized-d-ff` — SpecializedCLM
 - `--total-steps`, `--batch-size`, `--seq-len`, `--k`, `--lr`, `--warmup-steps`
 - `--val-frac`, `--val-every` — held-out validation slice + frequency
@@ -228,7 +229,7 @@ The `.complete` sentinel contains SHA-256 hashes of every other file in the chec
 
 ## Logs
 
-Training metrics in `logs/` (gitignored). Each run gets a timestamped directory with `metrics.jsonl` and a per-pid suffix (e.g., `jax_run_20260520_140000_123456_<pid>/`).
+Training metrics in `logs/` (gitignored). Each run gets a timestamped directory with `metrics.jsonl`. The slug is `jax_run_<YYYYMMDD>_<HHMMSS>_<microseconds>_<pid>/` (e.g., `jax_run_20260520_140000_123456_78901/`).
 
 The trainer writes one JSON record per scan chunk. The config record at the top of the file includes every `ModelConfig` field for both the supernet and every variant, the run seed, and the resolved CLI flags.
 
@@ -281,7 +282,7 @@ bash deploy/pod.sh stop myexp   # preserves volume, stops billing
 bash deploy/pod.sh delete myexp # destroys everything
 ```
 
-GPU shortcuts: `a5000`, `a40`, `a6000`, `4090`, `5090`, `l40s`, `h100`. Pod configs are cached in `~/.config/pawn/pods/<name>.env`.
+GPU shortcuts: `a5000`, `a40`, `a6000`, `4090`, `5090`, `l40s`, `a100`, `a100-pcie`, `a100-sxm`, `h100`, `h200`. Pod configs are cached in `~/.config/pawn/pods/<name>.env`.
 
 ### Instance Lifecycle (vast.ai)
 

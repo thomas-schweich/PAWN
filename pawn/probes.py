@@ -754,7 +754,6 @@ def train_probes(
         for name in probe_names
     }
     max_ply = train_data.max_ply
-    perm_key = key
 
     for epoch in range(n_epochs):
         perm_key, sub = jax.random.split(perm_key)

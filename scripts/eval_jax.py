@@ -92,6 +92,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.quiet:
         print(f"[setup] {descr} cfg=d{model.cfg.d_model}_L{model.cfg.n_layers}")
 
+    if args.seq_len > model.cfg.max_seq_len:
+        raise SystemExit(
+            f"--seq-len={args.seq_len} exceeds model max_seq_len="
+            f"{model.cfg.max_seq_len}. Lower --seq-len or pick a model "
+            f"with a longer context window."
+        )
+
     t0 = time.perf_counter()
     corpus = generate_corpus(
         n_games=args.n_games,

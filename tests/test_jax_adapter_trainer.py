@@ -155,6 +155,129 @@ def test_backbone_weights_are_frozen() -> None:
         )
 
 
+_FROZEN_BACKBONE_FIELDS = (
+    "src_embed", "dst_embed", "promo_embed", "outcome_embed",
+    "attn_norm", "wq", "wk", "wv", "wo",
+    "ffn_norm", "w_gate", "w_up", "w_down",
+    "final_norm", "lm_head", "pad_embed",
+)
+
+
+def _make_strategy_setup(strategy: str) -> tuple:
+    """Build (model, state, frozen, train_step) for a given strategy at
+    TINY scale. Returns the same shape ``_setup`` returns minus the
+    eval_step. Mirrors the per-strategy dispatch in
+    ``scripts/train_jax_adapter._BUILDERS``.
+    """
+    from pawn.adapters import (
+        BottleneckConfig, FiLMConfig, HybridConfig, LoRAConfig,
+        RoSAConfig, SparseConfig,
+        bottleneck_adapter_filter, film_adapter_filter,
+        hybrid_adapter_filter, init_bottleneck_model, init_film_model,
+        init_hybrid_model, init_lora_model, init_rosa_model,
+        init_sparse_model, rosa_adapter_filter, sparse_adapter_filter,
+    )
+
+    key = jax.random.PRNGKey(0)
+    supernet = init_model(TINY_SUPERNET, key)
+    backbone = sliced(supernet, TINY_VARIANTS["base"])
+    builder_key = jax.random.PRNGKey(1)
+
+    if strategy == "lora":
+        model = init_lora_model(
+            backbone, LoRAConfig(rank=4, targets=("q", "v")), builder_key,
+        )
+        filter_fn = adapter_filter
+    elif strategy == "film":
+        model = init_film_model(
+            backbone, FiLMConfig(use_output_film=True), builder_key,
+        )
+        filter_fn = film_adapter_filter
+    elif strategy == "bottleneck":
+        model = init_bottleneck_model(
+            backbone, BottleneckConfig(bottleneck_dim=8, n_hidden=1),
+            builder_key,
+        )
+        filter_fn = bottleneck_adapter_filter
+    elif strategy == "hybrid":
+        model = init_hybrid_model(
+            backbone,
+            HybridConfig(
+                lora=LoRAConfig(rank=4, targets=("q", "v")),
+                film=FiLMConfig(use_output_film=True),
+            ),
+            builder_key,
+        )
+        filter_fn = hybrid_adapter_filter
+    elif strategy == "sparse":
+        model = init_sparse_model(
+            backbone, SparseConfig(targets=("q", "v"), density=0.1),
+            builder_key,
+        )
+        filter_fn = sparse_adapter_filter
+    elif strategy == "rosa":
+        # Phase 1 partition is rosa_adapter_filter (LoRA + sparse legs).
+        # Sparse leg starts with mask=False so it can't move backbone
+        # values; LoRA leg moves W_eff but never the underlying field.
+        model = init_rosa_model(
+            backbone, RoSAConfig(rank=4, targets=("q", "v")), builder_key,
+        )
+        filter_fn = rosa_adapter_filter
+    else:
+        raise ValueError(f"unknown strategy {strategy!r}")
+
+    opt = make_optimizer(1e-1)
+    state, frozen = init_adapter_state(
+        model, opt, adapter_filter_fn=filter_fn,
+    )
+    train_step = make_adapter_train_step(opt, frozen)
+    return model, state, frozen, train_step
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    ["lora", "film", "bottleneck", "hybrid", "sparse", "rosa"],
+)
+def test_backbone_weights_are_frozen_all_strategies(strategy: str) -> None:
+    """Same §6.1 contract as ``test_backbone_weights_are_frozen``, but
+    extended across every backbone-wrapping strategy. A regression in
+    any adapter's ``adapter_filter`` that lets even one backbone leaf
+    onto the trainable side surfaces here under 20 high-LR steps.
+
+    Skips ``unfreeze`` (covered by
+    ``test_gradient_mask_freezes_layers_through_train_step`` — has
+    partially-trainable backbone fields, different invariant) and
+    ``specialized_clm`` (no wrapped backbone — it's from-scratch).
+    """
+    model, state, frozen, train_step = _make_strategy_setup(strategy)
+    batch = _real_batch(b=4, t=16)
+    for _ in range(20):
+        state, _ = train_step(state, batch)
+
+    # Structural invariant: every backbone leaf on the trainable side
+    # stays None. This is the load-bearing partition guard.
+    for name in _FROZEN_BACKBONE_FIELDS:
+        assert getattr(state.trainable.backbone, name) is None, (
+            f"[{strategy}] state.trainable.backbone.{name} became "
+            f"non-None after 20 steps — the optimizer leaked into "
+            f"the backbone."
+        )
+
+    # Functional invariant: the recombined backbone is bit-equal to
+    # the original. Catches a hypothetical regression where the
+    # frozen-side leaves themselves were mutated (eg via a non-pure
+    # apply-update path).
+    reconstructed = eqx.combine(state.trainable, frozen)
+    for name in ("wq", "wk", "wv", "wo", "lm_head", "final_norm"):
+        original = getattr(model.backbone, name)
+        current = getattr(reconstructed.backbone, name)
+        assert jnp.array_equal(original, current), (
+            f"[{strategy}] reconstructed.backbone.{name} drifted "
+            f"from original — max diff = "
+            f"{float(jnp.abs(original - current).max())}"
+        )
+
+
 def test_lora_weights_actually_update() -> None:
     """Complementary to the frozen-backbone test: the LoRA params
     DO change. Pins gradient flow through the adapter path."""

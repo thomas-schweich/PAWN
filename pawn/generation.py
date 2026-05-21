@@ -109,8 +109,12 @@ class GenerationResult:
 
     All arrays are NumPy on host. ``sequences`` includes the conditioning
     outcome token at position 0 and the move tokens at positions
-    ``1..N``. After ``terminated_at[i]`` the sequence is padded with
-    ``PAD_TOKEN``.
+    ``1..N``. Under ``mask_illegal=True``, positions after
+    ``game_lengths[i]`` are filled with ``PAD_TOKEN``. Under
+    ``mask_illegal=False`` (used to measure premature-padding /
+    post-terminal continuation rates), terminated rows keep being
+    sampled and the tail carries the model's continued samples — see
+    ``_analyze_generated_games`` for the metrics that depend on this.
     """
 
     sequences: np.ndarray        # (n_games, max_seq_len) int32
