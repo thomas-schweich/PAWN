@@ -590,7 +590,7 @@ the canonical name.)
 | `use_output_film` (default `True`) | ~~`film_output` (polarity-flipped via `--no-film-output`)~~ — polarity flip is gratuitous. |
 | `no_adapt_attn` | ~~`bottleneck_no_attn`~~ — cosmetic prefixing. |
 | `no_adapt_ffn` | ~~`bottleneck_no_ffn`~~ — cosmetic prefixing. |
-| `d_model` / `n_layers` / `n_heads` (inside `SpecializedCLMConfig`) | ~~`specialized_d_model` / `specialized_n_layers` / `specialized_n_heads`~~ — the prefix isn't needed inside a per-strategy config. |
+| `d_model` / `n_layers` / `n_heads` / `d_ff` (inside `SpecializedCLMConfig`) | ~~`specialized_d_model` / `specialized_n_layers` / `specialized_n_heads` / `specialized_d_ff`~~ — the prefix isn't needed inside a per-strategy config. |
 
 ### 8.4 Substantive changes — KEPT (document; do not revert)
 
