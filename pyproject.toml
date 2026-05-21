@@ -66,6 +66,14 @@ lab = [
 # ``metrics.jsonl``. Enable per run via ``--wandb-mode online`` on
 # either training driver.
 wandb = ["wandb>=0.16.0"]
+# Data-pipeline scripts (Lichess parquet extraction, LC0 generation,
+# model-card rendering). Only the data-tool scripts in ``scripts/``
+# need these — the training + eval surface doesn't pull them in.
+data-tools = [
+    "polars>=1.0.0",
+    "jinja2>=3.0.0",
+    "zstandard>=0.20.0",  # extract_lichess_parquet reads zst archives
+]
 
 [build-system]
 requires = ["hatchling"]
