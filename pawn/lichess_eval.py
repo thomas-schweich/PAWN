@@ -98,6 +98,15 @@ def _cache_root() -> Path:
     return Path(base)
 
 
+# Bump when the on-disk cache layout or the materialised arrays'
+# semantics change. v2 is the first bump: round-4 fixed the
+# prepend_outcome=True loss_mask to include position 0 (the
+# outcome→m1 supervision step). Any v1 cache from before that
+# commit would silently return the old broken mask on hit; bumping
+# the version forces a re-parse on next load.
+_CACHE_VERSION = 2
+
+
 def _cache_key(
     pgn_path: Path,
     max_ply: int,
@@ -111,10 +120,15 @@ def _cache_key(
     ``max_games`` is part of the key because the Rust parser truncates
     at that count — a smaller call would otherwise silently hit a
     larger-call cache (or vice versa).
+
+    ``_CACHE_VERSION`` is part of the key so that any change to the
+    materialised arrays' shape or semantics invalidates stale caches
+    without manual cleanup.
     """
     payload = (
-        f"{pgn_path.resolve()}|max_ply={max_ply}|min_ply={min_ply}"
-        f"|prepend_outcome={prepend_outcome}|max_games={max_games}"
+        f"v{_CACHE_VERSION}|{pgn_path.resolve()}|max_ply={max_ply}"
+        f"|min_ply={min_ply}|prepend_outcome={prepend_outcome}"
+        f"|max_games={max_games}"
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
 

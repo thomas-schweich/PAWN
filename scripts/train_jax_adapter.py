@@ -653,6 +653,15 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             f"--val-frac={args.val_frac} must be in (0, 1)"
         )
+    # Used as the modulo divisor inside the chunk loop. ``--val-every 0``
+    # would crash with ZeroDivisionError on the first chunk, after
+    # corpus generation + JIT trace had already paid their cost.
+    # Codex round-5 P3.
+    if args.val_every <= 0:
+        raise SystemExit(
+            f"--val-every={args.val_every} must be positive (final-chunk-"
+            f"only validation: set --val-every >= --total-steps // --k)"
+        )
 
     # Variant resolution upfront so strategy validation (e.g.
     # --n-unfreeze ≤ variant.n_layers) can see the variant config

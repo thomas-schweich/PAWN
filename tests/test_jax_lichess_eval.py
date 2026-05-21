@@ -177,6 +177,57 @@ def _make_lichess_pgn(games: list[dict]) -> str:
     return "".join(parts)
 
 
+def test_materialise_prepend_outcome_true_includes_position_0() -> None:
+    """``_materialise(prepend_outcome=True)`` must include position 0
+    (outcome→m1) in the loss_mask. Layout is
+    ``[outcome, m1, ..., mN, PAD, ...]`` and ``targets[0] = m1`` is a
+    legitimate supervised step — the whole point of outcome
+    conditioning. A regression that reverted to ``pos >= 1`` would
+    silently drop the first-move supervision from every
+    outcome-prefixed eval; both bug-detector and test-risk in round 5
+    flagged this fix as untested.
+    """
+    from pawn.config import OUTCOME_TOKEN_BASE
+    from pawn.lichess_eval import _materialise
+
+    seq_len = 8
+    n_moves = 3
+    # Simulated Rust-parser output for one prepend_outcome=True game.
+    tokens = np.full((1, seq_len), PAD_TOKEN, dtype=np.int32)
+    tokens[0, 0] = OUTCOME_TOKEN_BASE     # any outcome token
+    tokens[0, 1:1 + n_moves] = [10, 11, 12]
+    parsed = {
+        "tokens": tokens.astype(np.int16),
+        "game_lengths": np.array([n_moves], dtype=np.int32),
+        "white_elo": [1500],
+        "black_elo": [1500],
+        "result": ["1-0"],
+    }
+    corpus = _materialise(parsed, seq_len, prepend_outcome=True)
+
+    # Positions 0..n_moves inclusive → n_moves + 1 supervised rows.
+    # The pre-fix `pos >= 1` cut would give n_moves rows; the
+    # current `pos <= game_lengths` form gives n_moves + 1.
+    assert int(corpus.loss_mask[0].sum()) == n_moves + 1, (
+        f"loss_mask sum={int(corpus.loss_mask[0].sum())}, expected "
+        f"{n_moves + 1} (regression would drop position 0 → "
+        f"{n_moves})"
+    )
+    # Position 0 specifically: outcome→m1 supervision must be active.
+    assert bool(corpus.loss_mask[0, 0]), (
+        "loss_mask[0, 0] is False — the outcome→m1 supervision step "
+        "is being dropped"
+    )
+    # Position n_moves (the terminal m_N→PAD slot) must also be
+    # supervised at the loss_mask level. (The eval-time mask in
+    # ``pawn.eval`` further drops it via the ``target < NUM_ACTIONS``
+    # AND — pinned separately.)
+    assert bool(corpus.loss_mask[0, n_moves]), (
+        f"loss_mask[0, {n_moves}] is False — the terminal "
+        "supervision step is missing"
+    )
+
+
 def test_load_lichess_corpus_round_trips_through_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
