@@ -283,6 +283,12 @@ def test_rosa_three_phase_writes_transition_log_and_completes(
         active-entry count + targets).
       * The training run completes without raising.
       * `metrics.jsonl` has rows for both Phase 1 and Phase 3.
+      * The ``step_end`` column is monotonically non-decreasing
+        across the phase boundary (the round-2 fix preserves
+        ``state.step`` across the Phase 2 → 3 re-init; without it
+        Phase 3 logs jump backwards to step 0).
+      * The final row's ``step_end`` equals ``--total-steps`` —
+        the run accounted for every training step.
     """
     _run(
         [
@@ -309,6 +315,20 @@ def test_rosa_three_phase_writes_transition_log_and_completes(
     ]
     # 4 chunks total at k=5: 2 Phase-1 + 2 Phase-3.
     assert len(rows) == 4
+    # Monotonic step_end across the phase boundary. Each row's
+    # step_end >= the previous row's step_end. Round-2 fix
+    # (state._replace(step=phase1_step)) is what keeps this true
+    # past chunk_i == rosa_warmup_chunks.
+    step_ends = [r["step_end"] for r in rows]
+    for i in range(1, len(step_ends)):
+        assert step_ends[i] >= step_ends[i - 1], (
+            f"non-monotonic step_end at row {i}: "
+            f"{step_ends[i - 1]} → {step_ends[i]}"
+        )
+    # Final row accounts for every training step requested.
+    assert step_ends[-1] == 20, (
+        f"final step_end={step_ends[-1]} != --total-steps=20"
+    )
 
 
 def test_rosa_zero_warmup_runs_single_phase(tmp_path: Path) -> None:
@@ -388,10 +408,9 @@ def test_film_default_preserves_output_modulation(tmp_path: Path) -> None:
         cfg = json.loads((latest / "config.json").read_text())
         # Both film and hybrid records use_output_film / film_output
         # under different keys.
-        if strat == "film":
-            assert cfg["strategy_config"]["use_output_film"] is True
-        else:  # hybrid
-            assert cfg["strategy_config"]["film_output"] is True
+        # FiLM and Hybrid now share the ``use_output_film`` key
+        # (round-6 hygiene normalisation).
+        assert cfg["strategy_config"]["use_output_film"] is True
 
 
 def test_film_no_output_opt_out(tmp_path: Path) -> None:
@@ -436,6 +455,28 @@ def test_rejects_no_op_unfreeze_upfront(tmp_path: Path) -> None:
         )
     leaked = list(tmp_path.glob("jax_adapter_run_*"))
     assert not leaked, f"no-op unfreeze validation leaked: {leaked}"
+
+
+def test_rejects_rosa_top_k_frac_out_of_range(tmp_path: Path) -> None:
+    """``--rosa-top-k-frac`` outside (0, 1] is rejected upfront with
+    no orphan run-dir. Test-risk round 6 flagged this as the only
+    driver-level guard without a pinning test."""
+    for bad in ("0", "1.5", "-0.1"):
+        with pytest.raises(SystemExit, match="rosa-top-k-frac"):
+            _run(
+                [
+                    "--strategy", "rosa",
+                    "--supernet", "tiny", "--variant", "base",
+                    "--rank", "4",
+                    "--rosa-top-k-frac", bad,
+                    "--total-steps", "10", "--k", "5",
+                    "--batch-size", "2", "--seq-len", "16",
+                    "--warmup-steps", "1", "--val-frac", "0.1",
+                ],
+                tmp_path,
+            )
+    leaked = list(tmp_path.glob("jax_adapter_run_*"))
+    assert not leaked, f"rosa-top-k-frac validation leaked: {leaked}"
 
 
 def test_rejects_negative_lora_alpha_upfront(tmp_path: Path) -> None:

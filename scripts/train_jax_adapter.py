@@ -284,7 +284,12 @@ def _strategy_config_dict(args: argparse.Namespace) -> dict[str, Any]:
             "alpha": args.lora_alpha,
         }
         if s == "hybrid":
-            d["film_output"] = args.film_output
+            # Match the FiLM strategy's config-key shape so a
+            # reader can grep ``use_output_film`` across all
+            # FiLM-bearing strategies (FiLM, Hybrid). Bug-detector
+            # round 6 flagged the prior asymmetry as cosmetic but
+            # awkward.
+            d["use_output_film"] = args.film_output
         return d
     if s == "film":
         return {"use_output_film": args.film_output}
