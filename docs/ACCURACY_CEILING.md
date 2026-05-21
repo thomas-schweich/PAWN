@@ -1,5 +1,15 @@
 # Theoretical Accuracy Ceiling
 
+> **v1 metrics — v2 publishing pending.** The benchmarks, training
+> curves, and configuration details in this doc were produced on the
+> v1 PyTorch training stack. v2 (JAX/Equinox supernet, see
+> `docs/jax-migration.md`) is feature-complete on the
+> `jax_migration` integration branch; v2 runs will republish to new
+> HF repos (`pawn-{small,base,large}-v2`) with fresh metrics. The
+> v1 numbers stay accurate for the v1 published checkpoints
+> (`thomas-schweich/pawn-{small,base,large}`).
+
+
 PAWN is trained on uniformly random chess games. At each position with
 N legal moves, the next move is drawn uniformly from those N moves, so
 the Bayes-optimal predictor (without outcome information) can do no

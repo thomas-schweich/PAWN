@@ -42,32 +42,45 @@ cd engine && uv run --with maturin maturin develop --release && cd ..
 uv sync --extra cu128   # NVIDIA GPU (or --extra rocm for AMD)
 ```
 
-### Train an adapter
+### Train an adapter (JAX, v2)
 
 Weights and data can be loaded directly from HuggingFace:
 
 ```bash
-uv run python scripts/train.py --run-type adapter --strategy bottleneck \
+uv run python scripts/train_jax_adapter.py --strategy bottleneck \
     --checkpoint thomas-schweich/pawn-base \
-    --pgn thomas-schweich/pawn-lichess-full \
     --bottleneck-dim 32 --lr 1e-4 --local-checkpoints
 ```
 
-### Pretrain from scratch
+All eight strategies dispatch via `--strategy`
+(`lora` / `film` / `unfreeze` / `bottleneck` / `hybrid` /
+`sparse` / `rosa` / `specialized_clm`). Pass `--config <path>` to
+drive the run from a JSON file validated through
+`pawn.run_config.AdapterConfig`.
 
-Random games are generated on-the-fly; no dataset required:
+### Pretrain the supernet from scratch
+
+Random games are generated on-the-fly; no dataset required. v2
+trains one supernet from which `pawn-{small,base,large}` are
+extracted as nested slices (see `docs/jax-migration.md` §5):
 
 ```bash
-uv run python scripts/train.py --variant base --local-checkpoints
+# Verification scale
+uv run python scripts/train_jax.py --supernet tiny \
+    --total-steps 1000 --batch-size 16 --seq-len 64 --k 50 \
+    --local-checkpoints
 
-# Or train all three variants simultaneously on shared data
-uv run python scripts/train.py --config configs/cotrain_three_variants.json
+# Production scale (override the 64 GB corpus guard)
+uv run python scripts/train_jax.py --supernet supernet \
+    --total-steps 100000 --batch-size 256 --seq-len 512 --k 50 \
+    --max-corpus-gb 128 --local-checkpoints
 ```
 
 ### Run probes and diagnostics
 
 ```bash
-uv run python scripts/eval_probes.py --log-dir logs --device cuda
+uv run python scripts/eval_probes_jax.py \
+    --checkpoint ~/.cache/huggingface/pawn-jax-converted/pawn-small
 uv run python -m pawn.dashboard --log-dir logs  # real-time monitoring
 ```
 
