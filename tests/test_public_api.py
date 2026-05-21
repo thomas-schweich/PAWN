@@ -61,22 +61,105 @@ def test_pawn_jax_core_public_surface() -> None:
 
 
 @pytest.mark.unit
-def test_pawn_jax_trainer_surface_lands_in_S6() -> None:
-    """Placeholder pin for the JAX trainer's public symbols. The
-    actual import-and-touch test goes live when S6 lands
-    ``pawn.trainer`` with ``Batch`` / ``TrainState`` / ``VariantSpec``
-    / ``make_{lr_schedule,optimizer,scan_step,train_step}``."""
-    pytest.skip("pawn.trainer JAX surface lands in S6 — see docs/jax-migration.md §13")
+def test_pawn_jax_trainer_public_surface() -> None:
+    """Pin the JAX trainer's public symbols (S6)."""
+    from pawn.trainer import (
+        Batch,
+        VariantSpec,
+        make_lr_schedule,
+        make_optimizer,
+        make_scan_step,
+        make_train_step,
+    )
+
+    _ = (
+        Batch,
+        VariantSpec,
+        make_lr_schedule,
+        make_optimizer,
+        make_scan_step,
+        make_train_step,
+    )
 
 
 @pytest.mark.unit
-def test_pawn_jax_adapters_surface_lands_in_S7() -> None:
-    """Placeholder pin for the JAX adapters' public symbols. The
-    actual import-and-touch test goes live when S7 lands
-    ``pawn.adapters`` with ``LoRAConfig`` / ``LoRAModel`` /
-    ``adapter_filter`` / ``init_lora_model`` (and the other 7
-    strategies)."""
-    pytest.skip("pawn.adapters JAX surface lands in S7 — see docs/jax-migration.md §13")
+def test_pawn_jax_adapters_public_surface() -> None:
+    """Pin the JAX adapters' public symbols (S7)."""
+    from pawn.adapters import (
+        BottleneckConfig,
+        FiLMConfig,
+        HybridConfig,
+        LoRAConfig,
+        RoSAConfig,
+        SparseConfig,
+        SpecializedCLMConfig,
+        UnfreezeConfig,
+        adapter_filter,
+        init_bottleneck_model,
+        init_film_model,
+        init_hybrid_model,
+        init_lora_model,
+        init_rosa_model,
+        init_sparse_model,
+        init_specialized_clm,
+        init_unfreeze_model,
+    )
+
+    _ = (
+        BottleneckConfig,
+        FiLMConfig,
+        HybridConfig,
+        LoRAConfig,
+        RoSAConfig,
+        SparseConfig,
+        SpecializedCLMConfig,
+        UnfreezeConfig,
+        adapter_filter,
+        init_bottleneck_model,
+        init_film_model,
+        init_hybrid_model,
+        init_lora_model,
+        init_rosa_model,
+        init_sparse_model,
+        init_specialized_clm,
+        init_unfreeze_model,
+    )
+
+
+@pytest.mark.unit
+def test_pawn_run_config_public_surface() -> None:
+    """Pin the pydantic config surface (S4)."""
+    from pawn.run_config import (
+        AdapterConfig,
+        BaseRunConfig,
+        PretrainConfig,
+        RunConfig,
+        SpecializedCLMConfig,
+    )
+
+    _ = (
+        AdapterConfig,
+        BaseRunConfig,
+        PretrainConfig,
+        RunConfig,
+        SpecializedCLMConfig,
+    )
+
+
+@pytest.mark.unit
+def test_pawn_logging_public_surface() -> None:
+    """Pin the MetricsLogger surface (S4)."""
+    from pawn.logging import MetricsLogger, get_git_info, random_slug
+
+    _ = (MetricsLogger, get_git_info, random_slug)
+
+
+@pytest.mark.unit
+def test_pawn_sweep_public_surface() -> None:
+    """Pin the Optuna sweep surface (S10)."""
+    from pawn.sweep import AdapterObjective, SUGGEST_FNS, create_study
+
+    _ = (AdapterObjective, SUGGEST_FNS, create_study)
 
 
 @pytest.mark.unit
