@@ -680,3 +680,109 @@ def test_validation_failures_do_not_create_run_dir(tmp_path: Path) -> None:
             _run(args, tmp_path)
     leaked = list(tmp_path.glob("jax_adapter_run_*"))
     assert not leaked, f"validation failures leaked run dirs: {leaked}"
+
+
+# ---------------------------------------------------------------------------
+# Lichess data path (--pgn) — the realistic adapter task
+# ---------------------------------------------------------------------------
+
+
+def _write_lichess_parquet(path: Path, n_games: int, plies: int) -> None:
+    """Write a synthetic Lichess-schema parquet for the --pgn path."""
+    pl = pytest.importorskip("polars")
+    from pawn.config import OUTCOME_TOKEN_BASE
+
+    rows = [
+        {
+            "tokens": [((g + p) % 1900) for p in range(plies)],
+            "game_length": plies,
+            "outcome_token": OUTCOME_TOKEN_BASE + (g % 5),
+            "white_elo": 1800 + (g % 50),
+            "black_elo": 1800 + ((g * 3) % 50),
+        }
+        for g in range(n_games)
+    ]
+    pl.DataFrame(
+        rows,
+        schema={
+            "tokens": pl.List(pl.Int32),
+            "game_length": pl.Int32,
+            "outcome_token": pl.Int32,
+            "white_elo": pl.Int32,
+            "black_elo": pl.Int32,
+        },
+    ).write_parquet(path)
+
+
+def test_lichess_pgn_path_trains_and_tiles(tmp_path: Path) -> None:
+    """``--pgn`` loads a finite Elo-filtered Lichess slice and tiles it
+    across epochs to fill ``total_steps * batch_size`` game-slots — the
+    realistic adapter task. Pins that the slice is loaded, the cache
+    is written, and training completes through MetricsLogger."""
+    pytest.importorskip("polars")
+    pq = tmp_path / "lichess.parquet"
+    # 24 games × 20 plies. With total_steps=10 k=5 batch_size=2 the
+    # trainer needs 20 train-game-slots; the ~21-game train pool
+    # (after the val split) is tiled to fill them.
+    _write_lichess_parquet(pq, n_games=24, plies=20)
+
+    _run(
+        [
+            "--strategy", "lora",
+            "--supernet", "tiny", "--variant", "base",
+            "--lora-rank", "4",
+            "--total-steps", "10", "--k", "5",
+            "--batch-size", "2", "--seq-len", "24",
+            "--warmup-steps", "1",
+            "--val-frac", "0.2", "--val-every", "1", "--quiet",
+            "--pgn", str(pq),
+            "--elo-min", "1800", "--elo-max", "2000", "--min-ply", "10",
+            "--cache-dir", str(tmp_path / "lcache"),
+        ],
+        tmp_path,
+    )
+    runs = list(tmp_path.glob("jax_adapter_run_*"))
+    assert len(runs) == 1
+    cfg = json.loads((runs[0] / "config.json").read_text())
+    # config.json records the data-source provenance.
+    assert cfg["data_source"] == "lichess"
+    assert cfg["elo_min"] == 1800
+    assert cfg["elo_max"] == 2000
+    # The tokenized-Lichess cache was written.
+    cache_entries = [p for p in (tmp_path / "lcache").iterdir() if p.is_dir()]
+    assert len(cache_entries) == 1
+    assert (cache_entries[0] / ".complete").exists()
+    # Training produced train + val rows through MetricsLogger.
+    rows = [
+        json.loads(line)
+        for line in (runs[0] / "metrics.jsonl").read_text().splitlines()
+    ]
+    assert sum(r["type"] == "train" for r in rows) == 2  # 10 steps / k=5
+    assert any(r["type"] == "val" for r in rows)
+    for r in rows:
+        if r["type"] == "train":
+            assert math.isfinite(r["train_loss_mean"])
+
+
+def test_lichess_pgn_path_rejects_oversmall_slice(tmp_path: Path) -> None:
+    """A Lichess slice too small to yield even one val batch fails
+    upfront with an actionable message, no orphan run dir."""
+    pytest.importorskip("polars")
+    pq = tmp_path / "lichess.parquet"
+    _write_lichess_parquet(pq, n_games=3, plies=20)
+    with pytest.raises(SystemExit, match="val"):
+        _run(
+            [
+                "--strategy", "lora",
+                "--supernet", "tiny", "--variant", "base",
+                "--lora-rank", "4",
+                "--total-steps", "10", "--k", "5",
+                "--batch-size", "8", "--seq-len", "24",
+                "--warmup-steps", "1",
+                "--val-frac", "0.1", "--val-every", "1", "--quiet",
+                "--pgn", str(pq),
+                "--cache-dir", str(tmp_path / "lcache"),
+            ],
+            tmp_path,
+        )
+    assert not list(tmp_path.glob("jax_adapter_run_*"))

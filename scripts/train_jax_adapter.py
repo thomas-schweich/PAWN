@@ -689,6 +689,51 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--corpus-seed", type=int, default=None)
     parser.add_argument("--model-seed", type=int, default=None)
     parser.add_argument("--max-corpus-gb", type=float, default=8.0)
+    # Data source. The default (no --pgn) trains on Rust-engine
+    # random games — a verification proxy. The real adapter task is
+    # human-move prediction on Elo-filtered Lichess games: pass
+    # ``--pgn <hf-repo|path>`` to load the canonical pre-tokenized
+    # Lichess parquet, optionally narrowed to an Elo band. The
+    # finite Lichess slice is tiled across epochs with a per-epoch
+    # permutation to fill ``total_steps * batch_size`` game-slots
+    # (docs/jax-migration.md §6).
+    parser.add_argument(
+        "--pgn", type=str, default=None,
+        help="Lichess data source — a HF dataset repo id "
+             "(e.g. thomas-schweich/pawn-lichess-full) or a local "
+             "parquet file / directory. Omit to train on Rust-engine "
+             "random games (the verification proxy). Needs the "
+             "`data-tools` extra (polars).",
+    )
+    parser.add_argument(
+        "--elo-min", type=int, default=None,
+        help="Lichess Elo-band lower bound (inclusive); both players "
+             "must satisfy it. Ignored unless --pgn is set.",
+    )
+    parser.add_argument(
+        "--elo-max", type=int, default=None,
+        help="Lichess Elo-band upper bound (exclusive); both players "
+             "must satisfy it. Ignored unless --pgn is set.",
+    )
+    parser.add_argument(
+        "--min-ply", type=int, default=10,
+        help="drop Lichess games shorter than this many plies. "
+             "Ignored unless --pgn is set.",
+    )
+    parser.add_argument(
+        "--max-games", type=int, default=None,
+        help="cap on distinct Lichess games loaded (None = the whole "
+             "filtered slice). Ignored unless --pgn is set.",
+    )
+    parser.add_argument(
+        "--pgn-split", type=str, default="train",
+        help="parquet split name for the --pgn source (default: train).",
+    )
+    parser.add_argument(
+        "--cache-dir", type=str, default=None,
+        help="root for the tokenized-Lichess cache. Defaults to "
+             "$HF_HOME/pawn-lichess-cache. Ignored unless --pgn is set.",
+    )
     parser.add_argument("--logs-dir", default="logs")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
@@ -784,56 +829,130 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         raise SystemExit(f"LR-schedule configuration error: {exc}") from exc
 
-    # Train + val games. Round n_train_games so we get exactly
-    # total_steps × batch_size, and add the val fraction on top.
+    # ``n_train_games`` is the fixed number of (possibly repeated)
+    # game-slots the K-step lax.scan consumes in one pass.
     n_train_games = args.total_steps * args.batch_size
-    n_val_games = max(1, int(n_train_games * args.val_frac))
-    # Round n_val_games to a multiple of batch_size so the eval loop
-    # processes whole batches.
-    n_val_games = (n_val_games // args.batch_size) * args.batch_size
-    if n_val_games == 0:
-        raise SystemExit(
-            f"--val-frac={args.val_frac} produces <1 batch of val games. "
-            "Increase --val-frac or --total-steps."
-        )
-    n_total = n_train_games + n_val_games
     bytes_per_game = args.seq_len * 10 + 1
-    estimated_gb = n_total * bytes_per_game / (1024 ** 3)
-    if estimated_gb > args.max_corpus_gb:
-        raise SystemExit(
-            f"corpus would need ~{estimated_gb:.2f} GiB > "
-            f"--max-corpus-gb={args.max_corpus_gb}"
+    variant_label = "from-scratch" if args.strategy == "specialized_clm" else args.variant
+
+    if args.pgn is not None:
+        # ---- Lichess path: a finite Elo-filtered slice ----
+        # The realistic adapter task. The slice is finite — usually
+        # smaller than n_train_games — so a held-out fraction becomes
+        # val and the rest is tiled across epochs (per-epoch shuffle)
+        # to fill the n_train_games slots (docs/jax-migration.md §6).
+        from pawn.lichess_data import (  # noqa: PLC0415
+            load_lichess_corpus,
+            make_epoch_schedule,
         )
 
-    variant_label = "from-scratch" if args.strategy == "specialized_clm" else args.variant
+        t0 = time.perf_counter()
+        print(
+            f"[corpus] loading Lichess slice from {args.pgn!r} "
+            f"(elo_min={args.elo_min}, elo_max={args.elo_max}, "
+            f"min_ply={args.min_ply})"
+        )
+        lichess = load_lichess_corpus(
+            args.pgn,
+            split=args.pgn_split,
+            elo_min=args.elo_min,
+            elo_max=args.elo_max,
+            min_ply=args.min_ply,
+            seq_len=args.seq_len,
+            max_games=args.max_games,
+            cache_dir=args.cache_dir,
+        )
+        m_games = lichess.n_games
+        # Held-out val pool — a fixed slice of the distinct games,
+        # rounded to a whole number of batches.
+        n_val_games = max(1, int(m_games * args.val_frac))
+        n_val_games = (n_val_games // args.batch_size) * args.batch_size
+        if n_val_games == 0:
+            raise SystemExit(
+                f"--pgn slice has {m_games} games; --val-frac="
+                f"{args.val_frac} yields <1 val batch. Widen the Elo "
+                f"band, raise --val-frac, or lower --batch-size."
+            )
+        n_train_pool = m_games - n_val_games
+        if n_train_pool <= 0:
+            raise SystemExit(
+                f"--pgn slice has {m_games} games — all consumed by the "
+                f"val split. Widen the Elo band or lower --val-frac."
+            )
+        estimated_gb = (
+            (n_train_games + n_val_games) * bytes_per_game / (1024 ** 3)
+        )
+        if estimated_gb > args.max_corpus_gb:
+            raise SystemExit(
+                f"corpus would need ~{estimated_gb:.2f} GiB > "
+                f"--max-corpus-gb={args.max_corpus_gb}"
+            )
+        # val = first n_val_games distinct games; train pool = the rest.
+        val_tokens = lichess.tokens[:n_val_games]
+        val_attn = lichess.attn_mask[:n_val_games]
+        val_targets = lichess.targets[:n_val_games]
+        val_loss = lichess.loss_mask[:n_val_games]
+        # Tile the train pool across epochs to fill n_train_games.
+        # NB: distinct name from the LR-schedule ``sched`` above —
+        # this is an int64 index array, not an optax schedule.
+        epoch_idx = make_epoch_schedule(
+            n_train_pool, n_train_games, seed=corpus_seed
+        )
+        # Offset into the post-val region of the slice.
+        train_idx = epoch_idx + n_val_games
+        train_tokens = lichess.tokens[train_idx]
+        train_attn = lichess.attn_mask[train_idx]
+        train_targets = lichess.targets[train_idx]
+        train_loss = lichess.loss_mask[train_idx]
+        n_epochs = (n_train_games + n_train_pool - 1) // n_train_pool
+        print(
+            f"[corpus] Lichess slice: {m_games} games "
+            f"({n_train_pool} train pool + {n_val_games} val); "
+            f"tiled across ~{n_epochs} epochs to fill {n_train_games} "
+            f"slots; done in {time.perf_counter() - t0:.1f}s"
+        )
+    else:
+        # ---- Random-game proxy path ----
+        n_val_games = max(1, int(n_train_games * args.val_frac))
+        n_val_games = (n_val_games // args.batch_size) * args.batch_size
+        if n_val_games == 0:
+            raise SystemExit(
+                f"--val-frac={args.val_frac} produces <1 batch of val "
+                f"games. Increase --val-frac or --total-steps."
+            )
+        n_total = n_train_games + n_val_games
+        estimated_gb = n_total * bytes_per_game / (1024 ** 3)
+        if estimated_gb > args.max_corpus_gb:
+            raise SystemExit(
+                f"corpus would need ~{estimated_gb:.2f} GiB > "
+                f"--max-corpus-gb={args.max_corpus_gb}"
+            )
+        t0 = time.perf_counter()
+        print(f"[corpus] generating {n_total} random games (seed={corpus_seed})")
+        corpus = generate_corpus(
+            n_games=n_total,
+            max_ply=args.seq_len,
+            seq_len=args.seq_len,
+            seed=corpus_seed,
+        )
+        print(f"[corpus] done in {time.perf_counter() - t0:.1f}s")
+        # Train / val split: first n_train, then n_val.
+        train_tokens = corpus.tokens[:n_train_games]
+        train_attn = corpus.attn_mask[:n_train_games]
+        train_targets = corpus.targets[:n_train_games]
+        train_loss = corpus.loss_mask[:n_train_games]
+        val_tokens = corpus.tokens[n_train_games:]
+        val_attn = corpus.attn_mask[n_train_games:]
+        val_targets = corpus.targets[n_train_games:]
+        val_loss = corpus.loss_mask[n_train_games:]
+
     print(
         f"[setup] strategy={args.strategy} supernet={args.supernet} "
         f"variant={variant_label} total_steps={args.total_steps} "
         f"K={args.k} B={args.batch_size} T={args.seq_len} "
-        f"n_train_games={n_train_games} n_val_games={n_val_games}"
+        f"n_train_games={n_train_games} n_val_games={n_val_games} "
+        f"data={'lichess' if args.pgn else 'random'}"
     )
-
-    t0 = time.perf_counter()
-    print(
-        f"[corpus] generating {n_total} games (seed={corpus_seed})"
-    )
-    corpus = generate_corpus(
-        n_games=n_total,
-        max_ply=args.seq_len,
-        seq_len=args.seq_len,
-        seed=corpus_seed,
-    )
-    print(f"[corpus] done in {time.perf_counter() - t0:.1f}s")
-
-    # Train / val split: first n_train, then n_val.
-    train_tokens = corpus.tokens[:n_train_games]
-    train_attn = corpus.attn_mask[:n_train_games]
-    train_targets = corpus.targets[:n_train_games]
-    train_loss = corpus.loss_mask[:n_train_games]
-    val_tokens = corpus.tokens[n_train_games:]
-    val_attn = corpus.attn_mask[n_train_games:]
-    val_targets = corpus.targets[n_train_games:]
-    val_loss = corpus.loss_mask[n_train_games:]
 
     # MetricsLogger owns the run directory + every metrics row. The
     # ``suffix`` puts the strategy name in the run-dir name so a logs/
@@ -873,6 +992,14 @@ def main(argv: list[str] | None = None) -> int:
         "seed": args.seed,
         "corpus_seed": corpus_seed,
         "model_seed": model_seed,
+        # Data-source provenance — a saved config.json should record
+        # exactly which games the run trained on.
+        "data_source": "lichess" if args.pgn else "random",
+        "pgn": args.pgn,
+        "elo_min": args.elo_min,
+        "elo_max": args.elo_max,
+        "min_ply": args.min_ply if args.pgn else None,
+        "max_games": args.max_games,
     }
     logger.write_config_json(**run_config)
     logger.log_config(**run_config)

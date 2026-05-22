@@ -163,6 +163,17 @@ def test_pawn_sweep_public_surface() -> None:
 
 
 @pytest.mark.unit
+def test_pawn_lichess_data_public_surface() -> None:
+    """Pin the Lichess adapter-training data surface (S17). PAWN is a
+    finetuning testbed — the Elo-stratified Lichess path is the
+    realistic adapter task, so its entry points stay pinned."""
+    from pawn.corpus import pack_corpus
+    from pawn.lichess_data import load_lichess_corpus, make_epoch_schedule
+
+    _ = (pack_corpus, load_lichess_corpus, make_epoch_schedule)
+
+
+@pytest.mark.unit
 def test_chess_engine_importable() -> None:
     """The Rust extension must build before the Python test suite runs."""
     import chess_engine  # type: ignore[import-not-found]

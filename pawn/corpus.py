@@ -253,3 +253,47 @@ def outcome_tokens(corpus: Corpus) -> NDArray[np.int32]:
     IDs (1969..1979). Useful for callers that want to optionally
     prepend the outcome at sequence position 0."""
     return corpus.outcome_offset.astype(np.int32) + OUTCOME_TOKEN_BASE
+
+
+def pack_corpus(
+    move_ids: NDArray[np.int32],
+    game_lengths: NDArray[np.int32],
+    outcome_offset: NDArray[np.uint8],
+    *,
+    seq_len: int,
+) -> Corpus:
+    """Pack already-tokenized games into a trainer-ready ``Corpus``.
+
+    Unlike ``generate_corpus`` — which calls the Rust random-game
+    engine — this takes games that were tokenized elsewhere (e.g. a
+    Lichess parquet slice read by ``pawn.lichess_data``) plus their
+    per-game outcome offsets, and produces the identical ``Corpus``
+    shape the JAX trainers consume. The outcome is supplied directly
+    (already classified) rather than derived from an engine
+    termination code.
+
+    Args:
+        move_ids: ``int32[N, max_ply]`` — per-game move tokens,
+            left-aligned, garbage/zero past ``game_lengths[i]``
+            (``_pack_clm`` masks the tail).
+        game_lengths: ``int32[N]`` — real move count per game.
+        outcome_offset: ``uint8[N]`` — outcome offset in
+            ``[0, N_OUTCOMES)`` (i.e. ``outcome_token -
+            OUTCOME_TOKEN_BASE``).
+        seq_len: packed tensor width; must be ``>= move_ids.shape[1]``.
+    """
+    if outcome_offset.shape[0] != game_lengths.shape[0]:
+        raise ValueError(
+            f"outcome_offset has {outcome_offset.shape[0]} entries but "
+            f"game_lengths has {game_lengths.shape[0]}"
+        )
+    tokens, attn_mask, targets, loss_mask = _pack_clm(
+        move_ids, game_lengths, seq_len
+    )
+    return Corpus(
+        tokens=tokens,
+        attn_mask=attn_mask,
+        targets=targets,
+        loss_mask=loss_mask,
+        outcome_offset=outcome_offset.astype(np.uint8),
+    )

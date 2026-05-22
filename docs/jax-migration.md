@@ -96,7 +96,7 @@ convergence.
 |---|---|---|
 | `pawn/model.py` — Equinox `PAWNModel` supernet | Rust `engine/` — all chess logic, tokenization, legal-mask replay | `pawn/cotrain.py` — supernet replaces it (§5) |
 | `pawn/trainer.py` — fused training loop | `deploy/`, Docker images | `pawn/gpu.py` — JAX manages its own GPU/SDPA backend |
-| `pawn/corpus.py` — corpus generation/loading | `pawn/lichess_cache.py`, `pawn/lichess_data.py` — Lichess parquet pipeline shared with eval | `cotrain` run-type in `scripts/train.py` |
+| `pawn/corpus.py` — corpus generation/loading; `pawn/lichess_data.py` — Lichess parquet → JAX `Corpus` (S17) | Rust `engine/` PGN parsing + tokenization | `cotrain` run-type in `scripts/train.py` |
 | `pawn/checkpoint.py` — PyTree serialization | | RoSA `retro-sparse`/`retro-bottleneck` modes |
 | `pawn/adapter_trainer.py` + `pawn/adapters/` — all 8 strategies | | `mask_samples` / `grad_alpha` RoSA mask-gen (replaced by one-shot grad-magnitude) |
 | `pawn/eval.py`, `pawn/probes.py`, `pawn/generation.py`, `pawn/lichess_eval.py` | | `bucket_size` (JAX trainer is shape-static) |
@@ -681,8 +681,7 @@ pawn/
 ├── generation.py            # generation diagnostics + KV-cache
 ├── lab/                     # OPTIONAL EXTRA: pawn-lab MCP server
 ├── legacy.py                # one-time PyTorch → JAX converter
-├── lichess_cache.py         # Lichess Elo-stratified tokenized cache
-├── lichess_data.py          # Lichess parquet pipeline (polars)
+├── lichess_data.py          # Lichess parquet → JAX Corpus + on-disk cache (S17)
 ├── lichess_eval.py          # Elo-stratified Maia-style accuracy eval
 ├── logging.py               # MetricsLogger (RESTORED)
 ├── model.py                 # Equinox PAWNModel
@@ -1092,6 +1091,46 @@ Chunks:
   LoRA adapter on a tiny Lichess slice, evaluate. Attach the
   output to the framework-swap PR.
 - **S16.3 Open framework-swap PR.** `jax_migration → main`.
+
+### S17 — Lichess adapter-training data path (post-S16 follow-up)
+
+S5.2 originally planned to keep v1's `pawn/lichess_cache.py` +
+`pawn/lichess_data.py` "as-is" as a framework-agnostic pipeline.
+That was wrong twice over: the modules are PyTorch-coupled
+(`torch.utils.data` Dataset + bucketed-collate, `torch.Tensor`
+output), and S16 deleted them as broken dead code without a
+replacement — which silently dropped PAWN's primary use case
+(adapter fine-tuning on Elo-stratified human Lichess games; PAWN
+*is* a finetuning testbed). S17 restores that capability JAX-native.
+
+Chunks:
+
+- **S17.1 `pawn/corpus.py` — `pack_corpus`.** A public packing
+  entry: pre-tokenized games (`move_ids` + `game_lengths` +
+  `outcome_offset`) → `Corpus`. `generate_corpus` is the
+  random-game path; `pack_corpus` is the shared back-end the
+  Lichess path also uses.
+- **S17.2 `pawn/lichess_data.py` (JAX-native rewrite).**
+  `load_lichess_corpus()` scans the canonical pre-tokenized
+  Lichess parquet (`thomas-schweich/pawn-lichess-full` or a local
+  path), filters by Elo band + `min_ply`, packs into a `Corpus`,
+  and caches the packed arrays under
+  `$HF_HOME/pawn-lichess-cache/<key>/` with a `pawn._sentinel`
+  `.complete` integrity sentinel. `make_epoch_schedule()` tiles
+  the finite slice across epochs with a per-epoch permutation
+  (§6). Polars is a lazy import — only this path needs it
+  (`data-tools` extra).
+- **S17.3 `scripts/train_jax_adapter.py` wiring.** `--pgn` +
+  `--elo-min` / `--elo-max` / `--min-ply` / `--max-games` /
+  `--pgn-split` / `--cache-dir`. With `--pgn`, the trainer loads
+  the Lichess slice, holds out `--val-frac` of the distinct
+  games as validation, and tiles the rest to fill
+  `total_steps × batch_size` train-game-slots. Without `--pgn`
+  the random-game proxy is unchanged.
+- **S17.4 Tests.** `tests/test_jax_lichess_data.py` (pack_corpus,
+  make_epoch_schedule, load_lichess_corpus filter/cache against a
+  synthetic parquet) + two `--pgn`-path cases in
+  `tests/scripts/test_train_jax_adapter.py`.
 
 ## 14. Resolved decisions
 
