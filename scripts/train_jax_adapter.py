@@ -876,131 +876,131 @@ def main(argv: list[str] | None = None) -> int:
     }
     logger.write_config_json(**run_config)
     logger.log_config(**run_config)
-
-    # Init: slice → wrap with the chosen adapter → partition for
-    # adapter training. specialized_clm doesn't need a backbone at
-    # all (it builds a from-scratch model from its `--specialized-*`
-    # args), so we dispatch it without ever calling ``init_model`` on
-    # the supernet — at SUPERNET scale this saves ~200 MB of needless
-    # allocation that the dispatch-table path would otherwise burn
-    # just to be discarded. Codex round-3 P2.
-    key = jax.random.PRNGKey(model_seed)
-    builder_key = jax.random.PRNGKey(model_seed + 1)
-    if args.strategy == "specialized_clm":
-        cfg = SpecializedCLMConfig(
-            d_model=args.specialized_d_model,
-            n_layers=args.specialized_n_layers,
-            n_heads=args.specialized_n_heads,
-            d_ff=args.specialized_d_ff,
-        )
-        model: eqx.Module = init_specialized_clm(cfg, builder_key)
-        filter_fn: Callable[..., eqx.Module] = specialized_clm_adapter_filter
-        gradient_mask: eqx.Module | None = None
-    else:
-        assert variant_cfg is not None  # guarded above; specialized_clm is the only None case
-        supernet = init_model(supernet_cfg, key)
-        backbone = sliced(supernet, variant_cfg)
-        build_fn = _BUILDERS[args.strategy]
-        model, filter_fn, gradient_mask = build_fn(
-            backbone, args, builder_key,
-        )
-    # RoSA Phase-1 override: when the three-phase schedule is active
-    # (``--rosa-warmup-frac > 0``), the warmup runs with the LoRA-only
-    # filter; only A, B accumulate gradients. The joint filter the
-    # builder returned applies after the Phase-2 mask gen
-    # (which happens inside the training loop). When
-    # ``--rosa-warmup-frac == 0`` the original joint filter is used
-    # from step 0 and the three-phase scheduler is a no-op.
-    # ``rosa_three_phase`` was pre-computed above as part of the
-    # validation pass.
-    if rosa_three_phase:
-        active_filter_fn: Callable[..., eqx.Module] = rosa_lora_only_adapter_filter
-    else:
-        active_filter_fn = filter_fn
-    optimizer = make_optimizer(sched)
-    state, frozen = init_adapter_state(
-        model, optimizer, adapter_filter_fn=active_filter_fn,
-    )
-    train_step = make_adapter_train_step(
-        optimizer, frozen, gradient_mask=gradient_mask,
-    )
-    scan = make_adapter_scan_step(train_step, args.k)
-    eval_step = make_eval_step(frozen)
-
-    n_chunks = args.total_steps // args.k
-    # ``rosa_warmup_chunks`` was pre-computed during the upfront
-    # validation pass when ``rosa_three_phase`` was True; for non-RoSA
-    # or zero-warmup runs it's 0 (no phase transition).
-    if not rosa_three_phase:
-        rosa_warmup_chunks = 0
-    if rosa_three_phase:
-        print(
-            f"[train] n_chunks={n_chunks} (K={args.k} steps each); "
-            f"RoSA Phase 1 = {rosa_warmup_chunks} chunks, "
-            f"Phase 3 = {n_chunks - rosa_warmup_chunks} chunks; "
-            f"top-k frac = {args.rosa_top_k_frac}"
-        )
-    else:
-        print(f"[train] n_chunks={n_chunks} (K={args.k} steps each)")
-
-    # Pre-shape train corpus into [N_chunks, K, B, T] views.
-    chunk_shape = (n_chunks, args.k, args.batch_size, args.seq_len)
-    train_tokens_chunks = train_tokens.reshape(chunk_shape)
-    train_attn_chunks = train_attn.reshape(chunk_shape)
-    train_targets_chunks = train_targets.reshape(chunk_shape)
-    train_loss_chunks = train_loss.reshape(chunk_shape)
-
-    def run_validation(trainable: eqx.Module) -> tuple[float, int]:
-        """Iterate the val set in batches, return (mean_loss, total_n).
-        We iterate on the host (eval is a one-shot diagnostic, not on
-        the critical path) and accumulate weighted by n_supervised."""
-        n = val_tokens.shape[0]
-        total_loss = 0.0
-        total_n = 0
-        for s in range(0, n, args.batch_size):
-            e = s + args.batch_size
-            batch = (
-                _stage(val_tokens[s:e]),
-                _stage(val_attn[s:e]),
-                _stage(val_targets[s:e]),
-                _stage(val_loss[s:e]),
-            )
-            m = eval_step(trainable, batch)
-            ns = int(m["n_supervised"])
-            total_loss += float(m["loss"]) * ns
-            total_n += ns
-        return (total_loss / max(total_n, 1), total_n)
-
-    # W&B init (local import keeps base install dependency-clean).
-    wandb_run = None
-    if args.wandb:
-        from pawn.wandb_utils import init_wandb  # noqa: PLC0415
-        wandb_run = init_wandb(
-            enabled=True,
-            project=args.wandb_project,
-            slug=run_dir.name,
-            run_dir=run_dir,
-            run_type="adapter",
-            config={
-                "strategy": args.strategy,
-                "supernet": args.supernet,
-                "variant": args.variant if args.strategy != "specialized_clm" else None,
-                "total_steps": args.total_steps,
-                "batch_size": args.batch_size,
-                "seq_len": args.seq_len,
-                "k": args.k,
-                "lr": args.lr,
-                "warmup_steps": args.warmup_steps,
-                "val_frac": args.val_frac,
-                "val_every": args.val_every,
-                "strategy_config": _strategy_config_dict(args),
-            },
-        )
-
-    best_val = float("inf")
-    wall0 = time.perf_counter()
-    step_start = 0
     try:
+
+        # Init: slice → wrap with the chosen adapter → partition for
+        # adapter training. specialized_clm doesn't need a backbone at
+        # all (it builds a from-scratch model from its `--specialized-*`
+        # args), so we dispatch it without ever calling ``init_model`` on
+        # the supernet — at SUPERNET scale this saves ~200 MB of needless
+        # allocation that the dispatch-table path would otherwise burn
+        # just to be discarded. Codex round-3 P2.
+        key = jax.random.PRNGKey(model_seed)
+        builder_key = jax.random.PRNGKey(model_seed + 1)
+        if args.strategy == "specialized_clm":
+            cfg = SpecializedCLMConfig(
+                d_model=args.specialized_d_model,
+                n_layers=args.specialized_n_layers,
+                n_heads=args.specialized_n_heads,
+                d_ff=args.specialized_d_ff,
+            )
+            model: eqx.Module = init_specialized_clm(cfg, builder_key)
+            filter_fn: Callable[..., eqx.Module] = specialized_clm_adapter_filter
+            gradient_mask: eqx.Module | None = None
+        else:
+            assert variant_cfg is not None  # guarded above; specialized_clm is the only None case
+            supernet = init_model(supernet_cfg, key)
+            backbone = sliced(supernet, variant_cfg)
+            build_fn = _BUILDERS[args.strategy]
+            model, filter_fn, gradient_mask = build_fn(
+                backbone, args, builder_key,
+            )
+        # RoSA Phase-1 override: when the three-phase schedule is active
+        # (``--rosa-warmup-frac > 0``), the warmup runs with the LoRA-only
+        # filter; only A, B accumulate gradients. The joint filter the
+        # builder returned applies after the Phase-2 mask gen
+        # (which happens inside the training loop). When
+        # ``--rosa-warmup-frac == 0`` the original joint filter is used
+        # from step 0 and the three-phase scheduler is a no-op.
+        # ``rosa_three_phase`` was pre-computed above as part of the
+        # validation pass.
+        if rosa_three_phase:
+            active_filter_fn: Callable[..., eqx.Module] = rosa_lora_only_adapter_filter
+        else:
+            active_filter_fn = filter_fn
+        optimizer = make_optimizer(sched)
+        state, frozen = init_adapter_state(
+            model, optimizer, adapter_filter_fn=active_filter_fn,
+        )
+        train_step = make_adapter_train_step(
+            optimizer, frozen, gradient_mask=gradient_mask,
+        )
+        scan = make_adapter_scan_step(train_step, args.k)
+        eval_step = make_eval_step(frozen)
+
+        n_chunks = args.total_steps // args.k
+        # ``rosa_warmup_chunks`` was pre-computed during the upfront
+        # validation pass when ``rosa_three_phase`` was True; for non-RoSA
+        # or zero-warmup runs it's 0 (no phase transition).
+        if not rosa_three_phase:
+            rosa_warmup_chunks = 0
+        if rosa_three_phase:
+            print(
+                f"[train] n_chunks={n_chunks} (K={args.k} steps each); "
+                f"RoSA Phase 1 = {rosa_warmup_chunks} chunks, "
+                f"Phase 3 = {n_chunks - rosa_warmup_chunks} chunks; "
+                f"top-k frac = {args.rosa_top_k_frac}"
+            )
+        else:
+            print(f"[train] n_chunks={n_chunks} (K={args.k} steps each)")
+
+        # Pre-shape train corpus into [N_chunks, K, B, T] views.
+        chunk_shape = (n_chunks, args.k, args.batch_size, args.seq_len)
+        train_tokens_chunks = train_tokens.reshape(chunk_shape)
+        train_attn_chunks = train_attn.reshape(chunk_shape)
+        train_targets_chunks = train_targets.reshape(chunk_shape)
+        train_loss_chunks = train_loss.reshape(chunk_shape)
+
+        def run_validation(trainable: eqx.Module) -> tuple[float, int]:
+            """Iterate the val set in batches, return (mean_loss, total_n).
+            We iterate on the host (eval is a one-shot diagnostic, not on
+            the critical path) and accumulate weighted by n_supervised."""
+            n = val_tokens.shape[0]
+            total_loss = 0.0
+            total_n = 0
+            for s in range(0, n, args.batch_size):
+                e = s + args.batch_size
+                batch = (
+                    _stage(val_tokens[s:e]),
+                    _stage(val_attn[s:e]),
+                    _stage(val_targets[s:e]),
+                    _stage(val_loss[s:e]),
+                )
+                m = eval_step(trainable, batch)
+                ns = int(m["n_supervised"])
+                total_loss += float(m["loss"]) * ns
+                total_n += ns
+            return (total_loss / max(total_n, 1), total_n)
+
+        # W&B init (local import keeps base install dependency-clean).
+        wandb_run = None
+        if args.wandb:
+            from pawn.wandb_utils import init_wandb  # noqa: PLC0415
+            wandb_run = init_wandb(
+                enabled=True,
+                project=args.wandb_project,
+                slug=run_dir.name,
+                run_dir=run_dir,
+                run_type="adapter",
+                config={
+                    "strategy": args.strategy,
+                    "supernet": args.supernet,
+                    "variant": args.variant if args.strategy != "specialized_clm" else None,
+                    "total_steps": args.total_steps,
+                    "batch_size": args.batch_size,
+                    "seq_len": args.seq_len,
+                    "k": args.k,
+                    "lr": args.lr,
+                    "warmup_steps": args.warmup_steps,
+                    "val_frac": args.val_frac,
+                    "val_every": args.val_every,
+                    "strategy_config": _strategy_config_dict(args),
+                },
+            )
+
+        best_val = float("inf")
+        wall0 = time.perf_counter()
+        step_start = 0
         for chunk_i in range(n_chunks):
             # RoSA Phase 2 → Phase 3 transition. Runs once, between
             # the warmup chunk and the first joint-training chunk.
@@ -1156,15 +1156,15 @@ def main(argv: list[str] | None = None) -> int:
                     f"grad_norm={train_row['grad_norm_mean']:.3f} dt={dt:.2f}s"
                 )
             step_start = step_end
+        if wandb_run is not None:
+            from pawn.wandb_utils import finish_wandb  # noqa: PLC0415
+            finish_wandb(wandb_run, exit_code=0)
+        print(
+            f"[done] total wall = {time.perf_counter() - wall0:.1f}s; "
+            f"best_val={best_val:.4f}; run_dir={run_dir}"
+        )
     finally:
         logger.close()
-    if wandb_run is not None:
-        from pawn.wandb_utils import finish_wandb  # noqa: PLC0415
-        finish_wandb(wandb_run, exit_code=0)
-    print(
-        f"[done] total wall = {time.perf_counter() - wall0:.1f}s; "
-        f"best_val={best_val:.4f}; run_dir={run_dir}"
-    )
     return 0
 
 

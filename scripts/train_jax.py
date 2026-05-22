@@ -384,70 +384,74 @@ def main(argv: list[str] | None = None) -> int:
     # — the dashboard reads this row for run metadata.
     logger.log_config(**run_config)
 
-    key = jax.random.PRNGKey(model_seed)
-    model = init_model(supernet_cfg, key)
-    optimizer = make_optimizer(sched)
-    state = init_train_state(model, optimizer)
-    train_step = make_train_step(optimizer, specs)
-    scan = make_scan_step(train_step, args.k)
+    # Everything past logger construction runs inside the try so a
+    # failure during model init / W&B setup / corpus reshape still
+    # closes the metrics file handle in the finally.
+    try:
+        key = jax.random.PRNGKey(model_seed)
+        model = init_model(supernet_cfg, key)
+        optimizer = make_optimizer(sched)
+        state = init_train_state(model, optimizer)
+        train_step = make_train_step(optimizer, specs)
+        scan = make_scan_step(train_step, args.k)
 
-    n_chunks = args.total_steps // args.k
-    print(f"[train] n_chunks={n_chunks} (K={args.k} steps each)")
+        n_chunks = args.total_steps // args.k
+        print(f"[train] n_chunks={n_chunks} (K={args.k} steps each)")
 
-    # Initialise W&B before the chunk loop so the run is registered
-    # before any metrics are pushed. The import is local so the base
-    # install (no ``wandb`` extra) doesn't pay an unused import.
-    wandb_run = None
-    if args.wandb:
-        from pawn.wandb_utils import init_wandb  # noqa: PLC0415
-        wandb_run = init_wandb(
-            enabled=True,
-            project=args.wandb_project,
-            slug=run_dir.name,
-            run_dir=run_dir,
-            run_type="pretrain",
-            config={
-                "supernet": args.supernet,
-                "total_steps": args.total_steps,
-                "batch_size": args.batch_size,
-                "seq_len": args.seq_len,
-                "k": args.k,
-                "lr": args.lr,
-                "warmup_steps": args.warmup_steps,
-                "seed": args.seed,
-                "corpus_seed": corpus_seed,
-                "model_seed": model_seed,
-                "supernet_cfg": dataclasses.asdict(supernet_cfg),
-                "variants": {
-                    name: dataclasses.asdict(cfg)
-                    for name, cfg in variants.items()
+        # Initialise W&B before the chunk loop so the run is registered
+        # before any metrics are pushed. The import is local so the base
+        # install (no ``wandb`` extra) doesn't pay an unused import.
+        wandb_run = None
+        if args.wandb:
+            from pawn.wandb_utils import init_wandb  # noqa: PLC0415
+            wandb_run = init_wandb(
+                enabled=True,
+                project=args.wandb_project,
+                slug=run_dir.name,
+                run_dir=run_dir,
+                run_type="pretrain",
+                config={
+                    "supernet": args.supernet,
+                    "total_steps": args.total_steps,
+                    "batch_size": args.batch_size,
+                    "seq_len": args.seq_len,
+                    "k": args.k,
+                    "lr": args.lr,
+                    "warmup_steps": args.warmup_steps,
+                    "seed": args.seed,
+                    "corpus_seed": corpus_seed,
+                    "model_seed": model_seed,
+                    "supernet_cfg": dataclasses.asdict(supernet_cfg),
+                    "variants": {
+                        name: dataclasses.asdict(cfg)
+                        for name, cfg in variants.items()
+                    },
                 },
-            },
+            )
+
+        # One-time reshape of the flat corpus into per-chunk views. The
+        # reshape is zero-copy on the contiguous C-order arrays the
+        # engine produces; per-chunk staging then becomes a single
+        # contiguous slice + jnp.asarray per field.
+        chunked_corpus = _ChunkedCorpus(
+            corpus.tokens,
+            corpus.attn_mask,
+            corpus.targets,
+            corpus.loss_mask,
+            n_chunks=n_chunks,
+            k=args.k,
+            batch_size=args.batch_size,
         )
 
-    # One-time reshape of the flat corpus into per-chunk views. The
-    # reshape is zero-copy on the contiguous C-order arrays the engine
-    # produces; per-chunk staging then becomes a single contiguous
-    # slice + jnp.asarray per field.
-    chunked_corpus = _ChunkedCorpus(
-        corpus.tokens,
-        corpus.attn_mask,
-        corpus.targets,
-        corpus.loss_mask,
-        n_chunks=n_chunks,
-        k=args.k,
-        batch_size=args.batch_size,
-    )
-
-    # Reset wall0 just before the chunk loop so ``wall_s`` in metrics
-    # rows reflects training time only — corpus generation + model
-    # init were already timed separately in their own phases.
-    wall0 = time.perf_counter()
-    # ``step_start`` is carried across iterations on the host so we
-    # never force a D2H read of ``state.step`` BEFORE dispatching
-    # the next ``scan`` — that would serialise compute / staging.
-    step_start = 0
-    try:
+        # Reset wall0 just before the chunk loop so ``wall_s`` in
+        # metrics rows reflects training time only — corpus generation
+        # + model init were already timed separately in their own
+        # phases.
+        wall0 = time.perf_counter()
+        # ``step_start`` is carried across iterations on the host so we
+        # never force a D2H read of ``state.step`` BEFORE dispatching
+        # the next ``scan`` — that would serialise compute / staging.
+        step_start = 0
         for chunk_i in range(n_chunks):
             chunk = chunked_corpus.stage(chunk_i)
             t_chunk = time.perf_counter()
@@ -493,12 +497,15 @@ def main(argv: list[str] | None = None) -> int:
                     f"dt={dt:.2f}s"
                 )
             step_start = step_end
+        if wandb_run is not None:
+            from pawn.wandb_utils import finish_wandb  # noqa: PLC0415
+            finish_wandb(wandb_run, exit_code=0)
+        print(
+            f"[done] total wall = {time.perf_counter() - wall0:.1f}s; "
+            f"run_dir={run_dir}"
+        )
     finally:
         logger.close()
-    if wandb_run is not None:
-        from pawn.wandb_utils import finish_wandb  # noqa: PLC0415
-        finish_wandb(wandb_run, exit_code=0)
-    print(f"[done] total wall = {time.perf_counter() - wall0:.1f}s; run_dir={run_dir}")
     return 0
 
 
