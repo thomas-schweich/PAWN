@@ -38,9 +38,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import datetime
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -57,6 +55,7 @@ from pawn.config import (
     ModelConfig,
 )
 from pawn.corpus import generate_corpus
+from pawn.logging import MetricsLogger
 from pawn.model import init_model
 from pawn.trainer import (
     Batch,
@@ -69,14 +68,12 @@ from pawn.trainer import (
 )
 
 
-def _slug() -> str:
-    """Collision-resistant run slug: timestamp at microsecond
-    resolution plus PID. Two concurrent runs from the same user
-    on the same host within the same second still get distinct
-    directories (PIDs differ); the microsecond suffix also covers
-    the rare same-PID sub-second loop case."""
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    return f"{ts}_{os.getpid()}"
+def _metrics_device() -> str:
+    """Return ``"gpu"`` if JAX is on an accelerator backend, else
+    ``"cpu"``. Controls whether ``MetricsLogger`` shells out to
+    nvidia-smi / rocm-smi for per-record GPU memory stats."""
+    backend = jax.default_backend()
+    return "cpu" if backend == "cpu" else "gpu"
 
 
 def _resolve_supernet(name: str) -> tuple[ModelConfig, dict[str, ModelConfig]]:
@@ -346,45 +343,46 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"[corpus] done in {time.perf_counter() - t0:.1f}s")
 
-    # Run directory created AFTER corpus succeeds so a corpus-time
-    # OOM / engine panic doesn't leave an orphaned ``jax_run_*``
-    # directory containing only a config.json with no metrics.
-    run_dir = Path(args.logs_dir) / f"jax_run_{_slug()}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = run_dir / "metrics.jsonl"
-    config_path = run_dir / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "supernet": args.supernet,
-                # ``asdict`` captures every ``ModelConfig`` field — vocab_size,
-                # max_seq_len, n_outcomes, rope_base — so the config file is
-                # always a complete record without needing to hand-track the
-                # field list.
-                "supernet_cfg": dataclasses.asdict(supernet_cfg),
-                # Serialise the full per-variant ModelConfig dicts, not
-                # just the variant names: ``TINY_VARIANTS["small"]`` might
-                # be redefined later, and a stale ``config.json`` referencing
-                # only "small" would silently reflect the current definition.
-                "variants": {
-                    name: dataclasses.asdict(cfg)
-                    for name, cfg in variants.items()
-                },
-                "total_steps": args.total_steps,
-                "batch_size": args.batch_size,
-                "seq_len": args.seq_len,
-                "k": args.k,
-                "lr": args.lr,
-                "warmup_steps": args.warmup_steps,
-                "seed": args.seed,
-                "corpus_seed": corpus_seed,
-                "model_seed": model_seed,
-                "estimated_corpus_gib": estimated_gb,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+    # MetricsLogger owns the run directory. It is instantiated AFTER
+    # corpus generation succeeds so a corpus-time OOM / engine panic
+    # doesn't leave an orphaned ``jax_run_*`` directory. Every
+    # metrics row goes through ``log_config`` / ``log_train`` — that
+    # is what gets the ``type`` discriminator, the absolute
+    # ``timestamp``, the ``slug`` / ``hostname`` / ``git_hash``
+    # baseline, and the psutil + GPU memory stats onto each record
+    # (``docs/jax-migration.md`` §8.2).
+    logger = MetricsLogger(
+        args.logs_dir, run_prefix="jax_run", device=_metrics_device(),
     )
+    run_dir = logger.run_dir
+    # ``config.json`` sidecar — the full ModelConfig record for the
+    # supernet + every variant, plus the resolved run params. ``asdict``
+    # captures every ``ModelConfig`` field (vocab_size, max_seq_len,
+    # n_outcomes, rope_base) so the file never goes stale against a
+    # later config-constant redefinition.
+    run_config = {
+        "run_type": "pretrain",
+        "supernet": args.supernet,
+        "supernet_cfg": dataclasses.asdict(supernet_cfg),
+        "variants": {
+            name: dataclasses.asdict(cfg)
+            for name, cfg in variants.items()
+        },
+        "total_steps": args.total_steps,
+        "batch_size": args.batch_size,
+        "seq_len": args.seq_len,
+        "k": args.k,
+        "lr": args.lr,
+        "warmup_steps": args.warmup_steps,
+        "seed": args.seed,
+        "corpus_seed": corpus_seed,
+        "model_seed": model_seed,
+        "estimated_corpus_gib": estimated_gb,
+    }
+    logger.write_config_json(**run_config)
+    # ``type: "config"`` baseline record at the head of metrics.jsonl
+    # — the dashboard reads this row for run metadata.
+    logger.log_config(**run_config)
 
     key = jax.random.PRNGKey(model_seed)
     model = init_model(supernet_cfg, key)
@@ -441,16 +439,15 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=args.batch_size,
     )
 
-    with metrics_path.open("w", encoding="utf-8") as mf:
-        # Reset wall0 just before the chunk loop so ``wall_s`` in
-        # metrics rows reflects training time only — corpus generation
-        # + model init were already timed separately in their own
-        # phases.
-        wall0 = time.perf_counter()
-        # ``step_start`` is carried across iterations on the host so we
-        # never force a D2H read of ``state.step`` BEFORE dispatching
-        # the next ``scan`` — that would serialise compute / staging.
-        step_start = 0
+    # Reset wall0 just before the chunk loop so ``wall_s`` in metrics
+    # rows reflects training time only — corpus generation + model
+    # init were already timed separately in their own phases.
+    wall0 = time.perf_counter()
+    # ``step_start`` is carried across iterations on the host so we
+    # never force a D2H read of ``state.step`` BEFORE dispatching
+    # the next ``scan`` — that would serialise compute / staging.
+    step_start = 0
+    try:
         for chunk_i in range(n_chunks):
             chunk = chunked_corpus.stage(chunk_i)
             t_chunk = time.perf_counter()
@@ -470,7 +467,6 @@ def main(argv: list[str] | None = None) -> int:
             row = {
                 "chunk": chunk_i,
                 "step_start": step_start,
-                "step_end": step_end,
                 "wall_s": time.perf_counter() - wall0,
                 "chunk_wall_s": dt,
                 "loss_mean": float(host_metrics["loss"].mean()),
@@ -482,13 +478,10 @@ def main(argv: list[str] | None = None) -> int:
             for key_, vals in host_metrics.items():
                 if key_.startswith("loss_d"):
                     row[f"{key_}_last"] = float(vals[-1])
-            mf.write(json.dumps(row) + "\n")
-            # Flush every 10 chunks (and on the final one) — at the
-            # critical path between scan calls, frequent fsync stalls
-            # can compound on networked filesystems. The buffered
-            # write is still durable on graceful exit.
-            if (chunk_i + 1) % 10 == 0 or chunk_i + 1 == n_chunks:
-                mf.flush()
+            # ``log_train`` stamps the ``type: "train"`` discriminator,
+            # ``step``, ``timestamp``, ``elapsed``, the psutil + GPU
+            # memory stats, and flushes per-record (SIGKILL-durable).
+            logger.log_train(step=step_end, **row)
             if wandb_run is not None:
                 from pawn.wandb_utils import log_metrics  # noqa: PLC0415
                 log_metrics(wandb_run, row, step=step_end)
@@ -500,6 +493,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"dt={dt:.2f}s"
                 )
             step_start = step_end
+    finally:
+        logger.close()
     if wandb_run is not None:
         from pawn.wandb_utils import finish_wandb  # noqa: PLC0415
         finish_wandb(wandb_run, exit_code=0)

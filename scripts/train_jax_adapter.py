@@ -40,9 +40,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import datetime
 import json
-import os
 import sys
 import time
 from collections.abc import Callable
@@ -101,6 +99,7 @@ from pawn.config import (
     ModelConfig,
 )
 from pawn.corpus import generate_corpus
+from pawn.logging import MetricsLogger
 from pawn.model import PAWNModel, init_model, sliced
 from pawn.trainer import (
     Batch,
@@ -115,9 +114,12 @@ STRATEGIES = (
 )
 
 
-def _slug() -> str:
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    return f"{ts}_{os.getpid()}"
+def _metrics_device() -> str:
+    """Return ``"gpu"`` if JAX is on an accelerator backend, else
+    ``"cpu"`` — controls whether ``MetricsLogger`` shells out to
+    nvidia-smi / rocm-smi for per-record GPU memory stats."""
+    backend = jax.default_backend()
+    return "cpu" if backend == "cpu" else "gpu"
 
 
 def _resolve_supernet(name: str) -> tuple[ModelConfig, dict[str, ModelConfig]]:
@@ -833,39 +835,47 @@ def main(argv: list[str] | None = None) -> int:
     val_targets = corpus.targets[n_train_games:]
     val_loss = corpus.loss_mask[n_train_games:]
 
-    run_dir = Path(args.logs_dir) / f"jax_adapter_run_{_slug()}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = run_dir / "metrics.jsonl"
-    config_path = run_dir / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "strategy": args.strategy,
-                "strategy_config": _strategy_config_dict(args),
-                "supernet": args.supernet,
-                "variant": variant_label,
-                "supernet_cfg": dataclasses.asdict(supernet_cfg),
-                "variant_cfg": (
-                    dataclasses.asdict(variant_cfg) if variant_cfg is not None else None
-                ),
-                "total_steps": args.total_steps,
-                "batch_size": args.batch_size,
-                "seq_len": args.seq_len,
-                "k": args.k,
-                "lr": args.lr,
-                "warmup_steps": args.warmup_steps,
-                "val_frac": args.val_frac,
-                "val_every": args.val_every,
-                "n_train_games": n_train_games,
-                "n_val_games": n_val_games,
-                "seed": args.seed,
-                "corpus_seed": corpus_seed,
-                "model_seed": model_seed,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+    # MetricsLogger owns the run directory + every metrics row. The
+    # ``suffix`` puts the strategy name in the run-dir name so a logs/
+    # listing is self-describing; the ``type`` discriminator,
+    # ``timestamp``, ``slug`` / ``hostname`` / ``git_hash`` baseline,
+    # and psutil + GPU memory stats land on every record
+    # (``docs/jax-migration.md`` §8.2). Created AFTER the corpus +
+    # train/val split succeed so a data-time failure leaves no
+    # orphaned run dir.
+    logger = MetricsLogger(
+        args.logs_dir,
+        run_prefix="jax_adapter_run",
+        device=_metrics_device(),
+        suffix=args.strategy,
     )
+    run_dir = logger.run_dir
+    run_config = {
+        "run_type": "adapter",
+        "strategy": args.strategy,
+        "strategy_config": _strategy_config_dict(args),
+        "supernet": args.supernet,
+        "variant": variant_label,
+        "supernet_cfg": dataclasses.asdict(supernet_cfg),
+        "variant_cfg": (
+            dataclasses.asdict(variant_cfg) if variant_cfg is not None else None
+        ),
+        "total_steps": args.total_steps,
+        "batch_size": args.batch_size,
+        "seq_len": args.seq_len,
+        "k": args.k,
+        "lr": args.lr,
+        "warmup_steps": args.warmup_steps,
+        "val_frac": args.val_frac,
+        "val_every": args.val_every,
+        "n_train_games": n_train_games,
+        "n_val_games": n_val_games,
+        "seed": args.seed,
+        "corpus_seed": corpus_seed,
+        "model_seed": model_seed,
+    }
+    logger.write_config_json(**run_config)
+    logger.log_config(**run_config)
 
     # Init: slice → wrap with the chosen adapter → partition for
     # adapter training. specialized_clm doesn't need a backbone at
@@ -988,9 +998,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     best_val = float("inf")
-    with metrics_path.open("w", encoding="utf-8") as mf:
-        wall0 = time.perf_counter()
-        step_start = 0
+    wall0 = time.perf_counter()
+    step_start = 0
+    try:
         for chunk_i in range(n_chunks):
             # RoSA Phase 2 → Phase 3 transition. Runs once, between
             # the warmup chunk and the first joint-training chunk.
@@ -1098,43 +1108,56 @@ def main(argv: list[str] | None = None) -> int:
             host_metrics = {
                 mk: np.asarray(v) for mk, v in chunk_metrics.items()
             }
-            row: dict[str, float | int | None] = {
+            train_row: dict[str, float | int] = {
                 "chunk": chunk_i,
                 "step_start": step_start,
-                "step_end": step_end,
                 "wall_s": time.perf_counter() - wall0,
                 "chunk_wall_s": dt,
                 "train_loss_mean": float(host_metrics["loss"].mean()),
                 "train_loss_last": float(host_metrics["loss"][-1]),
                 "grad_norm_mean": float(host_metrics["grad_norm"].mean()),
                 "grad_norm_max": float(host_metrics["grad_norm"].max()),
-                "val_loss": None,
-                "val_n": None,
             }
+            # ``log_train`` stamps ``type: "train"`` + step + timestamp
+            # + psutil/GPU stats and flushes per-record.
+            logger.log_train(step=step_end, **train_row)
+
             do_val = (
                 (chunk_i + 1) % args.val_every == 0
                 or chunk_i + 1 == n_chunks
             )
+            vloss: float | None = None
             if do_val:
                 vloss, vn = run_validation(state.trainable)
-                row["val_loss"] = vloss
-                row["val_n"] = vn
                 if vloss < best_val:
                     best_val = vloss
-            mf.write(json.dumps(row) + "\n")
-            if (chunk_i + 1) % 10 == 0 or chunk_i + 1 == n_chunks:
-                mf.flush()
+                # Per §8.5: adapter validation is a SEPARATE
+                # ``type: "val"`` record, not a val-column bolted onto
+                # the train row. That is the v1 schema the dashboard's
+                # train/val split keys on.
+                logger.log_val(
+                    step=step_end,
+                    chunk=chunk_i,
+                    val_loss=vloss,
+                    val_n=vn,
+                )
             if wandb_run is not None:
                 from pawn.wandb_utils import log_metrics  # noqa: PLC0415
-                log_metrics(wandb_run, row, step=step_end)
+                # W&B has no ``type`` discriminator — log the combined
+                # train + val view under one step.
+                wandb_row: dict[str, float | int | None] = dict(train_row)
+                wandb_row["val_loss"] = vloss
+                log_metrics(wandb_run, wandb_row, step=step_end)
             if not args.quiet:
-                vs = f" val={row['val_loss']:.4f}" if row["val_loss"] is not None else ""
+                vs = f" val={vloss:.4f}" if vloss is not None else ""
                 print(
                     f"[chunk {chunk_i + 1}/{n_chunks}] step={step_end} "
-                    f"train_loss={row['train_loss_mean']:.4f}{vs} "
-                    f"grad_norm={row['grad_norm_mean']:.3f} dt={dt:.2f}s"
+                    f"train_loss={train_row['train_loss_mean']:.4f}{vs} "
+                    f"grad_norm={train_row['grad_norm_mean']:.3f} dt={dt:.2f}s"
                 )
             step_start = step_end
+    finally:
+        logger.close()
     if wandb_run is not None:
         from pawn.wandb_utils import finish_wandb  # noqa: PLC0415
         finish_wandb(wandb_run, exit_code=0)

@@ -51,7 +51,7 @@ def _run(args: list[str], tmp_path: Path) -> None:
 _GOOD_BASE = [
     "--supernet", "tiny",
     "--variant", "base",
-    "--rank", "4",
+    "--lora-rank", "4",
     "--total-steps", "10",
     "--k", "5",
     "--batch-size", "2",
@@ -70,7 +70,7 @@ def test_rejects_batch_size_zero(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="--batch-size"):
         _run(
             [
-                "--supernet", "tiny", "--variant", "base", "--rank", "4",
+                "--supernet", "tiny", "--variant", "base", "--lora-rank", "4",
                 "--total-steps", "10", "--k", "5",
                 "--batch-size", "0", "--seq-len", "16",
                 "--warmup-steps", "1", "--val-frac", "0.1",
@@ -83,7 +83,7 @@ def test_rejects_seq_len_zero(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="--seq-len"):
         _run(
             [
-                "--supernet", "tiny", "--variant", "base", "--rank", "4",
+                "--supernet", "tiny", "--variant", "base", "--lora-rank", "4",
                 "--total-steps", "10", "--k", "5",
                 "--batch-size", "2", "--seq-len", "0",
                 "--warmup-steps", "1", "--val-frac", "0.1",
@@ -96,7 +96,7 @@ def test_rejects_total_steps_not_multiple_of_k(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="multiple of"):
         _run(
             [
-                "--supernet", "tiny", "--variant", "base", "--rank", "4",
+                "--supernet", "tiny", "--variant", "base", "--lora-rank", "4",
                 "--total-steps", "7", "--k", "3",
                 "--batch-size", "2", "--seq-len", "16",
                 "--warmup-steps", "1", "--val-frac", "0.1",
@@ -106,10 +106,10 @@ def test_rejects_total_steps_not_multiple_of_k(tmp_path: Path) -> None:
 
 
 def test_rejects_rank_zero(tmp_path: Path) -> None:
-    with pytest.raises(SystemExit, match="--rank"):
+    with pytest.raises(SystemExit, match="--lora-rank"):
         _run(
             [
-                "--supernet", "tiny", "--variant", "base", "--rank", "0",
+                "--supernet", "tiny", "--variant", "base", "--lora-rank", "0",
                 "--total-steps", "10", "--k", "5",
                 "--batch-size", "2", "--seq-len", "16",
                 "--warmup-steps", "1", "--val-frac", "0.1",
@@ -122,7 +122,7 @@ def test_rejects_unknown_variant(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="--variant"):
         _run(
             [
-                "--supernet", "tiny", "--variant", "huge", "--rank", "4",
+                "--supernet", "tiny", "--variant", "huge", "--lora-rank", "4",
                 "--total-steps", "10", "--k", "5",
                 "--batch-size", "2", "--seq-len", "16",
                 "--warmup-steps", "1", "--val-frac", "0.1",
@@ -136,7 +136,7 @@ def test_rejects_val_frac_out_of_range(tmp_path: Path) -> None:
         with pytest.raises(SystemExit, match="--val-frac"):
             _run(
                 [
-                    "--supernet", "tiny", "--variant", "base", "--rank", "4",
+                    "--supernet", "tiny", "--variant", "base", "--lora-rank", "4",
                     "--total-steps", "10", "--k", "5",
                     "--batch-size", "2", "--seq-len", "16",
                     "--warmup-steps", "1", "--val-frac", v,
@@ -154,7 +154,7 @@ def test_rejects_val_every_zero(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="--val-every"):
         _run(
             [
-                "--supernet", "tiny", "--variant", "base", "--rank", "4",
+                "--supernet", "tiny", "--variant", "base", "--lora-rank", "4",
                 "--total-steps", "10", "--k", "5",
                 "--batch-size", "2", "--seq-len", "16",
                 "--warmup-steps", "1", "--val-frac", "0.1",
@@ -172,7 +172,7 @@ def test_rejects_seq_len_exceeding_max(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="seq-len"):
         _run(
             [
-                "--supernet", "tiny", "--variant", "base", "--rank", "4",
+                "--supernet", "tiny", "--variant", "base", "--lora-rank", "4",
                 "--total-steps", "10", "--k", "5",
                 "--batch-size", "2", "--seq-len", "9999",
                 "--warmup-steps", "1", "--val-frac", "0.1",
@@ -185,7 +185,7 @@ def test_rejects_bad_lr_schedule(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="LR-schedule"):
         _run(
             [
-                "--supernet", "tiny", "--variant", "base", "--rank", "4",
+                "--supernet", "tiny", "--variant", "base", "--lora-rank", "4",
                 "--total-steps", "10", "--k", "5",
                 "--batch-size", "2", "--seq-len", "16",
                 "--warmup-steps", "10",       # warmup == total
@@ -202,7 +202,7 @@ def test_happy_path_writes_metrics_and_config(tmp_path: Path) -> None:
     least one val row, and the run dir slug pattern is stable."""
     _run(
         [
-            "--supernet", "tiny", "--variant", "base", "--rank", "4",
+            "--supernet", "tiny", "--variant", "base", "--lora-rank", "4",
             "--total-steps", "50", "--k", "10",
             "--batch-size", "2", "--seq-len", "16",
             "--warmup-steps", "5", "--val-frac", "0.1",
@@ -226,30 +226,36 @@ def test_happy_path_writes_metrics_and_config(tmp_path: Path) -> None:
         json.loads(line)
         for line in (rd / "metrics.jsonl").read_text().splitlines()
     ]
-    # 50 steps / k=10 = 5 chunks; --val-every 2 + final = 3 val rows.
-    assert len(rows) == 5
-    val_rows = [r for r in rows if r["val_loss"] is not None]
+    # MetricsLogger schema: a ``type: "config"`` header, one
+    # ``type: "train"`` row per chunk (50 / k=10 = 5 chunks), and a
+    # SEPARATE ``type: "val"`` row per validation point (§8.5 — val
+    # is its own record, not a column on the train row).
+    config_rows = [r for r in rows if r["type"] == "config"]
+    train_rows = [r for r in rows if r["type"] == "train"]
+    val_rows = [r for r in rows if r["type"] == "val"]
+    assert len(config_rows) == 1
+    assert len(train_rows) == 5
     assert len(val_rows) >= 2
-    for r in rows:
+    for r in train_rows:
         assert math.isfinite(r["train_loss_mean"])
         assert math.isfinite(r["grad_norm_mean"])
-        if r["val_loss"] is not None:
-            assert math.isfinite(r["val_loss"])
+    for r in val_rows:
+        assert math.isfinite(r["val_loss"])
 
 
 _STRATEGY_EXTRA_ARGS: dict[str, list[str]] = {
-    "lora": ["--rank", "4"],
+    "lora": ["--lora-rank", "4"],
     "film": [],
     "unfreeze": ["--n-unfreeze", "1"],
     "bottleneck": ["--bottleneck-dim", "8"],
-    "hybrid": ["--rank", "4"],
-    "sparse": ["--sparse-density", "0.1"],
-    "rosa": ["--rank", "4"],
+    "hybrid": ["--lora-rank", "4"],
+    "sparse": ["--density", "0.1"],
+    "rosa": ["--lora-rank", "4"],
     "specialized_clm": [
-        "--specialized-d-model", "64",
-        "--specialized-n-layers", "2",
-        "--specialized-n-heads", "2",
-        "--specialized-d-ff", "128",
+        "--d-model", "64",
+        "--n-layers", "2",
+        "--n-heads", "2",
+        "--d-ff", "128",
     ],
 }
 
@@ -263,7 +269,8 @@ def test_each_strategy_dispatch_runs(strategy: str, tmp_path: Path) -> None:
     without raising. The 8th strategy (``specialized_clm``) is the
     only one that doesn't slice a supernet — its dispatch ignores
     ``--variant`` and builds a from-scratch model from the
-    ``--specialized-*`` hyperparams."""
+    ``--d-model`` / ``--n-layers`` / ``--n-heads`` / ``--d-ff``
+    hyperparams (§8.3 — no ``specialized_`` prefix)."""
     args = [
         "--strategy", strategy,
         "--supernet", "tiny", "--variant", "base",
@@ -284,13 +291,16 @@ def test_each_strategy_dispatch_runs(strategy: str, tmp_path: Path) -> None:
         assert cfg["variant_cfg"] is None
     else:
         assert cfg["variant"] == "base"
-    # At least one training row + one val row.
+    # At least one ``type: "train"`` row + the ``type: "config"``
+    # header. (val rows depend on --val-every; not asserted here.)
     rows = [
         json.loads(line)
         for line in (runs[0] / "metrics.jsonl").read_text().splitlines()
     ]
-    assert len(rows) == 2
-    for r in rows:
+    train_rows = [r for r in rows if r["type"] == "train"]
+    assert len(train_rows) >= 1
+    assert any(r["type"] == "config" for r in rows)
+    for r in train_rows:
         assert math.isfinite(r["train_loss_mean"])
         assert math.isfinite(r["grad_norm_mean"])
 
@@ -305,19 +315,20 @@ def test_rosa_three_phase_writes_transition_log_and_completes(
       * The Phase 2 → 3 transition log line appears once (announces
         active-entry count + targets).
       * The training run completes without raising.
-      * `metrics.jsonl` has rows for both Phase 1 and Phase 3.
-      * The ``step_end`` column is monotonically non-decreasing
-        across the phase boundary (the round-2 fix preserves
+      * `metrics.jsonl` has ``type: "train"`` rows for both Phase 1
+        and Phase 3.
+      * The ``step`` column is monotonically non-decreasing across
+        the phase boundary (the round-2 fix preserves
         ``state.step`` across the Phase 2 → 3 re-init; without it
         Phase 3 logs jump backwards to step 0).
-      * The final row's ``step_end`` equals ``--total-steps`` —
+      * The final train row's ``step`` equals ``--total-steps`` —
         the run accounted for every training step.
     """
     _run(
         [
             "--strategy", "rosa",
             "--supernet", "tiny", "--variant", "small",
-            "--rank", "4",
+            "--lora-rank", "4",
             "--total-steps", "20", "--k", "5",
             "--batch-size", "2", "--seq-len", "16",
             "--warmup-steps", "2", "--val-frac", "0.25",
@@ -336,21 +347,23 @@ def test_rosa_three_phase_writes_transition_log_and_completes(
         json.loads(line)
         for line in (runs[0] / "metrics.jsonl").read_text().splitlines()
     ]
-    # 4 chunks total at k=5: 2 Phase-1 + 2 Phase-3.
-    assert len(rows) == 4
-    # Monotonic step_end across the phase boundary. Each row's
-    # step_end >= the previous row's step_end. Round-2 fix
+    # 4 chunks total at k=5: 2 Phase-1 + 2 Phase-3 ``type: "train"``
+    # rows (plus the config header + per-chunk val rows).
+    train_rows = [r for r in rows if r["type"] == "train"]
+    assert len(train_rows) == 4
+    # Monotonic ``step`` across the phase boundary. Each train row's
+    # ``step`` >= the previous train row's. The round-2 fix
     # (state._replace(step=phase1_step)) is what keeps this true
     # past chunk_i == rosa_warmup_chunks.
-    step_ends = [r["step_end"] for r in rows]
+    step_ends = [r["step"] for r in train_rows]
     for i in range(1, len(step_ends)):
         assert step_ends[i] >= step_ends[i - 1], (
-            f"non-monotonic step_end at row {i}: "
+            f"non-monotonic step at train row {i}: "
             f"{step_ends[i - 1]} → {step_ends[i]}"
         )
-    # Final row accounts for every training step requested.
+    # Final train row accounts for every training step requested.
     assert step_ends[-1] == 20, (
-        f"final step_end={step_ends[-1]} != --total-steps=20"
+        f"final step={step_ends[-1]} != --total-steps=20"
     )
 
 
@@ -363,7 +376,7 @@ def test_rosa_zero_warmup_runs_single_phase(tmp_path: Path) -> None:
         [
             "--strategy", "rosa",
             "--supernet", "tiny", "--variant", "small",
-            "--rank", "4",
+            "--lora-rank", "4",
             "--total-steps", "10", "--k", "5",
             "--batch-size", "2", "--seq-len", "16",
             "--warmup-steps", "1", "--val-frac", "0.5",
@@ -391,7 +404,7 @@ def test_rosa_warmup_frac_too_large_rejected(tmp_path: Path) -> None:
             [
                 "--strategy", "rosa",
                 "--supernet", "tiny", "--variant", "small",
-                "--rank", "4",
+                "--lora-rank", "4",
                 "--total-steps", "10", "--k", "5",
                 "--batch-size", "2", "--seq-len", "16",
                 "--warmup-steps", "1", "--val-frac", "0.5",
@@ -407,17 +420,17 @@ def test_rosa_warmup_frac_too_large_rejected(tmp_path: Path) -> None:
 
 def test_film_default_preserves_output_modulation(tmp_path: Path) -> None:
     """Default `--strategy film` and `--strategy hybrid` invocations
-    (no `--no-film-output` flag) preserve the library default:
-    ``FiLMConfig.use_output_film == True``. Pre-fix (Codex round-5 P2),
-    the driver's `--film-output` flag was store_true with default
-    False — inverting the library default and silently shrinking the
-    adapter for the common no-flag invocation."""
+    (no `--no-use-output-film` flag) preserve the v1-canonical
+    default: ``FiLMConfig.use_output_film == True`` (§8.3 — the v2
+    ``--no-film-output`` polarity flip was reverted; the CLI now
+    uses a ``BooleanOptionalAction --use-output-film`` defaulting
+    True)."""
     for strat in ("film", "hybrid"):
         _run(
             [
                 "--strategy", strat,
                 "--supernet", "tiny", "--variant", "base",
-                "--rank", "4",
+                "--lora-rank", "4",
                 "--total-steps", "5", "--k", "5",
                 "--batch-size", "2", "--seq-len", "16",
                 "--warmup-steps", "1", "--val-frac", "0.5",
@@ -437,13 +450,14 @@ def test_film_default_preserves_output_modulation(tmp_path: Path) -> None:
 
 
 def test_film_no_output_opt_out(tmp_path: Path) -> None:
-    """The opt-out flag ``--no-film-output`` disables output FiLM. Pins
-    the user-facing toggle works as the round-5 fix advertises."""
+    """The opt-out flag ``--no-use-output-film`` disables output FiLM.
+    Pins the user-facing toggle works as §8.3's BooleanOptionalAction
+    revert advertises."""
     _run(
         [
             "--strategy", "film",
             "--supernet", "tiny", "--variant", "base",
-            "--no-film-output",
+            "--no-use-output-film",
             "--total-steps", "5", "--k", "5",
             "--batch-size", "2", "--seq-len", "16",
             "--warmup-steps", "1", "--val-frac", "0.5",
@@ -490,7 +504,7 @@ def test_rejects_rosa_top_k_frac_out_of_range(tmp_path: Path) -> None:
                 [
                     "--strategy", "rosa",
                     "--supernet", "tiny", "--variant", "base",
-                    "--rank", "4",
+                    "--lora-rank", "4",
                     "--rosa-top-k-frac", bad,
                     "--total-steps", "10", "--k", "5",
                     "--batch-size", "2", "--seq-len", "16",
@@ -514,7 +528,7 @@ def test_rejects_negative_lora_alpha_upfront(tmp_path: Path) -> None:
                 [
                     "--strategy", strat,
                     "--supernet", "tiny", "--variant", "base",
-                    "--rank", "4", "--lora-alpha", "-1",
+                    "--lora-rank", "4", "--lora-alpha", "-1",
                     "--total-steps", "10", "--k", "5",
                     "--batch-size", "2", "--seq-len", "16",
                     "--warmup-steps", "1", "--val-frac", "0.1",
@@ -526,17 +540,17 @@ def test_rejects_negative_lora_alpha_upfront(tmp_path: Path) -> None:
 
 
 def test_rejects_bottleneck_no_attn_no_ffn_upfront(tmp_path: Path) -> None:
-    """``--bottleneck-no-attn --bottleneck-no-ffn`` together is a
-    no-op adapter and rejected upfront. Pre-fix (Codex round-4 P2),
-    this raised inside ``BottleneckConfig.__post_init__`` after
-    corpus generation + run_dir creation."""
-    with pytest.raises(SystemExit, match="bottleneck-no-attn and "):
+    """``--no-adapt-attn --no-adapt-ffn`` together is a no-op adapter
+    and rejected upfront, before corpus generation + run_dir
+    creation. (§8.3: v1-canonical flag names — the v2
+    ``--bottleneck-no-*`` prefix was reverted.)"""
+    with pytest.raises(SystemExit, match="--no-adapt-attn and --no-adapt-ffn"):
         _run(
             [
                 "--strategy", "bottleneck",
                 "--supernet", "tiny", "--variant", "base",
                 "--bottleneck-dim", "8",
-                "--bottleneck-no-attn", "--bottleneck-no-ffn",
+                "--no-adapt-attn", "--no-adapt-ffn",
                 "--total-steps", "10", "--k", "5",
                 "--batch-size", "2", "--seq-len", "16",
                 "--warmup-steps", "1", "--val-frac", "0.1",
@@ -560,10 +574,10 @@ def test_rejects_specialized_clm_odd_head_dim_upfront(tmp_path: Path) -> None:
             [
                 "--strategy", "specialized_clm",
                 "--supernet", "tiny", "--variant", "base",
-                "--specialized-d-model", "70",
-                "--specialized-n-heads", "2",
-                "--specialized-n-layers", "2",
-                "--specialized-d-ff", "128",
+                "--d-model", "70",
+                "--n-heads", "2",
+                "--n-layers", "2",
+                "--d-ff", "128",
                 "--total-steps", "10", "--k", "5",
                 "--batch-size", "2", "--seq-len", "16",
                 "--warmup-steps", "1", "--val-frac", "0.1",
@@ -625,7 +639,7 @@ def test_rejects_sparse_density_out_of_range(tmp_path: Path) -> None:
                 "--total-steps", "10", "--k", "5",
                 "--batch-size", "2", "--seq-len", "16",
                 "--warmup-steps", "1", "--val-frac", "0.1",
-                "--sparse-density", "1.5",
+                "--density", "1.5",
             ],
             tmp_path,
         )
@@ -636,27 +650,27 @@ def test_validation_failures_do_not_create_run_dir(tmp_path: Path) -> None:
     for any documented validation failure."""
     cases = [
         # k = 0
-        ["--supernet", "tiny", "--variant", "base", "--rank", "4",
+        ["--supernet", "tiny", "--variant", "base", "--lora-rank", "4",
          "--total-steps", "10", "--k", "0",
          "--batch-size", "2", "--seq-len", "16",
          "--warmup-steps", "1", "--val-frac", "0.1"],
         # batch-size 0
-        ["--supernet", "tiny", "--variant", "base", "--rank", "4",
+        ["--supernet", "tiny", "--variant", "base", "--lora-rank", "4",
          "--total-steps", "10", "--k", "5",
          "--batch-size", "0", "--seq-len", "16",
          "--warmup-steps", "1", "--val-frac", "0.1"],
         # seq-len exceeds max
-        ["--supernet", "tiny", "--variant", "base", "--rank", "4",
+        ["--supernet", "tiny", "--variant", "base", "--lora-rank", "4",
          "--total-steps", "10", "--k", "5",
          "--batch-size", "2", "--seq-len", "9999",
          "--warmup-steps", "1", "--val-frac", "0.1"],
         # unknown variant
-        ["--supernet", "tiny", "--variant", "huge", "--rank", "4",
+        ["--supernet", "tiny", "--variant", "huge", "--lora-rank", "4",
          "--total-steps", "10", "--k", "5",
          "--batch-size", "2", "--seq-len", "16",
          "--warmup-steps", "1", "--val-frac", "0.1"],
         # bad LR schedule (warmup == total)
-        ["--supernet", "tiny", "--variant", "base", "--rank", "4",
+        ["--supernet", "tiny", "--variant", "base", "--lora-rank", "4",
          "--total-steps", "10", "--k", "5",
          "--batch-size", "2", "--seq-len", "16",
          "--warmup-steps", "10", "--val-frac", "0.1"],

@@ -191,9 +191,10 @@ def test_rejects_oversized_corpus(tmp_path: Path) -> None:
 
 def test_happy_path_writes_metrics_and_config(tmp_path: Path) -> None:
     """End-to-end smoke: a small TINY-supernet run produces config.json,
-    a metrics.jsonl with one row per chunk, finite losses, and
-    state.step matching the row's step_end. Pins the corpus →
-    trainer → driver pipeline integration that the per-chunk unit
+    a metrics.jsonl with a ``type: "config"`` header row + one
+    ``type: "train"`` row per chunk, finite losses, and state.step
+    matching the row's ``step``. Pins the corpus → trainer → driver
+    → MetricsLogger pipeline integration that the per-chunk unit
     tests miss."""
     _run(
         [
@@ -215,16 +216,25 @@ def test_happy_path_writes_metrics_and_config(tmp_path: Path) -> None:
     assert isinstance(cfg["variants"], dict)
     assert "small" in cfg["variants"]
     assert cfg["variants"]["small"]["d_model"] == 64
-    # metrics.jsonl has one row per chunk = total_steps / k = 2.
+    # metrics.jsonl goes through MetricsLogger: a ``type: "config"``
+    # baseline row, then one ``type: "train"`` row per chunk
+    # (= total_steps / k = 2).
     rows = [json.loads(line) for line in (rd / "metrics.jsonl").read_text().splitlines()]
-    assert len(rows) == 2
-    # Step counters advance monotonically and finish at total_steps.
-    assert rows[0]["step_start"] == 0
-    assert rows[0]["step_end"] == 5
-    assert rows[1]["step_start"] == 5
-    assert rows[1]["step_end"] == 10
-    # Losses are finite (no NaN/Inf at TINY scale).
+    config_rows = [r for r in rows if r["type"] == "config"]
+    train_rows = [r for r in rows if r["type"] == "train"]
+    assert len(config_rows) == 1
+    assert len(train_rows) == 2
+    # Every record carries the MetricsLogger baseline fields.
     for r in rows:
+        assert "timestamp" in r
+        assert "slug" in r or r["type"] != "config"
+    # Step counters advance monotonically and finish at total_steps.
+    assert train_rows[0]["step_start"] == 0
+    assert train_rows[0]["step"] == 5
+    assert train_rows[1]["step_start"] == 5
+    assert train_rows[1]["step"] == 10
+    # Losses are finite (no NaN/Inf at TINY scale).
+    for r in train_rows:
         assert math.isfinite(r["loss_mean"])
         assert math.isfinite(r["grad_norm_mean"])
 
