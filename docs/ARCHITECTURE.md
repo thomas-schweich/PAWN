@@ -1,5 +1,12 @@
 # PAWN Architecture
 
+> **v1 metrics disclaimer.** All metrics and benchmarks attached to
+> the published `pawn-{small, base, large}` HF repos are v1 PyTorch
+> numbers. v2 republishes to new HF repos
+> (`pawn-{small, base, large}-v2` or similar). The bridge that lets
+> v2 code load the v1 repos is `pawn.legacy.convert_legacy_checkpoint`.
+
+
 PAWN (Playstyle-Agnostic World-model Network for Chess) is a causal transformer trained on random chess games via next-token prediction. It learns chess rules, legal moves, and board state representations purely from move sequences, with no hand-crafted features or external game databases.
 
 This document describes the model architecture in detail.

@@ -47,28 +47,50 @@ uv sync --extra cu128   # NVIDIA GPU (or --extra rocm for AMD)
 Weights and data can be loaded directly from HuggingFace:
 
 ```bash
-uv run python scripts/train.py --run-type adapter --strategy bottleneck \
+uv run --extra rocm python scripts/train_jax_adapter.py \
+    --strategy bottleneck \
     --checkpoint thomas-schweich/pawn-base \
     --pgn thomas-schweich/pawn-lichess-full \
-    --bottleneck-dim 32 --lr 1e-4 --local-checkpoints
+    --bottleneck-dim 32 --lr 1e-4 --total-steps 200 --local-checkpoints
 ```
 
-### Pretrain from scratch
+The published `pawn-{small,base,large}` HF checkpoints are v1 PyTorch
+artifacts — they're loaded through `pawn.legacy.convert_legacy_checkpoint`
+which transposes weights into the v2 JAX layout. v2 republishes
+under new HF repos (`pawn-{small,base,large}-v2` or similar).
+
+### Pretrain the supernet
 
 Random games are generated on-the-fly; no dataset required:
 
 ```bash
-uv run python scripts/train.py --variant base --local-checkpoints
-
-# Or train all three variants simultaneously on shared data
-uv run python scripts/train.py --config configs/cotrain_three_variants.json
+uv run --extra rocm python scripts/train_jax.py \
+    --supernet base --total-steps 100000 --batch-size 256 \
+    --local-checkpoints
 ```
+
+The v1 cotrain path is GONE BY DESIGN — the supernet's joint loss
+(`sum` of per-variant cross-entropies on the same batch) replaces it.
 
 ### Run probes and diagnostics
 
 ```bash
-uv run python scripts/eval_probes.py --log-dir logs --device cuda
-uv run python -m pawn.dashboard --log-dir logs  # real-time monitoring
+# Move accuracy + per-phase
+uv run --extra rocm python scripts/eval_jax.py --checkpoint <converted-or-v2-dir>
+
+# Linear probes
+uv run --extra rocm python scripts/eval_probes_jax.py --checkpoint <converted>
+
+# 5 generation diagnostics (all gated on outcome_prefix_trained)
+uv run --extra rocm python scripts/eval_generation_jax.py \
+    --checkpoint <converted> --outcome-prefix-trained --edge-cases
+
+# Elo-stratified Lichess accuracy
+uv run --extra rocm python scripts/eval_vs_stockfish.py \
+    --checkpoint <converted> --pgn thomas-schweich/pawn-lichess-full
+
+# Real-time monitoring
+uv run --extra dashboard python -m pawn.dashboard --log-dir logs
 ```
 
 ## Architecture

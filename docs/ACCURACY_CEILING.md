@@ -1,5 +1,12 @@
 # Theoretical Accuracy Ceiling
 
+> **v1 metrics disclaimer.** All metrics and benchmarks attached to
+> the published `pawn-{small, base, large}` HF repos are v1 PyTorch
+> numbers. v2 republishes to new HF repos
+> (`pawn-{small, base, large}-v2` or similar). The bridge that lets
+> v2 code load the v1 repos is `pawn.legacy.convert_legacy_checkpoint`.
+
+
 PAWN is trained on uniformly random chess games. At each position with
 N legal moves, the next move is drawn uniformly from those N moves, so
 the Bayes-optimal predictor (without outcome information) can do no
