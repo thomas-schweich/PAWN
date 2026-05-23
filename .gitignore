@@ -76,3 +76,6 @@ runs/
 
 # Codex review scratch file (ephemeral, sometimes left behind by `codex review`)
 .codex
+
+# Rust scratch binaries (e.g. `rustc -o rust_out`)
+/rust_out

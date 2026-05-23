@@ -1,451 +1,457 @@
 # PAWN (Playstyle-Agnostic World-model Network for Chess)
 
-A causal transformer trained on random chess games, designed as a testbed for finetuning and augmentation methods at small scales. Apache 2.0.
+> **Post-swap orientation map (canonical).** This document describes the v2
+> JAX/Equinox/Optax repo. The framework swap is tracked in
+> `docs/jax_migration_plan.md`; until that migration lands, individual modules
+> referenced below may live on `feat/jax-migration/*` section branches rather
+> than on the integration branch.
+>
+> **Published v1 checkpoints.** `thomas-schweich/pawn-{small,base,large}` are
+> v1 PyTorch artifacts. They stay frozen — v2 republishes to new HF repos
+> (`pawn-{small,base,large}-v2`). The bridge that lets v2 code load the v1
+> repos is `pawn.legacy.convert_legacy_checkpoint`; every benchmark or metric
+> attached to a v1 repo card is a v1 PyTorch number, not a v2 number.
+
+A causal transformer trained on random chess games, designed as a testbed for
+finetuning and augmentation methods at small scales. Apache 2.0.
 
 ## Repository Structure
 
 ```
 pawn/
-├── engine/          # Rust chess engine with PyO3 bindings (via shakmaty)
-├── pawn/            # Core Python package
-│   ├── config.py    # CLMConfig (small/base/large), TrainingConfig
-│   ├── model.py     # PAWNCLM transformer (RMSNorm, SwiGLU, RoPE, factored embeddings)
-│   ├── data.py      # On-the-fly random game data pipeline (prepend_outcome flag)
-│   ├── lichess_data.py  # Lichess PGN data pipeline + legal mask computation
-│   ├── trainer.py   # Pretraining loop
-│   ├── gpu.py       # GPU auto-detection (compile/AMP/SDPA backend)
-│   ├── logging.py   # MetricsLogger (JSONL output)
-│   ├── checkpoint.py # Atomic save/load, .complete sentinel, HF push
-│   ├── adapters/    # Bottleneck, LoRA, FiLM, sparse, hybrid
-│   ├── eval_suite/  # Probes, generation tests, diagnostics, lichess eval
-│   └── dashboard/   # Solara training dashboard (metrics, charts, runner)
-├── scripts/         # Training and evaluation entry points
-├── tests/           # Unit tests
-├── deploy/          # RunPod + vast.ai deployment scripts
-└── docs/            # Architecture, training, adapter docs
+├── engine/                  # Rust chess engine with PyO3 bindings (via shakmaty)
+├── pawn/                    # Core Python package
+│   ├── _sentinel.py         # stdlib-only SHA-256 .complete sentinel helpers
+│   ├── config.py            # ModelConfig, SUPERNET, VARIANTS, TINY_*, validate_nested
+│   ├── model.py             # Equinox PAWNModel (RMSNorm + RoPE + SwiGLU + factored embeddings)
+│   ├── run_config.py        # pydantic configs: BaseRunConfig / PretrainConfig / AdapterConfig / SpecializedCLMConfig
+│   ├── logging.py           # MetricsLogger (JSONL, type-discriminated, NaN-sanitised)
+│   ├── checkpoint.py        # Atomic safetensors save/load + async HF push
+│   ├── corpus.py            # Rust-engine random games → Corpus (JAX arrays)
+│   ├── lichess_data.py      # Lichess parquet → Corpus, on-disk cache, multi-epoch tiling
+│   ├── trainer.py           # Pretraining: lax.scan K-step training loop + supernet joint loss
+│   ├── adapter_trainer.py   # Two-tier frozen/trainable PyTree adapter training
+│   ├── adapters/            # lora / film / unfreeze / bottleneck / hybrid / sparse / rosa / specialized_clm
+│   ├── eval.py              # Move-accuracy + per-phase
+│   ├── probes.py            # Linear probes via Optax fit on frozen hidden states
+│   ├── generation.py        # 5 generation diagnostics (all gated on outcome_prefix_trained) + KV-cached decoder
+│   ├── lichess_eval.py      # Elo-stratified Maia-style accuracy
+│   ├── eval_suite/          # Edge-case diagnostics, theoretical accuracy bounds, viz helpers
+│   ├── sweep.py             # Standalone Optuna driver (subprocess + in-process objectives)
+│   ├── legacy.py            # Single bridge: v1 torch HF checkpoint → JAX safetensors
+│   ├── lab/                 # FastMCP lab manager (trial orchestration via pydantic configs)
+│   ├── dashboard/           # Solara dashboard (reads metrics.jsonl)
+│   └── wandb_utils.py       # Optional W&B integration
+├── scripts/                 # Training and eval entry points (train_jax*, eval_jax*, sweep, etc.)
+├── tests/                   # Unit + integration + scripts/smoke tests
+├── deploy/                  # RunPod + vast.ai deployment scripts
+└── docs/                    # Architecture, training, adapter docs + the migration plan
 ```
 
 ## Building
 
-This is a uv workspace. The root project is the `pawn` Python package; `engine/` is the sole workspace member.
+This is a uv workspace. The root project is the `pawn` Python package;
+`engine/` is the sole workspace member.
 
 ```bash
 # Build the Rust chess engine (required before anything else)
 cd engine && uv run --with maturin maturin develop --release && cd ..
 
-# Install Python deps (dev tools like pytest, seaborn, solara are in base dependencies):
-uv sync --extra rocm      # AMD (ROCm 7.1)
-uv sync --extra cu128     # NVIDIA (CUDA 12.8)
+# Install Python deps — choose your GPU backend:
+uv sync --extra rocm      # AMD ROCm 7.1 (torch + triton + triton-rocm + jaxlib + jax-rocm7-plugin)
+uv sync --extra cu128     # NVIDIA CUDA 12.8 (torch + jaxlib + jax-cuda12-plugin)
+
+# Optional extras can be combined with a GPU extra:
+#   --extra dashboard   solara + plotly + pandas + anywidget + optuna-dashboard
+#   --extra lab         fastmcp (for `python -m pawn.lab`)
+#   --extra wandb       wandb metric mirror
 
 # Run tests
-uv run pytest tests/
+uv run --extra rocm pytest tests/
 
-# Pretrain from scratch (local dev)
-uv run python scripts/train.py --variant base --local-checkpoints
+# Pretrain the tiny supernet (local dev)
+uv run --extra rocm python scripts/train_jax.py --supernet tiny --total-steps 1000 \
+    --batch-size 16 --seq-len 64 --k 50 --local-checkpoints
 ```
 
-The only extras are GPU backends (`rocm` or `cu128`). Everything else (pytest, solara, optuna, seaborn, etc.) is in base dependencies. PyTorch lives in the extras because uv can't resolve CPU/CUDA/ROCm from a single lockfile — always specify `--extra rocm` or `--extra cu128`.
+The two GPU extras are mutually exclusive (declared in `[tool.uv].conflicts`).
+The base dependency set includes JAX + Equinox + Optax + pydantic + polars +
+matplotlib + seaborn + jinja2 + zstandard + optuna — these are load-bearing
+for the realistic Lichess adapter path, the legacy eval suite, and the
+data/publishing scripts, so they live in `[project.dependencies]` rather than
+behind an extra. Only the GPU plugins, the dashboard / lab UIs, and the wandb
+mirror are optional.
 
-**GPU requirement**: `configure_gpu()` (called by every training and eval script) raises `RuntimeError` if no CUDA/ROCm GPU is detected. This prevents accidentally running GPU workloads on CPU, which is almost always a mistake. The environment variable `PAWN_ALLOW_CPU=1` overrides this check as a last resort for the rare case where CPU execution is genuinely intended (e.g. a lightweight backfill script). Unit tests do not call `configure_gpu()` and run fine on CPU without the override.
+**GPU requirement.** JAX manages its own device detection. Training entry
+points refuse to run on CPU unless `PAWN_ALLOW_CPU=1` is set (parity with the
+v1 escape hatch). Unit tests run on CPU without the override.
 
 ## Engine (`engine/`)
 
-**Single source of truth** for all chess logic. All game simulation, move generation, legality checks, tokenization, PGN parsing, and board state extraction happen in Rust. No Python chess libraries.
+**Single source of truth** for all chess logic. All game simulation, move
+generation, legality checks, tokenization, PGN parsing, and board state
+extraction happen in Rust. No Python chess libraries.
 
-- Uses rayon for parallel game generation (~43K games/sec, 150M+/hr)
+- Uses rayon for parallel game generation
 - PyO3 bindings expose `chess_engine` module to Python
-- Key functions: `generate_random_games()`, `parse_pgn_file()`, `compute_legal_token_masks_sparse()`, `extract_board_states()`, `export_move_vocabulary()`, `compute_accuracy_ceiling()`
-- `export_move_vocabulary()` returns the 1,968-entry searchless_chess action table used by the factored embeddings.
+- Key functions: `generate_random_games()`, `parse_pgn_file()`,
+  `compute_legal_token_masks_sparse()`, `extract_board_states()`,
+  `export_move_vocabulary()`, `compute_accuracy_ceiling()`, `edge_case_bits()`
+- `export_move_vocabulary()` returns the 1,968-entry searchless_chess action
+  table used by the factored embeddings.
 
 ## Model
 
 ### Architecture
-- Decoder-only transformer, next-token prediction over 1,968 move tokens (1,980 total vocab)
-- Token vocabulary: 1,968 searchless_chess actions (0-1967) + 1 PAD (1968) + 11 outcomes (1969-1979) = 1,980 total
-- Factored embeddings: `src_embed[s] + dst_embed[d] + promo_embed[p]`
-- Sequence format: `[ply_1] ... [ply_N] [PAD] ... [PAD]` (512 tokens) — outcome prefix is optional via `prepend_outcome` flag
+
+- Decoder-only transformer, next-token prediction over 1,968 move tokens
+  (1,980 total vocab).
+- Token vocabulary: 1,968 searchless_chess actions (0–1967) + 1 PAD (1968) +
+  11 outcomes (1969–1979) = 1,980 total.
+- Factored embeddings: `src_embed[s] + dst_embed[d] + promo_embed[p]`.
+- Sequence format: `[ply_1] ... [ply_N] [PAD] ... [PAD]` (512 tokens) —
+  outcome prefix is optional via the `prepend_outcome` field in
+  `BaseRunConfig`.
+- Equinox `PAWNModel` is a single module covering the supernet, every sliced
+  variant, and any standalone (converted-legacy) model. Stacked layers are
+  applied with `jax.lax.scan` over a leading `n_layers` axis. Attention is
+  plain (materialised `QK^T`); at seq 512 attention is ~12% of step FLOPs and
+  plain attention sidesteps fused-kernel maturity under JAX-on-ROCm.
+
+### Supernet + variants
+
+The supernet is large's dimensions. small and base are nested slices of it —
+the inner `[:d_V, :d_V]` of every weight matrix. Joint training sums
+per-variant cross-entropies on the same batch; gradients accumulate into the
+one shared weight tensor. The supernet is sliced into three standalone
+safetensors checkpoints at publish time; downstream consumers see ordinary
+independent checkpoints.
+
+- `SUPERNET`: d=640, 10 layers, 10 heads, head_dim=64
+- `VARIANTS["small"]`: d=256, 4 heads
+- `VARIANTS["base"]`: d=512, 8 heads
+- `VARIANTS["large"]`: d=640, 10 heads (= the supernet itself)
+- `TINY_SUPERNET`: d=192, 4 layers, 3 heads — for verification runs that
+  don't need production scale. `TINY_VARIANTS` slice the same way.
+
+`head_dim = 64` is fixed across nested variants so width slices align to
+whole heads and RoPE is variant-invariant.
 
 > **Legacy note.** Earlier versions of this codebase used a ~60k-entry move
-> vocabulary and two separate parquet layouts ("v1" = pure-moves tokens with
-> outcomes derived coarsely from the PGN `result` header, "v2" = tokens with
-> the outcome prepended at position 0). **Both are gone.** The current code
-> only knows about the 1,968-action vocabulary and the single canonical
-> parquet schema written by `scripts/extract_lichess_parquet.py` (pure-moves
-> `tokens` + granular `outcome_token` column + per-game metadata). If you
-> find a reference to a "v1 vocab", "v2 format", `_result_to_outcome`,
-> `strip_outcome_token`, or `no_outcome_token`, it's a bug — those were all
-> removed during the 0.x → stable transition. Legacy checkpoints trained
-> against the old vocabulary are accessible only via the
-> `pre-vocab-transition` git tag; they cannot be loaded or trained against
-> from the current tree.
-
-### Variants
-- `CLMConfig.small()`: d=256, 8 layers, 4 heads, ~9.5M params
-- `CLMConfig.base()`: d=512, 8 layers, 8 heads, ~35.8M params (default)
-- `CLMConfig.large()`: d=640, 10 layers, 8 heads, ~68.4M params
-- `CLMConfig.toy()`: d=64, 2 layers, for tests only
+> vocabulary. The current code only knows about the 1,968-action vocabulary
+> and the single canonical parquet schema. Pre-vocab-transition checkpoints
+> are rejected loudly by `pawn.legacy.convert_legacy_checkpoint` and are
+> accessible only via the `pre-vocab-transition` git tag.
 
 ## Training
 
-All training scripts require one of `--hf-repo REPO_ID` or `--local-checkpoints` (mutually exclusive). Use `--local-checkpoints` for local dev; use `--hf-repo` for any run where you need durable checkpoints.
+All training scripts require one of `--hf-repo REPO_ID` or
+`--local-checkpoints` (mutually exclusive). Use `--local-checkpoints` for
+local dev; use `--hf-repo` for any run where you need durable checkpoints.
 
-### Pretraining
+### Pretraining the supernet
 
 ```bash
-# Single model
-uv run python scripts/train.py --variant base --local-checkpoints
+uv run --extra rocm python scripts/train_jax.py \
+    --supernet base --total-steps 100000 --batch-size 256 --local-checkpoints
 
-# All three variants simultaneously (shared data batches, sequential GPU).
-# Cotrain always takes a JSON config because the `variants` list is
-# shaped like [{"name": ..., "variant": ..., ...}, ...] and isn't
-# expressible on a flat CLI. A default 3-variant config ships at
-# configs/cotrain_three_variants.json.
-uv run python scripts/train.py --config configs/cotrain_three_variants.json
-
-# Resume from checkpoint
-uv run python scripts/train.py --variant base --resume checkpoints/step_00050000 --local-checkpoints
+# Resume from a checkpoint:
+uv run --extra rocm python scripts/train_jax.py --supernet base \
+    --resume checkpoints/step_00050000 --local-checkpoints
 ```
 
-**`scripts/train.py`** key args (all run types):
-- `--config PATH` — load a JSON run config (required for cotrain)
-- `--run-type {pretrain|adapter|cotrain}` — dispatch target
-- `--variant {small|base|large|toy|custom}` — pretrain model size (default: base)
-- `--resume PATH` — resume from checkpoint directory
-- `--total-steps N` — training steps (default: 100,000)
-- `--batch-size N` — batch size (default: 256)
-- `--discard-ply-limit` — only train on naturally-ended games (no ply-limit truncation)
-- Architecture overrides: `--d-model`, `--n-layers`, `--n-heads`, `--d-ff`, `--lr`, `--weight-decay`, `--warmup-steps`
+The training loop is a `jax.lax.scan` over `K` inner steps inside one
+`@eqx.filter_jit` function with buffers donated. Per-step body never returns
+to the host; per-chunk metrics flush to disk between chunks.
 
-**Cotrain-specific config fields** (in the JSON):
-- `shm_checkpoints: true` — write checkpoints to `/dev/shm` (requires `hf_repo`, volatile)
-- `run_evals: true` — run per-slot probes + diagnostics after training completes
-- `lichess_pgn: "..."` — Lichess PGN path for Maia-style accuracy eval (requires `run_evals`)
-- `publish_results: true` — push `eval_results.json` to HF (requires `hf_repo`)
-- `patience: N` — per-variant early stopping patience (eval intervals without improvement)
+Cotrain (the v1 multi-variant joint trainer) is GONE BY DESIGN. The supernet
+joint loss is what cotrain provided. Pretrain the supernet, then publish
+its three nested slices.
 
-### Adapter Training
+### Adapter training
 
-All adapter strategies dispatch through the unified `scripts/train.py` with `--run-type adapter --strategy STRATEGY`. They freeze the backbone and train only adapter parameters. Both `--checkpoint PATH` and `--pgn PATH` are required.
+All adapter strategies dispatch through `scripts/train_jax_adapter.py`. They
+freeze the backbone (via `eqx.partition(model, adapter_filter(model))`) and
+train only adapter parameters. `jax.grad` only differentiates the trainable
+PyTree, so XLA DCEs the backbone weight-gradients — a ~33% backward-pass FLOP
+cut for free.
 
 ```bash
-# Example: train a LoRA adapter on Lichess 1800-1900 games
-uv run python scripts/train.py --run-type adapter --strategy lora \
-    --checkpoint thomas-schweich/pawn-base \
+uv run --extra rocm python scripts/train_jax_adapter.py --strategy lora \
+    --supernet tiny --variant base --lora-rank 4 \
     --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
-    --steps-per-epoch all --epochs 1 \
-    --lora-rank 4 --lr 3e-4 --local-checkpoints
+    --total-steps 200 --local-checkpoints
 ```
 
-Adapter training is **cache-first**: the first run with a given (Elo, `min_ply`) combination filters and tokenizes the dataset to disk under `$HF_HOME/pawn-lichess-cache/<key>/` (or `$PAWN_DATA_CACHE/<key>/`); subsequent runs mmap that cache. Filter parameters bake into the cache key — different (Elo, `min_ply`) combinations produce different caches. `max_ply` and `prepend_outcome` only affect packing and apply at access time, so the cache is invariant to them.
+The 8 strategies and their key args (full surface in `pawn/run_config.py`):
 
-`--steps-per-epoch` is the canonical way to size an adapter run. Pass an integer or `"all"` (resolves to `n_train_games // batch_size` once the cache materializes; the resolved integer is what gets written to `run_config.json`). The legacy `--max-games` is accepted as `steps_per_epoch = max_games // batch_size` with a deprecation warning.
+| `--strategy`      | Adapter                                   | Key args                                                |
+|-------------------|-------------------------------------------|---------------------------------------------------------|
+| `lora`            | Low-rank attention                        | `--lora-rank 4 --lora-targets qkvo`                     |
+| `film`            | Channel-wise affine                       | `--use-output-film` (default True)                      |
+| `bottleneck`      | Houlsby MLP                               | `--bottleneck-dim 8 --no-adapt-attn`                    |
+| `hybrid`          | LoRA + FiLM                               | `--lora-rank 4`                                         |
+| `sparse`          | Binary mask                               | `--density 0.01 --sparse-targets qkvo`                  |
+| `rosa`            | Gradient-informed sparse + LoRA (3-phase) | `--rosa-mode rosa` &#124; `retro-sparse` &#124; `retro-bottleneck` |
+| `unfreeze`        | Fine-tune explicit layer picks            | `--unfreeze-layers 5,6,7`                               |
+| `specialized_clm` | From-scratch standalone transformer       | `--d-model 84 --n-layers 2`                             |
 
-| `--strategy` value  | Adapter | Key args | Typical params |
-|---------------------|---------|----------|----------------|
-| `bottleneck`        | Houlsby MLP | `--bottleneck-dim 8 --bottleneck-n-hidden 0` | ~131K |
-| `lora`              | Low-rank attention | `--lora-rank 4 --lora-targets qkvo` | ~65K |
-| `film`              | Channel-wise affine | `--no-output-film` | ~17K |
-| `sparse`            | Binary mask | `--density 0.01 --sparse-targets qkvo` | ~503K-2.7M |
-| `hybrid`            | LoRA + FiLM | `--lora-rank 4` | ~65K |
-| `rosa`              | Gradient-informed sparse + LoRA (3-phase) | `--rosa-mode rosa` | varies |
-| `specialized_clm`   | From-scratch standalone transformer (no backbone) | `--d-model 84 --n-layers 2` | ~524K |
-| `unfreeze`          | Fine-tune top N backbone layers | `--unfreeze-layers 6,7` | varies |
+The `rosa` strategy has three sub-modes selected by `--rosa-mode`: `rosa`
+(standard), `retro-sparse`, and `retro-bottleneck`. All three are
+in-scope and tested.
 
-Common adapter args: `--epochs 50`, `--batch-size 64`, `--lr 3e-4`, `--patience 10`, `--val-every 1`, `--steps-per-epoch all`, `--min-ply 10`, `--checkpoint-interval 5000`
+Lichess data is cache-first: the first run with a given (Elo, `min_ply`)
+combination filters and tokenizes the dataset to disk under
+`$HF_HOME/pawn-lichess-cache/<sha-of-filter-params>/`. The dataset's
+`validation` split is the default held-out source; pass `--pgn-val-split ""`
+to carve from train (only for single-file local sources).
 
-Adapter checkpoints are written to `logs/run_*/checkpoints/step_{global_step:08d}/` (matching the pretraining layout — never overwritten). A save fires whenever val hits a new best, whenever the step is a `--checkpoint-interval` multiple, or at termination (step limit, patience, shutdown). To find the best step from a run's `metrics.jsonl`, use `pawn.checkpoint.find_best_adapter_step`.
+LR schedules: `--lr-schedule {cosine,wsd,constant,one_cycle,infinite}` —
+warmup + cosine / WSD / constant / one_cycle / infinite-cooldown. Sum-fraction
+validation in `BaseRunConfig` keeps `warmup_frac`, `cooldown_frac`,
+`decay_frac` consistent.
 
-LR schedule: `--lr-schedule {cosine,wsd,constant,one_cycle,infinite}`. Default `cosine`.
-- `wsd` — Warmup-Stable-Decay. Holds peak LR for `1 - warmup_frac - decay_frac` of training, then decays over the last `--decay-frac` (default 0.1). `--wsd-decay-shape {linear,cosine}` controls the tail curve.
-- `constant` — linear warmup → hold peak indefinitely. Pair with `--patience` to actually stop.
-- `one_cycle` — Smith (2018) one-cycle: ramp from `peak/25` → `peak` over `--warmup-frac` of steps (try 0.3), then cosine-decay to `peak/10000`.
-- `infinite` — warmup → cosine cooldown to `--stable-lr-ratio` (default 0.1) × peak over `--cooldown-frac` of steps (default 0.2) → flat stable plateau → final decay to 0 over the last `--decay-frac` of steps (default 0.1, shape set by `--wsd-decay-shape`). The stable-plateau LR depends only on `--stable-lr-ratio`, not on `total_steps`, so any checkpoint taken during the plateau is a valid resumption point — extend `total_steps` on resume and the plateau simply lasts longer before the final decay kicks in. Useful when you don't want to commit to a total-step count upfront. See Hägele et al. (2024) arXiv:2405.18392.
+### Common CLI patterns
 
-Legal-move handling (defaults match pre-existing behavior):
-- `--disable-legal-mask` — drop the `-inf` hard mask on illegal logits and compute CE over the full 1,980-token vocabulary (same as pretraining). Useful for probing whether the adapter is leaning on the mask.
-- `--illegal-penalty λ` — adds `λ · E[P_illegal]` to the loss (mean softmax mass on illegal tokens). Only valid together with `--disable-legal-mask` — under the hard mask this term is analytically zero. Eval reports `illegal_pred_rate` / `illegal_prob_mass` in this regime.
+- `--config <path.json>` — load a JSON run config (validated through pydantic
+  `extra="forbid"`); CLI flags merge in and take precedence.
+- `--wandb` — enable Weights & Biases metric mirror (requires `--extra wandb`).
+- `PAWN_ALLOW_CPU=1` — last-resort CPU escape hatch.
 
-### Common CLI Patterns
+## Evaluation
 
-- `--sdpa-math` — force MATH SDPA backend (debugging escape hatch; not required anymore on ROCm)
-- `--no-compile` — disable torch.compile
-- `--no-amp` — disable mixed precision
-- `--num-workers N` — DataLoader workers (default: 4)
-- `--device {cuda|cpu}` — device selection
-- `--wandb` — enable Weights & Biases metrics logging (pretrain, cotrain, and adapter). Each process invocation creates a fresh run — no W&B state is persisted to checkpoints, so pause/resume is unaffected. Cotrain slots in a single invocation share `group=cotrain-<slug>` so variants cluster together. Resumed runs are independent runs; link them in the UI by filtering on the shared `git:<hash>` tag or the same HF branch URL. Set `PAWN_WANDB_MODE=disabled` to force offline behavior (CI / no network). Project name defaults to `pawn`; override via `WANDB_PROJECT` env var or `TrainingConfig.wandb_project`.
-
-## Evaluation & Metrics
-
-### Linear Probes
+### Move accuracy
 
 ```bash
-uv run python scripts/eval_probes.py --log-dir logs --device cuda
+uv run --extra rocm python scripts/eval_jax.py --checkpoint thomas-schweich/pawn-base
 ```
 
-Trains linear probes on frozen hidden states to measure internal representations (piece type, check status, castling rights, material count, game phase, etc.). Args: `--n-games 4096`, `--n-val-games 1024`, `--n-epochs 20`, `--run RUN_NAME` (specific run).
+Compatible with v1's eval_accuracy schema; reports overall + per-phase
+breakdown. Argmax restricted to `[0, NUM_ACTIONS)` so PAD and outcome tokens
+can't be sampled.
 
-### Move Prediction Accuracy
+### Linear probes
 
 ```bash
-uv run python scripts/eval_accuracy.py \
-    --checkpoint thomas-schweich/pawn-base \
-    --pgn thomas-schweich/pawn-lichess-full --elo-min 1800 --elo-max 1900 \
-    --adapter-checkpoint logs/run_*/checkpoints/step_00020000
+uv run --extra rocm python scripts/eval_probes_jax.py --checkpoint <converted>
 ```
 
-MAIA-compatible evaluation with per-phase and per-ply accuracy. Args: `--min-eval-ply 10`, `--max-games 50000`, `--per-ply`.
-
-### Theoretical Accuracy Ceilings
+### Generation diagnostics + edge-case diagnostics
 
 ```bash
-uv run python scripts/compute_theoretical_ceiling.py
+uv run --extra rocm python scripts/eval_generation_jax.py \
+    --checkpoint <converted> --outcome-prefix-trained --edge-cases
 ```
 
-Computes theoretical accuracy ceilings for random games via Monte Carlo rollouts: unconditional (E[1/N_legal]), naive-conditioned (1-ply filter), and MC-conditioned (Bayes-optimal with outcome knowledge). Reports a bias bracket (naive vs split-half corrected estimates) and bootstrap 95% CIs clustered by game. CPU-intensive.
+The five generation diagnostics — `outcome_signal_test`,
+`prefix_continuation_test`, `poisoned_prefix_test`, `impossible_task_test`,
+`improbable_task_test` — **all** condition on the outcome token at position 0
+and **all** return a `{"_skipped": ...}` sentinel when
+`--no-outcome-prefix-trained` is set.
 
-### Export to HuggingFace
+Edge-case diagnostics use `engine.edge_case_bits()` for guaranteed coverage
+of `in_check` / `double_check` / `pin_restricts` / `ep_available` /
+`castle_legal_*`.
+
+### Elo-stratified Lichess accuracy
 
 ```bash
-uv run python scripts/export_hf_repo.py --run-dir logs/run_YYYYMMDD_HHMMSS
+uv run --extra rocm python scripts/eval_vs_stockfish.py \
+    --checkpoint <converted> --pgn thomas-schweich/pawn-lichess-full
 ```
 
-Converts a training run to HuggingFace repo format (safetensors + metrics). Finds best checkpoint by val loss.
+Maia-style per-Elo-bin accuracy.
+
+### Compatibility loader (v1 HF → JAX)
+
+```bash
+python -c "from pawn.legacy import convert_legacy_checkpoint; \
+           convert_legacy_checkpoint('thomas-schweich/pawn-base')"
+```
+
+Reads a v1 torch `.safetensors` checkpoint, transposes linear weights from
+`(out, in)` to `(in, out)` JAX convention, writes a JAX checkpoint under
+`$HF_HOME/pawn-jax-converted/<variant>/`. Cached by content hash. Rejects
+pre-vocab-transition checkpoints loudly. This is the **only** v1↔v2 bridge.
 
 ## Checkpoints
 
-Pre-trained weights are hosted on HuggingFace and loaded directly by repo ID:
-- `thomas-schweich/pawn-small` — 9.5M params, `CLMConfig.small()`
-- `thomas-schweich/pawn-base` — 35.8M params, `CLMConfig.base()`
-- `thomas-schweich/pawn-large` — 68.4M params, `CLMConfig.large()`
+Pre-trained weights are hosted on HuggingFace and loaded by repo ID through
+the legacy converter:
 
-All scripts accept HF repo IDs for `--checkpoint` (e.g. `--checkpoint thomas-schweich/pawn-base`). Weights are downloaded and cached automatically via `huggingface_hub`.
+- `thomas-schweich/pawn-small` — v1 PyTorch, ~9.5M params
+- `thomas-schweich/pawn-base` — v1 PyTorch, ~35.8M params
+- `thomas-schweich/pawn-large` — v1 PyTorch, ~68.4M params
 
-### Checkpoint Format (safetensors)
+v2 supernet-derived checkpoints publish to new repos
+(`pawn-{small,base,large}-v2` or similar).
 
-Checkpoints are directories, not single files:
+### Checkpoint format (safetensors)
+
+Each checkpoint is a directory:
+
 ```
 step_00065000/
-├── model.safetensors        # model weights
-├── optimizer.safetensors    # flattened optimizer state
-├── training_state.json      # step, scheduler, scaler, RNG (base64)
-├── config.json              # model + training config
+├── model.safetensors        # one tensor per PAWNModel array field (~16 fields, declaration order)
+├── optimizer.safetensors    # flattened Optax state
+├── training_state.json      # step, scheduler, RNG (base64)
+├── config.json              # ModelConfig + run config
 └── .complete                # SHA-256 hashes of all files (integrity sentinel)
 ```
 
-Central module: `pawn/checkpoint.py`. All save/load goes through this module.
+Atomic save: payload files land in `step_<N>.tmp`, then a `.complete` sentinel
+with SHA-256s, then `os.rename(step_<N>.tmp, step_<N>)`. Old checkpoints are
+never overwritten or deleted by the trainer; pruning is the user's call.
 
-### Checkpoint Storage Modes
+**Every load verifies the sentinel.** `IncompleteCheckpointError` /
+`CheckpointIntegrityError` are raised on missing or mismatched hashes. The
+sentinel helpers live in `pawn/_sentinel.py` (stdlib-only) so they can be
+imported without dragging in JAX.
+
+### Storage modes
 
 All training scripts require one of:
-- `--hf-repo REPO_ID` — push checkpoints to a HuggingFace branch as they're written (durable)
-- `--local-checkpoints` — save locally only (for development without an HF account)
 
-HF mode creates a `run/{run_id}` branch. HF pushes happen in background threads (one per model slot) so training is not blocked by uploads. Squash-merge into main when satisfied.
+- `--hf-repo REPO_ID` — push checkpoints to a HuggingFace branch as they're
+  written (async; failures don't block training)
+- `--local-checkpoints` — save locally only
 
-Optional: `--shm-checkpoints` writes checkpoints to `/dev/shm` (RAM-backed filesystem, instant writes). Requires `--hf-repo` since `/dev/shm` is volatile. Old checkpoints are cleaned up after successful HF push, keeping only the latest and the best (by val loss) for post-training evals.
+HF mode creates a `run/{run_id}` branch. Squash-merge into main when
+satisfied.
 
-### Data Integrity
+### Operational guarantees
 
-**Every checkpoint write is atomic**: files are written to a `.tmp` directory, then renamed.
-The `.complete` sentinel contains SHA-256 hashes of every file in the checkpoint.
-**Hashes are always verified on load — no exceptions.**
+- **SIGTERM is handled gracefully** — the training loop finishes the current
+  chunk, saves a checkpoint, pushes to HF, and exits 0. Never use `kill -9`.
+- **`--resume <ckpt>`** loads `TrainState` from the checkpoint and splices
+  `state.step` from the saved value so the metrics log stays monotonic across
+  the resume.
+- **Never rsync checkpoint files from running pods.** Load via HF repo ID.
 
-- `IncompleteCheckpointError` — raised when `.complete` sentinel is missing
-- `CheckpointIntegrityError` — raised when any hash mismatches
+## Metrics & dashboard
 
-**Never use `kill -9` on training processes.** SIGTERM is handled gracefully: a flag is set,
-the training loop checks it between steps, saves a checkpoint, pushes to HF, and exits cleanly.
+`MetricsLogger` (`pawn/logging.py`) is the **only** path metrics take to
+disk. Every record in `metrics.jsonl` has a `type ∈ {"config","train","val"}`
+discriminator, a timestamp, slug, hostname, git_hash, and (on train/val)
+host + GPU memory stats. NaN / Inf sanitised to `null`. Per-record flush.
 
-**Never rsync checkpoint files from running pods.** Checkpoints are pushed to HuggingFace
-from the trainer. Load via HF repo ID (e.g. `--checkpoint thomas-schweich/pawn-base`).
+```bash
+uv run --extra dashboard python -m pawn.dashboard --log-dir logs
+```
 
-## Cloud GPU Operations
+Reads `metrics.jsonl` files, no dependency on training packages. Auto-detects
+run type from config fields. Shows loss curves, accuracy, LR schedules, GPU
+utilisation, patience clocks, and adapter-specific diagnostics.
 
-PAWN can run on either RunPod or vast.ai. The same Docker image works on both — pick the provider that has the GPU you want at the price you want. RunPod is the primary (mature, secure-cloud option, simpler pricing); vast.ai is supported for opportunistic pricing on consumer GPUs and access to hosts RunPod doesn't have.
+## Hyperparameter sweeps
+
+```bash
+uv run --extra rocm python scripts/sweep.py --strategy lora --n-trials 30 \
+    --supernet base --storage sqlite:///./lora.db --logs-dir ./sweep
+```
+
+Optuna driver with per-strategy `suggest_*` functions matching the v1 search
+spaces. Two objective shapes: `AdapterObjective` (subprocess per trial, parses
+`metrics.jsonl` for best `val_loss`) and `InProcessRoSAObjective` (skips
+per-trial JAX startup for big RoSA sweeps). Persistent study state via SQLite.
+
+## Lab (FastMCP)
+
+```bash
+uv run --extra lab python -m pawn.lab
+```
+
+`lab_launch(config={...})` validates the incoming trial dict through
+pydantic (`extra="forbid"` rejects stale field names). `lab_schema` returns
+JSON Schema generated from `PretrainConfig.model_json_schema()` /
+`AdapterConfig.model_json_schema()`.
+
+## Logs
+
+Training metrics in `logs/` (gitignored). Each run gets a timestamped
+directory with `metrics.jsonl` and a random slug.
+
+## Cloud GPU operations
+
+PAWN runs on either RunPod or vast.ai. The same Docker image works on both —
+pick the provider that has the GPU you want at the price you want.
 
 | | RunPod | vast.ai |
 |---|---|---|
 | Manager script | `deploy/pod.sh` | `deploy/vast.sh` |
 | CLI | `runpodctl` | `vastai` (or `uvx vastai`) |
 | Local config dir | `~/.config/pawn/pods/` | `~/.config/pawn/vast/` |
-| Volume model | Network volume mounted at `/workspace` | Single instance disk (use `--disk N`) |
-| Pricing | Fixed per-GPU rates | Marketplace; pass `--max-price` and/or `--interruptible` |
+| Volume model | Network volume mounted at `/workspace` | Single instance disk |
+| Pricing | Fixed per-GPU rates | Marketplace |
 
-Both share the same Docker image (`thomasschweich/pawn:latest`) and entrypoint (which honors the `PUBLIC_KEY` env var that both providers set). `vast.sh` mirrors `pod.sh`'s command surface (`create / start / stop / delete / ssh / list / status / setup / deploy / launch`) plus a `search` subcommand for browsing offers before committing.
-
-### Docker Image
-
-Docker images are **automatically built and pushed to Docker Hub by CI** on every merge to main. No manual builds needed.
-
-| Tag | Target | Base | GPU |
-|-----|--------|------|-----|
-| `thomasschweich/pawn:latest` | `runtime` | `python:3.12-slim` | CUDA (cu128 wheels bundle runtime) |
-| `thomasschweich/pawn:dev` | `dev` | `python:3.12-slim` | CUDA + Claude Code + tmux |
-| `thomasschweich/pawn:rocm` | `runtime-rocm` | `python:3.12-slim` | ROCm 7.1 (wheel bundles runtime) |
-| `thomasschweich/pawn:dev-rocm` | `dev-rocm` | `python:3.12-slim` | ROCm 7.1 + Claude Code + tmux |
-
-All images use `python:3.12-slim` — PyTorch cu128 wheels bundle CUDA runtime as separate `nvidia-*` pip packages, and PyTorch ROCm wheels bundle HIP/rocBLAS/MIOpen/etc. inside the wheel itself (~2.8 GB). No nvidia/cuda or rocm base image needed. The only host requirement is the GPU kernel driver.
-
-Code lives at `/opt/pawn` on all images. SSH in and run experiments directly.
-
-To build locally (rarely needed):
-```bash
-# CUDA
-docker build --platform linux/amd64 --target runtime \
-    --build-arg GIT_HASH=$(git rev-parse HEAD) \
-    -t thomasschweich/pawn:latest .
-
-# ROCm
-docker build --platform linux/amd64 --target runtime-rocm \
-    --build-arg GIT_HASH=$(git rev-parse HEAD) \
-    -t thomasschweich/pawn:rocm .
-```
-
-### Pod Lifecycle (RunPod)
-
-Use `deploy/pod.sh` for all pod management. Requires `runpodctl` (`curl -sSL https://cli.runpod.net | bash`).
+### Pod lifecycle (RunPod)
 
 ```bash
-# Create a pod
 bash deploy/pod.sh create myexp --gpu h100
-
-# SSH into it
 bash deploy/pod.sh ssh myexp
-
-# Launch training
-bash deploy/pod.sh launch myexp scripts/train.py --config configs/cotrain_three_variants.json --hf-repo thomas-schweich/pawn-{variant}
-
-# Stop (preserves volume, stops billing)
-bash deploy/pod.sh stop myexp
-
-# Delete (destroys everything)
-bash deploy/pod.sh delete myexp
+bash deploy/pod.sh launch myexp scripts/train_jax.py --supernet base \
+    --hf-repo thomas-schweich/pawn-base-v2
+bash deploy/pod.sh stop myexp        # SIGTERM, graceful shutdown
+bash deploy/pod.sh delete myexp      # destroy everything
 ```
 
-GPU shortcuts: `a5000`, `a40`, `a6000`, `4090`, `5090`, `l40s`, `h100`. Pod configs are cached in `~/.config/pawn/pods/<name>.env`.
-
-### Instance Lifecycle (vast.ai)
-
-Use `deploy/vast.sh` for vast.ai. Requires `vastai` (`uv tool install vastai` or `pip install --user vastai`) and `jq`. Authenticate once with `vastai set api-key <KEY>` (key at https://vast.ai/console/account).
+### Instance lifecycle (vast.ai)
 
 ```bash
-# Browse matching offers without creating anything
 bash deploy/vast.sh search --gpu 4090 --max-price 0.5
-
-# Create from cheapest matching offer
 bash deploy/vast.sh create myexp --gpu 4090 --max-price 0.5
-
-# Or take a chance on a spot/interruptible host
-bash deploy/vast.sh create cheap1 --gpu 3090 --interruptible
-
-# rsync the local checkout into /workspace/pawn on the instance —
-# required before `launch`, since the image bakes code at /opt/pawn
-# but `launch` runs from /workspace/pawn.
-bash deploy/vast.sh deploy myexp
-
-# SSH / launch / stop / delete
-bash deploy/vast.sh ssh myexp
-bash deploy/vast.sh launch myexp scripts/train.py --variant base --hf-repo thomas-schweich/pawn-base
-bash deploy/vast.sh stop myexp
+bash deploy/vast.sh deploy myexp     # rsync local checkout to /workspace/pawn
+bash deploy/vast.sh launch myexp scripts/train_jax.py --supernet base \
+    --hf-repo thomas-schweich/pawn-base-v2
 ```
 
-Vast.ai has no separate network volume — instance disk is sized via `--disk` (default 100 GB) and persists across `stop`/`start` (you keep paying the storage rate while stopped). `delete` destroys the disk. Instance configs are cached in `~/.config/pawn/vast/<name>.env`.
+`HF_TOKEN` and `PUBLIC_KEY` are forwarded automatically at create time. Both
+providers honour the same Docker image (`thomasschweich/pawn:latest`) and
+entrypoint.
 
-`HF_TOKEN` and `PUBLIC_KEY` (or `~/.ssh/id_ed25519.pub`/`id_rsa.pub`) from your local environment are passed through to the instance at create time.
+### Instance safety
 
-### GPU Selection
-
-Benchmarks from pretraining 3 models concurrently (cotrain, batch=256):
-
-| GPU | VRAM | $/hr | Step time | 100K cost | Notes |
-|-----|------|------|-----------|-----------|-------|
-| B200 | 192GB | $4.99 | 0.28s | ~$39 | Fastest |
-| H200 SXM | 80GB | $3.59 | 0.34s | ~$34 | Best wall-clock/cost balance |
-| RTX PRO 6000 | 48GB | $1.89 | 0.62s | ~$33 | Cheapest viable |
-| A100 PCIe | 80GB | $1.39 | 0.79s | ~$30 | Cheapest overall |
-| L40S | 48GB | $0.86 | 1.37s | ~$33 | Slow but cheap |
-| RTX 5090/4090/3090 | 24-32GB | — | OOM | — | Insufficient VRAM for 3 models |
-
-Total cost is remarkably consistent ($30-39) across viable GPUs. The choice is wall-clock time vs cost, not cost vs cost. Single-model training fits on 24GB GPUs.
-
-### Required Instance Configuration
-
-- **Persistent storage.** On RunPod, attach a network volume (mounted at `/workspace`). On vast.ai, the instance disk persists across stop/start; pick a size with `--disk` that comfortably holds checkpoints between HF pushes. Either way, ephemeral container layers are gone on delete.
-- **Set `HF_TOKEN` as an environment variable** for automatic HuggingFace authentication. The entrypoint persists it to `~/.cache/huggingface/token`. `vast.sh create` forwards `HF_TOKEN` from your local shell automatically.
-- `PAWN_MODEL=thomas-schweich/pawn-base` — auto-pull a checkpoint on startup (runner target).
-- `PAWN_CMD` — training command to execute (alternative to Docker CMD args).
-- `PAWN_DASHBOARD=0` — disable the auto-started dashboard + Caddy proxy (enabled by default).
-
-### Instance Safety
-
-- Stop with `bash deploy/pod.sh stop <name>` or `bash deploy/vast.sh stop <name>` — sends SIGTERM, trainer saves and pushes before exiting.
-- **Never delete/destroy an instance while training is running** — data loss risk on either provider.
-- **Never `kill -9` training processes** — use SIGTERM (plain `kill`), which triggers graceful shutdown.
-- **Never rsync checkpoint files from running instances** — load via HF repo ID instead.
-- On vast.ai with `--interruptible`, the host can preempt you at any time. Keep `--checkpoint-interval` short so HF has a recent push to resume from.
-
-## Monitoring Training Progress
-
-### Key Principle: Write Scripts to Disk for Pre-Approval
-
-When setting up recurring monitoring, **always write the monitoring script to a file first** so the user can review and pre-approve it. This avoids repeated permission prompts when `/loop` fires.
-
-**Pattern:**
-1. Write a bash script to disk (e.g., `scripts/check_my_run.sh`)
-2. User reviews and approves the script
-3. Schedule with `/loop 15m bash scripts/check_my_run.sh`
-
-The primary monitoring interface is the Solara dashboard (`python -m pawn.dashboard --log-dir logs`); any ad-hoc polling helpers are one-offs the model is expected to write on demand and leave out of the repo.
-
-### Dashboard
-
-```bash
-python -m pawn.dashboard --log-dir logs
-```
-
-Reads `metrics.jsonl` files, no dependency on training packages. Auto-detects run type from config fields. Shows loss curves, accuracy, LR schedules, GPU utilization, patience clocks, and adapter-specific diagnostics. Requires restart for code changes (no hot reload).
-
-**On cloud instances**, the dashboard starts automatically and is proxied through Caddy on port 8888. On RunPod, access it via the HTTP proxy URL (the "Connect" button → port 8888). On vast.ai, port 8888 is published on the host's mapped port — find it via `bash deploy/vast.sh status <name>` (look for the `8888/tcp` entry). Set `PAWN_DASHBOARD=0` as an environment variable to disable it.
-
-## Logs
-
-Training metrics in `logs/` (gitignored). Each run gets a timestamped directory with `metrics.jsonl` and a random slug (e.g., `run_20260325_140000_zesty-osprey/`).
-
-`MetricsLogger` (`pawn/logging.py`) writes one JSON object per line. Every record includes timestamp, step, elapsed time, and memory stats. Config records include hostname, git hash, git tag, and run slug.
-
-## Hyperparameter Sweeps
-
-Optuna integration via `pawn/sweep.py` and `scripts/sweep.py`:
-
-```bash
-uv run python scripts/sweep.py \
-    --adapter lora --n-trials 30 --n-jobs 2 --n-gpus 2 \
-    --total-steps 20000 --pruner hyperband \
-    --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \
-    --local-checkpoints
-```
-
-Supports all adapter types + architecture search. GPU affinity assigns `CUDA_VISIBLE_DEVICES = trial.number % n_gpus`. SQLite-backed study persistence. Pruner options: `hyperband`, `median`, `none`.
+- Stop with `pod.sh stop` / `vast.sh stop` — sends SIGTERM, trainer saves and
+  pushes before exiting.
+- **Never delete/destroy an instance while training is running.**
+- **Never `kill -9` training processes.**
+- **Never rsync checkpoint files from running instances** — load via HF repo
+  ID instead.
 
 ## Key Patterns & Gotchas
 
-- **Adapter training is cache-first.** First run with a given (Elo, `min_ply`) combination filters and tokenizes the dataset to disk; subsequent runs mmap the cache. Both LR-schedule sizing and resume use exact step counts derived from `steps_per_epoch` — no shard-count estimate, no fast-forward iteration through the data pipeline. The legacy streaming path is gone.
-- **`steps_per_epoch` is canonical for adapters.** `"all"` resolves to `n_train_games // batch_size` once the cache materializes. `max_games` is deprecated and converts to `steps_per_epoch = max_games // batch_size` with a warning.
-- **`schedule_health.json`** is written next to `metrics.jsonl` at trainer exit (both adapter and pretrain). Records `{planned_total_steps, actual_total_steps, reason_for_stop, lr_peak, actual_final_lr}`. The combination `actual != planned` AND `reason_for_stop == "completed"` is a structural-bug signal and prints a red banner.
-- **Bucket I/O uses `hf://buckets/<ns>/<name>` URLs via `hf sync`.** Never `hf upload --repo-type bucket` — the current CLI rejects bucket type and silently exits 0. For cron-driven syncs that need to fail loudly on auth/quota, use `scripts/sync_to_bucket.sh`.
-- **fp16 AMP overflows on ceiling-scale adapters.** Use `--amp-dtype bfloat16` for adapter training and eval; bf16 has fp32-range exponents. fp16 produces NaN-corrupted accuracy (~9%) on backbones with adapter activations exceeding fp16 range. `eval_accuracy.py`'s `--amp-dtype` defaults to `none` (fp32) for safety.
-- **DataLoader workers must use `multiprocessing_context='spawn'`** — the Rust engine uses rayon, and fork after rayon init causes deadlocks.
-- **`SDPA_BACKEND` must be set before `torch.compile()`** — compiled code captures the backend at trace time. The adapter trainer pins it directly before its step-level compile; `apply_gpu_config()` handles this for sweep / eval entry points that still wrap `forward_hidden` per-call.
-- **ROCm works**: Previously the flash-attention backward on ROCm hit a stride mismatch when combined with `torch.compile` + AMP. We worked around it by forcing RoPE outputs to be contiguous before SDPA in `pawn.model.Attention.forward` — flash is now the default on AMD too. `--sdpa-math` remains available as a debugging escape hatch but is no longer required. Everything else — training, eval, adapters, data loading — works identically on ROCm and CUDA. **Do not assume bugs are ROCm-specific.** Every other time something has failed on AMD it turned out to be a bug in our code (wrong torch version installed, stale lockfile, missing dependency, etc.), not a ROCm issue.
-- **Sparse logit projection**: `forward_hidden()` returns `(B,T,d_model)`, then only loss-masked positions project through `lm_head` — avoids full `(B,T,1980)` materialization.
-- **Legal mask via Rust**: `LegalMaskBuilder` replays games in Rust, returns sparse indices (~2 MB) scattered into a per-batch GPU bool buffer (vs ~70 MB dense). The mask buffer is allocated fresh per call rather than pre-allocated — the caching allocator reuses freed buffers across steps, and pre-allocation didn't pull its weight under bucketed collates where `T` varies per batch.
-- **GPU auto-detection**: `pawn.gpu.configure_gpu()` selects compile/AMP/SDPA settings. `apply_gpu_config()` applies them for the pretrain trainer and sweep/eval scripts. The adapter trainer instead wraps the entire training step in `torch.compile(mode="reduce-overhead")` (see `build_compiled_step`); it additionally compiles `model.forward_hidden` directly so `evaluate()` and `rosa_warmup()` retain their kernel-launch reduction. Both NVIDIA and AMD use flash attention + compile by default (flash on AMD relies on the RoPE contiguous fix in `Attention.forward`). Both paths are tested and production-validated.
-- **Factored embeddings**: each move token decomposes into `src_embed[s] + dst_embed[d] + promo_embed[p]`, shrinking the move-embedding table from `1968 × d_model` to `(64 + 64 + 5) × d_model` — ~14.8× fewer params on that table (input side only; `lm_head` is still a full `d_model → vocab` projection).
-- **stockfish-datagen 50-move rule is eval-strategic, not unconditional.** At halfmove 100 (the FIDE-claimable threshold), the side about to move claims iff Stockfish's top-candidate `score_cp` (side-to-move POV) is `< 0`. Winning/even sides keep playing; losing sides claim. The 75-move *automatic* rule (halfmove 150) is the hard upper bound, fires regardless of eval. Means the dataset has 50-move-rule draws scattered across halfmoves 100–150 (correlated with eval), giving the model a learnable signal for *when* to claim rather than baking in "halfmove 100 → game over." 3-fold repetition stays unconditional. See `stockfish-datagen/src/game.rs` (`detect_pre_eval_terminal` + `should_strategic_claim_50mv`).
-- **stockfish-datagen worker pinning shifts the n_workers sweet spot down.** Each (worker, Stockfish) pair is pinned to `worker_id % n_logical` on Linux so they share L1/L2. Local 16-thread / 8-physical / 2-SMT sweep at nodes=1: pinning peaks at 14 workers / 321 g/s (+7% over unpinned 16-worker peak; +36-38% in the under-saturated regime; -3% at parity with cores; -22% at workers=20). Rule of thumb: **`n_workers = total_threads − threads_per_core`** — i.e. fully occupy every physical core except one, and leave that one core entirely free for the kernel + watcher thread + HF upload networking + parquet I/O. For typical vast.ai 128-thread / 64-physical / 2-SMT pods that's 126 workers; the bundled `stockfish-datagen/examples/stockfish_100m.json` config defaults to that.
+- **Adapter training is cache-first.** First run with a given (Elo,
+  `min_ply`) combination filters and tokenizes to disk under
+  `$HF_HOME/pawn-lichess-cache/<key>/`. Subsequent runs mmap the cache. Filter
+  parameters bake into the cache key.
+- **`steps_per_epoch` is canonical for adapters.** `"all"` resolves to
+  `n_train_games // batch_size` once the cache materialises.
+- **`schedule_health.json`** is written at trainer exit. Records
+  `{planned_total_steps, actual_total_steps, reason_for_stop, lr_peak,
+  actual_final_lr}`. `actual != planned` AND `reason_for_stop == "completed"`
+  is a structural-bug signal.
+- **All five generation diagnostics gate on outcome_prefix_trained.** Not
+  just the obvious two (`impossible_task_test` / `improbable_task_test`).
+- **The held-out validation split is the default.** Carving val out of train
+  silently leaks; only opt back into carve-from-train for single-file local
+  sources without split structure.
+- **One framework.** JAX/Equinox/Optax everywhere. The only torch touchpoints
+  are `pawn/legacy.py` (the v1 converter) and `pawn/_torch_legacy_fixture.py`
+  (the converter's parity-test reference architecture).
+- **PAD-token init in the engine.** Every PGN-token-init site initialises
+  with `vocab::PAD_TOKEN`, not `0` — the vocab assigns `0` to a legal move,
+  so a 0-initialised tail looks like real moves downstream.
+- **Factored embeddings.** Each move token decomposes into
+  `src_embed[s] + dst_embed[d] + promo_embed[p]`, shrinking the
+  move-embedding table from `1968 × d_model` to `(64 + 64 + 5) × d_model`.
+- **WSL2 + ROCm.** JAX-on-ROCm works on WSL2 but emits a benign
+  "sysfs nodes path does not exist" warning at import time; ignore it. The
+  RocmDevice still resolves and jit'd kernels run normally.
 
-  As of the shard-id partitioning refactor, `cfg.n_workers` is operational-only — workers pull from a shared atomic shard-id counter, so changing it between runs never changes any game's content (the per-game seed is `mix(tier_seed, global_game_index)` and tier seeds are keyed by sha256(`tier.name`), not by index). Multi-pod cooperation uses `--shard-id-range A:B` on the `stockfish-datagen run` subcommand; each pod writes per-pod sentinels with the range zero-padded to 6 digits (`_tier_state-s000000-s005000.json`, `_manifest-s000000-s005000.json`) and `scripts/datagen_reconcile_tier.py` merges them into a canonical `_manifest.json` post-run. The orchestrator (`scripts/datagen_with_hf_sync.py`) commits shards via batched `huggingface_hub.HfApi.create_commit` calls with one `CommitOperationAdd` per shard (~1 commit per tier per cycle), staying well under HF's 128 commits/hour limit.
+## When in doubt
 
-  NUMA: `stockfish-datagen` calls `set_mempolicy(MPOL_INTERLEAVE)` at startup (Linux only). Children inherit across `execve`, so stockfish workers first-touch their NNUE page-cache fills under interleave policy. No-op on single-socket pods.
-
-  Stockfish binary: the `:datagen` Docker image JIT-builds the patched stockfish for the host CPU on first launch (`scripts/build_stockfish_for_host.sh`) and caches it under `/workspace/.cache/stockfish/`. One image tag covers every supported microarch (vnni512 / avx512 / avx2 / modern); the previous per-arch matrix (`:datagen-avx2`, `:datagen-avx512`) is gone.
+The original PyTorch/Stockfish-datagen pipeline lives at the `v1.0.0` git
+tag. The `pre-vocab-transition` tag preserves the older 60k-token vocabulary.
+The full framework swap is tracked in `docs/jax_migration_plan.md` — every
+commit on `jax_migration` and its section branches references that document
+under a `Plan:` line in the commit body.
