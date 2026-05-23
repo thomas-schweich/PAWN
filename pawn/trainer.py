@@ -35,7 +35,7 @@ Public surface:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Final
+from typing import Any, Callable, Final
 
 import equinox as eqx
 import jax
@@ -475,15 +475,27 @@ def unflatten_opt_state(
         )
     # Bind each restored leaf's dtype to the template leaf's dtype.
     # Without `dtype=`, `jnp.asarray(numpy_array)` infers from the
-    # numpy dtype — fine for floats but a silent narrowing risk if
-    # Optax ever stores a Python int (which `np.asarray` widens to
+    # numpy dtype — fine for arrays whose dtype was preserved by the
+    # safetensors round-trip, but a silent narrowing risk if Optax
+    # ever stores a Python int leaf (which `np.asarray` widens to
     # int64 on Linux/x86_64) where the template expected int32.
-    # Asserting dtype match keeps the round-trip faithful (round-1
-    # review-bug-detector defense-in-depth.)
+    #
+    # `getattr(leaf, "dtype", None)` covered the array case but
+    # *re-introduced* the footgun for python-int template leaves
+    # (round-2 bug-detector finding). Fall back to the *saved* leaf's
+    # numpy dtype when the template doesn't have one — the safetensors
+    # round-trip preserves dtype, so the saved dtype is the contract.
+    def _dtype_for(template_leaf: Any, saved: np.ndarray) -> Any:
+        if hasattr(template_leaf, "dtype"):
+            return template_leaf.dtype
+        # Template leaf is a python scalar; defer to the saved numpy
+        # array's dtype (preserved by safetensors).
+        return saved.dtype
+
     new_leaves = [
         jnp.asarray(
             flat[jax.tree_util.keystr(p)],
-            dtype=getattr(leaf, "dtype", None),
+            dtype=_dtype_for(leaf, flat[jax.tree_util.keystr(p)]),
         )
         for p, leaf in leaves_with_paths
     ]

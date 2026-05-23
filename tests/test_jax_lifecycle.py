@@ -8,6 +8,7 @@ import threading
 import time
 import unittest.mock as mock
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -56,8 +57,8 @@ def test_push_checkpoint_async_enqueues_upload(tmp_path: Path) -> None:
     tracker = HFPushTracker(repo_id="ns/test", branch="run/test")
     try:
         push_checkpoint_async(ckpt, tracker, upload_cls=_FakeHfApi)
-        failures = drain_push_queue(tracker, timeout=5.0)
-        assert failures == 0
+        timeouts, errors = drain_push_queue(tracker, timeout=5.0)
+        assert (timeouts, errors) == (0, 0)
         assert len(_FakeHfApi.calls) == 1
         call = _FakeHfApi.calls[0]
         assert call["repo_id"] == "ns/test"
@@ -80,8 +81,10 @@ def test_push_checkpoint_async_failures_dont_raise(tmp_path: Path) -> None:
     tracker = HFPushTracker(repo_id="ns/test")
     try:
         push_checkpoint_async(ckpt, tracker, upload_cls=_FailingApi)
-        failures = drain_push_queue(tracker, timeout=5.0)
-        assert failures == 1
+        timeouts, errors = drain_push_queue(tracker, timeout=5.0)
+        # Per round-2: a raised exception is an `error`, not a
+        # `timeout`. The worker exited normally; no thread is stuck.
+        assert (timeouts, errors) == (0, 1)
     finally:
         tracker.shutdown()
 
@@ -98,6 +101,97 @@ def test_push_checkpoint_async_requires_huggingface_hub_when_no_cls(
         with mock.patch.dict("sys.modules", {"huggingface_hub": None}):
             with pytest.raises(RuntimeError, match="huggingface_hub"):
                 push_checkpoint_async(ckpt, tracker)
+    finally:
+        tracker.shutdown()
+
+
+def test_join_distinguishes_timeouts_from_errors(tmp_path: Path) -> None:
+    """Round-2 review-bug-detector: a transient upload exception
+    (worker thread exited normally) must not be conflated with a
+    timeout (worker still running). Only the latter should drive the
+    abandon-thread path at shutdown.
+    """
+    ckpt = tmp_path / "step_00000010"
+    ckpt.mkdir()
+    tracker = HFPushTracker(repo_id="ns/test")
+
+    class _RaisingHfApi:
+        def upload_folder(self, **_kwargs: Any) -> None:
+            raise RuntimeError("simulated upload failure")
+
+    try:
+        push_checkpoint_async(ckpt, tracker, upload_cls=_RaisingHfApi)
+        timeouts, errors = tracker.join(timeout=5.0)
+        assert timeouts == 0, "exception ≠ timeout"
+        assert errors == 1, "the raising upload should count as an error"
+    finally:
+        tracker.shutdown()
+
+
+def test_shutdown_with_stuck_upload_returns_promptly(
+    tmp_path: Path,
+) -> None:
+    """Round-2 codex P2 + review-bug-detector Critical: a stuck upload
+    thread used to keep the process alive via
+    `concurrent.futures.thread._python_exit`'s join-on-non-daemon. The
+    fix: worker threads are daemonic via `_DaemonThreadPoolExecutor`,
+    and `shutdown(drain_succeeded=False)` returns without waiting. This
+    test injects a never-completing upload and asserts the shutdown
+    call returns inside a tight wall-clock bound.
+    """
+    ckpt = tmp_path / "step_00000010"
+    ckpt.mkdir()
+    tracker = HFPushTracker(repo_id="ns/test")
+    blocker = threading.Event()
+
+    class _StuckHfApi:
+        def upload_folder(self, **_kwargs: Any) -> None:
+            # Never completes — simulates a network hang.
+            blocker.wait()
+
+    try:
+        push_checkpoint_async(ckpt, tracker, upload_cls=_StuckHfApi)
+        # Drain with a tiny budget so we definitely time out.
+        timeouts, errors = tracker.join(timeout=0.2)
+        assert timeouts == 1, "stuck upload should produce a timeout"
+        assert errors == 0
+        # The shutdown call itself must return promptly — the daemon
+        # thread is left running but the executor doesn't block on it.
+        t0 = time.monotonic()
+        tracker.shutdown(drain_succeeded=False)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0, (
+            f"shutdown(drain_succeeded=False) blocked for {elapsed:.2f}s; "
+            f"the daemon-thread path is meant to return promptly"
+        )
+    finally:
+        # Release the stuck thread so it doesn't linger across tests.
+        blocker.set()
+
+
+def test_executor_worker_threads_are_daemonic(tmp_path: Path) -> None:
+    """Round-2 codex/bug: the executor's worker threads must be
+    daemonic so `concurrent.futures.thread._python_exit` doesn't join
+    them at interpreter shutdown — which would re-introduce the hang
+    `drain_succeeded=False` is meant to prevent.
+    """
+    ckpt = tmp_path / "step_00000010"
+    ckpt.mkdir()
+    tracker = HFPushTracker(repo_id="ns/test")
+
+    class _NoopHfApi:
+        def upload_folder(self, **_kwargs: Any) -> None:
+            pass
+
+    try:
+        # Submit one upload to force the executor to spin a worker.
+        push_checkpoint_async(ckpt, tracker, upload_cls=_NoopHfApi)
+        tracker.join(timeout=5.0)
+        # After at least one submission, _threads is non-empty and
+        # every entry must be daemonic.
+        assert tracker._executor._threads, "expected at least one worker"
+        for t in tracker._executor._threads:
+            assert t.daemon, f"worker {t.name} is not daemonic"
     finally:
         tracker.shutdown()
 

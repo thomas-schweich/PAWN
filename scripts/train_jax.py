@@ -267,14 +267,16 @@ def main(argv: list[str] | None = None) -> int:
             break
 
     if push_tracker:
-        # `drain_push_queue` returns the number of failures (timed-out
-        # or errored uploads). When non-zero, a future is stuck mid-
-        # upload and `Future.cancel()` is a no-op on a running thread —
-        # `shutdown(drain_succeeded=False)` falls back to `wait=False`
-        # so the trainer exits within the bounded SIGTERM budget the
-        # 300s drain advertised.
-        failures = drain_push_queue(push_tracker, timeout=300.0)
-        push_tracker.shutdown(drain_succeeded=(failures == 0))
+        # `drain_push_queue` reports (timeouts, errors). Only `timeouts`
+        # implies a worker is still running — that's the abandon-thread
+        # case (`drain_succeeded=False`) so the daemon worker is killed
+        # at interpreter exit. `errors > 0` means uploads raised but
+        # the worker exited normally, which is safe to `wait=True` on.
+        # Conflating the two (round-1 bug-detector finding) would
+        # cause a transient network error to spuriously skip the
+        # `wait=True` path that's still semantically correct.
+        timeouts, _errors = drain_push_queue(push_tracker, timeout=300.0)
+        push_tracker.shutdown(drain_succeeded=(timeouts == 0))
     logger.close()
     return 0
 

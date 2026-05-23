@@ -399,11 +399,11 @@ def main(argv: list[str] | None = None) -> int:
     if final_step > 0 and final_step % cfg.checkpoint_interval != 0:
         _save(final_step)
     if push_tracker:
-        # Same gating as `scripts/train_jax.py` — if drain timed out
-        # on a stuck upload, fall back to wait=False so the trainer
-        # exits within the bounded SIGTERM budget.
-        failures = drain_push_queue(push_tracker, timeout=300.0)
-        push_tracker.shutdown(drain_succeeded=(failures == 0))
+        # Mirror `scripts/train_jax.py` — only `timeouts > 0` implies a
+        # worker is stuck; `errors > 0` is an exit-cleanly upload
+        # failure that doesn't need the abandon-thread path.
+        timeouts, _errors = drain_push_queue(push_tracker, timeout=300.0)
+        push_tracker.shutdown(drain_succeeded=(timeouts == 0))
     logger.close()
     return 0
 

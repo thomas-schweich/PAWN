@@ -57,6 +57,75 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """`ThreadPoolExecutor` whose worker threads are daemonic.
+
+    The stock executor uses non-daemon worker threads, which the
+    interpreter joins at exit via
+    ``concurrent.futures.thread._python_exit``. A stuck HF upload
+    thread therefore keeps the process alive past ``main()`` returning
+    — the 300s SIGTERM budget in ``drain_push_queue`` only bounds the
+    *drain* call, not interpreter exit.
+
+    Daemonic threads are killed at interpreter shutdown. That is the
+    correct behavior here: by the time we abandon a future
+    (``drain_succeeded=False``), the upload is past its budget and the
+    operator wants the process to exit. Marking the worker daemonic
+    moves the abandon point from "hang forever" to "kill on exit".
+
+    `daemon` can only be set before `Thread.start()` — so this needs
+    to override `_adjust_thread_count` entirely (cpython's
+    implementation constructs and starts the thread atomically with
+    ``daemon=False``). We mirror the cpython internals (verified
+    against `concurrent.futures.thread._adjust_thread_count` in
+    Python 3.12) — keep this in sync if a future Python release
+    rearranges the worker-creation path.
+    """
+
+    def _adjust_thread_count(self) -> None:
+        # CPython implementation detail — `_threads_queues` and
+        # `_worker` live in `concurrent.futures.thread`. Import here so
+        # the dependency is contained to this override.
+        import concurrent.futures.thread as _cf_thread
+        import weakref
+        from typing import cast
+
+        # If a thread is already idle and waiting for work, no need to
+        # spin a new one. Mirror the cpython early-return.
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):  # noqa: ANN001
+            # `q.put(None)` is how the worker is signalled to exit. The
+            # cpython stub types `_work_queue.put` as `put(item: _WorkItem)`
+            # but `None` is the sentinel — cast to satisfy pyright.
+            cast(Any, q).put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = "%s_%d" % (
+                self._thread_name_prefix or self, num_threads
+            )
+            t = threading.Thread(
+                name=thread_name,
+                target=_cf_thread._worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,
+            )
+            t.start()
+            # The cpython stubs type `_threads` as `AbstractSet[Thread]`
+            # and `_threads_queues` as `Mapping[Any, Any]`. At runtime
+            # both are mutable (`set` and `WeakKeyDictionary`); cast
+            # through `Any` so the mutation is type-clean.
+            cast(Any, self._threads).add(t)
+            cast(Any, _cf_thread._threads_queues)[t] = self._work_queue
+
+
 @dataclass
 class HFPushTracker:
     """Tracks the in-flight HuggingFace upload futures.
@@ -72,7 +141,9 @@ class HFPushTracker:
     repo_id: str
     branch: str = "main"
     _executor: ThreadPoolExecutor = field(
-        default_factory=lambda: ThreadPoolExecutor(max_workers=1, thread_name_prefix="hf-push")
+        default_factory=lambda: _DaemonThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hf-push"
+        )
     )
     _futures: list[Future[None]] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -81,8 +152,22 @@ class HFPushTracker:
         with self._lock:
             self._futures.append(self._executor.submit(fn))
 
-    def join(self, *, timeout: float | None = None) -> int:
-        """Wait for all pending uploads. Returns the number of failures.
+    def join(self, *, timeout: float | None = None) -> tuple[int, int]:
+        """Wait for all pending uploads. Returns ``(timeouts, errors)``.
+
+        ``timeouts`` counts futures we couldn't wait for before
+        ``timeout`` elapsed — those represent threads still running.
+        ``errors`` counts uploads that raised inside the worker (and
+        therefore released the thread normally).
+
+        The two are reported separately because they have different
+        SIGTERM consequences:
+        - ``timeouts > 0`` means a worker is still alive; the trainer
+          must take the abandon-thread path at ``shutdown`` time
+          (``drain_succeeded=False``) so the daemon worker is killed
+          at interpreter exit instead of joining indefinitely.
+        - ``errors > 0`` means uploads failed but threads exited; the
+          trainer can ``shutdown(drain_succeeded=True)`` safely.
 
         Failures don't raise — training already finished, the goal is
         best-effort cleanup before exit.
@@ -91,7 +176,8 @@ class HFPushTracker:
         with self._lock:
             futures = list(self._futures)
             self._futures.clear()
-        failures = 0
+        timeouts = 0
+        errors = 0
         for fut in futures:
             try:
                 remaining = (
@@ -99,12 +185,18 @@ class HFPushTracker:
                 )
                 if remaining is not None and remaining < 0:
                     fut.cancel()
-                    failures += 1
+                    timeouts += 1
                     continue
                 fut.result(timeout=remaining)
+            except TimeoutError:
+                # `fut.result(timeout=...)` raises this if the worker
+                # didn't finish in `remaining`. A still-running thread.
+                timeouts += 1
             except Exception:
-                failures += 1
-        return failures
+                # The upload raised — thread exited, just a failed
+                # checkpoint. No abandon-thread needed.
+                errors += 1
+        return timeouts, errors
 
     def shutdown(self, *, drain_succeeded: bool = True) -> None:
         """Drain the executor.
@@ -173,8 +265,13 @@ def push_checkpoint_async(
     tracker.submit(_do_upload)
 
 
-def drain_push_queue(tracker: HFPushTracker, *, timeout: float = 300.0) -> int:
-    """Wait for all in-flight pushes (called from the SIGTERM handler)."""
+def drain_push_queue(
+    tracker: HFPushTracker, *, timeout: float = 300.0
+) -> tuple[int, int]:
+    """Wait for all in-flight pushes (called from the SIGTERM handler).
+
+    Returns ``(timeouts, errors)`` per :meth:`HFPushTracker.join`.
+    """
     return tracker.join(timeout=timeout)
 
 
