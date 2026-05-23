@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 import optax
 
@@ -106,7 +107,15 @@ class HFPushTracker:
         return failures
 
     def shutdown(self) -> None:
-        self._executor.shutdown(wait=False)
+        """Drain the executor.
+
+        `wait=True` lets *running* uploads finish — `Future.cancel()` on
+        a running thread is a no-op, and a `shutdown(wait=False)` would
+        abandon the live thread mid-write (PR #115 review #6).
+        `cancel_futures=True` does drop queued-but-not-started uploads
+        so we don't block forever on a deep backlog.
+        """
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 def push_checkpoint_async(
@@ -229,17 +238,24 @@ def _reset_shutdown_state_for_tests() -> None:
 def load_resume_state(
     ckpt_dir: Path | str,
     optimizer: optax.GradientTransformation,
-    key: Any,
+    key: jax.Array,
 ) -> TrainState:
     """Build a :class:`TrainState` from a saved checkpoint directory.
 
     Loads the model via :func:`pawn.checkpoint.load_model`, reads the
-    training_state.json sidecar (if present) for the step counter,
-    and returns a TrainState ready to continue training. ``state.step``
-    is spliced from the saved value so the metrics log stays
-    monotonic across the resume; ``opt_state`` is initialised fresh
-    against the loaded model (Optax internal counters reset, but the
-    metrics-step counter doesn't).
+    ``training_state.json`` sidecar for the step counter, and returns
+    a TrainState ready to continue training. ``state.step`` is spliced
+    from the saved value so the metrics log stays monotonic across
+    the resume.
+
+    If the checkpoint includes ``optimizer.safetensors`` (written by
+    :func:`pawn.checkpoint.save_model` when the trainer passed
+    ``optimizer_state``), the saved opt-state is restored via
+    :func:`pawn.trainer.unflatten_opt_state` — Adam moments + clip
+    counters survive the resume intact. If the slot is missing (older
+    checkpoints / runs that opted out), fall back to a fresh
+    ``optimizer.init(...)`` and emit a warning so the cold restart
+    surfaces in logs rather than silently spiking the loss.
     """
     ckpt_dir = Path(ckpt_dir)
     model = load_model(ckpt_dir)
@@ -260,7 +276,27 @@ def load_resume_state(
             step = 0
     import equinox as eqx
 
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    from pawn.checkpoint import OPTIMIZER_FILE
+    from pawn.trainer import unflatten_opt_state
+
+    template = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    opt_path = ckpt_dir / OPTIMIZER_FILE
+    if opt_path.is_file():
+        from safetensors.numpy import load_file as st_load
+        flat = st_load(str(opt_path))
+        opt_state = unflatten_opt_state(template, flat)
+    else:
+        # Older checkpoints didn't persist opt_state. The cold restart
+        # is loud rather than silent — a multi-hundred-step loss spike
+        # mid-cosine schedule is the typical failure mode and a stderr
+        # line is the cheapest signal for the operator.
+        print(
+            f"[pawn.lifecycle] WARNING: no {OPTIMIZER_FILE} in {ckpt_dir}; "
+            "resuming with a fresh opt_state (Adam moments will cold-start). "
+            "Long pretraining runs may see a loss spike at the resume point.",
+            file=sys.stderr,
+        )
+        opt_state = template
     return TrainState(
         model=model,
         opt_state=opt_state,

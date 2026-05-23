@@ -103,7 +103,10 @@ def test_validate_config_dispatches_by_run_type() -> None:
     from pawn.run_config import AdapterConfig, PretrainConfig
 
     assert isinstance(
-        validate_config({"run_type": "pretrain", "local_checkpoints": True}),
+        validate_config({
+            "run_type": "pretrain", "local_checkpoints": True,
+            "total_steps": 100,
+        }),
         PretrainConfig,
     )
     assert isinstance(

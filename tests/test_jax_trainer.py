@@ -272,6 +272,34 @@ def test_lr_schedule_rejects_warmup_greater_than_total_steps() -> None:
         make_lr_schedule(cfg, total_steps=100)
 
 
+def test_lr_schedule_wsd_rejects_non_monotonic_boundary() -> None:
+    """PR #115 review: `_check_lr_schedule_fractions` validates the
+    fractions, but `warmup_steps` overrides `warmup_frac` and can
+    drive `warmup + decay_steps > total_steps` — which produces a
+    non-monotonic `join_schedules` boundary that Optax silently
+    clamps wrong. Refuse the config up front.
+    """
+    cfg = _make_cfg(
+        lr_schedule="wsd", warmup_steps=600, decay_frac=0.5,
+        total_steps=1000,
+    )
+    with pytest.raises(ValueError, match="wsd schedule.*exceeds"):
+        make_lr_schedule(cfg, total_steps=1000)
+
+
+def test_lr_schedule_infinite_rejects_non_monotonic_boundary() -> None:
+    """Same gap as WSD for the `infinite` schedule (warmup +
+    cooldown + decay can exceed total even when fractions pass).
+    """
+    cfg = _make_cfg(
+        lr_schedule="infinite", warmup_steps=600,
+        cooldown_frac=0.3, decay_frac=0.2,
+        total_steps=1000,
+    )
+    with pytest.raises(ValueError, match="infinite schedule.*exceeds"):
+        make_lr_schedule(cfg, total_steps=1000)
+
+
 def test_lr_schedule_infinite_with_extreme_rounding_doesnt_crash() -> None:
     """A config with float fractions summing close to 1.0 can round into
     integer step counts that sum to > total_steps. The `infinite`

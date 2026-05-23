@@ -268,6 +268,16 @@ class PretrainConfig(BaseRunConfig):
 
     @model_validator(mode="after")
     def _check_pretrain(self) -> "PretrainConfig":
+        # `BaseRunConfig.total_steps` is `int | None = None` so the
+        # AdapterConfig path (which has its own override) can default
+        # it. The pretrain script genuinely requires it — surface that
+        # as a pydantic ValueError rather than a `print + return 2`
+        # in the script (PR #115 review #5).
+        if self.total_steps is None:
+            raise ValueError(
+                "PretrainConfig requires total_steps; pass --total-steps N "
+                "or set it in the JSON config"
+            )
         if self.accumulation_steps <= 0:
             raise ValueError(
                 f"accumulation_steps must be positive, got {self.accumulation_steps}"

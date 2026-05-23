@@ -34,8 +34,9 @@ from pawn.run_config import (
 
 def _pretrain_kwargs(**overrides: Any) -> dict[str, Any]:
     """Minimal valid PretrainConfig kwargs (must satisfy
-    BaseRunConfig._check_checkpoint_mode)."""
-    base: dict[str, Any] = {"local_checkpoints": True}
+    BaseRunConfig._check_checkpoint_mode AND
+    PretrainConfig._check_pretrain — which requires total_steps)."""
+    base: dict[str, Any] = {"local_checkpoints": True, "total_steps": 100}
     base.update(overrides)
     return base
 
@@ -264,16 +265,20 @@ def test_specialized_round_trips_through_json() -> None:
 
 def test_checkpoint_mode_requires_one_destination() -> None:
     with pytest.raises(ValueError, match="hf_repo.*hf_bucket.*local_checkpoints"):
-        PretrainConfig()  # no checkpoint destination
+        PretrainConfig(total_steps=100)  # no checkpoint destination
     # Happy path
-    PretrainConfig(local_checkpoints=True)
-    PretrainConfig(hf_repo="thomas-schweich/scratch")
-    PretrainConfig(hf_bucket="ns/bucket")
+    PretrainConfig(local_checkpoints=True, total_steps=100)
+    PretrainConfig(hf_repo="thomas-schweich/scratch", total_steps=100)
+    PretrainConfig(hf_bucket="ns/bucket", total_steps=100)
 
 
 def test_checkpoint_mode_rejects_hf_repo_plus_local() -> None:
     with pytest.raises(ValueError, match="mutually exclusive"):
-        PretrainConfig(hf_repo="thomas-schweich/scratch", local_checkpoints=True)
+        PretrainConfig(
+            hf_repo="thomas-schweich/scratch",
+            local_checkpoints=True,
+            total_steps=100,
+        )
 
 
 # _check_lr_schedule_fractions ----------------------------------------------
@@ -372,9 +377,12 @@ def test_max_corpus_gb_must_be_positive() -> None:
 
 
 def test_total_steps_must_be_positive_when_set() -> None:
-    """`total_steps` is optional (None means open-ended), but a negative
-    or zero value is a typo, not an intent."""
-    PretrainConfig(**_pretrain_kwargs(total_steps=None))
+    """`total_steps` is required by PretrainConfig (PR #115 review #5
+    moved the runtime check into the model_validator). Zero or
+    negative is a typo. None now also raises rather than slipping
+    through to a `print + return 2` in the script."""
+    with pytest.raises(ValueError, match="total_steps"):
+        PretrainConfig(local_checkpoints=True, total_steps=None)
     with pytest.raises(ValueError, match="total_steps"):
         PretrainConfig(**_pretrain_kwargs(total_steps=0))
 
@@ -678,7 +686,7 @@ def test_run_config_dispatches_by_run_type() -> None:
 
     adapter = TypeAdapter(RunConfig)
     pretrain = adapter.validate_python(
-        {"run_type": "pretrain", "local_checkpoints": True}
+        {"run_type": "pretrain", "local_checkpoints": True, "total_steps": 100}
     )
     assert isinstance(pretrain, PretrainConfig)
     adapter_cfg = adapter.validate_python(

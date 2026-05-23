@@ -41,6 +41,7 @@ from pawn.trainer import (
     Batch,
     TrainState,
     VariantSpec,
+    flatten_opt_state,
     make_lr_schedule,
     make_optimizer,
     make_scan_step,
@@ -136,10 +137,9 @@ def _require_accelerator() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+    # `_build_config` raises a pydantic ValueError if --total-steps is
+    # missing — no per-field runtime check needed here.
     cfg = _build_config(args)
-    if cfg.total_steps is None:
-        print("error: --total-steps is required", file=sys.stderr)
-        return 2
     _require_accelerator()
 
     # Pick supernet shape.
@@ -150,8 +150,14 @@ def main(argv: list[str] | None = None) -> int:
         for name in ("small", "base", "large")
     )
 
+    # `PretrainConfig._check_pretrain` validates that `total_steps` is
+    # not None — assert it for pyright (the model_validator constraint
+    # doesn't narrow the optional type at the field level).
+    assert cfg.total_steps is not None
+    total_steps: int = cfg.total_steps
+
     # Optimiser + state.
-    schedule = make_lr_schedule(cfg, cfg.total_steps)
+    schedule = make_lr_schedule(cfg, total_steps)
     optimizer = make_optimizer(cfg, schedule)
     if cfg.resume:
         state = load_resume_state(Path(cfg.resume), optimizer, jax.random.key(0))
@@ -193,9 +199,17 @@ def main(argv: list[str] | None = None) -> int:
         out = logger.run_dir / f"step_{step_int:08d}"
         if out.exists():
             return
+        # Flatten the Optax PyTree to a name → ndarray dict so
+        # save_model can drop it into `optimizer.safetensors`. The
+        # resume path uses the matching `unflatten_opt_state` to rebuild
+        # the PyTree against a freshly-initialised template — that's
+        # what keeps Adam's first/second moment estimates + the clip
+        # counter across the resume boundary.
+        opt_tensors = flatten_opt_state(state.opt_state)
         save_model(
             state.model, out,
             run_config=cfg.model_dump(),
+            optimizer_state=opt_tensors,
             training_state={"step": int(state.step)},
         )
         if push_tracker:
@@ -204,11 +218,11 @@ def main(argv: list[str] | None = None) -> int:
     start = int(state.step)
     t0 = time.time()
     next_step = start
-    while next_step < cfg.total_steps:
+    while next_step < total_steps:
         # Cap K at remaining steps so the final chunk lands exactly on
         # `total_steps`. Stack K batches on a leading axis; `scan_step`
         # runs them in one compiled program.
-        chunk_k = min(cfg.k, cfg.total_steps - next_step)
+        chunk_k = min(cfg.k, total_steps - next_step)
         chunk_seed = int(rng.integers(0, 2**31 - 1))
         chunk_corpus = generate_corpus(
             n_games=cfg.batch_size * chunk_k,
@@ -243,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if (
             next_step % cfg.checkpoint_interval == 0
-            or next_step == cfg.total_steps
+            or next_step == total_steps
         ):
             if cfg.local_checkpoints or cfg.hf_repo:
                 _save_checkpoint(next_step)

@@ -196,6 +196,26 @@ def test_pack_corpus_rejects_bad_outcome_shape() -> None:
         pack_corpus(move_ids, lengths, bad_outcome, seq_len=8)
 
 
+def test_pack_corpus_zero_length_game_has_empty_loss_mask() -> None:
+    """PR #115 review #4: a zero-length game previously got
+    `loss_mask[:, 0]` = True (supervising PAD → PAD). The threshold
+    should be -1 for the zero-length row so no positions are
+    supervised."""
+    move_ids = np.zeros((2, 8), dtype=np.int16)
+    # Game 0 has 3 real moves; game 1 has 0 (all PAD).
+    lengths = np.array([3, 0], dtype=np.int16)
+    outcome = np.zeros((2,), dtype=np.int32)
+    corpus = pack_corpus(
+        move_ids, lengths, outcome, seq_len=8, prepend_outcome=False
+    )
+    assert bool(corpus.loss_mask[0].any()), (
+        "non-empty game should still supervise its real moves"
+    )
+    assert not bool(corpus.loss_mask[1].any()), (
+        "zero-length game should have an empty loss mask"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Outcome-token mapping from termination codes
 # ---------------------------------------------------------------------------

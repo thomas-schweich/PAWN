@@ -189,3 +189,56 @@ def test_load_resume_state_returns_train_state_compatible_with_train_step(
     assert state.opt_state is not None
     assert isinstance(state.step, jax.Array)
     assert state.key is not None
+
+
+def test_load_resume_state_restores_opt_state_when_present(
+    tmp_path: Path,
+) -> None:
+    """PR-review #1: when the checkpoint includes `optimizer.safetensors`,
+    Adam's moment estimates survive the resume — no cold restart."""
+    import equinox as eqx
+
+    from pawn.trainer import flatten_opt_state
+
+    model = init_model(TINY_SUPERNET, key=0)
+    opt = optax.adamw(1e-3)
+    template = opt.init(eqx.filter(model, eqx.is_inexact_array))
+    # Synthesise a "trained" opt_state by injecting non-zero leaves so
+    # we can tell it apart from a freshly-initialised template.
+    def _bump(leaf):
+        if hasattr(leaf, "shape") and leaf.dtype.kind == "f":
+            return leaf + 0.5
+        return leaf
+    trained = jax.tree_util.tree_map(_bump, template)
+
+    out_dir = tmp_path / "step_00000010"
+    save_model(
+        model, out_dir,
+        optimizer_state=flatten_opt_state(trained),
+        training_state={"step": 10},
+    )
+
+    restored = load_resume_state(out_dir, opt, key=jax.random.key(0))
+    # The Adam moments (mu / nu) must equal the synthesised trained
+    # values, not the fresh-init zeros. Compare PyTree-wise.
+    trained_leaves = jax.tree_util.tree_leaves(trained)
+    restored_leaves = jax.tree_util.tree_leaves(restored.opt_state)
+    assert len(trained_leaves) == len(restored_leaves)
+    for t, r in zip(trained_leaves, restored_leaves):
+        assert (jnp.asarray(t) == jnp.asarray(r)).all()
+
+
+def test_load_resume_state_warns_on_missing_opt_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """PR-review #1 follow-up: older checkpoints without
+    `optimizer.safetensors` fall back to a fresh init, but the cold
+    restart must be loud on stderr so the operator can spot it."""
+    model = init_model(TINY_SUPERNET, key=0)
+    out_dir = tmp_path / "step_00000010"
+    save_model(model, out_dir, training_state={"step": 10})
+    opt = optax.adamw(1e-3)
+    load_resume_state(out_dir, opt, key=jax.random.key(0))
+    err = capsys.readouterr().err
+    assert "no optimizer.safetensors" in err
+    assert "cold-start" in err

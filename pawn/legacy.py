@@ -9,8 +9,12 @@ dimensions, and writes a JAX checkpoint under
 ``$HF_HOME/pawn-jax-converted/<sha>/``.
 
 Pre-vocab-transition checkpoints (vocab_size != 1980) are rejected
-loudly. Cached by source-content hash so a second call with the same
-source is a no-op.
+loudly. The conversion is cached by source *identifier* (HF repo ID
+or local path string), not by file content — a second call with the
+same source string returns the cached output directly. If the
+upstream HF repo has been re-published with new weights, pass
+``force=True`` to re-convert; the same is true for local paths whose
+contents have changed under the same path.
 
 For each per-layer v1 field (``layers.<i>.attn.wq.weight`` etc.), the
 converter stacks the N independent layer tensors into a single
@@ -57,8 +61,15 @@ def _converted_cache_root() -> Path:
     return Path.home() / ".cache" / "huggingface" / "pawn-jax-converted"
 
 
-def _content_hash(source: str) -> str:
-    """SHA-256 of the source identifier (HF repo or local path)."""
+def _source_id_hash(source: str) -> str:
+    """SHA-256 of the source *identifier* string (HF repo ID or local
+    path), versioned by ``_CONVERTED_CACHE_VERSION``.
+
+    Not a hash of the file content — re-publishing the upstream
+    checkpoint with new weights under the same identifier does NOT
+    invalidate this key. The matching `convert_legacy_checkpoint(...,
+    force=True)` flag is the documented escape hatch.
+    """
     return hashlib.sha256(
         f"{_CONVERTED_CACHE_VERSION}|{source}".encode("utf-8")
     ).hexdigest()[:32]
@@ -234,7 +245,7 @@ def convert_legacy_checkpoint(
     if output_dir is not None:
         final = Path(output_dir)
     else:
-        final = _converted_cache_root() / _content_hash(source)
+        final = _converted_cache_root() / _source_id_hash(source)
 
     if final.is_dir() and not force:
         # Cache hit — return the existing converted checkpoint.

@@ -60,6 +60,8 @@ __all__ = [
     "make_train_step",
     "make_scan_step",
     "slice_batch",
+    "flatten_opt_state",
+    "unflatten_opt_state",
 ]
 
 
@@ -273,6 +275,29 @@ def make_lr_schedule(
         )
     if cfg.lr_schedule == "wsd":
         decay_steps = int(round(cfg.decay_frac * total_steps))
+        # `_check_lr_schedule_fractions` validates `warmup_frac +
+        # decay_frac ≤ 1.0` in fractions, but `warmup` may have been
+        # resolved from an explicit `warmup_steps` override that
+        # ignores `warmup_frac`. When the override drives the actual
+        # sum over total_steps, refuse — Optax `join_schedules` would
+        # see a non-monotonic boundary (PR #115 review #2).
+        #
+        # Pure float-fraction rounding overflow (no explicit
+        # `warmup_steps` override) is tolerated by the
+        # `total_steps - decay_steps` boundary, which is at least
+        # `warmup` here when fractions are within 1.0.
+        if (
+            cfg.warmup_steps is not None
+            and warmup + decay_steps > total_steps
+        ):
+            raise ValueError(
+                f"wsd schedule: warmup ({warmup}) + decay_steps "
+                f"({decay_steps}) exceeds total_steps ({total_steps}). "
+                f"`decay_frac={cfg.decay_frac}` was validated against "
+                f"warmup_frac={cfg.warmup_frac} but warmup_steps "
+                f"({cfg.warmup_steps}) overrode the fraction. Reduce "
+                f"warmup_steps or decay_frac."
+            )
         decay = (
             optax.linear_schedule(peak, 0.0, decay_steps)
             if cfg.wsd_decay_shape == "linear"
@@ -302,10 +327,30 @@ def make_lr_schedule(
         cooldown_steps = int(round(cfg.cooldown_frac * total_steps))
         decay_steps = int(round(cfg.decay_frac * total_steps))
         stable_lr = peak * cfg.stable_lr_ratio
-        # Integer rounding of three fractions can sum to more than
-        # total_steps even when the float fractions sum to ≤1
-        # (BaseRunConfig validates floats, not rounded ints). Clamp to
-        # avoid `join_schedules` getting non-monotonic boundaries.
+        # `_check_lr_schedule_fractions` validates the float fractions;
+        # the same `warmup_steps` override path that breaks WSD breaks
+        # infinite too. Refuse `warmup + cooldown + decay > total` only
+        # when warmup was explicitly overridden — pure-rounding
+        # overflow is clamped to a zero-width stable plateau below
+        # (PR #115 review #2).
+        if (
+            cfg.warmup_steps is not None
+            and warmup + cooldown_steps + decay_steps > total_steps
+        ):
+            raise ValueError(
+                f"infinite schedule: warmup ({warmup}) + cooldown "
+                f"({cooldown_steps}) + decay ({decay_steps}) exceeds "
+                f"total_steps ({total_steps}). cooldown_frac="
+                f"{cfg.cooldown_frac}, decay_frac={cfg.decay_frac} "
+                f"were validated against warmup_frac={cfg.warmup_frac}, "
+                f"but warmup_steps ({cfg.warmup_steps}) overrode the "
+                f"fraction. Reduce warmup_steps, cooldown_frac, or "
+                f"decay_frac so the stable plateau has non-negative "
+                f"width."
+            )
+        # Integer rounding of three fractions can still sum to slightly
+        # more than total_steps even when the floats sum to ≤1; clamp
+        # to keep `join_schedules` boundaries monotonic.
         stable_steps = max(0, total_steps - warmup - cooldown_steps - decay_steps)
         cooldown = optax.cosine_decay_schedule(
             peak, cooldown_steps, cfg.stable_lr_ratio
@@ -352,6 +397,67 @@ def make_optimizer(
             weight_decay=cfg.weight_decay,
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Opt-state serialisation — preserve Adam moments + clip-state across resume
+# ---------------------------------------------------------------------------
+
+
+def flatten_opt_state(opt_state: optax.OptState) -> dict[str, np.ndarray]:
+    """Flatten an Optax state PyTree into a ``{path: ndarray}`` dict
+    that safetensors can persist.
+
+    `jax.tree_util.tree_flatten_with_path` yields stable path keys
+    (one per array leaf); we render those as a string key so the
+    safetensors file is content-addressable. Non-array leaves (e.g.
+    Optax's scalar counters that JAX serialises as 0-d arrays) are
+    stored too. The companion :func:`unflatten_opt_state` rebuilds
+    the PyTree using a freshly-initialised opt_state as the template.
+    """
+    leaves_with_paths, _ = jax.tree_util.tree_flatten_with_path(opt_state)
+    out: dict[str, np.ndarray] = {}
+    for path, leaf in leaves_with_paths:
+        key = jax.tree_util.keystr(path)
+        # Optax states contain a mix of arrays and python scalars (the
+        # step counter, sometimes). Coerce everything to numpy — JAX
+        # arrays via `np.asarray`, scalars via the same.
+        out[key] = np.asarray(leaf)
+    return out
+
+
+def unflatten_opt_state(
+    template: optax.OptState, flat: dict[str, np.ndarray]
+) -> optax.OptState:
+    """Rebuild an Optax state PyTree from the flat dict produced by
+    :func:`flatten_opt_state`.
+
+    `template` is a fresh `optimizer.init(...)` against the loaded
+    model — it provides the PyTree structure (treedef + path map) but
+    has empty / zero leaves. We overwrite each leaf with the loaded
+    array, matching by `jax.tree_util.keystr(path)` so the mapping
+    stays stable across Optax versions that may reorder leaves.
+
+    Raises :class:`ValueError` if the loaded dict and the template
+    have different leaf sets — that's a sign the saved checkpoint
+    used a different optimiser configuration than the current one,
+    which is unrecoverable.
+    """
+    leaves_with_paths, treedef = jax.tree_util.tree_flatten_with_path(template)
+    template_keys = {jax.tree_util.keystr(p) for p, _ in leaves_with_paths}
+    if template_keys != set(flat):
+        missing = sorted(template_keys - set(flat))
+        extra = sorted(set(flat) - template_keys)
+        raise ValueError(
+            "opt_state checkpoint shape mismatch — likely the saved "
+            "run used a different optimiser configuration than the "
+            f"current init. Missing: {missing[:5]}{'…' if len(missing) > 5 else ''} "
+            f"Extra: {extra[:5]}{'…' if len(extra) > 5 else ''}"
+        )
+    new_leaves = [
+        jnp.asarray(flat[jax.tree_util.keystr(p)]) for p, _ in leaves_with_paths
+    ]
+    return jax.tree_util.tree_unflatten(treedef, new_leaves)
 
 
 # ---------------------------------------------------------------------------
