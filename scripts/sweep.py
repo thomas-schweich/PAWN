@@ -35,6 +35,10 @@ def main(argv: list[str] | None = None) -> int:
         "--supernet", args.supernet,
         "--variant", args.variant,
         "--total-steps", str(args.total_steps),
+        # Pick a log_interval well below the sweep's --total-steps so each
+        # trial actually emits a val_loss row (the objective parses
+        # metrics.jsonl for the best val_loss; no rows ⇒ TrialPruned).
+        "--log-interval", str(max(1, args.total_steps // 5)),
         "--no-pgn",  # random games for sweep smoke
         "--batch-size", "8",
         "--seq-len", "32",

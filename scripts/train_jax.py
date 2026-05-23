@@ -161,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         if (step + 1) % cfg.log_interval == 0:
             logger.log_train(
                 step=step + 1, loss=float(loss),
-                lr=float(schedule(int(state.step))),
+                lr=np.asarray(schedule(int(state.step))).item(),
                 step_time=(time.time() - t0) / max(1, step + 1 - start),
             )
 

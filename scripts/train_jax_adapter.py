@@ -50,7 +50,9 @@ from pawn.lifecycle import (
 from pawn.logging import MetricsLogger
 from pawn.model import init_model, sliced
 from pawn.run_config import AdapterConfig
-from pawn.trainer import make_lr_schedule, make_optimizer, slice_batch
+from pawn.trainer import (
+    cross_entropy_loss, make_lr_schedule, make_optimizer, slice_batch,
+)
 
 
 def _strategy_config_from_run(cfg: AdapterConfig) -> object:
@@ -137,6 +139,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--local-checkpoints", action="store_true")
     ap.add_argument("--hf-repo", default=None)
     ap.add_argument("--logs-dir", type=Path, default=Path("logs"))
+    ap.add_argument("--log-interval", type=int, default=None,
+                    help="Steps between metrics rows; defaults to the "
+                         "BaseRunConfig log_interval (100)")
     return ap.parse_args(argv)
 
 
@@ -146,7 +151,7 @@ def _build_config(args: argparse.Namespace) -> AdapterConfig:
         base.update(json.loads(args.config.read_text()))
         base.setdefault("run_type", "adapter")
     for flag, val in vars(args).items():
-        if flag in ("config", "no_pgn", "local_checkpoints"):
+        if flag in ("config", "no_pgn", "local_checkpoints", "logs_dir"):
             continue
         if val is None or val is False:
             continue
@@ -175,7 +180,15 @@ def main(argv: list[str] | None = None) -> int:
         from pawn.checkpoint import load_model
         converted = convert_legacy_checkpoint(cfg.checkpoint)
         backbone = load_model(converted)
-        if cfg.variant != "large":
+        # v1 published checkpoints are standalone (each variant has its own
+        # depth — e.g. pawn-base is 8 layers, pawn-small is 8 layers), so
+        # they don't fit the v2 supernet's "all variants share n_layers"
+        # constraint and can't be sliced. Only slice when the loaded model
+        # *is* a v2 supernet shape — i.e. it has the same n_layers as the
+        # SUPERNET config. Otherwise treat the loaded model as standalone.
+        target_supernet = TINY_SUPERNET if cfg.supernet == "tiny" else SUPERNET
+        looks_like_supernet = backbone.cfg.n_layers == target_supernet.n_layers
+        if cfg.variant != "large" and looks_like_supernet:
             variant_cfg = (
                 TINY_VARIANTS[cfg.variant]
                 if cfg.supernet == "tiny"
@@ -203,11 +216,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     train_step = make_adapter_train_step(cfg.strategy, optimizer)
 
-    # Data: Lichess corpus or random games.
+    apply_fn = STRATEGIES[cfg.strategy].apply
+
+    @eqx.filter_jit
+    def val_step(backbone, adapter, batch):
+        effective = apply_fn(backbone, adapter)
+        return cross_entropy_loss(effective, batch)
+
+    # Data: Lichess corpus or random games. The val_corpus is the held-out
+    # `validation` split for PGN (cfg.pgn_val_split, default "validation")
+    # or a fresh-seed random corpus when --no-pgn is set.
     if args.no_pgn:
         corpus = generate_corpus(
             n_games=max(cfg.batch_size * 10, 1000),
             max_ply=cfg.seq_len, seq_len=cfg.seq_len, seed=0,
+        )
+        val_corpus = generate_corpus(
+            n_games=max(cfg.batch_size * 4, 100),
+            max_ply=cfg.seq_len, seq_len=cfg.seq_len, seed=1,
         )
     else:
         corpus = load_lichess_corpus(
@@ -217,6 +243,14 @@ def main(argv: list[str] | None = None) -> int:
             min_ply=cfg.min_ply,
             seq_len=cfg.seq_len,
             max_games=getattr(cfg, "max_games", None),
+        )
+        val_corpus = load_lichess_corpus(
+            cfg.pgn,
+            split=cfg.pgn_val_split or "validation",
+            elo_min=cfg.elo_min, elo_max=cfg.elo_max,
+            min_ply=cfg.min_ply,
+            seq_len=cfg.seq_len,
+            max_games=getattr(cfg, "val_games", None),
         )
 
     logger = MetricsLogger(
@@ -229,6 +263,11 @@ def main(argv: list[str] | None = None) -> int:
     should_shutdown = install_sigterm_handler()
 
     rng = np.random.default_rng(0)
+    val_rng = np.random.default_rng(1)
+    # eval_interval defaults to log_interval when unset so every
+    # train-row gets a paired val-row (val-loss is what the sweep
+    # objective and §3 criterion 7's "val loss decreases" key on).
+    eval_interval = cfg.eval_interval or cfg.log_interval
     t0 = time.time()
     for step in range(cfg.total_steps):
         idx = rng.integers(0, corpus.n_games, size=cfg.batch_size)
@@ -237,8 +276,18 @@ def main(argv: list[str] | None = None) -> int:
         if (step + 1) % cfg.log_interval == 0:
             logger.log_train(
                 step=step + 1, loss=float(loss),
-                lr=float(schedule(int(state.step))),
+                lr=np.asarray(schedule(int(state.step))).item(),
                 step_time=(time.time() - t0) / (step + 1),
+            )
+        if (step + 1) % eval_interval == 0:
+            val_idx = val_rng.integers(
+                0, val_corpus.n_games, size=cfg.batch_size
+            )
+            val_batch = slice_batch(val_corpus, val_idx)
+            val_loss = float(val_step(state.backbone, state.adapter, val_batch))
+            logger.log_val(
+                step=step + 1, val_loss=val_loss,
+                val_source=cfg.pgn_val_split if not args.no_pgn else "random",
             )
         if (step + 1) % cfg.checkpoint_interval == 0:
             out = args.logs_dir / f"adapter_step_{step + 1:08d}"

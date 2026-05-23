@@ -87,11 +87,33 @@ def _download_legacy_checkpoint(source: str) -> Path:
 def _read_legacy_config(checkpoint_dir: Path) -> dict:
     """Read the v1 config.json (or training_config.json) from the
     checkpoint dir. v1 may have placed the config under either name
-    depending on the era."""
+    depending on the era.
+
+    Returns a flat dict — the published v1 format wraps the model
+    fields under a ``model_config`` sub-dict
+    (``{"format_version": 1, "model_config": {"vocab_size": 1980, ...}}``)
+    while the parity fixture writes them flat. Pull from ``model_config``
+    when present so callers can read ``vocab_size`` / ``d_model`` /
+    ``n_layers`` etc. at the top level regardless of era.
+    """
     for name in ("config.json", "training_config.json"):
         candidate = checkpoint_dir / name
         if candidate.is_file():
-            return json.loads(candidate.read_text(encoding="utf-8"))
+            raw = json.loads(candidate.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and "model_config" in raw and isinstance(
+                raw["model_config"], dict
+            ):
+                # Surface the nested model fields at the top level.
+                merged = dict(raw["model_config"])
+                # Preserve other top-level keys for context (training_config,
+                # format_version, etc.) without letting them shadow the
+                # model-config values.
+                for k, v in raw.items():
+                    if k == "model_config":
+                        continue
+                    merged.setdefault(k, v)
+                return merged
+            return raw
     raise FileNotFoundError(
         f"v1 checkpoint at {checkpoint_dir} has no config.json or "
         f"training_config.json"
