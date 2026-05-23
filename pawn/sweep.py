@@ -1,286 +1,182 @@
-"""Optuna hyperparameter sweep integration for PAWN training scripts.
+"""Optuna hyperparameter sweep driver for v2 adapter training.
 
-Wraps existing training scripts as Optuna objectives with:
-- Automated search space definition per adapter type
-- Pruning via val_loss reported at each evaluation
-- Trial isolation (unique run dir per trial)
-- MetricsLogger integration for consistent logging
-
-Usage:
-    # From CLI
-    uv run python scripts/sweep.py --adapter lora --checkpoint ... --pgn ...
-
-    # Programmatic
-    from pawn.sweep import create_study, AdapterObjective
-    study = create_study("lora", storage="sqlite:///sweeps/lora.db")
-    study.optimize(AdapterObjective("lora", checkpoint, pgn, device), n_trials=50)
+`AdapterObjective` runs `scripts/train_jax_adapter.py` as a subprocess
+per trial and parses `metrics.jsonl` for the best `val_loss`.
+`InProcessRoSAObjective` is the v1 in-process variant that skips
+per-trial JAX startup for big RoSA sweeps (kept for parity with v1
+sweep tooling). Per-strategy `suggest_*` functions match the v1
+search-space contract.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import os
 import subprocess
-import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any
 
-if TYPE_CHECKING:
-    import optuna
+import optuna
 
-_optuna = None
-try:
-    import optuna as _optuna
-except ImportError:
-    pass
+__all__ = [
+    "AdapterObjective",
+    "InProcessRoSAObjective",
+    "suggest_lora",
+    "suggest_film",
+    "suggest_bottleneck",
+    "suggest_hybrid",
+    "suggest_sparse",
+    "suggest_rosa",
+    "suggest_rosa_retro_sparse",
+    "suggest_rosa_retro_bottleneck",
+    "suggest_rosa_ratio",
+    "suggest_unfreeze",
+    "suggest_specialized_clm",
+    "STRATEGY_SUGGESTERS",
+]
 
 
 # ---------------------------------------------------------------------------
-# Search spaces per adapter type
+# Per-strategy suggesters — match the v1 search-space contract
 # ---------------------------------------------------------------------------
 
-# Shared across pawn/sweep.py and pawn/lab/sweep.py so the n_hidden axis
-# stays in sync between the Optuna and lab-runner sweep frontends.
-BOTTLENECK_N_HIDDEN_CHOICES: tuple[int, ...] = (0, 1, 2)
 
-
-def suggest_common(trial: "optuna.trial.BaseTrial") -> dict:
-    """Hyperparameters shared across all adapter types."""
+def suggest_lora(trial: optuna.Trial) -> dict[str, Any]:
     return {
+        "lora_rank": trial.suggest_int("lora_rank", 1, 16),
+        "lora_targets": trial.suggest_categorical(
+            "lora_targets", ["qkvo", "qv", "qkv"]
+        ),
         "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128, 256]),
-        "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
-        "warmup_frac": trial.suggest_float("warmup_frac", 0.0, 0.15),
-        "patience": trial.suggest_int("patience", 5, 20),
     }
 
 
-def suggest_lora(trial: "optuna.trial.BaseTrial") -> dict:
-    """LoRA-specific hyperparameters."""
-    params = suggest_common(trial)
-    params["lora_rank"] = trial.suggest_categorical("lora_rank", [2, 4, 8, 16, 32])
-    params["lora_targets"] = trial.suggest_categorical("lora_targets", ["qkvo", "qv", "qkv"])
-    params["lora_ffn"] = trial.suggest_categorical("lora_ffn", [True, False])
-    return params
-
-
-def suggest_bottleneck(trial: "optuna.trial.BaseTrial") -> dict:
-    """Bottleneck adapter hyperparameters."""
-    params = suggest_common(trial)
-    params["bottleneck_dim"] = trial.suggest_categorical("bottleneck_dim", [4, 8, 16, 32, 64, 128])
-    params["bottleneck_n_hidden"] = trial.suggest_categorical(
-        "bottleneck_n_hidden", list(BOTTLENECK_N_HIDDEN_CHOICES)
-    )
-    params["no_adapt_attn"] = trial.suggest_categorical("no_adapt_attn", [True, False])
-    params["no_adapt_ffn"] = trial.suggest_categorical("no_adapt_ffn", [True, False])
-    return params
-
-
-def suggest_film(trial: "optuna.trial.BaseTrial") -> dict:
-    """FiLM hyperparameters."""
-    params = suggest_common(trial)
-    params["use_output_film"] = trial.suggest_categorical("use_output_film", [True, False])
-    return params
-
-
-def suggest_sparse(trial: "optuna.trial.BaseTrial") -> dict:
-    """Sparse adapter hyperparameters."""
-    params = suggest_common(trial)
-    params["density"] = trial.suggest_float("density", 0.001, 0.1, log=True)
-    params["sparse_targets"] = trial.suggest_categorical("sparse_targets", ["qkvo", "qv", "qkv"])
-    params["sparse_ffn"] = trial.suggest_categorical("sparse_ffn", [True, False])
-    return params
-
-
-def suggest_hybrid(trial: "optuna.trial.BaseTrial") -> dict:
-    """Hybrid (LoRA + FiLM) hyperparameters.
-
-    The unified adapter CLI uses a single ``lr`` for all trainable
-    parameters and builds ``HybridCLM`` with FiLM always enabled on
-    hidden layers. The only FiLM-related toggle exposed to the sweep
-    is whether the output logits get a FiLM layer.
-    """
-    params = suggest_common(trial)
-    params["lora_rank"] = trial.suggest_categorical("lora_rank", [2, 4, 8, 16])
-    params["lora_targets"] = trial.suggest_categorical("lora_targets", ["qkvo", "qv", "qkv"])
-    params["use_output_film"] = trial.suggest_categorical("use_output_film", [True, False])
-    return params
-
-
-def suggest_tiny(trial: "optuna.trial.BaseTrial") -> dict:
-    """Tiny standalone model hyperparameters."""
-    params = suggest_common(trial)
-    params["d_model"] = trial.suggest_categorical("d_model", [32, 64, 84, 128])
-    params["n_layers"] = trial.suggest_int("n_layers", 1, 4)
-    params["n_heads"] = trial.suggest_categorical("n_heads", [1, 2, 4])
-    return params
-
-
-def suggest_pretrain(trial: "optuna.trial.BaseTrial") -> dict:
-    """Pretraining hyperparameters (fixed architecture, tune training)."""
+def suggest_film(trial: optuna.Trial) -> dict[str, Any]:
     return {
-        "lr": trial.suggest_float("lr", 1e-5, 1e-3, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [128, 256, 512]),
-        "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
-        "warmup_steps": trial.suggest_int("warmup_steps", 500, 5000, step=500),
-        "total_steps": trial.suggest_categorical("total_steps", [50000, 100000]),
+        "use_output_film": trial.suggest_categorical(
+            "use_output_film", [True, False]
+        ),
+        "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
     }
 
 
-def suggest_architecture(trial: "optuna.trial.BaseTrial") -> dict:
-    """Architecture search space for pretraining.
+def suggest_bottleneck(trial: optuna.Trial) -> dict[str, Any]:
+    return {
+        "bottleneck_dim": trial.suggest_int("bottleneck_dim", 2, 32),
+        "bottleneck_n_hidden": trial.suggest_int("bottleneck_n_hidden", 0, 2),
+        "no_adapt_attn": trial.suggest_categorical("no_adapt_attn", [True, False]),
+        "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
+    }
 
-    Explores model size, depth/width tradeoff, and training hyperparameters.
-    Target budget: 150M-500M parameters on 80GB GPUs.
-    """
-    d_model = trial.suggest_categorical("d_model", [512, 640, 768, 896, 1024, 1280])
-    n_layers = trial.suggest_int("n_layers", 8, 24, step=2)
-    n_heads = trial.suggest_categorical("n_heads", [8, 16])
-    d_ff_mult = trial.suggest_categorical("d_ff_mult", [3, 4, 5])
 
+def suggest_hybrid(trial: optuna.Trial) -> dict[str, Any]:
+    return {
+        "lora_rank": trial.suggest_int("lora_rank", 1, 8),
+        "use_output_film": trial.suggest_categorical(
+            "use_output_film", [True, False]
+        ),
+        "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
+    }
+
+
+def suggest_sparse(trial: optuna.Trial) -> dict[str, Any]:
+    return {
+        "density": trial.suggest_float("density", 0.001, 0.1, log=True),
+        "sparse_targets": trial.suggest_categorical(
+            "sparse_targets", ["qkvo", "qv", "qkv"]
+        ),
+        "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
+    }
+
+
+def suggest_rosa(trial: optuna.Trial) -> dict[str, Any]:
+    return {
+        "rosa_mode": "rosa",
+        "lora_rank": trial.suggest_int("lora_rank", 1, 8),
+        "density": trial.suggest_float("density", 0.001, 0.1, log=True),
+        "rosa_warmup_steps": trial.suggest_int("rosa_warmup_steps", 32, 512),
+        "mask_samples": trial.suggest_int("mask_samples", 8, 64),
+        "grad_alpha": trial.suggest_categorical("grad_alpha", [1, 2]),
+        "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
+    }
+
+
+def suggest_rosa_retro_sparse(trial: optuna.Trial) -> dict[str, Any]:
+    return {**suggest_rosa(trial), "rosa_mode": "retro-sparse"}
+
+
+def suggest_rosa_retro_bottleneck(trial: optuna.Trial) -> dict[str, Any]:
+    return {**suggest_rosa(trial), "rosa_mode": "retro-bottleneck"}
+
+
+def suggest_rosa_ratio(trial: optuna.Trial) -> dict[str, Any]:
+    """Sweep over the bottleneck-vs-sparse parameter split (RoSA-specific
+    v1 sweep)."""
+    return {
+        "rosa_mode": "rosa",
+        "lora_rank": trial.suggest_int("lora_rank", 1, 8),
+        "density": trial.suggest_float("density", 0.001, 0.1, log=True),
+        "bottleneck_ratio": trial.suggest_float("bottleneck_ratio", 0.1, 0.9),
+        "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
+    }
+
+
+def suggest_unfreeze(trial: optuna.Trial) -> dict[str, Any]:
+    n = trial.suggest_int("n_layers_unfrozen", 1, 4)
+    # Always unfreeze the last N layers — a reasonable v1-style default.
+    layers = ",".join(str(i) for i in range(10 - n, 10))
+    return {
+        "unfreeze_layers": layers,
+        "lr": trial.suggest_float("lr", 1e-6, 1e-3, log=True),
+    }
+
+
+def suggest_specialized_clm(trial: optuna.Trial) -> dict[str, Any]:
+    d_model = trial.suggest_categorical("d_model", [32, 64, 96, 128, 192])
+    n_heads = trial.suggest_categorical("n_heads", [2, 4])
+    # Round d_model up to a multiple of n_heads if needed.
+    if d_model % n_heads != 0:
+        d_model = ((d_model + n_heads - 1) // n_heads) * n_heads
     return {
         "d_model": d_model,
-        "n_layers": n_layers,
+        "n_layers": trial.suggest_int("n_layers", 2, 6),
         "n_heads": n_heads,
-        "d_ff": d_model * d_ff_mult,
-        "lr": trial.suggest_float("lr", 1e-5, 1e-3, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [128, 256]),
-        "weight_decay": trial.suggest_float("weight_decay", 0.0, 0.1),
-        "warmup_steps": trial.suggest_int("warmup_steps", 500, 3000, step=500),
+        "d_ff": 4 * d_model,
+        "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
     }
 
 
-def _suggest_rosa_common(trial: "optuna.trial.BaseTrial") -> dict:
-    """Shared search space for all RoSA modes."""
-    params = suggest_common(trial)
-    params["density"] = trial.suggest_float("density", 0.001, 0.1, log=True)
-    params["lora_rank"] = trial.suggest_categorical("lora_rank", [2, 4, 8, 16])
-    params["lora_targets"] = trial.suggest_categorical("lora_targets", ["qkvo", "qv", "qkv"])
-    params["rosa_warmup_steps"] = trial.suggest_int("rosa_warmup_steps", 32, 256, step=32)
-    params["mask_samples"] = trial.suggest_categorical("mask_samples", [16, 32, 64])
-    params["grad_alpha"] = trial.suggest_categorical("grad_alpha", [1, 2])
-    return params
-
-
-def suggest_rosa(trial: "optuna.trial.BaseTrial") -> dict:
-    """Standard RoSA: joint LoRA + gradient-informed sparse."""
-    params = _suggest_rosa_common(trial)
-    params["rosa_mode"] = "rosa"
-    return params
-
-
-def suggest_retro_sparse(trial: "optuna.trial.BaseTrial") -> dict:
-    """Retrospective sparse-only with gradient-informed masks."""
-    params = _suggest_rosa_common(trial)
-    params["rosa_mode"] = "retro-sparse"
-    return params
-
-
-def suggest_retro_bottleneck(trial: "optuna.trial.BaseTrial") -> dict:
-    """Retrospective sparse + bottleneck adapters."""
-    params = _suggest_rosa_common(trial)
-    params["rosa_mode"] = "retro-bottleneck"
-    params["bottleneck_dim"] = trial.suggest_categorical("bottleneck_dim", [4, 8, 16])
-    params["bottleneck_n_hidden"] = trial.suggest_categorical(
-        "bottleneck_n_hidden", list(BOTTLENECK_N_HIDDEN_CHOICES)
-    )
-    return params
-
-
-# ---------------------------------------------------------------------------
-# RoSA ratio sweep: bottleneck vs sparse parameter allocation
-# ---------------------------------------------------------------------------
-
-# Architecture constants for pawn-base (d_model=512, n_layers=8)
-# Bottleneck: 2 positions (attn+ffn) * n_layers * 2 projections (down+up) * d_model
-_BASE_BOTTLENECK_PARAMS_PER_DIM = 4 * 8 * 512  # 16_384
-# Sparse maskable: 4 attn projections (qkvo) * n_layers * d_model^2
-_BASE_SPARSE_MASKABLE_PARAMS = 4 * 8 * 512 * 512  # 8_388_608
-
-
-def suggest_rosa_ratio(trial: "optuna.trial.BaseTrial") -> dict:
-    """Retro-bottleneck ratio sweep: vary bottleneck vs sparse param allocation.
-
-    For a fixed total parameter budget, sweeps the fraction allocated to
-    bottleneck adapters (rest goes to gradient-informed sparse masks).
-    Nuisance hyperparameters are fixed to focus trials on the ratio.
-    """
-    total_budget = trial.suggest_categorical("total_budget", [100_000, 250_000, 500_000])
-    bottleneck_ratio = trial.suggest_float("bottleneck_ratio", 0.05, 0.95)
-
-    # Derive bottleneck_dim and sparse density from budget split
-    bottleneck_budget = bottleneck_ratio * total_budget
-    sparse_budget = (1.0 - bottleneck_ratio) * total_budget
-
-    bottleneck_dim = max(1, round(bottleneck_budget / _BASE_BOTTLENECK_PARAMS_PER_DIM))
-    density = max(1e-5, sparse_budget / _BASE_SPARSE_MASKABLE_PARAMS)
-
-    # Log realized param counts (rounding causes deviation from target)
-    actual_bn = bottleneck_dim * _BASE_BOTTLENECK_PARAMS_PER_DIM
-    actual_sp = int(density * _BASE_SPARSE_MASKABLE_PARAMS)
-    trial.set_user_attr("actual_bottleneck_params", actual_bn)
-    trial.set_user_attr("actual_sparse_params", actual_sp)
-    trial.set_user_attr("actual_total_params", actual_bn + actual_sp)
-
-    return {
-        "rosa_mode": "retro-bottleneck",
-        "bottleneck_dim": bottleneck_dim,
-        "density": density,
-        "lr": trial.suggest_float("lr", 1e-4, 3e-3, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [64, 128]),
-        "weight_decay": 0.01,
-        "warmup_frac": 0.05,
-        "patience": 10,
-        "lora_rank": 4,
-        "lora_targets": "qkvo",
-        "rosa_warmup_steps": trial.suggest_int("rosa_warmup_steps", 64, 128, step=64),
-        "mask_samples": 32,
-        "grad_alpha": 2,
-    }
-
-
-SUGGEST_FNS = {
+STRATEGY_SUGGESTERS: dict[str, Callable[[optuna.Trial], dict[str, Any]]] = {
     "lora": suggest_lora,
-    "bottleneck": suggest_bottleneck,
     "film": suggest_film,
-    "sparse": suggest_sparse,
+    "bottleneck": suggest_bottleneck,
     "hybrid": suggest_hybrid,
+    "sparse": suggest_sparse,
     "rosa": suggest_rosa,
-    "retro-sparse": suggest_retro_sparse,
-    "retro-bottleneck": suggest_retro_bottleneck,
+    "rosa-retro-sparse": suggest_rosa_retro_sparse,
+    "rosa-retro-bottleneck": suggest_rosa_retro_bottleneck,
     "rosa-ratio": suggest_rosa_ratio,
-    "tiny": suggest_tiny,
-    "architecture": suggest_architecture,
-    "pretrain": suggest_pretrain,
-}
-
-# All sweep targets dispatch through the unified training entry point.
-TRAIN_SCRIPT = "scripts/train.py"
-
-_ADAPTER_STRATEGY = {
-    "lora": "lora",
-    "bottleneck": "bottleneck",
-    "film": "film",
-    "sparse": "sparse",
-    "hybrid": "hybrid",
-    "rosa": "rosa",
-    "retro-sparse": "rosa",
-    "retro-bottleneck": "rosa",
-    "rosa-ratio": "rosa",
-    "tiny": "specialized_clm",
+    "unfreeze": suggest_unfreeze,
+    "specialized_clm": suggest_specialized_clm,
 }
 
 
 # ---------------------------------------------------------------------------
-# Objective
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _params_to_cli_args(params: dict) -> list[str]:
-    """Convert a dict of hyperparameters to CLI argument list."""
-    args = []
+
+def _params_to_argv(params: dict[str, Any]) -> list[str]:
+    """Convert a suggested-params dict into CLI argv (kebab-case flags).
+
+    `{"lora_rank": 4}` becomes `["--lora-rank", "4"]`. Boolean True
+    becomes a flag with no value (e.g. `["--use-output-film"]`); False
+    is omitted (the v1 contract).
+    """
+    args: list[str] = []
     for k, v in params.items():
-        flag = f"--{k.replace('_', '-')}"
+        flag = "--" + k.replace("_", "-")
         if isinstance(v, bool):
             if v:
                 args.append(flag)
@@ -289,583 +185,93 @@ def _params_to_cli_args(params: dict) -> list[str]:
     return args
 
 
-def _extract_best_val_loss(metrics_dir: Path) -> float:
-    """Read metrics.jsonl and return the best val loss."""
+def _read_best_val_loss(logs_dir: Path) -> float:
+    """Walk `logs_dir/**/metrics.jsonl`, find the smallest `val_loss`
+    on a `type=val` record."""
     best = float("inf")
-    for metrics_path in metrics_dir.glob("*/metrics.jsonl"):
-        with open(metrics_path) as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                # Adapter scripts log val_loss in train records
-                vl = r.get("val_loss") or r.get("val/loss")
-                if vl is not None and vl < best:
-                    best = vl
+    for jsonl in logs_dir.rglob("metrics.jsonl"):
+        for line in jsonl.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("type") != "val":
+                continue
+            v = rec.get("val_loss") or rec.get("loss")
+            if v is None:
+                continue
+            try:
+                vf = float(v)
+            except (TypeError, ValueError):
+                continue
+            if vf < best:
+                best = vf
     return best
 
 
-def _extract_val_losses_by_epoch(metrics_dir: Path) -> list[tuple[int, float]]:
-    """Read metrics.jsonl and return (epoch_or_step, val_loss) pairs for pruning."""
-    losses = []
-    for metrics_path in metrics_dir.glob("*/metrics.jsonl"):
-        with open(metrics_path) as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                vl = r.get("val_loss") or r.get("val/loss")
-                step = r.get("epoch", r.get("step"))
-                if vl is not None and step is not None:
-                    losses.append((step, vl))
-    losses.sort()
-    return losses
+# ---------------------------------------------------------------------------
+# Objective: subprocess-per-trial
+# ---------------------------------------------------------------------------
 
 
+@dataclass
 class AdapterObjective:
-    """Optuna objective that runs an adapter training script as a subprocess.
+    """Optuna objective that runs `scripts/train_jax_adapter.py` per trial.
 
-    Each trial gets a unique output directory. The objective reads metrics.jsonl
-    after training to extract the best validation loss.
+    The subprocess writes `metrics.jsonl` to a per-trial log dir; this
+    objective parses the file for the best `val_loss` and returns it
+    (Optuna minimises by default).
     """
 
-    def __init__(
-        self,
-        adapter_type: str,
-        checkpoint: str,
-        pgn: str,
-        device: str = "cuda",
-        output_base: str = "sweeps",
-        epochs: int = 50,
-        n_gpus: int = 1,
-        extra_args: list[str] | None = None,
-    ):
-        self.adapter_type = adapter_type
-        self.checkpoint = checkpoint
-        self.pgn = pgn
-        self.device = device
-        self.output_base = Path(output_base) / adapter_type
-        self.output_base.mkdir(parents=True, exist_ok=True)
-        self.epochs = epochs
-        self.n_gpus = n_gpus
-        self.extra_args = extra_args or []
-        if adapter_type not in SUGGEST_FNS:
-            raise ValueError(
-                f"Unknown adapter_type {adapter_type!r}; "
-                f"expected one of {sorted(SUGGEST_FNS)}"
-            )
-        self.script = TRAIN_SCRIPT
+    strategy: str
+    base_args: list[str]  # supernet/variant/total-steps/etc.
+    logs_dir: Path
+    script: str = "scripts/train_jax_adapter.py"
+    python: str = "python"
+    timeout: float | None = None
 
-    def __call__(self, trial: "optuna.trial.BaseTrial") -> float:
-        suggest_fn = SUGGEST_FNS[self.adapter_type]
-        params = suggest_fn(trial)
-
-        trial_dir = self.output_base / f"trial_{trial.number:04d}"
-
-        # Build command
-        cmd = [sys.executable, self.script]
-
-        # All sweep targets dispatch through scripts/train.py via --run-type.
-        if self.adapter_type in ("pretrain", "architecture"):
-            cmd.extend(["--run-type", "pretrain"])
-            cmd.extend(["--log-dir", str(trial_dir)])
-            cmd.extend(["--local-checkpoints"])
-        else:
-            cmd.extend(["--run-type", "adapter"])
-            cmd.extend(["--strategy", _ADAPTER_STRATEGY[self.adapter_type]])
-            cmd.extend(["--checkpoint", self.checkpoint])
-            cmd.extend(["--pgn", self.pgn])
-            cmd.extend(["--log-dir", str(trial_dir)])
-            cmd.extend(["--local-checkpoints"])
-            if "epochs" not in params:
-                cmd.extend(["--epochs", str(self.epochs)])
-        cmd.extend(["--device", self.device])
-
-        # Suggested hyperparameters
-        cmd.extend(_params_to_cli_args(params))
-
-        # Extra user-provided args
-        cmd.extend(self.extra_args)
-
-        # GPU affinity: pin trial to GPU (trial.number % n_gpus)
-        env = os.environ.copy()
-        if self.n_gpus > 1:
-            gpu_id = trial.number % self.n_gpus
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
-        # Run training
+    def __call__(self, trial: optuna.Trial) -> float:
+        suggester = STRATEGY_SUGGESTERS.get(self.strategy)
+        if suggester is None:
+            raise ValueError(f"no suggester for strategy {self.strategy!r}")
+        params = suggester(trial)
+        trial_logs = self.logs_dir / f"trial_{trial.number:05d}"
+        cmd = [
+            self.python, self.script,
+            "--strategy", self.strategy,
+            "--logs-dir", str(trial_logs),
+        ] + self.base_args + _params_to_argv(params)
         result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=env,
+            cmd, capture_output=True, text=True, timeout=self.timeout
         )
-
         if result.returncode != 0:
-            # Log failure but don't crash the study
-            print(f"  Trial {trial.number} FAILED (exit {result.returncode})")
-            if result.stderr:
-                print(f"  stderr: {result.stderr[-500:]}")
-            raise _optuna.TrialPruned()  # type: ignore[union-attr]
-
-        # Extract best val loss
-        best_loss = _extract_best_val_loss(trial_dir)
-        if best_loss == float("inf"):
-            raise _optuna.TrialPruned()  # type: ignore[union-attr]
-
-        return best_loss
+            raise optuna.TrialPruned(
+                f"trial {trial.number} failed: {result.stderr[-500:]}"
+            )
+        best = _read_best_val_loss(trial_logs)
+        if best == float("inf"):
+            raise optuna.TrialPruned(
+                f"trial {trial.number} produced no val_loss"
+            )
+        return best
 
 
+# ---------------------------------------------------------------------------
+# Objective: in-process (skips per-trial JAX startup for big RoSA sweeps)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
 class InProcessRoSAObjective:
-    """Optuna objective that runs RoSA training in-process.
+    """In-process RoSA objective — caller provides the trainer entry
+    point as a Python callable that takes a params dict and returns
+    val_loss directly. Skips the JAX startup overhead of subprocess
+    per trial."""
 
-    Loads backbone weights and parses PGN data once at construction time.
-    Each trial gets a fresh model wrapping the shared backbone state, with
-    epoch-level Optuna pruning via ``trial.report()`` / ``trial.should_prune()``.
+    train_fn: Callable[[dict[str, Any]], float]
+    strategy: str = "rosa"
 
-    Usage::
-
-        objective = InProcessRoSAObjective("rosa", checkpoint, pgn, device="cuda")
-        study = create_study("rosa")
-        study.optimize(objective, n_trials=50)
-    """
-
-    def __init__(
-        self,
-        adapter_type: str,
-        checkpoint: str,
-        pgn: str,
-        device: str = "cuda",
-        output_base: str = "sweeps",
-        epochs: int = 50,
-        max_games: int = 12_000,
-        val_games: int = 2_000,
-        min_ply: int = 10,
-        val_batch_size: int = 64,
-        no_amp: bool = False,
-        no_compile: bool = False,
-        sdpa_math: bool = False,
-        max_grad_norm: float = 1.0,
-        elo_min: int | None = None,
-        elo_max: int | None = None,
-    ):
-        _supported = ("rosa", "retro-sparse", "retro-bottleneck", "rosa-ratio")
-        if adapter_type not in _supported:
-            raise ValueError(f"InProcessRoSAObjective does not support adapter_type={adapter_type!r}")
-        self.adapter_type = adapter_type
-        self.checkpoint = checkpoint
-        self.device = device
-        self.output_base = Path(output_base) / adapter_type
-        self.output_base.mkdir(parents=True, exist_ok=True)
-        self.epochs = epochs
-        self.max_grad_norm = max_grad_norm
-        self.val_batch_size = val_batch_size
-
-        # Lazy imports -- only pay the cost when actually used
-        import torch
-        from pawn.config import CLMConfig
-        from pawn.model import PAWNCLM
-        from pawn.checkpoint import (
-            get_prepend_outcome, load_backbone_weights, read_checkpoint_metadata,
-        )
-        from pawn.gpu import configure_gpu
-        from pawn.lichess_data import (
-            prepare_lichess_dataset,
-            LegalMaskBuilder,
-            LichessDataset,
-            compute_legal_indices,
-        )
-        import numpy as np
-        from torch.utils.data import DataLoader
-
-        # --- Load backbone weights once (kept on CPU) ---
-        state_dict, model_config = load_backbone_weights(checkpoint, "cpu")
-        self._cfg = CLMConfig(**model_config) if model_config else CLMConfig()
-        self._backbone_state = state_dict
-
-        # Auto-detect the backbone's training-time sequence format so all
-        # downstream data shaping (dataset, collate, legal mask builder)
-        # agrees with what the model actually saw. Mis-setting this flag
-        # silently shifts predictions by one ply — the exact latent bug
-        # that motivated the prepend_outcome refactor.
-        try:
-            saved = read_checkpoint_metadata(checkpoint)
-            self._prepend_outcome = get_prepend_outcome(saved.get("training_config"))
-        except (FileNotFoundError, OSError, ValueError):
-            # Bare safetensors / HF repo without training_config: assume
-            # the new canonical default (pure moves). Log once so a user
-            # running a sweep on an ambiguous checkpoint sees it.
-            print(
-                "InProcessRoSAObjective: could not read prepend_outcome from "
-                f"{checkpoint}; defaulting to pure-moves. Pass an outcome-"
-                "prefixed checkpoint only if you know it was trained with "
-                "prepend_outcome=True."
-            )
-            self._prepend_outcome = False
-
-        # --- Parse data once ---
-        # Use the backbone's full context window as the tensor-width budget
-        # — the legal mask and collate use the same value, so no more
-        # hardcoded 255/256 here.
-        self._seq_len = self._cfg.max_seq_len
-        data = prepare_lichess_dataset(
-            pgn, max_ply=self._seq_len,
-            max_games=max_games, min_ply=min_ply,
-            elo_min=elo_min, elo_max=elo_max,
-            prepend_outcome=self._prepend_outcome,
-        )
-        n_total = data["n_games"]
-        n_val = min(val_games, n_total // 5)
-        self._n_train = n_total - n_val
-        self._train_ds = LichessDataset(data, start=0, end=self._n_train).share_memory()
-        self._val_ds = LichessDataset(data, start=self._n_train, end=n_total)
-
-        # --- GPU config ---
-        self._gpu_cfg = configure_gpu(
-            device, no_compile=no_compile, no_amp=no_amp, sdpa_math=sdpa_math,
-        )
-        self._gpu_cfg_no_compile = configure_gpu(
-            device, no_compile=True, no_amp=no_amp, sdpa_math=sdpa_math,
-        )
-        self._use_amp = self._gpu_cfg["use_amp"]
-
-        # --- Precompute val legal indices (fixed batch size) ---
-        vocab_size = self._cfg.vocab_size
-        self._mask_builder = LegalMaskBuilder(
-            val_batch_size, seq_len=self._seq_len, vocab_size=vocab_size,
-            device=device, prepend_outcome=self._prepend_outcome,
-        )
-        val_loader = DataLoader(
-            self._val_ds, batch_size=val_batch_size, shuffle=False,
-            num_workers=0, pin_memory=True,
-        )
-        self._val_legal_indices = []
-        for batch in val_loader:
-            move_ids = batch["move_ids"]
-            if isinstance(move_ids, torch.Tensor):
-                move_ids = move_ids.numpy()
-            game_lengths = np.asarray(batch["game_length"], dtype=np.int16)
-            indices = compute_legal_indices(
-                move_ids, game_lengths, self._mask_builder.T, vocab_size,
-                prepend_outcome=self._prepend_outcome,
-            )
-            self._val_legal_indices.append(torch.from_numpy(indices).pin_memory())
-
-        print(f"InProcessRoSAObjective ready: {self._n_train} train / "
-              f"{n_val} val games, {len(self._val_legal_indices)} val batches")
-
-    def _make_backbone(self):
-        """Create a fresh backbone from the cached state dict."""
-        import torch
-        from pawn.model import PAWNCLM
-        model = PAWNCLM(self._cfg).to(self.device)
-        model.load_state_dict(self._backbone_state)
-        model.eval()
-        return model
-
-    def __call__(self, trial: "optuna.trial.BaseTrial") -> float:
-        import gc
-        import math
-        import torch
-        import torch.nn.functional as F
-        from torch.utils.data import DataLoader
-        from pawn.adapters.rosa import RoSACLM, RetroBottleneckCLM, generate_gradient_masks
-        from pawn.adapters.sparse import SparseCLM, SparseLinear
-        from pawn.adapters.lora import ATTN_PRESETS, _FFN_TARGETS
-        from pawn.gpu import apply_gpu_config
-        from pawn.lichess_data import LegalMaskCollate
-
-        assert _optuna is not None
-
-        suggest_fn = SUGGEST_FNS[self.adapter_type]
-        params = suggest_fn(trial)
-        mode = params["mode"]
-        density = params["density"]
-        lr = params["lr"]
-        lora_rank = params["lora_rank"]
-        lora_targets = params["lora_targets"]
-        batch_size = params["batch_size"]
-        warmup_steps = params["warmup_steps"]
-        mask_samples = params["mask_samples"]
-        grad_alpha = params["grad_alpha"]
-        weight_decay = params["weight_decay"]
-        warmup_frac = params["warmup_frac"]
-        patience = params["patience"]
-        bottleneck_dim = params.get("bottleneck_dim", 8)
-        bottleneck_n_hidden = int(params.get("bottleneck_n_hidden", 0))
-
-        vocab_size = self._cfg.vocab_size
-        use_amp = self._use_amp
-        device = self.device
-
-        # --- Data loaders (batch_size varies per trial) ---
-        # seq_len comes from the backbone (same value as the mask builder
-        # was created with); the legal-mask shift is driven by
-        # ``prepend_outcome``.
-        collate = LegalMaskCollate(
-            seq_len=self._seq_len, vocab_size=vocab_size,
-            prepend_outcome=self._prepend_outcome,
-        )
-        train_loader = DataLoader(
-            self._train_ds, batch_size=batch_size, shuffle=True,
-            num_workers=0, pin_memory=True, collate_fn=collate,
-        )
-        val_loader = DataLoader(
-            self._val_ds, batch_size=self.val_batch_size, shuffle=False,
-            num_workers=0, pin_memory=True,
-        )
-
-        # Ensure mask builder capacity matches train batch size
-        mask_builder = self._mask_builder
-        if batch_size > mask_builder._max_batch:
-            from pawn.lichess_data import LegalMaskBuilder
-            mask_builder = LegalMaskBuilder(
-                batch_size, seq_len=self._seq_len, vocab_size=vocab_size,
-                device=device, prepend_outcome=self._prepend_outcome,
-            )
-
-        # ---------------------------------------------------------------
-        # Phase 1: LoRA warm-up
-        # ---------------------------------------------------------------
-        backbone = self._make_backbone()
-        warmup_model = RoSACLM(
-            backbone, rank=lora_rank, alpha=None,
-            attn_targets=lora_targets, adapt_ffn=False,
-            lora_enabled=True, sparse_enabled=False,
-        ).to(device)
-
-        lora_params = warmup_model.lora_parameters()
-        optimizer = torch.optim.AdamW(lora_params, lr=lr, weight_decay=weight_decay)
-
-        warmup_model.train()
-        step = 0
-        while step < warmup_steps:
-            for batch in train_loader:
-                if step >= warmup_steps:
-                    break
-                ids = batch["input_ids"].to(device, non_blocking=True)
-                tgt = batch["targets"].to(device, non_blocking=True)
-                msk = batch["loss_mask"].to(device, non_blocking=True)
-                legal_mask = mask_builder.scatter(
-                    batch["legal_indices"], ids.shape[0], mask_builder.T
-                )
-
-                with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-                    hidden = warmup_model.forward_hidden(ids, msk)
-                    valid_logits = warmup_model.project_head(hidden[msk])
-                valid_logits = valid_logits.float()
-                valid_logits.masked_fill_(~legal_mask[msk], float("-inf"))
-                valid_targets = tgt[msk]
-                if valid_targets.shape[0] == 0:
-                    continue
-
-                loss = F.cross_entropy(valid_logits, valid_targets)
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(lora_params, self.max_grad_norm)
-                optimizer.step()
-                step += 1
-
-        del optimizer
-
-        # ---------------------------------------------------------------
-        # Phase 2: Mask generation
-        # ---------------------------------------------------------------
-        masks = generate_gradient_masks(
-            warmup_model, train_loader, mask_builder,
-            density=density, alpha=grad_alpha,
-            device=device, use_amp=use_amp, max_batches=mask_samples,
-        )
-
-        # ---------------------------------------------------------------
-        # Phase 3: Set up model per mode
-        # ---------------------------------------------------------------
-        attn_target_tuple = ATTN_PRESETS[lora_targets]
-
-        if mode == "rosa":
-            warmup_model.set_masks(masks)
-            warmup_model.reinit_lora()
-            model = warmup_model
-            adapter_params = model.adapter_parameters()
-        else:
-            # Retrospective modes: discard warm-up, reload backbone
-            del warmup_model
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            backbone = self._make_backbone()
-            sparse_model = SparseCLM(
-                backbone, density=density, attn_targets=attn_target_tuple,
-            )
-            # Overwrite random masks with gradient-derived masks
-            for layer_idx in range(len(backbone.layers)):
-                block = backbone.get_block(layer_idx)
-                for proj_name in attn_target_tuple:
-                    module = getattr(block.attn, proj_name, None)
-                    if isinstance(module, SparseLinear):
-                        key = f"layer{layer_idx}.{proj_name}"
-                        if key in masks:
-                            module.mask.copy_(masks[key])
-
-            if mode == "retro-sparse":
-                model = sparse_model
-                adapter_params = model.sparse_parameters()
-            else:  # retro-bottleneck
-                model = RetroBottleneckCLM(
-                    sparse_model.backbone, bottleneck_dim=bottleneck_dim,
-                    n_hidden=bottleneck_n_hidden,
-                ).to(device)
-                adapter_params = model.adapter_parameters()
-
-        # Compile for Phase 3
-        from pawn import model as model_module
-        model.forward_hidden = apply_gpu_config(
-            self._gpu_cfg, model_module, model.forward_hidden,
-        )
-
-        # ---------------------------------------------------------------
-        # Phase 3: Training with epoch-level pruning
-        # ---------------------------------------------------------------
-        optimizer = torch.optim.AdamW(adapter_params, lr=lr, weight_decay=weight_decay)
-        total_steps = self.epochs * len(train_loader)
-        sched_warmup = int(warmup_frac * total_steps)
-
-        def lr_lambda(s):
-            if s < sched_warmup:
-                return s / max(sched_warmup, 1)
-            progress = (s - sched_warmup) / max(total_steps - sched_warmup, 1)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        scaler = torch.amp.GradScaler() if use_amp else None
-
-        best_val_loss = float("inf")
-        patience_counter = 0
-
-        for epoch in range(self.epochs):
-            model.train()
-            for batch in train_loader:
-                ids = batch["input_ids"].to(device, non_blocking=True)
-                tgt = batch["targets"].to(device, non_blocking=True)
-                msk = batch["loss_mask"].to(device, non_blocking=True)
-                legal_mask = mask_builder.scatter(
-                    batch["legal_indices"], ids.shape[0], mask_builder.T
-                )
-
-                with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-                    hidden = model.forward_hidden(ids, msk)
-                    valid_logits = model.project_head(hidden[msk])
-                valid_logits = valid_logits.float()
-                valid_logits.masked_fill_(~legal_mask[msk], float("-inf"))
-                valid_targets = tgt[msk]
-                if valid_targets.shape[0] == 0:
-                    continue
-
-                loss = F.cross_entropy(valid_logits, valid_targets)
-                optimizer.zero_grad(set_to_none=True)
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(adapter_params, self.max_grad_norm)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(adapter_params, self.max_grad_norm)
-                    optimizer.step()
-                scheduler.step()
-
-            # --- Validation ---
-            model.eval()
-            total_loss = 0.0
-            total_pos = 0
-            with torch.no_grad():
-                for i, batch in enumerate(val_loader):
-                    ids = batch["input_ids"].to(device, non_blocking=True)
-                    tgt = batch["targets"].to(device, non_blocking=True)
-                    msk = batch["loss_mask"].to(device, non_blocking=True)
-                    lm = self._mask_builder.scatter(
-                        self._val_legal_indices[i],
-                        ids.shape[0],
-                        self._mask_builder.T,
-                    )
-                    with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-                        hidden = model.forward_hidden(ids, msk)
-                        vl = model.project_head(hidden[msk])
-                    vl = vl.float()
-                    vl.masked_fill_(~lm[msk], float("-inf"))
-                    vt = tgt[msk]
-                    n = vt.shape[0]
-                    if n == 0:
-                        continue
-                    total_loss += F.cross_entropy(vl, vt).item() * n
-                    total_pos += n
-
-            val_loss = total_loss / max(total_pos, 1)
-
-            # Report to Optuna for pruning
-            trial.report(val_loss, epoch)
-            if trial.should_prune():
-                self._cleanup(model, optimizer, scaler)
-                raise _optuna.TrialPruned()
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    break
-
-        self._cleanup(model, optimizer, scaler)
-        return best_val_loss
-
-    @staticmethod
-    def _cleanup(model, optimizer, scaler):
-        """Free GPU memory between trials."""
-        import gc
-        import torch
-        del model, optimizer, scaler
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-
-# ---------------------------------------------------------------------------
-# Study creation helpers
-# ---------------------------------------------------------------------------
-
-def create_study(
-    name: str,
-    storage: str | None = None,
-    direction: str = "minimize",
-    pruner: str = "hyperband",
-) -> "optuna.Study":
-    """Create an Optuna study with sensible defaults.
-
-    Args:
-        name: Study name (also used as DB table name).
-        storage: SQLite path (e.g. "sqlite:///sweeps/study.db"). None = in-memory.
-        direction: "minimize" for val_loss, "maximize" for accuracy.
-        pruner: "hyperband", "median", or "none".
-    """
-    if _optuna is None:
-        raise ImportError("optuna is required for sweeps: pip install optuna")
-
-    assert _optuna is not None
-    if pruner == "hyperband":
-        pruner_obj = _optuna.pruners.HyperbandPruner()
-    elif pruner == "median":
-        pruner_obj = _optuna.pruners.MedianPruner()
-    else:
-        pruner_obj = _optuna.pruners.NopPruner()
-
-    return _optuna.create_study(
-        study_name=name,
-        storage=storage,
-        direction=direction,
-        pruner=pruner_obj,
-        load_if_exists=True,
-    )
+    def __call__(self, trial: optuna.Trial) -> float:
+        suggester = STRATEGY_SUGGESTERS[self.strategy]
+        params = suggester(trial)
+        return self.train_fn(params)

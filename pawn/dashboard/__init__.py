@@ -1,27 +1,25 @@
-"""PAWN training dashboard — Solara + Jupyter.
+"""PAWN training dashboard.
 
-Standalone:  solara run pawn.dashboard.sol
-Jupyter:     from pawn.dashboard import Dashboard, Runner; Dashboard()
-CLI:         python -m pawn.dashboard --log-dir ../logs
+Light-weight v2 surface: only the metrics loader is unconditionally
+importable; the Solara UI lives behind a lazy `__getattr__` so
+`from pawn.dashboard.metrics import load_metrics` works without
+needing the `dashboard` extra installed.
+
+CLI:        python -m pawn.dashboard --log-dir <run-dir>
+Jupyter:    from pawn.dashboard import Dashboard; Dashboard()
 """
 
-from .metrics import col, detect_run_type, load_metrics, load_runs
+from pawn.dashboard.metrics import MetricsBundle, discover_runs, load_metrics
 
 
 def __getattr__(name):
-    # Lazy-load Solara components so metrics work without dashboard deps
-    if name in ("Dashboard", "Runner", "Page"):
-        from . import sol
+    # Solara components are lazy-loaded so the `dashboard` extra is
+    # only required when the UI is actually instantiated.
+    if name in ("Dashboard", "Page"):
+        from pawn.dashboard import sol
+
         return getattr(sol, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = [
-    "Dashboard",
-    "Runner",
-    "Page",
-    "load_runs",
-    "load_metrics",
-    "detect_run_type",
-    "col",
-]
+__all__ = ["MetricsBundle", "discover_runs", "load_metrics"]

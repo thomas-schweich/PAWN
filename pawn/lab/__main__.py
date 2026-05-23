@@ -1,7 +1,6 @@
-"""Entry point: python -m pawn.lab
+"""Entry point: ``python -m pawn.lab`` — starts the FastMCP server over stdio."""
 
-Starts the pawn-lab MCP server over stdio.
-"""
+from __future__ import annotations
 
 import logging
 import sys
@@ -13,6 +12,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-from pawn.lab.server import mcp
+from pawn.lab.server import build_server
 
-mcp.run()
+server = build_server()
+server.run()
