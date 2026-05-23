@@ -1,5 +1,18 @@
 # PAWN → JAX migration
 
+## Invocation
+
+- Feature slug: `jax-migration`
+- Original invocation: `/review-driven-development --resume docs/jax_migration_plan.md`
+- Effective flags (after defaults applied):
+  - `--plan-path`: `docs/jax_migration_plan.md`
+  - `--no-review-plan`: `true` *(the plan was already authored and reviewed before this branch existed; no post-plan checkpoint needed)*
+  - `--loop-chunks`: `false` *(single review wave per chunk; the full `/subagent-review --loop` only fires at section close + final review)*
+  - `--loop-sections`: `true`
+  - `--loop-final`: `true`
+  - `--pr-after-fixes`: `true` *(the framework-swap PR is the migration's only "done" state)*
+- Master feature branch: `jax_migration` *(this branch already exists, cut once from `main`; do not create `feat/jax-migration` — use `jax_migration` as the integration branch. Section branches go on `feat/jax-migration/<section-slug>` per skill §5.2.a or any other naming that doesn't collide with the master branch ref.)*
+
 ## 0. How to read this document
 
 This plan is written for the `/review-driven-development` skill. Each `### S<N>` section below is structured with four blocks the skill's `review-spec-alignment` agent will read and grade: `**Goal:**` (the section's intent in one sentence), `**Deliverables:**` (the concrete items the agent will check off), `**Verification:**` (the commands to run on the local GPU), and `**Definition of done:**` (the acceptance criterion or invariant the section advances). The structure is uniform across all sixteen sections. Don't rephrase or split these blocks — the spec-alignment agent grades by reading them.
