@@ -194,7 +194,7 @@ The 8 strategies and their key args (full surface in `pawn/run_config.py`):
 | `sparse`          | Binary mask                               | `--density 0.01 --sparse-targets qkvo`                  |
 | `rosa`            | Gradient-informed sparse + LoRA (3-phase) | `--rosa-mode rosa` &#124; `retro-sparse` &#124; `retro-bottleneck` |
 | `unfreeze`        | Fine-tune explicit layer picks            | `--unfreeze-layers 5,6,7`                               |
-| `specialized_clm` | From-scratch standalone transformer       | `--d-model 84 --n-layers 2`                             |
+| `specialized_clm` | From-scratch standalone transformer       | `--d-model 64 --n-layers 2 --n-heads 4 --d-ff 256`      |
 
 The `rosa` strategy has three sub-modes selected by `--rosa-mode`: `rosa`
 (standard), `retro-sparse`, and `retro-bottleneck`. All three are
