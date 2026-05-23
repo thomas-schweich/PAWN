@@ -183,7 +183,8 @@ def _filter_lichess(
 ) -> pl.DataFrame:
     """Apply Elo / min_ply / max_games filters and collect to memory."""
     schema = lf.collect_schema()
-    missing = set(_REQUIRED_COLS) - set(schema.names())
+    required: set[str] = set(_REQUIRED_COLS)
+    missing = required - set(schema.names())
     if missing:
         raise ValueError(
             f"Lichess parquet schema is missing required columns "

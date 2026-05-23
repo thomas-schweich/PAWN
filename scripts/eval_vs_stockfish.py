@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from pawn.checkpoint import load_model
+from pawn.corpus import Corpus
 from pawn.legacy import convert_legacy_checkpoint
 from pawn.lichess_data import load_lichess_corpus
 from pawn.lichess_eval import (
@@ -40,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     model = load_model(ckpt_path)
 
     bins = default_elo_bins()
-    bins_corpora: dict[EloBin, object] = {}
+    bins_corpora: dict[EloBin, Corpus] = {}
     for b in bins:
         try:
             c = load_lichess_corpus(

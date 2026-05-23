@@ -177,14 +177,24 @@ def _make_cfg(**kwargs: Any) -> PretrainConfig:
     return PretrainConfig(**defaults)
 
 
+def _f(arr_like: Any) -> float:
+    """`_f(sched(step))` — extracted helper because pyright sees the
+    optax schedule's return type as `ArrayLike` (which is a `Union` that
+    includes `complex`), refusing the direct ``float(...)`` cast.
+    ``np.asarray(x).item()`` returns a real Python ``float``, which
+    satisfies the type check while behaving identically at runtime.
+    """
+    return np.asarray(arr_like).item()
+
+
 def test_lr_schedule_cosine_warmup_then_decay() -> None:
     cfg = _make_cfg(lr_schedule="cosine", warmup_frac=0.1, lr=1e-3)
     sched = make_lr_schedule(cfg, total_steps=100)
-    assert float(sched(0)) == pytest.approx(0.0, abs=1e-7)
+    assert _f(sched(0)) == pytest.approx(0.0, abs=1e-7)
     # Peak around end of warmup.
-    assert float(sched(10)) == pytest.approx(1e-3, rel=1e-3)
+    assert _f(sched(10)) == pytest.approx(1e-3, rel=1e-3)
     # End of schedule decays to 0.
-    assert float(sched(99)) < 1e-4
+    assert _f(sched(99)) < 1e-4
 
 
 def test_lr_schedule_cosine_decay_steps_equals_total_steps() -> None:
@@ -194,19 +204,19 @@ def test_lr_schedule_cosine_decay_steps_equals_total_steps() -> None:
     cfg = _make_cfg(lr_schedule="cosine", warmup_frac=0.5, lr=1.0)
     sched = make_lr_schedule(cfg, total_steps=100)
     # At step 50 (end of warmup, decay starts), LR is peak.
-    assert float(sched(50)) == pytest.approx(1.0, rel=1e-3)
+    assert _f(sched(50)) == pytest.approx(1.0, rel=1e-3)
     # At step 100, LR has just reached end (≈0).
     # If decay_steps were (total_steps - warmup) = 50, we'd see LR=0
     # at step 100 with the first 50 steps in pure cosine — but we'd
     # also see weird oscillation past step 100.
-    assert float(sched(100)) == pytest.approx(0.0, abs=1e-3)
+    assert _f(sched(100)) == pytest.approx(0.0, abs=1e-3)
 
 
 def test_lr_schedule_constant_holds_peak() -> None:
     cfg = _make_cfg(lr_schedule="constant", warmup_frac=0.05, lr=1e-3)
     sched = make_lr_schedule(cfg, total_steps=100)
-    assert float(sched(50)) == pytest.approx(1e-3, rel=1e-3)
-    assert float(sched(99)) == pytest.approx(1e-3, rel=1e-3)
+    assert _f(sched(50)) == pytest.approx(1e-3, rel=1e-3)
+    assert _f(sched(99)) == pytest.approx(1e-3, rel=1e-3)
 
 
 def test_lr_schedule_wsd_warmup_stable_decay() -> None:
@@ -215,18 +225,18 @@ def test_lr_schedule_wsd_warmup_stable_decay() -> None:
     )
     sched = make_lr_schedule(cfg, total_steps=100)
     # Stable middle (step 50): peak.
-    assert float(sched(50)) == pytest.approx(1e-3, rel=1e-3)
+    assert _f(sched(50)) == pytest.approx(1e-3, rel=1e-3)
     # End of run: decayed.
-    assert float(sched(100)) < 1e-4
+    assert _f(sched(100)) < 1e-4
 
 
 def test_lr_schedule_one_cycle_ramps_then_cosine() -> None:
     cfg = _make_cfg(lr_schedule="one_cycle", warmup_frac=0.1, lr=1e-3)
     sched = make_lr_schedule(cfg, total_steps=100)
     # Peak at end of warmup.
-    assert float(sched(10)) == pytest.approx(1e-3, rel=1e-3)
+    assert _f(sched(10)) == pytest.approx(1e-3, rel=1e-3)
     # End: small (peak/10000).
-    assert float(sched(99)) < 1e-5
+    assert _f(sched(99)) < 1e-5
 
 
 def test_lr_schedule_infinite_has_stable_plateau() -> None:
@@ -242,7 +252,7 @@ def test_lr_schedule_infinite_has_stable_plateau() -> None:
     # Stable plateau (middle of stable phase): stable_lr.
     # warmup ends at 5, cooldown at 25, stable ends at 100 - 10 = 90.
     # Pick a step deep in stable: 50.
-    assert float(sched(50)) == pytest.approx(0.1, rel=1e-2)
+    assert _f(sched(50)) == pytest.approx(0.1, rel=1e-2)
 
 
 def test_lr_schedule_rejects_unknown_shape() -> None:
@@ -280,7 +290,7 @@ def test_lr_schedule_infinite_with_extreme_rounding_doesnt_crash() -> None:
     sched = make_lr_schedule(cfg, total_steps=3)
     # Each step is queryable (no crash).
     for step in range(3):
-        float(sched(step))
+        _f(sched(step))
 
 
 def test_supernet_joint_loss_rejects_empty_variants() -> None:
@@ -340,9 +350,14 @@ def test_make_optimizer_clip_actually_clips_under_sgd() -> None:
     huge_grads = {"w": jnp.full((4,), 500.0)}  # global norm = 1000
     state = pure_clip_sgd.init(params)
     updates, _ = pure_clip_sgd.update(huge_grads, state, params)
+    # `updates` is a `dict[str, jax.Array]` mirroring `params` at runtime.
+    # optax's typed `Updates` is the generic `ArrayTree` (Array | dict | …),
+    # so pyright won't accept `updates["w"]` without an explicit cast.
+    from typing import cast
+    upd_w = cast(dict[str, jax.Array], updates)["w"]
     # After clip to norm 1.0 + sgd(lr=1.0), update norm ≈ 1.0 (with
     # SGD's sign flip: updates = -clipped_grads).
-    upd_norm = float(jnp.linalg.norm(updates["w"]))
+    upd_norm = _f(jnp.linalg.norm(upd_w))
     assert upd_norm == pytest.approx(1.0, rel=1e-5)
 
 

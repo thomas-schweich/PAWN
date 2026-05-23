@@ -117,6 +117,8 @@ def init_lora_adapter(
 
     def kaiming(k: jax.Array, shape: tuple[int, ...]) -> jax.Array:
         # Kaiming-uniform with fan-in = shape[-1], a=sqrt(5).
+        if len(shape) == 0:
+            raise ValueError("kaiming requires at least a 1-D shape")
         fan_in = shape[-1] if len(shape) >= 2 else shape[0]
         bound = math.sqrt(6.0 / fan_in) / math.sqrt(3.0)  # ≈ sqrt(2/fan_in)
         return jax.random.uniform(k, shape, minval=-bound, maxval=bound)

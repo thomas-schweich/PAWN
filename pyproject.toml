@@ -124,8 +124,14 @@ typeCheckingMode = "basic"
 reportMissingTypeStubs = false
 reportPrivateImportUsage = false
 reportMissingImports = "error"
-include = ["pawn"]
-exclude = ["pawn/dashboard"]
+include = ["pawn", "scripts", "tests"]
+# Excludes:
+#   - pawn/dashboard: Solara widgets pyright can't follow.
+#   - scripts/vastai_score.py: PEP 723 uv-shebang script — its deps
+#     (requests, beautifulsoup4) are declared in-script via the
+#     `# /// script` block and resolved by uv at execution time;
+#     pyright doesn't see them.
+exclude = ["pawn/dashboard", "scripts/vastai_score.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

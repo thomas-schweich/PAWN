@@ -4,7 +4,7 @@ dispatch and train at least one chunk per plan §3 criterion 8.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import equinox as eqx
 import jax
@@ -275,7 +275,9 @@ def test_unfreeze_rejects_out_of_range_indices() -> None:
 
 
 @pytest.mark.parametrize("mode", ["rosa", "retro-sparse", "retro-bottleneck"])
-def test_rosa_dispatches_each_mode(mode: str) -> None:
+def test_rosa_dispatches_each_mode(
+    mode: Literal["rosa", "retro-sparse", "retro-bottleneck"],
+) -> None:
     backbone = init_model(TINY_SUPERNET, key=0)
     cfg = RoSAConfig(mode=mode, lora_rank=2, density=0.1)
     adapter = dispatch_init("rosa")(backbone, cfg, key=jax.random.key(0))

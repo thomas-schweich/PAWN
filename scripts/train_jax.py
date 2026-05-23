@@ -119,7 +119,11 @@ def main(argv: list[str] | None = None) -> int:
         state = load_resume_state(Path(cfg.resume), optimizer, jax.random.key(0))
     else:
         import equinox as eqx
-        model = init_model(supernet_cfg, key=cfg.base_seed if hasattr(cfg, "base_seed") else 0)
+        # PretrainConfig doesn't carry a runtime seed field — the supernet
+        # init key is fixed at 0 for reproducibility. The training stream's
+        # randomness comes from the Rust engine's per-batch seed, not from
+        # the model-init key.
+        model = init_model(supernet_cfg, key=0)
         opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
         state = TrainState(
             model=model, opt_state=opt_state, step=jnp.int32(0),

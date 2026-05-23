@@ -18,7 +18,7 @@ import platform
 import socket
 import sys
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 __all__ = [
     "init_wandb",
@@ -43,9 +43,21 @@ def init_wandb(
     """
     if not enabled:
         return None
-    mode = os.environ.get("PAWN_WANDB_MODE", "online")
-    if mode == "disabled":
+    mode_env = os.environ.get("PAWN_WANDB_MODE", "online")
+    mode: Literal["online", "offline", "disabled", "shared"]
+    if mode_env == "online":
+        mode = "online"
+    elif mode_env == "offline":
+        mode = "offline"
+    elif mode_env == "disabled":
         return None
+    elif mode_env == "shared":
+        mode = "shared"
+    else:
+        # Unrecognised PAWN_WANDB_MODE: fall back to "online" rather than
+        # crashing — the env var is intended as an operator-facing knob,
+        # not a typed enum.
+        mode = "online"
     try:
         import wandb
     except ImportError:
