@@ -30,7 +30,12 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import (
+    CancelledError,
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -188,10 +193,22 @@ class HFPushTracker:
                     timeouts += 1
                     continue
                 fut.result(timeout=remaining)
-            except TimeoutError:
+            except FutureTimeoutError:
                 # `fut.result(timeout=...)` raises this if the worker
                 # didn't finish in `remaining`. A still-running thread.
+                # Import explicitly from `concurrent.futures` rather
+                # than relying on the 3.11+ alias with builtin
+                # `TimeoutError` (round-3 bug-detector Important).
                 timeouts += 1
+            except CancelledError:
+                # Future was cancelled before the worker started —
+                # not a stuck thread, not a failed upload. Treat as
+                # neither timeout nor error (round-3 bug-detector
+                # Important: a `cancel_futures=True` shutdown between
+                # `submit()` and `result()` would have triggered
+                # this, and conflating it with `errors` would surface
+                # a spurious checkpoint-failure to the operator).
+                continue
             except Exception:
                 # The upload raised — thread exited, just a failed
                 # checkpoint. No abandon-thread needed.
@@ -211,18 +228,32 @@ class HFPushTracker:
         - ``drain_succeeded=False`` (the prior ``drain_push_queue``
           timed out — a future is stuck mid-upload and ``cancel()`` is
           a no-op on a running thread): ``wait=False`` so the trainer
-          can exit promptly. The stuck thread is abandoned at process
-          exit. This preserves the bounded SIGTERM total time that the
-          ``drain_push_queue(timeout=300)`` contract advertised.
+          can exit promptly. We also **remove the worker thread from
+          ``concurrent.futures.thread._threads_queues``** so cpython's
+          ``_python_exit`` atexit hook doesn't ``Thread.join()`` it
+          unconditionally (round-3 codex P1 + bug-detector Critical:
+          the daemon flag alone doesn't help — ``_python_exit`` runs
+          before daemon-thread-kill, and a ``join()`` on a stuck
+          worker blocks on the GIL-internal ``_tstate_lock``).
 
-        Without this gating, a stuck upload made the trainer hang
-        forever at shutdown (Codex P2 / bug-detector Important on the
-        round-1 review of commit 92d618b).
+        Without this gating, a stuck upload makes the trainer hang
+        forever past the bounded SIGTERM budget.
         """
         if drain_succeeded:
             self._executor.shutdown(wait=True, cancel_futures=True)
-        else:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            return
+
+        # Abandon path: pop our workers from cpython's atexit join
+        # list, *then* shut down the executor. After this returns,
+        # the daemon worker is left running but the interpreter will
+        # exit normally — `_python_exit` no longer sees the worker.
+        import concurrent.futures.thread as _cf_thread
+        from typing import cast as _cast
+
+        threads_queues = _cast(Any, _cf_thread._threads_queues)
+        for t in list(self._executor._threads):
+            threads_queues.pop(t, None)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 def push_checkpoint_async(

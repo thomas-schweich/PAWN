@@ -482,14 +482,30 @@ def unflatten_opt_state(
     #
     # `getattr(leaf, "dtype", None)` covered the array case but
     # *re-introduced* the footgun for python-int template leaves
-    # (round-2 bug-detector finding). Fall back to the *saved* leaf's
-    # numpy dtype when the template doesn't have one — the safetensors
-    # round-trip preserves dtype, so the saved dtype is the contract.
+    # (round-2 bug-detector finding). Round-3 test-risk caught that
+    # the fallback to `saved.dtype` is still risky: `np.asarray(42)`
+    # on Linux defaults to int64, which JAX silently truncates to
+    # int32 with a `UserWarning` (the JAX default int dtype).
+    #
+    # Resolution: when the template is a python scalar, normalise to
+    # `np.int32` (for ints / bools) or `np.float32` (for floats),
+    # which match JAX's defaults. Array-typed leaves still use the
+    # template's dtype directly — that's the contract for the
+    # production case where every Optax leaf is a JAX array.
     def _dtype_for(template_leaf: Any, saved: np.ndarray) -> Any:
         if hasattr(template_leaf, "dtype"):
             return template_leaf.dtype
-        # Template leaf is a python scalar; defer to the saved numpy
-        # array's dtype (preserved by safetensors).
+        # Template leaf is a python scalar — match JAX's default int
+        # dtype rather than trusting `saved.dtype` (which inherits
+        # `np.asarray(python_int)`'s Linux-default int64).
+        if isinstance(template_leaf, bool):
+            return np.bool_
+        if isinstance(template_leaf, int):
+            return np.int32
+        if isinstance(template_leaf, float):
+            return np.float32
+        # Unknown scalar type — fall back to saved.dtype as a
+        # best-effort.
         return saved.dtype
 
     new_leaves = [

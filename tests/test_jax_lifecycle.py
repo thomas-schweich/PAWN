@@ -12,6 +12,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 
@@ -194,6 +195,134 @@ def test_executor_worker_threads_are_daemonic(tmp_path: Path) -> None:
             assert t.daemon, f"worker {t.name} is not daemonic"
     finally:
         tracker.shutdown()
+
+
+def test_shutdown_drain_failed_removes_workers_from_python_exit_join(
+    tmp_path: Path,
+) -> None:
+    """Round-3 codex P1 + bug-detector Critical: the daemon flag alone
+    doesn't prevent `concurrent.futures.thread._python_exit` from
+    `Thread.join()`-ing a stuck worker at interpreter shutdown.
+    `_python_exit` iterates ``_threads_queues`` unconditionally.
+    `shutdown(drain_succeeded=False)` must pop our workers from that
+    dict so the atexit hook doesn't see them.
+    """
+    import concurrent.futures.thread as _cf_thread
+
+    ckpt = tmp_path / "step_00000010"
+    ckpt.mkdir()
+    tracker = HFPushTracker(repo_id="ns/test")
+    blocker = threading.Event()
+
+    class _StuckHfApi:
+        def upload_folder(self, **_kwargs: Any) -> None:
+            blocker.wait()
+
+    try:
+        push_checkpoint_async(ckpt, tracker, upload_cls=_StuckHfApi)
+        # Drain times out → drain_succeeded=False path
+        timeouts, _errors = tracker.join(timeout=0.2)
+        assert timeouts == 1
+        worker_threads = list(tracker._executor._threads)
+        assert worker_threads, "expected at least one worker"
+        # Before shutdown the worker IS in `_threads_queues` (cpython
+        # registered it at thread creation).
+        assert all(
+            t in _cf_thread._threads_queues for t in worker_threads
+        ), "worker thread is not registered in _threads_queues"
+        tracker.shutdown(drain_succeeded=False)
+        # After shutdown the worker is gone from `_threads_queues`,
+        # so `_python_exit` won't try to join it.
+        for t in worker_threads:
+            assert t not in _cf_thread._threads_queues, (
+                f"worker {t.name} still in _threads_queues; "
+                f"_python_exit would block on it"
+            )
+    finally:
+        blocker.set()
+
+
+def test_join_treats_cancelled_future_as_neither_timeout_nor_error(
+    tmp_path: Path,
+) -> None:
+    """Round-3 bug-detector Important: a future cancelled before its
+    worker runs raises `CancelledError` on `result()`. It's not a
+    timeout (no stuck thread) and not an upload failure — `join` must
+    skip it cleanly so the trainer doesn't surface a spurious
+    checkpoint-failure to the operator.
+    """
+    ckpt = tmp_path / "step_00000010"
+    ckpt.mkdir()
+    tracker = HFPushTracker(repo_id="ns/test")
+    blocker = threading.Event()
+
+    class _NeverCalled:
+        def upload_folder(self, **_kwargs: Any) -> None:
+            blocker.wait()
+
+    try:
+        push_checkpoint_async(ckpt, tracker, upload_cls=_NeverCalled)
+        push_checkpoint_async(ckpt, tracker, upload_cls=_NeverCalled)
+        push_checkpoint_async(ckpt, tracker, upload_cls=_NeverCalled)
+        # First future is running on the single-worker executor;
+        # the next two are queued. Cancel them — `cancel()` returns
+        # True for queued futures, False for the running one.
+        with tracker._lock:
+            futures = list(tracker._futures)
+        assert futures[1].cancel(), "queued future #1 must be cancellable"
+        assert futures[2].cancel(), "queued future #2 must be cancellable"
+        # Release the running future so it completes; `join` then
+        # observes 0 timeouts + 0 errors (the cancelled ones are
+        # skipped) + 1 normal completion.
+        blocker.set()
+        timeouts, errors = tracker.join(timeout=5.0)
+        assert timeouts == 0
+        assert errors == 0, (
+            f"cancelled futures should not be counted as errors "
+            f"(got {errors})"
+        )
+    finally:
+        blocker.set()
+
+
+def test_unflatten_opt_state_python_int_template_uses_int32(
+    tmp_path: Path,
+) -> None:
+    """Round-3 test-risk Important + bug-detector follow-up: the
+    `_dtype_for` fallback for python-int template leaves must
+    normalise to `np.int32` (the JAX default int dtype). Without
+    this, `np.asarray(42)`'s Linux-default int64 would survive the
+    round-trip, JAX would emit a `UserWarning` truncating to int32,
+    and a sufficiently large value would silently wrap.
+    """
+    import jax.numpy as jnp_local
+
+    from pawn.trainer import flatten_opt_state, unflatten_opt_state
+
+    # Synthesise a tiny opt-state-shaped PyTree with a *python int*
+    # template leaf (rather than a JAX int32 ArrayImpl). The Optax
+    # state in production doesn't have python-int leaves, but this
+    # is the defense-in-depth path the fallback was written for.
+    template = {"count": 0, "moment": jnp_local.zeros((4,), dtype=jnp_local.float32)}
+
+    # Simulate a saved checkpoint where the count was serialised as
+    # int32 (the value `_dtype_for` should pick).
+    flat = {
+        "['count']": np.int32(7),
+        "['moment']": np.ones((4,), dtype=np.float32),
+    }
+
+    from typing import cast
+    # `unflatten_opt_state` declares `optax.OptState` (an `Any` alias);
+    # narrow to the dict shape we built the template with.
+    restored_d = cast(
+        "dict[str, jax.Array]", unflatten_opt_state(template, flat)
+    )
+    assert restored_d["count"].dtype == jnp_local.int32, (
+        f"expected int32 restored count, got {restored_d['count'].dtype}"
+    )
+    assert int(restored_d["count"]) == 7
+    assert restored_d["moment"].dtype == jnp_local.float32
 
 
 # ---------------------------------------------------------------------------
