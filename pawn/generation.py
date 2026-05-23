@@ -640,20 +640,39 @@ def _analyze_generated_games(
 def outcome_signal_test(
     model: PAWNModel,
     *,
+    outcome_prefix_trained: bool,
     n_per_outcome: int = 1000,
     mask_conditions: tuple[bool, ...] = (False, True),
     batch_size: int = 64,
     seed: int = 0,
     verbose: bool = True,
     use_kv_cache: bool = True,
-) -> dict[str, dict[str, dict[str, Any]]]:
+) -> dict[str, Any]:
     """Run the §6.1-6.3 outcome-token signal test.
 
     For each outcome name + masked / unmasked condition, generate
-    ``n_per_outcome`` games and report the §6 metrics.
+    ``n_per_outcome`` games and report the §6 metrics. Conditions
+    the model on an outcome token at sequence position 0, so it
+    only has interpretable meaning when the model was trained with
+    ``prepend_outcome=True``. Pass ``outcome_prefix_trained=True``
+    to opt in; otherwise returns a ``{"_skipped": ...}`` sentinel
+    (§5.1 of the v2-parity-gap audit).
 
-    Returns ``results[outcome_name][masked|unmasked] = metrics``.
+    Returns ``results[outcome_name][masked|unmasked] = metrics`` (or
+    a single ``{"_skipped": ...}`` dict).
     """
+    if not outcome_prefix_trained:
+        return {
+            "_skipped": (
+                "outcome_signal_test only has interpretable meaning on "
+                "models trained with prepend_outcome=True (outcome-token "
+                "conditioning at sequence position 0). The current model "
+                "wasn't, so position 0's outcome token is out-of-"
+                "distribution and the metrics measure nothing. Re-run "
+                "with --outcome-prefix-trained on a model trained that "
+                "way."
+            ),
+        }
     results: dict[str, dict[str, dict[str, Any]]] = {}
     for oname, otok in OUTCOME_TOKENS.items():
         results[oname] = {}
@@ -702,6 +721,7 @@ def prefix_continuation_test(
     model: PAWNModel,
     corpus: dict[str, np.ndarray],
     *,
+    outcome_prefix_trained: bool,
     n_per_bucket: int = 200,
     prefix_pcts: tuple[float, ...] = (0.1, 0.5, 0.9),
     absolute_plies: tuple[int, ...] = (10, 50, 100, 200),
@@ -712,10 +732,24 @@ def prefix_continuation_test(
 ) -> dict[str, Any]:
     """§6.4 prefix continuation test with within-test outcome controls.
 
+    Conditions the model on an outcome token at sequence position 0
+    so it only has interpretable meaning when the model was trained
+    with ``prepend_outcome=True``. Pass ``outcome_prefix_trained=True``
+    to opt in; otherwise returns a ``{"_skipped": ...}`` sentinel
+    (§5.1 of the v2-parity-gap audit).
+
     ``corpus`` must contain ``"move_ids"`` (int16 ``[N, max_ply]``),
     ``"game_lengths"`` (int16 ``[N]``), and ``"termination_codes"``
     (uint8 ``[N]``) — the standard tuple from ``engine.generate_clm_batch``.
     """
+    if not outcome_prefix_trained:
+        return {
+            "_skipped": (
+                "prefix_continuation_test only has interpretable meaning "
+                "on models trained with prepend_outcome=True. Re-run with "
+                "--outcome-prefix-trained on a model trained that way."
+            ),
+        }
     move_ids = corpus["move_ids"]
     game_lengths = corpus["game_lengths"]
     term_codes = corpus["termination_codes"]
@@ -799,6 +833,7 @@ def poisoned_prefix_test(
     model: PAWNModel,
     corpus: dict[str, np.ndarray],
     *,
+    outcome_prefix_trained: bool,
     n_per_pair: int = 500,
     prefix_pct: float = 0.5,
     batch_size: int = 64,
@@ -812,7 +847,21 @@ def poisoned_prefix_test(
     condition the continuation on ``poisoned`` instead. Report the
     outcome distribution + match rate against both conditioning and
     actual outcomes.
+
+    Conditions the model on an outcome token at sequence position 0
+    so it only has interpretable meaning when the model was trained
+    with ``prepend_outcome=True``. Pass ``outcome_prefix_trained=True``
+    to opt in; otherwise returns a ``{"_skipped": ...}`` sentinel
+    (§5.1 of the v2-parity-gap audit).
     """
+    if not outcome_prefix_trained:
+        return {
+            "_skipped": (
+                "poisoned_prefix_test only has interpretable meaning on "
+                "models trained with prepend_outcome=True. Re-run with "
+                "--outcome-prefix-trained on a model trained that way."
+            ),
+        }
     move_ids = corpus["move_ids"]
     game_lengths = corpus["game_lengths"]
     term_codes = corpus["termination_codes"]

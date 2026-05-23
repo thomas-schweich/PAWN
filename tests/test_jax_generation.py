@@ -547,6 +547,7 @@ def test_outcome_signal_test_smoke() -> None:
     results = outcome_signal_test(
         model, n_per_outcome=4, mask_conditions=(False, True),
         batch_size=4, seed=0, verbose=False,
+        outcome_prefix_trained=True,
     )
     assert set(results.keys()) == set(OUTCOME_TOKENS.keys())
     for oname, by_mask in results.items():
@@ -586,6 +587,7 @@ def test_prefix_continuation_test_smoke() -> None:
         model, corpus,
         n_per_bucket=2, prefix_pcts=(0.5,), absolute_plies=(10,),
         batch_size=4, seed=42, verbose=False,
+        outcome_prefix_trained=True,
     )
     # At least one outcome bucket should have completed (random games
     # are dominated by PLY_LIMIT, so that one is guaranteed in a corpus
@@ -599,6 +601,7 @@ def test_poisoned_prefix_test_smoke() -> None:
     results = poisoned_prefix_test(
         model, corpus, n_per_pair=2, prefix_pct=0.5,
         batch_size=4, seed=43,
+        outcome_prefix_trained=True,
     )
     # ``results`` may be empty (rare outcomes in 64 games), but every
     # entry must carry the required keys.

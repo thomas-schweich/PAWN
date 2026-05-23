@@ -209,6 +209,7 @@ def main() -> None:
             model, n_per_outcome=args.n_per_outcome,
             batch_size=args.batch_size, seed=args.seed,
             verbose=not args.quiet, use_kv_cache=args.use_kv_cache,
+            outcome_prefix_trained=args.outcome_prefix_trained,
         )
     if "prefix_continuation" in tests_to_run:
         assert corpus is not None
@@ -216,6 +217,7 @@ def main() -> None:
             model, corpus, n_per_bucket=args.n_per_bucket,
             batch_size=args.batch_size, seed=args.seed,
             verbose=not args.quiet, use_kv_cache=args.use_kv_cache,
+            outcome_prefix_trained=args.outcome_prefix_trained,
         )
     if "poisoned_prefix" in tests_to_run:
         assert corpus is not None
@@ -223,6 +225,7 @@ def main() -> None:
             model, corpus, n_per_pair=args.n_per_pair,
             batch_size=args.batch_size, seed=args.seed,
             use_kv_cache=args.use_kv_cache,
+            outcome_prefix_trained=args.outcome_prefix_trained,
         )
     if "impossible_task" in tests_to_run:
         assert corpus is not None
