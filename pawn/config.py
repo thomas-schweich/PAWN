@@ -1,159 +1,287 @@
-"""PAWN model and training configuration."""
+"""PAWN model configuration: vocab constants + supernet/variant dimensions.
+
+This module is the single source of truth for the model's discrete
+dimensions and the vocabulary contract. It is intentionally lightweight
+— a few frozen dataclasses + module-level constants — so it can be
+imported by non-training code (the legacy converter, the dashboard, the
+lab MCP server) without dragging in JAX. The Equinox ``PAWNModel`` in
+:mod:`pawn.model` is built from these configs but does not own them.
+
+Layout:
+
+- **Vocab constants** (``PAD_TOKEN``, ``OUTCOME_TOKEN_BASE``,
+  ``NUM_ACTIONS``, ``VOCAB_SIZE``, the named outcome IDs) — must stay
+  in lockstep with ``engine/src/vocab.rs``. Pre-vocab-transition
+  checkpoints used a ~60k-token vocabulary; those are accessible only
+  via the ``pre-vocab-transition`` git tag and are rejected by
+  :func:`pawn.legacy.convert_legacy_checkpoint`.
+- **Sequence + RoPE** (``MAX_SEQ_LEN``, ``ROPE_BASE``).
+- :data:`HEAD_DIM` = 64, fixed across all nested variants so width
+  slices align to whole heads and RoPE phase tables are
+  variant-invariant.
+- :class:`ModelConfig` — frozen dataclass for one architecture's
+  dimensions.
+- :data:`SUPERNET` + :data:`VARIANTS` — the production supernet and
+  its three nested slices.
+- :data:`TINY_SUPERNET` + :data:`TINY_VARIANTS` — same shape, smaller;
+  for verification runs.
+- :func:`validate_nested` — assert a ``ModelConfig`` describes a valid
+  nested slice of another. Called once at import for the constants
+  below, and re-called by ``pawn.model.sliced`` at slicing time.
+"""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from types import MappingProxyType
+from typing import Final, Mapping
+
+__all__ = [
+    # Vocab
+    "NUM_ACTIONS",
+    "PAD_TOKEN",
+    "OUTCOME_TOKEN_BASE",
+    "N_PRETRAINING_OUTCOMES",
+    "N_TOTAL_OUTCOMES",
+    "VOCAB_SIZE",
+    "WHITE_CHECKMATES",
+    "BLACK_CHECKMATES",
+    "STALEMATE",
+    "DRAW_BY_RULE",
+    "PLY_LIMIT",
+    "WHITE_RESIGNS",
+    "BLACK_RESIGNS",
+    "DRAW_BY_AGREEMENT",
+    "WHITE_WINS_ON_TIME",
+    "BLACK_WINS_ON_TIME",
+    "DRAW_BY_TIME",
+    # Sequence + RoPE
+    "MAX_SEQ_LEN",
+    "ROPE_BASE",
+    "HEAD_DIM",
+    # Configs
+    "ModelConfig",
+    "NestingError",
+    "SUPERNET",
+    "VARIANTS",
+    "TINY_SUPERNET",
+    "TINY_VARIANTS",
+    "validate_nested",
+]
 
 
-# ---- New vocabulary (searchless_chess) ----
-# Token layout: actions [0, 1967], PAD [1968], outcomes [1969, 1979]
-# Must match engine/src/vocab.rs
+# ---------------------------------------------------------------------------
+# Vocabulary (must match engine/src/vocab.rs exactly)
+# ---------------------------------------------------------------------------
 
-PAD_TOKEN = 1968
-OUTCOME_TOKEN_BASE = 1969
-NUM_ACTIONS = 1968
+NUM_ACTIONS: Final[int] = 1968
+PAD_TOKEN: Final[int] = 1968
+OUTCOME_TOKEN_BASE: Final[int] = 1969
+N_PRETRAINING_OUTCOMES: Final[int] = 5  # Tokens 1969–1973 (natural game terminations)
+N_TOTAL_OUTCOMES: Final[int] = 11       # Tokens 1969–1979 (incl. Lichess-specific)
+VOCAB_SIZE: Final[int] = NUM_ACTIONS + 1 + N_TOTAL_OUTCOMES  # 1980
 
-# Pretraining outcomes (random games — natural terminations)
-WHITE_CHECKMATES = 1969
-BLACK_CHECKMATES = 1970
-STALEMATE = 1971
-DRAW_BY_RULE = 1972       # 75-move, fivefold repetition, insufficient material
-PLY_LIMIT = 1973          # Hit max plies (also used for truncated Lichess games)
-
-# Lichess-specific outcomes (finetuning data)
-WHITE_RESIGNS = 1974      # Normal termination, white wins, no checkmate
-BLACK_RESIGNS = 1975      # Normal termination, black wins, no checkmate
-DRAW_BY_AGREEMENT = 1976  # Normal termination, draw, not stalemate
-WHITE_WINS_ON_TIME = 1977 # Time forfeit, white wins
-BLACK_WINS_ON_TIME = 1978 # Time forfeit, black wins
-DRAW_BY_TIME = 1979       # Time forfeit, draw (insufficient mating material)
-
-N_PRETRAINING_OUTCOMES = 5  # Tokens 1969-1973
-N_TOTAL_OUTCOMES = 11       # Tokens 1969-1979
+# Named outcome token IDs (kept verbatim from v1 / engine vocab.rs)
+WHITE_CHECKMATES: Final[int] = 1969
+BLACK_CHECKMATES: Final[int] = 1970
+STALEMATE: Final[int] = 1971
+DRAW_BY_RULE: Final[int] = 1972         # 75-move, fivefold repetition, insufficient material
+PLY_LIMIT: Final[int] = 1973            # Hit max plies (also used for truncated Lichess games)
+WHITE_RESIGNS: Final[int] = 1974
+BLACK_RESIGNS: Final[int] = 1975
+DRAW_BY_AGREEMENT: Final[int] = 1976
+WHITE_WINS_ON_TIME: Final[int] = 1977
+BLACK_WINS_ON_TIME: Final[int] = 1978
+DRAW_BY_TIME: Final[int] = 1979
 
 
-@dataclass
-class CLMConfig:
-    """Model architecture hyperparameters."""
+# ---------------------------------------------------------------------------
+# Sequence + RoPE
+# ---------------------------------------------------------------------------
 
-    # Vocabulary: 1968 actions + 1 PAD + 11 outcomes = 1980
-    vocab_size: int = 1980
-    max_seq_len: int = 512
+MAX_SEQ_LEN: Final[int] = 512
+ROPE_BASE: Final[float] = 10000.0
+
+
+# ---------------------------------------------------------------------------
+# Architecture: head_dim fixed across variants
+# ---------------------------------------------------------------------------
+
+HEAD_DIM: Final[int] = 64
+
+
+@dataclass(frozen=True, slots=True)
+class ModelConfig:
+    """Dimensions of one transformer architecture.
+
+    For a supernet, the d_* fields describe the full-width version; for
+    a variant, they describe the slice taken from a supernet.
+    :func:`validate_nested` checks the parent/child relationship.
+
+    All fields are validated in ``__post_init__`` so it's impossible to
+    construct a self-inconsistent config (e.g. d_model not divisible by
+    n_heads).
+    """
+
+    d_model: int
+    n_layers: int
+    n_heads: int
+    d_ff: int
+    head_dim: int = HEAD_DIM
+    vocab_size: int = VOCAB_SIZE
+    max_seq_len: int = MAX_SEQ_LEN
+    rope_base: float = ROPE_BASE
     n_outcomes: int = N_TOTAL_OUTCOMES
 
-    # Transformer
-    d_model: int = 512
-    n_layers: int = 8
-    n_heads: int = 8
-    d_ff: int = 2048  # 4x expansion
-    dropout: float = 0.0
+    def __post_init__(self) -> None:
+        if self.d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {self.d_model}")
+        if self.n_layers <= 0:
+            raise ValueError(f"n_layers must be positive, got {self.n_layers}")
+        if self.n_heads <= 0:
+            raise ValueError(f"n_heads must be positive, got {self.n_heads}")
+        if self.head_dim <= 0:
+            raise ValueError(f"head_dim must be positive, got {self.head_dim}")
+        if self.head_dim * self.n_heads != self.d_model:
+            raise ValueError(
+                f"d_model ({self.d_model}) must equal head_dim ({self.head_dim}) "
+                f"* n_heads ({self.n_heads})"
+            )
+        if self.d_ff <= 0:
+            raise ValueError(f"d_ff must be positive, got {self.d_ff}")
+        if self.d_ff < self.d_model:
+            raise ValueError(
+                f"d_ff ({self.d_ff}) must be ≥ d_model ({self.d_model})"
+            )
+        if self.vocab_size <= 0:
+            raise ValueError(f"vocab_size must be positive, got {self.vocab_size}")
+        if self.max_seq_len <= 0:
+            raise ValueError(f"max_seq_len must be positive, got {self.max_seq_len}")
+        if self.n_outcomes < 0:
+            raise ValueError(f"n_outcomes must be non-negative, got {self.n_outcomes}")
+        if self.rope_base <= 0:
+            raise ValueError(f"rope_base must be positive, got {self.rope_base}")
 
-    # RoPE
-    rope_base: float = 10000.0
 
-    @classmethod
-    def small(cls) -> "CLMConfig":
-        """~9.5M parameters."""
-        return cls(d_model=256, n_layers=8, n_heads=4, d_ff=1024)
+class NestingError(ValueError):
+    """``variant`` can't be cleanly extracted as a nested slice of ``supernet``.
 
-    @classmethod
-    def base(cls) -> "CLMConfig":
-        """~35.8M parameters (default)."""
-        return cls()
+    Distinct subclass of :class:`ValueError` so callers (e.g.
+    ``pawn.model.sliced``) can catch nesting violations specifically
+    without losing the existing ``except ValueError`` semantics.
+    """
 
-    @classmethod
-    def large(cls) -> "CLMConfig":
-        """~68.4M parameters."""
-        return cls(d_model=640, n_layers=10, n_heads=8, d_ff=2560)
 
-    @classmethod
-    def toy(cls) -> "CLMConfig":
-        return cls(
-            d_model=64,
-            n_layers=2,
-            n_heads=4,
-            d_ff=256,
+def validate_nested(variant: ModelConfig, supernet: ModelConfig) -> None:
+    """Assert ``variant`` is a valid nested slice of ``supernet``.
+
+    Every dimension of the variant must be a non-strict subset of the
+    supernet's, and head_dim / vocab / seq / RoPE base must match
+    exactly so the supernet's per-token, per-position, and per-head
+    structure is reusable.
+
+    Raises :class:`NestingError` on any mismatch.
+    """
+    if variant.head_dim != supernet.head_dim:
+        raise NestingError(
+            f"head_dim mismatch: variant={variant.head_dim} supernet={supernet.head_dim}"
+        )
+    if variant.n_layers != supernet.n_layers:
+        raise NestingError(
+            f"n_layers mismatch: variant={variant.n_layers} supernet={supernet.n_layers} "
+            f"(variants share the supernet's depth)"
+        )
+    if variant.d_model > supernet.d_model:
+        raise NestingError(
+            f"variant d_model {variant.d_model} exceeds supernet {supernet.d_model}"
+        )
+    # n_heads <= supernet.n_heads is *implied* by d_model + head_dim being a
+    # ModelConfig invariant (head_dim × n_heads == d_model, head_dim equal).
+    # No standalone n_heads check needed.
+    if variant.d_ff > supernet.d_ff:
+        raise NestingError(
+            f"variant d_ff {variant.d_ff} exceeds supernet {supernet.d_ff}"
+        )
+    if variant.vocab_size != supernet.vocab_size:
+        raise NestingError(
+            f"vocab_size mismatch: variant={variant.vocab_size} supernet={supernet.vocab_size}"
+        )
+    if variant.max_seq_len != supernet.max_seq_len:
+        raise NestingError(
+            f"max_seq_len mismatch: variant={variant.max_seq_len} supernet={supernet.max_seq_len}"
+        )
+    # Float equality is safe here because rope_base is a default literal
+    # (10000.0) in every supernet/variant constant; user-constructed configs
+    # that derive rope_base arithmetically should reuse the constant rather
+    # than recompute it.
+    if variant.rope_base != supernet.rope_base:
+        raise NestingError(
+            f"rope_base mismatch: variant={variant.rope_base} supernet={supernet.rope_base}"
+        )
+    if variant.n_outcomes != supernet.n_outcomes:
+        raise NestingError(
+            f"n_outcomes mismatch: variant={variant.n_outcomes} supernet={supernet.n_outcomes}"
         )
 
 
-@dataclass
-class TrainingConfig:
-    """Training hyperparameters."""
+# ---------------------------------------------------------------------------
+# Production supernet (large's dimensions) and its nested variants.
+# small and base are *inner [:d_V, :d_V] slices* of every weight matrix;
+# large IS the supernet. d_ff scales 4× d_model uniformly to keep nesting
+# math simple (the slice is taken as [:d_V_model, :d_V_ff]).
+# ---------------------------------------------------------------------------
 
-    # Optimization
-    lr: float = 3e-4
-    weight_decay: float = 0.01
-    max_grad_norm: float = 1.0
-    warmup_steps: int = 1000
-    total_steps: int = 100_000
-    # LR schedule: ``"cosine"`` (default), ``"wsd"``, ``"constant"``,
-    # ``"one_cycle"``, or ``"infinite"``. See ``pawn.trainer`` for the
-    # class implementations and ``pawn.run_config.BaseRunConfig.lr_schedule``
-    # for semantics.
-    lr_schedule: Literal[
-        "cosine", "wsd", "constant", "one_cycle", "infinite"
-    ] = "cosine"
-    # WSD / infinite final-decay-phase length (in steps). Used when
-    # ``lr_schedule`` is ``"wsd"`` or ``"infinite"`` (ignored otherwise).
-    decay_steps: int = 10_000
-    # Decay-phase curve shape for WSD's single decay and for the final
-    # decay of the ``"infinite"`` schedule: ``"linear"`` or ``"cosine"``.
-    # Ignored for schedules without a final decay.
-    wsd_decay_shape: Literal["linear", "cosine"] = "linear"
-    # Infinite-schedule cooldown length (peak → stable_lr_ratio via
-    # cosine). Ignored unless ``lr_schedule == "infinite"``.
-    cooldown_steps: int = 20_000
-    # Infinite-schedule stable plateau LR, as a fraction of peak LR.
-    # Ignored unless ``lr_schedule == "infinite"``.
-    stable_lr_ratio: float = 0.1
+SUPERNET: Final[ModelConfig] = ModelConfig(
+    d_model=640,
+    n_layers=10,
+    n_heads=10,
+    d_ff=2560,
+)
 
-    # Batch
-    batch_size: int = 256
-    max_ply: int = 512  # Matches max_seq_len (no outcome prefix by default)
-    discard_ply_limit: bool = False  # Only train on games that ended naturally
-    num_workers: int = 4
+# `MappingProxyType` makes the dict structurally immutable — `VARIANTS["small"] = ...`
+# raises `TypeError` rather than silently swapping a config out from under
+# callers. `Final` alone would only block rebinding the name.
+VARIANTS: Final[Mapping[str, ModelConfig]] = MappingProxyType(
+    {
+        "small": ModelConfig(d_model=256, n_layers=10, n_heads=4, d_ff=1024),
+        "base": ModelConfig(d_model=512, n_layers=10, n_heads=8, d_ff=2048),
+        "large": SUPERNET,
+    }
+)
 
-    # Precision
-    use_amp: bool = True
 
-    # Gradient accumulation
-    accumulation_steps: int = 1
+# ---------------------------------------------------------------------------
+# Tiny supernet (for verification runs that don't need production scale).
+# Same nesting structure as the production set; same head_dim.
+# ---------------------------------------------------------------------------
 
-    # Logging
-    log_interval: int = 10
-    eval_interval: int = 500
-    checkpoint_interval: int = 5000
+TINY_SUPERNET: Final[ModelConfig] = ModelConfig(
+    d_model=192,
+    n_layers=4,
+    n_heads=3,
+    d_ff=768,
+)
 
-    # Pause (for LR exploration — stop early without killing)
-    pause_after_steps: int | None = None
+TINY_VARIANTS: Final[Mapping[str, ModelConfig]] = MappingProxyType(
+    {
+        "small": ModelConfig(d_model=64, n_layers=4, n_heads=1, d_ff=256),
+        "base": ModelConfig(d_model=128, n_layers=4, n_heads=2, d_ff=512),
+        "large": TINY_SUPERNET,
+    }
+)
 
-    # Ablations
-    prepend_outcome: bool = False  # Prepend outcome token at position 0 for outcome-conditioned training
-    mate_boost: float = 0.0  # Probability of taking mate-in-1 (0.0=random, 1.0=always)
 
-    # Seeds
-    base_seed: int = 42
-    val_seed: int = (2**63) - 1
-    val_games: int = 512
+def _check_constants_nest_at_import() -> None:
+    """Sanity-check the module-level supernet/variant pairs once at import.
 
-    # Paths
-    checkpoint_dir: str = "checkpoints"
-    log_dir: str = "logs"
-    use_wandb: bool = False
-    wandb_project: str = "pawn"
+    Catches any drift between :data:`SUPERNET` and :data:`VARIANTS` (and
+    likewise the TINY pair) so a typo in the dimensions surfaces as an
+    import-time error instead of mid-training.
+    """
+    for cfg in VARIANTS.values():
+        validate_nested(cfg, SUPERNET)
+    for cfg in TINY_VARIANTS.values():
+        validate_nested(cfg, TINY_SUPERNET)
 
-    # Device
-    device: str = "cuda"
 
-    @classmethod
-    def toy(cls) -> "TrainingConfig":
-        return cls(
-            lr=1e-3,
-            batch_size=32,
-            total_steps=5000,
-            warmup_steps=100,
-            eval_interval=100,
-            checkpoint_interval=1000,
-            num_workers=2,
-            use_amp=False,
-            val_games=64,
-        )
+_check_constants_nest_at_import()

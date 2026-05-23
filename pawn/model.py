@@ -1,555 +1,508 @@
-"""PAWN: Causal Language Model for chess move prediction.
+"""PAWN: Equinox decoder-only transformer for chess move prediction.
 
-Decoder-only transformer (`Vaswani et al., 2017
-<https://arxiv.org/abs/1706.03762>`_) with next-token prediction over
-the move vocabulary.  Key architectural choices drawn from subsequent
-work:
+A single :class:`PAWNModel` covers the supernet, every nested variant,
+and any standalone (converted-legacy) model. The full module is built
+at the supernet's dimensions; :func:`sliced` returns a new
+:class:`PAWNModel` with every parameter tensor sliced to the variant's
+shape (the inner ``[:d_V, :d_V]`` block of every weight matrix).
 
-* **RMSNorm** -- `Zhang & Sennrich, 2019 <https://arxiv.org/abs/1910.07467>`_
-* **SwiGLU** FFN -- `Shazeer, 2020 <https://arxiv.org/abs/2002.05202>`_
-* **Rotary Position Embeddings (RoPE)** -- `Su et al., 2021
-  <https://arxiv.org/abs/2104.09864>`_
+Architectural choices:
+
+- **Stacked-layer ``lax.scan``.** Per-layer weights are stored with a
+  leading ``n_layers`` axis (e.g. ``wq`` is shape
+  ``(n_layers, d_model, d_model)``). The forward pass applies the
+  layers via :func:`jax.lax.scan`, so XLA sees one layer body unrolled
+  into a loop rather than N separate trace bodies — far less HLO and a
+  much faster compile.
+- **Plain attention** (materialised ``QK^T``). At seq=512, attention
+  is roughly 12% of step FLOPs; plain attention sidesteps the
+  fused-kernel maturity issues we'd hit with JAX-on-ROCm.
+- **RMSNorm in the v2 cast order** — compute the norm in fp32, multiply
+  by the weight in fp32, downcast at the very end. The v1 PyTorch
+  layout downcast *between* the norm and the weight multiply. The two
+  paths are bit-identical in fp32 (the difference vanishes when the
+  intermediate dtype is already float32), so the legacy converter's
+  fp32 parity test agrees on both; the v2 layout is one fewer cast and
+  is the form the plan §5 calls out. See :func:`_rmsnorm` for details.
+- **RoPE applied in fp32** to Q and K, then downcast — same reason.
+- **SwiGLU FFN:** ``down(silu(gate(x)) * up(x))``.
+- **Factored input embeddings:** every move token decomposes into
+  ``src_embed[s] + dst_embed[d] + promo_embed[p]``. PAD positions get
+  ``pad_embed``; outcome-token positions get
+  ``outcome_embed[token - OUTCOME_TOKEN_BASE]``. Overrides are
+  branchless (:func:`jnp.where`) so the compiler can fuse them.
+- **Output head:** a single linear over the full vocabulary. Argmax
+  callers restrict to ``[0, NUM_ACTIONS)`` so PAD and outcome tokens
+  can't be sampled — that restriction lives in :mod:`pawn.eval`, not
+  here.
+
+Save schema: the 16 trainable arrays in declaration order — the
+:data:`SAVED_FIELDS` tuple is the canonical ordering, and this module
+asserts ``len(SAVED_FIELDS) == 16`` at import (see below). The
+non-trainable :attr:`PAWNModel.decomp_table` buffer is rebuilt at load
+time from the engine vocabulary; RoPE phase tables are recomputed
+inside the forward pass and never stored. Both stay out of the
+safetensors payload.
 """
 
-import math
+from __future__ import annotations
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn.attention import sdpa_kernel, SDPBackend
+from typing import Final
 
-from pawn.config import CLMConfig, NUM_ACTIONS, OUTCOME_TOKEN_BASE, PAD_TOKEN
+import equinox as eqx
+import jax
+import jax.numpy as jnp
 from chess_engine import export_move_vocabulary
+from jaxtyping import Array, Bool, Float, Int
 
-# ROCm flash attention backward has stride mismatches with torch.compile.
-# Set this to use MATH backend instead (enables compile + AMP on ROCm).
-SDPA_BACKEND: SDPBackend | None = None
+from pawn.config import (
+    NUM_ACTIONS,
+    OUTCOME_TOKEN_BASE,
+    PAD_TOKEN,
+    ModelConfig,
+    validate_nested,
+)
+
+__all__ = [
+    "PAWNModel",
+    "TransformerLayer",
+    "SAVED_FIELDS",
+    "init_model",
+    "sliced",
+]
 
 
-def _build_decomposition_table() -> torch.Tensor:
-    """Build static token -> (src, dst, promo_type) lookup table.
+# Names of the 16 trainable arrays in safetensors declaration order.
+# The `assert` below pins the count at import; `pawn.checkpoint` imports
+# this module, so the guard fires before any save/load can run.
+SAVED_FIELDS: Final[tuple[str, ...]] = (
+    "embed_src",
+    "embed_dst",
+    "embed_promo",
+    "embed_pad",
+    "embed_outcome",
+    "layers.attn_norm_w",
+    "layers.wq",
+    "layers.wk",
+    "layers.wv",
+    "layers.wo",
+    "layers.ffn_norm_w",
+    "layers.w_gate",
+    "layers.w_up",
+    "layers.w_down",
+    "final_norm_w",
+    "lm_head",
+)
+assert len(SAVED_FIELDS) == 16, "model save schema must be 16 fields"
 
-    Reads the searchless vocabulary from the Rust engine and returns
-    int16[NUM_ACTIONS, 3]. PAD and outcome tokens are above the table
-    range and handled by standalone embeddings.
+
+_RMSNORM_EPS: Final[float] = 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Math helpers (free functions — easier to unit-test, easier to JIT-trace)
+# ---------------------------------------------------------------------------
+
+
+def _rmsnorm(
+    x: Float[Array, "... d"],
+    weight: Float[Array, "d"],
+) -> Float[Array, "... d"]:
+    """RMSNorm with the v2 cast order: norm AND weight multiply in fp32,
+    downcast once at the very end.
+
+    Concretely: upcast ``x`` and ``weight`` to fp32, compute
+    ``(x_f * rms_f) * w_f`` in fp32, then ``.astype(x.dtype)``. The
+    plan §5 phrase is "weight-multiply-in-fp32-then-downcast" — i.e.
+    this v2 order.
+
+    Note the v1 PyTorch path was subtly different: ``(x_f * norm).to(
+    x.dtype) * self.weight`` — downcasting *between* the norm and the
+    weight multiply. The two orders are bit-identical in fp32 (a
+    no-op ``.to(float32)`` between) and diverge only in bf16/fp16
+    activations. The legacy converter's parity test runs in fp32, so
+    both orders agree on its tolerance; this v2 layout is the one the
+    plan asks for and is one fewer cast.
     """
-    vocab = export_move_vocabulary()
-    table = torch.zeros(NUM_ACTIONS, 3, dtype=torch.int16)
-    sq_names = vocab["square_names"]
-    promo_map = {"q": 1, "r": 2, "b": 3, "n": 4}
-    for token_idx, uci_str in vocab["token_to_move"].items():
-        src_sq = sq_names.index(uci_str[:2])
-        dst_sq = sq_names.index(uci_str[2:4])
-        promo_type = promo_map.get(uci_str[4:], 0)
-        table[token_idx] = torch.tensor([src_sq, dst_sq, promo_type], dtype=torch.int16)
-    return table
+    x_f = x.astype(jnp.float32)
+    w_f = weight.astype(jnp.float32)
+    rms = jax.lax.rsqrt(jnp.mean(x_f * x_f, axis=-1, keepdims=True) + _RMSNORM_EPS)
+    return ((x_f * rms) * w_f).astype(x.dtype)
 
 
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (`Zhang & Sennrich, 2019
-    <https://arxiv.org/abs/1910.07467>`_)."""
+def _build_rope(
+    head_dim: int, max_seq_len: int, base: float
+) -> tuple[Float[Array, "T half"], Float[Array, "T half"]]:
+    """Precompute RoPE phase tables.
 
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_f = x.float() if x.dtype != torch.float32 else x
-        norm = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x_f * norm).to(x.dtype) * self.weight
+    Returns ``(cos, sin)`` each of shape ``(max_seq_len, head_dim // 2)``,
+    in fp32. The per-step RoPE application upcasts Q/K to fp32 before
+    multiplying through, so storing the tables in fp32 is the canonical
+    form.
+    """
+    half = head_dim // 2
+    inv_freq = 1.0 / (
+        base ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim)
+    )
+    t = jnp.arange(max_seq_len, dtype=jnp.float32)
+    freqs = jnp.einsum("t,d->td", t, inv_freq)  # (T, half)
+    assert freqs.shape == (max_seq_len, half)
+    return jnp.cos(freqs), jnp.sin(freqs)
 
 
 def _apply_rope(
-    x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
-) -> torch.Tensor:
-    """Apply Rotary Position Embeddings (`Su et al., 2021
-    <https://arxiv.org/abs/2104.09864>`_).
+    x: Float[Array, "B H T d_head"],
+    rope_cos: Float[Array, "T half"],
+    rope_sin: Float[Array, "T half"],
+) -> Float[Array, "B H T d_head"]:
+    """Apply RoPE to Q or K.
 
-    x: (B, n_heads, T, head_dim)
-    rope_cos, rope_sin: (1, 1, T, head_dim // 2)
+    Split the last axis (``head_dim``) into adjacent ``(even, odd)``
+    pairs and rotate each pair by the angle ``freqs[t, i]``. Compute in
+    fp32 then downcast to the input dtype.
     """
-    x_f = x.float() if x.dtype != torch.float32 else x
-    x_r = x_f.reshape(*x.shape[:-1], -1, 2)
-    x0, x1 = x_r.unbind(-1)
-
+    orig_dtype = x.dtype
+    x_f = x.astype(jnp.float32)
+    pairs = x_f.reshape(*x_f.shape[:-1], -1, 2)
+    x0 = pairs[..., 0]
+    x1 = pairs[..., 1]
     out0 = x0 * rope_cos - x1 * rope_sin
     out1 = x0 * rope_sin + x1 * rope_cos
-
-    out = torch.stack([out0, out1], dim=-1).reshape(x.shape)
-    return out.to(x.dtype) if x.dtype != torch.float32 else out
-
-
-def _precompute_rope_freqs(dim: int, max_len: int, base: float = 10000.0) -> torch.Tensor:
-    """Precompute RoPE frequency tensor. Returns (max_len, dim // 2)."""
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-    t = torch.arange(max_len).float()
-    freqs = torch.outer(t, freqs)
-    return freqs
+    out = jnp.stack([out0, out1], axis=-1).reshape(x_f.shape)
+    return out.astype(orig_dtype)
 
 
-class Attention(nn.Module):
-    def __init__(self, cfg: CLMConfig):
-        super().__init__()
-        self.n_heads = cfg.n_heads
-        self.head_dim = cfg.d_model // cfg.n_heads
-
-        self.wq = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.wk = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.wv = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.wo = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        rope_cos: torch.Tensor,
-        rope_sin: torch.Tensor,
-        mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        B, T, _ = x.shape
-
-        q = self.wq(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.wk(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.wv(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
-
-        q = _apply_rope(q, rope_cos, rope_sin).contiguous()
-        k = _apply_rope(k, rope_cos, rope_sin).contiguous()
-
-        if SDPA_BACKEND is not None:
-            with sdpa_kernel(SDPA_BACKEND):
-                attn_out = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=mask, is_causal=(mask is None)
-                )
-        else:
-            attn_out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, is_causal=(mask is None)
-            )
-
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, -1)
-        return self.wo(attn_out)
-
-    def forward_kv(
-        self,
-        x: torch.Tensor,
-        rope_cos: torch.Tensor,
-        rope_sin: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Forward with KV-cache for autoregressive generation.
-
-        Args:
-            x: (B, T_new, d_model) — full sequence for prefill, single token for decode.
-            rope_cos/sin: (1, 1, T_new, head_dim//2) — RoPE for the new positions only.
-            kv_cache: optional (K, V) each (B, n_heads, T_cached, head_dim).
-
-        Returns:
-            out: (B, T_new, d_model)
-            new_cache: (K, V) each (B, n_heads, T_total, head_dim)
-        """
-        B, T_new, _ = x.shape
-
-        q = self.wq(x).view(B, T_new, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.wk(x).view(B, T_new, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.wv(x).view(B, T_new, self.n_heads, self.head_dim).transpose(1, 2)
-
-        q = _apply_rope(q, rope_cos, rope_sin)
-        k = _apply_rope(k, rope_cos, rope_sin)
-
-        if kv_cache is not None:
-            k = torch.cat([kv_cache[0], k], dim=2)
-            v = torch.cat([kv_cache[1], v], dim=2)
-
-        # Prefill (no cache): causal mask. Decode (with cache): single query
-        # attends to all cached keys — no mask needed.
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v, is_causal=(kv_cache is None)
-        )
-
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_new, -1)
-        return self.wo(attn_out), (k, v)
+# ---------------------------------------------------------------------------
+# Static buffers
+# ---------------------------------------------------------------------------
 
 
-class SwiGLUFFN(nn.Module):
-    """SwiGLU feed-forward network (`Shazeer, 2020
-    <https://arxiv.org/abs/2002.05202>`_)."""
+def _build_decomp_table() -> Int[Array, "n_actions 3"]:
+    """Build the (src, dst, promo) lookup table from the engine vocab.
 
-    def __init__(self, cfg: CLMConfig):
-        super().__init__()
-        self.w_gate = nn.Linear(cfg.d_model, cfg.d_ff, bias=False)
-        self.w_up = nn.Linear(cfg.d_model, cfg.d_ff, bias=False)
-        self.w_down = nn.Linear(cfg.d_ff, cfg.d_model, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
-
-
-class TransformerBlock(nn.Module):
-    attn_norm: RMSNorm
-    attn: Attention
-    ffn_norm: RMSNorm
-    ffn: SwiGLUFFN
-
-    def __init__(self, cfg: CLMConfig):
-        super().__init__()
-        self.attn_norm = RMSNorm(cfg.d_model)
-        self.attn = Attention(cfg)
-        self.ffn_norm = RMSNorm(cfg.d_model)
-        self.ffn = SwiGLUFFN(cfg)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        rope_cos: torch.Tensor,
-        rope_sin: torch.Tensor,
-        mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope_cos, rope_sin, mask)
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
-
-    def forward_kv(
-        self,
-        x: torch.Tensor,
-        rope_cos: torch.Tensor,
-        rope_sin: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Forward with KV-cache."""
-        attn_out, new_cache = self.attn.forward_kv(
-            self.attn_norm(x), rope_cos, rope_sin, kv_cache
-        )
-        x = x + attn_out
-        x = x + self.ffn(self.ffn_norm(x))
-        return x, new_cache
+    Each move token in ``[0, NUM_ACTIONS)`` decomposes into a source
+    square (0–63), destination square (0–63), and promotion type
+    (0=none, 1=q, 2=r, 3=b, 4=n). PAD and outcome tokens are clamped to
+    a safe row by :meth:`PAWNModel._embed` and then overwritten
+    branchlessly.
+    """
+    vocab = export_move_vocabulary()
+    sq_names: list[str] = list(vocab["square_names"])
+    sq_index = {name: i for i, name in enumerate(sq_names)}  # O(1) lookup
+    promo_map = {"q": 1, "r": 2, "b": 3, "n": 4}
+    rows: list[list[int]] = []
+    for token_idx in range(NUM_ACTIONS):
+        uci: str = vocab["token_to_move"][token_idx]
+        src = sq_index[uci[:2]]
+        dst = sq_index[uci[2:4]]
+        promo = promo_map.get(uci[4:], 0)
+        rows.append([src, dst, promo])
+    return jnp.array(rows, dtype=jnp.int32)
 
 
-class CLMEmbedding(nn.Module):
-    """Factored input embeddings for CLM.
+# ---------------------------------------------------------------------------
+# Modules
+# ---------------------------------------------------------------------------
 
-    Move tokens use factored embedding: src_embed[s] + dst_embed[d] + promo_embed[p].
-    PAD and outcome tokens use standalone embeddings.
+
+class TransformerLayer(eqx.Module):
+    """One transformer block's parameters, packed with a leading
+    ``n_layers`` axis so the whole stack can be applied with
+    :func:`jax.lax.scan`.
+
+    For a single instantiation of :class:`PAWNModel`, ``model.layers`` is
+    *one* :class:`TransformerLayer` whose leaves each have a leading
+    ``n_layers`` dimension (e.g. ``model.layers.wq`` is
+    ``(n_layers, d_model, d_model)``). The forward pass uses
+    :func:`jax.lax.scan` to iterate over that leading axis.
     """
 
-    decomp_table: torch.Tensor
+    attn_norm_w: Float[Array, "n_layers d"]
+    wq: Float[Array, "n_layers d d"]
+    wk: Float[Array, "n_layers d d"]
+    wv: Float[Array, "n_layers d d"]
+    wo: Float[Array, "n_layers d d"]
+    ffn_norm_w: Float[Array, "n_layers d"]
+    w_gate: Float[Array, "n_layers d d_ff"]
+    w_up: Float[Array, "n_layers d d_ff"]
+    w_down: Float[Array, "n_layers d_ff d"]
 
-    def __init__(self, cfg: CLMConfig):
-        super().__init__()
-        self.d_model = cfg.d_model
-        self.n_actions = NUM_ACTIONS
-        self.pad_token = PAD_TOKEN
-        self.outcome_base = OUTCOME_TOKEN_BASE
 
-        # Factored move components
-        self.src_embed = nn.Embedding(64, cfg.d_model)
-        self.dst_embed = nn.Embedding(64, cfg.d_model)
-        self.promo_embed = nn.Embedding(5, cfg.d_model)  # 0=none, 1=q, 2=r, 3=b, 4=n
+class PAWNModel(eqx.Module):
+    """Decoder-only transformer over the move + outcome vocabulary.
 
-        # Standalone embeddings
-        self.pad_embed = nn.Parameter(torch.zeros(cfg.d_model))
-        self.outcome_embed = nn.Embedding(cfg.n_outcomes, cfg.d_model)
+    See module docstring for the architectural choices and the save
+    schema. The class lays out 16 trainable array fields (declaration
+    order matching :data:`SAVED_FIELDS`), one non-trainable
+    int32 buffer (:attr:`decomp_table` — filtered out automatically by
+    ``eqx.is_inexact_array``), and one static ``cfg`` reference. RoPE
+    phase tables are not stored on the model; they're recomputed
+    inside :meth:`__call__` per forward call and constant-folded by
+    JIT when ``cfg`` is static.
+    """
 
-        # Static decomposition table: token_idx -> (src, dst, promo_type)
-        self.register_buffer("decomp_table", _build_decomposition_table(), persistent=False)
+    # 16 trainable fields — declaration order = save order.
+    embed_src: Float[Array, "64 d"]
+    embed_dst: Float[Array, "64 d"]
+    embed_promo: Float[Array, "5 d"]
+    embed_pad: Float[Array, "d"]
+    embed_outcome: Float[Array, "n_out d"]
+    layers: TransformerLayer
+    final_norm_w: Float[Array, "d"]
+    lm_head: Float[Array, "d V"]
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    # Non-trainable lookup table (int32 — `eqx.is_inexact_array` filters it
+    # out automatically so the trainer's optimizer never touches it). Not
+    # in `SAVED_FIELDS`; `pawn.checkpoint.load_model` rebuilds it from the
+    # engine vocab at load time via `_build_decomp_table()`.
+    decomp_table: Int[Array, "n_actions 3"]
+
+    # Static config: kept out of the PyTree so JIT keys on it directly.
+    # RoPE phase tables are NOT stored — they're a function of cfg only and
+    # are recomputed inside `__call__`. Storing them as float PyTree leaves
+    # would put them in the path of `eqx.filter(model, eqx.is_inexact_array)`
+    # (the standard equinox trainable filter), letting the optimizer update
+    # the positional encoding. Under JIT with static cfg, the recomputation
+    # is constant-folded and lives in the compiled program exactly once.
+    cfg: ModelConfig = eqx.field(static=True)
+
+    def __call__(
+        self,
+        input_ids: Int[Array, "B T"],
+        attention_mask: Int[Array, "B T"] | None = None,
+    ) -> Float[Array, "B T V"]:
+        """Forward pass.
+
+        ``input_ids`` is ``(batch, seq)`` int32 token IDs (move tokens,
+        PAD, or outcome tokens). ``attention_mask`` is ``1`` for real
+        tokens and ``0`` for PAD; if omitted, a fully-real mask is
+        assumed.
+
+        Returns logits of shape ``(batch, seq, vocab_size)``. Callers
+        that sample argmax over the move vocabulary should restrict to
+        ``[:, :, :NUM_ACTIONS]`` so PAD and outcome tokens can't be
+        chosen.
         """
-        input_ids: (B, T) int tensor of token indices
-        Returns: (B, T, d_model)
+        T = input_ids.shape[-1]
+        if T > self.cfg.max_seq_len:
+            raise ValueError(
+                f"sequence length {T} exceeds cfg.max_seq_len "
+                f"{self.cfg.max_seq_len}"
+            )
+        x = self._embed(input_ids)
+        # RoPE tables are recomputed per call — constant-folded by JIT
+        # under a static cfg, so the cost is one trace-time build.
+        rope_cos, rope_sin = _build_rope(self.cfg.head_dim, T, self.cfg.rope_base)
+        causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+        if attention_mask is None:
+            mask = causal[None, None, :, :]  # (1, 1, T, T)
+        else:
+            pad = attention_mask.astype(jnp.bool_)[:, None, None, :]  # (B, 1, 1, T)
+            mask = causal[None, None, :, :] & pad
+        x = self._run_layers(x, rope_cos, rope_sin, mask)
+        x = _rmsnorm(x, self.final_norm_w)
+        return jnp.einsum("btd,dv->btv", x, self.lm_head)
+
+    # -----------------------------------------------------------------------
+    # Forward-pass internals
+    # -----------------------------------------------------------------------
+
+    def _embed(self, input_ids: Int[Array, "B T"]) -> Float[Array, "B T d"]:
+        """Factored move embeddings + PAD/outcome overrides.
+
+        Tokens in ``[0, NUM_ACTIONS)``: ``src + dst + promo`` lookup.
+        Tokens equal to ``PAD_TOKEN``: replaced with ``embed_pad``.
+        Tokens ``>= OUTCOME_TOKEN_BASE``: replaced with
+        ``embed_outcome[token - OUTCOME_TOKEN_BASE]``.
+
+        Overrides are branchless (:func:`jnp.where`) so the layout is
+        fusion-friendly.
         """
-        # Decompose all tokens (PAD and outcomes get (0,0,0) from the table —
-        # their factored embeddings are garbage but will be overridden below)
-        flat = input_ids.long().clamp(0, self.decomp_table.shape[0] - 1)
-        decomp = self.decomp_table[flat]  # (B, T, 3)
-        src_idx = decomp[..., 0].long()
-        dst_idx = decomp[..., 1].long()
-        promo_idx = decomp[..., 2].long()
+        ids = input_ids.astype(jnp.int32)
+        # Clamp to a safe range so the decomp table lookup doesn't OOB
+        # on PAD / outcome positions; those positions are overwritten below.
+        safe_ids = jnp.clip(ids, 0, NUM_ACTIONS - 1)
+        decomp = self.decomp_table[safe_ids]  # (B, T, 3)
+        src_idx = decomp[..., 0]
+        dst_idx = decomp[..., 1]
+        promo_idx = decomp[..., 2]
+        emb = (
+            self.embed_src[src_idx]
+            + self.embed_dst[dst_idx]
+            + self.embed_promo[promo_idx]
+        )
 
-        emb = self.src_embed(src_idx) + self.dst_embed(dst_idx) + self.promo_embed(promo_idx)
+        pad_mask = (ids == PAD_TOKEN)[..., None]
+        emb = jnp.where(pad_mask, self.embed_pad, emb)
 
-        # Override PAD positions (branchless for torch.compile)
-        pad_mask = (input_ids == self.pad_token).unsqueeze(-1)  # (B, T, 1)
-        emb = torch.where(pad_mask, self.pad_embed, emb)
-
-        # Override outcome token positions (branchless)
-        outcome_idx = (input_ids - self.outcome_base).clamp(0, self.outcome_embed.num_embeddings - 1)
-        outcome_embs = self.outcome_embed(outcome_idx)
-        outcome_mask = (input_ids >= self.outcome_base).unsqueeze(-1)  # (B, T, 1)
-        emb = torch.where(outcome_mask, outcome_embs, emb)
-
+        n_outcomes = self.embed_outcome.shape[0]
+        outcome_idx = jnp.clip(ids - OUTCOME_TOKEN_BASE, 0, n_outcomes - 1)
+        outcome_emb = self.embed_outcome[outcome_idx]
+        outcome_mask = (ids >= OUTCOME_TOKEN_BASE)[..., None]
+        emb = jnp.where(outcome_mask, outcome_emb, emb)
         return emb
 
+    def _run_layers(
+        self,
+        x: Float[Array, "B T d"],
+        rope_cos: Float[Array, "T half"],
+        rope_sin: Float[Array, "T half"],
+        mask: Bool[Array, "B 1 T T"],
+    ) -> Float[Array, "B T d"]:
+        """Apply all ``n_layers`` transformer blocks via :func:`jax.lax.scan`.
 
-class PAWNCLM(nn.Module):
-    """PAWN: Causal Language Model for chess.
+        ``self.layers`` is one :class:`TransformerLayer` whose leaves
+        have a leading ``n_layers`` axis. :func:`jax.lax.scan` iterates
+        layer-by-layer; each iteration sees a per-layer slice of every
+        weight tensor.
+        """
+        head_dim = self.cfg.head_dim
+        n_heads = self.cfg.n_heads
+        # Compile-time constant — hoist out of the scan body so we don't
+        # re-allocate a 0-d scalar and dispatch a sqrt kernel on every layer.
+        inv_scale = head_dim ** -0.5
+        # Mask sentinel: hoist `jnp.finfo` out of the scan body (same reason).
+        # Use the working-dtype's minimum so softmax sees -inf-equivalent.
+        attn_neg_inf = jnp.finfo(x.dtype).min
 
-    Predicts the next token (move or padding) via softmax over the
-    full vocabulary. No factored output head, no grid, no BCE.
+        def step(
+            carry: Float[Array, "B T d"],
+            layer: TransformerLayer,
+        ) -> tuple[Float[Array, "B T d"], None]:
+            h = carry
+            # ---- attention block (pre-norm + residual) ----
+            normed = _rmsnorm(h, layer.attn_norm_w)
+            B, T, D = normed.shape  # noqa: N806
+            q = jnp.einsum("btd,de->bte", normed, layer.wq)
+            k = jnp.einsum("btd,de->bte", normed, layer.wk)
+            v = jnp.einsum("btd,de->bte", normed, layer.wv)
+            q = q.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+            k = k.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+            v = v.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+            q = _apply_rope(q, rope_cos, rope_sin)
+            k = _apply_rope(k, rope_cos, rope_sin)
+            scores = jnp.einsum("bhid,bhjd->bhij", q, k) * inv_scale
+            scores = jnp.where(mask, scores, attn_neg_inf)
+            attn = jax.nn.softmax(scores, axis=-1)
+            attn_out = jnp.einsum("bhij,bhjd->bhid", attn, v)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, D)
+            h = h + jnp.einsum("btd,de->bte", attn_out, layer.wo)
+
+            # ---- ffn block (pre-norm + residual) ----
+            normed = _rmsnorm(h, layer.ffn_norm_w)
+            gate = jnp.einsum("btd,df->btf", normed, layer.w_gate)
+            up = jnp.einsum("btd,df->btf", normed, layer.w_up)
+            ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, layer.w_down)
+            h = h + ffn_out
+            return h, None
+
+        x, _ = jax.lax.scan(step, x, self.layers)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Construction + slicing
+# ---------------------------------------------------------------------------
+
+
+def _normal_init(
+    key: jax.Array, shape: tuple[int, ...], std: float = 0.02
+) -> jax.Array:
+    """Normal(0, std) init.
+
+    Matches the v1 ``nn.init.normal_(p, std=0.02)`` convention for any
+    parameter with dim > 1.
     """
-
-    rope_cos: torch.Tensor
-    rope_sin: torch.Tensor
-    causal_mask: torch.Tensor
-    embed: CLMEmbedding
-    layers: nn.ModuleList
-    final_norm: RMSNorm
-    lm_head: nn.Linear
-
-    def __init__(self, cfg: CLMConfig):
-        super().__init__()
-        self.cfg = cfg
-
-        self.embed = CLMEmbedding(cfg)
-        self.layers = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layers)])
-        self.final_norm = RMSNorm(cfg.d_model)
-        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-
-        # Static buffers
-        rope_freqs = _precompute_rope_freqs(
-            cfg.d_model // cfg.n_heads, cfg.max_seq_len, cfg.rope_base
-        )
-        self.register_buffer(
-            "rope_cos", rope_freqs.cos().unsqueeze(0).unsqueeze(0), persistent=False
-        )
-        self.register_buffer(
-            "rope_sin", rope_freqs.sin().unsqueeze(0).unsqueeze(0), persistent=False
-        )
-        self.register_buffer(
-            "causal_mask",
-            torch.ones(cfg.max_seq_len, cfg.max_seq_len, dtype=torch.bool).tril(),
-            persistent=False,
-        )
-
-        self._init_weights()
-
-    def get_block(self, i: int) -> TransformerBlock:
-        """Typed accessor for transformer layers (avoids ModuleList type erasure)."""
-        return self.layers[i]  # type: ignore[return-value]
-
-    def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.normal_(p, mean=0.0, std=0.02)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        hidden_only: bool = False,
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """
-        input_ids: (B, T) token indices
-        attention_mask: (B, T) bool — True for real tokens (outcome + moves)
-        hidden_only: if True, skip intermediate layer collection and return
-            only the final hidden state in layer_outputs.
-
-        Returns:
-            logits: (B, T, vocab_size)
-            layer_outputs: list of (B, T, d_model) from each layer
-        """
-        x = self.embed(input_ids)
-
-        T = input_ids.shape[1]
-        if T > self.rope_cos.shape[2]:
-            raise ValueError(
-                f"Sequence length {T} exceeds max {self.rope_cos.shape[2]}"
-            )
-        causal = self.causal_mask[:T, :T]
-        padding = attention_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
-        mask = causal.unsqueeze(0) & padding  # (B, 1, T, T)
-
-        rope_cos = self.rope_cos[:, :, :T, :]
-        rope_sin = self.rope_sin[:, :, :T, :]
-
-        if hidden_only:
-            for layer in self.layers:
-                x = layer(x, rope_cos, rope_sin, mask)
-            layer_outputs = [x]
-        else:
-            layer_outputs = [x]  # embedding output
-            for layer in self.layers:
-                x = layer(x, rope_cos, rope_sin, mask)
-                layer_outputs.append(x)
-
-        x = self.final_norm(x)
-        logits = self.lm_head(x)
-
-        return logits, layer_outputs
-
-    def forward_train(
-        self,
-        input_ids: torch.Tensor,
-        loss_mask: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Training-optimized forward: computes lm_head only at non-padding
-        positions to avoid materializing the full (B, T, vocab_size) logits
-        tensor. Returns loss and metrics directly.
-
-        Metrics are returned as raw GPU tensors to avoid CUDA synchronization.
-        Call .item() on them only when you need to log (e.g. every N steps).
-
-        Args:
-            input_ids: (B, T) token indices
-            loss_mask: (B, T) bool — True for positions included in loss
-                       (outcome + moves, not padding). Also used as the
-                       attention padding mask for SDPA.
-            targets: (B, T) target token indices (padding positions ignored)
-
-        Returns:
-            loss: scalar tensor (for backward)
-            metrics: dict with loss and accuracy as GPU tensors (no .item())
-        """
-        x = self.embed(input_ids)
-
-        T = input_ids.shape[1]
-        if T > self.rope_cos.shape[2]:
-            raise ValueError(
-                f"Sequence length {T} exceeds max {self.rope_cos.shape[2]}"
-            )
-        causal = self.causal_mask[:T, :T]
-        padding = loss_mask.unsqueeze(1).unsqueeze(2)
-        mask = causal.unsqueeze(0) & padding
-
-        rope_cos = self.rope_cos[:, :, :T, :]
-        rope_sin = self.rope_sin[:, :, :T, :]
-
-        for layer in self.layers:
-            x = layer(x, rope_cos, rope_sin, mask)
-
-        x = self.final_norm(x)
-
-        # Project only valid positions through lm_head to save ~25% memory
-        valid_x = x[loss_mask]                       # (N_valid, d_model)
-        valid_logits = self.lm_head(valid_x)         # (N_valid, vocab_size)
-        valid_targets = targets[loss_mask]            # (N_valid,)
-
-        loss = F.cross_entropy(valid_logits, valid_targets)
-
-        with torch.no_grad():
-            preds = valid_logits.argmax(dim=-1)
-            accuracy = (preds == valid_targets).float().mean()
-
-        return loss, {"loss": loss.detach(), "accuracy": accuracy}
-
-    def forward_eval(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return final hidden states (B, T, d_model) without lm_head projection.
-
-        Use for memory-efficient evaluation: project only needed positions
-        through lm_head on the caller side instead of materializing the full
-        (B, T, vocab_size) logits tensor.
-        """
-        x = self.embed(input_ids)
-
-        T = input_ids.shape[1]
-        if T > self.rope_cos.shape[2]:
-            raise ValueError(
-                f"Sequence length {T} exceeds max {self.rope_cos.shape[2]}"
-            )
-        causal = self.causal_mask[:T, :T]
-        padding = attention_mask.unsqueeze(1).unsqueeze(2)
-        mask = causal.unsqueeze(0) & padding
-
-        rope_cos = self.rope_cos[:, :, :T, :]
-        rope_sin = self.rope_sin[:, :, :T, :]
-
-        for layer in self.layers:
-            x = layer(x, rope_cos, rope_sin, mask)
-
-        return self.final_norm(x)
-
-    def forward_generate(
-        self,
-        input_ids: torch.Tensor,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-        """Forward pass with KV-cache for autoregressive generation.
-
-        Prefill (kv_cache=None): processes full input, builds cache.
-        Decode (kv_cache provided): processes single new token, extends cache.
-
-        Always returns logits for the last position only to save memory.
-
-        Args:
-            input_ids: (B, T) for prefill, (B, 1) for decode.
-            kv_cache: None for prefill, list of (K, V) per layer for decode.
-
-        Returns:
-            logits: (B, 1, vocab_size)
-            new_kv_cache: list of (K, V) per layer.
-        """
-        x = self.embed(input_ids)
-
-        T_new = input_ids.shape[1]
-        T_total = T_new
-        if kv_cache is not None:
-            T_cached = kv_cache[0][0].shape[2]
-            T_total = T_cached + T_new
-            rope_cos = self.rope_cos[:, :, T_cached:T_total, :]
-            rope_sin = self.rope_sin[:, :, T_cached:T_total, :]
-        else:
-            rope_cos = self.rope_cos[:, :, :T_new, :]
-            rope_sin = self.rope_sin[:, :, :T_new, :]
-        if T_total > self.rope_cos.shape[2]:
-            raise ValueError(
-                f"Sequence length {T_total} exceeds max {self.rope_cos.shape[2]}"
-            )
-
-        new_kv_cache = []
-        for i in range(len(self.layers)):
-            layer_cache = kv_cache[i] if kv_cache is not None else None
-            x, new_cache = self.get_block(i).forward_kv(x, rope_cos, rope_sin, layer_cache)
-            new_kv_cache.append(new_cache)
-
-        x = self.final_norm(x[:, -1:, :])
-        logits = self.lm_head(x)
-
-        return logits, new_kv_cache
+    return jax.random.normal(key, shape, dtype=jnp.float32) * std
 
 
-_IGNORE_INDEX = -100
+def init_model(cfg: ModelConfig, key: jax.Array | int) -> PAWNModel:
+    """Build a freshly-initialised :class:`PAWNModel` at ``cfg``'s shape.
 
+    ``key`` is either a :func:`jax.random.PRNGKey` / :func:`jax.random.key`
+    output or a Python ``int`` (in which case ``jax.random.key(int)`` is
+    called) — the int form is a convenience for tests and scripts.
 
-def clm_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    loss_mask: torch.Tensor,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Compute CLM cross-entropy loss on non-padding positions.
-
-    Uses ignore_index on a flat view to avoid materializing a copy of
-    all valid-position logits.
-
-    Args:
-        logits: (B, T, vocab_size)
-        targets: (B, T) target token indices
-        loss_mask: (B, T) bool — True for positions included in loss
-
-    Returns:
-        loss: scalar
-        metrics: dict with loss value and accuracy
+    All weight tensors are drawn from ``Normal(0, 0.02)`` (the v1
+    convention for ``dim > 1`` params). RMSNorm weights are
+    one-initialised so the norm acts as identity at step 0;
+    ``embed_pad`` is zero-initialised. ``decomp_table`` is built from
+    the engine vocab. RoPE phase tables are *not* stored on the
+    model — :meth:`PAWNModel.__call__` recomputes them per forward
+    pass from ``cfg.head_dim`` / ``cfg.max_seq_len`` / ``cfg.rope_base``,
+    and JIT constant-folds them when ``cfg`` is static.
     """
-    B, T, V = logits.shape
+    if isinstance(key, int):
+        key = jax.random.key(key)
+    sub = jax.random.split(key, 12)
+    d = cfg.d_model
+    d_ff = cfg.d_ff
+    n_layers = cfg.n_layers
+    V = cfg.vocab_size  # noqa: N806
 
-    # Flat views — no copy
-    logits_flat = logits.view(-1, V)
-    # Set padding targets to ignore_index so cross_entropy skips them
-    targets_flat = torch.where(loss_mask.view(-1), targets.view(-1), _IGNORE_INDEX)
+    layers = TransformerLayer(
+        attn_norm_w=jnp.ones((n_layers, d), dtype=jnp.float32),
+        wq=_normal_init(sub[0], (n_layers, d, d)),
+        wk=_normal_init(sub[1], (n_layers, d, d)),
+        wv=_normal_init(sub[2], (n_layers, d, d)),
+        wo=_normal_init(sub[3], (n_layers, d, d)),
+        ffn_norm_w=jnp.ones((n_layers, d), dtype=jnp.float32),
+        w_gate=_normal_init(sub[4], (n_layers, d, d_ff)),
+        w_up=_normal_init(sub[5], (n_layers, d, d_ff)),
+        w_down=_normal_init(sub[6], (n_layers, d_ff, d)),
+    )
+    return PAWNModel(
+        embed_src=_normal_init(sub[7], (64, d)),
+        embed_dst=_normal_init(sub[8], (64, d)),
+        embed_promo=_normal_init(sub[9], (5, d)),
+        embed_pad=jnp.zeros((d,), dtype=jnp.float32),
+        embed_outcome=_normal_init(sub[10], (cfg.n_outcomes, d)),
+        layers=layers,
+        final_norm_w=jnp.ones((d,), dtype=jnp.float32),
+        lm_head=_normal_init(sub[11], (d, V)),
+        decomp_table=_build_decomp_table(),
+        cfg=cfg,
+    )
 
-    loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=_IGNORE_INDEX)
 
-    # Top-1 accuracy (only at valid positions)
-    with torch.no_grad():
-        preds = logits_flat.argmax(dim=-1)
-        valid = targets_flat != _IGNORE_INDEX
-        accuracy = (preds[valid] == targets_flat[valid]).float().mean().item()
+def sliced(supernet_model: PAWNModel, variant_cfg: ModelConfig) -> PAWNModel:
+    """Return a new :class:`PAWNModel` at the variant shape, taking the
+    inner ``[:d_V, :d_V]`` block of every weight tensor.
 
-    metrics = {
-        "loss": loss.item(),
-        "accuracy": accuracy,
-    }
+    Raises :class:`pawn.config.NestingError` if ``variant_cfg`` doesn't
+    nest under the supernet's config (so the slice would be undefined).
 
-    return loss, metrics
+    The supernet is not mutated; this returns a fresh
+    :class:`PAWNModel`. The decomposition table is reused as-is — it
+    doesn't depend on width. RoPE phase tables are recomputed inside
+    ``__call__`` per forward, so they don't need to be carried by the
+    variant model.
+    """
+    validate_nested(variant_cfg, supernet_model.cfg)
+    dv = variant_cfg.d_model
+    dv_ff = variant_cfg.d_ff
+
+    sup_layers = supernet_model.layers
+    layers = TransformerLayer(
+        attn_norm_w=sup_layers.attn_norm_w[:, :dv],
+        wq=sup_layers.wq[:, :dv, :dv],
+        wk=sup_layers.wk[:, :dv, :dv],
+        wv=sup_layers.wv[:, :dv, :dv],
+        wo=sup_layers.wo[:, :dv, :dv],
+        ffn_norm_w=sup_layers.ffn_norm_w[:, :dv],
+        w_gate=sup_layers.w_gate[:, :dv, :dv_ff],
+        w_up=sup_layers.w_up[:, :dv, :dv_ff],
+        w_down=sup_layers.w_down[:, :dv_ff, :dv],
+    )
+    return PAWNModel(
+        embed_src=supernet_model.embed_src[:, :dv],
+        embed_dst=supernet_model.embed_dst[:, :dv],
+        embed_promo=supernet_model.embed_promo[:, :dv],
+        embed_pad=supernet_model.embed_pad[:dv],
+        embed_outcome=supernet_model.embed_outcome[:, :dv],
+        layers=layers,
+        final_norm_w=supernet_model.final_norm_w[:dv],
+        lm_head=supernet_model.lm_head[:dv, :],
+        decomp_table=supernet_model.decomp_table,
+        cfg=variant_cfg,
+    )
