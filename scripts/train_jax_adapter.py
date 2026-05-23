@@ -727,7 +727,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--pgn-split", type=str, default="train",
-        help="parquet split name for the --pgn source (default: train).",
+        help="parquet split name for the --pgn TRAIN source "
+             "(default: train).",
+    )
+    parser.add_argument(
+        "--pgn-val-split", type=str, default="validation",
+        help="parquet split name to load as VALIDATION from the --pgn "
+             "source (default: validation — matches the canonical "
+             "HF dataset layout). Pass '' (empty) to disable the "
+             "held-out split and carve val out of the train slice "
+             "instead (useful when the source is a single file with "
+             "no split structure).",
     )
     parser.add_argument(
         "--cache-dir", type=str, default=None,
@@ -847,12 +857,13 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         t0 = time.perf_counter()
+        # Load the TRAIN slice.
         print(
-            f"[corpus] loading Lichess slice from {args.pgn!r} "
-            f"(elo_min={args.elo_min}, elo_max={args.elo_max}, "
-            f"min_ply={args.min_ply})"
+            f"[corpus] loading Lichess train slice ({args.pgn_split}) "
+            f"from {args.pgn!r} (elo_min={args.elo_min}, "
+            f"elo_max={args.elo_max}, min_ply={args.min_ply})"
         )
-        lichess = load_lichess_corpus(
+        train_corpus = load_lichess_corpus(
             args.pgn,
             split=args.pgn_split,
             elo_min=args.elo_min,
@@ -862,23 +873,76 @@ def main(argv: list[str] | None = None) -> int:
             max_games=args.max_games,
             cache_dir=args.cache_dir,
         )
-        m_games = lichess.n_games
-        # Held-out val pool — a fixed slice of the distinct games,
-        # rounded to a whole number of batches.
-        n_val_games = max(1, int(m_games * args.val_frac))
-        n_val_games = (n_val_games // args.batch_size) * args.batch_size
-        if n_val_games == 0:
-            raise SystemExit(
-                f"--pgn slice has {m_games} games; --val-frac="
-                f"{args.val_frac} yields <1 val batch. Widen the Elo "
-                f"band, raise --val-frac, or lower --batch-size."
+
+        # Load the VAL slice. If --pgn-val-split is a non-empty string,
+        # use that held-out split from the source (the
+        # ``thomas-schweich/pawn-lichess-full`` dataset ships proper
+        # ``validation`` + ``test`` shards alongside ``train`` — using
+        # them avoids leaking training games into the val set). Pass
+        # ``--pgn-val-split ""`` to opt out and carve val out of train
+        # (matches the behavior for single-file local sources with no
+        # split structure).
+        if args.pgn_val_split:
+            print(
+                f"[corpus] loading Lichess val slice "
+                f"({args.pgn_val_split}) from {args.pgn!r}"
             )
-        n_train_pool = m_games - n_val_games
-        if n_train_pool <= 0:
-            raise SystemExit(
-                f"--pgn slice has {m_games} games — all consumed by the "
-                f"val split. Widen the Elo band or lower --val-frac."
+            val_corpus = load_lichess_corpus(
+                args.pgn,
+                split=args.pgn_val_split,
+                elo_min=args.elo_min,
+                elo_max=args.elo_max,
+                min_ply=args.min_ply,
+                seq_len=args.seq_len,
+                max_games=None,  # don't cap val — small anyway
+                cache_dir=args.cache_dir,
             )
+            n_val_games = (
+                val_corpus.n_games // args.batch_size
+            ) * args.batch_size
+            if n_val_games == 0:
+                raise SystemExit(
+                    f"--pgn val split {args.pgn_val_split!r} has "
+                    f"{val_corpus.n_games} games after filters; "
+                    f"--batch-size={args.batch_size} yields 0 whole "
+                    f"batches. Widen the filters, lower --batch-size, "
+                    f"or pass --pgn-val-split '' to carve val out of "
+                    f"the train slice."
+                )
+            val_tokens = val_corpus.tokens[:n_val_games]
+            val_attn = val_corpus.attn_mask[:n_val_games]
+            val_targets = val_corpus.targets[:n_val_games]
+            val_loss = val_corpus.loss_mask[:n_val_games]
+            n_train_pool = train_corpus.n_games
+            train_offset = 0
+            val_source = f"held-out '{args.pgn_val_split}' split"
+        else:
+            # Carve val out of train: first n_val_games distinct games.
+            n_val_games = max(1, int(train_corpus.n_games * args.val_frac))
+            n_val_games = (
+                n_val_games // args.batch_size
+            ) * args.batch_size
+            if n_val_games == 0:
+                raise SystemExit(
+                    f"--pgn slice has {train_corpus.n_games} games; "
+                    f"--val-frac={args.val_frac} yields <1 val batch. "
+                    f"Widen filters, raise --val-frac, or lower "
+                    f"--batch-size."
+                )
+            n_train_pool = train_corpus.n_games - n_val_games
+            if n_train_pool <= 0:
+                raise SystemExit(
+                    f"--pgn slice has {train_corpus.n_games} games — "
+                    f"all consumed by the carved val split. Widen "
+                    f"filters or lower --val-frac."
+                )
+            val_tokens = train_corpus.tokens[:n_val_games]
+            val_attn = train_corpus.attn_mask[:n_val_games]
+            val_targets = train_corpus.targets[:n_val_games]
+            val_loss = train_corpus.loss_mask[:n_val_games]
+            train_offset = n_val_games
+            val_source = f"carved-from-train (--val-frac={args.val_frac})"
+
         estimated_gb = (
             (n_train_games + n_val_games) * bytes_per_game / (1024 ** 3)
         )
@@ -887,29 +951,26 @@ def main(argv: list[str] | None = None) -> int:
                 f"corpus would need ~{estimated_gb:.2f} GiB > "
                 f"--max-corpus-gb={args.max_corpus_gb}"
             )
-        # val = first n_val_games distinct games; train pool = the rest.
-        val_tokens = lichess.tokens[:n_val_games]
-        val_attn = lichess.attn_mask[:n_val_games]
-        val_targets = lichess.targets[:n_val_games]
-        val_loss = lichess.loss_mask[:n_val_games]
+
         # Tile the train pool across epochs to fill n_train_games.
         # NB: distinct name from the LR-schedule ``sched`` above —
         # this is an int64 index array, not an optax schedule.
         epoch_idx = make_epoch_schedule(
             n_train_pool, n_train_games, seed=corpus_seed
         )
-        # Offset into the post-val region of the slice.
-        train_idx = epoch_idx + n_val_games
-        train_tokens = lichess.tokens[train_idx]
-        train_attn = lichess.attn_mask[train_idx]
-        train_targets = lichess.targets[train_idx]
-        train_loss = lichess.loss_mask[train_idx]
+        # Offset into the post-val region of the train slice (zero
+        # when val came from a separate held-out split).
+        train_idx = epoch_idx + train_offset
+        train_tokens = train_corpus.tokens[train_idx]
+        train_attn = train_corpus.attn_mask[train_idx]
+        train_targets = train_corpus.targets[train_idx]
+        train_loss = train_corpus.loss_mask[train_idx]
         n_epochs = (n_train_games + n_train_pool - 1) // n_train_pool
         print(
-            f"[corpus] Lichess slice: {m_games} games "
-            f"({n_train_pool} train pool + {n_val_games} val); "
+            f"[corpus] Lichess: {n_train_pool} train games + "
+            f"{n_val_games} val games ({val_source}); "
             f"tiled across ~{n_epochs} epochs to fill {n_train_games} "
-            f"slots; done in {time.perf_counter() - t0:.1f}s"
+            f"train slots; done in {time.perf_counter() - t0:.1f}s"
         )
     else:
         # ---- Random-game proxy path ----
@@ -996,6 +1057,8 @@ def main(argv: list[str] | None = None) -> int:
         # exactly which games the run trained on.
         "data_source": "lichess" if args.pgn else "random",
         "pgn": args.pgn,
+        "pgn_split": args.pgn_split if args.pgn else None,
+        "pgn_val_split": args.pgn_val_split if args.pgn else None,
         "elo_min": args.elo_min,
         "elo_max": args.elo_max,
         "min_ply": args.min_ply if args.pgn else None,

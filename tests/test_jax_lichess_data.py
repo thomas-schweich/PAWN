@@ -5,8 +5,8 @@ Covers ``pawn.corpus.pack_corpus`` (pre-tokenized games → Corpus),
 tiling), and ``pawn.lichess_data.load_lichess_corpus`` (parquet scan +
 Elo / ply filter + pack + on-disk cache round-trip).
 
-The Lichess load tests build a synthetic parquet in ``tmp_path`` and
-require polars (the ``data-tools`` extra); they ``importorskip`` it.
+The Lichess load tests build a synthetic parquet in ``tmp_path``.
+Polars is a base dep so no ``importorskip`` is needed.
 """
 
 from __future__ import annotations
@@ -138,7 +138,7 @@ def test_epoch_schedule_rejects_bad_args() -> None:
 
 def _write_synthetic_parquet(path: Path, rows: list[dict]) -> None:
     """Write a Lichess-schema parquet with the given rows."""
-    pl = pytest.importorskip("polars")
+    import polars as pl
     pl.DataFrame(
         rows,
         schema={
@@ -165,7 +165,6 @@ def _game(
 
 @pytest.mark.unit
 def test_load_lichess_corpus_basic(tmp_path: Path) -> None:
-    pytest.importorskip("polars")
     from pawn.lichess_data import load_lichess_corpus
 
     pq = tmp_path / "lichess.parquet"
@@ -192,7 +191,6 @@ def test_load_lichess_corpus_basic(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_load_lichess_corpus_elo_filter(tmp_path: Path) -> None:
-    pytest.importorskip("polars")
     from pawn.lichess_data import load_lichess_corpus
 
     pq = tmp_path / "lichess.parquet"
@@ -219,7 +217,6 @@ def test_load_lichess_corpus_elo_filter(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_load_lichess_corpus_min_ply_filter(tmp_path: Path) -> None:
-    pytest.importorskip("polars")
     from pawn.lichess_data import load_lichess_corpus
 
     pq = tmp_path / "lichess.parquet"
@@ -239,7 +236,6 @@ def test_load_lichess_corpus_min_ply_filter(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_load_lichess_corpus_cache_round_trip(tmp_path: Path) -> None:
-    pytest.importorskip("polars")
     from pawn.lichess_data import load_lichess_corpus
 
     pq = tmp_path / "lichess.parquet"
@@ -276,7 +272,6 @@ def test_load_lichess_corpus_cache_key_sensitive_to_filter(
 ) -> None:
     """A different Elo band must produce a distinct cache entry — not
     silently reuse the first slice's cache."""
-    pytest.importorskip("polars")
     from pawn.lichess_data import load_lichess_corpus
 
     pq = tmp_path / "lichess.parquet"
@@ -303,7 +298,6 @@ def test_load_lichess_corpus_cache_key_sensitive_to_filter(
 
 @pytest.mark.unit
 def test_load_lichess_corpus_empty_filter_raises(tmp_path: Path) -> None:
-    pytest.importorskip("polars")
     from pawn.lichess_data import load_lichess_corpus
 
     pq = tmp_path / "lichess.parquet"
@@ -322,7 +316,7 @@ def test_load_lichess_corpus_empty_filter_raises(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_load_lichess_corpus_missing_columns_raises(tmp_path: Path) -> None:
-    pl = pytest.importorskip("polars")
+    import polars as pl
     from pawn.lichess_data import load_lichess_corpus
 
     pq = tmp_path / "bad.parquet"
@@ -339,7 +333,6 @@ def test_load_lichess_corpus_missing_columns_raises(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_load_lichess_corpus_max_games_cap(tmp_path: Path) -> None:
-    pytest.importorskip("polars")
     from pawn.lichess_data import load_lichess_corpus
 
     pq = tmp_path / "lichess.parquet"
@@ -355,9 +348,54 @@ def test_load_lichess_corpus_max_games_cap(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+def test_load_lichess_corpus_split_prefixed_local_dir(tmp_path: Path) -> None:
+    """A local dir with ``train-*.parquet`` / ``validation-*.parquet``
+    shards is scanned by split — the HF ``data/{split}-*.parquet``
+    convention also applies to local mirrors. The default
+    ``--pgn-val-split=validation`` then loads only the held-out
+    games."""
+    from pawn.lichess_data import load_lichess_corpus
+
+    pq_dir = tmp_path / "lichess"
+    pq_dir.mkdir()
+    # Two distinct splits with distinct outcome offsets so we can tell
+    # them apart in the loaded Corpus.
+    _write_synthetic_parquet(
+        pq_dir / "train-00000-of-00001.parquet",
+        [_game([1, 2, 3, 4, 5], 0, 1700, 1700) for _ in range(10)],
+    )
+    _write_synthetic_parquet(
+        pq_dir / "validation-00000-of-00001.parquet",
+        [_game([6, 7, 8, 9, 10], 2, 1700, 1700) for _ in range(4)],
+    )
+    train_corpus = load_lichess_corpus(
+        str(pq_dir),
+        split="train",
+        seq_len=8,
+        min_ply=0,
+        cache_dir=tmp_path / "cache",
+    )
+    val_corpus = load_lichess_corpus(
+        str(pq_dir),
+        split="validation",
+        seq_len=8,
+        min_ply=0,
+        cache_dir=tmp_path / "cache",
+    )
+    # Each split loaded its own shards — no cross-contamination.
+    assert train_corpus.n_games == 10
+    assert val_corpus.n_games == 4
+    # outcome offsets match the split's writer (0 for train, 2 for val).
+    assert (train_corpus.outcome_offset == 0).all()
+    assert (val_corpus.outcome_offset == 2).all()
+    # Two distinct cache entries (one per split).
+    cache_entries = [p for p in (tmp_path / "cache").iterdir() if p.is_dir()]
+    assert len(cache_entries) == 2
+
+
+@pytest.mark.unit
 def test_load_lichess_corpus_truncates_long_games(tmp_path: Path) -> None:
     """A game longer than seq_len is truncated to seq_len moves."""
-    pytest.importorskip("polars")
     from pawn.lichess_data import load_lichess_corpus
 
     pq = tmp_path / "lichess.parquet"

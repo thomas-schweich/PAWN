@@ -689,7 +689,7 @@ def test_validation_failures_do_not_create_run_dir(tmp_path: Path) -> None:
 
 def _write_lichess_parquet(path: Path, n_games: int, plies: int) -> None:
     """Write a synthetic Lichess-schema parquet for the --pgn path."""
-    pl = pytest.importorskip("polars")
+    import polars as pl
     from pawn.config import OUTCOME_TOKEN_BASE
 
     rows = [
@@ -719,7 +719,6 @@ def test_lichess_pgn_path_trains_and_tiles(tmp_path: Path) -> None:
     across epochs to fill ``total_steps * batch_size`` game-slots — the
     realistic adapter task. Pins that the slice is loaded, the cache
     is written, and training completes through MetricsLogger."""
-    pytest.importorskip("polars")
     pq = tmp_path / "lichess.parquet"
     # 24 games × 20 plies. With total_steps=10 k=5 batch_size=2 the
     # trainer needs 20 train-game-slots; the ~21-game train pool
@@ -735,7 +734,7 @@ def test_lichess_pgn_path_trains_and_tiles(tmp_path: Path) -> None:
             "--batch-size", "2", "--seq-len", "24",
             "--warmup-steps", "1",
             "--val-frac", "0.2", "--val-every", "1", "--quiet",
-            "--pgn", str(pq),
+            "--pgn", str(pq), "--pgn-val-split", "",  # single file → carve
             "--elo-min", "1800", "--elo-max", "2000", "--min-ply", "10",
             "--cache-dir", str(tmp_path / "lcache"),
         ],
@@ -748,7 +747,9 @@ def test_lichess_pgn_path_trains_and_tiles(tmp_path: Path) -> None:
     assert cfg["data_source"] == "lichess"
     assert cfg["elo_min"] == 1800
     assert cfg["elo_max"] == 2000
-    # The tokenized-Lichess cache was written.
+    assert cfg["pgn_val_split"] == ""
+    # The tokenized-Lichess cache was written (one entry — single
+    # split loaded since --pgn-val-split="" carves from train).
     cache_entries = [p for p in (tmp_path / "lcache").iterdir() if p.is_dir()]
     assert len(cache_entries) == 1
     assert (cache_entries[0] / ".complete").exists()
@@ -764,10 +765,101 @@ def test_lichess_pgn_path_trains_and_tiles(tmp_path: Path) -> None:
             assert math.isfinite(r["train_loss_mean"])
 
 
+def test_lichess_pgn_path_uses_held_out_validation_split(tmp_path: Path) -> None:
+    """When the --pgn source is a directory with split-prefixed
+    parquets (the HF ``data/{split}-*.parquet`` layout), the default
+    ``--pgn-val-split=validation`` reads val from the held-out shards
+    rather than carving from train. Critical: the realistic adapter
+    benchmark requires no leakage between train and val."""
+    pq_dir = tmp_path / "lichess"
+    pq_dir.mkdir()
+    _write_lichess_parquet(
+        pq_dir / "train-00000-of-00001.parquet", n_games=30, plies=20
+    )
+    # Build the held-out split by hand — distinct outcome offset so we
+    # can verify it isn't accidentally sampled from train.
+    import polars as pl
+    from pawn.config import OUTCOME_TOKEN_BASE
+
+    pl.DataFrame(
+        [
+            {
+                "tokens": [((g + p) % 1900) for p in range(20)],
+                "game_length": 20,
+                "outcome_token": OUTCOME_TOKEN_BASE + 2,  # distinct
+                "white_elo": 1850,
+                "black_elo": 1850,
+            }
+            for g in range(8)
+        ],
+        schema={
+            "tokens": pl.List(pl.Int32),
+            "game_length": pl.Int32,
+            "outcome_token": pl.Int32,
+            "white_elo": pl.Int32,
+            "black_elo": pl.Int32,
+        },
+    ).write_parquet(pq_dir / "validation-00000-of-00001.parquet")
+
+    _run(
+        [
+            "--strategy", "lora",
+            "--supernet", "tiny", "--variant", "base",
+            "--lora-rank", "4",
+            "--total-steps", "10", "--k", "5",
+            "--batch-size", "2", "--seq-len", "24",
+            "--warmup-steps", "1",
+            "--val-frac", "0.2", "--val-every", "1", "--quiet",
+            "--pgn", str(pq_dir),
+            "--pgn-split", "train", "--pgn-val-split", "validation",
+            "--elo-min", "1800", "--elo-max", "2000", "--min-ply", "10",
+            "--cache-dir", str(tmp_path / "lcache"),
+        ],
+        tmp_path,
+    )
+    runs = list(tmp_path.glob("jax_adapter_run_*"))
+    assert len(runs) == 1
+    cfg = json.loads((runs[0] / "config.json").read_text())
+    assert cfg["pgn_split"] == "train"
+    assert cfg["pgn_val_split"] == "validation"
+    # Two cache entries — one per loaded split.
+    cache_entries = [p for p in (tmp_path / "lcache").iterdir() if p.is_dir()]
+    assert len(cache_entries) == 2
+
+
+def test_lichess_pgn_path_carve_from_train_when_val_split_empty(
+    tmp_path: Path,
+) -> None:
+    """``--pgn-val-split ""`` opts out of the held-out split and
+    carves val out of train — for single-file sources with no split
+    structure."""
+    pq = tmp_path / "lichess.parquet"
+    _write_lichess_parquet(pq, n_games=30, plies=20)
+    _run(
+        [
+            "--strategy", "lora",
+            "--supernet", "tiny", "--variant", "base",
+            "--lora-rank", "4",
+            "--total-steps", "10", "--k", "5",
+            "--batch-size", "2", "--seq-len", "24",
+            "--warmup-steps", "1",
+            "--val-frac", "0.2", "--val-every", "1", "--quiet",
+            "--pgn", str(pq),
+            "--pgn-val-split", "",       # carve from train
+            "--elo-min", "1800", "--elo-max", "2000", "--min-ply", "10",
+            "--cache-dir", str(tmp_path / "lcache"),
+        ],
+        tmp_path,
+    )
+    runs = list(tmp_path.glob("jax_adapter_run_*"))
+    assert len(runs) == 1
+    cfg = json.loads((runs[0] / "config.json").read_text())
+    assert cfg["pgn_val_split"] == ""
+
+
 def test_lichess_pgn_path_rejects_oversmall_slice(tmp_path: Path) -> None:
     """A Lichess slice too small to yield even one val batch fails
     upfront with an actionable message, no orphan run dir."""
-    pytest.importorskip("polars")
     pq = tmp_path / "lichess.parquet"
     _write_lichess_parquet(pq, n_games=3, plies=20)
     with pytest.raises(SystemExit, match="val"):
@@ -780,7 +872,7 @@ def test_lichess_pgn_path_rejects_oversmall_slice(tmp_path: Path) -> None:
                 "--batch-size", "8", "--seq-len", "24",
                 "--warmup-steps", "1",
                 "--val-frac", "0.1", "--val-every", "1", "--quiet",
-                "--pgn", str(pq),
+                "--pgn", str(pq), "--pgn-val-split", "",  # carve
                 "--cache-dir", str(tmp_path / "lcache"),
             ],
             tmp_path,

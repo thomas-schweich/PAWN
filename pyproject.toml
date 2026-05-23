@@ -35,6 +35,23 @@ dependencies = [
     # v1 ``pawn/__init__.py`` still imports the v1 PyTorch model so
     # bare ``uv sync`` is broken until S3 lands.
     "optuna>=4.0.0",
+    # Polars — the realistic adapter task (``pawn.lichess_data``,
+    # §13 S17) reads Elo-stratified Lichess parquet shards. Was in
+    # the ``data-tools`` extra in earlier rounds; moved to base so
+    # ``uv sync`` (no extras) produces a working ``--pgn`` path,
+    # matching the project's preference for keeping extras minimal.
+    "polars>=1.0.0",
+    # Plotting + templating + zstandard archives — used by the data
+    # / publishing scripts (``scripts/extract_lichess_parquet.py``,
+    # ``scripts/generate_model_cards.py``, ``scripts/compute_theoretical_ceiling.py``)
+    # and the legacy ``pawn.eval_suite`` polars pipeline. Moved out
+    # of ``data-tools`` for the same reason as polars: collapsing
+    # the extra removes a footgun (``--extra data-tools`` was easy
+    # to forget) without meaningfully bloating the install.
+    "matplotlib>=3.10.0",
+    "seaborn>=0.13.0",
+    "jinja2>=3.0.0",
+    "zstandard>=0.20.0",
     # Dev
     "pyright>=1.1.0",
     "pytest~=9.0.0",
@@ -102,18 +119,6 @@ lab = [
 # writing only the local ``metrics.jsonl``. Enable per run via
 # ``--wandb-mode online`` on either training driver.
 wandb = ["wandb>=0.16.0"]
-# Data-pipeline scripts (Lichess parquet extraction, LC0 generation,
-# model-card rendering) AND the legacy ``pawn.eval_suite``
-# position-parquet pipeline (``bounds.py`` / ``viz.py`` /
-# ``corpus.py``). Only those tools need these; the training + eval
-# surface doesn't pull them in.
-data-tools = [
-    "polars>=1.0.0",
-    "jinja2>=3.0.0",
-    "zstandard>=0.20.0",  # extract_lichess_parquet reads zst archives
-    "matplotlib>=3.10.0",  # pawn/eval_suite/viz.py
-    "seaborn>=0.13.0",     # pawn/eval_suite/viz.py
-]
 
 [build-system]
 requires = ["hatchling"]

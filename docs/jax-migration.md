@@ -701,12 +701,16 @@ pawn/
   `pawn.torch_loader` who don't need GPU jaxlib.
 - `--extra dashboard` — solara + plotly + anywidget for
   `pawn.dashboard`.
-- `--extra lab` — fastmcp + optuna for `pawn.lab`.
+- `--extra lab` — fastmcp + optuna-dashboard for `pawn.lab`
+  (optuna itself is base, shared with `pawn.sweep`).
 - `--extra wandb` — wandb client for `pawn.wandb_utils`.
-- `--extra data-tools` — polars + jinja2 + zstandard for the data
-  scripts (`extract_lichess_parquet`, `compute_theoretical_ceiling`,
-  `generate_model_cards`, etc.) and for the legacy
-  `pawn.eval_suite` position-parquet pipeline.
+
+The earlier ``data-tools`` extra (polars / matplotlib / seaborn /
+jinja2 / zstandard) was collapsed into base in S18 — the project
+prefers a smaller extra surface over fewer-but-heavier base deps,
+and the realistic adapter task (Lichess parquet via
+`pawn.lichess_data`) needs polars anyway, so making it a quiet
+"forgot the extra → ImportError" footgun was the wrong default.
 
 ## 11. Integration branch and merge strategy
 
@@ -1131,6 +1135,43 @@ Chunks:
   make_epoch_schedule, load_lichess_corpus filter/cache against a
   synthetic parquet) + two `--pgn`-path cases in
   `tests/scripts/test_train_jax_adapter.py`.
+
+### S18 — Collapse `data-tools` extra into base + held-out val-split
+
+Two corrections to S17 the project owner flagged:
+
+1. **`data-tools` → base.** The project prefers a smaller extra
+   surface to fewer-but-heavier base deps ("extras only when
+   genuinely required"). Polars / matplotlib / seaborn / jinja2 /
+   zstandard moved into `[project.dependencies]`; the `data-tools`
+   extra is gone. The Dockerfile drops every `--extra data-tools`
+   reference (no longer needed). `pawn/lichess_data.py` switches
+   from a lazy polars import to a normal top-level import; the
+   tests drop their `pytest.importorskip("polars")` guards.
+
+2. **Held-out val split — not carve-from-train.** S17 took the
+   first ``--val-frac`` of the loaded `--pgn` slice as validation,
+   which silently carves val out of the train pool — leakage when
+   the source dataset has proper held-out shards. The canonical
+   `thomas-schweich/pawn-lichess-full` dataset ships
+   `train` (287 shards) + `validation` (10 shards) + `test`
+   (9 shards). The script now defaults `--pgn-val-split=validation`
+   and loads val from that held-out split. Pass `--pgn-val-split ""`
+   to opt back into carve-from-train (the right behavior for a
+   single-file local source with no split structure).
+
+   `pawn.lichess_data._scan_parquet` becomes split-aware for local
+   directories too — a dir with `train-*.parquet` /
+   `validation-*.parquet` shards is scanned by split (matching the
+   HF datasets convention); dirs without that structure (or
+   single-file sources) fall back to "scan all parquets."
+
+   `scripts/train_jax_adapter.py` records the val-source
+   provenance in `config.json` (`pgn_split`, `pgn_val_split`).
+
+Chunks: S18 lands as a single ``fix(scripts):`` commit; tests
+extended for both pieces (local-dir split-prefixed scan +
+held-out vs carve script-level paths).
 
 ## 14. Resolved decisions
 

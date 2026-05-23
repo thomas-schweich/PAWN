@@ -17,11 +17,6 @@ is shape-static (no bucketed dynamic padding — ``docs/jax-migration.md``
 §8.4 removed ``bucket_size``), so this produces fixed-width ``[N, T]``
 arrays directly and the on-disk cache stores those arrays verbatim.
 
-Polars is a lazy import — only the parquet path needs it, so the
-base install (random-game adapter training) stays polars-free.
-Install the parquet path's deps with ``uv sync --extra data-tools``
-(the published Docker runtime images bake it in).
-
 Cache layout under ``<cache_root>/<key>/``:
   - ``corpus.safetensors`` — the five packed ``Corpus`` arrays.
   - ``meta.json``          — filter params + game count.
@@ -38,17 +33,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
+import polars as pl
 from numpy.typing import NDArray
 from safetensors.numpy import load_file, save_file
 
 from pawn.config import N_OUTCOMES, OUTCOME_TOKEN_BASE
 from pawn.corpus import Corpus, pack_corpus
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    import polars as pl
 
 _DEFAULT_HF_REPO = "thomas-schweich/pawn-lichess-full"
 _CACHE_FORMAT_VERSION = 1
@@ -57,26 +50,8 @@ _META_FILE = "meta.json"
 
 
 # ---------------------------------------------------------------------------
-# Parquet scan (lazy polars import)
+# Parquet scan
 # ---------------------------------------------------------------------------
-
-
-def _require_polars() -> "Any":
-    """Import polars, or raise a clear actionable error.
-
-    Polars is in the ``data-tools`` extra, not the base deps — only
-    the Lichess parquet path needs it. Random-game adapter training
-    (``pawn.corpus.generate_corpus``) does not.
-    """
-    try:
-        import polars as pl  # noqa: PLC0415
-    except ImportError as exc:  # pragma: no cover - env-dependent
-        raise ImportError(
-            "pawn.lichess_data needs polars to read the Lichess parquet. "
-            "Install it with `uv sync --extra data-tools` (the published "
-            "Docker runtime images already bake it in)."
-        ) from exc
-    return pl
 
 
 def _scan_parquet(
@@ -87,17 +62,29 @@ def _scan_parquet(
 
     ``source`` is either a local path (file or directory of parquet
     shards) or a HuggingFace dataset repo id (``namespace/name``).
-    HF repos are scanned via the ``hf://`` protocol; if that fails
-    (older fsspec, auth quirks) the shards are downloaded with
-    ``hf_hub_download`` and scanned locally.
+    Local directories with split-prefixed shards
+    (``train-XXXXX.parquet`` / ``validation-XXXXX.parquet`` / etc. —
+    matching the HF datasets convention) are scanned by split; dirs
+    without that structure (or single-file local sources) fall back
+    to "scan all parquet files." HF repos are scanned via the
+    ``hf://`` protocol; if that fails (older fsspec, auth quirks)
+    the shards are downloaded with ``hf_hub_download`` and scanned
+    locally.
     """
-    pl = _require_polars()
     src = str(source)
 
     local = Path(src)
     if local.exists():
         if local.is_dir():
-            return pl.scan_parquet(str(local / "*.parquet"))
+            # Prefer split-prefixed shards when present.
+            shards = sorted(local.glob(f"{split}-*.parquet"))
+            if not shards:
+                shards = sorted(local.glob("*.parquet"))
+            if not shards:
+                raise FileNotFoundError(
+                    f"no parquet files matched {split!r} in {local}"
+                )
+            return pl.scan_parquet([str(s) for s in shards])
         return pl.scan_parquet(str(local))
 
     # Treat ``source`` as a HF dataset repo id.
@@ -184,7 +171,6 @@ def _build_corpus_from_parquet(
     max_games: int | None,
 ) -> Corpus:
     """Scan, filter, and pack the Lichess parquet into a ``Corpus``."""
-    pl = _require_polars()
     lf = _scan_parquet(source, split)
     schema = lf.collect_schema()
     names = set(schema.names())

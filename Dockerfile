@@ -128,13 +128,8 @@ COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /uvx /bin/
 
 # ── Deps (CUDA) ──────────────────────────────────────────────────────
 FROM deps-common AS deps
-# ``--extra data-tools`` baked in so the published runtime image can
-# run extract_lichess_parquet / compute_theoretical_ceiling /
-# generate_model_cards and the legacy ``pawn.eval_suite`` polars
-# pipeline without a manual ``uv sync`` inside the container
-# (``docs/jax-migration.md`` §13 S14).
 RUN uv venv && \
-    uv sync --extra cu128 --extra data-tools --no-dev --frozen --no-install-workspace && \
+    uv sync --extra cu128 --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl ${UV_CACHE_DIR}
 
 # ── Runtime (CUDA) ───────────────────────────────────────────────────
@@ -163,13 +158,8 @@ CMD ["/opt/pawn/deploy/entrypoint.sh"]
 
 # ── Deps (ROCm) ──────────────────────────────────────────────────────
 FROM deps-common AS deps-rocm
-# ``--extra data-tools`` baked in so the published runtime image can
-# run extract_lichess_parquet / compute_theoretical_ceiling /
-# generate_model_cards and the legacy ``pawn.eval_suite`` polars
-# pipeline without a manual ``uv sync`` inside the container
-# (``docs/jax-migration.md`` §13 S14).
 RUN uv venv && \
-    uv sync --extra rocm --extra data-tools --no-dev --frozen --no-install-workspace && \
+    uv sync --extra rocm --no-dev --frozen --no-install-workspace && \
     uv pip install /tmp/*.whl && rm -rf /tmp/*.whl ${UV_CACHE_DIR}
 
 # ── Runtime (ROCm) ───────────────────────────────────────────────────
@@ -320,8 +310,7 @@ COPY --chown=pawn:pawn . .
 # Dev images get every optional extra so lab + dashboard + wandb are
 # available out-of-box (matches the JAX migration plan §13 S14).
 RUN PATH="/home/pawn/.cargo/bin:${PATH}" \
-    uv sync --extra cu128 --extra data-tools --extra lab \
-            --extra dashboard --extra wandb --frozen
+    uv sync --extra cu128 --extra lab --extra dashboard --extra wandb --frozen
 
 ARG GIT_HASH=""
 ARG GIT_TAG=""
@@ -348,8 +337,7 @@ COPY --chown=pawn:pawn . .
 # Dev images get every optional extra so lab + dashboard + wandb are
 # available out-of-box (matches the JAX migration plan §13 S14).
 RUN PATH="/home/pawn/.cargo/bin:${PATH}" \
-    uv sync --extra rocm --extra data-tools --extra lab \
-            --extra dashboard --extra wandb --frozen
+    uv sync --extra rocm --extra lab --extra dashboard --extra wandb --frozen
 
 ARG GIT_HASH=""
 ARG GIT_TAG=""
