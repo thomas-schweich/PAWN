@@ -297,7 +297,7 @@ def test_unflatten_opt_state_python_int_template_uses_int32(
     """
     import jax.numpy as jnp_local
 
-    from pawn.trainer import flatten_opt_state, unflatten_opt_state
+    from pawn.trainer import unflatten_opt_state
 
     # Synthesise a tiny opt-state-shaped PyTree with a *python int*
     # template leaf (rather than a JAX int32 ArrayImpl). The Optax
@@ -323,6 +323,77 @@ def test_unflatten_opt_state_python_int_template_uses_int32(
     )
     assert int(restored_d["count"]) == 7
     assert restored_d["moment"].dtype == jnp_local.float32
+
+
+def test_unflatten_opt_state_numpy_scalar_template_normalises_to_int32(
+    tmp_path: Path,
+) -> None:
+    """Round-4 bug-detector Important: a `numpy.int64` *scalar*
+    template leaf (not a multi-dim array) has `hasattr("dtype")` =
+    True, so the round-3 fix's `hasattr` check let int64 fall
+    through. JAX then truncated to int32 with a `UserWarning`.
+    `_dtype_for` now treats numpy scalars (`np.generic`) the same as
+    python scalars and normalises to int32 / float32 / bool_.
+    """
+    import jax.numpy as jnp_local
+
+    from pawn.trainer import unflatten_opt_state
+
+    # numpy scalar (np.int64) as the template leaf — what
+    # `np.asarray(python_int)` produces on Linux.
+    template = {
+        "count": np.int64(0),
+        "moment": jnp_local.zeros((4,), dtype=jnp_local.float32),
+    }
+    flat = {
+        "['count']": np.int32(7),
+        "['moment']": np.ones((4,), dtype=np.float32),
+    }
+
+    from typing import cast
+    restored_d = cast(
+        "dict[str, jax.Array]", unflatten_opt_state(template, flat)
+    )
+    assert restored_d["count"].dtype == jnp_local.int32, (
+        f"numpy.int64 scalar template should normalise to int32, "
+        f"got {restored_d['count'].dtype}"
+    )
+    assert int(restored_d["count"]) == 7
+
+
+def test_unflatten_opt_state_preserves_multidim_array_dtype(
+    tmp_path: Path,
+) -> None:
+    """Round-4 bug-detector follow-up: while numpy scalars get
+    normalised, multi-dimensional numpy arrays must preserve their
+    declared dtype — that's the user's intent, not a default-width
+    artifact.
+
+    Uses `uint8` (a non-default dtype JAX represents natively without
+    `JAX_ENABLE_X64`) so the test demonstrates the array-dtype-
+    preservation path independent of JAX's int64 / float64 truncation.
+    """
+    import jax.numpy as jnp_local
+
+    from pawn.trainer import unflatten_opt_state
+
+    template = {
+        "byte_counter": np.zeros((3,), dtype=np.uint8),
+        "moment": jnp_local.zeros((4,), dtype=jnp_local.float32),
+    }
+    flat = {
+        "['byte_counter']": np.array([1, 2, 3], dtype=np.uint8),
+        "['moment']": np.ones((4,), dtype=np.float32),
+    }
+
+    from typing import cast
+    restored_d = cast(
+        "dict[str, jax.Array]", unflatten_opt_state(template, flat)
+    )
+    assert restored_d["byte_counter"].dtype == jnp_local.uint8, (
+        f"multi-dim numpy array should keep its declared dtype, "
+        f"got {restored_d['byte_counter'].dtype}"
+    )
 
 
 # ---------------------------------------------------------------------------

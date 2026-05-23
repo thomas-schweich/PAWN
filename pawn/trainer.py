@@ -492,14 +492,33 @@ def unflatten_opt_state(
     # which match JAX's defaults. Array-typed leaves still use the
     # template's dtype directly — that's the contract for the
     # production case where every Optax leaf is a JAX array.
+    # Numpy scalars (`np.int64(5)` etc) and python scalars both
+    # behave the same way semantically — a 0-d value carrying a
+    # default-int-width dtype. Treat both as scalar inputs and
+    # normalise to the JAX canonical width (int32 / float32 / bool).
+    # Numpy *arrays* are NOT scalars — their dtype is the user's
+    # intent and we preserve it verbatim. Round-4 bug-detector
+    # Important caught that a `numpy.int64` scalar template leaf
+    # (e.g. if a future Optax release stores `np.int64(step)` as a
+    # counter) passed through the `hasattr("dtype")` branch and
+    # returned int64, which JAX then truncated with a UserWarning.
     def _dtype_for(template_leaf: Any, saved: np.ndarray) -> Any:
-        if hasattr(template_leaf, "dtype"):
-            return template_leaf.dtype
-        # Template leaf is a python scalar — match JAX's default int
-        # dtype rather than trusting `saved.dtype` (which inherits
-        # `np.asarray(python_int)`'s Linux-default int64).
-        if isinstance(template_leaf, bool):
+        if isinstance(template_leaf, (bool, np.bool_)):
             return np.bool_
+        # Numpy scalars are `np.generic` but not `np.ndarray`. They
+        # mimic python scalars in semantics; route them through the
+        # normalisation path rather than trusting their non-canonical
+        # default dtype.
+        if isinstance(template_leaf, np.ndarray) and template_leaf.ndim > 0:
+            # Multi-dimensional numpy array — preserve the user's
+            # dtype intent.
+            return template_leaf.dtype
+        if hasattr(template_leaf, "dtype") and not isinstance(
+            template_leaf, np.generic
+        ):
+            # JAX array (or other array-like with a canonical dtype).
+            return template_leaf.dtype
+        # Python scalar OR numpy scalar — normalise to JAX defaults.
         if isinstance(template_leaf, int):
             return np.int32
         if isinstance(template_leaf, float):
