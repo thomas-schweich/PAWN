@@ -116,11 +116,17 @@ def init_lora_adapter(
     flags = _targets_to_flags(cfg.targets)
 
     def kaiming(k: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-        # Kaiming-uniform with fan-in = shape[-1], a=sqrt(5).
+        # Kaiming-uniform matching PyTorch `kaiming_uniform_(a=sqrt(5))`
+        # — the v1 init this adapter is meant to mirror. For
+        # `a=sqrt(5)`, `gain = sqrt(2 / (1 + 5)) = sqrt(1/3)`, and
+        # `bound = gain * sqrt(3 / fan_in) = sqrt(1/fan_in)`.
+        # An earlier version computed `sqrt(2/fan_in)` (gain=1.0
+        # default), inflating LoRA A-matrices by sqrt(2) relative to
+        # v1; this restored the v1 contract.
         if len(shape) == 0:
             raise ValueError("kaiming requires at least a 1-D shape")
         fan_in = shape[-1] if len(shape) >= 2 else shape[0]
-        bound = math.sqrt(6.0 / fan_in) / math.sqrt(3.0)  # ≈ sqrt(2/fan_in)
+        bound = math.sqrt(1.0 / fan_in)
         return jax.random.uniform(k, shape, minval=-bound, maxval=bound)
 
     keys = jax.random.split(key, 16)

@@ -156,21 +156,39 @@ def test_each_strategy_dispatch_runs(strategy: str) -> None:
         key=jax.random.key(0),
     )
 
-    # Some strategies have no trainable params (unfreeze), so the
-    # optimizer would no-op; that's fine for the dispatch test.
+    # Snapshot backbone.wq BEFORE train_step — the JIT donates the
+    # state buffer, so the original `backbone` reference is invalid
+    # after the call. `np.asarray(...)` materialises the comparison
+    # baseline to host memory.
     if strategy == "unfreeze":
-        # Unfreeze's adapter has no trainable inexact-arrays — running
-        # train step would do nothing, so we just verify the apply
-        # function returns the backbone untouched.
-        applied = dispatch_apply(strategy)(backbone, adapter)
-        assert applied is backbone
-        return
+        backbone_wq_pre = np.asarray(backbone.layers.wq)
 
     train_step = make_adapter_train_step(strategy, opt)
     batch = _make_batch()
     new_state, loss = train_step(state, batch)
     assert int(new_state.step) == 1
     assert jnp.isfinite(loss)
+
+    if strategy == "unfreeze":
+        # At init the unfreeze adapter is an exact copy of the
+        # backbone's transformer slices, so `apply_unfreeze` at step 0
+        # produces a model whose layers match the backbone's. After one
+        # train step, the unmasked layers in `state.adapter.layers`
+        # must have moved (gradient was non-zero); the masked layers
+        # must still match the pre-step backbone (gradient was zero
+        # because `where` blocks their forward contribution).
+        from pawn.adapters.unfreeze import parse_unfreeze_layers
+        unfrozen = parse_unfreeze_layers("0,1")  # matches `_strategy_config`
+        post_wq = np.asarray(new_state.adapter.layers.wq)
+        for i in range(post_wq.shape[0]):
+            if i in unfrozen:
+                assert not np.allclose(post_wq[i], backbone_wq_pre[i]), (
+                    f"unfrozen layer {i} should have trained"
+                )
+            else:
+                assert np.allclose(post_wq[i], backbone_wq_pre[i]), (
+                    f"frozen layer {i} should still match backbone"
+                )
 
 
 # ---------------------------------------------------------------------------

@@ -42,7 +42,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-def suggest_lora(trial: optuna.Trial) -> dict[str, Any]:
+def suggest_lora(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     return {
         "lora_rank": trial.suggest_int("lora_rank", 1, 16),
         "lora_targets": trial.suggest_categorical(
@@ -52,7 +52,7 @@ def suggest_lora(trial: optuna.Trial) -> dict[str, Any]:
     }
 
 
-def suggest_film(trial: optuna.Trial) -> dict[str, Any]:
+def suggest_film(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     return {
         "use_output_film": trial.suggest_categorical(
             "use_output_film", [True, False]
@@ -61,7 +61,7 @@ def suggest_film(trial: optuna.Trial) -> dict[str, Any]:
     }
 
 
-def suggest_bottleneck(trial: optuna.Trial) -> dict[str, Any]:
+def suggest_bottleneck(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     return {
         "bottleneck_dim": trial.suggest_int("bottleneck_dim", 2, 32),
         "bottleneck_n_hidden": trial.suggest_int("bottleneck_n_hidden", 0, 2),
@@ -70,7 +70,7 @@ def suggest_bottleneck(trial: optuna.Trial) -> dict[str, Any]:
     }
 
 
-def suggest_hybrid(trial: optuna.Trial) -> dict[str, Any]:
+def suggest_hybrid(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     return {
         "lora_rank": trial.suggest_int("lora_rank", 1, 8),
         "use_output_film": trial.suggest_categorical(
@@ -80,7 +80,7 @@ def suggest_hybrid(trial: optuna.Trial) -> dict[str, Any]:
     }
 
 
-def suggest_sparse(trial: optuna.Trial) -> dict[str, Any]:
+def suggest_sparse(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     return {
         "density": trial.suggest_float("density", 0.001, 0.1, log=True),
         "sparse_targets": trial.suggest_categorical(
@@ -90,7 +90,7 @@ def suggest_sparse(trial: optuna.Trial) -> dict[str, Any]:
     }
 
 
-def suggest_rosa(trial: optuna.Trial) -> dict[str, Any]:
+def suggest_rosa(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     return {
         "rosa_mode": "rosa",
         "lora_rank": trial.suggest_int("lora_rank", 1, 8),
@@ -102,15 +102,15 @@ def suggest_rosa(trial: optuna.Trial) -> dict[str, Any]:
     }
 
 
-def suggest_rosa_retro_sparse(trial: optuna.Trial) -> dict[str, Any]:
+def suggest_rosa_retro_sparse(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     return {**suggest_rosa(trial), "rosa_mode": "retro-sparse"}
 
 
-def suggest_rosa_retro_bottleneck(trial: optuna.Trial) -> dict[str, Any]:
+def suggest_rosa_retro_bottleneck(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     return {**suggest_rosa(trial), "rosa_mode": "retro-bottleneck"}
 
 
-def suggest_rosa_ratio(trial: optuna.Trial) -> dict[str, Any]:
+def suggest_rosa_ratio(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     """Sweep over the bottleneck-vs-sparse parameter split (RoSA-specific
     v1 sweep)."""
     return {
@@ -122,17 +122,28 @@ def suggest_rosa_ratio(trial: optuna.Trial) -> dict[str, Any]:
     }
 
 
-def suggest_unfreeze(trial: optuna.Trial) -> dict[str, Any]:
-    n = trial.suggest_int("n_layers_unfrozen", 1, 4)
+def suggest_unfreeze(
+    trial: optuna.Trial, *, n_layers: int = 10
+) -> dict[str, Any]:
+    """Sample an unfreeze-layers spec.
+
+    ``n_layers`` is the total depth of the targeted backbone. Defaults
+    to 10 (production SUPERNET), but the sweep driver should pass the
+    actual variant depth so the suggester doesn't propose layer indices
+    that ``init_unfreeze_adapter`` will reject — e.g. for the tiny
+    supernet (n_layers=4) suggesting "7,8,9" kills every trial.
+    """
+    max_unfrozen = min(4, n_layers)
+    n = trial.suggest_int("n_layers_unfrozen", 1, max_unfrozen)
     # Always unfreeze the last N layers — a reasonable v1-style default.
-    layers = ",".join(str(i) for i in range(10 - n, 10))
+    layers = ",".join(str(i) for i in range(n_layers - n, n_layers))
     return {
         "unfreeze_layers": layers,
         "lr": trial.suggest_float("lr", 1e-6, 1e-3, log=True),
     }
 
 
-def suggest_specialized_clm(trial: optuna.Trial) -> dict[str, Any]:
+def suggest_specialized_clm(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     d_model = trial.suggest_categorical("d_model", [32, 64, 96, 128, 192])
     n_heads = trial.suggest_categorical("n_heads", [2, 4])
     # Round d_model up to a multiple of n_heads if needed.
@@ -147,7 +158,7 @@ def suggest_specialized_clm(trial: optuna.Trial) -> dict[str, Any]:
     }
 
 
-STRATEGY_SUGGESTERS: dict[str, Callable[[optuna.Trial], dict[str, Any]]] = {
+STRATEGY_SUGGESTERS: dict[str, Callable[..., dict[str, Any]]] = {
     "lora": suggest_lora,
     "film": suggest_film,
     "bottleneck": suggest_bottleneck,
@@ -197,7 +208,16 @@ def _read_best_val_loss(logs_dir: Path) -> float:
                 continue
             if rec.get("type") != "val":
                 continue
-            v = rec.get("val_loss") or rec.get("loss")
+            # `or` would silently fall back to `loss` if `val_loss` is
+            # 0.0 (legitimate) or NaN-sanitised null. Use explicit
+            # presence checks so a trial with `val_loss=0.0` isn't
+            # mis-keyed on the training loss.
+            if "val_loss" in rec:
+                v = rec["val_loss"]
+            elif "loss" in rec:
+                v = rec["loss"]
+            else:
+                v = None
             if v is None:
                 continue
             try:
@@ -229,12 +249,16 @@ class AdapterObjective:
     script: str = "scripts/train_jax_adapter.py"
     python: str = "python"
     timeout: float | None = None
+    # Backbone depth hint forwarded to suggesters that need it
+    # (currently only `suggest_unfreeze`). Defaults to the production
+    # supernet depth; sweep CLI should override when targeting tiny.
+    n_layers: int = 10
 
     def __call__(self, trial: optuna.Trial) -> float:
         suggester = STRATEGY_SUGGESTERS.get(self.strategy)
         if suggester is None:
             raise ValueError(f"no suggester for strategy {self.strategy!r}")
-        params = suggester(trial)
+        params = suggester(trial, n_layers=self.n_layers)
         trial_logs = self.logs_dir / f"trial_{trial.number:05d}"
         cmd = [
             self.python, self.script,

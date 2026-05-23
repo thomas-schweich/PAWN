@@ -67,6 +67,7 @@ __all__ = [
     "dispatch_filter",
     "make_adapter_train_step",
     "make_adapter_scan_step",
+    "make_forward_eval",
     "forward_eval",
 ]
 
@@ -267,15 +268,38 @@ def make_adapter_scan_step(
 # ---------------------------------------------------------------------------
 
 
-@eqx.filter_jit
+def make_forward_eval(
+    strategy: str,
+) -> Callable[[PAWNModel, Any, Batch], Float[Array, "B T V"]]:
+    """Build a JIT'd forward pass for eval — backbone + adapter → logits.
+
+    Resolves ``dispatch_apply(strategy)`` *outside* the JIT closure so
+    each (strategy, backbone-structure, adapter-structure) tuple
+    compiles once, not per call. Earlier versions took ``strategy`` as
+    an inner argument and called ``dispatch_apply(strategy)`` inside
+    the traced body — that retraced per distinct ``strategy`` value
+    and hid a runtime dispatch in the JIT signature.
+    """
+    apply_fn = dispatch_apply(strategy)
+
+    @eqx.filter_jit
+    def forward_eval(
+        backbone: PAWNModel, adapter: Any, batch: Batch
+    ) -> Float[Array, "B T V"]:
+        effective = apply_fn(backbone, adapter)
+        return effective(batch.tokens, batch.attn_mask)
+
+    return forward_eval
+
+
 def forward_eval(
     backbone: PAWNModel, adapter: Any, batch: Batch, strategy: str
 ) -> Float[Array, "B T V"]:
-    """JIT'd forward pass for eval — backbone + adapter → logits.
+    """Back-compat shim: resolve the JIT'd forward eval per call.
 
-    Doesn't compute gradients; calls the strategy's ``apply`` function
-    to build the effective model, then PAWNModel.__call__.
+    Prefer :func:`make_forward_eval` and reuse the returned closure —
+    repeated invocations of this shim re-resolve ``dispatch_apply``
+    every time, which is exactly the JIT-keying problem
+    :func:`make_forward_eval` solves.
     """
-    apply_fn = dispatch_apply(strategy)
-    effective = apply_fn(backbone, adapter)
-    return effective(batch.tokens, batch.attn_mask)
+    return make_forward_eval(strategy)(backbone, adapter, batch)

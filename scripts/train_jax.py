@@ -38,12 +38,13 @@ from pawn.logging import MetricsLogger
 from pawn.model import init_model
 from pawn.run_config import PretrainConfig
 from pawn.trainer import (
+    Batch,
     TrainState,
     VariantSpec,
     make_lr_schedule,
     make_optimizer,
+    make_scan_step,
     make_train_step,
-    slice_batch,
 )
 
 
@@ -97,12 +98,49 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
     return PretrainConfig(**base)
 
 
+def _resolve_device() -> str:
+    """Device label for MetricsLogger / GPU-stats source.
+
+    Mirrors `scripts/train_jax_adapter._resolve_device` so the logger
+    picks the right `*-smi` shell-out regardless of the JAX backend.
+    """
+    import jax
+
+    backend = jax.default_backend()
+    if backend == "gpu":
+        dev_str = str(jax.devices()[0]).lower()
+        if "rocm" in dev_str:
+            return "rocm"
+        return "cuda"
+    if backend == "tpu":
+        return "tpu"
+    return "cpu"
+
+
+def _require_accelerator() -> None:
+    """Refuse to run training on CPU unless `PAWN_ALLOW_CPU=1` is set.
+
+    Mirrors the v1 escape hatch pinned in plan §6 / CLAUDE.md.
+    """
+    import os
+
+    import jax
+
+    if jax.default_backend() == "cpu" and os.environ.get("PAWN_ALLOW_CPU") != "1":
+        raise SystemExit(
+            "JAX resolved to the CPU backend; refusing to run training. "
+            "Install a GPU jaxlib plugin (--extra rocm or --extra cu128), "
+            "or set PAWN_ALLOW_CPU=1 to override."
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     cfg = _build_config(args)
     if cfg.total_steps is None:
         print("error: --total-steps is required", file=sys.stderr)
         return 2
+    _require_accelerator()
 
     # Pick supernet shape.
     supernet_cfg = TINY_SUPERNET if cfg.supernet == "tiny" else SUPERNET
@@ -132,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
 
     train_step = make_train_step(optimizer, variants)
     logger = MetricsLogger(
-        log_dir=args.logs_dir, run_prefix="pretrain", device="cuda"
+        log_dir=args.logs_dir, run_prefix="pretrain", device=_resolve_device()
     )
     logger.log_config(run_type="pretrain", model=cfg.model_dump())
 
@@ -142,54 +180,76 @@ def main(argv: list[str] | None = None) -> int:
     # SIGTERM handler — flips a flag the loop polls between chunks.
     should_shutdown = install_sigterm_handler()
 
-    # Pre-generate one chunk of training corpus per K steps (random
-    # games are i.i.d. so no shuffle needed).
-    chunk_size = cfg.k * cfg.batch_size
+    # K-step `lax.scan` body — plan §10 S6 + §4: "Whole training loop as
+    # one compiled program — eliminate per-step launch and dispatch
+    # overhead." The scan body never returns to the host inside a chunk;
+    # per-chunk metrics flush between chunks.
+    scan_step = make_scan_step(train_step)
+
     rng = np.random.default_rng(0)
+    indices = np.arange(cfg.batch_size, dtype=np.int64)
+
+    def _save_checkpoint(step_int: int) -> None:
+        out = logger.run_dir / f"step_{step_int:08d}"
+        if out.exists():
+            return
+        save_model(
+            state.model, out,
+            run_config=cfg.model_dump(),
+            training_state={"step": int(state.step)},
+        )
+        if push_tracker:
+            push_checkpoint_async(out, push_tracker)
 
     start = int(state.step)
-    last_save = start
-    losses: list[float] = []
     t0 = time.time()
-    for step in range(start, cfg.total_steps):
-        # Fresh batch each step.
-        seed = int(rng.integers(0, 2**31 - 1))
-        corpus = generate_corpus(
-            n_games=cfg.batch_size, max_ply=cfg.seq_len,
-            seq_len=cfg.seq_len, seed=seed,
+    next_step = start
+    while next_step < cfg.total_steps:
+        # Cap K at remaining steps so the final chunk lands exactly on
+        # `total_steps`. Stack K batches on a leading axis; `scan_step`
+        # runs them in one compiled program.
+        chunk_k = min(cfg.k, cfg.total_steps - next_step)
+        chunk_seed = int(rng.integers(0, 2**31 - 1))
+        chunk_corpus = generate_corpus(
+            n_games=cfg.batch_size * chunk_k,
+            max_ply=cfg.seq_len, seq_len=cfg.seq_len, seed=chunk_seed,
         )
-        batch = slice_batch(corpus, np.arange(cfg.batch_size))
-        state, loss = train_step(state, batch)
-        losses.append(float(loss))
+        tokens = chunk_corpus.tokens.reshape(chunk_k, cfg.batch_size, cfg.seq_len)
+        targets = chunk_corpus.targets.reshape(chunk_k, cfg.batch_size, cfg.seq_len)
+        attn = chunk_corpus.attn_mask.reshape(chunk_k, cfg.batch_size, cfg.seq_len)
+        lmask = chunk_corpus.loss_mask.reshape(chunk_k, cfg.batch_size, cfg.seq_len)
+        chunk_batches = Batch(
+            tokens=jnp.asarray(tokens), targets=jnp.asarray(targets),
+            attn_mask=jnp.asarray(attn), loss_mask=jnp.asarray(lmask),
+        )
+        state, chunk_losses = scan_step(state, chunk_batches)
+        next_step += chunk_k
 
-        if (step + 1) % cfg.log_interval == 0:
-            logger.log_train(
-                step=step + 1, loss=float(loss),
-                lr=np.asarray(schedule(int(state.step))).item(),
-                step_time=(time.time() - t0) / max(1, step + 1 - start),
-            )
+        # One D→H per chunk, not per step.
+        chunk_losses_np = np.asarray(chunk_losses)
 
-        if (step + 1) % cfg.checkpoint_interval == 0 or (step + 1) == cfg.total_steps:
-            if cfg.local_checkpoints or cfg.hf_repo:
-                out = args.logs_dir / f"step_{step + 1:08d}"
-                save_model(
-                    state.model, out,
-                    run_config=cfg.model_dump(),
-                    training_state={"step": int(state.step)},
+        # Log every step that crossed a log_interval boundary inside the
+        # chunk — replays the within-chunk loss curve without per-step
+        # syncs.
+        chunk_start = next_step - chunk_k
+        for i in range(chunk_k):
+            step = chunk_start + i + 1
+            if step % cfg.log_interval == 0:
+                logger.log_train(
+                    step=step, loss=float(chunk_losses_np[i]),
+                    lr=np.asarray(schedule(step)).item(),
+                    step_time=(time.time() - t0) / max(1, step - start),
                 )
-                if push_tracker:
-                    push_checkpoint_async(out, push_tracker)
-                last_save = step + 1
+
+        if (
+            next_step % cfg.checkpoint_interval == 0
+            or next_step == cfg.total_steps
+        ):
+            if cfg.local_checkpoints or cfg.hf_repo:
+                _save_checkpoint(next_step)
 
         if should_shutdown():
-            # Save once before exiting.
-            out = args.logs_dir / f"step_{int(state.step):08d}"
-            if not out.exists():
-                save_model(
-                    state.model, out,
-                    run_config=cfg.model_dump(),
-                    training_state={"step": int(state.step)},
-                )
+            _save_checkpoint(next_step)
             break
 
     if push_tracker:

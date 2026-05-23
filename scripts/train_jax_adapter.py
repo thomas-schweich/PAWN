@@ -55,6 +55,51 @@ from pawn.trainer import (
 )
 
 
+def _resolve_device() -> str:
+    """Return the device label for MetricsLogger / GPU-stats source.
+
+    Reads ``jax.default_backend()`` so the logger picks the right
+    ``smi`` shell-out (``rocm-smi`` on ROCm, ``nvidia-smi`` on CUDA)
+    instead of hardcoding ``cuda``. Falls back to ``cpu`` when JAX
+    reports no accelerator — the script then exits unless the operator
+    has set ``PAWN_ALLOW_CPU=1`` (parity with the v1 escape hatch
+    pinned in plan §6).
+    """
+    import jax
+
+    backend = jax.default_backend()
+    if backend == "gpu":
+        # `jax.devices()[0]` reports `rocm:0` on ROCm and `cuda:0` on
+        # NVIDIA; the prefix is what the MetricsLogger keys on.
+        dev_str = str(jax.devices()[0]).lower()
+        if "rocm" in dev_str:
+            return "rocm"
+        return "cuda"
+    if backend == "tpu":
+        return "tpu"
+    return "cpu"
+
+
+def _require_accelerator() -> None:
+    """Refuse to run training on CPU unless ``PAWN_ALLOW_CPU=1`` is set.
+
+    JAX silently falls back to CPU if no GPU plugin is installed; without
+    this guard, an operator can start a multi-hour run and only notice
+    much later (per CLAUDE.md / plan §6 the v1 escape hatch is
+    ``PAWN_ALLOW_CPU=1``; preserve it).
+    """
+    import os
+
+    import jax
+
+    if jax.default_backend() == "cpu" and os.environ.get("PAWN_ALLOW_CPU") != "1":
+        raise SystemExit(
+            "JAX resolved to the CPU backend; refusing to run training. "
+            "Install a GPU jaxlib plugin (--extra rocm or --extra cu128), "
+            "or set PAWN_ALLOW_CPU=1 to override."
+        )
+
+
 def _strategy_config_from_run(cfg: AdapterConfig) -> object:
     """Build the adapter's strategy Config from the AdapterConfig fields."""
     s = cfg.strategy
@@ -83,9 +128,25 @@ def _strategy_config_from_run(cfg: AdapterConfig) -> object:
             density=cfg.density or 0.01,
             targets=cfg.sparse_targets or "qkvo",
         )
-    if s in ("rosa",):
+    if s in ("rosa", "rosa-retro-sparse", "rosa-retro-bottleneck"):
+        # The three RoSA-family strategies share init/apply; the mode is
+        # what differs. Default `mode` to the strategy name suffix when
+        # the user uses --strategy directly; honour an explicit
+        # --rosa-mode override.
+        from typing import cast
+
+        from pawn.adapters.rosa import RoSAMode
+        suffix_to_mode: dict[str, RoSAMode] = {
+            "rosa": "rosa",
+            "rosa-retro-sparse": "retro-sparse",
+            "rosa-retro-bottleneck": "retro-bottleneck",
+        }
+        mode: RoSAMode = (
+            cast(RoSAMode, cfg.rosa_mode) if cfg.rosa_mode is not None
+            else suffix_to_mode[s]
+        )
         return RoSAConfig(
-            mode=cfg.rosa_mode or "rosa",
+            mode=mode,
             lora_rank=cfg.lora_rank or 4,
             density=cfg.density or 0.01,
             rosa_warmup_steps=cfg.rosa_warmup_steps,
@@ -153,7 +214,11 @@ def _build_config(args: argparse.Namespace) -> AdapterConfig:
     for flag, val in vars(args).items():
         if flag in ("config", "no_pgn", "local_checkpoints", "logs_dir"):
             continue
-        if val is None or val is False:
+        # Skip None (not-set) but keep False so a user can disable a
+        # default-True `store_true` flag via the JSON config. (CLI alone
+        # can't flip a `store_true` back to False; the merge from `args`
+        # to the pydantic config dict is the only path.)
+        if val is None:
             continue
         base[flag] = val
     if args.local_checkpoints:
@@ -167,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.total_steps is None:
         print("error: --total-steps is required", file=sys.stderr)
         return 2
+    _require_accelerator()
     if cfg.strategy not in STRATEGIES:
         print(f"error: unknown strategy {cfg.strategy!r}", file=sys.stderr)
         return 2
@@ -255,12 +321,33 @@ def main(argv: list[str] | None = None) -> int:
 
     logger = MetricsLogger(
         log_dir=args.logs_dir, run_prefix=f"adapter-{cfg.strategy}",
-        device="cuda", suffix=cfg.variant,
+        device=_resolve_device(), suffix=cfg.variant,
     )
     logger.log_config(run_type="adapter", config=cfg.model_dump())
 
     push_tracker = HFPushTracker(repo_id=cfg.hf_repo) if cfg.hf_repo else None
     should_shutdown = install_sigterm_handler()
+
+    def _save(step_int: int) -> None:
+        """Save the *effective* model — `apply_fn(backbone, adapter)` —
+        not the frozen backbone. The whole point of adapter training is
+        that `state.adapter` holds the trained delta; saving the
+        backbone discards it. The effective model loads cleanly via
+        `pawn.checkpoint.load_model` and downstream eval scripts treat
+        it as an ordinary published checkpoint.
+
+        Checkpoints land under the MetricsLogger's per-run directory so
+        two concurrent runs can't collide on the same path.
+        """
+        effective = apply_fn(state.backbone, state.adapter)
+        out = logger.run_dir / f"adapter_step_{step_int:08d}"
+        save_model(
+            effective, out,
+            run_config=cfg.model_dump(),
+            training_state={"step": int(state.step)},
+        )
+        if push_tracker:
+            push_checkpoint_async(out, push_tracker)
 
     rng = np.random.default_rng(0)
     val_rng = np.random.default_rng(1)
@@ -269,10 +356,12 @@ def main(argv: list[str] | None = None) -> int:
     # objective and §3 criterion 7's "val loss decreases" key on).
     eval_interval = cfg.eval_interval or cfg.log_interval
     t0 = time.time()
+    final_step = 0
     for step in range(cfg.total_steps):
         idx = rng.integers(0, corpus.n_games, size=cfg.batch_size)
         batch = slice_batch(corpus, idx)
         state, loss = train_step(state, batch)
+        final_step = step + 1
         if (step + 1) % cfg.log_interval == 0:
             logger.log_train(
                 step=step + 1, loss=float(loss),
@@ -290,16 +379,16 @@ def main(argv: list[str] | None = None) -> int:
                 val_source=cfg.pgn_val_split if not args.no_pgn else "random",
             )
         if (step + 1) % cfg.checkpoint_interval == 0:
-            out = args.logs_dir / f"adapter_step_{step + 1:08d}"
-            save_model(
-                state.backbone, out,
-                run_config=cfg.model_dump(),
-                training_state={"step": int(state.step)},
-            )
-            if push_tracker:
-                push_checkpoint_async(out, push_tracker)
+            _save(step + 1)
         if should_shutdown():
             break
+    # Always emit a final checkpoint at run-end, even when
+    # `total_steps < checkpoint_interval` (short LoRA smokes, sweeps,
+    # the §3 criterion 7 acceptance command). Without this the trained
+    # adapter weights are discarded silently when the loop exits before
+    # crossing a checkpoint boundary.
+    if final_step > 0 and final_step % cfg.checkpoint_interval != 0:
+        _save(final_step)
     if push_tracker:
         drain_push_queue(push_tracker, timeout=300.0)
         push_tracker.shutdown()

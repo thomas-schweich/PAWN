@@ -89,7 +89,7 @@ x = x + FFN(RMSNorm(x))
 
 A final RMSNorm is applied after the last transformer block, before the output projection.
 
-**Attention.** Standard multi-head self-attention with no bias terms in any of the projection matrices (Q, K, V, output). Attention uses PyTorch's `scaled_dot_product_attention` with a causal mask combined with a padding mask. The padding mask ensures that PAD tokens are not attended to.
+**Attention.** Standard multi-head self-attention with no bias terms in any of the projection matrices (Q, K, V, output). The v2 stack (JAX/Equinox/Optax) materialises the attention `QK^T` scores plainly with a causal × padding mask combined via `jax.numpy.where`; the v1 PyTorch stack used `torch.nn.functional.scaled_dot_product_attention`. At seq 512 attention is ~12% of step FLOPs and plain attention sidesteps fused-kernel maturity under JAX-on-ROCm. The padding mask ensures that PAD tokens are not attended to.
 
 **Positional encoding.** [Rotary Position Embeddings (RoPE)](https://arxiv.org/abs/2104.09864) (Su et al., 2021) with base frequency 10000. RoPE is applied to the query and key vectors after projection, before the attention computation. Frequency tensors are precomputed for the full sequence length and stored as non-persistent buffers.
 
@@ -107,13 +107,23 @@ This uses three weight matrices per block instead of the standard two, with no b
 
 ## Model Variants
 
+**v1 (published HF checkpoints — PyTorch):**
+
 | Variant | d_model | Layers | Heads | Head dim | d_ff | Parameters |
 |---------|---------|--------|-------|----------|------|------------|
 | Small   | 256     | 8      | 4     | 64       | 1024 | 8.94M      |
 | Base    | 512     | 8      | 8     | 64       | 2048 | 34.65M     |
 | Large   | 640     | 10     | 8     | 80       | 2560 | 66.91M     |
 
-All variants use the same vocabulary, sequence length (512), and architectural choices. They differ only in width, depth, and head count. A `toy` variant (d=64, 2 layers, 4 heads) exists for testing.
+**v2 (JAX/Equinox/Optax — supernet + nested slices, all share depth + head_dim):**
+
+| Variant | d_model | Layers | Heads | Head dim | d_ff |
+|---------|---------|--------|-------|----------|------|
+| Small   | 256     | 10     | 4     | 64       | 1024 |
+| Base    | 512     | 10     | 8     | 64       | 2048 |
+| Large   | 640     | 10     | 10    | 64       | 2560 |
+
+The v2 stack pins `head_dim = 64` so width slices align to whole heads and RoPE is variant-invariant; all variants share the supernet's depth (10 layers) so the inner `[:d_V, :d_V]` of every weight matrix gives a valid sub-model. A `TINY_SUPERNET` (d=192, 4 layers, 3 heads) exists for verification runs that don't need production scale.
 
 The v1.0.0 parameter counts are slightly lower than the legacy `-legacy` repos with the same `d_model`/`n_layers`/`n_heads`, because the new 1,980-token vocabulary has roughly half the entries of the old 4,278-token vocab. The output projection (`lm_head`: `d_model → vocab_size`) is the only place vocab size enters the parameter count — factored input embeddings keep the input side compact regardless.
 

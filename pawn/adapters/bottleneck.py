@@ -46,6 +46,17 @@ class BottleneckConfig:
     no_adapt_attn: bool = False
     no_adapt_ffn: bool = False
 
+    def __post_init__(self) -> None:
+        # Both placement flags off ⇒ the adapter touches nothing and
+        # would silently degenerate to "frozen backbone" at runtime.
+        # Surface that as a config error rather than a no-op run.
+        if self.no_adapt_attn and self.no_adapt_ffn:
+            raise ValueError(
+                "BottleneckConfig: no_adapt_attn and no_adapt_ffn are "
+                "both set — the bottleneck would touch nothing. Enable "
+                "at least one site."
+            )
+
 
 class BottleneckAdapter(eqx.Module):
     """Per-layer down/up bottleneck weights.
@@ -70,7 +81,11 @@ def init_bottleneck_adapter(
     d = backbone.cfg.d_model
     n_layers = backbone.cfg.n_layers
     keys = jax.random.split(key, 2)
-    bound = math.sqrt(6.0 / d) / math.sqrt(3.0)
+    # Kaiming-uniform with fan-in = d_model, a=sqrt(5) — matches
+    # PyTorch's `kaiming_uniform_(a=sqrt(5))` (gain=sqrt(1/3),
+    # bound=sqrt(1/fan_in)). Earlier version used sqrt(2/d) which is
+    # the gain=1 ReLU variant and inflated init by sqrt(2).
+    bound = math.sqrt(1.0 / d)
     down = jax.random.uniform(
         keys[0], (n_layers, d, cfg.dim), minval=-bound, maxval=bound
     )

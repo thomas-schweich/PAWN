@@ -45,10 +45,16 @@ def main(argv: list[str] | None = None) -> int:
         "--k", "5",
         "--local-checkpoints",
     ]
+    # Resolve backbone depth so `suggest_unfreeze` doesn't propose
+    # layer indices outside the variant's actual depth (tiny supernet
+    # has 4 layers, production has 10).
+    from pawn.config import SUPERNET, TINY_SUPERNET
+    target = TINY_SUPERNET if args.supernet == "tiny" else SUPERNET
     obj = AdapterObjective(
         strategy=args.strategy,
         base_args=base_args,
         logs_dir=args.logs_dir,
+        n_layers=target.n_layers,
     )
     study.optimize(obj, n_trials=args.n_trials)
     print(f"best_value: {study.best_value}")

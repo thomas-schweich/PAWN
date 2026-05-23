@@ -195,11 +195,15 @@ def test_adapter_model_json_schema_includes_strategy_enum() -> None:
     schema = AdapterConfig.model_json_schema()
     assert "properties" in schema
     strategy_field = schema["properties"]["strategy"]
-    # Pydantic encodes Literal[...] as enum
+    # Pydantic encodes Literal[...] as enum. All 10 keys in
+    # `pawn.adapter_trainer.STRATEGIES` must be admissible — the three
+    # RoSA modes (`rosa`, `rosa-retro-sparse`, `rosa-retro-bottleneck`)
+    # are distinct CLI strategies per the plan adapter table.
     assert "enum" in strategy_field
     assert set(strategy_field["enum"]) == {
         "bottleneck", "lora", "film", "sparse",
-        "rosa", "hybrid", "specialized_clm", "unfreeze",
+        "rosa", "rosa-retro-sparse", "rosa-retro-bottleneck",
+        "hybrid", "specialized_clm", "unfreeze",
     }
 
 

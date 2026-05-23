@@ -293,9 +293,14 @@ class AdapterConfig(BaseRunConfig):
     """
 
     run_type: Literal["adapter"] = "adapter"
+    # All 10 keys in `pawn.adapter_trainer.STRATEGIES`. The three RoSA
+    # modes (`rosa`, `rosa-retro-sparse`, `rosa-retro-bottleneck`) are
+    # distinct CLI strategies per CLAUDE.md's adapter table — they share
+    # init/apply but the `rosa_mode` field selects the sub-mode.
     strategy: Literal[
         "bottleneck", "lora", "film", "sparse",
-        "rosa", "hybrid", "specialized_clm", "unfreeze",
+        "rosa", "rosa-retro-sparse", "rosa-retro-bottleneck",
+        "hybrid", "specialized_clm", "unfreeze",
     ]
     # Which v1 checkpoint to adapt. Loaded through
     # `pawn.legacy.convert_legacy_checkpoint` when this points at the

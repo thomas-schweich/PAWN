@@ -33,6 +33,7 @@ from pawn.model import PAWNModel
 __all__ = [
     "RoSAConfig",
     "RoSAAdapter",
+    "RoSAMode",
     "init_rosa_adapter",
     "apply_rosa",
     "rosa_filter",

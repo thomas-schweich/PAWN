@@ -11,7 +11,7 @@ Feel free to use PAWN in your own experiments. PAWN is developed as a personal p
 
 ## Model Variants
 
-The model comes in three sizes, all trained from scratch on random chess games generated on-the-fly by a Rust-based chess backend. The v1.0.0 weights were trained together for 200K steps at batch size 256 on a single GPU — all three variants see the same random-game batches each step, with one forward/backward pass per variant in sequence (see [cotrain config](configs/cotrain_three_variants.json)). The numbers below come from the best 5K-cadence checkpoint by val loss (step 195,000 ≈ 49.9M sequences) for all three variants:
+The model comes in three sizes, all trained from scratch on random chess games generated on-the-fly by a Rust-based chess backend. The v1.0.0 weights were trained together for 200K steps at batch size 256 on a single GPU — all three variants see the same random-game batches each step, with one forward/backward pass per variant in sequence. **The v1 numbers below come from the best 5K-cadence checkpoint by val loss (step 195,000 ≈ 49.9M sequences) for all three variants under the PyTorch stack. The v2 stack (JAX/Equinox/Optax) replaces multi-variant cotraining with the supernet's joint loss; v2 weights publish to new HF repos (`pawn-{small,base,large}-v2`).**
 
 | Variant | d_model | Layers | Heads | Params | Top-1 | Legal rate | Game completion | Download |
 |---------|---------|--------|-------|--------|-------|------------|-----------------|----------|

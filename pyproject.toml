@@ -50,13 +50,13 @@ rocm = [
     "torch~=2.10.0",
     "triton-rocm>=3.6.0",
     "triton>=3.6.0",
-    # JAX-on-ROCm: system ROCm 7.x runtime + plugin from PyPI.
-    "jaxlib==0.10.0",
+    # JAX-on-ROCm: system ROCm 7.x runtime + plugin from PyPI. The base
+    # `jaxlib==0.10.0` pin in [project.dependencies] is shared by both
+    # GPU extras; only the platform-specific plugin lives here.
     "jax-rocm7-plugin==0.10.0",
 ]
 cu128 = [
     "torch~=2.10.0",
-    "jaxlib==0.10.0",
     "jax-cuda12-plugin[with-cuda]==0.10.0",
 ]
 # Solara dashboard for log inspection.

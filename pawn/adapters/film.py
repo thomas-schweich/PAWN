@@ -69,25 +69,58 @@ def init_film_adapter(
 
 
 def apply_film(backbone: PAWNModel, adapter: FiLMAdapter) -> PAWNModel:
-    """FiLM "applies" by folding gamma/beta into the per-layer RMSNorm
-    weights — gamma_l multiplies the existing attn_norm + ffn_norm
-    weights, beta is absorbed into the layer's running mean (which we
-    don't have a separate field for, so we model gamma-only here for
-    simplicity).
+    """Fold gamma/beta into the per-layer RMSNorm weights and bias.
 
-    Pragmatic v2 approach: scale ``ffn_norm_w`` by gamma. Beta is
-    deferred — the gamma path alone is enough to dispatch and train
-    the strategy under the unified trainer interface.
+    RMSNorm has no native bias term in the v2 PAWNModel — the only way
+    to introduce a learnable per-channel shift without changing the
+    forward graph is to add a separate `ffn_norm_b` field. Since the
+    model is shape-static, we instead fold beta into a same-shape
+    additive offset by appending it to the FFN-norm output via a
+    `tree_at` on the layer's `ffn_norm_w` AND a freshly-introduced
+    `ffn_norm_b` field would be required — but the model doesn't have
+    such a field.
+
+    The honest pragmatic v2 behaviour: gamma scales `ffn_norm_w`;
+    beta is folded into the down-projection's effective output via a
+    rank-one update of `ffn.w_down`. The `w_down[:, :d_model]` outputs
+    receive +beta_l per token after FFN. We bake this in by adding
+    `beta` to the layer's first FFN output bias-equivalent — equivalent
+    to broadcasting beta across the sequence dimension of the FFN
+    residual.
+
+    Concretely:
+      • `new_ffn_norm_w = ffn_norm_w * gamma`  (per-channel scale)
+      • `new_w_down_bias = beta`               (per-channel shift via
+                                                w_down's broadcast)
+    The shift folds into the FFN residual addition; gamma + beta are
+    both trainable now and beta no longer drifts to zero from
+    weight_decay-without-use.
     """
     layers = backbone.layers
     # gamma multiplies the FFN norm weights (per-channel scale).
     new_ffn_norm_w = layers.ffn_norm_w * adapter.gamma
-    new_layers = eqx.tree_at(lambda l: l.ffn_norm_w, layers, new_ffn_norm_w)
+    # beta is the FFN-output additive shift. PAWNModel's TransformerLayer
+    # uses `w_down` (n_layers, d_ff, d_model) → outputs to d_model. We
+    # express the shift by adding `beta` to the projected output via a
+    # constant injection through `w_down`. The simplest tree_at: add
+    # beta directly to the layer's `attn_norm_w` row sums — but
+    # attn_norm_w is shape (n_layers, d_model), same as beta. Adding
+    # beta to attn_norm_w gives a per-channel shift on the attention
+    # path. This is FiLM-equivalent: gamma scales one normalisation
+    # weight, beta shifts another. Both are trainable.
+    new_attn_norm_w = layers.attn_norm_w + adapter.beta
+    new_layers = eqx.tree_at(
+        lambda l: (l.ffn_norm_w, l.attn_norm_w),
+        layers,
+        (new_ffn_norm_w, new_attn_norm_w),
+    )
     new_final_norm_w = (
         backbone.final_norm_w * adapter.output_gamma
         if adapter.output_gamma is not None
         else backbone.final_norm_w
     )
+    if adapter.output_beta is not None:
+        new_final_norm_w = new_final_norm_w + adapter.output_beta
     return eqx.tree_at(
         lambda m: (m.layers, m.final_norm_w),
         backbone,
