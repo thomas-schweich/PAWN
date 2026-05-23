@@ -465,6 +465,15 @@ class AdapterConfig(BaseRunConfig):
 
     @model_validator(mode="after")
     def _check_adapter_cadence(self) -> "AdapterConfig":
+        # Mirror PretrainConfig — every training run needs a concrete
+        # step budget, surfaced as a pydantic ValueError at parse time
+        # so the lab manager + discriminated-union dispatch fail loudly
+        # rather than at script entry (round-1 review-type-correctness).
+        if self.total_steps is None:
+            raise ValueError(
+                "AdapterConfig requires total_steps; pass --total-steps N "
+                "or set it in the JSON config"
+            )
         if self.epochs <= 0:
             raise ValueError(f"epochs must be positive, got {self.epochs}")
         if self.val_every <= 0:
@@ -572,6 +581,15 @@ class SpecializedCLMConfig(BaseRunConfig):
 
     @model_validator(mode="after")
     def _check_arch(self) -> "SpecializedCLMConfig":
+        # Mirror PretrainConfig / AdapterConfig — surface the missing
+        # `total_steps` at pydantic parse time so the discriminated-union
+        # dispatch fails loudly rather than deferring to the script's
+        # entry point (round-1 review-type-correctness).
+        if self.total_steps is None:
+            raise ValueError(
+                "SpecializedCLMConfig requires total_steps; pass "
+                "--total-steps N or set it in the JSON config"
+            )
         if self.d_model <= 0:
             raise ValueError(f"d_model must be positive, got {self.d_model}")
         if self.n_layers <= 0:

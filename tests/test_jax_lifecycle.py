@@ -203,11 +203,21 @@ def test_load_resume_state_restores_opt_state_when_present(
     model = init_model(TINY_SUPERNET, key=0)
     opt = optax.adamw(1e-3)
     template = opt.init(eqx.filter(model, eqx.is_inexact_array))
-    # Synthesise a "trained" opt_state by injecting non-zero leaves so
-    # we can tell it apart from a freshly-initialised template.
+    # Synthesise a "trained" opt_state by injecting non-zero leaves on
+    # BOTH the float (mu / nu — Adam moments) and the int (count —
+    # Adam step counter) leaves. Round-1 review caught that bumping
+    # only floats meant a corrupted `count` would slip through —
+    # bias-correction divides by `1 - b1^count`, so a count stuck at
+    # zero NaNs every gradient on the first resumed step.
     def _bump(leaf):
-        if hasattr(leaf, "shape") and leaf.dtype.kind == "f":
+        if not hasattr(leaf, "dtype"):
+            return leaf
+        if leaf.dtype.kind == "f":
             return leaf + 0.5
+        if leaf.dtype.kind in ("i", "u"):
+            # +42 picks a non-zero, non-default value the round-trip
+            # has to preserve. (jnp.int32 + python int → jnp.int32.)
+            return leaf + 42
         return leaf
     trained = jax.tree_util.tree_map(_bump, template)
 
@@ -219,13 +229,21 @@ def test_load_resume_state_restores_opt_state_when_present(
     )
 
     restored = load_resume_state(out_dir, opt, key=jax.random.key(0))
-    # The Adam moments (mu / nu) must equal the synthesised trained
-    # values, not the fresh-init zeros. Compare PyTree-wise.
+    # The Adam moments (mu / nu) AND the step counter (count) must
+    # equal the synthesised trained values, not the fresh-init zeros.
+    # Assert both value AND dtype equality leaf-wise — the dtype-bind
+    # in `unflatten_opt_state` is the defense against silent int
+    # narrowing across the safetensors round-trip.
     trained_leaves = jax.tree_util.tree_leaves(trained)
     restored_leaves = jax.tree_util.tree_leaves(restored.opt_state)
     assert len(trained_leaves) == len(restored_leaves)
     for t, r in zip(trained_leaves, restored_leaves):
-        assert (jnp.asarray(t) == jnp.asarray(r)).all()
+        t_arr = jnp.asarray(t)
+        r_arr = jnp.asarray(r)
+        assert t_arr.dtype == r_arr.dtype, (
+            f"dtype mismatch on round-trip: {t_arr.dtype} vs {r_arr.dtype}"
+        )
+        assert (t_arr == r_arr).all()
 
 
 def test_load_resume_state_warns_on_missing_opt_state(

@@ -303,13 +303,23 @@ def make_lr_schedule(
             if cfg.wsd_decay_shape == "linear"
             else optax.cosine_decay_schedule(peak, decay_steps, 0.0)
         )
+        # Pure float-fraction rounding can drive `total_steps -
+        # decay_steps < warmup` (e.g. `warmup_frac=0.5, decay_frac=0.5,
+        # total_steps=3` rounds to warmup=2, decay=2, decay-start=1).
+        # Clamp to the warmup boundary so `join_schedules` boundaries
+        # stay monotonic; the stable phase has zero width then, which is
+        # the right behavior — the schedule transitions straight from
+        # warmup into decay. Mirrors the `max(0, ...)` clamp the
+        # `infinite` branch has at line 379. (Round-1 review-test-risk
+        # + review-bug-detector flagged the missing clamp.)
+        decay_start = max(warmup, total_steps - decay_steps)
         return optax.join_schedules(
             [
                 optax.linear_schedule(0.0, peak, warmup),
                 optax.constant_schedule(peak),
                 decay,
             ],
-            [warmup, total_steps - decay_steps],
+            [warmup, decay_start],
         )
     if cfg.lr_schedule == "one_cycle":
         init = peak / 25.0
@@ -414,14 +424,23 @@ def flatten_opt_state(opt_state: optax.OptState) -> dict[str, np.ndarray]:
     Optax's scalar counters that JAX serialises as 0-d arrays) are
     stored too. The companion :func:`unflatten_opt_state` rebuilds
     the PyTree using a freshly-initialised opt_state as the template.
+
+    Issues ONE batched device→host transfer via :func:`jax.device_get`
+    instead of one `np.asarray` round-trip per leaf — at SUPERNET
+    scale the opt_state carries ~3× the model parameter count (Adam
+    moments + clip), so the per-leaf path stalled the trainer at
+    checkpoint boundaries waiting on N separate D→H copies. The
+    batched form lets the XLA backend coalesce the transfer.
+    (Round-1 review-performance-analyzer Critical.)
     """
-    leaves_with_paths, _ = jax.tree_util.tree_flatten_with_path(opt_state)
+    host_state = jax.device_get(opt_state)
+    leaves_with_paths, _ = jax.tree_util.tree_flatten_with_path(host_state)
     out: dict[str, np.ndarray] = {}
     for path, leaf in leaves_with_paths:
         key = jax.tree_util.keystr(path)
-        # Optax states contain a mix of arrays and python scalars (the
-        # step counter, sometimes). Coerce everything to numpy — JAX
-        # arrays via `np.asarray`, scalars via the same.
+        # After `jax.device_get`, leaves are already numpy / python
+        # scalars; `np.asarray` is a no-op wrap for the array case
+        # and a trivial 0-d allocation for the scalar case.
         out[key] = np.asarray(leaf)
     return out
 
@@ -454,8 +473,19 @@ def unflatten_opt_state(
             f"current init. Missing: {missing[:5]}{'…' if len(missing) > 5 else ''} "
             f"Extra: {extra[:5]}{'…' if len(extra) > 5 else ''}"
         )
+    # Bind each restored leaf's dtype to the template leaf's dtype.
+    # Without `dtype=`, `jnp.asarray(numpy_array)` infers from the
+    # numpy dtype — fine for floats but a silent narrowing risk if
+    # Optax ever stores a Python int (which `np.asarray` widens to
+    # int64 on Linux/x86_64) where the template expected int32.
+    # Asserting dtype match keeps the round-trip faithful (round-1
+    # review-bug-detector defense-in-depth.)
     new_leaves = [
-        jnp.asarray(flat[jax.tree_util.keystr(p)]) for p, _ in leaves_with_paths
+        jnp.asarray(
+            flat[jax.tree_util.keystr(p)],
+            dtype=getattr(leaf, "dtype", None),
+        )
+        for p, leaf in leaves_with_paths
     ]
     return jax.tree_util.tree_unflatten(treedef, new_leaves)
 

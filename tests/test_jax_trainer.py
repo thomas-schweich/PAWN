@@ -321,6 +321,27 @@ def test_lr_schedule_infinite_with_extreme_rounding_doesnt_crash() -> None:
         _f(sched(step))
 
 
+def test_lr_schedule_wsd_with_extreme_rounding_doesnt_crash() -> None:
+    """Mirror of the infinite-schedule rounding test. The `wsd`
+    boundary `total_steps - decay_steps` can fall below `warmup` when
+    `warmup_frac + decay_frac` rounds just over 1.0 — e.g.
+    `warmup_frac=0.5, decay_frac=0.5, total_steps=3` rounds to
+    warmup=2, decay_steps=2, decay-start=1 (< warmup). Clamp
+    `decay_start = max(warmup, total_steps - decay_steps)` keeps the
+    `join_schedules` boundaries monotonic. (Round-1 review-test-risk +
+    review-bug-detector caught the missing clamp.)
+    """
+    cfg = _make_cfg(
+        lr_schedule="wsd",
+        warmup_frac=0.5,
+        decay_frac=0.5,
+        total_steps=3,
+    )
+    sched = make_lr_schedule(cfg, total_steps=3)
+    for step in range(3):
+        _f(sched(step))
+
+
 def test_supernet_joint_loss_rejects_empty_variants() -> None:
     """An empty `variants` tuple would produce zero loss every step,
     silently advancing the optimizer state with weight-decay drift.

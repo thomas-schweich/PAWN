@@ -51,7 +51,8 @@ from pawn.logging import MetricsLogger
 from pawn.model import init_model, sliced
 from pawn.run_config import AdapterConfig
 from pawn.trainer import (
-    cross_entropy_loss, make_lr_schedule, make_optimizer, slice_batch,
+    cross_entropy_loss, flatten_opt_state, make_lr_schedule,
+    make_optimizer, slice_batch,
 )
 
 
@@ -336,6 +337,13 @@ def main(argv: list[str] | None = None) -> int:
         `pawn.checkpoint.load_model` and downstream eval scripts treat
         it as an ordinary published checkpoint.
 
+        Also persists `optimizer.safetensors` (Adam moments + clip
+        counter) via `flatten_opt_state` so an adapter `--resume` doesn't
+        cold-start the optimiser — mirrors the pretrain save path added
+        in commit 92d618b for PR review #1, and addresses the round-1
+        review-bug-detector finding that adapter resumes were emitting
+        the "no optimizer.safetensors" warning every time.
+
         Checkpoints land under the MetricsLogger's per-run directory so
         two concurrent runs can't collide on the same path.
         """
@@ -344,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
         save_model(
             effective, out,
             run_config=cfg.model_dump(),
+            optimizer_state=flatten_opt_state(state.opt_state),
             training_state={"step": int(state.step)},
         )
         if push_tracker:
@@ -390,8 +399,11 @@ def main(argv: list[str] | None = None) -> int:
     if final_step > 0 and final_step % cfg.checkpoint_interval != 0:
         _save(final_step)
     if push_tracker:
-        drain_push_queue(push_tracker, timeout=300.0)
-        push_tracker.shutdown()
+        # Same gating as `scripts/train_jax.py` — if drain timed out
+        # on a stuck upload, fall back to wait=False so the trainer
+        # exits within the bounded SIGTERM budget.
+        failures = drain_push_queue(push_tracker, timeout=300.0)
+        push_tracker.shutdown(drain_succeeded=(failures == 0))
     logger.close()
     return 0
 

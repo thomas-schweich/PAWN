@@ -106,16 +106,31 @@ class HFPushTracker:
                 failures += 1
         return failures
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, drain_succeeded: bool = True) -> None:
         """Drain the executor.
 
-        `wait=True` lets *running* uploads finish — `Future.cancel()` on
-        a running thread is a no-op, and a `shutdown(wait=False)` would
-        abandon the live thread mid-write (PR #115 review #6).
-        `cancel_futures=True` does drop queued-but-not-started uploads
-        so we don't block forever on a deep backlog.
+        Two-state contract:
+
+        - ``drain_succeeded=True`` (caller verified every prior upload
+          completed within budget): ``wait=True`` so running uploads
+          finish cleanly. ``cancel_futures=True`` drops queued-but-not-
+          started uploads so we don't block on a backlog.
+
+        - ``drain_succeeded=False`` (the prior ``drain_push_queue``
+          timed out — a future is stuck mid-upload and ``cancel()`` is
+          a no-op on a running thread): ``wait=False`` so the trainer
+          can exit promptly. The stuck thread is abandoned at process
+          exit. This preserves the bounded SIGTERM total time that the
+          ``drain_push_queue(timeout=300)`` contract advertised.
+
+        Without this gating, a stuck upload made the trainer hang
+        forever at shutdown (Codex P2 / bug-detector Important on the
+        round-1 review of commit 92d618b).
         """
-        self._executor.shutdown(wait=True, cancel_futures=True)
+        if drain_succeeded:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+        else:
+            self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 def push_checkpoint_async(

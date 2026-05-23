@@ -112,7 +112,7 @@ def test_validate_config_dispatches_by_run_type() -> None:
     assert isinstance(
         validate_config({
             "run_type": "adapter", "local_checkpoints": True,
-            "strategy": "lora", "lora_rank": 4,
+            "total_steps": 100, "strategy": "lora", "lora_rank": 4,
         }),
         AdapterConfig,
     )
@@ -146,6 +146,7 @@ def test_lab_launch_dry_run_validates_without_spawning() -> None:
         {
             "run_type": "adapter",
             "local_checkpoints": True,
+            "total_steps": 100,
             "strategy": "lora",
             "lora_rank": 4,
         },

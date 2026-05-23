@@ -267,8 +267,14 @@ def main(argv: list[str] | None = None) -> int:
             break
 
     if push_tracker:
-        drain_push_queue(push_tracker, timeout=300.0)
-        push_tracker.shutdown()
+        # `drain_push_queue` returns the number of failures (timed-out
+        # or errored uploads). When non-zero, a future is stuck mid-
+        # upload and `Future.cancel()` is a no-op on a running thread —
+        # `shutdown(drain_succeeded=False)` falls back to `wait=False`
+        # so the trainer exits within the bounded SIGTERM budget the
+        # 300s drain advertised.
+        failures = drain_push_queue(push_tracker, timeout=300.0)
+        push_tracker.shutdown(drain_succeeded=(failures == 0))
     logger.close()
     return 0
 

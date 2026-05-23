@@ -44,6 +44,7 @@ def _pretrain_kwargs(**overrides: Any) -> dict[str, Any]:
 def _adapter_kwargs(**overrides: Any) -> dict[str, Any]:
     base: dict[str, Any] = {
         "local_checkpoints": True,
+        "total_steps": 100,
         "strategy": "lora",
         "lora_rank": 4,
     }
@@ -54,6 +55,7 @@ def _adapter_kwargs(**overrides: Any) -> dict[str, Any]:
 def _specialized_kwargs(**overrides: Any) -> dict[str, Any]:
     base: dict[str, Any] = {
         "local_checkpoints": True,
+        "total_steps": 100,
         "d_model": 64,
         "n_layers": 2,
         "n_heads": 2,
@@ -433,53 +435,53 @@ def test_pretrain_checkpoint_interval_positive() -> None:
 
 def test_adapter_lora_requires_rank() -> None:
     with pytest.raises(ValueError, match="lora_rank"):
-        AdapterConfig(local_checkpoints=True, strategy="lora")
+        AdapterConfig(local_checkpoints=True, total_steps=100, strategy="lora")
 
 
 def test_adapter_lora_rank_must_be_positive() -> None:
     with pytest.raises(ValueError, match="lora_rank"):
-        AdapterConfig(local_checkpoints=True, strategy="lora", lora_rank=0)
+        AdapterConfig(local_checkpoints=True, total_steps=100, strategy="lora", lora_rank=0)
 
 
 def test_adapter_sparse_requires_density() -> None:
     with pytest.raises(ValueError, match="density"):
-        AdapterConfig(local_checkpoints=True, strategy="sparse")
+        AdapterConfig(local_checkpoints=True, total_steps=100, strategy="sparse")
 
 
 def test_adapter_sparse_density_in_unit_interval() -> None:
     with pytest.raises(ValueError, match="density"):
         AdapterConfig(
-            local_checkpoints=True, strategy="sparse", density=1.5
+            local_checkpoints=True, total_steps=100, strategy="sparse", density=1.5
         )
 
 
 def test_adapter_bottleneck_requires_dim() -> None:
     with pytest.raises(ValueError, match="bottleneck_dim"):
-        AdapterConfig(local_checkpoints=True, strategy="bottleneck")
+        AdapterConfig(local_checkpoints=True, total_steps=100, strategy="bottleneck")
 
 
 def test_adapter_bottleneck_dim_positive() -> None:
     with pytest.raises(ValueError, match="bottleneck_dim"):
         AdapterConfig(
-            local_checkpoints=True, strategy="bottleneck", bottleneck_dim=0
+            local_checkpoints=True, total_steps=100, strategy="bottleneck", bottleneck_dim=0
         )
 
 
 def test_adapter_rosa_requires_mode() -> None:
     with pytest.raises(ValueError, match="rosa_mode"):
-        AdapterConfig(local_checkpoints=True, strategy="rosa")
+        AdapterConfig(local_checkpoints=True, total_steps=100, strategy="rosa")
 
 
 def test_adapter_unfreeze_requires_layers() -> None:
     with pytest.raises(ValueError, match="unfreeze_layers"):
-        AdapterConfig(local_checkpoints=True, strategy="unfreeze")
+        AdapterConfig(local_checkpoints=True, total_steps=100, strategy="unfreeze")
 
 
 def test_adapter_specialized_clm_requires_arch() -> None:
     """Per plan §10 S3, all four arch fields are required for the
     in-adapter specialized_clm path."""
     with pytest.raises(ValueError, match="d_model"):
-        AdapterConfig(local_checkpoints=True, strategy="specialized_clm")
+        AdapterConfig(local_checkpoints=True, total_steps=100, strategy="specialized_clm")
 
 
 def test_adapter_specialized_clm_requires_d_ff() -> None:
@@ -488,6 +490,7 @@ def test_adapter_specialized_clm_requires_d_ff() -> None:
     with pytest.raises(ValueError, match="d_ff"):
         AdapterConfig(
             local_checkpoints=True,
+            total_steps=100,
             strategy="specialized_clm",
             d_model=64,
             n_layers=2,
@@ -499,7 +502,7 @@ def test_adapter_hybrid_requires_lora_rank() -> None:
     """`hybrid = LoRA + FiLM` per the plan adapter table; missing
     lora_rank should fail just like for `--strategy lora`."""
     with pytest.raises(ValueError, match="hybrid.*lora_rank"):
-        AdapterConfig(local_checkpoints=True, strategy="hybrid")
+        AdapterConfig(local_checkpoints=True, total_steps=100, strategy="hybrid")
 
 
 def test_adapter_specialized_clm_requires_d_model_divisible_by_n_heads() -> None:
@@ -509,6 +512,7 @@ def test_adapter_specialized_clm_requires_d_model_divisible_by_n_heads() -> None
     with pytest.raises(ValueError, match="divisible by n_heads"):
         AdapterConfig(
             local_checkpoints=True,
+            total_steps=100,
             strategy="specialized_clm",
             d_model=33,
             n_layers=2,
@@ -522,7 +526,7 @@ def test_adapter_specialized_clm_requires_d_model_divisible_by_n_heads() -> None
 
 def test_unfreeze_layers_happy_form() -> None:
     cfg = AdapterConfig(
-        local_checkpoints=True, strategy="unfreeze", unfreeze_layers="5,6,7"
+        local_checkpoints=True, total_steps=100, strategy="unfreeze", unfreeze_layers="5,6,7"
     )
     assert cfg.unfreeze_layers == "5,6,7"
 
@@ -532,6 +536,7 @@ def test_unfreeze_layers_normalises_whitespace() -> None:
     `s.split(",")` doesn't trip on leading-space tokens like `" 6"`."""
     cfg = AdapterConfig(
         local_checkpoints=True,
+        total_steps=100,
         strategy="unfreeze",
         unfreeze_layers="5, 6, 7",
     )
@@ -540,7 +545,7 @@ def test_unfreeze_layers_normalises_whitespace() -> None:
 
 def test_unfreeze_layers_single_layer_form() -> None:
     cfg = AdapterConfig(
-        local_checkpoints=True, strategy="unfreeze", unfreeze_layers="0"
+        local_checkpoints=True, total_steps=100, strategy="unfreeze", unfreeze_layers="0"
     )
     assert cfg.unfreeze_layers == "0"
 
@@ -548,7 +553,7 @@ def test_unfreeze_layers_single_layer_form() -> None:
 def test_unfreeze_layers_rejects_empty_string() -> None:
     with pytest.raises(ValueError, match="unfreeze_layers"):
         AdapterConfig(
-            local_checkpoints=True, strategy="unfreeze", unfreeze_layers=""
+            local_checkpoints=True, total_steps=100, strategy="unfreeze", unfreeze_layers=""
         )
 
 
@@ -556,6 +561,7 @@ def test_unfreeze_layers_rejects_non_int_part() -> None:
     with pytest.raises(ValueError, match="unfreeze_layers"):
         AdapterConfig(
             local_checkpoints=True,
+            total_steps=100,
             strategy="unfreeze",
             unfreeze_layers="5,abc,7",
         )
@@ -565,7 +571,7 @@ def test_unfreeze_layers_rejects_top_n_count_form() -> None:
     """Plan §6 explicit: the v1 contract is comma-separated explicit
     picks, NOT a top-N integer count."""
     cfg = AdapterConfig(
-        local_checkpoints=True, strategy="unfreeze", unfreeze_layers="3"
+        local_checkpoints=True, total_steps=100, strategy="unfreeze", unfreeze_layers="3"
     )
     # The string "3" must remain "3" (not be re-interpreted as "top 3 layers").
     assert cfg.unfreeze_layers == "3"
@@ -630,6 +636,7 @@ def test_specialized_d_model_must_divide_n_heads() -> None:
     with pytest.raises(ValueError, match="divisible by n_heads"):
         SpecializedCLMConfig(
             local_checkpoints=True,
+            total_steps=100,
             d_model=33,
             n_layers=2,
             n_heads=4,
@@ -693,6 +700,7 @@ def test_run_config_dispatches_by_run_type() -> None:
         {
             "run_type": "adapter",
             "local_checkpoints": True,
+            "total_steps": 100,
             "strategy": "lora",
             "lora_rank": 4,
         }
@@ -702,6 +710,7 @@ def test_run_config_dispatches_by_run_type() -> None:
         {
             "run_type": "specialized_clm",
             "local_checkpoints": True,
+            "total_steps": 100,
             "d_model": 64,
             "n_layers": 2,
             "n_heads": 2,
