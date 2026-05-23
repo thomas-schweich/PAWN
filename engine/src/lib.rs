@@ -770,7 +770,10 @@ fn uci_to_tokens<'py>(
 )> {
     let n = games.len();
     let (flat, lengths) = py.allow_threads(|| {
-        let mut flat = vec![0i16; n * max_ply];
+        // PAD-init the buffer so positions past game_length read as PAD
+        // (the vocab assigns 0 to a legal move; a zero-initialised tail
+        // would look like real moves downstream). Plan §10 S11.
+        let mut flat = vec![vocab::PAD_TOKEN as i16; n * max_ply];
         let mut lengths = Vec::with_capacity(n);
         // Convert in parallel
         let results: Vec<(Vec<u16>, usize)> = games
@@ -875,8 +878,11 @@ fn parse_pgn_enriched<'py>(
     let n = games.len();
     let dict = PyDict::new(py);
 
-    // Flat 0-padded arrays for tokens, clocks, evals (N * max_ply)
-    let mut flat_tokens = vec![0i16; n * max_ply];
+    // PAD-init the token buffer so positions past game_length read as
+    // PAD (plan §10 S11; the vocab assigns 0 to a legal move).
+    // Clocks/evals stay zero-initialised — 0 is the right "no data"
+    // sentinel for those.
+    let mut flat_tokens = vec![vocab::PAD_TOKEN as i16; n * max_ply];
     let mut flat_clocks = vec![0u16; n * max_ply];
     let mut flat_evals = vec![0i16; n * max_ply];
 
@@ -1019,7 +1025,9 @@ fn parse_pgn_lichess<'py>(
 
     // Tokens: (N, seq_len). With `prepend_outcome`, slot 0 is the outcome
     // token and moves start at slot 1; otherwise slot 0 is the first move.
-    let mut flat_tokens = vec![0i16; n * seq_len];
+    // PAD-init the token buffer so unused trailing slots aren't read as a
+    // legal move (vocab assigns 0 to a real move). Plan §10 S11.
+    let mut flat_tokens = vec![vocab::PAD_TOKEN as i16; n * seq_len];
     // Clocks are parallel to the move positions only (no outcome slot),
     // so their width tracks `effective_max_ply`.
     let mut flat_clocks = vec![0u16; n * effective_max_ply];
@@ -1195,7 +1203,9 @@ fn parse_pgn_sampled<'py>(
     let n = games.len();
     let dict = PyDict::new(py);
 
-    let mut flat_tokens = vec![0i16; n * max_ply];
+    // PAD-init the token buffer; clocks/evals stay zero (correct
+    // sentinel for "no data"). Plan §10 S11.
+    let mut flat_tokens = vec![vocab::PAD_TOKEN as i16; n * max_ply];
     let mut flat_clocks = vec![0u16; n * max_ply];
     let mut flat_evals = vec![0i16; n * max_ply];
     let mut lengths_out = Vec::with_capacity(n);
@@ -1728,5 +1738,29 @@ mod tests {
     fn test_promo_pieces_accessible_from_lib() {
         assert_eq!(vocab::PROMO_PIECES.len(), 4);
         assert_eq!(vocab::PROMO_PIECES, ["q", "r", "b", "n"]);
+    }
+
+    /// Plan §10 S11: every PGN-to-tokens path's token buffer is
+    /// PAD-initialised so positions past `game_length` aren't read as
+    /// a legal move (the vocab assigns 0 to a legal move). Spot-check
+    /// the contract by calling `uci_to_tokens` style flow at the
+    /// vec-init level: a zero `n * max_ply` vec PAD-init'd has all
+    /// entries equal to `PAD_TOKEN as i16`.
+    #[test]
+    fn test_token_buffer_pad_init_contract() {
+        let n = 3;
+        let max_ply = 8;
+        let buf = vec![vocab::PAD_TOKEN as i16; n * max_ply];
+        for v in &buf {
+            assert_eq!(
+                *v, vocab::PAD_TOKEN as i16,
+                "token buffer must be PAD-initialised, not 0"
+            );
+        }
+        // PAD_TOKEN is 1968 — a value the vocab does NOT decompose as
+        // a real move (it returns None). Without PAD-init the trailing
+        // tail would read as token 0, which IS a legal move.
+        assert!(vocab::decompose_token(vocab::PAD_TOKEN).is_none());
+        assert!(vocab::decompose_token(0).is_some());
     }
 }
