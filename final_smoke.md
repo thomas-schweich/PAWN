@@ -347,25 +347,48 @@ $ uv run --extra rocm python scripts/eval_generation_jax.py \
 $ uv run --extra rocm python scripts/eval_generation_jax.py \
     --checkpoint <converted-pawn-base> --outcome-prefix-trained --edge-cases \
     --output /tmp/v2_eval_gen_oprefix.json
-# All 5 diagnostics: ACTIVE (no _skipped sentinel)
-# edge_cases: 6 categories (in_check, double_check, pin_restricts,
-#   ep_available, castle_legal_kingside, castle_legal_queenside)
+# All 5 diagnostics: ACTIVE (no _skipped sentinel) — every diagnostic
+# block carries the v1-parity metrics (outcome_match_rate, forfeit_rate,
+# mean_game_length, post_terminal_padding_rate) derived from real
+# autoregressive generation per parity #6 / commit ebc6a7d.
+# edge_cases: 10 categories — the full v1 set restored in parity #11
+# (commit ebc6a7d) via `compute_edge_case_accuracy_quota`:
+#   in_check, double_check, pin_restricts, ep_available,
+#   castle_legal_kingside, castle_legal_queenside, castle_blocked_check,
+#   promotion_available, checkmate, stalemate.
+# Quota-controlled sampling guarantees every label has n_positions > 0
+# (vs the random-game path where rare labels silently report 0).
 ```
 
 The skip-sentinel contract is asserted by `tests/test_jax_eval.py`.
-The depth of the diagnostic scoring loop (skeleton vs the full v1
-autoregressive + KV-cache decoder) is tracked under parity item #6 in
-`docs/JAX_PARITY_SHORTFALLS.md`.
+The full v1 autoregressive generator ships as
+`pawn.generation.autoregressive_generate`; the KV-cached decoder
+fast-path is the one remaining perf follow-up (DEFERRALS.md) — it
+doesn't change diagnostic correctness, only throughput at large
+`n_per_outcome`.
 
 ---
 
 ## 12. Edge-case diagnostics
 
-`pawn/eval_suite/diagnostics.py` uses the Rust engine's
-`compute_edge_stats_per_ply` for guaranteed coverage of `in_check`,
-`double_check`, `pin_restricts`, `ep_available`, `castle_legal_*`
-(verified in `tests/test_jax_eval.py`, in the green suite). Live wiring
-through the script:
+`pawn/eval_suite/diagnostics.py` covers the **full v1 label set**
+(parity #11 / commit ebc6a7d): `in_check`, `double_check`,
+`pin_restricts`, `ep_available`, `castle_legal_kingside`,
+`castle_legal_queenside`, `castle_blocked_check`,
+`promotion_available`, `checkmate`, `stalemate`. Two paths:
+
+- `compute_edge_case_accuracy(model, move_ids, game_lengths)` — uses
+  `engine.compute_edge_stats_per_ply` on a pre-existing corpus
+  (random games or Lichess parquet). Rare labels (checkmate,
+  stalemate) may have `n_positions=0` on a small random pool.
+- `compute_edge_case_accuracy_quota(model, per_label)` — calls
+  `engine.generate_diagnostic_sets` with explicit per-label quotas
+  so **every** label has `n_positions > 0` (verified end-to-end by
+  `tests/test_jax_eval.py::test_edge_case_accuracy_quota_guarantees_coverage`).
+  This is the path `scripts/eval_generation_jax.py --edge-cases`
+  uses.
+
+Live wiring through the script:
 
 ```bash
 $ uv run --extra rocm python scripts/eval_generation_jax.py \
