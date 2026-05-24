@@ -281,7 +281,15 @@ def main(argv: list[str] | None = None) -> int:
         backbone=backbone, adapter=adapter, opt_state=opt_state,
         step=jnp.int32(0), key=jax.random.key(0),
     )
-    train_step = make_adapter_train_step(cfg.strategy, optimizer)
+    _DTYPE_MAP = {
+        "bfloat16": jnp.bfloat16,
+        "float16": jnp.float16,
+        "float32": None,
+    }
+    compute_dtype = _DTYPE_MAP[cfg.amp_dtype]
+    train_step = make_adapter_train_step(
+        cfg.strategy, optimizer, compute_dtype=compute_dtype
+    )
 
     apply_fn = STRATEGIES[cfg.strategy].apply
 

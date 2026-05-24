@@ -14,12 +14,45 @@ from __future__ import annotations
 import pytest
 
 
-def test_pawn_init_is_docstring_only() -> None:
-    """`pawn/__init__.py` is intentionally empty (plan §10 S2) so
-    `import pawn` is side-effect-free."""
+def test_pawn_init_exposes_v2_top_level_names() -> None:
+    """The v2 public surface re-exports `ModelConfig`, `PAWNModel`, and
+    the `RunConfig` discriminated-union members from `pawn`."""
     import pawn
 
     assert pawn.__doc__ is not None
+    # v2 names — these must all be importable directly from `pawn`.
+    from pawn import (
+        AdapterConfig,
+        BaseRunConfig,
+        ModelConfig,
+        PAWNModel,
+        PretrainConfig,
+        RunConfig,
+        SpecializedCLMConfig,
+    )
+
+    # Sanity: each is a real type, not None / stub.
+    for cls in (
+        ModelConfig,
+        PAWNModel,
+        BaseRunConfig,
+        PretrainConfig,
+        AdapterConfig,
+        SpecializedCLMConfig,
+    ):
+        assert cls is not None
+
+
+def test_pawn_v1_names_raise_migration_error() -> None:
+    """v1 import sites (`from pawn import CLMConfig`) must surface a
+    precise migration error pointing at the v2 replacement, not a
+    generic "no attribute" or, worse, silent success on a stale
+    type."""
+    import pawn
+
+    for old_name in ("CLMConfig", "TrainingConfig", "PAWNCLM"):
+        with pytest.raises(ImportError, match=old_name):
+            getattr(pawn, old_name)
 
 
 def test_config_public_surface() -> None:

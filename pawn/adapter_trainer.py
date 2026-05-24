@@ -179,6 +179,8 @@ class AdapterTrainState(eqx.Module):
 def make_adapter_train_step(
     strategy: str,
     optimizer: optax.GradientTransformation,
+    *,
+    compute_dtype: "jnp.dtype | None" = None,
 ) -> Callable[
     [AdapterTrainState, Batch], tuple[AdapterTrainState, Float[Array, ""]]
 ]:
@@ -188,6 +190,8 @@ def make_adapter_train_step(
     inline it. Gradients flow only through the adapter PyTree;
     ``backbone`` is held outside the autograd path via
     :func:`eqx.partition`.
+
+    ``compute_dtype`` selects the AMP forward dtype (plan §5).
     """
 
     apply_fn = dispatch_apply(strategy)
@@ -198,7 +202,9 @@ def make_adapter_train_step(
     ) -> tuple[AdapterTrainState, Float[Array, ""]]:
         def loss_fn(adapter: Any) -> Float[Array, ""]:
             effective = apply_fn(state.backbone, adapter)
-            return cross_entropy_loss(effective, batch)
+            return cross_entropy_loss(
+                effective, batch, compute_dtype=compute_dtype
+            )
 
         loss, grads = eqx.filter_value_and_grad(loss_fn)(state.adapter)
 

@@ -174,7 +174,19 @@ def main(argv: list[str] | None = None) -> int:
             key=jax.random.key(0),
         )
 
-    train_step = make_train_step(optimizer, variants)
+    # Resolve cfg.amp_dtype → jnp dtype. None ⇒ fp32 forward (back-
+    # compat with existing tests that synthesise opt_state in fp32 and
+    # parity-test the legacy converter bit-exact). The default is
+    # bf16 per plan §5 + v1 parity.
+    _DTYPE_MAP = {
+        "bfloat16": jnp.bfloat16,
+        "float16": jnp.float16,
+        "float32": None,
+    }
+    compute_dtype = _DTYPE_MAP[cfg.amp_dtype]
+    train_step = make_train_step(
+        optimizer, variants, compute_dtype=compute_dtype
+    )
     logger = MetricsLogger(
         log_dir=args.logs_dir, run_prefix="pretrain", device=_resolve_device()
     )

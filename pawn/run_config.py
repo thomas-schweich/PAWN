@@ -6,9 +6,11 @@ field set matches v1 ``pawn/run_config.py`` verbatim (per plan §7's
 backward-compatibility contract — the names users type and the schemas
 they grep are durable) plus a handful of v2-specific additions
 (``supernet``, ``variant``, ``k``, ``max_corpus_gb``, ``seq_len``).
-Torch-only fields (``amp_dtype``, ``device``, ``num_workers``,
-``no_compile``, ``sdpa_math``) are dropped — JAX manages its own
-backend.
+Torch-only fields (``device``, ``num_workers``, ``no_compile``,
+``sdpa_math``) are dropped — JAX manages its own backend. The
+``amp_dtype`` field is *retained* — v2 honours bf16 mixed-precision
+forward compute per plan §5 ("Forward casts parameters to bf16 with
+fp32 accumulation; the master copy and Adam moments stay fp32").
 
 The v1 ``CotrainConfig`` is GONE BY DESIGN: the supernet's joint loss
 replaces multi-variant co-training, so the pretrainer in S6 trains the
@@ -108,6 +110,16 @@ class BaseRunConfig(BaseModel):
     # training. All 5 generation diagnostics in S8 gate on this flag.
     prepend_outcome: bool = False
     discard_ply_limit: bool = False
+
+    # --- Mixed precision (v1-parity field name) -------------------------
+    # bf16/fp16 forward compute with fp32 master weights + Adam moments
+    # (plan §5). The model forward casts activations to this dtype at
+    # `_run_layers` entry; `_rmsnorm` and `softmax` upcast to fp32
+    # internally and downcast back, matching standard "weights in fp32,
+    # compute in bf16" recipes. Defaults to bf16 because v1 defaulted
+    # to bf16 (and the perf gap surfaced in the post-r4 review was due
+    # to this contract not being wired up).
+    amp_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
 
     # --- JAX-specific (new in v2) --------------------------------------
     # Which supernet config the run trains / slices from. ``"production"``

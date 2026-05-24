@@ -135,11 +135,31 @@ def test_specialized_clm_uses_bare_arch_fields() -> None:
 
 
 def test_torch_fields_dropped() -> None:
-    """`amp_dtype` / `device` / `num_workers` / `no_compile` / `sdpa_math`
-    are JAX-irrelevant and should not appear on BaseRunConfig."""
+    """`device` / `num_workers` / `no_compile` / `sdpa_math` are JAX-
+    irrelevant and stay dropped on the v2 BaseRunConfig.
+
+    `amp_dtype` is *retained* per the parity audit
+    (docs/JAX_PARITY_SHORTFALLS.md §1): v2 honours bf16 mixed-precision
+    forward compute per plan §5. Covered by
+    `test_amp_dtype_field_present_and_defaults_to_bfloat16`.
+    """
     fields = set(PretrainConfig.model_fields)
-    for absent in ("amp_dtype", "device", "num_workers", "no_compile", "sdpa_math"):
+    for absent in ("device", "num_workers", "no_compile", "sdpa_math"):
         assert absent not in fields, f"{absent} should have been dropped"
+
+
+def test_amp_dtype_field_present_and_defaults_to_bfloat16() -> None:
+    """v1 parity per docs/JAX_PARITY_SHORTFALLS.md §1: `amp_dtype` is a
+    BaseRunConfig field, defaults to bf16 (matches v1 + plan §5), and
+    rejects anything outside {bfloat16, float16, float32}."""
+    cfg = PretrainConfig(**_pretrain_kwargs())
+    assert cfg.amp_dtype == "bfloat16"
+    cfg = PretrainConfig(**_pretrain_kwargs(amp_dtype="float32"))
+    assert cfg.amp_dtype == "float32"
+    with pytest.raises(ValueError, match="amp_dtype"):
+        PretrainConfig(
+            **_pretrain_kwargs(amp_dtype="int8")  # type: ignore[arg-type]
+        )
 
 
 def test_supernet_field_options() -> None:

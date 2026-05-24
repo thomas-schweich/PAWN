@@ -146,7 +146,10 @@ class VariantSpec:
 
 
 def cross_entropy_loss(
-    model: PAWNModel, batch: Batch
+    model: PAWNModel,
+    batch: Batch,
+    *,
+    compute_dtype: jnp.dtype | None = None,
 ) -> Float[Array, ""]:
     """Masked cross-entropy on a single variant + batch.
 
@@ -158,8 +161,12 @@ def cross_entropy_loss(
     batch returns 0 / 1 = 0 (the optimizer should be a no-op then,
     which is what the `lax.cond` guard in :func:`make_optimizer` is
     for).
+
+    ``compute_dtype`` is the AMP forward dtype (plan §5). ``None`` (the
+    default) runs the model in fp32 — the legacy converter's parity
+    test and any consumer that needs bit-stable logits pass ``None``.
     """
-    logits = model(batch.tokens, batch.attn_mask)  # (B, T, V)
+    logits = model(batch.tokens, batch.attn_mask, compute_dtype=compute_dtype)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     target_lp = jnp.take_along_axis(
         log_probs, batch.targets[..., None], axis=-1
@@ -173,6 +180,8 @@ def supernet_joint_loss(
     model: PAWNModel,
     batch: Batch,
     variants: tuple[VariantSpec, ...],
+    *,
+    compute_dtype: jnp.dtype | None = None,
 ) -> Float[Array, ""]:
     """The supernet joint loss: **sum** per-variant cross-entropies on
     the same batch.
@@ -205,7 +214,9 @@ def supernet_joint_loss(
             sub_model = model
         else:
             sub_model = sliced(model, spec.cfg)
-        total = total + cross_entropy_loss(sub_model, batch)
+        total = total + cross_entropy_loss(
+            sub_model, batch, compute_dtype=compute_dtype
+        )
     return total
 
 
@@ -545,6 +556,8 @@ def unflatten_opt_state(
 def make_train_step(
     optimizer: optax.GradientTransformation,
     variants: tuple[VariantSpec, ...],
+    *,
+    compute_dtype: jnp.dtype | None = None,
 ) -> Callable[[TrainState, Batch], tuple[TrainState, Float[Array, ""]]]:
     """Return a JIT-compiled single training step closing over the
     optimizer + variant list.
@@ -574,7 +587,9 @@ def make_train_step(
         state: TrainState, batch: Batch
     ) -> tuple[TrainState, Float[Array, ""]]:
         def loss_fn(model: PAWNModel) -> Float[Array, ""]:
-            return supernet_joint_loss(model, batch, variants)
+            return supernet_joint_loss(
+                model, batch, variants, compute_dtype=compute_dtype
+            )
 
         loss, grads = eqx.filter_value_and_grad(loss_fn)(state.model)
 

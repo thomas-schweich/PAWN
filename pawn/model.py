@@ -270,6 +270,8 @@ class PAWNModel(eqx.Module):
         self,
         input_ids: Int[Array, "B T"],
         attention_mask: Int[Array, "B T"] | None = None,
+        *,
+        compute_dtype: jnp.dtype | None = None,
     ) -> Float[Array, "B T V"]:
         """Forward pass.
 
@@ -277,6 +279,17 @@ class PAWNModel(eqx.Module):
         PAD, or outcome tokens). ``attention_mask`` is ``1`` for real
         tokens and ``0`` for PAD; if omitted, a fully-real mask is
         assumed.
+
+        ``compute_dtype`` selects the mixed-precision *forward-activation*
+        dtype (plan §5). The master parameters stay fp32 — they're cast
+        per einsum just before the matmul, then XLA folds the cast into
+        the kernel where it can. Reductions (RMSNorm, softmax) upcast
+        to fp32 internally and downcast back, matching the standard
+        "weights fp32 / compute bf16 / accumulate fp32" recipe. The
+        final logits are returned in fp32 for downstream loss
+        stability. ``None`` (default) keeps the whole forward in fp32 —
+        used by tests, eval, and the parity test that compares
+        bit-exact against v1 in fp32.
 
         Returns logits of shape ``(batch, seq, vocab_size)``. Callers
         that sample argmax over the move vocabulary should restrict to
@@ -290,6 +303,8 @@ class PAWNModel(eqx.Module):
                 f"{self.cfg.max_seq_len}"
             )
         x = self._embed(input_ids)
+        if compute_dtype is not None:
+            x = x.astype(compute_dtype)
         # RoPE tables are recomputed per call — constant-folded by JIT
         # under a static cfg, so the cost is one trace-time build.
         rope_cos, rope_sin = _build_rope(self.cfg.head_dim, T, self.cfg.rope_base)
@@ -299,9 +314,19 @@ class PAWNModel(eqx.Module):
         else:
             pad = attention_mask.astype(jnp.bool_)[:, None, None, :]  # (B, 1, 1, T)
             mask = causal[None, None, :, :] & pad
-        x = self._run_layers(x, rope_cos, rope_sin, mask)
+        x = self._run_layers(x, rope_cos, rope_sin, mask, compute_dtype)
         x = _rmsnorm(x, self.final_norm_w)
-        return jnp.einsum("btd,dv->btv", x, self.lm_head)
+        # `_rmsnorm` returns in `x.dtype` (compute dtype if set). Cast
+        # `lm_head` to match and upcast logits to fp32 for downstream
+        # loss stability (the cross-entropy then keeps numerics tight
+        # regardless of forward dtype).
+        lm_head = (
+            self.lm_head.astype(compute_dtype)
+            if compute_dtype is not None
+            else self.lm_head
+        )
+        logits = jnp.einsum("btd,dv->btv", x, lm_head)
+        return logits.astype(jnp.float32)
 
     # -----------------------------------------------------------------------
     # Forward-pass internals
@@ -348,6 +373,7 @@ class PAWNModel(eqx.Module):
         rope_cos: Float[Array, "T half"],
         rope_sin: Float[Array, "T half"],
         mask: Bool[Array, "B 1 T T"],
+        compute_dtype: jnp.dtype | None = None,
     ) -> Float[Array, "B T d"]:
         """Apply all ``n_layers`` transformer blocks via :func:`jax.lax.scan`.
 
@@ -355,15 +381,18 @@ class PAWNModel(eqx.Module):
         have a leading ``n_layers`` axis. :func:`jax.lax.scan` iterates
         layer-by-layer; each iteration sees a per-layer slice of every
         weight tensor.
+
+        ``compute_dtype`` controls activation precision. When set, each
+        per-layer weight is cast to ``compute_dtype`` just before its
+        einsum — XLA fuses the cast into the matmul kernel where it
+        can. `_rmsnorm` and `softmax` upcast to fp32 internally for
+        numerical stability and downcast back.
         """
         head_dim = self.cfg.head_dim
         n_heads = self.cfg.n_heads
         # Compile-time constant — hoist out of the scan body so we don't
         # re-allocate a 0-d scalar and dispatch a sqrt kernel on every layer.
         inv_scale = head_dim ** -0.5
-        # Mask sentinel: hoist `jnp.finfo` out of the scan body (same reason).
-        # Use the working-dtype's minimum so softmax sees -inf-equivalent.
-        attn_neg_inf = jnp.finfo(x.dtype).min
 
         def step(
             carry: Float[Array, "B T d"],
@@ -371,28 +400,61 @@ class PAWNModel(eqx.Module):
         ) -> tuple[Float[Array, "B T d"], None]:
             h = carry
             # ---- attention block (pre-norm + residual) ----
+            # `_rmsnorm` upcasts to fp32 internally and downcasts to
+            # `h.dtype` — so `normed` is the compute dtype when AMP is on.
             normed = _rmsnorm(h, layer.attn_norm_w)
             B, T, D = normed.shape  # noqa: N806
-            q = jnp.einsum("btd,de->bte", normed, layer.wq)
-            k = jnp.einsum("btd,de->bte", normed, layer.wk)
-            v = jnp.einsum("btd,de->bte", normed, layer.wv)
+            # Cast Q/K/V/O weights to compute_dtype just before each
+            # einsum. XLA fuses the cast into the kernel; the master
+            # weight stays fp32 in `self.layers.wq` etc., so backward
+            # accumulates in fp32 via standard JAX autograd.
+            wq = layer.wq if compute_dtype is None else layer.wq.astype(compute_dtype)
+            wk = layer.wk if compute_dtype is None else layer.wk.astype(compute_dtype)
+            wv = layer.wv if compute_dtype is None else layer.wv.astype(compute_dtype)
+            wo = layer.wo if compute_dtype is None else layer.wo.astype(compute_dtype)
+            q = jnp.einsum("btd,de->bte", normed, wq)
+            k = jnp.einsum("btd,de->bte", normed, wk)
+            v = jnp.einsum("btd,de->bte", normed, wv)
             q = q.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
             k = k.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
             v = v.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
             q = _apply_rope(q, rope_cos, rope_sin)
             k = _apply_rope(k, rope_cos, rope_sin)
+            # Attention scores: matmul in compute dtype, then upcast to
+            # fp32 for the softmax (the fp32 score tensor is the
+            # numerically-sensitive intermediate). Downcast attn weights
+            # back to compute dtype for the value matmul.
             scores = jnp.einsum("bhid,bhjd->bhij", q, k) * inv_scale
-            scores = jnp.where(mask, scores, attn_neg_inf)
-            attn = jax.nn.softmax(scores, axis=-1)
+            scores_f32 = scores.astype(jnp.float32)
+            mask_neg_inf = jnp.finfo(jnp.float32).min
+            scores_f32 = jnp.where(mask, scores_f32, mask_neg_inf)
+            attn = jax.nn.softmax(scores_f32, axis=-1)
+            if compute_dtype is not None:
+                attn = attn.astype(compute_dtype)
             attn_out = jnp.einsum("bhij,bhjd->bhid", attn, v)
             attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, D)
-            h = h + jnp.einsum("btd,de->bte", attn_out, layer.wo)
+            h = h + jnp.einsum("btd,de->bte", attn_out, wo)
 
             # ---- ffn block (pre-norm + residual) ----
             normed = _rmsnorm(h, layer.ffn_norm_w)
-            gate = jnp.einsum("btd,df->btf", normed, layer.w_gate)
-            up = jnp.einsum("btd,df->btf", normed, layer.w_up)
-            ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, layer.w_down)
+            w_gate = (
+                layer.w_gate
+                if compute_dtype is None
+                else layer.w_gate.astype(compute_dtype)
+            )
+            w_up = (
+                layer.w_up
+                if compute_dtype is None
+                else layer.w_up.astype(compute_dtype)
+            )
+            w_down = (
+                layer.w_down
+                if compute_dtype is None
+                else layer.w_down.astype(compute_dtype)
+            )
+            gate = jnp.einsum("btd,df->btf", normed, w_gate)
+            up = jnp.einsum("btd,df->btf", normed, w_up)
+            ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, w_down)
             h = h + ffn_out
             return h, None
 
