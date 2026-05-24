@@ -341,12 +341,20 @@ def _build_train_state(cfg, lr: float = 3e-4, key: int = 42):
     return state, optimizer, model
 
 
-def _make_backbone_step(state, optimizer, batch, jit: bool):
+def _make_backbone_step(
+    state, optimizer, batch, jit: bool, compute_dtype=None
+):
     """Return a `() -> new_state` closure timing one backbone training step.
 
     `jit=True` returns the jitted train_step from `pawn.trainer.make_train_step`.
     `jit=False` builds an unjitted clone of the same loss + update path so
     eager mode measures the cost of running the autograd graph in Python.
+
+    `compute_dtype` (None / jnp.bfloat16 / jnp.float16 / jnp.float32)
+    controls AMP forward dtype. Threaded into both `train_step` paths
+    so the perf benchmarks exercise the same precision settings the
+    real training scripts use (otherwise this script silently runs
+    fp32 even when the user asks for bf16).
     """
     import jax
     import equinox as eqx
@@ -358,11 +366,15 @@ def _make_backbone_step(state, optimizer, batch, jit: bool):
     variants = (VariantSpec(name="bench", cfg=state.model.cfg, is_supernet=True),)
 
     if jit:
-        train_step = make_train_step(optimizer, variants)
+        train_step = make_train_step(
+            optimizer, variants, compute_dtype=compute_dtype
+        )
     else:
         def _eager_train_step(s, b):
             def loss_fn(model):
-                return cross_entropy_loss(model, b)
+                return cross_entropy_loss(
+                    model, b, compute_dtype=compute_dtype
+                )
             loss, grads = eqx.filter_value_and_grad(loss_fn)(s.model)
             updates, new_opt = optimizer.update(grads, s.opt_state, s.model)
             new_model = eqx.apply_updates(s.model, updates)
@@ -390,6 +402,7 @@ def bench_backbone(
     do_eager: bool,
     n_iter: int,
     n_warmup: int,
+    compute_dtype=None,
 ) -> list[TimingResult]:
     """Benchmark backbone training steps."""
     import jax
@@ -398,11 +411,19 @@ def bench_backbone(
 
     results: list[TimingResult] = []
 
+    dtype_label = (
+        compute_dtype.dtype.name
+        if compute_dtype is not None and hasattr(compute_dtype, "dtype")
+        else (str(compute_dtype) if compute_dtype is not None else "float32")
+    )
     print("\n" + "=" * 72)
     print(" BACKBONE TRAINING BENCHMARKS (GPU)")
     print("=" * 72)
     print(f"  batch_size={batch_size}  device={jax.devices()[0]}  n_iter={n_iter}")
-    print(f"  framework: JAX/Equinox/Optax  attention: plain (materialised QK^T)")
+    print(
+        f"  framework: JAX/Equinox/Optax  attention: plain (materialised QK^T)  "
+        f"compute_dtype: {dtype_label}"
+    )
 
     batch = _make_corpus_batch(batch_size)
 
@@ -432,7 +453,10 @@ def bench_backbone(
                 ))
                 print(f"    params: {n_params:,}")
 
-            step_fn, _cell = _make_backbone_step(state, optimizer, batch, jit=use_jit)
+            step_fn, _cell = _make_backbone_step(
+                state, optimizer, batch, jit=use_jit,
+                compute_dtype=compute_dtype,
+            )
 
             try:
                 gpu_timing = time_gpu(step_fn, n_warmup=n_warmup, n_iter=n_iter)
@@ -1229,6 +1253,17 @@ def main():
                         help="Warmup iterations per benchmark (default: 5). "
                              "JIT compilation happens during warmup.")
 
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["bfloat16", "float16", "float32"],
+        default="bfloat16",
+        help=(
+            "Forward-compute dtype (default: bfloat16). Mirrors the "
+            "BaseRunConfig.amp_dtype field — bf16 is what the v1 PyTorch "
+            "AMP path used and what the v2 training scripts default to."
+        ),
+    )
+
     parser.add_argument("--json", type=str, default=None,
                         help="Save results to JSON file")
 
@@ -1265,6 +1300,15 @@ def main():
     concurrency_results: list[ConcurrencyResult] = []
     adapter_results: list[TimingResult] = []
 
+    # Resolve amp_dtype → jnp dtype.
+    import jax.numpy as jnp_local
+    _DTYPE_MAP = {
+        "bfloat16": jnp_local.bfloat16,
+        "float16": jnp_local.float16,
+        "float32": None,
+    }
+    compute_dtype = _DTYPE_MAP[args.amp_dtype]
+
     if do_engine:
         engine_results = bench_engine(
             args.engine_games, args.n_iter, args.n_warmup,
@@ -1274,6 +1318,7 @@ def main():
         backbone_results = bench_backbone(
             args.variants, args.batch_size,
             do_jit, do_eager, args.n_iter, args.n_warmup,
+            compute_dtype=compute_dtype,
         )
     if do_data_pipeline:
         data_pipeline_results = bench_data_pipeline(
