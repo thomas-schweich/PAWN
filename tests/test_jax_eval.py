@@ -100,43 +100,73 @@ def test_each_diagnostic_skips_when_not_outcome_prefix_trained(name: str) -> Non
 
 
 def test_outcome_signal_test_runs_when_gate_on() -> None:
+    """v1 parity: outcome_signal_test now runs real autoregressive
+    generation per outcome and reports per-outcome metrics (match rate,
+    forfeit rate, mean game length). Tiny defaults keep the test under
+    a few seconds without the KV-cached decoder."""
+    from pawn.generation import OUTCOME_TOKENS
+
     model = init_model(TINY_SUPERNET, key=0)
     res = outcome_signal_test(
-        model, outcome_prefix_trained=True, n_games=4, seq_len=16
+        model, outcome_prefix_trained=True,
+        n_per_outcome=2, max_seq_len=8, mask_conditions=(True,),
     )
-    assert "mean_l1_distance" in res
     assert "_skipped" not in res
+    # Every v1 outcome appears with masked-condition results.
+    for name in OUTCOME_TOKENS:
+        assert name in res
+        assert "masked" in res[name]
+        metrics = res[name]["masked"]
+        # Headline v1 metrics are present and in-range.
+        assert 0.0 <= metrics["outcome_match_rate"] <= 1.0
+        assert 0.0 <= metrics["forfeit_rate"] <= 1.0
+        assert metrics["mean_game_length"] >= 0.0
 
 
 def test_prefix_continuation_test_runs_when_gate_on() -> None:
     model = init_model(TINY_SUPERNET, key=0)
     prefix = jnp.array([5, 10], dtype=jnp.int32)
     res = prefix_continuation_test(
-        model, prefix, WHITE_CHECKMATES, outcome_prefix_trained=True
+        model, prefix, WHITE_CHECKMATES, outcome_prefix_trained=True,
+        n_continuations=2, seq_len=8,
     )
-    assert "next_move_token" in res
-    assert 0 <= res["next_move_token"] < NUM_ACTIONS
+    # `next_move_argmax` is the cheap single-shot probe; the AR
+    # analysis is the v1-parity metric block.
+    assert "next_move_argmax" in res
+    assert 0 <= res["next_move_argmax"] < NUM_ACTIONS
+    assert "ar_continuation" in res
+    assert res["ar_continuation"]["n_games"] == 2
 
 
 def test_poisoned_prefix_test_runs_when_gate_on() -> None:
     model = init_model(TINY_SUPERNET, key=0)
     prefix = jnp.array([5, 10], dtype=jnp.int32)
     res = poisoned_prefix_test(
-        model, prefix, BLACK_CHECKMATES, outcome_prefix_trained=True
+        model, prefix, BLACK_CHECKMATES, outcome_prefix_trained=True,
+        n_continuations=2, seq_len=8,
     )
     assert res["diagnostic"] == "poisoned_prefix_test"
+    assert "ar_continuation" in res
 
 
 def test_impossible_task_test_runs_when_gate_on() -> None:
     model = init_model(TINY_SUPERNET, key=0)
-    res = impossible_task_test(model, outcome_prefix_trained=True)
+    res = impossible_task_test(
+        model, outcome_prefix_trained=True, n_games=2, seq_len=8,
+    )
     assert "top1_prob" in res and "entropy" in res
+    assert "ar_analysis" in res
+    # Forfeit rate is the headline for the impossible task.
+    assert 0.0 <= res["ar_analysis"]["forfeit_rate"] <= 1.0
 
 
 def test_improbable_task_test_runs_when_gate_on() -> None:
     model = init_model(TINY_SUPERNET, key=0)
-    res = improbable_task_test(model, outcome_prefix_trained=True)
+    res = improbable_task_test(
+        model, outcome_prefix_trained=True, n_games=2, seq_len=8,
+    )
     assert "top1_prob" in res and "entropy" in res
+    assert "ar_analysis" in res
 
 
 def test_run_all_diagnostics_has_5_entries() -> None:
@@ -211,9 +241,51 @@ def test_edge_case_accuracy_runs() -> None:
     results = compute_edge_case_accuracy(
         model, move_ids, game_lengths, batch_size=4
     )
-    # 6 labels in the canonical order.
+    # Parity #6: 10 labels in the canonical order (v1 surface).
     assert [r.label for r in results] == list(EDGE_CASE_LABELS)
+    assert len(EDGE_CASE_LABELS) == 10
     # Every label has finite accuracy in [0, 1].
     for r in results:
         assert 0.0 <= r.accuracy <= 1.0
         assert r.n_positions >= 0
+
+
+def test_edge_case_labels_include_added_v1_categories() -> None:
+    """The 4 categories restored in parity #6 must be present.
+
+    `n_positions` may be 0 on the 8-game random pool — guarantee of
+    coverage requires the quota-controlled path
+    (`compute_edge_case_accuracy_quota`)."""
+    from pawn.eval_suite.diagnostics import EDGE_CASE_LABELS
+    for label in (
+        "castle_blocked_check", "promotion_available",
+        "checkmate", "stalemate",
+    ):
+        assert label in EDGE_CASE_LABELS
+
+
+def test_edge_case_accuracy_quota_guarantees_coverage() -> None:
+    """`compute_edge_case_accuracy_quota` calls
+    `engine.generate_diagnostic_sets` with per-label quotas, so every
+    label should have ``n_positions > 0`` even for rare cases like
+    `checkmate` / `stalemate`."""
+    from pawn.eval_suite.diagnostics import (
+        EDGE_CASE_LABELS,
+        compute_edge_case_accuracy_quota,
+    )
+    model = init_model(TINY_SUPERNET, key=0)
+    # `per_label=4` is the smallest budget that reliably surfaces
+    # `stalemate` (the rarest label — engine empirically needs ~400
+    # simulated games per stalemate; the default factor=500 amortises
+    # that). Keep `max_ply=256` because stalemate tends to appear in
+    # longer games.
+    results = compute_edge_case_accuracy_quota(
+        model, per_label=4, max_ply=256, batch_size=4,
+    )
+    by_label = {r.label: r for r in results}
+    for label in EDGE_CASE_LABELS:
+        assert label in by_label
+        assert by_label[label].n_positions > 0, (
+            f"quota-controlled sampling missed label {label!r}"
+        )
+        assert 0.0 <= by_label[label].accuracy <= 1.0

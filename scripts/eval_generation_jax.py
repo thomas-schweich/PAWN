@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""5 generation diagnostics — all gated on outcome_prefix_trained."""
+"""5 generation diagnostics — all gated on outcome_prefix_trained.
+
+The diagnostics run real autoregressive generation (see
+:mod:`pawn.generation`) and aggregate the v1-parity metrics dict
+(outcome match rate, forfeit rate, mean game length, post-terminal
+padding ratio).
+
+``--edge-cases`` additionally runs the engine-quota-controlled
+edge-case accuracy via
+:func:`pawn.eval_suite.diagnostics.compute_edge_case_accuracy_quota`,
+which guarantees coverage for every label in
+:data:`pawn.eval_suite.diagnostics.EDGE_CASE_LABELS` (in_check,
+double_check, pin_restricts, ep_available, castle_legal_*,
+castle_blocked_check, promotion_available, checkmate, stalemate).
+"""
 
 from __future__ import annotations
 
@@ -21,8 +35,27 @@ def main(argv: list[str] | None = None) -> int:
     gate.add_argument(
         "--no-outcome-prefix-trained", dest="trained", action="store_false"
     )
-    ap.add_argument("--edge-cases", action="store_true",
-                    help="also run edge-case diagnostics via engine.edge_case_bits")
+    ap.add_argument(
+        "--edge-cases", action="store_true",
+        help="also run edge-case diagnostics via "
+        "engine.generate_diagnostic_sets (quota-controlled coverage of "
+        "all 10 labels)",
+    )
+    ap.add_argument(
+        "--edge-per-label", type=int, default=10,
+        help="per-(colour, label) game count for quota-controlled edge "
+        "case sampling (default 10; raise for rarer labels)",
+    )
+    ap.add_argument(
+        "--gen-n-per-outcome", type=int, default=16,
+        help="games per outcome in `outcome_signal_test` (v1's default "
+        "was 1000; we default to 16 because the JAX path doesn't yet "
+        "use a KV-cached decoder — raise as throughput allows)",
+    )
+    ap.add_argument(
+        "--gen-max-seq-len", type=int, default=32,
+        help="autoregressive decode horizon for the generation suite",
+    )
     ap.add_argument("--output", type=Path, default=None)
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
@@ -33,13 +66,18 @@ def main(argv: list[str] | None = None) -> int:
         ckpt_path = Path(ckpt)
     model = load_model(ckpt_path)
 
-    results = run_all_diagnostics(model, outcome_prefix_trained=args.trained)
+    results = run_all_diagnostics(
+        model,
+        outcome_prefix_trained=args.trained,
+        n_per_outcome=args.gen_n_per_outcome,
+        max_seq_len=args.gen_max_seq_len,
+    )
 
     if args.edge_cases:
-        import chess_engine as engine
-        from pawn.eval_suite.diagnostics import compute_edge_case_accuracy
-        moves, lens, _ = engine.generate_random_games(64, 64, 42)
-        edge = compute_edge_case_accuracy(model, moves, lens)
+        from pawn.eval_suite.diagnostics import compute_edge_case_accuracy_quota
+        edge = compute_edge_case_accuracy_quota(
+            model, per_label=args.edge_per_label,
+        )
         results["edge_cases"] = {
             r.label: {"accuracy": r.accuracy, "n_positions": r.n_positions}
             for r in edge
