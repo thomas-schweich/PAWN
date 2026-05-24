@@ -24,7 +24,9 @@ from pawn.adapter_trainer import (
     AdapterTrainState,
     dispatch_filter,
     dispatch_init,
+    generate_rosa_masks,
     make_adapter_train_step,
+    rosa_phase1_to_phase3,
 )
 from pawn.adapters import (
     BottleneckConfig,
@@ -121,13 +123,18 @@ def _strategy_config_from_run(cfg: AdapterConfig) -> object:
         )
     if s == "hybrid":
         return HybridConfig(
-            lora=LoRAConfig(rank=cfg.lora_rank or 4),
+            lora=LoRAConfig(
+                rank=cfg.lora_rank or 4,
+                targets=cfg.lora_targets or "qkvo",
+                ffn=cfg.lora_ffn,
+            ),
             film=FiLMConfig(use_output_film=cfg.use_output_film),
         )
     if s == "sparse":
         return SparseConfig(
             density=cfg.density or 0.01,
             targets=cfg.sparse_targets or "qkvo",
+            ffn=cfg.sparse_ffn,
         )
     if s in ("rosa", "rosa-retro-sparse", "rosa-retro-bottleneck"):
         # The three RoSA-family strategies share init/apply; the mode is
@@ -153,6 +160,10 @@ def _strategy_config_from_run(cfg: AdapterConfig) -> object:
             rosa_warmup_steps=cfg.rosa_warmup_steps,
             mask_samples=cfg.mask_samples,
             grad_alpha=cfg.grad_alpha,
+            lora_targets=cfg.lora_targets or "qkvo",
+            lora_ffn=cfg.lora_ffn,
+            sparse_targets=cfg.sparse_targets or "qkvo",
+            sparse_ffn=cfg.sparse_ffn,
         )
     if s == "unfreeze":
         return UnfreezeConfig(layers=cfg.unfreeze_layers or "5,6,7")
@@ -352,17 +363,61 @@ def main(argv: list[str] | None = None) -> int:
         review-bug-detector finding that adapter resumes were emitting
         the "no optimizer.safetensors" warning every time.
 
+        Bottleneck-style adapters (and RoSA's ``retro-bottleneck`` mode)
+        return a wrapper module rather than a folded :class:`PAWNModel`,
+        because their Houlsby residual MLP has a GELU nonlinearity that
+        can't collapse into the backbone's weight tensors. For these
+        the save path writes the frozen backbone as the main checkpoint
+        and dumps the adapter weights as ``adapter.safetensors`` in the
+        same directory — the resume / eval loader is responsible for
+        re-composing the wrapper when both files are present (a
+        v1-parity follow-up tracked under parity #8's deleted-test
+        port; the current load path treats the saved backbone as the
+        de-facto effective model).
+
         Checkpoints land under the MetricsLogger's per-run directory so
         two concurrent runs can't collide on the same path.
         """
+        from pawn.adapters.bottleneck import BottleneckEffective
         effective = apply_fn(state.backbone, state.adapter)
         out = logger.run_dir / f"adapter_step_{step_int:08d}"
-        save_model(
-            effective, out,
-            run_config=cfg.model_dump(),
-            optimizer_state=flatten_opt_state(state.opt_state),
-            training_state={"step": int(state.step)},
-        )
+        if isinstance(effective, BottleneckEffective):
+            # Bottleneck wrapper: persist backbone as the main payload
+            # and sidecar the adapter weights for downstream re-load.
+            save_model(
+                effective.backbone, out,
+                run_config=cfg.model_dump(),
+                optimizer_state=flatten_opt_state(state.opt_state),
+                training_state={"step": int(state.step)},
+            )
+            from safetensors.numpy import save_file as st_save
+            adapter_arrays: dict[str, np.ndarray] = {}
+            for field_name in (
+                "down_attn", "hidden_attn", "up_attn",
+                "down_ffn", "hidden_ffn", "up_ffn",
+            ):
+                leaf = getattr(effective.adapter, field_name)
+                if leaf is not None:
+                    adapter_arrays[f"bottleneck.{field_name}"] = np.asarray(leaf)
+            if adapter_arrays:
+                st_save(adapter_arrays, str(out / "adapter.safetensors"))
+        else:
+            # PAWNModel — the standard weight-folded save path. The
+            # narrowing assertion satisfies pyright: the only two
+            # apply_fn return types in v2 are PAWNModel and
+            # BottleneckEffective; the isinstance branch above peeled
+            # off the wrapper, leaving the PAWNModel case here.
+            from pawn.model import PAWNModel as _PAWNModel
+            assert isinstance(effective, _PAWNModel), (
+                f"unexpected effective type {type(effective).__name__}; "
+                "extend the save dispatch in train_jax_adapter._save"
+            )
+            save_model(
+                effective, out,
+                run_config=cfg.model_dump(),
+                optimizer_state=flatten_opt_state(state.opt_state),
+                training_state={"step": int(state.step)},
+            )
         if push_tracker:
             push_checkpoint_async(out, push_tracker)
 
@@ -374,31 +429,97 @@ def main(argv: list[str] | None = None) -> int:
     eval_interval = cfg.eval_interval or cfg.log_interval
     t0 = time.time()
     final_step = 0
-    for step in range(cfg.total_steps):
-        idx = rng.integers(0, corpus.n_games, size=cfg.batch_size)
-        batch = slice_batch(corpus, idx)
-        state, loss = train_step(state, batch)
-        final_step = step + 1
-        if (step + 1) % cfg.log_interval == 0:
-            logger.log_train(
-                step=step + 1, loss=float(loss),
-                lr=np.asarray(schedule(int(state.step))).item(),
-                step_time=(time.time() - t0) / (step + 1),
+    is_rosa = cfg.strategy in ("rosa", "rosa-retro-sparse", "rosa-retro-bottleneck")
+
+    def _run_steps(
+        state: AdapterTrainState,
+        step_fn: object,  # eqx-jitted closure
+        n_steps: int,
+        start_step: int,
+    ) -> tuple[AdapterTrainState, int]:
+        """Inner loop chunk used by both non-RoSA paths and per-phase
+        RoSA orchestration. Returns ``(new_state, last_step_done)``
+        where ``last_step_done`` is the absolute step counter the loop
+        reached so the outer scope can drive checkpoints and resumes."""
+        nonlocal final_step
+        for offset in range(n_steps):
+            absolute = start_step + offset
+            idx = rng.integers(0, corpus.n_games, size=cfg.batch_size)
+            batch = slice_batch(corpus, idx)
+            state, loss = step_fn(state, batch)  # type: ignore[operator]
+            final_step = absolute + 1
+            if final_step % cfg.log_interval == 0:
+                logger.log_train(
+                    step=final_step, loss=float(loss),
+                    lr=np.asarray(schedule(int(state.step))).item(),
+                    step_time=(time.time() - t0) / final_step,
+                )
+            if final_step % eval_interval == 0:
+                val_idx = val_rng.integers(
+                    0, val_corpus.n_games, size=cfg.batch_size
+                )
+                val_batch = slice_batch(val_corpus, val_idx)
+                val_loss = float(val_step(state.backbone, state.adapter, val_batch))
+                logger.log_val(
+                    step=final_step, val_loss=val_loss,
+                    val_source=cfg.pgn_val_split if not args.no_pgn else "random",
+                )
+            if final_step % cfg.checkpoint_interval == 0:
+                _save(final_step)
+            if should_shutdown():
+                return state, final_step
+        return state, final_step
+
+    if is_rosa:
+        # Phase 1: LoRA warmup (state.adapter init'd with
+        # lora_active=True, sparse_active=False; bottleneck branch is
+        # silenced via apply_rosa's sparse_active gate).
+        rosa_cfg = state.adapter.cfg
+        warmup_n = min(rosa_cfg.rosa_warmup_steps, cfg.total_steps)
+        state, last = _run_steps(state, train_step, warmup_n, start_step=0)
+        if not should_shutdown() and warmup_n < cfg.total_steps:
+            # Phase 2: gather `mask_samples` batches and accumulate
+            # |grad|^grad_alpha on each sparse delta to derive the
+            # density-thresholded boolean masks. The deltas are zeroed
+            # before Phase 3 so the sparse contribution starts at zero.
+            mask_batches: list = []
+            for _ in range(rosa_cfg.mask_samples):
+                idx = rng.integers(0, corpus.n_games, size=cfg.batch_size)
+                mask_batches.append(slice_batch(corpus, idx))
+            new_sparse = generate_rosa_masks(
+                state.backbone, state.adapter, mask_batches,
+                compute_dtype=compute_dtype,
             )
-        if (step + 1) % eval_interval == 0:
-            val_idx = val_rng.integers(
-                0, val_corpus.n_games, size=cfg.batch_size
+            # Phase 3: re-init LoRA (kaiming A, zero B), install masks,
+            # flip toggles per mode (rosa keeps LoRA on; retro modes
+            # drop LoRA). The optimizer is re-initialised because the
+            # branch toggles change which arrays receive gradients.
+            new_adapter = rosa_phase1_to_phase3(
+                state.adapter, new_sparse, key=jax.random.key(1),
             )
-            val_batch = slice_batch(val_corpus, val_idx)
-            val_loss = float(val_step(state.backbone, state.adapter, val_batch))
-            logger.log_val(
-                step=step + 1, val_loss=val_loss,
-                val_source=cfg.pgn_val_split if not args.no_pgn else "random",
+            flt = dispatch_filter(cfg.strategy)(new_adapter)
+            opt_state = optimizer.init(eqx.filter(new_adapter, flt))
+            state = AdapterTrainState(
+                backbone=state.backbone,
+                adapter=new_adapter,
+                opt_state=opt_state,
+                step=state.step,
+                key=state.key,
             )
-        if (step + 1) % cfg.checkpoint_interval == 0:
-            _save(step + 1)
-        if should_shutdown():
-            break
+            # Phase 3 train step has the same `apply_rosa` closure but
+            # the adapter's toggles are now Phase-3-shaped, so the
+            # composed forward includes sparse (and bottleneck where
+            # appropriate). Re-build the jitted step to pick up the new
+            # opt_state shape.
+            train_step = make_adapter_train_step(
+                cfg.strategy, optimizer, compute_dtype=compute_dtype
+            )
+            phase3_remaining = cfg.total_steps - warmup_n
+            state, _ = _run_steps(
+                state, train_step, phase3_remaining, start_step=warmup_n,
+            )
+    else:
+        state, _ = _run_steps(state, train_step, cfg.total_steps, start_step=0)
     # Always emit a final checkpoint at run-end, even when
     # `total_steps < checkpoint_interval` (short LoRA smokes, sweeps,
     # the §3 criterion 7 acceptance command). Without this the trained

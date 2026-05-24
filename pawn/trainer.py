@@ -46,7 +46,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from pawn.config import ModelConfig
 from pawn.corpus import Corpus
-from pawn.model import PAWNModel, sliced
+from pawn.model import EffectiveCallable, PAWNModel, sliced
 from pawn.run_config import BaseRunConfig
 
 __all__ = [
@@ -146,7 +146,7 @@ class VariantSpec:
 
 
 def cross_entropy_loss(
-    model: PAWNModel,
+    model: "PAWNModel | EffectiveCallable",
     batch: Batch,
     *,
     compute_dtype: jnp.dtype | None = None,

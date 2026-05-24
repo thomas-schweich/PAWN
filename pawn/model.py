@@ -47,7 +47,8 @@ safetensors payload.
 
 from __future__ import annotations
 
-from typing import Final
+from collections.abc import Callable
+from typing import Any, Final, Protocol, runtime_checkable
 
 import equinox as eqx
 import jax
@@ -66,10 +67,33 @@ from pawn.config import (
 __all__ = [
     "PAWNModel",
     "TransformerLayer",
+    "EffectiveCallable",
     "SAVED_FIELDS",
     "init_model",
     "sliced",
 ]
+
+
+@runtime_checkable
+class EffectiveCallable(Protocol):
+    """The minimal call-signature the trainer and eval need from any
+    "effective model" — :class:`PAWNModel` itself for weight-folding
+    adapters (LoRA, sparse, FiLM, ...) or a wrapper module like
+    :class:`pawn.adapters.bottleneck.BottleneckEffective` for adapters
+    that inject post-sublayer residuals.
+
+    Anything that exposes ``__call__(input_ids, attention_mask, *,
+    compute_dtype) -> logits`` satisfies this Protocol — runtime
+    isinstance checks work because of ``@runtime_checkable``.
+    """
+
+    def __call__(
+        self,
+        input_ids: Int[Array, "B T"],
+        attention_mask: Int[Array, "B T"] | None = None,
+        *,
+        compute_dtype: jnp.dtype | None = None,
+    ) -> Float[Array, "B T V"]: ...
 
 
 # Names of the 16 trainable arrays in safetensors declaration order.
@@ -272,6 +296,11 @@ class PAWNModel(eqx.Module):
         attention_mask: Int[Array, "B T"] | None = None,
         *,
         compute_dtype: jnp.dtype | None = None,
+        attn_hook: Callable[[Float[Array, "B T d"], Any], Float[Array, "B T d"]]
+        | None = None,
+        ffn_hook: Callable[[Float[Array, "B T d"], Any], Float[Array, "B T d"]]
+        | None = None,
+        hook_data: Any = None,
     ) -> Float[Array, "B T V"]:
         """Forward pass.
 
@@ -290,6 +319,18 @@ class PAWNModel(eqx.Module):
         stability. ``None`` (default) keeps the whole forward in fp32 —
         used by tests, eval, and the parity test that compares
         bit-exact against v1 in fp32.
+
+        ``attn_hook`` / ``ffn_hook`` / ``hook_data`` are the adapter
+        injection points. When non-None, the scan body calls
+        ``h = attn_hook(h, hook_slice)`` after the attention sublayer's
+        residual addition and ``h = ffn_hook(h, hook_slice)`` after the
+        FFN sublayer's residual. ``hook_data`` is a PyTree (or None)
+        with a leading ``n_layers`` axis on every leaf; the scan
+        zip-iterates ``(layer, hook_slice)`` so the hooks see the
+        per-layer slice. Used by :mod:`pawn.adapters.bottleneck` to add
+        Houlsby residual MLPs after each sublayer; other adapters
+        (LoRA, sparse) fold corrections into the weight tensors instead
+        and leave the hooks unset.
 
         Returns logits of shape ``(batch, seq, vocab_size)``. Callers
         that sample argmax over the move vocabulary should restrict to
@@ -314,7 +355,10 @@ class PAWNModel(eqx.Module):
         else:
             pad = attention_mask.astype(jnp.bool_)[:, None, None, :]  # (B, 1, 1, T)
             mask = causal[None, None, :, :] & pad
-        x = self._run_layers(x, rope_cos, rope_sin, mask, compute_dtype)
+        x = self._run_layers(
+            x, rope_cos, rope_sin, mask, compute_dtype,
+            attn_hook=attn_hook, ffn_hook=ffn_hook, hook_data=hook_data,
+        )
         x = _rmsnorm(x, self.final_norm_w)
         # `_rmsnorm` returns in `x.dtype` (compute dtype if set). Cast
         # `lm_head` to match and upcast logits to fp32 for downstream
@@ -374,6 +418,12 @@ class PAWNModel(eqx.Module):
         rope_sin: Float[Array, "T half"],
         mask: Bool[Array, "B 1 T T"],
         compute_dtype: jnp.dtype | None = None,
+        *,
+        attn_hook: Callable[[Float[Array, "B T d"], Any], Float[Array, "B T d"]]
+        | None = None,
+        ffn_hook: Callable[[Float[Array, "B T d"], Any], Float[Array, "B T d"]]
+        | None = None,
+        hook_data: Any = None,
     ) -> Float[Array, "B T d"]:
         """Apply all ``n_layers`` transformer blocks via :func:`jax.lax.scan`.
 
@@ -387,17 +437,29 @@ class PAWNModel(eqx.Module):
         einsum — XLA fuses the cast into the matmul kernel where it
         can. `_rmsnorm` and `softmax` upcast to fp32 internally for
         numerical stability and downcast back.
+
+        ``attn_hook`` / ``ffn_hook`` / ``hook_data`` inject adapter
+        residuals after each sublayer; see :meth:`__call__` for the
+        contract.
         """
         head_dim = self.cfg.head_dim
         n_heads = self.cfg.n_heads
         # Compile-time constant — hoist out of the scan body so we don't
         # re-allocate a 0-d scalar and dispatch a sqrt kernel on every layer.
         inv_scale = head_dim ** -0.5
+        has_hooks = (
+            attn_hook is not None or ffn_hook is not None
+        ) and hook_data is not None
 
         def step(
             carry: Float[Array, "B T d"],
-            layer: TransformerLayer,
+            layer_and_hook: Any,
         ) -> tuple[Float[Array, "B T d"], None]:
+            if has_hooks:
+                layer, hook_slice = layer_and_hook
+            else:
+                layer = layer_and_hook
+                hook_slice = None
             h = carry
             # ---- attention block (pre-norm + residual) ----
             # `_rmsnorm` upcasts to fp32 internally and downcasts to
@@ -434,6 +496,8 @@ class PAWNModel(eqx.Module):
             attn_out = jnp.einsum("bhij,bhjd->bhid", attn, v)
             attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, D)
             h = h + jnp.einsum("btd,de->bte", attn_out, wo)
+            if attn_hook is not None:
+                h = attn_hook(h, hook_slice)
 
             # ---- ffn block (pre-norm + residual) ----
             normed = _rmsnorm(h, layer.ffn_norm_w)
@@ -456,9 +520,12 @@ class PAWNModel(eqx.Module):
             up = jnp.einsum("btd,df->btf", normed, w_up)
             ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, w_down)
             h = h + ffn_out
+            if ffn_hook is not None:
+                h = ffn_hook(h, hook_slice)
             return h, None
 
-        x, _ = jax.lax.scan(step, x, self.layers)
+        scan_input: Any = (self.layers, hook_data) if has_hooks else self.layers
+        x, _ = jax.lax.scan(step, x, scan_input)
         return x
 
 

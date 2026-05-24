@@ -33,10 +33,19 @@ from pawn.adapters import (
     SpecializedCLMConfig,
     UnfreezeConfig,
 )
+from pawn.adapters.bottleneck import BottleneckEffective
 from pawn.config import TINY_SUPERNET
 from pawn.corpus import generate_corpus
 from pawn.model import PAWNModel, init_model
 from pawn.trainer import Batch, slice_batch
+
+
+# `apply_fn` may return either the patched ``PAWNModel`` (for adapters that
+# fold corrections into the backbone weights — LoRA, sparse, FiLM,
+# unfreeze, ...) or a callable wrapper such as ``BottleneckEffective`` (for
+# adapters whose semantics require post-sublayer residual injection). The
+# trainer + eval scripts treat both uniformly; the test accepts either.
+_EFFECTIVE_TYPES = (PAWNModel, BottleneckEffective)
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +117,7 @@ def test_each_strategy_init_and_apply(strategy: str) -> None:
     apply = dispatch_apply(strategy)
     adapter = init(backbone, cfg, key=jax.random.key(1))
     effective = apply(backbone, adapter)
-    assert isinstance(effective, PAWNModel)
+    assert isinstance(effective, _EFFECTIVE_TYPES)
     # Forward pass on a tiny batch.
     tokens = jnp.zeros((2, 16), dtype=jnp.int32)
     logits = effective(tokens)
@@ -302,4 +311,231 @@ def test_rosa_dispatches_each_mode(
     assert adapter.cfg.mode == mode
     # apply runs without error in every mode.
     effective = dispatch_apply("rosa")(backbone, adapter)
-    assert isinstance(effective, PAWNModel)
+    assert isinstance(effective, _EFFECTIVE_TYPES)
+
+
+# ---------------------------------------------------------------------------
+# Sparse FFN — v1 parity: `cfg.ffn=True` must populate FFN delta/mask pairs
+# ---------------------------------------------------------------------------
+
+
+def test_sparse_ffn_populates_ffn_delta_and_mask_pairs() -> None:
+    """Parity #5 (sparse-FFN): with ``cfg.ffn=True`` the adapter
+    carries delta/mask pairs for ``w_gate`` / ``w_up`` / ``w_down``;
+    with ``cfg.ffn=False`` those pairs are ``None`` (no allocation)."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg_on = SparseConfig(density=0.1, ffn=True)
+    adapter_on = dispatch_init("sparse")(backbone, cfg_on, key=jax.random.key(0))
+    assert adapter_on.delta_gate is not None
+    assert adapter_on.delta_up is not None
+    assert adapter_on.delta_down is not None
+    assert adapter_on.mask_gate is not None
+    assert adapter_on.mask_up is not None
+    assert adapter_on.mask_down is not None
+    # Mask density is approximately cfg.density (Bernoulli sampling).
+    frac = float(adapter_on.mask_gate.mean())
+    assert 0.02 < frac < 0.2, f"sparse ffn mask density={frac:.4f} off"
+
+    cfg_off = SparseConfig(density=0.1, ffn=False)
+    adapter_off = dispatch_init("sparse")(backbone, cfg_off, key=jax.random.key(0))
+    assert adapter_off.delta_gate is None
+    assert adapter_off.delta_up is None
+    assert adapter_off.delta_down is None
+
+
+# ---------------------------------------------------------------------------
+# Bottleneck — Houlsby parity: real residual MLP with attn + FFN placement
+# ---------------------------------------------------------------------------
+
+
+def test_bottleneck_init_populates_both_placements_by_default() -> None:
+    """With both placement flags off (the default), init populates both
+    attn-side and FFN-side weights; the zero-init up-projection makes
+    the start identical to the frozen backbone."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("bottleneck")(
+        backbone, BottleneckConfig(dim=4), key=jax.random.key(0)
+    )
+    assert adapter.down_attn is not None and adapter.up_attn is not None
+    assert adapter.down_ffn is not None and adapter.up_ffn is not None
+    # Up projections are zero-init ⇒ effective ≈ backbone at step 0.
+    assert float(jnp.abs(adapter.up_attn).max()) == 0.0
+    assert float(jnp.abs(adapter.up_ffn).max()) == 0.0
+    # Down projections are kaiming-initialised (small but nonzero).
+    assert float(jnp.abs(adapter.down_attn).max()) > 0.0
+
+
+def test_bottleneck_no_adapt_attn_disables_attn_branch() -> None:
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("bottleneck")(
+        backbone, BottleneckConfig(dim=4, no_adapt_attn=True),
+        key=jax.random.key(0),
+    )
+    assert adapter.down_attn is None
+    assert adapter.up_attn is None
+    assert adapter.down_ffn is not None  # FFN still active
+
+
+def test_bottleneck_identity_at_init_matches_backbone_logits() -> None:
+    """The Houlsby up-projection starts at zero ⇒ the residual is
+    identity at step 0 ⇒ bottleneck-effective forward equals the bare
+    backbone forward to within numerical tolerance."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("bottleneck")(
+        backbone, BottleneckConfig(dim=4), key=jax.random.key(0),
+    )
+    effective = dispatch_apply("bottleneck")(backbone, adapter)
+    tokens = jnp.zeros((2, 16), dtype=jnp.int32)
+    bare = backbone(tokens)
+    bottlenecked = effective(tokens)
+    # Identity at init: differences should be exactly zero (the
+    # residual is `h + up(gelu(down(h)))` and up is exactly 0).
+    assert jnp.allclose(bare, bottlenecked, atol=1e-6, rtol=0)
+
+
+def test_bottleneck_n_hidden_extra_stages_shape() -> None:
+    """``n_hidden=2`` adds two extra (dim, dim) GELU stages between the
+    down and up projections — verify the buffer shape carries them."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("bottleneck")(
+        backbone, BottleneckConfig(dim=4, n_hidden=2), key=jax.random.key(0),
+    )
+    assert adapter.hidden_attn is not None
+    assert adapter.hidden_attn.shape == (
+        TINY_SUPERNET.n_layers, 2, 4, 4,
+    ), f"got {adapter.hidden_attn.shape}"
+    assert adapter.hidden_ffn is not None
+    assert adapter.hidden_ffn.shape == (TINY_SUPERNET.n_layers, 2, 4, 4)
+
+
+def test_bottleneck_rejects_both_placements_off() -> None:
+    with pytest.raises(ValueError, match="both set"):
+        BottleneckConfig(dim=4, no_adapt_attn=True, no_adapt_ffn=True)
+
+
+# ---------------------------------------------------------------------------
+# RoSA — mode-aware apply
+# ---------------------------------------------------------------------------
+
+
+def test_rosa_retro_bottleneck_init_builds_bottleneck_branch() -> None:
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = RoSAConfig(
+        mode="retro-bottleneck", lora_rank=2, density=0.1, bottleneck_dim=4,
+    )
+    adapter = dispatch_init("rosa")(backbone, cfg, key=jax.random.key(0))
+    assert adapter.bottleneck is not None
+    # The retro-bottleneck phase 1 starts with sparse_active=False so
+    # apply_rosa returns a LoRA-effective PAWNModel (the bottleneck
+    # only contributes after Phase 2→3 flips sparse_active=True).
+    eff = dispatch_apply("rosa")(backbone, adapter)
+    assert isinstance(eff, _EFFECTIVE_TYPES)
+
+
+def test_rosa_generate_masks_yields_density_targeted_topk() -> None:
+    """generate_rosa_masks produces boolean masks where the True
+    count per delta_* matches ``density * numel`` (the v1 Algorithm 1
+    top-k contract)."""
+    from pawn.adapter_trainer import generate_rosa_masks
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = RoSAConfig(mode="rosa", lora_rank=2, density=0.05, mask_samples=2)
+    adapter = dispatch_init("rosa")(backbone, cfg, key=jax.random.key(0))
+    batches = [_make_batch(), _make_batch()]
+    new_sparse = generate_rosa_masks(
+        backbone, adapter, batches, compute_dtype=None,
+    )
+    for name in (
+        "mask_q", "mask_k", "mask_v", "mask_o",
+    ):
+        m = getattr(new_sparse, name)
+        assert m is not None, f"{name} mask missing"
+        on_count = int(m.sum())
+        expected = max(1, int(0.05 * m.size))
+        # top-k → exactly `expected` per leaf.
+        assert on_count == expected, (
+            f"{name}: density-targeted top-k expected {expected} "
+            f"True positions, got {on_count}"
+        )
+    # Deltas reset to zero after mask gen (Phase 3 starts from
+    # identity sparse contribution).
+    for name in (
+        "delta_q", "delta_k", "delta_v", "delta_o",
+    ):
+        d = getattr(new_sparse, name)
+        assert d is not None
+        assert float(jnp.abs(d).max()) == 0.0
+
+
+def test_rosa_phase1_to_phase3_flips_toggles_per_mode() -> None:
+    """rosa_phase1_to_phase3 sets `sparse_active=True` for every mode
+    and `lora_active=(mode == "rosa")` — retro modes drop the LoRA
+    branch after warmup."""
+    from pawn.adapter_trainer import rosa_phase1_to_phase3
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    for mode, expect_lora in (
+        ("rosa", True),
+        ("retro-sparse", False),
+        ("retro-bottleneck", False),
+    ):
+        cfg = RoSAConfig(mode=mode, lora_rank=2, density=0.1)  # type: ignore[arg-type]
+        ad = dispatch_init("rosa")(backbone, cfg, key=jax.random.key(0))
+        assert ad.lora_active is True and ad.sparse_active is False
+        new = rosa_phase1_to_phase3(ad, ad.sparse, key=jax.random.key(2))
+        assert new.sparse_active is True
+        assert new.lora_active is expect_lora
+
+
+def test_rosa_retro_modes_init_skip_bottleneck() -> None:
+    """rosa + rosa-retro-sparse don't carry a bottleneck branch — the
+    field stays None and `apply_rosa` returns the pure LoRA/sparse
+    composition."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    for mode in ("rosa", "retro-sparse"):
+        cfg = RoSAConfig(mode=mode, lora_rank=2, density=0.1)  # type: ignore[arg-type]
+        adapter = dispatch_init("rosa")(backbone, cfg, key=jax.random.key(0))
+        assert adapter.bottleneck is None, f"mode={mode} should not have bottleneck"
+
+
+# ---------------------------------------------------------------------------
+# Unfreeze — masked-slot drift under weight_decay > 0
+# ---------------------------------------------------------------------------
+
+
+def test_unfreeze_masked_slots_do_not_drift_under_weight_decay() -> None:
+    """Parity #5 (unfreeze): with `weight_decay > 0`, AdamW's decoupled
+    decay would update masked layer slots toward zero even though
+    their gradients are zero. The trainer's
+    `_freeze_masked_unfreeze_slots` post-update hook keeps masked slots
+    pinned to the backbone values."""
+    backbone = init_model(TINY_SUPERNET, key=0)  # n_layers=4
+    cfg = UnfreezeConfig(layers="0,1")  # masked = (2, 3)
+    adapter = dispatch_init("unfreeze")(backbone, cfg, key=jax.random.key(0))
+    flt = dispatch_filter("unfreeze")(adapter)
+    # Large weight_decay so a single step's drift would be measurable
+    # if the snap-back wasn't running.
+    opt = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=1e-2, weight_decay=1.0),
+    )
+    opt_state = opt.init(eqx.filter(adapter, flt))
+    state = AdapterTrainState(
+        backbone=backbone, adapter=adapter, opt_state=opt_state,
+        step=jnp.int32(0), key=jax.random.key(0),
+    )
+    backbone_wq = np.asarray(backbone.layers.wq)
+    train_step = make_adapter_train_step("unfreeze", opt)
+    batch = _make_batch()
+    # Step the trainer a handful of times so any drift would compound.
+    for _ in range(3):
+        state, _ = train_step(state, batch)
+    post_wq = np.asarray(state.adapter.layers.wq)
+    for masked_idx in (2, 3):
+        np.testing.assert_array_equal(
+            post_wq[masked_idx], backbone_wq[masked_idx],
+            err_msg=(
+                f"masked layer {masked_idx} drifted under weight_decay — "
+                "the snap-back hook is not enforcing the invariant"
+            ),
+        )
