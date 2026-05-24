@@ -298,6 +298,55 @@ def _query_gpu_stats() -> dict[str, float] | None:
     return None
 
 
+def _query_jax_memory_stats() -> dict[str, float] | None:
+    """Return process-side JAX allocator memory in v1-parity field names.
+
+    v1 used :func:`torch.cuda.{max_memory_allocated, memory_reserved,
+    memory_allocated}` which report this process's torch allocator.
+    JAX exposes the equivalent via ``device.memory_stats()``:
+
+    - ``peak_bytes_in_use``  → ``gpu_peak_gb``   (cumulative since
+                                                  process start)
+    - ``pool_bytes``         → ``gpu_reserved_gb`` (allocator pool size)
+    - ``bytes_in_use``       → ``gpu_current_gb`` (currently allocated)
+
+    Returns ``None`` on the CPU backend, or if the JAX import / device
+    query fails. Best-effort: the smi-side numbers
+    (:func:`_query_gpu_stats`) still cover the system-wide view.
+
+    Cumulative-peak semantics differ slightly from v1 — v1 reset the
+    peak counter after every record so each row's ``gpu_peak_gb`` was a
+    per-record max. JAX doesn't expose a ``reset_peak`` knob, so v2's
+    field is monotonic-since-process-start. The field *name* matches v1
+    so existing dashboards parse it unchanged.
+    """
+    try:
+        import jax
+    except ImportError:
+        return None
+    try:
+        devices = jax.devices()
+    except Exception:  # noqa: BLE001 — JAX raises a variety of types here
+        return None
+    if not devices:
+        return None
+    dev = devices[0]
+    if not hasattr(dev, "memory_stats"):
+        return None
+    try:
+        stats = dev.memory_stats()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(stats, dict):
+        return None
+    gib = 1024 ** 3
+    return {
+        "gpu_peak_gb": round(stats.get("peak_bytes_in_use", 0) / gib, 3),
+        "gpu_reserved_gb": round(stats.get("pool_bytes", 0) / gib, 3),
+        "gpu_current_gb": round(stats.get("bytes_in_use", 0) / gib, 3),
+    }
+
+
 # Fields the logger stamps itself — callers can't override them via kwargs.
 # Reserved so a stale `type=` (or, worse, a `type` field inside a pydantic
 # run-config dump-then-unpack) can't silently replace the dashboard's
@@ -497,11 +546,22 @@ class MetricsLogger:
         record["mem/cpu_percent"] = round(sum(per_cpu) if per_cpu else 0.0, 1)
         if self._device == "cpu":
             return
+        # v1-parity allocator stats (process-side, JAX backend). The
+        # field names match v1's torch path so existing dashboards key
+        # off them unchanged. See `_query_jax_memory_stats` for the
+        # cumulative-peak semantic note.
+        jax_stats = _query_jax_memory_stats()
+        if jax_stats is not None:
+            record["mem/gpu_peak_gb"] = jax_stats["gpu_peak_gb"]
+            record["mem/gpu_reserved_gb"] = jax_stats["gpu_reserved_gb"]
+            record["mem/gpu_current_gb"] = jax_stats["gpu_current_gb"]
+        # System-wide view via *-smi (covers other processes on the
+        # GPU). Retained alongside the v1-parity fields — the
+        # dashboard tolerates additional fields, and the smi numbers
+        # were the original v2 reporting surface.
         gpu = _query_gpu_stats()
         if gpu is None:
             return
-        # Match the v1 schema where reasonable; the dashboard reader
-        # tolerates additional fields.
         record["mem/gpu_used_gb"] = gpu["gpu_used_gb"]
         record["mem/gpu_total_gb"] = gpu["gpu_total_gb"]
 

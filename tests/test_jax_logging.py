@@ -295,27 +295,67 @@ def test_device_cpu_skips_gpu_query(tmp_path: Path) -> None:
 
 
 def test_device_cuda_invokes_gpu_query(tmp_path: Path) -> None:
-    """`device != "cpu"` triggers the GPU shell-out backend."""
+    """`device != "cpu"` triggers the GPU shell-out backend AND the
+    v1-parity JAX allocator probe; both populate their record fields."""
     with mock.patch(
         "pawn.logging._query_gpu_stats",
         return_value={"gpu_used_gb": 4.0, "gpu_total_gb": 24.0},
-    ) as mock_query:
+    ) as mock_smi, mock.patch(
+        "pawn.logging._query_jax_memory_stats",
+        return_value={
+            "gpu_peak_gb": 2.5,
+            "gpu_reserved_gb": 3.0,
+            "gpu_current_gb": 1.7,
+        },
+    ) as mock_jax:
         with MetricsLogger(tmp_path, slug="s", device="cuda") as logger:
             logger.log_train(step=1, loss=1.0)
-        assert mock_query.called
+        assert mock_smi.called
+        assert mock_jax.called
     parsed = json.loads(logger.path.read_text().splitlines()[0])
+    # smi-based system-wide fields.
     assert parsed["mem/gpu_used_gb"] == 4.0
     assert parsed["mem/gpu_total_gb"] == 24.0
+    # v1-parity allocator fields (parity #7).
+    assert parsed["mem/gpu_peak_gb"] == 2.5
+    assert parsed["mem/gpu_reserved_gb"] == 3.0
+    assert parsed["mem/gpu_current_gb"] == 1.7
 
 
 def test_device_cuda_with_no_gpu_backend_skips_gpu_fields(tmp_path: Path) -> None:
     """If the shell-out returns None (no CLI, query failed), no GPU
     fields are added — the run still logs cleanly."""
-    with mock.patch("pawn.logging._query_gpu_stats", return_value=None):
+    with mock.patch("pawn.logging._query_gpu_stats", return_value=None), \
+         mock.patch("pawn.logging._query_jax_memory_stats", return_value=None):
         with MetricsLogger(tmp_path, slug="s", device="cuda") as logger:
             logger.log_train(step=1, loss=1.0)
     parsed = json.loads(logger.path.read_text().splitlines()[0])
     assert "mem/gpu_used_gb" not in parsed
+    # v1-parity allocator fields are equally skipped when JAX returns None.
+    assert "mem/gpu_peak_gb" not in parsed
+    assert "mem/gpu_reserved_gb" not in parsed
+    assert "mem/gpu_current_gb" not in parsed
+
+
+def test_jax_memory_stats_field_names_match_v1_torch_path(tmp_path: Path) -> None:
+    """Parity #7: the v1 torch path used `mem/gpu_{peak,reserved,current}_gb`;
+    the v2 JAX path emits the same names so existing dashboards
+    (pawn/dashboard/charts.py:409-411) and grep'd workflows keep
+    working unchanged."""
+    with mock.patch(
+        "pawn.logging._query_jax_memory_stats",
+        return_value={
+            "gpu_peak_gb": 9.0,
+            "gpu_reserved_gb": 10.0,
+            "gpu_current_gb": 8.0,
+        },
+    ), mock.patch("pawn.logging._query_gpu_stats", return_value=None):
+        with MetricsLogger(tmp_path, slug="s", device="cuda") as logger:
+            logger.log_train(step=1, loss=1.0)
+    parsed = json.loads(logger.path.read_text().splitlines()[0])
+    assert set(parsed) >= {
+        "mem/gpu_peak_gb", "mem/gpu_reserved_gb", "mem/gpu_current_gb",
+    }
 
 
 # ---------------------------------------------------------------------------
