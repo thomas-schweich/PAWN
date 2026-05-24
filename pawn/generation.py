@@ -28,10 +28,13 @@ The diagnostics:
 Real autoregressive generation lives in :func:`autoregressive_generate`,
 which iterates one token at a time, applies the engine's legal-mask
 constraint when ``mask_illegal=True``, and tracks per-game termination
-state via :class:`chess_engine.PyBatchRLEnv`. JAX models don't have a
-KV-cached decoder yet — we run the full forward pass per decode step;
-the cost is acceptable at diagnostic-scale ``n_games``. KV-cache
-support is tracked as a perf follow-up.
+state via :class:`chess_engine.PyBatchRLEnv`. The default path uses
+the KV-cached decoder on :class:`pawn.model.PAWNModel` (and on
+:class:`pawn.adapters.bottleneck.BottleneckEffective`) — O(T) per
+decode step instead of O(T²) per step, so production-scale
+``n_per_outcome=1000`` runs stay tractable. Pass
+``use_kv_cache=False`` for the legacy full-forward path (used by the
+KV-cache parity test).
 """
 
 from __future__ import annotations
@@ -55,7 +58,7 @@ from pawn.config import (
     STALEMATE,
     WHITE_CHECKMATES,
 )
-from pawn.model import EffectiveCallable, PAWNModel
+from pawn.model import EffectiveCallable, KVCache, PAWNModel, init_kv_cache
 
 __all__ = [
     "DIAGNOSTIC_NAMES",
@@ -151,14 +154,22 @@ def autoregressive_generate(
     max_seq_len: int | None = None,
     temperature: float = 1.0,
     seed: int = 0,
+    use_kv_cache: bool | None = None,
 ) -> dict[str, np.ndarray]:
     """Generate ``n_games`` games autoregressively from ``model``.
 
     Mirrors the v1 :func:`pawn.eval_suite.generation.autoregressive_generate`
-    contract — same input shapes, same output dict keys. Runs the model's
-    full forward pass per decode step (no KV cache yet on the JAX side).
-    Game state is tracked by :class:`chess_engine.PyBatchRLEnv` so
-    legal-move masking and termination detection match the v1 engine.
+    contract — same input shapes, same output dict keys. Game state is
+    tracked by :class:`chess_engine.PyBatchRLEnv` so legal-move masking
+    and termination detection match the v1 engine.
+
+    ``use_kv_cache`` (default: auto-detect): when the ``model`` exposes
+    :meth:`PAWNModel.forward_with_cache`, use the cached decode path —
+    O(T) per step instead of O(T²) per step. Auto-detection covers
+    bare :class:`PAWNModel` and :class:`BottleneckEffective`; force
+    ``False`` for the legacy full-forward path (mostly for parity
+    testing). Force ``True`` to assert the cached path is available
+    and fail loudly otherwise.
 
     Returns a dict with:
         sequences:       (n_games, max_seq_len) int32 — full token stream
@@ -213,80 +224,180 @@ def autoregressive_generate(
 
     # ---- Decode loop ------------------------------------------------------
     rng = np.random.default_rng(seed)
-    # JIT the forward once; subsequent calls reuse the compile cache.
     import equinox as eqx
 
-    @eqx.filter_jit
-    def _forward(t: Int[Array, "B T"], a: Int[Array, "B T"]) -> Float[Array, "B T V"]:
-        return model(t, a)
+    # Auto-detect cache support: both PAWNModel and BottleneckEffective
+    # expose `forward_with_cache`; legacy wrappers (e.g. FiLM/LoRA
+    # apply_fn returns a fresh PAWNModel — same attribute) do too. The
+    # `getattr` form keeps EffectiveCallable Protocol-typed callers
+    # from having to declare the optional method.
+    has_cache_method = hasattr(model, "forward_with_cache")
+    if use_kv_cache is None:
+        use_kv_cache = has_cache_method
+    if use_kv_cache and not has_cache_method:
+        raise ValueError(
+            f"use_kv_cache=True but {type(model).__name__} has no "
+            "forward_with_cache method"
+        )
 
-    # Initial prefill: outcome + any prefix.
-    prefill_len = prefix_end + 1
-    tokens_jax = jnp.asarray(sequences[:, :prefill_len])
-    attn_jax = jnp.ones_like(tokens_jax, dtype=jnp.bool_)
-    logits_jax = _forward(tokens_jax, attn_jax)
-    next_logits = np.asarray(logits_jax[:, -1, :])
+    if use_kv_cache:
+        # Cache capacity = max_seq_len exactly (one slot per token in
+        # the generated sequence). The cache lives outside the jit'd
+        # step function so we can functionally update it across calls.
+        cache: KVCache = init_kv_cache(
+            model.cfg,  # type: ignore[attr-defined]
+            batch_size=n_games,
+            max_seq_len=max_seq_len,
+        )
 
-    for pos in range(prefill_len, max_seq_len):
-        active = ~terminated
-        if not active.any():
-            break
+        @eqx.filter_jit
+        def _prefill(
+            tokens: Int[Array, "B T_new"],
+            cache_in: KVCache,
+            pos_start: Int[Array, ""],
+        ) -> tuple[Float[Array, "B T_new V"], KVCache]:
+            return model.forward_with_cache(  # type: ignore[union-attr]
+                tokens, cache_in, pos_start,
+            )
 
-        # Optional legal-mask before sampling.
-        if temperature != 1.0:
-            next_logits = next_logits / temperature
-        if mask_illegal:
-            raw = np.asarray(env.get_legal_token_masks_batch(all_indices))
-            # Terminated games: only PAD is legal so the model's choice
-            # doesn't matter (pos is ignored by the env once terminated).
-            pad_row = np.zeros((1, next_logits.shape[1]), dtype=bool)
-            pad_row[0, PAD_TOKEN] = True
-            term_mat = terminated[:, None]
-            full_mask = np.where(term_mat, pad_row, raw)
-            next_logits = np.where(full_mask, next_logits, -np.inf)
+        @eqx.filter_jit
+        def _decode_step(
+            token: Int[Array, "B 1"],
+            cache_in: KVCache,
+            pos_start: Int[Array, ""],
+        ) -> tuple[Float[Array, "B 1 V"], KVCache]:
+            return model.forward_with_cache(  # type: ignore[union-attr]
+                token, cache_in, pos_start,
+            )
 
-        # Gumbel-max sampling (matches v1's `(logits + gumbel).argmax`).
-        # Equivalent to temperature-1 categorical sampling without a
-        # softmax materialisation.
-        gumbel = -np.log(-np.log(rng.uniform(1e-10, 1.0, size=next_logits.shape)))
-        sampled = (next_logits + gumbel).argmax(axis=-1).astype(np.int32)
-        sequences[:, pos] = sampled
+        # Prefill: outcome + any prefix in a single call.
+        prefill_len = prefix_end + 1
+        tokens_jax = jnp.asarray(sequences[:, :prefill_len])
+        logits_jax, cache = _prefill(tokens_jax, cache, jnp.int32(0))
+        next_logits = np.asarray(logits_jax[:, -1, :])
 
-        # Premature-PAD detection.
-        pad_mask = active & (sampled == PAD_TOKEN)
-        if pad_mask.any():
-            terminated[pad_mask] = True
-            terminated_at[pad_mask] = pos - 1
-            term_codes[pad_mask] = -2
+        for pos in range(prefill_len, max_seq_len):
+            active = ~terminated
+            if not active.any():
+                break
 
-        # Apply moves for the remaining active games.
-        move_mask = active & ~pad_mask & ~terminated
-        if move_mask.any():
-            mv_idx = all_indices[move_mask]
-            mv_tok = sampled[move_mask].astype(np.uint16)
-            legality, step_tc = env.apply_moves(mv_idx, mv_tok)
-            legality = np.asarray(legality)
-            step_tc = np.asarray(step_tc)
-            illegal = ~legality
-            if illegal.any():
-                forfeit_global = mv_idx[illegal]
-                forfeit_ply[forfeit_global] = pos - 1
-                terminated[forfeit_global] = True
-                terminated_at[forfeit_global] = pos - 1
-                term_codes[forfeit_global] = -3
-            termed = legality & (step_tc >= 0)
-            if termed.any():
-                tg = mv_idx[termed]
-                terminated[tg] = True
-                terminated_at[tg] = pos
-                term_codes[tg] = step_tc[termed]
+            if temperature != 1.0:
+                next_logits = next_logits / temperature
+            if mask_illegal:
+                raw = np.asarray(env.get_legal_token_masks_batch(all_indices))
+                pad_row = np.zeros((1, next_logits.shape[1]), dtype=bool)
+                pad_row[0, PAD_TOKEN] = True
+                term_mat = terminated[:, None]
+                full_mask = np.where(term_mat, pad_row, raw)
+                next_logits = np.where(full_mask, next_logits, -np.inf)
 
-        # Next forward unless this was the last position or everyone's done.
-        if pos < max_seq_len - 1 and not terminated.all():
-            tokens_jax = jnp.asarray(sequences[:, : pos + 1])
-            attn_jax = jnp.ones_like(tokens_jax, dtype=jnp.bool_)
-            logits_jax = _forward(tokens_jax, attn_jax)
-            next_logits = np.asarray(logits_jax[:, -1, :])
+            gumbel = -np.log(
+                -np.log(rng.uniform(1e-10, 1.0, size=next_logits.shape))
+            )
+            sampled = (next_logits + gumbel).argmax(axis=-1).astype(np.int32)
+            sequences[:, pos] = sampled
+
+            pad_mask = active & (sampled == PAD_TOKEN)
+            if pad_mask.any():
+                terminated[pad_mask] = True
+                terminated_at[pad_mask] = pos - 1
+                term_codes[pad_mask] = -2
+
+            move_mask = active & ~pad_mask & ~terminated
+            if move_mask.any():
+                mv_idx = all_indices[move_mask]
+                mv_tok = sampled[move_mask].astype(np.uint16)
+                legality, step_tc = env.apply_moves(mv_idx, mv_tok)
+                legality = np.asarray(legality)
+                step_tc = np.asarray(step_tc)
+                illegal = ~legality
+                if illegal.any():
+                    forfeit_global = mv_idx[illegal]
+                    forfeit_ply[forfeit_global] = pos - 1
+                    terminated[forfeit_global] = True
+                    terminated_at[forfeit_global] = pos - 1
+                    term_codes[forfeit_global] = -3
+                termed = legality & (step_tc >= 0)
+                if termed.any():
+                    tg = mv_idx[termed]
+                    terminated[tg] = True
+                    terminated_at[tg] = pos
+                    term_codes[tg] = step_tc[termed]
+
+            if pos < max_seq_len - 1 and not terminated.all():
+                # Feed the freshly sampled token at position `pos`.
+                tok_jax = jnp.asarray(sequences[:, pos : pos + 1])
+                logits_jax, cache = _decode_step(
+                    tok_jax, cache, jnp.int32(pos),
+                )
+                next_logits = np.asarray(logits_jax[:, -1, :])
+    else:
+        @eqx.filter_jit
+        def _forward(
+            t: Int[Array, "B T"], a: Int[Array, "B T"]
+        ) -> Float[Array, "B T V"]:
+            return model(t, a)
+
+        # Initial prefill: outcome + any prefix.
+        prefill_len = prefix_end + 1
+        tokens_jax = jnp.asarray(sequences[:, :prefill_len])
+        attn_jax = jnp.ones_like(tokens_jax, dtype=jnp.bool_)
+        logits_jax = _forward(tokens_jax, attn_jax)
+        next_logits = np.asarray(logits_jax[:, -1, :])
+
+        for pos in range(prefill_len, max_seq_len):
+            active = ~terminated
+            if not active.any():
+                break
+
+            if temperature != 1.0:
+                next_logits = next_logits / temperature
+            if mask_illegal:
+                raw = np.asarray(env.get_legal_token_masks_batch(all_indices))
+                pad_row = np.zeros((1, next_logits.shape[1]), dtype=bool)
+                pad_row[0, PAD_TOKEN] = True
+                term_mat = terminated[:, None]
+                full_mask = np.where(term_mat, pad_row, raw)
+                next_logits = np.where(full_mask, next_logits, -np.inf)
+
+            gumbel = -np.log(
+                -np.log(rng.uniform(1e-10, 1.0, size=next_logits.shape))
+            )
+            sampled = (next_logits + gumbel).argmax(axis=-1).astype(np.int32)
+            sequences[:, pos] = sampled
+
+            pad_mask = active & (sampled == PAD_TOKEN)
+            if pad_mask.any():
+                terminated[pad_mask] = True
+                terminated_at[pad_mask] = pos - 1
+                term_codes[pad_mask] = -2
+
+            move_mask = active & ~pad_mask & ~terminated
+            if move_mask.any():
+                mv_idx = all_indices[move_mask]
+                mv_tok = sampled[move_mask].astype(np.uint16)
+                legality, step_tc = env.apply_moves(mv_idx, mv_tok)
+                legality = np.asarray(legality)
+                step_tc = np.asarray(step_tc)
+                illegal = ~legality
+                if illegal.any():
+                    forfeit_global = mv_idx[illegal]
+                    forfeit_ply[forfeit_global] = pos - 1
+                    terminated[forfeit_global] = True
+                    terminated_at[forfeit_global] = pos - 1
+                    term_codes[forfeit_global] = -3
+                termed = legality & (step_tc >= 0)
+                if termed.any():
+                    tg = mv_idx[termed]
+                    terminated[tg] = True
+                    terminated_at[tg] = pos
+                    term_codes[tg] = step_tc[termed]
+
+            if pos < max_seq_len - 1 and not terminated.all():
+                tokens_jax = jnp.asarray(sequences[:, : pos + 1])
+                attn_jax = jnp.ones_like(tokens_jax, dtype=jnp.bool_)
+                logits_jax = _forward(tokens_jax, attn_jax)
+                next_logits = np.asarray(logits_jax[:, -1, :])
 
     # Games that never terminated within the window.
     still_going = ~terminated

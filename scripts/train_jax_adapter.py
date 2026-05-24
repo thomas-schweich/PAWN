@@ -211,6 +211,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                     help="use random-game corpus instead of Lichess parquet")
     ap.add_argument("--local-checkpoints", action="store_true")
     ap.add_argument("--hf-repo", default=None)
+    ap.add_argument("--resume", type=Path, default=None,
+                    help="resume from an adapter_step_<N> checkpoint dir. "
+                         "Bottleneck-style adapters automatically detect "
+                         "the adapter.safetensors sidecar.")
+    ap.add_argument("--use-sdpa", action="store_true",
+                    help="opt the attention block into "
+                         "jax.nn.dot_product_attention (parity #43). "
+                         "Off by default — gain is hardware-dependent.")
     ap.add_argument("--logs-dir", type=Path, default=Path("logs"))
     ap.add_argument("--log-interval", type=int, default=None,
                     help="Steps between metrics rows; defaults to the "
@@ -224,7 +232,10 @@ def _build_config(args: argparse.Namespace) -> AdapterConfig:
         base.update(json.loads(args.config.read_text()))
         base.setdefault("run_type", "adapter")
     for flag, val in vars(args).items():
-        if flag in ("config", "no_pgn", "local_checkpoints", "logs_dir"):
+        if flag in ("config", "no_pgn", "local_checkpoints", "logs_dir", "resume"):
+            # `resume` is operated on directly from `args` (it's a Path,
+            # not a pydantic-validated string), so don't merge it into
+            # the config dict.
             continue
         # Skip None (not-set) but keep False so a user can disable a
         # default-True `store_true` flag via the JSON config. (CLI alone
@@ -286,11 +297,61 @@ def main(argv: list[str] | None = None) -> int:
     # Optimizer over the adapter only.
     schedule = make_lr_schedule(cfg, cfg.total_steps)
     optimizer = make_optimizer(cfg, schedule)
-    flt = dispatch_filter(cfg.strategy)(adapter)
-    opt_state = optimizer.init(eqx.filter(adapter, flt))
+
+    # Resume: splice adapter + step + opt-state from a checkpoint dir.
+    # The backbone is taken from the checkpoint (the saved `model.safetensors`
+    # *is* the backbone for bottleneck-style adapters; for weight-folded
+    # adapters it's the folded effective model — both load cleanly via
+    # `pawn.checkpoint.load_model` since the v2 schema treats them
+    # identically). Bottleneck adapters auto-detect the sidecar via
+    # `load_bottleneck_adapter`; other strategies cold-start the adapter
+    # PyTree but warm-start the optimizer state, which still preserves
+    # Adam moments + clip counter across the resume boundary.
+    resume_step = 0
+    if args.resume is not None:
+        from pawn.adapters.bottleneck import (
+            ADAPTER_SAFETENSORS,
+            BottleneckConfig,
+            load_bottleneck_adapter,
+        )
+        from pawn.checkpoint import OPTIMIZER_FILE, load_model
+        from pawn.trainer import unflatten_opt_state
+
+        ckpt_dir = Path(args.resume)
+        backbone = load_model(ckpt_dir)
+        # Splice step from training_state.json.
+        ts_path = ckpt_dir / "training_state.json"
+        if ts_path.is_file():
+            ts_data = json.loads(ts_path.read_text(encoding="utf-8"))
+            resume_step = int(ts_data.get("step", 0))
+        # Bottleneck sidecar: re-compose the wrapper. Otherwise fall
+        # back to the freshly-initialised adapter (weight-folded
+        # adapters bake into the backbone at save time, so they don't
+        # need a separate restore step).
+        sidecar = ckpt_dir / ADAPTER_SAFETENSORS
+        if sidecar.is_file() and isinstance(strategy_cfg, BottleneckConfig):
+            adapter = load_bottleneck_adapter(ckpt_dir, strategy_cfg)
+        # Build the optimizer template *after* adapter rebuild so the
+        # opt-state shape matches what the loaded adapter trains.
+        flt = dispatch_filter(cfg.strategy)(adapter)
+        opt_state = optimizer.init(eqx.filter(adapter, flt))
+        opt_path = ckpt_dir / OPTIMIZER_FILE
+        if opt_path.is_file():
+            from safetensors.numpy import load_file as st_load
+            flat = st_load(str(opt_path))
+            opt_state = unflatten_opt_state(opt_state, flat)
+        else:
+            print(
+                f"[train_jax_adapter] WARNING: no {OPTIMIZER_FILE} in "
+                f"{args.resume}; resuming with fresh opt_state.",
+                file=sys.stderr,
+            )
+    else:
+        flt = dispatch_filter(cfg.strategy)(adapter)
+        opt_state = optimizer.init(eqx.filter(adapter, flt))
     state = AdapterTrainState(
         backbone=backbone, adapter=adapter, opt_state=opt_state,
-        step=jnp.int32(0), key=jax.random.key(0),
+        step=jnp.int32(resume_step), key=jax.random.key(0),
     )
     _DTYPE_MAP = {
         "bfloat16": jnp.bfloat16,
@@ -299,7 +360,8 @@ def main(argv: list[str] | None = None) -> int:
     }
     compute_dtype = _DTYPE_MAP[cfg.amp_dtype]
     train_step = make_adapter_train_step(
-        cfg.strategy, optimizer, compute_dtype=compute_dtype
+        cfg.strategy, optimizer,
+        compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa,
     )
 
     apply_fn = STRATEGIES[cfg.strategy].apply
@@ -369,38 +431,26 @@ def main(argv: list[str] | None = None) -> int:
         can't collapse into the backbone's weight tensors. For these
         the save path writes the frozen backbone as the main checkpoint
         and dumps the adapter weights as ``adapter.safetensors`` in the
-        same directory — the resume / eval loader is responsible for
-        re-composing the wrapper when both files are present (a
-        v1-parity follow-up tracked under parity #8's deleted-test
-        port; the current load path treats the saved backbone as the
-        de-facto effective model).
+        same directory — :func:`pawn.adapters.bottleneck.load_bottleneck_adapter`
+        re-composes the wrapper at resume time.
 
         Checkpoints land under the MetricsLogger's per-run directory so
         two concurrent runs can't collide on the same path.
         """
-        from pawn.adapters.bottleneck import BottleneckEffective
+        from pawn.adapters.bottleneck import (
+            BottleneckEffective,
+            save_bottleneck_adapter,
+        )
         effective = apply_fn(state.backbone, state.adapter)
         out = logger.run_dir / f"adapter_step_{step_int:08d}"
         if isinstance(effective, BottleneckEffective):
-            # Bottleneck wrapper: persist backbone as the main payload
-            # and sidecar the adapter weights for downstream re-load.
             save_model(
                 effective.backbone, out,
                 run_config=cfg.model_dump(),
                 optimizer_state=flatten_opt_state(state.opt_state),
                 training_state={"step": int(state.step)},
             )
-            from safetensors.numpy import save_file as st_save
-            adapter_arrays: dict[str, np.ndarray] = {}
-            for field_name in (
-                "down_attn", "hidden_attn", "up_attn",
-                "down_ffn", "hidden_ffn", "up_ffn",
-            ):
-                leaf = getattr(effective.adapter, field_name)
-                if leaf is not None:
-                    adapter_arrays[f"bottleneck.{field_name}"] = np.asarray(leaf)
-            if adapter_arrays:
-                st_save(adapter_arrays, str(out / "adapter.safetensors"))
+            save_bottleneck_adapter(effective.adapter, out)
         else:
             # PAWNModel — the standard weight-folded save path. The
             # narrowing assertion satisfies pyright: the only two
@@ -476,6 +526,19 @@ def main(argv: list[str] | None = None) -> int:
         # silenced via apply_rosa's sparse_active gate).
         rosa_cfg = state.adapter.cfg
         warmup_n = min(rosa_cfg.rosa_warmup_steps, cfg.total_steps)
+        # Resume not supported across the RoSA phase 1→3 boundary —
+        # the Phase 2 mask-gen is non-resumable (the masks aren't
+        # persisted yet). RoSA --resume must hand back a checkpoint
+        # taken inside the Phase 3 segment; the simpler path is to
+        # disallow RoSA resume entirely for now.
+        if resume_step > 0:
+            print(
+                "[train_jax_adapter] WARNING: --resume + RoSA is best-effort: "
+                "the Phase 2 mask-generation state is not persisted, so a "
+                "resume that crosses the Phase 1→3 boundary re-runs Phase 2 "
+                "with a fresh mask draw.",
+                file=sys.stderr,
+            )
         state, last = _run_steps(state, train_step, warmup_n, start_step=0)
         if not should_shutdown() and warmup_n < cfg.total_steps:
             # Phase 2: gather `mask_samples` batches and accumulate
@@ -519,7 +582,13 @@ def main(argv: list[str] | None = None) -> int:
                 state, train_step, phase3_remaining, start_step=warmup_n,
             )
     else:
-        state, _ = _run_steps(state, train_step, cfg.total_steps, start_step=0)
+        # `resume_step` is the absolute step the saved checkpoint
+        # reached; remaining work is `cfg.total_steps - resume_step`
+        # so the run honours the original total-steps budget.
+        remaining = max(0, cfg.total_steps - resume_step)
+        state, _ = _run_steps(
+            state, train_step, remaining, start_step=resume_step,
+        )
     # Always emit a final checkpoint at run-end, even when
     # `total_steps < checkpoint_interval` (short LoRA smokes, sweeps,
     # the §3 criterion 7 acceptance command). Without this the trained

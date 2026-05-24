@@ -162,6 +162,16 @@ def test_amp_dtype_field_present_and_defaults_to_bfloat16() -> None:
         )
 
 
+def test_use_sdpa_field_defaults_off() -> None:
+    """Parity #43 follow-up: ``use_sdpa`` is a bool field that defaults
+    to False (keep the bit-stable baseline) and accepts True to opt
+    into the :func:`jax.nn.dot_product_attention` path."""
+    cfg = PretrainConfig(**_pretrain_kwargs())
+    assert cfg.use_sdpa is False
+    cfg = PretrainConfig(**_pretrain_kwargs(use_sdpa=True))
+    assert cfg.use_sdpa is True
+
+
 def test_supernet_field_options() -> None:
     """`supernet` is a Literal['tiny','production']."""
     cfg = PretrainConfig(**_pretrain_kwargs(supernet="tiny"))

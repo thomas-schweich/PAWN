@@ -363,9 +363,12 @@ $ uv run --extra rocm python scripts/eval_generation_jax.py \
 The skip-sentinel contract is asserted by `tests/test_jax_eval.py`.
 The full v1 autoregressive generator ships as
 `pawn.generation.autoregressive_generate`; the KV-cached decoder
-fast-path is the one remaining perf follow-up (DEFERRALS.md) — it
-doesn't change diagnostic correctness, only throughput at large
-`n_per_outcome`.
+fast-path is wired by default via :class:`pawn.model.KVCache` +
+:meth:`PAWNModel.forward_with_cache`, with auto-detection in
+``autoregressive_generate`` (bare :class:`PAWNModel` and
+:class:`BottleneckEffective` both qualify). The parity test
+`test_autoregressive_generate_kv_cache_matches_full_forward` pins
+bit-identical sequences between cached and non-cached paths.
 
 ---
 

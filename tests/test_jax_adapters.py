@@ -393,6 +393,81 @@ def test_bottleneck_identity_at_init_matches_backbone_logits() -> None:
     assert jnp.allclose(bare, bottlenecked, atol=1e-6, rtol=0)
 
 
+def test_bottleneck_save_load_roundtrip(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A bottleneck adapter saved via ``save_bottleneck_adapter`` reloads
+    bit-identical via ``load_bottleneck_adapter``. This is the load-bearing
+    invariant for the trainer's --resume path (DEFERRALS bottleneck adapter
+    resume): a re-composed wrapper must produce the same logits as the one
+    that wrote the sidecar."""
+    from pawn.adapters.bottleneck import (
+        ADAPTER_SAFETENSORS,
+        apply_bottleneck,
+        load_bottleneck_adapter,
+        save_bottleneck_adapter,
+    )
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = BottleneckConfig(dim=4)
+    adapter = dispatch_init("bottleneck")(backbone, cfg, key=jax.random.key(0))
+    # Mutate the up projections to exercise the round-trip (zero-init
+    # would be trivially equal — we want a non-degenerate test).
+    rng_key = jax.random.key(7)
+    perturb = jax.random.normal(rng_key, adapter.up_attn.shape) * 0.01
+    adapter = eqx.tree_at(lambda a: a.up_attn, adapter, adapter.up_attn + perturb)
+
+    save_bottleneck_adapter(adapter, tmp_path)
+    assert (tmp_path / ADAPTER_SAFETENSORS).is_file()
+
+    loaded = load_bottleneck_adapter(tmp_path, cfg)
+    assert loaded.cfg == cfg
+    # Tensor-by-tensor equality on the populated fields.
+    for field_name in (
+        "down_attn", "hidden_attn", "up_attn",
+        "down_ffn", "hidden_ffn", "up_ffn",
+    ):
+        orig = getattr(adapter, field_name)
+        new = getattr(loaded, field_name)
+        if orig is None:
+            assert new is None
+        else:
+            assert new is not None
+            assert jnp.array_equal(orig, new)
+
+    # Forward parity: the re-loaded wrapper produces the same logits.
+    tokens = jnp.zeros((2, 16), dtype=jnp.int32)
+    orig_logits = apply_bottleneck(backbone, adapter)(tokens)
+    new_logits = apply_bottleneck(backbone, loaded)(tokens)
+    assert jnp.allclose(orig_logits, new_logits, atol=1e-6, rtol=0)
+
+
+def test_bottleneck_load_rejects_missing_sidecar(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """An empty directory raises FileNotFoundError — the trainer's
+    resume path predicates on the sidecar's existence, so this is the
+    expected exception type."""
+    from pawn.adapters.bottleneck import load_bottleneck_adapter
+
+    cfg = BottleneckConfig(dim=4)
+    with pytest.raises(FileNotFoundError, match="adapter.safetensors"):
+        load_bottleneck_adapter(tmp_path, cfg)
+
+
+def test_bottleneck_save_load_respects_placement_flags(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """``no_adapt_attn=True`` writes only the FFN fields; the load
+    restores Nones in the disabled slots."""
+    from pawn.adapters.bottleneck import (
+        load_bottleneck_adapter,
+        save_bottleneck_adapter,
+    )
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = BottleneckConfig(dim=4, no_adapt_attn=True)
+    adapter = dispatch_init("bottleneck")(backbone, cfg, key=jax.random.key(0))
+    save_bottleneck_adapter(adapter, tmp_path)
+    loaded = load_bottleneck_adapter(tmp_path, cfg)
+    assert loaded.down_attn is None and loaded.up_attn is None
+    assert loaded.down_ffn is not None and loaded.up_ffn is not None
+
+
 def test_bottleneck_n_hidden_extra_stages_shape() -> None:
     """``n_hidden=2`` adds two extra (dim, dim) GELU stages between the
     down and up projections — verify the buffer shape carries them."""

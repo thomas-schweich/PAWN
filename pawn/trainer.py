@@ -150,6 +150,7 @@ def cross_entropy_loss(
     batch: Batch,
     *,
     compute_dtype: jnp.dtype | None = None,
+    use_sdpa: bool = False,
 ) -> Float[Array, ""]:
     """Masked cross-entropy on a single variant + batch.
 
@@ -165,8 +166,30 @@ def cross_entropy_loss(
     ``compute_dtype`` is the AMP forward dtype (plan §5). ``None`` (the
     default) runs the model in fp32 — the legacy converter's parity
     test and any consumer that needs bit-stable logits pass ``None``.
+
+    ``use_sdpa`` opts the attention block into
+    :func:`jax.nn.dot_product_attention` (parity #43). Bare
+    :class:`PAWNModel` accepts the kwarg; wrappers that satisfy
+    :class:`EffectiveCallable` (e.g. ``BottleneckEffective``) do not —
+    the trainer falls back to the plain path automatically. See
+    :data:`pawn.run_config.BaseRunConfig.use_sdpa` for the operator
+    surface.
     """
-    logits = model(batch.tokens, batch.attn_mask, compute_dtype=compute_dtype)
+    if isinstance(model, PAWNModel):
+        logits = model(
+            batch.tokens, batch.attn_mask,
+            compute_dtype=compute_dtype, use_sdpa=use_sdpa,
+        )
+    else:
+        # `EffectiveCallable` wrappers don't expose `use_sdpa` — they
+        # call into the backbone with their own hooks and would need a
+        # wrapper-side flag to pass it through. For now the wrapper
+        # path always uses plain attention; the SDPA win is mostly for
+        # inference shapes anyway, where bottleneck adapters aren't in
+        # play (adapter training stays on the plain path).
+        logits = model(
+            batch.tokens, batch.attn_mask, compute_dtype=compute_dtype,
+        )
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     target_lp = jnp.take_along_axis(
         log_probs, batch.targets[..., None], axis=-1
@@ -182,6 +205,7 @@ def supernet_joint_loss(
     variants: tuple[VariantSpec, ...],
     *,
     compute_dtype: jnp.dtype | None = None,
+    use_sdpa: bool = False,
 ) -> Float[Array, ""]:
     """The supernet joint loss: **sum** per-variant cross-entropies on
     the same batch.
@@ -215,7 +239,7 @@ def supernet_joint_loss(
         else:
             sub_model = sliced(model, spec.cfg)
         total = total + cross_entropy_loss(
-            sub_model, batch, compute_dtype=compute_dtype
+            sub_model, batch, compute_dtype=compute_dtype, use_sdpa=use_sdpa,
         )
     return total
 
@@ -558,6 +582,7 @@ def make_train_step(
     variants: tuple[VariantSpec, ...],
     *,
     compute_dtype: jnp.dtype | None = None,
+    use_sdpa: bool = False,
 ) -> Callable[[TrainState, Batch], tuple[TrainState, Float[Array, ""]]]:
     """Return a JIT-compiled single training step closing over the
     optimizer + variant list.
@@ -588,7 +613,8 @@ def make_train_step(
     ) -> tuple[TrainState, Float[Array, ""]]:
         def loss_fn(model: PAWNModel) -> Float[Array, ""]:
             return supernet_joint_loss(
-                model, batch, variants, compute_dtype=compute_dtype
+                model, batch, variants,
+                compute_dtype=compute_dtype, use_sdpa=use_sdpa,
             )
 
         loss, grads = eqx.filter_value_and_grad(loss_fn)(state.model)

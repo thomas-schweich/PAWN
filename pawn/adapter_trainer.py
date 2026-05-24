@@ -233,6 +233,7 @@ def make_adapter_train_step(
     optimizer: optax.GradientTransformation,
     *,
     compute_dtype: "jnp.dtype | None" = None,
+    use_sdpa: bool = False,
 ) -> Callable[
     [AdapterTrainState, Batch], tuple[AdapterTrainState, Float[Array, ""]]
 ]:
@@ -244,6 +245,11 @@ def make_adapter_train_step(
     :func:`eqx.partition`.
 
     ``compute_dtype`` selects the AMP forward dtype (plan §5).
+    ``use_sdpa`` is the parity #43 fast-path opt-in — only honoured
+    for strategies whose ``apply_fn`` returns a bare :class:`PAWNModel`
+    (LoRA, sparse, FiLM, unfreeze, ...); bottleneck-style wrappers
+    silently fall back to plain attention because the wrapper's
+    ``__call__`` doesn't take a ``use_sdpa`` kwarg.
     """
 
     apply_fn = dispatch_apply(strategy)
@@ -256,7 +262,8 @@ def make_adapter_train_step(
         def loss_fn(adapter: Any) -> Float[Array, ""]:
             effective = apply_fn(state.backbone, adapter)
             return cross_entropy_loss(
-                effective, batch, compute_dtype=compute_dtype
+                effective, batch,
+                compute_dtype=compute_dtype, use_sdpa=use_sdpa,
             )
 
         loss, grads = eqx.filter_value_and_grad(loss_fn)(state.adapter)

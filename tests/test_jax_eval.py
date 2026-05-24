@@ -175,6 +175,31 @@ def test_run_all_diagnostics_has_5_entries() -> None:
     assert set(results.keys()) == set(DIAGNOSTIC_NAMES)
 
 
+def test_autoregressive_generate_kv_cache_matches_full_forward() -> None:
+    """The cached and non-cached paths in `autoregressive_generate`
+    must agree on the generated sequences (both seeded the same and
+    sampling is deterministic for argmax-style Gumbel-max at the same
+    weights). Pins the speed-vs-correctness invariant — a future change
+    that breaks numeric parity between cache paths shows up here."""
+    from pawn.generation import WHITE_CHECKMATES, autoregressive_generate
+
+    model = init_model(TINY_SUPERNET, key=0)
+    gen_plain = autoregressive_generate(
+        model, WHITE_CHECKMATES, n_games=2,
+        mask_illegal=True, max_seq_len=8, seed=0, use_kv_cache=False,
+    )
+    gen_cached = autoregressive_generate(
+        model, WHITE_CHECKMATES, n_games=2,
+        mask_illegal=True, max_seq_len=8, seed=0, use_kv_cache=True,
+    )
+    # Sequences should match: the two paths share sampling RNG (the
+    # `seed=0` -> default_rng draws are deterministic) and produce
+    # numerically-equivalent logits per parity test in test_jax_model.
+    assert np.array_equal(gen_plain["sequences"], gen_cached["sequences"])
+    assert np.array_equal(gen_plain["term_codes"], gen_cached["term_codes"])
+    assert np.array_equal(gen_plain["game_lengths"], gen_cached["game_lengths"])
+
+
 # ---------------------------------------------------------------------------
 # Linear probes
 # ---------------------------------------------------------------------------

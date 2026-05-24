@@ -121,6 +121,20 @@ class BaseRunConfig(BaseModel):
     # to this contract not being wired up).
     amp_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
 
+    # --- SDPA fast-path (parity #43) -----------------------------------
+    # Opt into `jax.nn.dot_product_attention` (XLA implementation) for
+    # the attention block. The plan §5 marked SDPA out of scope citing
+    # fused-kernel maturity on JAX-on-ROCm; in practice the XLA impl
+    # works fine for inference shapes but OOMs at training shapes on
+    # RDNA 3 hardware (64 KB shared memory < the 128 KB the fused
+    # kernel requests at B≥2 T=512). Off by default to preserve the
+    # bit-stable plain-attention baseline; flip to True on hardware
+    # where SDPA actually wins (modern data-center GPUs or inference
+    # workloads at smaller B/T). See `tests/test_jax_model.py
+    # ::test_use_sdpa_matches_plain_attention_within_fp32_noise` for
+    # the correctness guard.
+    use_sdpa: bool = False
+
     # --- JAX-specific (new in v2) --------------------------------------
     # Which supernet config the run trains / slices from. ``"production"``
     # = `SUPERNET` (d=640, 10 layers, 10 heads); ``"tiny"`` =

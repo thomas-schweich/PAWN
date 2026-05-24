@@ -32,10 +32,11 @@ from typing import Any
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int
+import numpy as np
+from jaxtyping import Array, Float, Int
 
 from pawn.config import ModelConfig
-from pawn.model import PAWNModel
+from pawn.model import KVCache, PAWNModel
 
 __all__ = [
     "BottleneckConfig",
@@ -44,7 +45,15 @@ __all__ = [
     "init_bottleneck_adapter",
     "apply_bottleneck",
     "bottleneck_filter",
+    "ADAPTER_SAFETENSORS",
+    "save_bottleneck_adapter",
+    "load_bottleneck_adapter",
 ]
+
+
+# Sidecar filename used by the trainer's save / resume path. Held as a
+# module constant so the train + load sites can't drift apart.
+ADAPTER_SAFETENSORS = "adapter.safetensors"
 
 
 @dataclass(frozen=True)
@@ -283,6 +292,51 @@ class BottleneckEffective(eqx.Module):
             hook_data=hook_data,
         )
 
+    def forward_with_cache(
+        self,
+        input_ids: Int[Array, "B T_new"],
+        cache: KVCache,
+        pos_start: Int[Array, ""] | int,
+        *,
+        compute_dtype: jnp.dtype | None = None,
+    ) -> tuple[Float[Array, "B T_new V"], KVCache]:
+        """Cached forward — delegates to the backbone's KV-cached path
+        and threads the bottleneck residual hooks through unchanged.
+
+        The Houlsby residual MLP is position-local (operates pointwise
+        on the hidden state at each token), so injecting it at the
+        same attn/ffn hook sites in the cached path produces the same
+        logits as the non-cached forward — modulo XLA kernel-ordering
+        noise. Lets adapter-wrapped backbones share the KV-cache
+        speedup with bare :class:`PAWNModel` for generation.
+        """
+        adapter = self.adapter
+        hook_data = adapter
+
+        def attn_hook(
+            h: Float[Array, "B T d"], slice_: BottleneckAdapter
+        ) -> Float[Array, "B T d"]:
+            return _bottleneck_residual(
+                h, slice_.down_attn, slice_.hidden_attn, slice_.up_attn,
+                compute_dtype,
+            )
+
+        def ffn_hook(
+            h: Float[Array, "B T d"], slice_: BottleneckAdapter
+        ) -> Float[Array, "B T d"]:
+            return _bottleneck_residual(
+                h, slice_.down_ffn, slice_.hidden_ffn, slice_.up_ffn,
+                compute_dtype,
+            )
+
+        return self.backbone.forward_with_cache(
+            input_ids, cache, pos_start,
+            compute_dtype=compute_dtype,
+            attn_hook=attn_hook if not adapter.cfg.no_adapt_attn else None,
+            ffn_hook=ffn_hook if not adapter.cfg.no_adapt_ffn else None,
+            hook_data=hook_data,
+        )
+
 
 def apply_bottleneck(
     backbone: PAWNModel, adapter: BottleneckAdapter
@@ -295,4 +349,92 @@ def apply_bottleneck(
 def bottleneck_filter(adapter: BottleneckAdapter) -> BottleneckAdapter:
     return jax.tree_util.tree_map(
         lambda leaf: True if eqx.is_inexact_array(leaf) else False, adapter
+    )
+
+
+# ---------------------------------------------------------------------------
+# Save / load — sidecar safetensors next to the backbone checkpoint
+# ---------------------------------------------------------------------------
+
+
+# Fields persisted to / restored from the sidecar safetensors file.
+# Stored under ``bottleneck.<field>`` keys so future adapter sidecars
+# can coexist in the same directory without colliding.
+_ADAPTER_FIELDS: tuple[str, ...] = (
+    "down_attn", "hidden_attn", "up_attn",
+    "down_ffn", "hidden_ffn", "up_ffn",
+)
+
+
+def save_bottleneck_adapter(
+    adapter: BottleneckAdapter, out_dir: Any,
+) -> None:
+    """Write the bottleneck weights to ``out_dir/adapter.safetensors``.
+
+    Only the populated fields land on disk — the ``no_adapt_attn`` /
+    ``no_adapt_ffn`` placements stay None at load time because the
+    config is replayed alongside the backbone (so the
+    :func:`init_bottleneck_adapter` path takes the same branch as it
+    did at save time).
+
+    The caller is responsible for writing ``out_dir/model.safetensors``
+    (the frozen backbone) and the config block; this just emits the
+    Houlsby sidecar. Keeps the train-time save path's two-file layout
+    in lockstep with the load path below.
+    """
+    from pathlib import Path
+
+    from safetensors.numpy import save_file as st_save
+
+    out_path = Path(out_dir)
+    arrays: dict[str, np.ndarray] = {}
+    for name in _ADAPTER_FIELDS:
+        leaf = getattr(adapter, name)
+        if leaf is not None:
+            arrays[f"bottleneck.{name}"] = np.asarray(leaf)
+    if arrays:
+        st_save(arrays, str(out_path / ADAPTER_SAFETENSORS))
+
+
+def load_bottleneck_adapter(
+    ckpt_dir: Any, cfg: BottleneckConfig,
+) -> BottleneckAdapter:
+    """Restore a :class:`BottleneckAdapter` from a checkpoint sidecar.
+
+    Expects ``ckpt_dir/adapter.safetensors`` written by
+    :func:`save_bottleneck_adapter`. ``cfg`` must match the
+    save-time config — the placement flags determine which fields are
+    populated; a mismatch will surface as a ``KeyError`` reading the
+    sidecar.
+
+    Raises :class:`FileNotFoundError` if the sidecar isn't present —
+    callers that need a "is this a bottleneck checkpoint" check should
+    test for ``(ckpt_dir / "adapter.safetensors").is_file()`` first.
+    """
+    from pathlib import Path
+
+    from safetensors.numpy import load_file as st_load
+
+    path = Path(ckpt_dir) / ADAPTER_SAFETENSORS
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"no {ADAPTER_SAFETENSORS} in {ckpt_dir} — not a bottleneck "
+            "checkpoint, or saved without sidecar"
+        )
+    flat = st_load(str(path))
+
+    def _maybe(key: str) -> jax.Array | None:
+        full = f"bottleneck.{key}"
+        if full not in flat:
+            return None
+        return jnp.asarray(flat[full])
+
+    return BottleneckAdapter(
+        down_attn=_maybe("down_attn"),
+        hidden_attn=_maybe("hidden_attn"),
+        up_attn=_maybe("up_attn"),
+        down_ffn=_maybe("down_ffn"),
+        hidden_ffn=_maybe("hidden_ffn"),
+        up_ffn=_maybe("up_ffn"),
+        cfg=cfg,
     )

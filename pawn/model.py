@@ -68,8 +68,10 @@ __all__ = [
     "PAWNModel",
     "TransformerLayer",
     "EffectiveCallable",
+    "KVCache",
     "SAVED_FIELDS",
     "init_model",
+    "init_kv_cache",
     "sliced",
 ]
 
@@ -184,6 +186,11 @@ def _apply_rope(
     Split the last axis (``head_dim``) into adjacent ``(even, odd)``
     pairs and rotate each pair by the angle ``freqs[t, i]``. Compute in
     fp32 then downcast to the input dtype.
+
+    ``rope_cos`` / ``rope_sin`` must have the same ``T`` as ``x`` —
+    callers that need a positional offset (KV-cached decode) should
+    slice the full ``max_seq_len`` tables down to the active window
+    before calling. See :meth:`PAWNModel.forward_with_cache`.
     """
     orig_dtype = x.dtype
     x_f = x.astype(jnp.float32)
@@ -227,6 +234,55 @@ def _build_decomp_table() -> Int[Array, "n_actions 3"]:
 # ---------------------------------------------------------------------------
 # Modules
 # ---------------------------------------------------------------------------
+
+
+class KVCache(eqx.Module):
+    """Per-layer Key/Value cache for autoregressive decoding.
+
+    Both arrays share the layout ``(n_layers, B, n_heads, T_max,
+    head_dim)`` — leading ``n_layers`` axis so :func:`jax.lax.scan`
+    over the transformer stack can read one layer's slice from each
+    leaf. ``T_max`` is the cache capacity (typically
+    ``cfg.max_seq_len``); the active prefix length is tracked by the
+    caller (a Python ``int`` or a ``jnp`` scalar) so the JIT key
+    doesn't depend on the position.
+
+    The cache lives outside the model — :func:`init_kv_cache` allocates
+    a fresh one, and :meth:`PAWNModel.forward_with_cache` returns a
+    new ``KVCache`` with the new K/V slices written in.
+    """
+
+    k: Float[Array, "n_layers B H T_max d"]
+    v: Float[Array, "n_layers B H T_max d"]
+
+
+def init_kv_cache(
+    cfg: ModelConfig,
+    batch_size: int,
+    max_seq_len: int | None = None,
+    dtype: Any = None,
+) -> KVCache:
+    """Allocate a zero-initialised :class:`KVCache` for ``cfg``.
+
+    ``max_seq_len`` defaults to ``cfg.max_seq_len``; pass a smaller
+    value for diagnostics that only generate short games (the cache
+    allocation is ``2 * n_layers * B * n_heads * T_max * head_dim``
+    floats — at the production supernet shape and ``T_max=512`` that's
+    a few hundred MB per batch).
+
+    ``dtype`` defaults to ``float32`` so the cache survives the
+    forward's bf16 ↔ fp32 dance unchanged; pass ``jnp.bfloat16`` when
+    the entire forward is bf16 and the cache memory is a concern.
+    """
+    if max_seq_len is None:
+        max_seq_len = cfg.max_seq_len
+    if dtype is None:
+        dtype = jnp.float32
+    shape = (cfg.n_layers, batch_size, cfg.n_heads, max_seq_len, cfg.head_dim)
+    return KVCache(
+        k=jnp.zeros(shape, dtype=dtype),
+        v=jnp.zeros(shape, dtype=dtype),
+    )
 
 
 class TransformerLayer(eqx.Module):
@@ -562,6 +618,220 @@ class PAWNModel(eqx.Module):
         scan_input: Any = (self.layers, hook_data) if has_hooks else self.layers
         x, _ = jax.lax.scan(step, x, scan_input)
         return x
+
+    # -----------------------------------------------------------------------
+    # KV-cached generation path
+    # -----------------------------------------------------------------------
+
+    def forward_with_cache(
+        self,
+        input_ids: Int[Array, "B T_new"],
+        cache: KVCache,
+        pos_start: Int[Array, ""] | int,
+        *,
+        compute_dtype: jnp.dtype | None = None,
+        attn_hook: Callable[[Float[Array, "B T d"], Any], Float[Array, "B T d"]]
+        | None = None,
+        ffn_hook: Callable[[Float[Array, "B T d"], Any], Float[Array, "B T d"]]
+        | None = None,
+        hook_data: Any = None,
+        use_sdpa: bool = False,
+    ) -> tuple[Float[Array, "B T_new V"], KVCache]:
+        """Cached forward pass for autoregressive decoding.
+
+        Mirrors :meth:`__call__` but writes the freshly-computed K/V
+        into ``cache`` at slots ``[pos_start, pos_start + T_new)`` and
+        attends over the full cache window
+        ``[0, pos_start + T_new)``. ``T_new`` can be ``1`` for the
+        common decode step or larger for a prefill chunk; ``pos_start``
+        is a Python ``int`` or a ``jnp`` scalar (use the latter when
+        you want one JIT trace across many decode positions —
+        :func:`jax.lax.dynamic_update_slice` handles both).
+
+        Returns ``(logits, new_cache)``. ``logits`` is ``(B, T_new,
+        V)``; callers that only want the next-token prediction take
+        ``logits[:, -1, :]``. The returned cache is a fresh
+        :class:`KVCache` (functional update) with the new slices
+        written; the input cache is unchanged.
+
+        Math invariant: the logits returned by ``forward_with_cache``
+        at position ``pos_start`` are bit-identical (modulo XLA
+        kernel-ordering noise) to
+        ``model(input_ids[:, :pos_start + T_new])[:, pos_start:]``.
+        The KV-cache test in ``tests/test_jax_kv_cache.py`` pins this.
+
+        The cached path uses plain attention always (no SDPA fallback)
+        because :func:`jax.nn.dot_product_attention` requires symmetric
+        ``T_q == T_kv`` layouts; ``use_sdpa`` is accepted but ignored.
+        Adapter hooks (``attn_hook`` / ``ffn_hook`` / ``hook_data``)
+        are threaded through exactly as in the full-forward path.
+        """
+        del use_sdpa  # cached path is plain-attention only; flag accepted
+        # for caller API parity but not honoured.
+        T_new = input_ids.shape[-1]  # noqa: N806
+        T_max = cache.k.shape[3]  # noqa: N806
+        if T_new > T_max:
+            raise ValueError(
+                f"forward_with_cache input length {T_new} exceeds cache "
+                f"capacity {T_max}"
+            )
+
+        x = self._embed(input_ids)
+        if compute_dtype is not None:
+            x = x.astype(compute_dtype)
+
+        head_dim = self.cfg.head_dim
+        n_heads = self.cfg.n_heads
+        inv_scale = head_dim ** -0.5
+        has_hooks = (
+            attn_hook is not None or ffn_hook is not None
+        ) and hook_data is not None
+
+        # RoPE: build the full table once and slice the active window.
+        rope_cos_full, rope_sin_full = _build_rope(
+            head_dim, T_max, self.cfg.rope_base
+        )
+
+        pos_arr = pos_start + jnp.arange(T_new, dtype=jnp.int32)
+        rope_cos = rope_cos_full[pos_arr]  # (T_new, half)
+        rope_sin = rope_sin_full[pos_arr]
+
+        # Causal + cache-window mask: q at offset i (absolute position
+        # pos_start + i) attends to absolute positions [0, pos_start +
+        # i + 1). Build the (T_new, T_max) mask explicitly using
+        # `lax.dynamic_*` so it works with both Python int and jnp
+        # scalar pos_start.
+        kv_positions = jnp.arange(T_max, dtype=jnp.int32)  # (T_max,)
+        # absolute_q_positions: (T_new,)
+        absolute_q = pos_start + jnp.arange(T_new, dtype=jnp.int32)
+        # mask[i, j] = (kv_positions[j] <= absolute_q[i])
+        attn_mask_2d = kv_positions[None, :] <= absolute_q[:, None]
+        # Broadcast to (1, 1, T_new, T_max) so it can be combined with
+        # the per-batch PAD mask if one is added later. We don't take a
+        # PAD mask here because autoregressive decode emits one token
+        # per step and feeds it back — there are no PAD positions in
+        # the cache window during decode.
+        attn_mask = attn_mask_2d[None, None, :, :]
+
+        def step(
+            carry: Float[Array, "B T_new d"],
+            layer_kv_hook: Any,
+        ) -> tuple[
+            Float[Array, "B T_new d"],
+            tuple[
+                Float[Array, "B H T_max d"],
+                Float[Array, "B H T_max d"],
+            ],
+        ]:
+            if has_hooks:
+                layer, layer_k, layer_v, hook_slice = layer_kv_hook
+            else:
+                layer, layer_k, layer_v = layer_kv_hook
+                hook_slice = None
+            h = carry
+            normed = _rmsnorm(h, layer.attn_norm_w)
+            B, T_n, D = normed.shape  # noqa: N806
+            wq = layer.wq if compute_dtype is None else layer.wq.astype(compute_dtype)
+            wk = layer.wk if compute_dtype is None else layer.wk.astype(compute_dtype)
+            wv = layer.wv if compute_dtype is None else layer.wv.astype(compute_dtype)
+            wo = layer.wo if compute_dtype is None else layer.wo.astype(compute_dtype)
+            q = jnp.einsum("btd,de->bte", normed, wq)
+            k_new = jnp.einsum("btd,de->bte", normed, wk)
+            v_new = jnp.einsum("btd,de->bte", normed, wv)
+            q = q.reshape(B, T_n, n_heads, head_dim).transpose(0, 2, 1, 3)
+            k_new = k_new.reshape(B, T_n, n_heads, head_dim).transpose(0, 2, 1, 3)
+            v_new = v_new.reshape(B, T_n, n_heads, head_dim).transpose(0, 2, 1, 3)
+            q = _apply_rope(q, rope_cos, rope_sin)
+            k_new = _apply_rope(k_new, rope_cos, rope_sin)
+
+            # Write k_new / v_new into the layer cache at pos_start.
+            # The cache leaves are (B, H, T_max, D); the start indices
+            # are (0, 0, pos_start, 0). `dynamic_update_slice` accepts
+            # either Python int or jnp scalar at any axis.
+            #
+            # Match the cache dtype so the update doesn't widen the
+            # cache: this is only relevant when compute_dtype != cache
+            # dtype (e.g. cache fp32, compute bf16) — without the
+            # explicit cast we'd hit a dtype-mismatch error inside
+            # dynamic_update_slice.
+            cache_dtype = layer_k.dtype
+            k_to_write = k_new.astype(cache_dtype)
+            v_to_write = v_new.astype(cache_dtype)
+            zero = jnp.int32(0)
+            pos_int = jnp.asarray(pos_start, dtype=jnp.int32)
+            new_layer_k = jax.lax.dynamic_update_slice(
+                layer_k, k_to_write, (zero, zero, pos_int, zero),
+            )
+            new_layer_v = jax.lax.dynamic_update_slice(
+                layer_v, v_to_write, (zero, zero, pos_int, zero),
+            )
+
+            # Attention: q (B, H, T_new, d) against new_layer_{k,v} (B,
+            # H, T_max, d). Cast cache to compute dtype before the
+            # matmul so the einsum kernel runs in compute dtype.
+            k_for_attn = (
+                new_layer_k
+                if compute_dtype is None
+                else new_layer_k.astype(compute_dtype)
+            )
+            v_for_attn = (
+                new_layer_v
+                if compute_dtype is None
+                else new_layer_v.astype(compute_dtype)
+            )
+            scores = jnp.einsum("bhid,bhjd->bhij", q, k_for_attn) * inv_scale
+            scores_f32 = scores.astype(jnp.float32)
+            mask_neg_inf = jnp.finfo(jnp.float32).min
+            scores_f32 = jnp.where(attn_mask, scores_f32, mask_neg_inf)
+            attn = jax.nn.softmax(scores_f32, axis=-1)
+            if compute_dtype is not None:
+                attn = attn.astype(compute_dtype)
+            attn_out = jnp.einsum("bhij,bhjd->bhid", attn, v_for_attn)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T_n, D)
+            h = h + jnp.einsum("btd,de->bte", attn_out, wo)
+            if attn_hook is not None:
+                h = attn_hook(h, hook_slice)
+
+            normed = _rmsnorm(h, layer.ffn_norm_w)
+            w_gate = (
+                layer.w_gate
+                if compute_dtype is None
+                else layer.w_gate.astype(compute_dtype)
+            )
+            w_up = (
+                layer.w_up
+                if compute_dtype is None
+                else layer.w_up.astype(compute_dtype)
+            )
+            w_down = (
+                layer.w_down
+                if compute_dtype is None
+                else layer.w_down.astype(compute_dtype)
+            )
+            gate = jnp.einsum("btd,df->btf", normed, w_gate)
+            up = jnp.einsum("btd,df->btf", normed, w_up)
+            ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, w_down)
+            h = h + ffn_out
+            if ffn_hook is not None:
+                h = ffn_hook(h, hook_slice)
+            return h, (new_layer_k, new_layer_v)
+
+        scan_input: Any
+        if has_hooks:
+            scan_input = (self.layers, cache.k, cache.v, hook_data)
+        else:
+            scan_input = (self.layers, cache.k, cache.v)
+        x, (new_k_stack, new_v_stack) = jax.lax.scan(step, x, scan_input)
+
+        x = _rmsnorm(x, self.final_norm_w)
+        lm_head = (
+            self.lm_head.astype(compute_dtype)
+            if compute_dtype is not None
+            else self.lm_head
+        )
+        logits = jnp.einsum("btd,dv->btv", x, lm_head)
+        new_cache = KVCache(k=new_k_stack, v=new_v_stack)
+        return logits.astype(jnp.float32), new_cache
 
 
 # ---------------------------------------------------------------------------

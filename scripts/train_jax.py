@@ -67,6 +67,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--resume", type=Path, default=None)
     ap.add_argument("--logs-dir", type=Path, default=Path("logs"))
     ap.add_argument("--wandb", action="store_true")
+    ap.add_argument("--use-sdpa", action="store_true",
+                    help="opt the attention block into "
+                         "jax.nn.dot_product_attention (parity #43). "
+                         "Off by default — gain is hardware-dependent.")
     return ap.parse_args(argv)
 
 
@@ -90,6 +94,7 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
         ("hf_repo", args.hf_repo),
         ("wandb", args.wandb),
         ("resume", str(args.resume) if args.resume else None),
+        ("use_sdpa", args.use_sdpa),
     ):
         if val is not None:
             base[flag] = val
@@ -185,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     compute_dtype = _DTYPE_MAP[cfg.amp_dtype]
     train_step = make_train_step(
-        optimizer, variants, compute_dtype=compute_dtype
+        optimizer, variants, compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa,
     )
     logger = MetricsLogger(
         log_dir=args.logs_dir, run_prefix="pretrain", device=_resolve_device()

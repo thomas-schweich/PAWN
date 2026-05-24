@@ -41,35 +41,50 @@ These v1 surfaces are intentionally absent from v2 and will not return:
 These are intentional follow-ups — outside the parity scope as
 defined but not gone-by-design:
 
-- **KV-cached generation decoder.** `pawn.generation.autoregressive_generate`
-  runs the model's full forward pass per decode step (parity #6).
-  The diagnostics work end-to-end at small `n_per_outcome` (default
-  16-32); production runs at v1's `n_per_outcome=1000` would benefit
-  from a `forward_generate` path on `PAWNModel`. Tracked because the
-  v2 model intentionally uses plain attention (no fused SDPA) and
-  the KV-cache work is most naturally bundled with the SDPA
-  exploration (parity #43).
-- **Bottleneck adapter resume across re-init.** Bottleneck-style
-  adapters save the trained Houlsby weights as
-  `adapter.safetensors` alongside the backbone checkpoint (parity
-  #5). The trainer's `--resume` path currently restores the
-  PAWNModel + optimizer; re-composing the `BottleneckEffective`
-  wrapper on resume is wired for `pawn.trainer` but not yet for
-  `scripts/train_jax_adapter.py --resume`. RoSA + standard adapter
-  resume works without this.
 - **Live HF push verification.** `tests/test_jax_lifecycle.py`
   covers every load-bearing branch of `HFPushTracker` and
   `_DaemonThreadPoolExecutor` with a mocked `HfApi` (parity #4).
   Actually pushing bytes to an HF repo requires a scratch repo +
   `HF_TOKEN`; deferred to release-time live-verify rather than
   included in the CI test sweep.
-- **SDPA fast-path on ROCm.** `jax.nn.dot_product_attention` is
-  reportedly working on recent ROCm + jaxlib. Tracked as parity #43
-  in this document and `docs/JAX_PARITY_SHORTFALLS.md`. The
-  migration plan §5 marked it "out of scope" for the framework
-  swap; the bf16 perf win shipped in parity #2 (2.85× v1 baseline)
-  reached the throughput bar without it, so it's a future
-  enhancement rather than a parity gap.
+
+## Resolved follow-ups
+
+The original three items here landed in the parity sweep's follow-up
+push (commits on `jax_migration` after `3a0f8e2`):
+
+- **KV-cached generation decoder.** :class:`pawn.model.KVCache` +
+  :meth:`PAWNModel.forward_with_cache` decode one position at a time
+  by writing fresh K/V slices into a pre-allocated cache and attending
+  over the populated window. :func:`pawn.generation.autoregressive_generate`
+  auto-detects the cached path (`use_kv_cache=None` → enabled
+  whenever the model exposes ``forward_with_cache``; bare
+  :class:`PAWNModel` and :class:`BottleneckEffective` both qualify),
+  and the parity test
+  `tests/test_jax_eval.py::test_autoregressive_generate_kv_cache_matches_full_forward`
+  pins bit-identical sequences across the cached and non-cached
+  paths. Falls back to the plain forward when ``use_kv_cache=False``
+  (for parity testing) or when the model lacks the method.
+- **Bottleneck adapter resume across re-init.**
+  :func:`pawn.adapters.bottleneck.save_bottleneck_adapter` /
+  :func:`load_bottleneck_adapter` round-trip the Houlsby weights
+  alongside the backbone in the same checkpoint dir.
+  `scripts/train_jax_adapter.py --resume <ckpt_dir>` auto-detects the
+  ``adapter.safetensors`` sidecar and re-composes the
+  :class:`BottleneckEffective` wrapper, splicing the saved step + Adam
+  moments. RoSA + standard adapter resume works the same way (no
+  sidecar needed for weight-folded adapters).
+- **SDPA fast-path on ROCm.**
+  :func:`jax.nn.dot_product_attention` is wired through
+  :meth:`PAWNModel.__call__` (parity #43), threaded into the trainer
+  via :data:`BaseRunConfig.use_sdpa`, and exposed on both pretrain
+  + adapter CLIs as ``--use-sdpa``. Off by default because the gain
+  is hardware-dependent: on RDNA 3 the fused kernel OOMs at training
+  shapes (B≥2 T=512 wants 128 KB shared memory; the GPU has 64 KB
+  per CU). On data-center GPUs and inference shapes the same flag
+  produces real speedups without parity loss — the correctness guard
+  in `tests/test_jax_model.py::test_use_sdpa_matches_plain_attention_within_fp32_noise`
+  pins the bit-identical (within fp32 noise) invariant.
 
 ## Acceptance-criteria status
 

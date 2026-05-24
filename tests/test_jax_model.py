@@ -39,7 +39,9 @@ from pawn.config import (
 )
 from pawn.model import (
     SAVED_FIELDS,
+    KVCache,
     PAWNModel,
+    init_kv_cache,
     init_model,
     sliced,
 )
@@ -409,3 +411,102 @@ def test_use_sdpa_matches_plain_attention_within_fp32_noise() -> None:
     # path, so per-position diffs can be a few ulps. Empirically max
     # diff is in the 1e-5 range on tiny supernet random weights.
     assert jnp.allclose(plain, sdpa, atol=1e-3, rtol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# KV-cached generation
+# ---------------------------------------------------------------------------
+
+
+def test_init_kv_cache_shapes_match_cfg() -> None:
+    """``init_kv_cache`` allocates a (n_layers, B, H, T_max, head_dim)
+    K/V pair matching the model config."""
+    cache = init_kv_cache(TINY_SUPERNET, batch_size=3, max_seq_len=16)
+    expected = (
+        TINY_SUPERNET.n_layers, 3, TINY_SUPERNET.n_heads, 16, TINY_SUPERNET.head_dim,
+    )
+    assert cache.k.shape == expected
+    assert cache.v.shape == expected
+    # Zero-initialised so unfilled slots are masked-out cleanly.
+    assert jnp.all(cache.k == 0)
+    assert jnp.all(cache.v == 0)
+
+
+def test_init_kv_cache_defaults_to_cfg_max_seq_len() -> None:
+    """When ``max_seq_len`` is omitted, the cache capacity comes from
+    ``cfg.max_seq_len``."""
+    cache = init_kv_cache(TINY_SUPERNET, batch_size=1)
+    assert cache.k.shape[3] == TINY_SUPERNET.max_seq_len
+
+
+def test_forward_with_cache_matches_full_forward_one_shot() -> None:
+    """Single-call cached forward over a full prefix produces logits
+    bit-identical to the non-cached forward (modulo XLA kernel-ordering
+    noise). This pins the load-bearing invariant — without it the
+    diagnostics get different numbers in cached vs non-cached mode."""
+    model = init_model(TINY_SUPERNET, key=0)
+    tokens = jnp.array(
+        [[1969, 5, 10, 20, 30, 40], [1970, 8, 16, 24, 32, 40]], dtype=jnp.int32,
+    )
+    plain = model(tokens)
+    cache = init_kv_cache(TINY_SUPERNET, batch_size=2, max_seq_len=8)
+    cached, _ = model.forward_with_cache(tokens, cache, pos_start=0)
+    assert plain.shape == cached.shape
+    assert jnp.allclose(plain, cached, atol=1e-4, rtol=1e-4)
+
+
+def test_forward_with_cache_step_by_step_matches_full_forward() -> None:
+    """Step-by-step single-token cached decode reproduces the full
+    forward across positions. This is the actual hot path for
+    autoregressive generation — one token per call, threading the cache
+    through."""
+    model = init_model(TINY_SUPERNET, key=0)
+    tokens = jnp.array(
+        [[1969, 5, 10, 20, 30, 40, 50, 60]], dtype=jnp.int32,
+    )
+    plain = model(tokens)
+    cache = init_kv_cache(TINY_SUPERNET, batch_size=1, max_seq_len=16)
+    chunks: list[jax.Array] = []
+    for pos in range(tokens.shape[1]):
+        l, cache = model.forward_with_cache(
+            tokens[:, pos : pos + 1], cache, pos_start=pos,
+        )
+        chunks.append(l)
+    cached = jnp.concatenate(chunks, axis=1)
+    assert jnp.allclose(plain, cached, atol=1e-4, rtol=1e-4)
+
+
+def test_forward_with_cache_rejects_oversized_input() -> None:
+    """An input longer than the cache capacity must raise — silently
+    overflowing the cache would corrupt later decode steps."""
+    model = init_model(TINY_SUPERNET, key=0)
+    cache = init_kv_cache(TINY_SUPERNET, batch_size=1, max_seq_len=4)
+    tokens = jnp.zeros((1, 8), dtype=jnp.int32)
+    with pytest.raises(ValueError, match="exceeds cache capacity"):
+        model.forward_with_cache(tokens, cache, pos_start=0)
+
+
+def test_forward_with_cache_returns_fresh_cache() -> None:
+    """The cached forward is a functional update — the input cache is
+    not mutated, and the returned cache has the new K/V written in."""
+    model = init_model(TINY_SUPERNET, key=0)
+    cache = init_kv_cache(TINY_SUPERNET, batch_size=1, max_seq_len=8)
+    tokens = jnp.array([[1969, 5, 10]], dtype=jnp.int32)
+    _, new_cache = model.forward_with_cache(tokens, cache, pos_start=0)
+    # Input cache untouched.
+    assert jnp.all(cache.k == 0)
+    assert jnp.all(cache.v == 0)
+    # Filled slots: positions [0, 3) — non-zero.
+    assert float(jnp.linalg.norm(new_cache.k[:, 0, :, 0, :])) > 0.0
+    assert float(jnp.linalg.norm(new_cache.k[:, 0, :, 2, :])) > 0.0
+    # Unfilled slots: position 3+ — still zero.
+    assert jnp.all(new_cache.k[:, 0, :, 3, :] == 0)
+
+
+def test_kv_cache_is_pytree() -> None:
+    """KVCache is an eqx.Module so it threads through jit and scan
+    cleanly. Verify it round-trips through ``jax.tree_util.tree_map``."""
+    cache = init_kv_cache(TINY_SUPERNET, batch_size=1, max_seq_len=4)
+    cache2 = jax.tree_util.tree_map(lambda x: x + 0, cache)
+    assert isinstance(cache2, KVCache)
+    assert cache2.k.shape == cache.k.shape
