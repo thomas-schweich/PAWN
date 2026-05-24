@@ -382,3 +382,30 @@ def test_decomp_table_shape() -> None:
     assert jnp.all((model.decomp_table[:, 0] >= 0) & (model.decomp_table[:, 0] < 64))
     assert jnp.all((model.decomp_table[:, 1] >= 0) & (model.decomp_table[:, 1] < 64))
     assert jnp.all((model.decomp_table[:, 2] >= 0) & (model.decomp_table[:, 2] < 5))
+
+
+# ---------------------------------------------------------------------------
+# Parity #43: SDPA opt-in fast path
+# ---------------------------------------------------------------------------
+
+
+def test_use_sdpa_matches_plain_attention_within_fp32_noise() -> None:
+    """``use_sdpa=True`` switches the attention block to
+    :func:`jax.nn.dot_product_attention` (XLA impl). The migration
+    plan §5 marked SDPA out of scope citing fused-kernel maturity on
+    JAX-on-ROCm; in practice the XLA implementation works fine.
+
+    Verify the SDPA path produces logits that match the plain
+    materialised-QK path within fp32 numerical noise (the two paths
+    differ only in how XLA fuses the matmul+softmax — algebraically
+    identical, but the kernel ordering can introduce tiny rounding
+    differences)."""
+    model = init_model(TINY_SUPERNET, key=0)
+    tokens = jnp.zeros((2, 16), dtype=jnp.int32)
+    plain = model(tokens)
+    sdpa = model(tokens, use_sdpa=True)
+    assert plain.shape == sdpa.shape
+    # Generous tolerance: SDPA's fused kernel reorders ops vs the plain
+    # path, so per-position diffs can be a few ulps. Empirically max
+    # diff is in the 1e-5 range on tiny supernet random weights.
+    assert jnp.allclose(plain, sdpa, atol=1e-3, rtol=1e-3)
