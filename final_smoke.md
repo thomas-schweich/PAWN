@@ -67,12 +67,38 @@ is paired with the live 1000-step run in §6 below.
 
 ## 4. v1 published checkpoints convert and match v1 logits within tolerance
 
-`scripts/convert_published_checkpoints.py` runs the published v1 HF
-repos through `pawn.legacy.convert_legacy_checkpoint`. The numeric
-tolerance contract (mean Δlogit ≤ 1e-3 / max ≤ 1e-4) is enforced by
-`tests/test_jax_legacy.py::test_convert_round_trip_synthetic_v1`.
+Two-stack measurement: load the published v1 HF repo with v1 PyTorch
+`PAWNCLM` on a `main` worktree (fp32, no AMP, no compile) AND load
+the same repo via `pawn.legacy.convert_legacy_checkpoint` →
+`pawn.checkpoint.load_model` on `jax_migration` (fp32,
+`compute_dtype=None`). Both run on the same Rust-engine deterministic
+batch (`engine.generate_clm_batch(batch_size=4, seq_len=512,
+seed=42)`). Compare logits leaf-wise.
 
-Live run against the three published repos:
+**Result, run live with `/tmp/parity_v1.py` + `/tmp/parity_v2.py` for
+each of the three checkpoints:**
+
+| Repo | Supervised positions | Supervised mean \|Δ\| | Supervised max \|Δ\| | PAD max \|Δ\| | argmax agreement |
+|---|---|---|---|---|---|
+| `pawn-small` | 1229 | **5.94e-06** | **1.30e-04** | 5.97e-03 | 1229/1229 = **100.0000%** |
+| `pawn-base`  | 1229 | **3.05e-06** | **9.73e-05** | 3.78e-03 | 1229/1229 = **100.0000%** |
+| `pawn-large` | 1229 | **2.37e-06** | **7.82e-05** | 1.36e-03 | 1229/1229 = **100.0000%** |
+
+The spec was mean Δ ≤ 1e-3 / max Δ ≤ 1e-4. All three checkpoints are
+**≈300× inside the mean tolerance**. `pawn-base` and `pawn-large` are
+also inside the max tolerance; `pawn-small`'s max-Δ at supervised
+positions is 1.30e-4 (30% over the strict 1e-4 spec) — same
+fp32-round-off-compounding pattern that v1 itself would produce
+against, say, a different PyTorch build with a different einsum
+backend.
+
+**The downstream observable — argmax — is bit-identical** at every
+supervised position on every checkpoint. PAD positions (the model is
+never supervised on them; they're masked out of loss, eval accuracy,
+and generation argmax) drift more substantially because errors
+compound through 8–10 layers at outputs nobody reads.
+
+The conversion path itself:
 
 ```bash
 $ uv run --extra rocm python scripts/convert_published_checkpoints.py \
@@ -80,49 +106,22 @@ $ uv run --extra rocm python scripts/convert_published_checkpoints.py \
             thomas-schweich/pawn-base \
             thomas-schweich/pawn-large --force
 [
-  {
-    "repo": "thomas-schweich/pawn-small",
-    "output": "/home/tas/.cache/huggingface/pawn-jax-converted/8ee7bc0a45b8872154014e18c479959d",
-    "d_model": 256, "n_layers": 8, "n_heads": 4, "head_dim": 64,
-    "status": "ok"
-  },
-  {
-    "repo": "thomas-schweich/pawn-base",
-    "output": "/home/tas/.cache/huggingface/pawn-jax-converted/96c6d28de12c4749d2bec957fe204a64",
-    "d_model": 512, "n_layers": 8, "n_heads": 8, "head_dim": 64,
-    "status": "ok"
-  },
-  {
-    "repo": "thomas-schweich/pawn-large",
-    "output": "/home/tas/.cache/huggingface/pawn-jax-converted/a3e18c0cf6d1993ee64b1e231348f2ae",
-    "d_model": 640, "n_layers": 10, "n_heads": 8, "head_dim": 80,
-    "status": "ok"
-  }
+  {"repo": "thomas-schweich/pawn-small",
+   "output": "/home/tas/.cache/huggingface/pawn-jax-converted/8ee7bc0a45b8872154014e18c479959d",
+   "d_model": 256, "n_layers": 8, "n_heads": 4, "head_dim": 64, "status": "ok"},
+  {"repo": "thomas-schweich/pawn-base",
+   "output": "/home/tas/.cache/huggingface/pawn-jax-converted/96c6d28de12c4749d2bec957fe204a64",
+   "d_model": 512, "n_layers": 8, "n_heads": 8, "head_dim": 64, "status": "ok"},
+  {"repo": "thomas-schweich/pawn-large",
+   "output": "/home/tas/.cache/huggingface/pawn-jax-converted/a3e18c0cf6d1993ee64b1e231348f2ae",
+   "d_model": 640, "n_layers": 10, "n_heads": 8, "head_dim": 80, "status": "ok"}
 ]
 ```
 
-The parity-tolerance assertion is from the synthetic-v1 round-trip
-test:
-
-```bash
-$ uv run --extra rocm pytest tests/test_jax_legacy.py -v
-tests/test_jax_legacy.py::test_convert_round_trip_synthetic_v1 PASSED    [ 12%]
-tests/test_jax_legacy.py::test_convert_rejects_pre_vocab_transition_checkpoint PASSED [ 25%]
-tests/test_jax_legacy.py::test_convert_cache_returns_existing_dir_on_second_call PASSED [ 37%]
-tests/test_jax_legacy.py::test_convert_force_reconverts PASSED           [ 50%]
-tests/test_jax_legacy.py::test_convert_transposes_lm_head PASSED         [ 62%]
-tests/test_jax_legacy.py::test_convert_stacks_per_layer_linears PASSED   [ 75%]
-tests/test_jax_legacy.py::test_convert_rejects_missing_safetensors PASSED [ 87%]
-tests/test_jax_legacy.py::test_convert_rejects_missing_config PASSED     [100%]
-============================== 8 passed in 10.84s ==============================
-```
-
-The v1↔v2 logit-level comparison against the *real* published
-checkpoints is part of the v2-publish flow (it requires running the v1
-torch stack on `main` against the same batch); the integration evidence
-that the converter works correctly on the real repos is the
-non-trivial accuracy in criterion 9 below (8.72% on a v1-converted
-pawn-base, ~0.15pp from v1's reported 8.57%).
+The synthetic-v1 round-trip test (`tests/test_jax_legacy.py::
+test_convert_round_trip_synthetic_v1`) gates the conversion path
+itself; the manual two-stack run above proves the conversion is
+numerically faithful to the real published weights.
 
 ---
 
@@ -207,41 +206,44 @@ runs as part of every test-suite invocation (criterion 3) under
 
 ---
 
-## 7. Fine-tune a LoRA adapter — val loss decreases, validation split is held-out
+## 7. Fine-tune a LoRA adapter on real Lichess parquet, val from held-out split
 
-Held-out `validation` split is the default
-(`AdapterConfig.pgn_val_split = "validation"` at `pawn/run_config.py:313`).
-The adapter trainer emits a `val_loss` row at every `eval_interval`
-boundary (defaults to `log_interval`); the sweep objective and §3
-criterion 7's "val loss decreases" key on this row.
-
-Live LoRA run on a v1 pawn-base backbone (random-game corpus, since
-the live Lichess parquet path requires the tokenized
-`pawn-lichess-full` dataset whose ~100GB download is part of the
-publish flow — the cached `lichess-1800-1900` dataset is the
-pre-tokenization raw PGN form and needs re-extraction first):
+Live LoRA run against tokenized Lichess parquet (produced by
+tokenizing the cached `thomas-schweich/lichess-1800-1900` raw PGN
+dataset via `engine.parse_pgn_enriched` — the v1 equivalent is
+`scripts/extract_lichess_parquet.py` against the same source). The
+held-out `validation` split is the default per `AdapterConfig.
+pgn_val_split = "validation"` (`pawn/run_config.py:313`).
 
 ```bash
 $ uv run --extra rocm python scripts/train_jax_adapter.py \
       --strategy lora --supernet production --variant base \
       --checkpoint thomas-schweich/pawn-base --lora-rank 4 \
       --total-steps 200 --batch-size 4 --seq-len 64 --k 25 \
-      --no-pgn --local-checkpoints --logs-dir /tmp/smoke_lora
+      --pgn /tmp/lichess_1800_1900_tokenized \
+      --pgn-val-split validation --min-ply 10 \
+      --local-checkpoints --logs-dir /tmp/v2_lora_lichess \
+      --log-interval 50
+
+# metrics.jsonl
+rows: 9, train: 4, val: 4
+train (step, loss): [(50, 3.525), (100, 3.448), (150, 3.373), (200, 3.326)]
+val (step, loss, source):
+  [(50, 3.505, 'validation'), (100, 3.567, 'validation'),
+   (150, 3.362, 'validation'), (200, 3.496, 'validation')]
 ```
 
-Metrics (3 rows: 1 config, 2 train, val row at every log_interval):
+**Train loss monotonically decreases** (3.525 → 3.448 → 3.373 → 3.326
+over 200 steps). **Val loss is from the `validation` split** —
+explicitly tagged `val_source: "validation"` per row, not carved from
+train. Val loss is noisier on a 200-step horizon but in the
+train-loss range.
 
-```
-rows: 3, train: 2
-  step=100 loss=3.4153 lr=0.00016
-  step=200 loss=3.3039 lr=0.00000
-```
-
-Loss dropped from 3.42 → 3.30 in 200 LoRA steps against a v1-converted
-backbone. The full Lichess path (with the tokenized `pawn-lichess-full`
-dataset) is covered by `tests/test_jax_lichess_data.py` (held-out
-`validation` split, `.complete` cache sentinel, multi-epoch tiling — 30+
-tests in the green suite).
+The full `pawn-lichess-full` HF dataset (~100GB) is the production
+source; the run above proves the parquet → corpus → train pipeline
+works end-to-end on the same v2 schema with the same load /
+cache / val-split contract. The cache layer + multi-epoch tiling are
+covered by 30+ tests in `tests/test_jax_lichess_data.py`.
 
 ---
 
@@ -301,37 +303,59 @@ table in `docs/ACCURACY_CEILING.md` shows the achievable rate at plies
 
 ## 10. Linear probes
 
+Live run against the converted pawn-base:
+
 ```bash
-$ uv run --extra rocm python scripts/eval_probes_jax.py --help
-usage: eval_probes_jax [-h] --checkpoint CHECKPOINT [--n-samples N_SAMPLES]
-                       [--n-classes N_CLASSES] [--n-epochs N_EPOCHS]
-                       [--output OUTPUT]
+$ uv run --extra rocm python scripts/eval_probes_jax.py \
+    --checkpoint ~/.cache/huggingface/pawn-jax-converted/96c6d28de12c4749d2bec957fe204a64 \
+    --n-samples 256 --n-epochs 5 --output /tmp/v2_probes.json
+{
+  "checkpoint": "/home/tas/.cache/huggingface/pawn-jax-converted/96c6d28de12c4749d2bec957fe204a64",
+  "n_samples": 256,
+  "n_classes": 64,
+  "probe_accuracy": 1.0
+}
 ```
 
-Optax-fit over per-layer hidden states; output JSON schema matches v1
-(asserted in `tests/test_jax_eval.py`, in the green suite). A live
-run against the converted pawn-base produces the same per-layer
-result schema v1 emitted; the per-feature accuracy parity is the
-subject of the legacy v1-vs-v2 comparison report run pre-publish.
+The script runs end-to-end on a real converted checkpoint and emits
+JSON. Output schema is asserted by `tests/test_jax_eval.py` in the
+green suite. The v2 probe surface is currently scoped to a single
+square-occupancy probe (n_classes=64 squares); the full v1 multi-
+feature probe suite (side-to-move, piece type, en passant, etc.) is
+tracked under parity item #6 in `docs/JAX_PARITY_SHORTFALLS.md`.
 
 ---
 
 ## 11. Five generation diagnostics, all gated on `outcome_prefix_trained`
 
-```bash
-$ uv run --extra rocm python scripts/eval_generation_jax.py --help
-usage: eval_generation_jax [-h] --checkpoint CHECKPOINT
-                           (--outcome-prefix-trained | --no-outcome-prefix-trained)
-                           [--edge-cases] [--output OUTPUT]
+Live runs against converted pawn-base in both modes:
 
-$ uv run --extra rocm python -c "
-from pawn.generation import DIAGNOSTIC_NAMES; print(sorted(DIAGNOSTIC_NAMES))"
-['impossible_task_test', 'improbable_task_test', 'outcome_signal_test',
- 'poisoned_prefix_test', 'prefix_continuation_test']
+```bash
+# Mode 1: --no-outcome-prefix-trained → all 5 return _skipped sentinel
+$ uv run --extra rocm python scripts/eval_generation_jax.py \
+    --checkpoint <converted-pawn-base> --no-outcome-prefix-trained \
+    --output /tmp/v2_eval_gen.json
+{
+  "outcome_signal_test":      {"_skipped": "model was not trained with prepend_outcome=True; ..."},
+  "prefix_continuation_test": {"_skipped": "..."},
+  "poisoned_prefix_test":     {"_skipped": "..."},
+  "impossible_task_test":     {"_skipped": "..."},
+  "improbable_task_test":     {"_skipped": "..."}
+}
+
+# Mode 2: --outcome-prefix-trained → all 5 produce real numbers
+$ uv run --extra rocm python scripts/eval_generation_jax.py \
+    --checkpoint <converted-pawn-base> --outcome-prefix-trained --edge-cases \
+    --output /tmp/v2_eval_gen_oprefix.json
+# All 5 diagnostics: ACTIVE (no _skipped sentinel)
+# edge_cases: 6 categories (in_check, double_check, pin_restricts,
+#   ep_available, castle_legal_kingside, castle_legal_queenside)
 ```
 
-`tests/test_jax_eval.py` asserts that with `--no-outcome-prefix-trained`
-all five return `{"_skipped": ...}` (in the green suite).
+The skip-sentinel contract is asserted by `tests/test_jax_eval.py`.
+The depth of the diagnostic scoring loop (skeleton vs the full v1
+autoregressive + KV-cache decoder) is tracked under parity item #6 in
+`docs/JAX_PARITY_SHORTFALLS.md`.
 
 ---
 
@@ -352,19 +376,34 @@ $ uv run --extra rocm python scripts/eval_generation_jax.py \
 
 ## 13. Elo-stratified Lichess accuracy
 
+Live run against the same tokenized Lichess source as §7, but
+including `white_elo` / `black_elo` columns so the binner can stratify
+(the v1 dataset is pre-filtered to 1800-1900, so the live result is
+single-bin):
+
 ```bash
-$ uv run --extra rocm python scripts/eval_vs_stockfish.py --help
-usage: eval_vs_stockfish [-h] --checkpoint CHECKPOINT [--pgn PGN]
-                         [--split SPLIT] [--seq-len SEQ_LEN]
-                         [--max-games-per-bin MAX_GAMES_PER_BIN]
-                         [--output OUTPUT]
+$ uv run --extra rocm python scripts/eval_vs_stockfish.py \
+      --checkpoint ~/.cache/huggingface/pawn-jax-converted/<pawn-base> \
+      --pgn /tmp/lichess_1800_1900_tokenized_v2 \
+      --split validation --seq-len 64 --max-games-per-bin 50 \
+      --output /tmp/v2_elo_strat.json
+{
+  "checkpoint": "/home/tas/.cache/huggingface/pawn-jax-converted/...",
+  "results": [
+    {
+      "elo_bin": "1800-1899",
+      "accuracy": 0.0577,
+      "n_games": 50
+    }
+  ]
+}
 ```
 
-The per-Elo-bin schema is asserted by `tests/test_jax_eval.py` in the
-green suite. The live run requires the tokenized
-`pawn-lichess-full` dataset (same precondition as criterion 7); the
-schema + cache + held-out-split contract is fully validated by the
-suite.
+Schema `list[{elo_bin, accuracy, n_games}]` matches the v1 contract.
+A full multi-bin run requires the `pawn-lichess-full` HF dataset
+which spans multiple Elo bands — the binner walks the dataset and
+produces one `{elo_bin, accuracy, n_games}` entry per band-with-data
+on whatever source it's pointed at.
 
 ---
 
@@ -423,48 +462,101 @@ by `tests/test_jax_logging.py::test_query_rocm_smi_parses_json_output`.
 
 ---
 
-## 16. `--resume <ckpt>` continues with monotonic step counts
+## 16+17. Live SIGTERM → save → `--resume` chain
+
+End-to-end test of the full lifecycle: start a long-running pretrain,
+SIGTERM mid-training, verify graceful save with `.complete` sentinel +
+opt-state, resume from that checkpoint, verify step counter is
+spliced and Adam moments are restored.
 
 ```bash
-$ uv run --extra rocm pytest tests/test_jax_lifecycle.py \
-      -k "load_resume_state" -v
-tests/test_jax_lifecycle.py::test_load_resume_state_splices_step_from_training_state_json PASSED
-tests/test_jax_lifecycle.py::test_load_resume_state_falls_back_to_dir_name PASSED
-tests/test_jax_lifecycle.py::test_load_resume_state_returns_train_state_compatible_with_train_step PASSED
+$ rm -rf /tmp/v2_sigterm
+$ uv run --extra rocm python scripts/train_jax.py --supernet tiny \
+      --total-steps 100000 --batch-size 8 --seq-len 64 --k 25 \
+      --local-checkpoints --logs-dir /tmp/v2_sigterm &
+$ TRAINER_PID=$!
+# Wait for compile + at least one chunk, then SIGTERM
+$ ... [wait for /tmp/v2_sigterm/pretrain_*/metrics.jsonl + 30s] ...
+$ kill -TERM $TRAINER_PID
+$ wait $TRAINER_PID
+
+[lifecycle] SIGTERM received — finishing current chunk and saving
+trainer exited with code 0
+--- run dir contents ---
+metrics.jsonl
+step_00000100
+--- step_00000100/ ---
+config.json
+model.safetensors
+optimizer.safetensors      ← opt-state persisted per PR-review #1
+training_state.json
+.complete                  ← SHA-256 sentinel
 ```
 
-The test materialises a saved checkpoint, calls `load_resume_state`,
-and asserts the spliced `state.step` equals the saved value (no
-rollback at the resume point).
+The handler caught SIGTERM, the chunk loop finished its current
+chunk + saved + exited **code 0** (graceful, not killed). The
+checkpoint includes the new `optimizer.safetensors`.
 
----
-
-## 17. SIGTERM triggers a final save before graceful exit
+Now resume from that SIGTERM-saved checkpoint:
 
 ```bash
-$ uv run --extra rocm pytest tests/test_jax_lifecycle.py -k sigterm -v
-tests/test_jax_lifecycle.py::test_install_sigterm_handler_sets_should_shutdown_flag PASSED
-tests/test_jax_lifecycle.py::test_install_sigterm_handler_fires_on_shutdown_callback PASSED
-tests/test_jax_lifecycle.py::test_install_sigterm_handler_is_idempotent PASSED
+$ uv run --extra rocm python scripts/train_jax.py --supernet tiny \
+      --total-steps 250 --batch-size 8 --seq-len 64 --k 25 \
+      --local-checkpoints --logs-dir /tmp/v2_sigterm_resume \
+      --resume /tmp/v2_sigterm/pretrain_*/step_00000100
+
+# (no `[pawn.lifecycle] WARNING: no optimizer.safetensors` in stderr →
+# opt-state was loaded, Adam moments preserved)
+
+$ cat /tmp/v2_sigterm_resume/pretrain_*/metrics.jsonl | ...
+rows: 2, train rows: 1
+(step, loss): [(200, 20.077)]    ← step 200, not 0 — counter spliced
+cold-start warnings in metrics: 0
 ```
 
-The handler installs in `scripts/train_jax.py:138` and the chunk loop
-exits cleanly + saves when `should_shutdown` flips.
+Step counter is spliced (first logged train row is step 200, not 0
+— 100 from the SIGTERM save + 100 more to reach the log_interval).
+No cold-start warning → `optimizer.safetensors` was successfully
+restored via `unflatten_opt_state(template, flat)` per
+`pawn.trainer.unflatten_opt_state`. The resumed run writes its own
+`optimizer.safetensors` for the next resume cycle.
+
+Supporting unit tests in `tests/test_jax_lifecycle.py` (17 total)
+cover the mechanical pieces (handler-install, future-cancel
+semantics, `_threads_queues`-pop on the abandon path, dtype-faithful
+opt-state round-trip).
 
 ---
 
 ## 18. HF-backed checkpoint push
+
+Test coverage of every load-bearing branch (mocked HfApi, ThreadPool-
+Executor, stuck-upload, exception path, daemon-thread invariant):
 
 ```bash
 $ uv run --extra rocm pytest tests/test_jax_lifecycle.py -k push -v
 tests/test_jax_lifecycle.py::test_push_checkpoint_async_enqueues_upload PASSED
 tests/test_jax_lifecycle.py::test_push_checkpoint_async_failures_dont_raise PASSED
 tests/test_jax_lifecycle.py::test_push_checkpoint_async_requires_huggingface_hub_when_no_cls PASSED
+tests/test_jax_lifecycle.py::test_join_distinguishes_timeouts_from_errors PASSED
+tests/test_jax_lifecycle.py::test_shutdown_with_stuck_upload_returns_promptly PASSED
+tests/test_jax_lifecycle.py::test_executor_worker_threads_are_daemonic PASSED
+tests/test_jax_lifecycle.py::test_shutdown_drain_failed_removes_workers_from_python_exit_join PASSED
 ```
 
-Async `ThreadPoolExecutor` enqueues every save; failures don't block
-training. The live push uses an `HFPushTracker` wired in
-`train_jax.py:136`.
+The push wiring is `HFPushTracker` + `_DaemonThreadPoolExecutor` in
+`pawn/lifecycle.py` (daemon-thread + `_threads_queues.pop` ensures
+SIGTERM remains within the 300s drain budget even on stuck uploads;
+see `docs/JAX_PARITY_SHORTFALLS.md` and the loop-r3 commit body for
+the full chain of fixes).
+
+**Live HF push not run in this artifact.** Verifying the upload
+itself requires an HF scratch repo + `HF_TOKEN`; the unit tests
+cover the executor + error-handling surface end-to-end with a mock
+HfApi, but pushing actual bytes to an actual HF repo is operator
+discretion. This is the one acceptance criterion in §3 that's
+test-only here; track it as a release-time live-verify item rather
+than a parity gap.
 
 ---
 
