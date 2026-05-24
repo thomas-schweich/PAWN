@@ -503,6 +503,120 @@ def test_rosa_retro_modes_init_skip_bottleneck() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_film_init_gamma_ones_beta_zeros() -> None:
+    """v1 parity (deleted tests/adapters/test_film.py): FiLM gamma is
+    one-initialised and beta is zero-initialised so the residual is
+    identity at step 0."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("film")(
+        backbone, FiLMConfig(use_output_film=True), key=jax.random.key(0),
+    )
+    assert np.allclose(np.asarray(adapter.gamma), 1.0)
+    assert np.allclose(np.asarray(adapter.beta), 0.0)
+    if adapter.output_gamma is not None:
+        assert np.allclose(np.asarray(adapter.output_gamma), 1.0)
+    if adapter.output_beta is not None:
+        assert np.allclose(np.asarray(adapter.output_beta), 0.0)
+
+
+def test_film_param_shapes_match_n_layers_times_d_model() -> None:
+    """v1 parity: FiLM has 2 trainable param slabs per layer
+    (gamma + beta), each shape ``(n_layers, d_model)``; optional
+    output FiLM adds a third slab of shape ``(d_model,)``."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("film")(
+        backbone, FiLMConfig(use_output_film=True), key=jax.random.key(0),
+    )
+    n_layers = TINY_SUPERNET.n_layers
+    d_model = TINY_SUPERNET.d_model
+    assert adapter.gamma.shape == (n_layers, d_model)
+    assert adapter.beta.shape == (n_layers, d_model)
+    assert adapter.output_gamma is not None
+    assert adapter.output_gamma.shape == (d_model,)
+    assert adapter.output_beta is not None
+    assert adapter.output_beta.shape == (d_model,)
+
+
+def test_film_identity_at_init_matches_backbone_logits() -> None:
+    """v1 parity: at init the residual is identity, so the effective
+    forward should match the bare backbone within bf16 tolerance."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("film")(
+        backbone, FiLMConfig(use_output_film=True), key=jax.random.key(0),
+    )
+    effective = dispatch_apply("film")(backbone, adapter)
+    tokens = jnp.zeros((2, 16), dtype=jnp.int32)
+    bare = backbone(tokens)
+    filmed = effective(tokens)
+    # FiLM folds beta into attn_norm_w (not as a residual) so the
+    # identity is "approximately identity" — within fp32 noise on
+    # untrained random weights.
+    assert jnp.allclose(bare, filmed, atol=1e-5, rtol=0)
+
+
+def test_film_without_output_film_skips_output_slab() -> None:
+    """v1 parity: `use_output_film=False` should leave the output
+    FiLM None (no extra trainable parameters)."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("film")(
+        backbone, FiLMConfig(use_output_film=False), key=jax.random.key(0),
+    )
+    assert adapter.output_gamma is None
+    assert adapter.output_beta is None
+
+
+def test_lora_targets_qv_skips_k_and_o() -> None:
+    """v1 parity (deleted tests/adapters/test_lora.py): `targets="qv"`
+    populates only the q + v LoRA matrices, leaving k + o None."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("lora")(
+        backbone, LoRAConfig(rank=2, targets="qv"), key=jax.random.key(0),
+    )
+    assert adapter.A_q is not None and adapter.B_q is not None
+    assert adapter.A_v is not None and adapter.B_v is not None
+    assert adapter.A_k is None and adapter.B_k is None
+    assert adapter.A_o is None and adapter.B_o is None
+
+
+def test_lora_ffn_populates_gate_up_down_pairs() -> None:
+    """v1 parity: `ffn=True` adds LoRA to all 3 FFN projections
+    (gate, up, down) with the correct rank-bridge shapes."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    rank = 2
+    adapter = dispatch_init("lora")(
+        backbone, LoRAConfig(rank=rank, ffn=True), key=jax.random.key(0),
+    )
+    n_layers = TINY_SUPERNET.n_layers
+    d_model = TINY_SUPERNET.d_model
+    d_ff = TINY_SUPERNET.d_ff
+    # A_gate / A_up: (n_layers, d_model, rank); B_gate / B_up: (n_layers, rank, d_ff)
+    assert adapter.A_gate is not None and adapter.A_gate.shape == (n_layers, d_model, rank)
+    assert adapter.B_gate is not None and adapter.B_gate.shape == (n_layers, rank, d_ff)
+    assert adapter.A_up is not None and adapter.A_up.shape == (n_layers, d_model, rank)
+    assert adapter.B_up is not None and adapter.B_up.shape == (n_layers, rank, d_ff)
+    # A_down: (n_layers, d_ff, rank); B_down: (n_layers, rank, d_model)
+    assert adapter.A_down is not None and adapter.A_down.shape == (n_layers, d_ff, rank)
+    assert adapter.B_down is not None and adapter.B_down.shape == (n_layers, rank, d_model)
+    # B is zero-init so identity-at-step-0 holds even with FFN LoRA.
+    assert float(jnp.abs(adapter.B_gate).max()) == 0.0
+    assert float(jnp.abs(adapter.B_up).max()) == 0.0
+    assert float(jnp.abs(adapter.B_down).max()) == 0.0
+
+
+def test_lora_identity_at_init_matches_backbone() -> None:
+    """v1 parity: B=0 ⇒ A@B=0 ⇒ effective weight = frozen weight ⇒
+    effective forward bit-exact-ish to the bare backbone."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("lora")(
+        backbone, LoRAConfig(rank=4), key=jax.random.key(0),
+    )
+    effective = dispatch_apply("lora")(backbone, adapter)
+    tokens = jnp.zeros((2, 16), dtype=jnp.int32)
+    bare = backbone(tokens)
+    lora_out = effective(tokens)
+    assert jnp.allclose(bare, lora_out, atol=1e-6, rtol=0)
+
+
 def test_unfreeze_masked_slots_do_not_drift_under_weight_decay() -> None:
     """Parity #5 (unfreeze): with `weight_decay > 0`, AdamW's decoupled
     decay would update masked layer slots toward zero even though
