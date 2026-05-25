@@ -236,8 +236,12 @@ def _build_config(args: argparse.Namespace) -> AdapterConfig:
     # `not None`, and silently overrode a JSON `"use_sdpa": true`).
     # These are AdapterConfig fields, so they round-trip through the
     # pydantic config — but we only merge from CLI when actually set.
+    # NOTE: `--wandb` is intentionally absent — the adapter parser
+    # doesn't register it (the pretrain script does). Adding it here
+    # would be a no-op because `getattr(args, "wandb", False)` always
+    # returns False on the adapter side. (Round-2 bug-detector MINOR.)
     _CLI_STORE_TRUE_FLAGS = ("use_sdpa", "use_output_film", "no_adapt_attn",
-                             "no_adapt_ffn", "wandb")
+                             "no_adapt_ffn")
     for flag, val in vars(args).items():
         if flag in (
             "config", "no_pgn", "local_checkpoints", "logs_dir", "resume",
@@ -334,20 +338,32 @@ def main(argv: list[str] | None = None) -> int:
         from pawn.checkpoint import OPTIMIZER_FILE, load_model
         from pawn.trainer import unflatten_opt_state
 
-        # RoSA --resume is rejected early: Phase 2 mask state isn't
+        # Require `training_state.json` on --resume. A missing file
+        # would silently fall back to resume_step=0, bypassing the
+        # RoSA guard and producing a cryptic `unflatten_opt_state`
+        # tree-shape mismatch later (round-2 test-risk + bug-detector
+        # MEDIUM). Better to fail loudly here so the operator either
+        # restores the file or restarts the run fresh.
+        ckpt_dir = Path(args.resume)
+        ts_path = ckpt_dir / "training_state.json"
+        if not ts_path.is_file():
+            raise SystemExit(
+                f"[train_jax_adapter] --resume requires "
+                f"{ts_path.name} in the checkpoint dir; got "
+                f"{ckpt_dir} with no such file. The training-state "
+                "sidecar carries the saved step counter and is "
+                "load-bearing for the resume contract."
+            )
+        ts_data = json.loads(ts_path.read_text(encoding="utf-8"))
+        resume_step = int(ts_data.get("step", 0))
+
+        # RoSA --resume is rejected upfront: Phase 2 mask state isn't
         # persisted, and the saved opt-state's tree shape doesn't
         # round-trip across phase boundaries. Catching this before
         # `unflatten_opt_state` gives a clear error message instead
         # of a cryptic tree-shape mismatch (round-1 codex P2 +
         # bug-detector IMPORTANT).
-        ckpt_dir = Path(args.resume)
-        ts_path = ckpt_dir / "training_state.json"
-        if ts_path.is_file():
-            _ts_peek = json.loads(ts_path.read_text(encoding="utf-8"))
-            _resume_step_peek = int(_ts_peek.get("step", 0))
-        else:
-            _resume_step_peek = 0
-        if is_rosa_strategy and _resume_step_peek > 0:
+        if is_rosa_strategy and resume_step > 0:
             raise SystemExit(
                 "[train_jax_adapter] --resume is not supported for RoSA "
                 "strategies: Phase 2 mask-generation state is not "
@@ -358,11 +374,6 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         backbone = load_model(ckpt_dir)
-        # Splice step from training_state.json.
-        ts_path = ckpt_dir / "training_state.json"
-        if ts_path.is_file():
-            ts_data = json.loads(ts_path.read_text(encoding="utf-8"))
-            resume_step = int(ts_data.get("step", 0))
         # Bottleneck sidecar: re-compose the wrapper. Otherwise fall
         # back to the freshly-initialised adapter (weight-folded
         # adapters bake into the backbone at save time, so they don't

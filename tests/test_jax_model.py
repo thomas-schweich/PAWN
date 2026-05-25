@@ -486,17 +486,30 @@ def test_forward_with_cache_rejects_oversized_input() -> None:
         model.forward_with_cache(tokens, cache, pos_start=0)
 
 
-def test_forward_with_cache_rejects_write_window_overflow() -> None:
-    """A write window past the cache capacity must raise: lax.dynamic_update_slice
-    silently clamps the start so `pos_start + T_new > T_max` would corrupt
-    the cache without warning. Round-1 review (bug-detector + codex P2)
-    pinned this as a critical correctness gap."""
+@pytest.mark.parametrize(
+    "pos_start",
+    [
+        6,                                       # Python int
+        jnp.int32(6),                            # JAX scalar
+    ],
+    ids=["python_int", "jnp_scalar"],
+)
+def test_forward_with_cache_rejects_write_window_overflow(pos_start) -> None:  # type: ignore[no-untyped-def]
+    """A write window past the cache capacity must raise for any
+    integer type of `pos_start`: `lax.dynamic_update_slice` silently
+    clamps the start so `pos_start + T_new > T_max` would corrupt the
+    cache without warning. Round-1 + round-2 review (bug-detector +
+    codex P2) pinned this as a critical correctness gap; the round-1
+    fix only caught Python int, leaving JAX scalars (the
+    `autoregressive_generate` cached-path call form) silently broken.
+    `eqx.error_if` now handles both."""
     model = init_model(TINY_SUPERNET, key=0)
     cache = init_kv_cache(TINY_SUPERNET, batch_size=1, max_seq_len=8)
-    # T_new=4 starting at pos_start=6 writes into [6, 10) but capacity is 8.
     tokens = jnp.zeros((1, 4), dtype=jnp.int32)
-    with pytest.raises(ValueError, match="exceeds cache capacity"):
-        model.forward_with_cache(tokens, cache, pos_start=6)
+    # `eqx.error_if` raises EqxRuntimeError (a ValueError subclass at
+    # runtime — pytest's regex match catches the message either way).
+    with pytest.raises(Exception, match="exceeds cache capacity"):
+        model.forward_with_cache(tokens, cache, pos_start=pos_start)
 
 
 def test_forward_with_cache_returns_fresh_cache() -> None:

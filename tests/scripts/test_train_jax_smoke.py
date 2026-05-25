@@ -56,3 +56,81 @@ def test_script_help_works(script_name: str) -> None:
     assert result.returncode == 0, (
         f"{script_name} --help failed:\n{result.stdout}\n{result.stderr}"
     )
+
+
+def test_train_jax_adapter_rejects_rosa_resume(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """RoSA + --resume with step > 0 must fail loudly before any
+    optimizer-state damage. Round-2 test-risk: the prior fix was
+    verified only by manual smoke run; this test pins the rejection.
+
+    Constructs a minimal fake checkpoint directory with just enough
+    `training_state.json` for the early `_resume_step_peek` read to
+    fire, then runs the script as a subprocess and asserts the exit
+    message comes from our SystemExit rather than a downstream
+    cryptic shape mismatch."""
+    import json
+    import subprocess
+
+    fake_ckpt = tmp_path / "step_00000100"
+    fake_ckpt.mkdir()
+    (fake_ckpt / "training_state.json").write_text(json.dumps({"step": 100}))
+
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax_adapter.py",
+            "--strategy", "rosa", "--rosa-mode", "rosa",
+            "--supernet", "tiny", "--variant", "small",
+            "--checkpoint", "thomas-schweich/pawn-small",
+            "--no-pgn", "--total-steps", "6",
+            "--batch-size", "4", "--seq-len", "16", "--k", "2",
+            "--lora-rank", "2", "--density", "0.1",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--resume", str(fake_ckpt),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode != 0, "RoSA --resume should fail"
+    combined = result.stdout + result.stderr
+    assert "--resume is not supported for RoSA" in combined, (
+        f"Expected the RoSA-resume guard message; got stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+
+
+def test_train_jax_adapter_rejects_resume_without_training_state(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """--resume against a directory missing `training_state.json` must
+    fail loudly. The prior code silently treated the absent file as
+    `step=0`, bypassing the RoSA guard and producing a cryptic
+    downstream error. Round-2 test-risk MEDIUM."""
+    import subprocess
+
+    fake_ckpt = tmp_path / "step_00000050_no_ts"
+    fake_ckpt.mkdir()
+    # Intentionally do NOT write training_state.json.
+
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax_adapter.py",
+            "--strategy", "lora",
+            "--supernet", "tiny", "--variant", "small",
+            "--checkpoint", "thomas-schweich/pawn-small",
+            "--no-pgn", "--total-steps", "6",
+            "--batch-size", "4", "--seq-len", "16", "--k", "2",
+            "--lora-rank", "2",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--resume", str(fake_ckpt),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode != 0, (
+        "Resume against a sidecar-less dir should fail"
+    )
+    combined = result.stdout + result.stderr
+    assert "training_state.json" in combined, (
+        f"Expected the missing-sidecar guard; got stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )

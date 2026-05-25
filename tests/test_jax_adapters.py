@@ -451,6 +451,63 @@ def test_bottleneck_load_rejects_missing_sidecar(tmp_path) -> None:  # type: ign
         load_bottleneck_adapter(tmp_path, cfg)
 
 
+def test_bottleneck_save_rejects_empty_adapter(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A BottleneckAdapter constructed with every field None (only
+    reachable by bypassing BottleneckConfig validation, e.g. directly
+    via eqx.tree_at) must refuse to write rather than silently land
+    an empty sidecar that load_bottleneck_adapter then can't read.
+    Round-2 test-risk MEDIUM pinned this gap."""
+    from pawn.adapters.bottleneck import (
+        BottleneckAdapter,
+        save_bottleneck_adapter,
+    )
+
+    # Construct a degenerate adapter directly (bypasses
+    # BottleneckConfig's __post_init__ no-op guard).
+    cfg = BottleneckConfig(dim=4)
+    empty = BottleneckAdapter(
+        down_attn=None, hidden_attn=None, up_attn=None,
+        down_ffn=None, hidden_ffn=None, up_ffn=None,
+        cfg=cfg,
+    )
+    with pytest.raises(ValueError, match="no populated fields"):
+        save_bottleneck_adapter(empty, tmp_path)
+
+
+def test_bottleneck_load_rejects_placement_mismatch(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Saving with one placement disabled then loading with a cfg
+    that expects both placements must raise — silently building a
+    mixed None / non-None adapter would crash at first forward.
+    Round-2 test-risk MEDIUM."""
+    from pawn.adapters.bottleneck import (
+        load_bottleneck_adapter,
+        save_bottleneck_adapter,
+    )
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    # Save with attn disabled (FFN-only sidecar).
+    save_cfg = BottleneckConfig(dim=4, no_adapt_attn=True)
+    adapter = dispatch_init("bottleneck")(
+        backbone, save_cfg, key=jax.random.key(0),
+    )
+    save_bottleneck_adapter(adapter, tmp_path)
+
+    # Load with a cfg that expects both placements: mismatch.
+    bad_cfg = BottleneckConfig(dim=4)
+    with pytest.raises(ValueError, match="sidecar mismatch"):
+        load_bottleneck_adapter(tmp_path, bad_cfg)
+
+    # And the reverse: save both, load with attn disabled.
+    save_cfg = BottleneckConfig(dim=4)
+    adapter = dispatch_init("bottleneck")(
+        backbone, save_cfg, key=jax.random.key(0),
+    )
+    save_bottleneck_adapter(adapter, tmp_path)
+    bad_cfg = BottleneckConfig(dim=4, no_adapt_attn=True)
+    with pytest.raises(ValueError, match="sidecar mismatch"):
+        load_bottleneck_adapter(tmp_path, bad_cfg)
+
+
 def test_bottleneck_save_load_respects_placement_flags(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """``no_adapt_attn=True`` writes only the FFN fields; the load
     restores Nones in the disabled slots."""

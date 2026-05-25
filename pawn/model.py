@@ -721,20 +721,23 @@ class PAWNModel(eqx.Module):
                 f"forward_with_cache input length {T_new} exceeds cache "
                 f"capacity {T_max}"
             )
-        # `lax.dynamic_update_slice` *silently clamps* the write start so
-        # the slice fits inside the destination buffer — `pos_start +
-        # T_new > T_max` would corrupt the cache instead of raising. The
-        # T_new-only guard above is therefore insufficient; round-1
-        # review (bug-detector + test-risk + codex P2) flagged this.
-        # We only validate Python-int `pos_start` here: when pos_start
-        # is a `jnp` scalar (used by autoregressive_generate to share
-        # one JIT trace across decode positions), the value isn't
-        # available at trace time and the caller takes responsibility.
-        if isinstance(pos_start, int) and pos_start + T_new > T_max:
-            raise ValueError(
-                f"forward_with_cache write window [{pos_start}, "
-                f"{pos_start + T_new}) exceeds cache capacity {T_max}"
-            )
+        # `lax.dynamic_update_slice` *silently clamps* the write start
+        # so the slice fits inside the destination buffer —
+        # `pos_start + T_new > T_max` would corrupt the cache instead
+        # of raising. Use `eqx.error_if` so the guard fires uniformly
+        # for Python int, numpy integer, and JAX-traced scalar
+        # `pos_start` (round-1 + round-2 codex P2 / bug-detector
+        # IMPORTANT). The error is raised at runtime — for jitted
+        # callers that's after compile, for eager callers it's
+        # immediate.
+        pos_start_arr = jnp.asarray(pos_start, dtype=jnp.int32)
+        end = pos_start_arr + jnp.int32(T_new)
+        input_ids = eqx.error_if(
+            input_ids,
+            end > jnp.int32(T_max),
+            f"forward_with_cache write window exceeds cache capacity "
+            f"{T_max} (input length {T_new} starting at pos_start)",
+        )
 
         x = self._embed(input_ids)
         if compute_dtype is not None:

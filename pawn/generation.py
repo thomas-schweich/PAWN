@@ -161,6 +161,7 @@ def autoregressive_generate(
     temperature: float = 1.0,
     seed: int = 0,
     use_kv_cache: bool | None = None,
+    cache_dtype: jnp.dtype | None = None,
 ) -> dict[str, np.ndarray]:
     """Generate ``n_games`` games autoregressively from ``model``.
 
@@ -176,6 +177,14 @@ def autoregressive_generate(
     ``False`` for the legacy full-forward path (mostly for parity
     testing). Force ``True`` to assert the cached path is available
     and fail loudly otherwise.
+
+    ``cache_dtype`` (default: ``jnp.float32``): the dtype the KV cache
+    is allocated in. Bf16 cuts cache memory in half, which is the
+    binding constraint at production-scale ``n_games=1000`` (round-2
+    perf review). Only safe when the surrounding forward also runs in
+    bf16 — i.e. the model was constructed with a bf16 compute path —
+    otherwise the cache write loses precision. Defaults to fp32 to
+    keep the parity-test invariant intact.
 
     Returns a dict with:
         sequences:       (n_games, max_seq_len) int32 — full token stream
@@ -316,6 +325,7 @@ def autoregressive_generate(
             cached_model.cfg,
             batch_size=n_games,
             max_seq_len=max_seq_len,
+            dtype=cache_dtype,
         )
 
         @eqx.filter_jit
