@@ -68,6 +68,7 @@ __all__ = [
     "PAWNModel",
     "TransformerLayer",
     "EffectiveCallable",
+    "KVCacheCallable",
     "KVCache",
     "SAVED_FIELDS",
     "init_model",
@@ -85,9 +86,24 @@ class EffectiveCallable(Protocol):
     that inject post-sublayer residuals.
 
     Anything that exposes ``__call__(input_ids, attention_mask, *,
-    compute_dtype) -> logits`` satisfies this Protocol — runtime
-    isinstance checks work because of ``@runtime_checkable``.
+    compute_dtype) -> logits`` plus ``cfg`` satisfies this Protocol —
+    runtime isinstance checks work because of ``@runtime_checkable``.
+    The ``cfg`` property is what eval/generation paths read to size
+    KV caches and choose seq lengths; both :class:`PAWNModel` (field)
+    and :class:`BottleneckEffective` (property forwarding to backbone)
+    expose it.
     """
+
+    @property
+    def cfg(self) -> "ModelConfig":
+        # Property (read-only) lets implementations satisfy the
+        # Protocol with either a dataclass-style field
+        # (:class:`PAWNModel`, where ``cfg`` is an `eqx.field(static=True)`)
+        # or a forwarded ``@property`` (:class:`BottleneckEffective`,
+        # which exposes its backbone's cfg). A bare `cfg: ModelConfig`
+        # attribute declaration would be mutable/invariant and reject
+        # the property form under pyright.
+        ...
 
     def __call__(
         self,
@@ -96,6 +112,27 @@ class EffectiveCallable(Protocol):
         *,
         compute_dtype: jnp.dtype | None = None,
     ) -> Float[Array, "B T V"]: ...
+
+
+@runtime_checkable
+class KVCacheCallable(EffectiveCallable, Protocol):
+    """An :class:`EffectiveCallable` that also exposes the cached decode
+    path. :class:`PAWNModel` and :class:`BottleneckEffective` qualify;
+    weight-folded adapters whose ``apply_fn`` returns a fresh
+    :class:`PAWNModel` qualify by inheritance. Callers use a
+    ``hasattr`` check to detect at runtime — this Protocol gives the
+    static-type surface for the branch where we know the cached path
+    is available.
+    """
+
+    def forward_with_cache(
+        self,
+        input_ids: Int[Array, "B T_new"],
+        cache: "KVCache",
+        pos_start: Int[Array, ""] | int,
+        *,
+        compute_dtype: jnp.dtype | None = None,
+    ) -> tuple[Float[Array, "B T_new V"], "KVCache"]: ...
 
 
 # Names of the 16 trainable arrays in safetensors declaration order.
@@ -260,7 +297,7 @@ def init_kv_cache(
     cfg: ModelConfig,
     batch_size: int,
     max_seq_len: int | None = None,
-    dtype: Any = None,
+    dtype: jnp.dtype | None = None,
 ) -> KVCache:
     """Allocate a zero-initialised :class:`KVCache` for ``cfg``.
 
@@ -268,11 +305,20 @@ def init_kv_cache(
     value for diagnostics that only generate short games (the cache
     allocation is ``2 * n_layers * B * n_heads * T_max * head_dim``
     floats — at the production supernet shape and ``T_max=512`` that's
-    a few hundred MB per batch).
+    ~2.6 GB per game-batch in fp32 vs ~1.3 GB in bf16).
 
-    ``dtype`` defaults to ``float32`` so the cache survives the
-    forward's bf16 ↔ fp32 dance unchanged; pass ``jnp.bfloat16`` when
-    the entire forward is bf16 and the cache memory is a concern.
+    ``dtype`` defaults to ``float32`` because the precision contract
+    is: *the cache must hold at least as much precision as the
+    surrounding forward's compute_dtype*. With a fp32 forward and a
+    bf16 cache, the K/V values get downcast on write and lose
+    precision; the bit-stable parity test
+    (`tests/test_jax_model.py::test_forward_with_cache_matches_full_forward_one_shot`)
+    would fail. Production callers running a bf16 forward should pass
+    ``dtype=jnp.bfloat16`` explicitly — `autoregressive_generate` and
+    similar paths do this when they're driving inference at
+    ``n_per_outcome=1000`` scale. Round-1 perf review flagged the
+    cache size as the dominant memory consumer at production scale,
+    so the bf16 path is what unlocks the long-prefix decode budget.
     """
     if max_seq_len is None:
         max_seq_len = cfg.max_seq_len
@@ -675,6 +721,20 @@ class PAWNModel(eqx.Module):
                 f"forward_with_cache input length {T_new} exceeds cache "
                 f"capacity {T_max}"
             )
+        # `lax.dynamic_update_slice` *silently clamps* the write start so
+        # the slice fits inside the destination buffer — `pos_start +
+        # T_new > T_max` would corrupt the cache instead of raising. The
+        # T_new-only guard above is therefore insufficient; round-1
+        # review (bug-detector + test-risk + codex P2) flagged this.
+        # We only validate Python-int `pos_start` here: when pos_start
+        # is a `jnp` scalar (used by autoregressive_generate to share
+        # one JIT trace across decode positions), the value isn't
+        # available at trace time and the caller takes responsibility.
+        if isinstance(pos_start, int) and pos_start + T_new > T_max:
+            raise ValueError(
+                f"forward_with_cache write window [{pos_start}, "
+                f"{pos_start + T_new}) exceeds cache capacity {T_max}"
+            )
 
         x = self._embed(input_ids)
         if compute_dtype is not None:
@@ -692,18 +752,19 @@ class PAWNModel(eqx.Module):
             head_dim, T_max, self.cfg.rope_base
         )
 
-        pos_arr = pos_start + jnp.arange(T_new, dtype=jnp.int32)
-        rope_cos = rope_cos_full[pos_arr]  # (T_new, half)
-        rope_sin = rope_sin_full[pos_arr]
+        # Absolute query positions for the new chunk; reused for the
+        # RoPE slice and the causal mask. Round-1 simplification flagged
+        # the prior code as recomputing the same array under two names
+        # (pos_arr / absolute_q).
+        absolute_q = pos_start + jnp.arange(T_new, dtype=jnp.int32)
+        rope_cos = rope_cos_full[absolute_q]  # (T_new, half)
+        rope_sin = rope_sin_full[absolute_q]
 
         # Causal + cache-window mask: q at offset i (absolute position
         # pos_start + i) attends to absolute positions [0, pos_start +
-        # i + 1). Build the (T_new, T_max) mask explicitly using
-        # `lax.dynamic_*` so it works with both Python int and jnp
-        # scalar pos_start.
+        # i + 1). Built explicitly so it works with both Python int and
+        # jnp scalar pos_start.
         kv_positions = jnp.arange(T_max, dtype=jnp.int32)  # (T_max,)
-        # absolute_q_positions: (T_new,)
-        absolute_q = pos_start + jnp.arange(T_new, dtype=jnp.int32)
         # mask[i, j] = (kv_positions[j] <= absolute_q[i])
         attn_mask_2d = kv_positions[None, :] <= absolute_q[:, None]
         # Broadcast to (1, 1, T_new, T_max) so it can be combined with

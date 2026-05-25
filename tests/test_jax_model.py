@@ -486,6 +486,19 @@ def test_forward_with_cache_rejects_oversized_input() -> None:
         model.forward_with_cache(tokens, cache, pos_start=0)
 
 
+def test_forward_with_cache_rejects_write_window_overflow() -> None:
+    """A write window past the cache capacity must raise: lax.dynamic_update_slice
+    silently clamps the start so `pos_start + T_new > T_max` would corrupt
+    the cache without warning. Round-1 review (bug-detector + codex P2)
+    pinned this as a critical correctness gap."""
+    model = init_model(TINY_SUPERNET, key=0)
+    cache = init_kv_cache(TINY_SUPERNET, batch_size=1, max_seq_len=8)
+    # T_new=4 starting at pos_start=6 writes into [6, 10) but capacity is 8.
+    tokens = jnp.zeros((1, 4), dtype=jnp.int32)
+    with pytest.raises(ValueError, match="exceeds cache capacity"):
+        model.forward_with_cache(tokens, cache, pos_start=6)
+
+
 def test_forward_with_cache_returns_fresh_cache() -> None:
     """The cached forward is a functional update — the input cache is
     not mutated, and the returned cache has the new K/V written in."""

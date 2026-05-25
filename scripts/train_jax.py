@@ -92,12 +92,19 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
         ("warmup_frac", args.warmup_frac),
         ("checkpoint_interval", args.checkpoint_interval),
         ("hf_repo", args.hf_repo),
-        ("wandb", args.wandb),
         ("resume", str(args.resume) if args.resume else None),
-        ("use_sdpa", args.use_sdpa),
     ):
         if val is not None:
             base[flag] = val
+    # `store_true` flags: only merge when actually set so a CLI omit
+    # doesn't override a JSON config that has the flag True (round-1
+    # codex P2: `--use-sdpa` and `--wandb` defaulted to False, were
+    # `not None`, and silently overrode the config). Mirrors the
+    # `local_checkpoints` handling below.
+    if args.use_sdpa:
+        base["use_sdpa"] = True
+    if args.wandb:
+        base["wandb"] = True
     if args.local_checkpoints:
         base["local_checkpoints"] = True
     base.setdefault("run_type", "pretrain")

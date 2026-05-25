@@ -231,19 +231,33 @@ def _build_config(args: argparse.Namespace) -> AdapterConfig:
     if args.config is not None:
         base.update(json.loads(args.config.read_text()))
         base.setdefault("run_type", "adapter")
+    # `store_true` flags whose default-False would clobber a JSON-set
+    # True (round-1 codex P2: `--use-sdpa` defaulted to False, was
+    # `not None`, and silently overrode a JSON `"use_sdpa": true`).
+    # These are AdapterConfig fields, so they round-trip through the
+    # pydantic config — but we only merge from CLI when actually set.
+    _CLI_STORE_TRUE_FLAGS = ("use_sdpa", "use_output_film", "no_adapt_attn",
+                             "no_adapt_ffn", "wandb")
     for flag, val in vars(args).items():
-        if flag in ("config", "no_pgn", "local_checkpoints", "logs_dir", "resume"):
-            # `resume` is operated on directly from `args` (it's a Path,
-            # not a pydantic-validated string), so don't merge it into
-            # the config dict.
+        if flag in (
+            "config", "no_pgn", "local_checkpoints", "logs_dir", "resume",
+            *_CLI_STORE_TRUE_FLAGS,
+        ):
+            # `resume` is operated on directly from `args` (Path, not a
+            # pydantic-validated string). `no_pgn` and
+            # `local_checkpoints` are consumed in main(), not in the
+            # config. The store_true flags need explicit opt-in
+            # handling so an absent CLI flag doesn't override a JSON
+            # True.
             continue
-        # Skip None (not-set) but keep False so a user can disable a
-        # default-True `store_true` flag via the JSON config. (CLI alone
-        # can't flip a `store_true` back to False; the merge from `args`
-        # to the pydantic config dict is the only path.)
         if val is None:
             continue
         base[flag] = val
+    # Opt-in handling for store_true flags: only merge into the config
+    # when the user actually passed them (val is True).
+    for flag in _CLI_STORE_TRUE_FLAGS:
+        if getattr(args, flag, False):
+            base[flag] = True
     if args.local_checkpoints:
         base["local_checkpoints"] = True
     return AdapterConfig(**base)
@@ -308,6 +322,9 @@ def main(argv: list[str] | None = None) -> int:
     # PyTree but warm-start the optimizer state, which still preserves
     # Adam moments + clip counter across the resume boundary.
     resume_step = 0
+    is_rosa_strategy = cfg.strategy in (
+        "rosa", "rosa-retro-sparse", "rosa-retro-bottleneck",
+    )
     if args.resume is not None:
         from pawn.adapters.bottleneck import (
             ADAPTER_SAFETENSORS,
@@ -317,7 +334,29 @@ def main(argv: list[str] | None = None) -> int:
         from pawn.checkpoint import OPTIMIZER_FILE, load_model
         from pawn.trainer import unflatten_opt_state
 
+        # RoSA --resume is rejected early: Phase 2 mask state isn't
+        # persisted, and the saved opt-state's tree shape doesn't
+        # round-trip across phase boundaries. Catching this before
+        # `unflatten_opt_state` gives a clear error message instead
+        # of a cryptic tree-shape mismatch (round-1 codex P2 +
+        # bug-detector IMPORTANT).
         ckpt_dir = Path(args.resume)
+        ts_path = ckpt_dir / "training_state.json"
+        if ts_path.is_file():
+            _ts_peek = json.loads(ts_path.read_text(encoding="utf-8"))
+            _resume_step_peek = int(_ts_peek.get("step", 0))
+        else:
+            _resume_step_peek = 0
+        if is_rosa_strategy and _resume_step_peek > 0:
+            raise SystemExit(
+                "[train_jax_adapter] --resume is not supported for RoSA "
+                "strategies: Phase 2 mask-generation state is not "
+                "persisted in the checkpoint, so re-running from a "
+                "Phase 1/2/3 boundary would either re-execute completed "
+                "work (exceeding total_steps) or apply stale masks. "
+                "Restart the run from step 0 instead."
+            )
+
         backbone = load_model(ckpt_dir)
         # Splice step from training_state.json.
         ts_path = ckpt_dir / "training_state.json"
@@ -479,7 +518,7 @@ def main(argv: list[str] | None = None) -> int:
     eval_interval = cfg.eval_interval or cfg.log_interval
     t0 = time.time()
     final_step = 0
-    is_rosa = cfg.strategy in ("rosa", "rosa-retro-sparse", "rosa-retro-bottleneck")
+    is_rosa = is_rosa_strategy
 
     def _run_steps(
         state: AdapterTrainState,
@@ -526,19 +565,8 @@ def main(argv: list[str] | None = None) -> int:
         # silenced via apply_rosa's sparse_active gate).
         rosa_cfg = state.adapter.cfg
         warmup_n = min(rosa_cfg.rosa_warmup_steps, cfg.total_steps)
-        # Resume not supported across the RoSA phase 1→3 boundary —
-        # the Phase 2 mask-gen is non-resumable (the masks aren't
-        # persisted yet). RoSA --resume must hand back a checkpoint
-        # taken inside the Phase 3 segment; the simpler path is to
-        # disallow RoSA resume entirely for now.
-        if resume_step > 0:
-            print(
-                "[train_jax_adapter] WARNING: --resume + RoSA is best-effort: "
-                "the Phase 2 mask-generation state is not persisted, so a "
-                "resume that crosses the Phase 1→3 boundary re-runs Phase 2 "
-                "with a fresh mask draw.",
-                file=sys.stderr,
-            )
+        # `--resume + RoSA` is rejected upstream (where args.resume is
+        # parsed) so resume_step is guaranteed to be 0 here.
         state, last = _run_steps(state, train_step, warmup_n, start_step=0)
         if not should_shutdown() and warmup_n < cfg.total_steps:
             # Phase 2: gather `mask_samples` batches and accumulate
@@ -575,7 +603,8 @@ def main(argv: list[str] | None = None) -> int:
             # appropriate). Re-build the jitted step to pick up the new
             # opt_state shape.
             train_step = make_adapter_train_step(
-                cfg.strategy, optimizer, compute_dtype=compute_dtype
+                cfg.strategy, optimizer,
+                compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa,
             )
             phase3_remaining = cfg.total_steps - warmup_n
             state, _ = _run_steps(

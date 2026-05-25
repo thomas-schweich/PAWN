@@ -114,9 +114,19 @@ extraction happen in Rust. No Python chess libraries.
   `BaseRunConfig`.
 - Equinox `PAWNModel` is a single module covering the supernet, every sliced
   variant, and any standalone (converted-legacy) model. Stacked layers are
-  applied with `jax.lax.scan` over a leading `n_layers` axis. Attention is
-  plain (materialised `QK^T`); at seq 512 attention is ~12% of step FLOPs and
-  plain attention sidesteps fused-kernel maturity under JAX-on-ROCm.
+  applied with `jax.lax.scan` over a leading `n_layers` axis. Attention
+  defaults to plain materialised `QK^T`; pass `--use-sdpa` (or set
+  `use_sdpa=True` on `BaseRunConfig`) to switch to
+  `jax.nn.dot_product_attention` (XLA implementation). The default is plain
+  because on RDNA 3 the fused kernel OOMs at training shapes (B≥2 T=512 wants
+  128 KB shared memory; the GPU has 64 KB/CU). At seq 512 attention is ~12%
+  of step FLOPs.
+- KV-cached decode: `PAWNModel.forward_with_cache(input_ids, cache,
+  pos_start)` + `pawn.model.KVCache` + `init_kv_cache(...)` give an
+  autoregressive generation path that's O(T) per step instead of O(T²) per
+  step. `pawn.generation.autoregressive_generate` auto-detects the cached
+  path; `use_kv_cache=False` keeps the legacy full-forward for parity
+  testing.
 
 ### Supernet + variants
 

@@ -39,7 +39,7 @@ KV-cache parity test).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -58,7 +58,13 @@ from pawn.config import (
     STALEMATE,
     WHITE_CHECKMATES,
 )
-from pawn.model import EffectiveCallable, KVCache, PAWNModel, init_kv_cache
+from pawn.model import (
+    EffectiveCallable,
+    KVCache,
+    KVCacheCallable,
+    PAWNModel,
+    init_kv_cache,
+)
 
 __all__ = [
     "DIAGNOSTIC_NAMES",
@@ -184,7 +190,7 @@ def autoregressive_generate(
     illegal move (recorded as a forfeit termination, code -3).
     """
     if max_seq_len is None:
-        max_seq_len = model.cfg.max_seq_len  # type: ignore[attr-defined]
+        max_seq_len = model.cfg.max_seq_len
 
     # Sequences buffer + initial outcome conditioning.
     sequences = np.full((n_games, max_seq_len), PAD_TOKEN, dtype=np.int32)
@@ -240,94 +246,103 @@ def autoregressive_generate(
             "forward_with_cache method"
         )
 
+    # Common sampling/env-update step factored out so the cached and
+    # non-cached paths share one body (round-1 simplification flagged
+    # the prior copy-paste). Returns the sampled token vector for
+    # the caller's next-forward scheduling.
+    def _sample_and_step_env(
+        pos: int, next_logits_arr: np.ndarray,
+    ) -> np.ndarray:
+        active = ~terminated
+        if temperature != 1.0:
+            next_logits_arr = next_logits_arr / temperature
+        if mask_illegal:
+            raw = np.asarray(env.get_legal_token_masks_batch(all_indices))
+            pad_row = np.zeros((1, next_logits_arr.shape[1]), dtype=bool)
+            pad_row[0, PAD_TOKEN] = True
+            term_mat = terminated[:, None]
+            full_mask = np.where(term_mat, pad_row, raw)
+            next_logits_arr = np.where(full_mask, next_logits_arr, -np.inf)
+        gumbel = -np.log(
+            -np.log(rng.uniform(1e-10, 1.0, size=next_logits_arr.shape))
+        )
+        sampled = (next_logits_arr + gumbel).argmax(axis=-1).astype(np.int32)
+        sequences[:, pos] = sampled
+        pad_mask = active & (sampled == PAD_TOKEN)
+        if pad_mask.any():
+            terminated[pad_mask] = True
+            terminated_at[pad_mask] = pos - 1
+            term_codes[pad_mask] = -2
+        move_mask = active & ~pad_mask & ~terminated
+        if move_mask.any():
+            mv_idx = all_indices[move_mask]
+            mv_tok = sampled[move_mask].astype(np.uint16)
+            legality, step_tc = env.apply_moves(mv_idx, mv_tok)
+            legality = np.asarray(legality)
+            step_tc = np.asarray(step_tc)
+            illegal = ~legality
+            if illegal.any():
+                forfeit_global = mv_idx[illegal]
+                forfeit_ply[forfeit_global] = pos - 1
+                terminated[forfeit_global] = True
+                terminated_at[forfeit_global] = pos - 1
+                term_codes[forfeit_global] = -3
+            termed = legality & (step_tc >= 0)
+            if termed.any():
+                tg = mv_idx[termed]
+                terminated[tg] = True
+                terminated_at[tg] = pos
+                term_codes[tg] = step_tc[termed]
+        return sampled
+
     if use_kv_cache:
         # Cache capacity = max_seq_len exactly (one slot per token in
         # the generated sequence). The cache lives outside the jit'd
         # step function so we can functionally update it across calls.
+        # `pos_start` is a Python int — `lax.dynamic_update_slice`
+        # accepts Python ints for offsets, so we avoid the host→device
+        # scalar transfer per decode step (round-1 perf review).
+        # `eqx.filter_jit` will treat `pos_start` as a traced argument
+        # via `jnp.int32(pos)` though, since a fresh Python int per
+        # call would re-trace; the alternative is `jax.jit` with
+        # `static_argnums=(2,)` which would recompile per pos. Sharing
+        # one compiled program across positions is the right trade.
+        # The cache-aware narrowing: `has_cache_method` was checked
+        # above. Cast through KVCacheCallable so pyright sees the
+        # forward_with_cache attribute. (Runtime isinstance via the
+        # Protocol's @runtime_checkable does the same check.)
+        cached_model = cast(KVCacheCallable, model)
         cache: KVCache = init_kv_cache(
-            model.cfg,  # type: ignore[attr-defined]
+            cached_model.cfg,
             batch_size=n_games,
             max_seq_len=max_seq_len,
         )
 
         @eqx.filter_jit
-        def _prefill(
+        def _forward_cached(
             tokens: Int[Array, "B T_new"],
             cache_in: KVCache,
             pos_start: Int[Array, ""],
         ) -> tuple[Float[Array, "B T_new V"], KVCache]:
-            return model.forward_with_cache(  # type: ignore[union-attr]
+            return cached_model.forward_with_cache(
                 tokens, cache_in, pos_start,
             )
 
-        @eqx.filter_jit
-        def _decode_step(
-            token: Int[Array, "B 1"],
-            cache_in: KVCache,
-            pos_start: Int[Array, ""],
-        ) -> tuple[Float[Array, "B 1 V"], KVCache]:
-            return model.forward_with_cache(  # type: ignore[union-attr]
-                token, cache_in, pos_start,
-            )
-
-        # Prefill: outcome + any prefix in a single call.
+        # Prefill: outcome + any prefix in one call.
         prefill_len = prefix_end + 1
         tokens_jax = jnp.asarray(sequences[:, :prefill_len])
-        logits_jax, cache = _prefill(tokens_jax, cache, jnp.int32(0))
+        logits_jax, cache = _forward_cached(
+            tokens_jax, cache, jnp.int32(0),
+        )
         next_logits = np.asarray(logits_jax[:, -1, :])
 
         for pos in range(prefill_len, max_seq_len):
-            active = ~terminated
-            if not active.any():
+            if not (~terminated).any():
                 break
-
-            if temperature != 1.0:
-                next_logits = next_logits / temperature
-            if mask_illegal:
-                raw = np.asarray(env.get_legal_token_masks_batch(all_indices))
-                pad_row = np.zeros((1, next_logits.shape[1]), dtype=bool)
-                pad_row[0, PAD_TOKEN] = True
-                term_mat = terminated[:, None]
-                full_mask = np.where(term_mat, pad_row, raw)
-                next_logits = np.where(full_mask, next_logits, -np.inf)
-
-            gumbel = -np.log(
-                -np.log(rng.uniform(1e-10, 1.0, size=next_logits.shape))
-            )
-            sampled = (next_logits + gumbel).argmax(axis=-1).astype(np.int32)
-            sequences[:, pos] = sampled
-
-            pad_mask = active & (sampled == PAD_TOKEN)
-            if pad_mask.any():
-                terminated[pad_mask] = True
-                terminated_at[pad_mask] = pos - 1
-                term_codes[pad_mask] = -2
-
-            move_mask = active & ~pad_mask & ~terminated
-            if move_mask.any():
-                mv_idx = all_indices[move_mask]
-                mv_tok = sampled[move_mask].astype(np.uint16)
-                legality, step_tc = env.apply_moves(mv_idx, mv_tok)
-                legality = np.asarray(legality)
-                step_tc = np.asarray(step_tc)
-                illegal = ~legality
-                if illegal.any():
-                    forfeit_global = mv_idx[illegal]
-                    forfeit_ply[forfeit_global] = pos - 1
-                    terminated[forfeit_global] = True
-                    terminated_at[forfeit_global] = pos - 1
-                    term_codes[forfeit_global] = -3
-                termed = legality & (step_tc >= 0)
-                if termed.any():
-                    tg = mv_idx[termed]
-                    terminated[tg] = True
-                    terminated_at[tg] = pos
-                    term_codes[tg] = step_tc[termed]
-
+            _sample_and_step_env(pos, next_logits)
             if pos < max_seq_len - 1 and not terminated.all():
-                # Feed the freshly sampled token at position `pos`.
                 tok_jax = jnp.asarray(sequences[:, pos : pos + 1])
-                logits_jax, cache = _decode_step(
+                logits_jax, cache = _forward_cached(
                     tok_jax, cache, jnp.int32(pos),
                 )
                 next_logits = np.asarray(logits_jax[:, -1, :])
@@ -338,7 +353,6 @@ def autoregressive_generate(
         ) -> Float[Array, "B T V"]:
             return model(t, a)
 
-        # Initial prefill: outcome + any prefix.
         prefill_len = prefix_end + 1
         tokens_jax = jnp.asarray(sequences[:, :prefill_len])
         attn_jax = jnp.ones_like(tokens_jax, dtype=jnp.bool_)
@@ -346,53 +360,9 @@ def autoregressive_generate(
         next_logits = np.asarray(logits_jax[:, -1, :])
 
         for pos in range(prefill_len, max_seq_len):
-            active = ~terminated
-            if not active.any():
+            if not (~terminated).any():
                 break
-
-            if temperature != 1.0:
-                next_logits = next_logits / temperature
-            if mask_illegal:
-                raw = np.asarray(env.get_legal_token_masks_batch(all_indices))
-                pad_row = np.zeros((1, next_logits.shape[1]), dtype=bool)
-                pad_row[0, PAD_TOKEN] = True
-                term_mat = terminated[:, None]
-                full_mask = np.where(term_mat, pad_row, raw)
-                next_logits = np.where(full_mask, next_logits, -np.inf)
-
-            gumbel = -np.log(
-                -np.log(rng.uniform(1e-10, 1.0, size=next_logits.shape))
-            )
-            sampled = (next_logits + gumbel).argmax(axis=-1).astype(np.int32)
-            sequences[:, pos] = sampled
-
-            pad_mask = active & (sampled == PAD_TOKEN)
-            if pad_mask.any():
-                terminated[pad_mask] = True
-                terminated_at[pad_mask] = pos - 1
-                term_codes[pad_mask] = -2
-
-            move_mask = active & ~pad_mask & ~terminated
-            if move_mask.any():
-                mv_idx = all_indices[move_mask]
-                mv_tok = sampled[move_mask].astype(np.uint16)
-                legality, step_tc = env.apply_moves(mv_idx, mv_tok)
-                legality = np.asarray(legality)
-                step_tc = np.asarray(step_tc)
-                illegal = ~legality
-                if illegal.any():
-                    forfeit_global = mv_idx[illegal]
-                    forfeit_ply[forfeit_global] = pos - 1
-                    terminated[forfeit_global] = True
-                    terminated_at[forfeit_global] = pos - 1
-                    term_codes[forfeit_global] = -3
-                termed = legality & (step_tc >= 0)
-                if termed.any():
-                    tg = mv_idx[termed]
-                    terminated[tg] = True
-                    terminated_at[tg] = pos
-                    term_codes[tg] = step_tc[termed]
-
+            _sample_and_step_env(pos, next_logits)
             if pos < max_seq_len - 1 and not terminated.all():
                 tokens_jax = jnp.asarray(sequences[:, : pos + 1])
                 attn_jax = jnp.ones_like(tokens_jax, dtype=jnp.bool_)

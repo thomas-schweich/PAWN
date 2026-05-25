@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import equinox as eqx
@@ -367,7 +368,7 @@ _ADAPTER_FIELDS: tuple[str, ...] = (
 
 
 def save_bottleneck_adapter(
-    adapter: BottleneckAdapter, out_dir: Any,
+    adapter: BottleneckAdapter, out_dir: "Path | str",
 ) -> None:
     """Write the bottleneck weights to ``out_dir/adapter.safetensors``.
 
@@ -381,9 +382,14 @@ def save_bottleneck_adapter(
     (the frozen backbone) and the config block; this just emits the
     Houlsby sidecar. Keeps the train-time save path's two-file layout
     in lockstep with the load path below.
-    """
-    from pathlib import Path
 
+    Raises :class:`ValueError` if every adapter field is None (an
+    all-placements-disabled :class:`BottleneckConfig` would already
+    fail at construction, so this branch only fires when an adapter
+    is built directly without the config validation — surfacing it
+    loudly avoids a silent train-then-lose-weights failure flagged
+    by round-1 test-risk review).
+    """
     from safetensors.numpy import save_file as st_save
 
     out_path = Path(out_dir)
@@ -392,27 +398,34 @@ def save_bottleneck_adapter(
         leaf = getattr(adapter, name)
         if leaf is not None:
             arrays[f"bottleneck.{name}"] = np.asarray(leaf)
-    if arrays:
-        st_save(arrays, str(out_path / ADAPTER_SAFETENSORS))
+    if not arrays:
+        raise ValueError(
+            "BottleneckAdapter has no populated fields — refusing to "
+            "write an empty sidecar. Check that BottleneckConfig has "
+            "at least one of no_adapt_attn / no_adapt_ffn set to False."
+        )
+    st_save(arrays, str(out_path / ADAPTER_SAFETENSORS))
 
 
 def load_bottleneck_adapter(
-    ckpt_dir: Any, cfg: BottleneckConfig,
+    ckpt_dir: "Path | str", cfg: BottleneckConfig,
 ) -> BottleneckAdapter:
     """Restore a :class:`BottleneckAdapter` from a checkpoint sidecar.
 
     Expects ``ckpt_dir/adapter.safetensors`` written by
-    :func:`save_bottleneck_adapter`. ``cfg`` must match the
-    save-time config — the placement flags determine which fields are
-    populated; a mismatch will surface as a ``KeyError`` reading the
-    sidecar.
+    :func:`save_bottleneck_adapter`. ``cfg`` must match the save-time
+    config — the placement flags (``no_adapt_attn`` / ``no_adapt_ffn``)
+    determine which fields are populated, and a mismatch between the
+    sidecar's populated keys and ``cfg``'s placement flags is
+    rejected with :class:`ValueError` rather than silently loading
+    mismatched None / non-None fields (round-1 bug-detector finding:
+    the prior docstring claimed KeyError, but the silent-None branch
+    actually fired, leading to a crash at first forward).
 
     Raises :class:`FileNotFoundError` if the sidecar isn't present —
     callers that need a "is this a bottleneck checkpoint" check should
     test for ``(ckpt_dir / "adapter.safetensors").is_file()`` first.
     """
-    from pathlib import Path
-
     from safetensors.numpy import load_file as st_load
 
     path = Path(ckpt_dir) / ADAPTER_SAFETENSORS
@@ -422,6 +435,20 @@ def load_bottleneck_adapter(
             "checkpoint, or saved without sidecar"
         )
     flat = st_load(str(path))
+
+    # Validate the sidecar's populated keys against cfg's placement
+    # flags so a save / resume config mismatch fails loudly at load.
+    expect_attn = not cfg.no_adapt_attn
+    expect_ffn = not cfg.no_adapt_ffn
+    has_attn = "bottleneck.down_attn" in flat
+    has_ffn = "bottleneck.down_ffn" in flat
+    if expect_attn != has_attn or expect_ffn != has_ffn:
+        raise ValueError(
+            f"BottleneckConfig / sidecar mismatch at {path}: cfg expects "
+            f"(attn={expect_attn}, ffn={expect_ffn}) but sidecar has "
+            f"(attn={has_attn}, ffn={has_ffn}). Was the run resumed "
+            "with different placement flags?"
+        )
 
     def _maybe(key: str) -> jax.Array | None:
         full = f"bottleneck.{key}"
