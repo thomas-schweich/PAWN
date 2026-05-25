@@ -242,6 +242,32 @@ def test_autoregressive_generate_rejects_bf16_cache_with_fp32_compute() -> None:
         )
 
 
+def test_autoregressive_generate_rejects_mismatched_low_precision_pair() -> None:
+    """Round-4 codex P2: `cache=fp16 + compute=bf16` (or the reverse)
+    is permitted by a naive "both low-precision" check but is
+    actually unsafe — bf16's exponent range is wider than fp16, so a
+    bf16-compute K/V can overflow when written to a fp16 cache.
+    The validator now requires *exact* match for low-precision
+    pairs."""
+    from pawn.generation import WHITE_CHECKMATES, autoregressive_generate
+
+    model = init_model(TINY_SUPERNET, key=0)
+    # fp16 cache + bf16 compute: rejected.
+    with pytest.raises(ValueError, match="requires compute_dtype to be the same"):
+        autoregressive_generate(
+            model, WHITE_CHECKMATES, n_games=2,
+            mask_illegal=True, max_seq_len=8,
+            cache_dtype=jnp.float16, compute_dtype=jnp.bfloat16,
+        )
+    # bf16 cache + fp16 compute: rejected (overflow direction).
+    with pytest.raises(ValueError, match="requires compute_dtype to be the same"):
+        autoregressive_generate(
+            model, WHITE_CHECKMATES, n_games=2,
+            mask_illegal=True, max_seq_len=8,
+            cache_dtype=jnp.bfloat16, compute_dtype=jnp.float16,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Linear probes
 # ---------------------------------------------------------------------------

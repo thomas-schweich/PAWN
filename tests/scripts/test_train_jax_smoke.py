@@ -149,7 +149,10 @@ def test_train_jax_adapter_rejects_resume_without_training_state(tmp_path) -> No
         env=_subprocess_env(),
     )
     combined = result.stdout + result.stderr
-    assert "training_state.json" in combined, (
+    # Match the guard's distinctive phrase so a generic traceback
+    # mentioning the filename can't satisfy the assertion
+    # (round-4 bug-detector MINOR).
+    assert "--resume requires" in combined and "training_state.json" in combined, (
         f"Expected the missing-sidecar guard; got stdout={result.stdout!r} "
         f"stderr={result.stderr!r}"
     )

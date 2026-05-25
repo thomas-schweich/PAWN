@@ -207,18 +207,22 @@ def autoregressive_generate(
     if max_seq_len is None:
         max_seq_len = model.cfg.max_seq_len
 
-    # Cache dtype / compute dtype pairing: reject a configuration that
-    # would silently lose precision on cache writes (round-3
-    # bug-detector). A bf16 / fp16 cache requires the forward to also
-    # run in that dtype so the K/V being written are at cache
-    # precision. fp32 cache with any compute_dtype is always safe.
+    # Cache dtype / compute dtype pairing: reject any configuration
+    # that would silently mis-precision cache writes. A bf16 / fp16
+    # cache requires the forward to run in *exactly the same* dtype so
+    # K/V being written aren't downcast (fp32→bf16) or unsafely
+    # rebound (bf16↔fp16, where bf16's larger exponent range can
+    # overflow fp16). fp32 cache with any compute_dtype is always
+    # safe (compute writes are widening or no-op). Round-3 + round-4
+    # bug-detector + codex P2.
     _low_precision = (jnp.bfloat16, jnp.float16)
-    if cache_dtype in _low_precision and compute_dtype not in _low_precision:
+    if cache_dtype in _low_precision and cache_dtype != compute_dtype:
         raise ValueError(
-            f"cache_dtype={cache_dtype} requires compute_dtype to also "
-            f"be bf16/fp16 (got compute_dtype={compute_dtype}); otherwise "
-            "K/V written into the cache get downcast from a higher-"
-            "precision forward and lose information silently."
+            f"cache_dtype={cache_dtype} requires compute_dtype to be "
+            f"the same (got compute_dtype={compute_dtype}). Mismatched "
+            "low-precision pairs (e.g. bf16 cache + fp16 compute, or "
+            "bf16 cache + fp32 compute) lose precision or overflow on "
+            "cache writes."
         )
 
     # Sequences buffer + initial outcome conditioning.
@@ -538,7 +542,7 @@ def prefix_continuation_test(
     tokens = tokens.at[0, 1 : 1 + p].set(jnp.asarray(prefix_np))
     attn = jnp.zeros((1, seq_len), dtype=jnp.bool_)
     attn = attn.at[0, : 1 + p].set(True)
-    logits = model(tokens, attn)
+    logits = model(tokens, attn, compute_dtype=compute_dtype)
     next_argmax = int(_argmax_action(logits)[0, p])
 
     result: dict[str, Any] = {
@@ -609,7 +613,7 @@ def impossible_task_test(
     tokens = jnp.full((1, seq_len), PAD_TOKEN, dtype=jnp.int32)
     tokens = tokens.at[0, 0].set(WHITE_CHECKMATES)
     attn = jnp.zeros((1, seq_len), dtype=jnp.bool_).at[0, 0].set(True)
-    logits = model(tokens, attn)
+    logits = model(tokens, attn, compute_dtype=compute_dtype)
     probs = jax.nn.softmax(logits[0, 1, :NUM_ACTIONS], axis=-1)
     result: dict[str, Any] = {
         "diagnostic": "impossible_task_test",
@@ -642,7 +646,7 @@ def improbable_task_test(
     tokens = jnp.full((1, seq_len), PAD_TOKEN, dtype=jnp.int32)
     tokens = tokens.at[0, 0].set(DRAW_BY_AGREEMENT)
     attn = jnp.zeros((1, seq_len), dtype=jnp.bool_).at[0, 0].set(True)
-    logits = model(tokens, attn)
+    logits = model(tokens, attn, compute_dtype=compute_dtype)
     probs = jax.nn.softmax(logits[0, 1, :NUM_ACTIONS], axis=-1)
     result: dict[str, Any] = {
         "diagnostic": "improbable_task_test",
