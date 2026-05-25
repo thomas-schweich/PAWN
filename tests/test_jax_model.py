@@ -503,13 +503,35 @@ def test_forward_with_cache_rejects_write_window_overflow(pos_start) -> None:  #
     fix only caught Python int, leaving JAX scalars (the
     `autoregressive_generate` cached-path call form) silently broken.
     `eqx.error_if` now handles both."""
+    import equinox as eqx
     model = init_model(TINY_SUPERNET, key=0)
     cache = init_kv_cache(TINY_SUPERNET, batch_size=1, max_seq_len=8)
     tokens = jnp.zeros((1, 4), dtype=jnp.int32)
-    # `eqx.error_if` raises EqxRuntimeError (a ValueError subclass at
-    # runtime — pytest's regex match catches the message either way).
-    with pytest.raises(Exception, match="exceeds cache capacity"):
+    # `eqx.error_if` raises EquinoxRuntimeError (concrete type — using
+    # the specific class instead of bare `Exception` so unrelated
+    # regressions can't silently satisfy the match).
+    with pytest.raises(eqx.EquinoxRuntimeError, match="exceeds cache capacity"):
         model.forward_with_cache(tokens, cache, pos_start=pos_start)
+
+
+def test_forward_with_cache_oob_guard_fires_under_jit() -> None:
+    """The OOB guard must also raise when the caller wraps
+    `forward_with_cache` in `eqx.filter_jit` — that's the actual
+    `autoregressive_generate` hot path. Round-3 test-risk HIGH +
+    bug-detector IMPORTANT raised the concern that `eqx.error_if`
+    might silently degrade to a no-op inside JIT; this test pins the
+    expected behavior (EquinoxRuntimeError still surfaces)."""
+    import equinox as eqx
+    model = init_model(TINY_SUPERNET, key=0)
+    cache = init_kv_cache(TINY_SUPERNET, batch_size=1, max_seq_len=8)
+    tokens = jnp.zeros((1, 4), dtype=jnp.int32)
+
+    @eqx.filter_jit
+    def jitted_forward(t: jax.Array, c, p: jax.Array):  # type: ignore[no-untyped-def]
+        return model.forward_with_cache(t, c, p)
+
+    with pytest.raises(eqx.EquinoxRuntimeError, match="exceeds cache capacity"):
+        jitted_forward(tokens, cache, jnp.int32(6))
 
 
 def test_forward_with_cache_returns_fresh_cache() -> None:

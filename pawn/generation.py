@@ -162,6 +162,7 @@ def autoregressive_generate(
     seed: int = 0,
     use_kv_cache: bool | None = None,
     cache_dtype: jnp.dtype | None = None,
+    compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, np.ndarray]:
     """Generate ``n_games`` games autoregressively from ``model``.
 
@@ -181,10 +182,15 @@ def autoregressive_generate(
     ``cache_dtype`` (default: ``jnp.float32``): the dtype the KV cache
     is allocated in. Bf16 cuts cache memory in half, which is the
     binding constraint at production-scale ``n_games=1000`` (round-2
-    perf review). Only safe when the surrounding forward also runs in
-    bf16 — i.e. the model was constructed with a bf16 compute path —
-    otherwise the cache write loses precision. Defaults to fp32 to
-    keep the parity-test invariant intact.
+    perf review). Must be paired with ``compute_dtype`` — bf16 cache
+    + fp32 forward would still downcast K/V on write and lose
+    precision (round-3 bug-detector). A ``ValueError`` is raised if
+    ``cache_dtype`` is bf16 / fp16 but ``compute_dtype`` is not.
+
+    ``compute_dtype`` (default: ``None`` → fp32): the forward-pass
+    activation dtype passed to ``forward_with_cache``. Used together
+    with ``cache_dtype`` so the cache stores at full precision of the
+    surrounding forward.
 
     Returns a dict with:
         sequences:       (n_games, max_seq_len) int32 — full token stream
@@ -200,6 +206,20 @@ def autoregressive_generate(
     """
     if max_seq_len is None:
         max_seq_len = model.cfg.max_seq_len
+
+    # Cache dtype / compute dtype pairing: reject a configuration that
+    # would silently lose precision on cache writes (round-3
+    # bug-detector). A bf16 / fp16 cache requires the forward to also
+    # run in that dtype so the K/V being written are at cache
+    # precision. fp32 cache with any compute_dtype is always safe.
+    _low_precision = (jnp.bfloat16, jnp.float16)
+    if cache_dtype in _low_precision and compute_dtype not in _low_precision:
+        raise ValueError(
+            f"cache_dtype={cache_dtype} requires compute_dtype to also "
+            f"be bf16/fp16 (got compute_dtype={compute_dtype}); otherwise "
+            "K/V written into the cache get downcast from a higher-"
+            "precision forward and lose information silently."
+        )
 
     # Sequences buffer + initial outcome conditioning.
     sequences = np.full((n_games, max_seq_len), PAD_TOKEN, dtype=np.int32)
@@ -335,7 +355,7 @@ def autoregressive_generate(
             pos_start: Int[Array, ""],
         ) -> tuple[Float[Array, "B T_new V"], KVCache]:
             return cached_model.forward_with_cache(
-                tokens, cache_in, pos_start,
+                tokens, cache_in, pos_start, compute_dtype=compute_dtype,
             )
 
         # Prefill: outcome + any prefix in one call.
@@ -361,7 +381,7 @@ def autoregressive_generate(
         def _forward(
             t: Int[Array, "B T"], a: Int[Array, "B T"]
         ) -> Float[Array, "B T V"]:
-            return model(t, a)
+            return model(t, a, compute_dtype=compute_dtype)
 
         prefill_len = prefix_end + 1
         tokens_jax = jnp.asarray(sequences[:, :prefill_len])
@@ -459,6 +479,8 @@ def outcome_signal_test(
     n_per_outcome: int = 32,
     max_seq_len: int = 64,
     mask_conditions: tuple[bool, ...] = (False, True),
+    cache_dtype: jnp.dtype | None = None,
+    compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, Any]:
     """v1 §6.1-6.3 outcome signal test (autoregressive).
 
@@ -478,6 +500,7 @@ def outcome_signal_test(
             gen = autoregressive_generate(
                 model, tok, n_per_outcome,
                 mask_illegal=masked, max_seq_len=max_seq_len,
+                cache_dtype=cache_dtype, compute_dtype=compute_dtype,
             )
             per_outcome[label] = analyze_generated_games(gen, name)
         out[name] = per_outcome
@@ -493,6 +516,8 @@ def prefix_continuation_test(
     seq_len: int = 32,
     n_continuations: int = 8,
     ar: bool = True,
+    cache_dtype: jnp.dtype | None = None,
+    compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, Any]:
     """Given an outcome + the first P moves, does the model continue?
 
@@ -529,6 +554,7 @@ def prefix_continuation_test(
             mask_illegal=True,
             prefix_moves=prefix_batch, prefix_lengths=prefix_lens,
             max_seq_len=seq_len,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         )
         outcome_name = next(
             (k for k, v in OUTCOME_TOKENS.items() if v == outcome_token),
@@ -546,6 +572,8 @@ def poisoned_prefix_test(
     outcome_prefix_trained: bool,
     seq_len: int = 32,
     n_continuations: int = 8,
+    cache_dtype: jnp.dtype | None = None,
+    compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, Any]:
     """Prefix continuation with an outcome token that contradicts the
     actual game (e.g. white-checkmates moves paired with a
@@ -557,6 +585,7 @@ def poisoned_prefix_test(
         model, true_prefix, poisoned_outcome,
         outcome_prefix_trained=True, seq_len=seq_len,
         n_continuations=n_continuations,
+        cache_dtype=cache_dtype, compute_dtype=compute_dtype,
     )
     inner["diagnostic"] = "poisoned_prefix_test"
     return inner
@@ -568,6 +597,8 @@ def impossible_task_test(
     outcome_prefix_trained: bool,
     seq_len: int = 16,
     n_games: int = 16,
+    cache_dtype: jnp.dtype | None = None,
+    compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, Any]:
     """Outcome at slot 0 = 'white checkmates' but no opening move can
     deliver mate-in-1. Reports the top-1 prob + entropy of the model's
@@ -589,6 +620,7 @@ def impossible_task_test(
         gen = autoregressive_generate(
             model, WHITE_CHECKMATES, n_games,
             mask_illegal=True, max_seq_len=seq_len,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         )
         result["ar_analysis"] = analyze_generated_games(gen, "WHITE_CHECKMATES")
     return result
@@ -600,6 +632,8 @@ def improbable_task_test(
     outcome_prefix_trained: bool,
     seq_len: int = 16,
     n_games: int = 16,
+    cache_dtype: jnp.dtype | None = None,
+    compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, Any]:
     """Outcome at slot 0 = DRAW_BY_AGREEMENT (very low prior). Reports
     top-1 prob + entropy + AR analysis."""
@@ -619,6 +653,7 @@ def improbable_task_test(
         gen = autoregressive_generate(
             model, DRAW_BY_AGREEMENT, n_games,
             mask_illegal=True, max_seq_len=seq_len,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         )
         result["ar_analysis"] = analyze_generated_games(gen, "DRAW_BY_AGREEMENT")
     return result
@@ -630,6 +665,8 @@ def run_all_diagnostics(
     outcome_prefix_trained: bool,
     n_per_outcome: int = 16,
     max_seq_len: int = 32,
+    cache_dtype: jnp.dtype | None = None,
+    compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Run all 5 diagnostics, return a dict keyed by name.
 
@@ -639,29 +676,40 @@ def run_all_diagnostics(
     autoregressive generation per v1 parity; defaults are conservative
     so the full suite stays under a minute on a small backbone — pass
     larger ``n_per_outcome`` / ``max_seq_len`` for the full v1 numbers.
+
+    ``cache_dtype`` / ``compute_dtype`` (default None → fp32) are
+    threaded to every internal :func:`autoregressive_generate` call so
+    a single ``--cache-dtype bfloat16 --compute-dtype bfloat16``
+    invocation on the CLI halves the production-scale cache budget.
+    The pairing constraint is enforced by ``autoregressive_generate``.
     """
     prefix = jnp.array([5, 10], dtype=jnp.int32)
     return {
         "outcome_signal_test": outcome_signal_test(
             model, outcome_prefix_trained=outcome_prefix_trained,
             n_per_outcome=n_per_outcome, max_seq_len=max_seq_len,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         ),
         "prefix_continuation_test": prefix_continuation_test(
             model, prefix, WHITE_CHECKMATES,
             outcome_prefix_trained=outcome_prefix_trained,
             n_continuations=min(8, n_per_outcome),
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         ),
         "poisoned_prefix_test": poisoned_prefix_test(
             model, prefix, BLACK_CHECKMATES,
             outcome_prefix_trained=outcome_prefix_trained,
             n_continuations=min(8, n_per_outcome),
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         ),
         "impossible_task_test": impossible_task_test(
             model, outcome_prefix_trained=outcome_prefix_trained,
             n_games=min(16, n_per_outcome),
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         ),
         "improbable_task_test": improbable_task_test(
             model, outcome_prefix_trained=outcome_prefix_trained,
             n_games=min(16, n_per_outcome),
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         ),
     }

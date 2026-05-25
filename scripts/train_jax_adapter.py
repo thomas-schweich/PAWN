@@ -278,6 +278,40 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: unknown strategy {cfg.strategy!r}", file=sys.stderr)
         return 2
 
+    # Early --resume validation runs *before* any HF checkpoint
+    # download or local model load so guard failures don't waste
+    # bandwidth or compile time. Round-3 bug-detector MINOR: the
+    # prior order made the RoSA-resume test depend on HF network
+    # state in CI. We only peek at the resume-specific sidecar
+    # files; full restore happens further down once the backbone is
+    # in hand.
+    is_rosa_strategy = cfg.strategy in (
+        "rosa", "rosa-retro-sparse", "rosa-retro-bottleneck",
+    )
+    resume_step_early = 0
+    if args.resume is not None:
+        _resume_dir = Path(args.resume)
+        _ts_path = _resume_dir / "training_state.json"
+        if not _ts_path.is_file():
+            raise SystemExit(
+                f"[train_jax_adapter] --resume requires "
+                f"{_ts_path.name} in the checkpoint dir; got "
+                f"{_resume_dir} with no such file. The training-state "
+                "sidecar carries the saved step counter and is "
+                "load-bearing for the resume contract."
+            )
+        _ts_data = json.loads(_ts_path.read_text(encoding="utf-8"))
+        resume_step_early = int(_ts_data.get("step", 0))
+        if is_rosa_strategy and resume_step_early > 0:
+            raise SystemExit(
+                "[train_jax_adapter] --resume is not supported for RoSA "
+                "strategies: Phase 2 mask-generation state is not "
+                "persisted in the checkpoint, so re-running from a "
+                "Phase 1/2/3 boundary would either re-execute completed "
+                "work (exceeding total_steps) or apply stale masks. "
+                "Restart the run from step 0 instead."
+            )
+
     # Build / load backbone.
     if cfg.strategy == "specialized_clm":
         # Standalone — no backbone needed.
@@ -325,10 +359,11 @@ def main(argv: list[str] | None = None) -> int:
     # `load_bottleneck_adapter`; other strategies cold-start the adapter
     # PyTree but warm-start the optimizer state, which still preserves
     # Adam moments + clip counter across the resume boundary.
-    resume_step = 0
-    is_rosa_strategy = cfg.strategy in (
-        "rosa", "rosa-retro-sparse", "rosa-retro-bottleneck",
-    )
+    # `resume_step` is already extracted upstream (right after
+    # `_require_accelerator`) so the RoSA / training-state checks
+    # fire before any HF download. Below we restore the backbone +
+    # adapter + optimizer state from the checkpoint.
+    resume_step = resume_step_early
     if args.resume is not None:
         from pawn.adapters.bottleneck import (
             ADAPTER_SAFETENSORS,
@@ -338,41 +373,7 @@ def main(argv: list[str] | None = None) -> int:
         from pawn.checkpoint import OPTIMIZER_FILE, load_model
         from pawn.trainer import unflatten_opt_state
 
-        # Require `training_state.json` on --resume. A missing file
-        # would silently fall back to resume_step=0, bypassing the
-        # RoSA guard and producing a cryptic `unflatten_opt_state`
-        # tree-shape mismatch later (round-2 test-risk + bug-detector
-        # MEDIUM). Better to fail loudly here so the operator either
-        # restores the file or restarts the run fresh.
         ckpt_dir = Path(args.resume)
-        ts_path = ckpt_dir / "training_state.json"
-        if not ts_path.is_file():
-            raise SystemExit(
-                f"[train_jax_adapter] --resume requires "
-                f"{ts_path.name} in the checkpoint dir; got "
-                f"{ckpt_dir} with no such file. The training-state "
-                "sidecar carries the saved step counter and is "
-                "load-bearing for the resume contract."
-            )
-        ts_data = json.loads(ts_path.read_text(encoding="utf-8"))
-        resume_step = int(ts_data.get("step", 0))
-
-        # RoSA --resume is rejected upfront: Phase 2 mask state isn't
-        # persisted, and the saved opt-state's tree shape doesn't
-        # round-trip across phase boundaries. Catching this before
-        # `unflatten_opt_state` gives a clear error message instead
-        # of a cryptic tree-shape mismatch (round-1 codex P2 +
-        # bug-detector IMPORTANT).
-        if is_rosa_strategy and resume_step > 0:
-            raise SystemExit(
-                "[train_jax_adapter] --resume is not supported for RoSA "
-                "strategies: Phase 2 mask-generation state is not "
-                "persisted in the checkpoint, so re-running from a "
-                "Phase 1/2/3 boundary would either re-execute completed "
-                "work (exceeding total_steps) or apply stale masks. "
-                "Restart the run from step 0 instead."
-            )
-
         backbone = load_model(ckpt_dir)
         # Bottleneck sidecar: re-compose the wrapper. Otherwise fall
         # back to the freshly-initialised adapter (weight-folded

@@ -58,6 +58,20 @@ def test_script_help_works(script_name: str) -> None:
     )
 
 
+def _subprocess_env() -> "dict[str, str]":
+    """Subprocess env for CPU-friendly script tests.
+
+    `_require_accelerator()` refuses to run on CPU unless
+    `PAWN_ALLOW_CPU=1` is set (parity with v1). Round-3 codex P2: the
+    subprocess tests below need this override or they fail before
+    reaching the guard they're trying to pin on CPU-only CI.
+    """
+    import os
+    env = os.environ.copy()
+    env["PAWN_ALLOW_CPU"] = "1"
+    return env
+
+
 def test_train_jax_adapter_rejects_rosa_resume(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """RoSA + --resume with step > 0 must fail loudly before any
     optimizer-state damage. Round-2 test-risk: the prior fix was
@@ -67,7 +81,11 @@ def test_train_jax_adapter_rejects_rosa_resume(tmp_path) -> None:  # type: ignor
     `training_state.json` for the early `_resume_step_peek` read to
     fire, then runs the script as a subprocess and asserts the exit
     message comes from our SystemExit rather than a downstream
-    cryptic shape mismatch."""
+    cryptic shape mismatch.
+
+    Uses an in-tree TINY_SUPERNET-shaped fake (the `--checkpoint`
+    arg refers to a path on disk, but the script's early-exit code
+    path doesn't load it before the RoSA guard fires)."""
     import json
     import subprocess
 
@@ -90,13 +108,16 @@ def test_train_jax_adapter_rejects_rosa_resume(tmp_path) -> None:  # type: ignor
         capture_output=True,
         text=True,
         timeout=120,
+        env=_subprocess_env(),
     )
-    assert result.returncode != 0, "RoSA --resume should fail"
     combined = result.stdout + result.stderr
+    # Specific guard message (not just any non-zero exit — that could
+    # be an unrelated import error). Round-3 test-risk MEDIUM.
     assert "--resume is not supported for RoSA" in combined, (
         f"Expected the RoSA-resume guard message; got stdout={result.stdout!r} "
         f"stderr={result.stderr!r}"
     )
+    assert result.returncode != 0, "RoSA --resume should fail"
 
 
 def test_train_jax_adapter_rejects_resume_without_training_state(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -125,12 +146,13 @@ def test_train_jax_adapter_rejects_resume_without_training_state(tmp_path) -> No
         capture_output=True,
         text=True,
         timeout=120,
-    )
-    assert result.returncode != 0, (
-        "Resume against a sidecar-less dir should fail"
+        env=_subprocess_env(),
     )
     combined = result.stdout + result.stderr
     assert "training_state.json" in combined, (
         f"Expected the missing-sidecar guard; got stdout={result.stdout!r} "
         f"stderr={result.stderr!r}"
+    )
+    assert result.returncode != 0, (
+        "Resume against a sidecar-less dir should fail"
     )

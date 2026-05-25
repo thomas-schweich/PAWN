@@ -200,6 +200,48 @@ def test_autoregressive_generate_kv_cache_matches_full_forward() -> None:
     assert np.array_equal(gen_plain["game_lengths"], gen_cached["game_lengths"])
 
 
+def test_autoregressive_generate_bf16_cache_runs() -> None:
+    """The `cache_dtype=jnp.bfloat16` path (paired with `compute_dtype`)
+    must run end-to-end. Round-3 test-risk MEDIUM: the bf16-cache opt-in
+    surface had no test, so a future change that broke the dtype pairing
+    could land silently. This pins that the bf16 forward + bf16 cache
+    path produces valid output (sequences, term codes, game lengths)
+    with no exceptions."""
+    from pawn.generation import WHITE_CHECKMATES, autoregressive_generate
+
+    model = init_model(TINY_SUPERNET, key=0)
+    gen = autoregressive_generate(
+        model, WHITE_CHECKMATES, n_games=2,
+        mask_illegal=True, max_seq_len=8, seed=0,
+        use_kv_cache=True,
+        cache_dtype=jnp.bfloat16, compute_dtype=jnp.bfloat16,
+    )
+    # Headline shape + dtype invariants — sequences are int32 game
+    # tokens, not affected by the bf16 cache choice.
+    assert gen["sequences"].shape == (2, 8)
+    assert gen["sequences"].dtype == np.int32
+    assert gen["term_codes"].shape == (2,)
+    # Outcome token at pos 0 is preserved regardless of dtype.
+    assert (gen["sequences"][:, 0] == WHITE_CHECKMATES).all()
+
+
+def test_autoregressive_generate_rejects_bf16_cache_with_fp32_compute() -> None:
+    """`cache_dtype=bfloat16` without `compute_dtype=bfloat16` must
+    raise — a fp32 forward writing into a bf16 cache silently
+    downcasts on every write (round-3 bug-detector). The
+    `autoregressive_generate` validator catches this at call time
+    rather than letting the operator commit to a lossy run."""
+    from pawn.generation import WHITE_CHECKMATES, autoregressive_generate
+
+    model = init_model(TINY_SUPERNET, key=0)
+    with pytest.raises(ValueError, match="requires compute_dtype"):
+        autoregressive_generate(
+            model, WHITE_CHECKMATES, n_games=2,
+            mask_illegal=True, max_seq_len=8,
+            cache_dtype=jnp.bfloat16,  # no compute_dtype
+        )
+
+
 # ---------------------------------------------------------------------------
 # Linear probes
 # ---------------------------------------------------------------------------

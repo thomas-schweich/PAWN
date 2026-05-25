@@ -56,8 +56,31 @@ def main(argv: list[str] | None = None) -> int:
         "--gen-max-seq-len", type=int, default=32,
         help="autoregressive decode horizon for the generation suite",
     )
+    ap.add_argument(
+        "--cache-dtype",
+        choices=("float32", "bfloat16", "float16"),
+        default="float32",
+        help="dtype for the KV cache (bf16 halves the cache footprint "
+        "at production-scale n_per_outcome — paired with --compute-dtype)",
+    )
+    ap.add_argument(
+        "--compute-dtype",
+        choices=("float32", "bfloat16", "float16"),
+        default="float32",
+        help="forward-pass compute dtype (must match --cache-dtype "
+        "precision when --cache-dtype is bf16/fp16)",
+    )
     ap.add_argument("--output", type=Path, default=None)
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    import jax.numpy as jnp
+    _DTYPE_MAP = {
+        "float32": None,  # init_kv_cache treats None as fp32
+        "bfloat16": jnp.bfloat16,
+        "float16": jnp.float16,
+    }
+    cache_dtype = _DTYPE_MAP[args.cache_dtype]
+    compute_dtype = _DTYPE_MAP[args.compute_dtype]
 
     ckpt = args.checkpoint
     if "/" in ckpt and not Path(ckpt).exists():
@@ -71,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
         outcome_prefix_trained=args.trained,
         n_per_outcome=args.gen_n_per_outcome,
         max_seq_len=args.gen_max_seq_len,
+        cache_dtype=cache_dtype,
+        compute_dtype=compute_dtype,
     )
 
     if args.edge_cases:
