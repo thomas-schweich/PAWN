@@ -145,6 +145,22 @@ class BaseRunConfig(BaseModel):
     # `use_sdpa` when both are set.
     use_flash: bool = True
 
+    # --- Supernet variant sampling -------------------------------------
+    # Sandwich-sample one non-supernet variant per step instead of the
+    # exhaustive sum-over-all loop. The supernet (``is_supernet=True``)
+    # variant always runs; one of the remaining variants is drawn
+    # uniformly and its CE is scaled by ``N`` to keep the per-step loss
+    # an unbiased estimator of the full sum. Empirical 5090 measurement
+    # at SUPERNET (d=640, d_ff=1792, n_layers=10), B=64, T=512, bf16,
+    # 3-variant supernet loss surface: 165.49 ms (deterministic) →
+    # 149.06 ms (stochastic), i.e. ~10% throughput improvement. MatFormer
+    # / matryoshka-supernet literature shows quality convergence to the
+    # full sum at the cost of a small variance increase in the
+    # small-variant gradient signal. Off by default to keep the
+    # deterministic loss surface for tests and parity; flip to True for
+    # production supernet pretraining.
+    stochastic_variants: bool = False
+
     # --- JAX-specific (new in v2) --------------------------------------
     # Which supernet config the run trains / slices from. ``"production"``
     # = `SUPERNET` (d=640, 10 layers, 10 heads); ``"tiny"`` =

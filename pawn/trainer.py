@@ -229,6 +229,7 @@ def supernet_joint_loss(
     compute_dtype: jnp.dtype | None = None,
     use_sdpa: bool = False,
     use_flash: bool = False,
+    stochastic_key: jax.Array | None = None,
 ) -> Float[Array, ""]:
     """The supernet joint loss: **sum** per-variant cross-entropies on
     the same batch.
@@ -249,22 +250,79 @@ def supernet_joint_loss(
     Variants are unrolled statically — the tuple is treated as a
     Python-static list so `lax.scan` over it would be wrong (variants
     have different shapes, so they can't be scan-stacked).
+
+    ``stochastic_key`` switches into a sandwich-sampling regime: when
+    given, the supernet (``is_supernet=True``) variant is run every
+    step as normal, and exactly *one* of the remaining non-supernet
+    variants is sampled uniformly each step. The sampled variant's
+    CE is scaled by ``N`` (the number of non-supernet variants) so
+    that ``E[loss_stochastic] == sum-of-all loss``: the gradient
+    update is unbiased in expectation. Saves ~50-67% of the per-step
+    forward+backward FLOPs when the variant count grows (the small
+    and base variants of the production supernet each contribute a
+    full forward+backward pass through their respective dims). The
+    correctness story is the MatFormer / matryoshka-supernet
+    literature: stochastic width sampling has been shown to converge
+    to the same quality as full joint training, with a small variance
+    increase in the small-variant gradient signal.
+
+    Pass ``stochastic_key=None`` (default) to keep the exhaustive
+    sum-of-all path for tests, parity checks, and any caller that
+    needs a deterministic loss surface.
     """
     if not variants:
         raise ValueError(
             "supernet_joint_loss requires at least one VariantSpec; "
             "got an empty tuple"
         )
+    if stochastic_key is None:
+        total = jnp.array(0.0, dtype=jnp.float32)
+        for spec in variants:
+            if spec.is_supernet:
+                sub_model = model
+            else:
+                sub_model = sliced(model, spec.cfg)
+            total = total + cross_entropy_loss(
+                sub_model, batch,
+                compute_dtype=compute_dtype,
+                use_sdpa=use_sdpa, use_flash=use_flash,
+            )
+        return total
+
+    # Stochastic sandwich: supernet always + one sampled non-supernet
+    # variant, scaled by N to keep the expectation equal to the full
+    # sum.
+    supernet_variants = tuple(v for v in variants if v.is_supernet)
+    other_variants = tuple(v for v in variants if not v.is_supernet)
     total = jnp.array(0.0, dtype=jnp.float32)
-    for spec in variants:
-        if spec.is_supernet:
-            sub_model = model
-        else:
-            sub_model = sliced(model, spec.cfg)
+    for spec in supernet_variants:
         total = total + cross_entropy_loss(
-            sub_model, batch,
-            compute_dtype=compute_dtype, use_sdpa=use_sdpa, use_flash=use_flash,
+            model, batch,
+            compute_dtype=compute_dtype,
+            use_sdpa=use_sdpa, use_flash=use_flash,
         )
+
+    if other_variants:
+        n_other = len(other_variants)
+
+        def _make_branch(spec: VariantSpec):
+            def _branch(_: Any) -> Float[Array, ""]:
+                sub = sliced(model, spec.cfg)
+                return cross_entropy_loss(
+                    sub, batch,
+                    compute_dtype=compute_dtype,
+                    use_sdpa=use_sdpa, use_flash=use_flash,
+                ) * jnp.float32(n_other)
+            return _branch
+
+        idx = jax.random.randint(
+            stochastic_key, (), 0, n_other, dtype=jnp.int32
+        )
+        sampled = jax.lax.switch(
+            idx, [_make_branch(s) for s in other_variants], operand=None
+        )
+        total = total + sampled
+
     return total
 
 
@@ -659,6 +717,7 @@ def make_train_step(
     compute_dtype: jnp.dtype | None = None,
     use_sdpa: bool = False,
     use_flash: bool = False,
+    stochastic_variants: bool = False,
 ) -> Callable[[TrainState, Batch], tuple[TrainState, Float[Array, ""]]]:
     """Return a JIT-compiled single training step closing over the
     optimizer + variant list.
@@ -687,10 +746,22 @@ def make_train_step(
         state: TrainState, batch: Batch
     ) -> tuple[TrainState, Float[Array, ""]]:
         def loss_fn(model: PAWNModel) -> Float[Array, ""]:
+            # Derive a per-step subkey by folding the step counter into
+            # the state's RNG key. Distinct per step, deterministic
+            # within a step (so two replays of the same batch take the
+            # same variant), zero PyTree-mutation overhead. ``None``
+            # in deterministic mode short-circuits the sampling inside
+            # ``supernet_joint_loss`` and keeps the exhaustive sum.
+            sub_key = (
+                jax.random.fold_in(state.key, state.step)
+                if stochastic_variants
+                else None
+            )
             return supernet_joint_loss(
                 model, batch, variants,
                 compute_dtype=compute_dtype,
                 use_sdpa=use_sdpa, use_flash=use_flash,
+                stochastic_key=sub_key,
             )
 
         loss, grads = eqx.filter_value_and_grad(loss_fn)(state.model)

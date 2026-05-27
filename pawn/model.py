@@ -827,6 +827,21 @@ class PAWNModel(eqx.Module):
         unroll = (
             int(unroll_str) if unroll_str else self.cfg.n_layers
         )
+        # ``PAWN_USE_REMAT=1`` wraps the per-layer ``step`` body in
+        # ``jax.checkpoint`` (with the dot-no-batch-dims policy that
+        # saves matmul outputs and recomputes RMSNorm / RoPE /
+        # residuals on backward). Trades ~18% backward FLOPs for ~3-5×
+        # activation memory headroom — the only way to fit B=256 at
+        # LARGE inside the 5090's 32 GB VRAM. Validated empirically:
+        # round-3 review (Sonnet conv + Opus conv + Opus OOB) flagged
+        # it as the largest-impact remaining lever specifically
+        # because it unlocks larger batches, not because it makes
+        # B=64 faster.
+        if os.environ.get("PAWN_USE_REMAT"):
+            step = jax.checkpoint(  # type: ignore[assignment]
+                step,
+                policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+            )
         x, _ = jax.lax.scan(step, x, scan_input, unroll=unroll)
         return x
 

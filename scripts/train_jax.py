@@ -77,6 +77,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                          "(force the plain materialised QK^T path). "
                          "Flash is the default on GPU; CPU runs "
                          "auto-fall-back regardless of this flag.")
+    ap.add_argument("--stochastic-variants", action="store_true",
+                    help="enable sandwich-style variant sampling in "
+                         "supernet_joint_loss: always run the supernet "
+                         "plus one randomly-sampled non-supernet variant "
+                         "per step (scaled to keep the gradient unbiased). "
+                         "~10%% throughput at 3-variant production loss; "
+                         "off by default.")
     return ap.parse_args(argv)
 
 
@@ -109,6 +116,8 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
     # `local_checkpoints` handling below.
     if args.use_sdpa:
         base["use_sdpa"] = True
+    if args.stochastic_variants:
+        base["stochastic_variants"] = True
     if args.no_flash:
         base["use_flash"] = False
     if args.wandb:
@@ -214,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
     train_step = make_train_step(
         optimizer, variants,
         compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa, use_flash=use_flash,
+        stochastic_variants=cfg.stochastic_variants,
     )
     logger = MetricsLogger(
         log_dir=args.logs_dir, run_prefix="pretrain", device=_resolve_device()

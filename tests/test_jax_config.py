@@ -163,12 +163,19 @@ def test_model_config_rejects_non_positive_rope_base() -> None:
 
 
 def test_supernet_dimensions() -> None:
-    """The plan §5 pins SUPERNET to d=640 / 10 layers / 10 heads / head_dim=64."""
+    """The plan §5 pins SUPERNET to d=640 / 10 layers / 10 heads / head_dim=64.
+
+    ``d_ff`` was originally 4 × d_model (2560); round-3 perf work
+    (commit landing this test edit) flipped to ~8/3 × d_model rounded
+    up to a 128-multiple = 1792. The new ratio matches Llama-1/2/3
+    SwiGLU sizing and cuts ~30% of FFN compute. See
+    :data:`pawn.config.SUPERNET` for the rationale comment.
+    """
     assert SUPERNET.d_model == 640
     assert SUPERNET.n_layers == 10
     assert SUPERNET.n_heads == 10
     assert SUPERNET.head_dim == 64
-    assert SUPERNET.d_ff == 2560  # 4 × d_model
+    assert SUPERNET.d_ff == 1792  # ≈ 8/3 × d_model, rounded to 128-multiple
 
 
 def test_variants_dimensions() -> None:
