@@ -262,6 +262,8 @@ class BottleneckEffective(eqx.Module):
         attention_mask: Int[Array, "B T"] | None = None,
         *,
         compute_dtype: jnp.dtype | None = None,
+        use_sdpa: bool = False,
+        use_flash: bool = False,
     ) -> Float[Array, "B T V"]:
         adapter = self.adapter
         # Per-layer hook slices: each leaf of `hook_data` has a leading
@@ -291,6 +293,8 @@ class BottleneckEffective(eqx.Module):
             attn_hook=attn_hook if not adapter.cfg.no_adapt_attn else None,
             ffn_hook=ffn_hook if not adapter.cfg.no_adapt_ffn else None,
             hook_data=hook_data,
+            use_sdpa=use_sdpa,
+            use_flash=use_flash,
         )
 
     def forward_with_cache(

@@ -176,23 +176,16 @@ def cross_entropy_loss(
     :data:`pawn.run_config.BaseRunConfig.use_sdpa` for the operator
     surface.
     """
-    if isinstance(model, PAWNModel):
-        logits = model(
-            batch.tokens, batch.attn_mask,
-            compute_dtype=compute_dtype, use_sdpa=use_sdpa, use_flash=use_flash,
-        )
-    else:
-        # `EffectiveCallable` wrappers don't expose `use_sdpa` / `use_flash`
-        # — they call into the backbone with their own hooks and would
-        # need a wrapper-side flag to pass it through. For now the
-        # wrapper path always uses plain attention; both the SDPA win
-        # and the Pallas-flash win are mostly for inference shapes /
-        # weight-folding adapters anyway, where bottleneck-style
-        # post-sublayer adapters aren't in play (the bottleneck
-        # adapter training path stays on plain attention).
-        logits = model(
-            batch.tokens, batch.attn_mask, compute_dtype=compute_dtype,
-        )
+    # ``EffectiveCallable`` now mandates the ``use_sdpa`` / ``use_flash``
+    # kwargs (Protocol updated alongside the bottleneck wrapper's
+    # ``__call__`` signature) — both :class:`PAWNModel` and
+    # :class:`BottleneckEffective` accept the same surface, so the
+    # dispatch is uniform and bottleneck-style adapters get the
+    # Pallas-flash win too.
+    logits = model(
+        batch.tokens, batch.attn_mask,
+        compute_dtype=compute_dtype, use_sdpa=use_sdpa, use_flash=use_flash,
+    )
     # Fused logsumexp + integer-label gather. Replaces the old
     # ``log_softmax(logits) → take_along_axis(...)`` pair which
     # materialised the full ``(B, T, V)`` log-probs tensor in fp32
@@ -200,12 +193,22 @@ def cross_entropy_loss(
     # numerical stability — the explicit ``.astype(jnp.float32)`` here
     # is the one-time upcast that used to live inside
     # :meth:`PAWNModel.__call__`.
+    #
+    # ``where=loss_mask[..., None]`` tells optax/JAX to skip PAD
+    # positions in both the forward logsumexp **and** the backward
+    # pass. ``jax.nn.logsumexp`` masks the False positions out of the
+    # sum; optax then sets the per-position loss to 0 at PAD via
+    # ``jnp.where(jnp.any(where, axis), out, 0.0)``. The autograd
+    # graph through that ``jnp.where`` zeros the upstream gradient at
+    # PAD positions, so the lm_head and final-norm backward never
+    # accumulate PAD-position contributions. With ~84% PAD on random
+    # game corpora this is a sizeable bandwidth + grad-compute win.
     per_pos_loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits.astype(jnp.float32), batch.targets
-    )  # (B, T)
-    neg_lp = per_pos_loss * batch.loss_mask
+        logits.astype(jnp.float32), batch.targets,
+        where=batch.loss_mask.astype(jnp.bool_)[..., None],
+    )  # (B, T), zero at PAD positions thanks to ``where=``
     n_real = jnp.maximum(batch.loss_mask.sum(), 1)
-    return neg_lp.sum() / n_real
+    return per_pos_loss.sum() / n_real
 
 
 def supernet_joint_loss(
@@ -451,6 +454,13 @@ def make_optimizer(
         optax.adamw(
             learning_rate=lr_schedule,
             weight_decay=cfg.weight_decay,
+            # First moment (``mu``) in bf16 — saves ~half the optimizer
+            # state's HBM footprint (~70 MB at BASE / ~140 MB at LARGE)
+            # and the matching read/write bandwidth on every step. The
+            # second moment (``nu``) stays fp32 because Adam's ``rsqrt``
+            # is sensitive to denominator precision near zero. Standard
+            # practice in optax / Maxtext / Mesh-Transformer-JAX.
+            mu_dtype=jnp.bfloat16,
         ),
     )
 

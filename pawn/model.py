@@ -60,6 +60,7 @@ safetensors payload.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import Any, Final, Protocol, runtime_checkable
 
@@ -133,6 +134,8 @@ class EffectiveCallable(Protocol):
         attention_mask: Int[Array, "B T"] | None = None,
         *,
         compute_dtype: jnp.dtype | None = None,
+        use_sdpa: bool = False,
+        use_flash: bool = False,
     ) -> Float[Array, "B T V"]: ...
 
 
@@ -269,7 +272,7 @@ def _pallas_attn(
     attention_mask: Int[Array, "B T"] | None,
     inv_scale: float,
 ) -> Float[Array, "B T HD"]:
-    """Pallas flash attention with right-padded PAD handling.
+    """Pallas flash attention.
 
     ``q``/``k``/``v`` come in the ``(B, H, T, d_head)`` layout used by
     the rest of the transformer block; this helper transposes to
@@ -277,29 +280,34 @@ def _pallas_attn(
     head/dim axes on the way out so the caller can pass straight into
     the output projection.
 
-    PAD handling: ``attention_mask`` (1 for real tokens, 0 for PAD)
-    becomes ``segment_ids`` — Pallas masks attention to within-segment
-    pairs, which combined with ``causal=True`` gives "causal AND no
-    attend-to-PAD". For right-padded sequences this matches the
-    ``(B, 1, T, T)`` mask the plain path builds. ``None`` skips
-    segment masking (pure causal, the common training case where the
-    batch is fully real or right-padding is irrelevant under causal).
+    PAD handling: deliberately **not** passed to the kernel. The Rust
+    engine emits strictly right-padded sequences (PAD tokens only at
+    the tail), so causal attention already prevents real tokens from
+    attending to PAD positions — every real query at position ``p``
+    only sees positions ``[0, p]``, all of which are real. PAD queries
+    *do* attend to real keys, but their outputs are weighted to zero
+    by ``batch.loss_mask`` downstream and contribute nothing to the
+    gradient. Passing ``segment_ids`` here would force Pallas onto a
+    masked-attention codepath that does extra per-block segment-mask
+    compute every kv block for no behavioural benefit; dropping it is
+    a free ~0.5-3% win on the production-shape benches. Non-
+    right-padded callers (rare, only some future inference paths)
+    must use ``use_flash=False`` to opt into the explicit-mask plain
+    path.
     """
+    del attention_mask  # see docstring — causal+right-pad makes this redundant
     from jax.experimental.pallas.ops.gpu.attention import mha as _pl_mha
 
     q_bthd = q_bhtd.transpose(0, 2, 1, 3)
     k_bthd = k_bhtd.transpose(0, 2, 1, 3)
     v_bthd = v_bhtd.transpose(0, 2, 1, 3)
-    segment_ids = (
-        attention_mask.astype(jnp.int32) if attention_mask is not None else None
-    )
     # `mha` is a `jax.custom_vjp` wrapper, which pyright surfaces as an
     # opaque `object` — annotate so downstream `.shape` / `.reshape`
     # type-check. The runtime contract is well-defined: same dtype and
     # leading dims as the inputs, with the H/D axes preserved.
     out_bthd: jax.Array = _pl_mha(
         q_bthd, k_bthd, v_bthd,
-        segment_ids=segment_ids,
+        segment_ids=None,
         sm_scale=float(inv_scale),
         causal=True,
     )
@@ -685,6 +693,12 @@ class PAWNModel(eqx.Module):
             # einsum. XLA fuses the cast into the kernel; the master
             # weight stays fp32 in `self.layers.wq` etc., so backward
             # accumulates in fp32 via standard JAX autograd.
+            #
+            # Note: a QKV-pack variant (concat W along the out axis,
+            # one bigger matmul, jnp.split after) was tested empirically
+            # and is shape-dependent — wins ~2% at BASE B=64 but **loses
+            # ~6% at LARGE B=64** on RTX 5090. The supernet trains at
+            # LARGE shape, so the unpacked 3-matmul form ships.
             wq = layer.wq if compute_dtype is None else layer.wq.astype(compute_dtype)
             wk = layer.wk if compute_dtype is None else layer.wk.astype(compute_dtype)
             wv = layer.wv if compute_dtype is None else layer.wv.astype(compute_dtype)
@@ -746,6 +760,10 @@ class PAWNModel(eqx.Module):
 
             # ---- ffn block (pre-norm + residual) ----
             normed = _rmsnorm(h, layer.ffn_norm_w)
+            # Gate+up pack variant (concat W along out axis, one bigger
+            # matmul, jnp.split after) was tested and behaves like the
+            # QKV-pack experiment above — wins at BASE but loses at
+            # LARGE. Keeping unpacked for production parity.
             w_gate = (
                 layer.w_gate
                 if compute_dtype is None
@@ -770,14 +788,21 @@ class PAWNModel(eqx.Module):
             return h, None
 
         scan_input: Any = (self.layers, hook_data) if has_hooks else self.layers
-        # ``unroll=n_layers`` fully unrolls the layer loop at trace time.
-        # The HLO grows ~n_layers× larger, but XLA can then fuse across
-        # layer boundaries (e.g., layer-i residual add into layer-i+1
-        # RMSNorm read) — the same kind of cross-iteration fusion that
-        # torch.compile's Inductor gets from an explicit Python for-loop
-        # in the v1 model. ``cfg.n_layers`` is a Python int (static
-        # cfg), so ``unroll`` is a compile-time constant.
-        x, _ = jax.lax.scan(step, x, scan_input, unroll=self.cfg.n_layers)
+        # Unrolling the layer loop trades HLO size for cross-layer
+        # fusion (e.g., layer-i residual add into layer-i+1 RMSNorm
+        # read) — the same kind of cross-iteration fusion that
+        # `torch.compile`'s Inductor gets from an explicit Python
+        # for-loop in v1. Full ``unroll=n_layers`` is best at
+        # compile-bound shapes; partial unrolls (2 or 4) leave more
+        # opportunity for XLA to schedule activation memory tighter,
+        # which helps at high batch / long seq where activation
+        # checkpoints dominate. ``PAWN_SCAN_UNROLL`` overrides for
+        # benching; leaving it unset keeps the default (full unroll).
+        unroll_str = os.environ.get("PAWN_SCAN_UNROLL")
+        unroll = (
+            int(unroll_str) if unroll_str else self.cfg.n_layers
+        )
+        x, _ = jax.lax.scan(step, x, scan_input, unroll=unroll)
         return x
 
     # -----------------------------------------------------------------------

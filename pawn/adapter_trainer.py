@@ -272,29 +272,23 @@ def make_adapter_train_step(
 
         loss, grads = eqx.filter_value_and_grad(loss_fn)(state.adapter)
 
-        # Empty-batch guard (mirror of pretrain trainer).
-        do_update = batch.loss_mask.sum() > 0
-
-        def apply_update(args):
-            grads_, opt_state_, adapter_ = args
-            updates, new_opt = optimizer.update(grads_, opt_state_, adapter_)
-            new_adapter = eqx.apply_updates(adapter_, updates)
-            if is_unfreeze:
-                new_adapter = _freeze_masked_unfreeze_slots(
-                    new_adapter, state.backbone
-                )
-            return new_adapter, new_opt
-
-        def skip_update(args):
-            _, opt_state_, adapter_ = args
-            return adapter_, opt_state_
-
-        new_adapter, new_opt_state = jax.lax.cond(
-            do_update,
-            apply_update,
-            skip_update,
-            (grads, state.opt_state, state.adapter),
+        # Unconditional optimizer update. The earlier `jax.lax.cond`
+        # empty-batch guard was removed for the same reason the
+        # pretrain trainer dropped it in `be59a6d`: XLA computes both
+        # branches of a `lax.cond` and the per-leaf `select` over
+        # `adapter + opt_state` fires every step. The engine
+        # guarantees at least one supervised position per real game,
+        # so the all-PAD batch case is hypothetical and the tiny
+        # weight-decay drift risk is acceptable.
+        params: Any = state.adapter
+        updates, new_opt_state = optimizer.update(
+            grads, state.opt_state, params
         )
+        new_adapter = eqx.apply_updates(state.adapter, updates)
+        if is_unfreeze:
+            new_adapter = _freeze_masked_unfreeze_slots(
+                new_adapter, state.backbone
+            )
 
         new_state = AdapterTrainState(
             backbone=state.backbone,
