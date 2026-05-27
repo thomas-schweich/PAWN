@@ -218,7 +218,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--use-sdpa", action="store_true",
                     help="opt the attention block into "
                          "jax.nn.dot_product_attention (parity #43). "
-                         "Off by default — gain is hardware-dependent.")
+                         "Off by default — superseded by Pallas flash on GPU.")
+    ap.add_argument("--no-flash", action="store_true",
+                    help="disable the Pallas flash-attention kernel "
+                         "(force the plain materialised QK^T path). "
+                         "Flash is the default on GPU; CPU runs "
+                         "auto-fall-back regardless of this flag.")
     ap.add_argument("--logs-dir", type=Path, default=Path("logs"))
     ap.add_argument("--log-interval", type=int, default=None,
                     help="Steps between metrics rows; defaults to the "
@@ -245,6 +250,7 @@ def _build_config(args: argparse.Namespace) -> AdapterConfig:
     for flag, val in vars(args).items():
         if flag in (
             "config", "no_pgn", "local_checkpoints", "logs_dir", "resume",
+            "no_flash",
             *_CLI_STORE_TRUE_FLAGS,
         ):
             # `resume` is operated on directly from `args` (Path, not a
@@ -262,6 +268,11 @@ def _build_config(args: argparse.Namespace) -> AdapterConfig:
     for flag in _CLI_STORE_TRUE_FLAGS:
         if getattr(args, flag, False):
             base[flag] = True
+    if args.no_flash:
+        # `--no-flash` is the explicit opt-out; default `use_flash`
+        # is True in the run config so an absent CLI flag must not
+        # set the value either way.
+        base["use_flash"] = False
     if args.local_checkpoints:
         base["local_checkpoints"] = True
     return AdapterConfig(**base)
@@ -410,9 +421,12 @@ def main(argv: list[str] | None = None) -> int:
         "float32": None,
     }
     compute_dtype = _DTYPE_MAP[cfg.amp_dtype]
+    # Pallas flash requires the GPU backend; CPU smoke runs
+    # (`PAWN_ALLOW_CPU=1`) auto-fall-back to plain attention.
+    use_flash = cfg.use_flash and jax.default_backend() == "gpu"
     train_step = make_adapter_train_step(
         cfg.strategy, optimizer,
-        compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa,
+        compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa, use_flash=use_flash,
     )
 
     apply_fn = STRATEGIES[cfg.strategy].apply
@@ -616,7 +630,8 @@ def main(argv: list[str] | None = None) -> int:
             # opt_state shape.
             train_step = make_adapter_train_step(
                 cfg.strategy, optimizer,
-                compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa,
+                compute_dtype=compute_dtype,
+                use_sdpa=cfg.use_sdpa, use_flash=use_flash,
             )
             phase3_remaining = cfg.total_steps - warmup_n
             state, _ = _run_steps(

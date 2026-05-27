@@ -127,13 +127,23 @@ class BaseRunConfig(BaseModel):
     # fused-kernel maturity on JAX-on-ROCm; in practice the XLA impl
     # works fine for inference shapes but OOMs at training shapes on
     # RDNA 3 hardware (64 KB shared memory < the 128 KB the fused
-    # kernel requests at B≥2 T=512). Off by default to preserve the
-    # bit-stable plain-attention baseline; flip to True on hardware
-    # where SDPA actually wins (modern data-center GPUs or inference
-    # workloads at smaller B/T). See `tests/test_jax_model.py
+    # kernel requests at B≥2 T=512). Off by default — superseded by
+    # ``use_flash`` (Pallas) on GPU, which is faster than the XLA SDPA
+    # on every shape we've measured. See `tests/test_jax_model.py
     # ::test_use_sdpa_matches_plain_attention_within_fp32_noise` for
     # the correctness guard.
     use_sdpa: bool = False
+    # --- Pallas flash attention ---------------------------------------
+    # Route the attention block through
+    # `jax.experimental.pallas.ops.gpu.attention.mha` — a Triton-flavoured
+    # fused attention kernel that ships with JAX. Measured ~6× faster
+    # than the plain materialised path at BASE T=512 on RDNA3 (gfx1100)
+    # and beats the XLA SDPA path. **On by default**: training runs
+    # pick it up automatically. CPU runs (`PAWN_ALLOW_CPU=1` smoke
+    # tests) auto-fall-back to the plain path at script startup so the
+    # config default doesn't need to be flipped. `use_flash` wins over
+    # `use_sdpa` when both are set.
+    use_flash: bool = True
 
     # --- JAX-specific (new in v2) --------------------------------------
     # Which supernet config the run trains / slices from. ``"production"``

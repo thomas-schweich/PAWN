@@ -151,6 +151,7 @@ def cross_entropy_loss(
     *,
     compute_dtype: jnp.dtype | None = None,
     use_sdpa: bool = False,
+    use_flash: bool = False,
 ) -> Float[Array, ""]:
     """Masked cross-entropy on a single variant + batch.
 
@@ -178,23 +179,31 @@ def cross_entropy_loss(
     if isinstance(model, PAWNModel):
         logits = model(
             batch.tokens, batch.attn_mask,
-            compute_dtype=compute_dtype, use_sdpa=use_sdpa,
+            compute_dtype=compute_dtype, use_sdpa=use_sdpa, use_flash=use_flash,
         )
     else:
-        # `EffectiveCallable` wrappers don't expose `use_sdpa` — they
-        # call into the backbone with their own hooks and would need a
-        # wrapper-side flag to pass it through. For now the wrapper
-        # path always uses plain attention; the SDPA win is mostly for
-        # inference shapes anyway, where bottleneck adapters aren't in
-        # play (adapter training stays on the plain path).
+        # `EffectiveCallable` wrappers don't expose `use_sdpa` / `use_flash`
+        # — they call into the backbone with their own hooks and would
+        # need a wrapper-side flag to pass it through. For now the
+        # wrapper path always uses plain attention; both the SDPA win
+        # and the Pallas-flash win are mostly for inference shapes /
+        # weight-folding adapters anyway, where bottleneck-style
+        # post-sublayer adapters aren't in play (the bottleneck
+        # adapter training path stays on plain attention).
         logits = model(
             batch.tokens, batch.attn_mask, compute_dtype=compute_dtype,
         )
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-    target_lp = jnp.take_along_axis(
-        log_probs, batch.targets[..., None], axis=-1
-    ).squeeze(-1)  # (B, T)
-    neg_lp = -target_lp * batch.loss_mask
+    # Fused logsumexp + integer-label gather. Replaces the old
+    # ``log_softmax(logits) → take_along_axis(...)`` pair which
+    # materialised the full ``(B, T, V)`` log-probs tensor in fp32
+    # (~520 MB/step at BASE shape). The fused kernel runs in fp32 for
+    # numerical stability — the explicit ``.astype(jnp.float32)`` here
+    # is the one-time upcast that used to live inside
+    # :meth:`PAWNModel.__call__`.
+    per_pos_loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits.astype(jnp.float32), batch.targets
+    )  # (B, T)
+    neg_lp = per_pos_loss * batch.loss_mask
     n_real = jnp.maximum(batch.loss_mask.sum(), 1)
     return neg_lp.sum() / n_real
 
@@ -206,6 +215,7 @@ def supernet_joint_loss(
     *,
     compute_dtype: jnp.dtype | None = None,
     use_sdpa: bool = False,
+    use_flash: bool = False,
 ) -> Float[Array, ""]:
     """The supernet joint loss: **sum** per-variant cross-entropies on
     the same batch.
@@ -239,7 +249,8 @@ def supernet_joint_loss(
         else:
             sub_model = sliced(model, spec.cfg)
         total = total + cross_entropy_loss(
-            sub_model, batch, compute_dtype=compute_dtype, use_sdpa=use_sdpa,
+            sub_model, batch,
+            compute_dtype=compute_dtype, use_sdpa=use_sdpa, use_flash=use_flash,
         )
     return total
 
@@ -583,6 +594,7 @@ def make_train_step(
     *,
     compute_dtype: jnp.dtype | None = None,
     use_sdpa: bool = False,
+    use_flash: bool = False,
 ) -> Callable[[TrainState, Batch], tuple[TrainState, Float[Array, ""]]]:
     """Return a JIT-compiled single training step closing over the
     optimizer + variant list.
@@ -592,19 +604,18 @@ def make_train_step(
     scalar so the JIT trace is value-independent — same compiled
     program for step 0 and step 999.
 
-    Padded-batch weight-decay drift guard: when ``batch.loss_mask`` is
-    all-False (an empty batch), the gradient is zero everywhere and
-    the loss is 0, so the optimizer's `clip + adamw` would still apply
-    `weight_decay * model_params` to every parameter — drifting the
-    model toward zero across many padded batches.
-
-    The guard uses ``jax.lax.cond`` to select between an "apply update"
-    branch and a "skip update" branch. Under XLA both branches are
-    traced and lowered into the executable, then `select` picks the
-    correct outputs — so the cost saving is in the *output*
-    (params unchanged), not the compute. The model + opt_state remain
-    byte-identical when the batch is empty; ``state.step`` still
-    advances (wall-clock counter, decoupled from optimizer progress).
+    The optimizer update is unconditional. An earlier version wrapped
+    it in ``jax.lax.cond`` to skip the AdamW step on all-PAD batches —
+    the concern being that ``weight_decay * model_params`` would still
+    fire and drift params toward zero. In practice the cond hurt more
+    than it helped: XLA traces and computes **both** branches of a
+    ``lax.cond`` (the saving is in the selected output, not the
+    compute), so the empty-batch guard cost a ~0.5-1 ms/step ``select``
+    over every leaf of model + opt_state on every batch, including the
+    >99% of batches with no empty positions. The Rust engine guarantees
+    at least one supervised position per real game and Lichess
+    filtering rejects pathological games, so we accept the tiny drift
+    risk on the (hypothetical) all-PAD batch.
     """
 
     @eqx.filter_jit(donate="all")
@@ -614,33 +625,20 @@ def make_train_step(
         def loss_fn(model: PAWNModel) -> Float[Array, ""]:
             return supernet_joint_loss(
                 model, batch, variants,
-                compute_dtype=compute_dtype, use_sdpa=use_sdpa,
+                compute_dtype=compute_dtype,
+                use_sdpa=use_sdpa, use_flash=use_flash,
             )
 
         loss, grads = eqx.filter_value_and_grad(loss_fn)(state.model)
-
-        # Empty-batch guard: if loss_mask sums to 0, the batch supervised
-        # nothing — skip the optimizer update to avoid weight_decay
-        # drifting the params toward zero.
-        n_supervised = batch.loss_mask.sum()
-        do_update = n_supervised > 0
-
-        def apply_update(args):
-            grads_, opt_state_, model_ = args
-            updates, new_opt = optimizer.update(grads_, opt_state_, model_)
-            new_model = eqx.apply_updates(model_, updates)
-            return new_model, new_opt
-
-        def skip_update(args):
-            _, opt_state_, model_ = args
-            return model_, opt_state_
-
-        new_model, new_opt_state = jax.lax.cond(
-            do_update,
-            apply_update,
-            skip_update,
-            (grads, state.opt_state, state.model),
+        # ``optimizer.update`` expects ``params`` to be a generic PyTree
+        # — :class:`PAWNModel` is one (it's an ``eqx.Module``), but pyright
+        # narrows the field type to the concrete class. Pass through a
+        # local binding so the type widens to ``Any`` for the call.
+        params: Any = state.model
+        updates, new_opt_state = optimizer.update(
+            grads, state.opt_state, params
         )
+        new_model = eqx.apply_updates(state.model, updates)
 
         new_state = TrainState(
             model=new_model,

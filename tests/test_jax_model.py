@@ -413,6 +413,34 @@ def test_use_sdpa_matches_plain_attention_within_fp32_noise() -> None:
     assert jnp.allclose(plain, sdpa, atol=1e-3, rtol=1e-3)
 
 
+def test_use_flash_matches_plain_attention_within_fp32_noise() -> None:
+    """``use_flash=True`` routes attention through
+    :func:`jax.experimental.pallas.ops.gpu.attention.mha` — a Triton
+    fused-attention kernel. Verify the Pallas path is algebraically
+    equivalent to the plain materialised path within fp32 noise on
+    tiny-supernet random weights.
+
+    Pallas requires a GPU backend; skip on CPU. ``head_dim`` must be a
+    power of two ≥ 16 for the bundled Pallas mha, which the tiny
+    supernet (head_dim=64) satisfies.
+    """
+    import pytest
+
+    if jax.default_backend() != "gpu":
+        pytest.skip("Pallas flash attention requires a GPU backend")
+    model = init_model(TINY_SUPERNET, key=0)
+    # Use a non-zero token so the embed-lookup hits real (non-PAD) rows;
+    # an all-zero batch goes through the PAD-embed override and bypasses
+    # the attention contribution we actually want to compare.
+    tokens = jnp.arange(2 * 16, dtype=jnp.int32).reshape(2, 16) % 100
+    plain = model(tokens)
+    flash = model(tokens, use_flash=True)
+    assert plain.shape == flash.shape
+    # Tolerance: Pallas reorders the softmax/matmul reduction across
+    # tiles, so per-position diffs can run a few ulps wider than SDPA's.
+    assert jnp.allclose(plain, flash, atol=1e-3, rtol=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # KV-cached generation
 # ---------------------------------------------------------------------------

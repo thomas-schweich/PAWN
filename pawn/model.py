@@ -14,9 +14,22 @@ Architectural choices:
   layers via :func:`jax.lax.scan`, so XLA sees one layer body unrolled
   into a loop rather than N separate trace bodies — far less HLO and a
   much faster compile.
-- **Plain attention** (materialised ``QK^T``). At seq=512, attention
-  is roughly 12% of step FLOPs; plain attention sidesteps the
-  fused-kernel maturity issues we'd hit with JAX-on-ROCm.
+- **Attention paths.** Three implementations share the per-layer
+  ``_run_layers`` scan body, selected by call kwargs:
+    * ``use_flash=True`` — :func:`jax.experimental.pallas.ops.gpu.attention.mha`,
+      a Triton fused kernel. ~6× faster than the plain path at BASE
+      T=512 on RDNA3 (gfx1100) and the default for training. PAD
+      handling rides on Pallas ``segment_ids``; causal is
+      unconditional.
+    * ``use_sdpa=True`` — :func:`jax.nn.dot_product_attention` (XLA
+      impl). Legacy fast path; superseded by Pallas on GPU.
+    * Neither — plain materialised ``QK^T``. Bit-stable baseline used
+      by the legacy converter's fp32 parity test and by CPU smoke
+      runs (scripts auto-fall-back when ``jax.default_backend() !=
+      "gpu"``).
+  At seq=512, attention is roughly 12% of step FLOPs on plain — and
+  the cliff that ate v2's win against v1 PyTorch before Pallas
+  landed.
 - **RMSNorm in the v2 cast order** — compute the norm in fp32, multiply
   by the weight in fp32, downcast at the very end. The v1 PyTorch
   layout downcast *between* the norm and the weight multiply. The two
@@ -63,6 +76,15 @@ from pawn.config import (
     ModelConfig,
     validate_nested,
 )
+
+# Pallas flash attention. `jax.experimental.pallas.ops.gpu.attention.mha`
+# is the Triton-flavoured fused attention bundled with JAX; it targets
+# CUDA via Triton-CUDA and ROCm via Triton-ROCm. ~6× faster than the
+# plain materialised QK^T path at B=16 T=512 H=8 D=64 bf16 on RDNA3
+# (gfx1100). Backward is custom_vjp'd. Imported lazily inside
+# :func:`_pallas_attn` so CPU-only environments (tests, parity) can
+# still import :mod:`pawn.model` even when the Pallas GPU backend
+# isn't loadable.
 
 __all__ = [
     "PAWNModel",
@@ -240,6 +262,51 @@ def _apply_rope(
     return out.astype(orig_dtype)
 
 
+def _pallas_attn(
+    q_bhtd: Float[Array, "B H T d"],
+    k_bhtd: Float[Array, "B H T d"],
+    v_bhtd: Float[Array, "B H T d"],
+    attention_mask: Int[Array, "B T"] | None,
+    inv_scale: float,
+) -> Float[Array, "B T HD"]:
+    """Pallas flash attention with right-padded PAD handling.
+
+    ``q``/``k``/``v`` come in the ``(B, H, T, d_head)`` layout used by
+    the rest of the transformer block; this helper transposes to
+    ``(B, T, H, d_head)`` for the Pallas kernel and flattens the
+    head/dim axes on the way out so the caller can pass straight into
+    the output projection.
+
+    PAD handling: ``attention_mask`` (1 for real tokens, 0 for PAD)
+    becomes ``segment_ids`` — Pallas masks attention to within-segment
+    pairs, which combined with ``causal=True`` gives "causal AND no
+    attend-to-PAD". For right-padded sequences this matches the
+    ``(B, 1, T, T)`` mask the plain path builds. ``None`` skips
+    segment masking (pure causal, the common training case where the
+    batch is fully real or right-padding is irrelevant under causal).
+    """
+    from jax.experimental.pallas.ops.gpu.attention import mha as _pl_mha
+
+    q_bthd = q_bhtd.transpose(0, 2, 1, 3)
+    k_bthd = k_bhtd.transpose(0, 2, 1, 3)
+    v_bthd = v_bhtd.transpose(0, 2, 1, 3)
+    segment_ids = (
+        attention_mask.astype(jnp.int32) if attention_mask is not None else None
+    )
+    # `mha` is a `jax.custom_vjp` wrapper, which pyright surfaces as an
+    # opaque `object` — annotate so downstream `.shape` / `.reshape`
+    # type-check. The runtime contract is well-defined: same dtype and
+    # leading dims as the inputs, with the H/D axes preserved.
+    out_bthd: jax.Array = _pl_mha(
+        q_bthd, k_bthd, v_bthd,
+        segment_ids=segment_ids,
+        sm_scale=float(inv_scale),
+        causal=True,
+    )
+    B, T, H, D = out_bthd.shape  # noqa: N806
+    return out_bthd.reshape(B, T, H * D)
+
+
 # ---------------------------------------------------------------------------
 # Static buffers
 # ---------------------------------------------------------------------------
@@ -404,6 +471,7 @@ class PAWNModel(eqx.Module):
         | None = None,
         hook_data: Any = None,
         use_sdpa: bool = False,
+        use_flash: bool = False,
     ) -> Float[Array, "B T V"]:
         """Forward pass.
 
@@ -447,6 +515,15 @@ class PAWNModel(eqx.Module):
         established bit-stable baseline; opt in for perf-sensitive
         runs.
 
+        ``use_flash`` routes the attention block through
+        :func:`jax.experimental.pallas.ops.gpu.attention.mha` — a
+        Triton-flavoured fused attention kernel. ~6× faster than the
+        plain path at BASE T=512 on RDNA3 (gfx1100). Requires a
+        GPU backend; trainers set this from the run config after
+        resolving the backend (CPU smoke runs auto-fall-back). Wins
+        over ``use_sdpa`` when both are eligible; the XLA SDPA path on
+        ROCm is slower than plain for our shapes.
+
         Returns logits of shape ``(batch, seq, vocab_size)``. Callers
         that sample argmax over the move vocabulary should restrict to
         ``[:, :, :NUM_ACTIONS]`` so PAD and outcome tokens can't be
@@ -464,29 +541,48 @@ class PAWNModel(eqx.Module):
         # RoPE tables are recomputed per call — constant-folded by JIT
         # under a static cfg, so the cost is one trace-time build.
         rope_cos, rope_sin = _build_rope(self.cfg.head_dim, T, self.cfg.rope_base)
-        causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-        if attention_mask is None:
-            mask = causal[None, None, :, :]  # (1, 1, T, T)
+        # The materialised ``(B, 1, T, T)`` mask is only consumed by the
+        # plain and SDPA paths; the Pallas-flash path uses
+        # ``segment_ids`` derived directly from ``attention_mask`` and
+        # ignores ``mask``. Build it lazily so XLA can DCE it for free
+        # (a 16 MB bool tensor at B=64 T=512 that would otherwise be
+        # threaded through the scan as a loop-invariant capture).
+        mask: Bool[Array, "B 1 T T"] | None
+        if use_flash:
+            mask = None
         else:
-            pad = attention_mask.astype(jnp.bool_)[:, None, None, :]  # (B, 1, 1, T)
-            mask = causal[None, None, :, :] & pad
+            causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+            if attention_mask is None:
+                mask = causal[None, None, :, :]  # (1, 1, T, T)
+            else:
+                pad = attention_mask.astype(jnp.bool_)[:, None, None, :]  # (B, 1, 1, T)
+                mask = causal[None, None, :, :] & pad
         x = self._run_layers(
-            x, rope_cos, rope_sin, mask, compute_dtype,
+            x, rope_cos, rope_sin, mask, attention_mask, compute_dtype,
             attn_hook=attn_hook, ffn_hook=ffn_hook, hook_data=hook_data,
-            use_sdpa=use_sdpa,
+            use_sdpa=use_sdpa, use_flash=use_flash,
         )
         x = _rmsnorm(x, self.final_norm_w)
         # `_rmsnorm` returns in `x.dtype` (compute dtype if set). Cast
-        # `lm_head` to match and upcast logits to fp32 for downstream
-        # loss stability (the cross-entropy then keeps numerics tight
-        # regardless of forward dtype).
+        # `lm_head` to match. The trailing fp32 cast on `logits` was a
+        # ~520 MB/step HBM bandwidth tax in the bf16 training path
+        # (materialised a full ``(B, T, V)`` fp32 tensor, then
+        # ``log_softmax`` materialised another). The training loss
+        # (``pawn.trainer.cross_entropy_loss``) handles the fp32 cast
+        # inside the fused ``optax.softmax_cross_entropy_with_integer_labels``
+        # call, so we only upcast here for fp32-mode callers (legacy
+        # parity test, eval, probes) — i.e. when ``compute_dtype is
+        # None``, the einsum result is already fp32 and the cast is a
+        # no-op.
         lm_head = (
             self.lm_head.astype(compute_dtype)
             if compute_dtype is not None
             else self.lm_head
         )
         logits = jnp.einsum("btd,dv->btv", x, lm_head)
-        return logits.astype(jnp.float32)
+        if compute_dtype is None:
+            return logits.astype(jnp.float32)
+        return logits
 
     # -----------------------------------------------------------------------
     # Forward-pass internals
@@ -532,7 +628,8 @@ class PAWNModel(eqx.Module):
         x: Float[Array, "B T d"],
         rope_cos: Float[Array, "T half"],
         rope_sin: Float[Array, "T half"],
-        mask: Bool[Array, "B 1 T T"],
+        mask: Bool[Array, "B 1 T T"] | None,
+        attention_mask: Int[Array, "B T"] | None,
         compute_dtype: jnp.dtype | None = None,
         *,
         attn_hook: Callable[[Float[Array, "B T d"], Any], Float[Array, "B T d"]]
@@ -541,6 +638,7 @@ class PAWNModel(eqx.Module):
         | None = None,
         hook_data: Any = None,
         use_sdpa: bool = False,
+        use_flash: bool = False,
     ) -> Float[Array, "B T d"]:
         """Apply all ``n_layers`` transformer blocks via :func:`jax.lax.scan`.
 
@@ -599,7 +697,14 @@ class PAWNModel(eqx.Module):
             v = v.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
             q = _apply_rope(q, rope_cos, rope_sin)
             k = _apply_rope(k, rope_cos, rope_sin)
-            if use_sdpa:
+            if use_flash:
+                # Pallas Triton-flavoured fused attention; consumes the
+                # (B, H, T, D) tensors after RoPE and emits (B, T, D)
+                # ready for the output projection. PAD-masking comes
+                # from `attention_mask` via segment_ids inside
+                # `_pallas_attn`; causal is unconditional.
+                attn_out = _pallas_attn(q, k, v, attention_mask, inv_scale)
+            elif use_sdpa:
                 # `jax.nn.dot_product_attention` expects (B, T, H, D)
                 # layout, not the (B, H, T, D) we computed above. The
                 # transpose is free under XLA fusion. SDPA's `mask`
@@ -622,7 +727,10 @@ class PAWNModel(eqx.Module):
                 # Attention scores: matmul in compute dtype, then upcast to
                 # fp32 for the softmax (the fp32 score tensor is the
                 # numerically-sensitive intermediate). Downcast attn weights
-                # back to compute dtype for the value matmul.
+                # back to compute dtype for the value matmul. ``mask`` is
+                # only ``None`` on the ``use_flash`` path (handled above) —
+                # narrow it for pyright.
+                assert mask is not None
                 scores = jnp.einsum("bhid,bhjd->bhij", q, k) * inv_scale
                 scores_f32 = scores.astype(jnp.float32)
                 mask_neg_inf = jnp.finfo(jnp.float32).min
@@ -662,7 +770,14 @@ class PAWNModel(eqx.Module):
             return h, None
 
         scan_input: Any = (self.layers, hook_data) if has_hooks else self.layers
-        x, _ = jax.lax.scan(step, x, scan_input)
+        # ``unroll=n_layers`` fully unrolls the layer loop at trace time.
+        # The HLO grows ~n_layers× larger, but XLA can then fuse across
+        # layer boundaries (e.g., layer-i residual add into layer-i+1
+        # RMSNorm read) — the same kind of cross-iteration fusion that
+        # torch.compile's Inductor gets from an explicit Python for-loop
+        # in the v1 model. ``cfg.n_layers`` is a Python int (static
+        # cfg), so ``unroll`` is a compile-time constant.
+        x, _ = jax.lax.scan(step, x, scan_input, unroll=self.cfg.n_layers)
         return x
 
     # -----------------------------------------------------------------------

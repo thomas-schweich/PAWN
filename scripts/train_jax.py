@@ -70,7 +70,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--use-sdpa", action="store_true",
                     help="opt the attention block into "
                          "jax.nn.dot_product_attention (parity #43). "
-                         "Off by default — gain is hardware-dependent.")
+                         "Off by default — superseded by --use-flash on GPU.")
+    ap.add_argument("--no-flash", action="store_true",
+                    help="disable the Pallas flash-attention kernel "
+                         "(force the plain materialised QK^T path). "
+                         "Flash is the default on GPU; CPU runs "
+                         "auto-fall-back regardless of this flag.")
     return ap.parse_args(argv)
 
 
@@ -103,6 +108,8 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
     # `local_checkpoints` handling below.
     if args.use_sdpa:
         base["use_sdpa"] = True
+    if args.no_flash:
+        base["use_flash"] = False
     if args.wandb:
         base["wandb"] = True
     if args.local_checkpoints:
@@ -196,8 +203,13 @@ def main(argv: list[str] | None = None) -> int:
         "float32": None,
     }
     compute_dtype = _DTYPE_MAP[cfg.amp_dtype]
+    # Pallas flash requires the GPU backend; CPU smoke runs
+    # (`PAWN_ALLOW_CPU=1`) auto-fall-back to the plain path regardless
+    # of `cfg.use_flash`.
+    use_flash = cfg.use_flash and jax.default_backend() == "gpu"
     train_step = make_train_step(
-        optimizer, variants, compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa,
+        optimizer, variants,
+        compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa, use_flash=use_flash,
     )
     logger = MetricsLogger(
         log_dir=args.logs_dir, run_prefix="pretrain", device=_resolve_device()
