@@ -207,6 +207,15 @@ def autoregressive_generate(
     if max_seq_len is None:
         max_seq_len = model.cfg.max_seq_len
 
+    # Cache dtype default: track ``compute_dtype`` rather than forcing
+    # fp32. Production decode at ``n_per_outcome=1000`` is memory-
+    # bound on the KV cache (~2.6 GB / game-batch at fp32, ~1.3 GB at
+    # bf16), so the default fp32 was leaving 1.3 GB of headroom on the
+    # table for callers running a bf16 forward. The user can still
+    # force fp32 (or any other dtype) explicitly; only the default
+    # tracks compute_dtype. Round-3 perf review (Opus conv).
+    if cache_dtype is None:
+        cache_dtype = compute_dtype  # may still be None → fp32 inside init_kv_cache
     # Cache dtype / compute dtype pairing: reject any configuration
     # that would silently mis-precision cache writes. A bf16 / fp16
     # cache requires the forward to run in *exactly the same* dtype so

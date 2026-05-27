@@ -182,10 +182,11 @@ def cross_entropy_loss(
     # :class:`BottleneckEffective` accept the same surface, so the
     # dispatch is uniform and bottleneck-style adapters get the
     # Pallas-flash win too.
-    logits = model(
-        batch.tokens, batch.attn_mask,
-        compute_dtype=compute_dtype, use_sdpa=use_sdpa, use_flash=use_flash,
-    )
+    with jax.named_scope("forward"):
+        logits = model(
+            batch.tokens, batch.attn_mask,
+            compute_dtype=compute_dtype, use_sdpa=use_sdpa, use_flash=use_flash,
+        )
     # Fused logsumexp + integer-label gather. Replaces the old
     # ``log_softmax(logits) → take_along_axis(...)`` pair which
     # materialised the full ``(B, T, V)`` log-probs tensor in fp32
@@ -194,21 +195,30 @@ def cross_entropy_loss(
     # is the one-time upcast that used to live inside
     # :meth:`PAWNModel.__call__`.
     #
-    # ``where=loss_mask[..., None]`` tells optax/JAX to skip PAD
-    # positions in both the forward logsumexp **and** the backward
-    # pass. ``jax.nn.logsumexp`` masks the False positions out of the
-    # sum; optax then sets the per-position loss to 0 at PAD via
-    # ``jnp.where(jnp.any(where, axis), out, 0.0)``. The autograd
-    # graph through that ``jnp.where`` zeros the upstream gradient at
-    # PAD positions, so the lm_head and final-norm backward never
-    # accumulate PAD-position contributions. With ~84% PAD on random
-    # game corpora this is a sizeable bandwidth + grad-compute win.
-    per_pos_loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits.astype(jnp.float32), batch.targets,
-        where=batch.loss_mask.astype(jnp.bool_)[..., None],
-    )  # (B, T), zero at PAD positions thanks to ``where=``
-    n_real = jnp.maximum(batch.loss_mask.sum(), 1)
-    return per_pos_loss.sum() / n_real
+    # ``where=loss_mask[..., None]`` is the **backward-only** PAD
+    # optimisation, not a forward bandwidth saving. Reading optax
+    # source: the ``where=`` path inside
+    # ``optax.softmax_cross_entropy_with_integer_labels`` calls
+    # ``jax.nn.logsumexp(logits, axis=-1, where=where)``, whose
+    # implementation does ``a = jnp.where(where, a, 0)`` and then
+    # reduces — i.e. it materialises *another* full ``(B, T, V)``
+    # fp32 copy. The actual saving comes from optax's outer
+    # ``jnp.where(jnp.any(where, axis), out, 0.0)`` (loss is forced
+    # to 0 at PAD positions): the autograd graph through that
+    # ``jnp.where`` zeros the upstream gradient at PAD positions,
+    # so the lm_head, final-norm, and pre-norm backward never
+    # accumulate PAD-position contributions. Measured supervision
+    # density on bench data is 71% (mean game length ~364 plies of
+    # 512), so we skip ~29% of the loss-side backward compute. Round-3
+    # review (Opus conv) caught the previous comment overstating the
+    # forward saving here.
+    with jax.named_scope("cross_entropy"):
+        per_pos_loss = optax.softmax_cross_entropy_with_integer_labels(
+            logits.astype(jnp.float32), batch.targets,
+            where=batch.loss_mask.astype(jnp.bool_)[..., None],
+        )  # (B, T), zero at PAD positions thanks to ``where=``
+        n_real = jnp.maximum(batch.loss_mask.sum(), 1)
+        return per_pos_loss.sum() / n_real
 
 
 def supernet_joint_loss(
@@ -436,21 +446,65 @@ def make_lr_schedule(
 # ---------------------------------------------------------------------------
 
 
+def _branchless_clip_by_global_norm(max_norm: float) -> optax.GradientTransformation:
+    """Branchless replacement for :func:`optax.clip_by_global_norm`.
+
+    Optax's stock implementation
+    (``optax/transforms/_clipping.py:94``) is:
+
+    .. code-block:: python
+
+        trigger = g_norm < max_norm
+        clip_fn = lambda t: jax.lax.select(trigger, t, (t / g_norm) * max_norm)
+        updates = jax.tree.map(clip_fn, updates)
+
+    ``jax.lax.select`` always evaluates both branches, so the divide-
+    and-scale path runs for every parameter leaf on every step, even
+    when the gradient norm is already below the clip threshold. The
+    optax source has a TODO acknowledging this. The branchless form
+    is mathematically equivalent:
+
+        g_norm = max(g_norm, max_norm)
+        updates = updates / g_norm * max_norm
+
+    When ``g_norm <= max_norm`` the ``max`` selects ``max_norm`` and
+    the rescale is a no-op (multiply-then-divide by the same scalar).
+    When ``g_norm > max_norm`` the ``max`` selects ``g_norm`` and the
+    rescale is the usual clip. One pass over ``updates`` instead of
+    two, no ``select`` materialisation. ~0.2-0.3 ms saved per step at
+    LARGE shape. Round-3 review surfaced this (Opus conv).
+    """
+
+    def init_fn(params):
+        del params
+        return optax.EmptyState()
+
+    def update_fn(updates, state, params=None):
+        del params
+        g_norm = optax.tree.norm(updates)
+        scale = max_norm / jnp.maximum(g_norm, max_norm)
+        clipped = jax.tree_util.tree_map(lambda t: t * scale.astype(t.dtype), updates)
+        return clipped, state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 def make_optimizer(
     cfg: BaseRunConfig,
     lr_schedule: optax.Schedule,
 ) -> optax.GradientTransformation:
-    """Build the v2 optimizer: gradient clip + AdamW.
+    """Build the v2 optimizer: branchless gradient clip + AdamW.
 
-    ``optax.chain(clip_by_global_norm(1.0), adamw(lr_schedule, weight_decay))``
-    is the plan-pinned shape. Weight-decay is applied through Optax's
-    AdamW (decoupled, scaled by lr). The padded-batch weight-decay
-    drift guard isn't here at the optimizer level — it lives in
-    :func:`make_train_step` where we can see whether the batch was
-    empty.
+    Uses the local :func:`_branchless_clip_by_global_norm` instead of
+    ``optax.clip_by_global_norm`` to avoid the latter's
+    ``lax.select``-materialises-both-branches overhead. Weight-decay
+    is applied through Optax's AdamW (decoupled, scaled by lr). The
+    padded-batch weight-decay drift guard isn't here at the optimizer
+    level — it lives in :func:`make_train_step` where we can see
+    whether the batch was empty.
     """
     return optax.chain(
-        optax.clip_by_global_norm(_CLIP_NORM),
+        _branchless_clip_by_global_norm(_CLIP_NORM),
         optax.adamw(
             learning_rate=lr_schedule,
             weight_decay=cfg.weight_decay,

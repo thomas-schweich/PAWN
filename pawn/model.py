@@ -246,23 +246,36 @@ def _apply_rope(
     """Apply RoPE to Q or K.
 
     Split the last axis (``head_dim``) into adjacent ``(even, odd)``
-    pairs and rotate each pair by the angle ``freqs[t, i]``. Compute in
-    fp32 then downcast to the input dtype.
+    pairs and rotate each pair by the angle ``freqs[t, i]``. Computes
+    in the input dtype — the rope tables (which are built in fp32)
+    are downcast to ``x.dtype`` at function entry. Earlier versions
+    upcast ``x`` to fp32, did the rotation in fp32, then downcast at
+    the end; the explicit upcast cost a full ``(B, H, T, d_head)``
+    fp32 materialisation per Q + K call (×n_layers in the scan).
+    Standard Llama-1/2/3 reference implementations apply RoPE in
+    compute-dtype directly — the rotation is a unit-norm operation so
+    the only precision concern is per-element accumulation, which at
+    ``T<=512`` is well below bf16's noise floor.
 
     ``rope_cos`` / ``rope_sin`` must have the same ``T`` as ``x`` —
     callers that need a positional offset (KV-cached decode) should
     slice the full ``max_seq_len`` tables down to the active window
     before calling. See :meth:`PAWNModel.forward_with_cache`.
+
+    fp32-mode callers (the legacy converter's parity test, eval, the
+    KV-cached generation path when ``compute_dtype`` is ``None``)
+    still pay no precision cost — ``x.dtype`` is fp32 there, so the
+    cast on the rope tables is a no-op and the rotation stays fp32
+    end-to-end.
     """
-    orig_dtype = x.dtype
-    x_f = x.astype(jnp.float32)
-    pairs = x_f.reshape(*x_f.shape[:-1], -1, 2)
+    cos = rope_cos.astype(x.dtype)
+    sin = rope_sin.astype(x.dtype)
+    pairs = x.reshape(*x.shape[:-1], -1, 2)
     x0 = pairs[..., 0]
     x1 = pairs[..., 1]
-    out0 = x0 * rope_cos - x1 * rope_sin
-    out1 = x0 * rope_sin + x1 * rope_cos
-    out = jnp.stack([out0, out1], axis=-1).reshape(x_f.shape)
-    return out.astype(orig_dtype)
+    out0 = x0 * cos - x1 * sin
+    out1 = x0 * sin + x1 * cos
+    return jnp.stack([out0, out1], axis=-1).reshape(x.shape)
 
 
 def _pallas_attn(
@@ -543,9 +556,10 @@ class PAWNModel(eqx.Module):
                 f"sequence length {T} exceeds cfg.max_seq_len "
                 f"{self.cfg.max_seq_len}"
             )
-        x = self._embed(input_ids)
-        if compute_dtype is not None:
-            x = x.astype(compute_dtype)
+        with jax.named_scope("embed"):
+            x = self._embed(input_ids)
+            if compute_dtype is not None:
+                x = x.astype(compute_dtype)
         # RoPE tables are recomputed per call — constant-folded by JIT
         # under a static cfg, so the cost is one trace-time build.
         rope_cos, rope_sin = _build_rope(self.cfg.head_dim, T, self.cfg.rope_base)
@@ -565,12 +579,14 @@ class PAWNModel(eqx.Module):
             else:
                 pad = attention_mask.astype(jnp.bool_)[:, None, None, :]  # (B, 1, 1, T)
                 mask = causal[None, None, :, :] & pad
-        x = self._run_layers(
-            x, rope_cos, rope_sin, mask, attention_mask, compute_dtype,
-            attn_hook=attn_hook, ffn_hook=ffn_hook, hook_data=hook_data,
-            use_sdpa=use_sdpa, use_flash=use_flash,
-        )
-        x = _rmsnorm(x, self.final_norm_w)
+        with jax.named_scope("transformer_layers"):
+            x = self._run_layers(
+                x, rope_cos, rope_sin, mask, attention_mask, compute_dtype,
+                attn_hook=attn_hook, ffn_hook=ffn_hook, hook_data=hook_data,
+                use_sdpa=use_sdpa, use_flash=use_flash,
+            )
+        with jax.named_scope("final_norm"):
+            x = _rmsnorm(x, self.final_norm_w)
         # `_rmsnorm` returns in `x.dtype` (compute dtype if set). Cast
         # `lm_head` to match. The trailing fp32 cast on `logits` was a
         # ~520 MB/step HBM bandwidth tax in the bf16 training path
@@ -587,7 +603,8 @@ class PAWNModel(eqx.Module):
             if compute_dtype is not None
             else self.lm_head
         )
-        logits = jnp.einsum("btd,dv->btv", x, lm_head)
+        with jax.named_scope("lm_head"):
+            logits = jnp.einsum("btd,dv->btv", x, lm_head)
         if compute_dtype is None:
             return logits.astype(jnp.float32)
         return logits
@@ -687,7 +704,8 @@ class PAWNModel(eqx.Module):
             # ---- attention block (pre-norm + residual) ----
             # `_rmsnorm` upcasts to fp32 internally and downcasts to
             # `h.dtype` — so `normed` is the compute dtype when AMP is on.
-            normed = _rmsnorm(h, layer.attn_norm_w)
+            with jax.named_scope("attn_norm"):
+                normed = _rmsnorm(h, layer.attn_norm_w)
             B, T, D = normed.shape  # noqa: N806
             # Cast Q/K/V/O weights to compute_dtype just before each
             # einsum. XLA fuses the cast into the kernel; the master
@@ -703,21 +721,24 @@ class PAWNModel(eqx.Module):
             wk = layer.wk if compute_dtype is None else layer.wk.astype(compute_dtype)
             wv = layer.wv if compute_dtype is None else layer.wv.astype(compute_dtype)
             wo = layer.wo if compute_dtype is None else layer.wo.astype(compute_dtype)
-            q = jnp.einsum("btd,de->bte", normed, wq)
-            k = jnp.einsum("btd,de->bte", normed, wk)
-            v = jnp.einsum("btd,de->bte", normed, wv)
-            q = q.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
-            k = k.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
-            v = v.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
-            q = _apply_rope(q, rope_cos, rope_sin)
-            k = _apply_rope(k, rope_cos, rope_sin)
+            with jax.named_scope("qkv_proj"):
+                q = jnp.einsum("btd,de->bte", normed, wq)
+                k = jnp.einsum("btd,de->bte", normed, wk)
+                v = jnp.einsum("btd,de->bte", normed, wv)
+                q = q.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+                k = k.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+                v = v.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+            with jax.named_scope("rope"):
+                q = _apply_rope(q, rope_cos, rope_sin)
+                k = _apply_rope(k, rope_cos, rope_sin)
             if use_flash:
                 # Pallas Triton-flavoured fused attention; consumes the
                 # (B, H, T, D) tensors after RoPE and emits (B, T, D)
                 # ready for the output projection. PAD-masking comes
                 # from `attention_mask` via segment_ids inside
                 # `_pallas_attn`; causal is unconditional.
-                attn_out = _pallas_attn(q, k, v, attention_mask, inv_scale)
+                with jax.named_scope("attn_pallas"):
+                    attn_out = _pallas_attn(q, k, v, attention_mask, inv_scale)
             elif use_sdpa:
                 # `jax.nn.dot_product_attention` expects (B, T, H, D)
                 # layout, not the (B, H, T, D) we computed above. The
@@ -754,12 +775,14 @@ class PAWNModel(eqx.Module):
                     attn = attn.astype(compute_dtype)
                 attn_out = jnp.einsum("bhij,bhjd->bhid", attn, v)
                 attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, D)
-            h = h + jnp.einsum("btd,de->bte", attn_out, wo)
+            with jax.named_scope("attn_out_proj"):
+                h = h + jnp.einsum("btd,de->bte", attn_out, wo)
             if attn_hook is not None:
                 h = attn_hook(h, hook_slice)
 
             # ---- ffn block (pre-norm + residual) ----
-            normed = _rmsnorm(h, layer.ffn_norm_w)
+            with jax.named_scope("ffn_norm"):
+                normed = _rmsnorm(h, layer.ffn_norm_w)
             # Gate+up pack variant (concat W along out axis, one bigger
             # matmul, jnp.split after) was tested and behaves like the
             # QKV-pack experiment above — wins at BASE but loses at
@@ -779,9 +802,11 @@ class PAWNModel(eqx.Module):
                 if compute_dtype is None
                 else layer.w_down.astype(compute_dtype)
             )
-            gate = jnp.einsum("btd,df->btf", normed, w_gate)
-            up = jnp.einsum("btd,df->btf", normed, w_up)
-            ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, w_down)
+            with jax.named_scope("ffn_gate_up"):
+                gate = jnp.einsum("btd,df->btf", normed, w_gate)
+                up = jnp.einsum("btd,df->btf", normed, w_up)
+            with jax.named_scope("ffn_down"):
+                ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, w_down)
             h = h + ffn_out
             if ffn_hook is not None:
                 h = ffn_hook(h, hook_slice)

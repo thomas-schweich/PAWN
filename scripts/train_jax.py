@@ -27,6 +27,7 @@ import numpy as np
 from pawn.checkpoint import save_model
 from pawn.config import SUPERNET, TINY_SUPERNET, VARIANTS, TINY_VARIANTS
 from pawn.corpus import generate_corpus
+from pawn.jax_setup import setup_jax_caching
 from pawn.lifecycle import (
     HFPushTracker,
     drain_push_queue,
@@ -160,6 +161,9 @@ def main(argv: list[str] | None = None) -> int:
     # missing — no per-field runtime check needed here.
     cfg = _build_config(args)
     _require_accelerator()
+    cache_path = setup_jax_caching()
+    if cache_path is not None:
+        print(f"JAX compilation cache: {cache_path}")
 
     # Pick supernet shape.
     supernet_cfg = TINY_SUPERNET if cfg.supernet == "tiny" else SUPERNET

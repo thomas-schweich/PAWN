@@ -41,6 +41,7 @@ from pawn.adapters import (
 from pawn.checkpoint import save_model
 from pawn.config import SUPERNET, TINY_SUPERNET, VARIANTS, TINY_VARIANTS
 from pawn.corpus import generate_corpus
+from pawn.jax_setup import setup_jax_caching
 from pawn.legacy import convert_legacy_checkpoint
 from pawn.lichess_data import load_lichess_corpus
 from pawn.lifecycle import (
@@ -285,6 +286,9 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --total-steps is required", file=sys.stderr)
         return 2
     _require_accelerator()
+    cache_path = setup_jax_caching()
+    if cache_path is not None:
+        print(f"JAX compilation cache: {cache_path}")
     if cfg.strategy not in STRATEGIES:
         print(f"error: unknown strategy {cfg.strategy!r}", file=sys.stderr)
         return 2
