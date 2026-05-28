@@ -66,12 +66,16 @@ jobs:
 
       - name: Install Python deps
         run: |
-          # --extra lab/wandb: pawn/lab/server.py and pawn/wandb_utils.py
-          # import fastmcp / wandb (lazily). They're in pyright's include
-          # scope (not excluded) with reportMissingImports="error", so the
-          # extras must be present or the Pyright step fails — matching how
-          # pyright is run locally.
-          uv sync --extra lab --extra wandb
+          # Non-GPU extras needed by the type-check + test steps:
+          #   lab      → fastmcp        (pawn/lab/server.py, pyright include scope)
+          #   wandb    → wandb          (pawn/wandb_utils.py, pyright include scope)
+          #   dashboard→ plotly/pandas  (pawn/dashboard, imported by tests/lab/
+          #              test_dashboard_charts.py)
+          # Without these, Pyright (reportMissingImports="error") and the
+          # dashboard tests fail in CI though they pass locally where the
+          # extras are present. GPU extras (rocm/cu128) are intentionally
+          # omitted — they conflict and CI is CPU-only (torch cpu below).
+          uv sync --extra lab --extra wandb --extra dashboard
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Pyright
