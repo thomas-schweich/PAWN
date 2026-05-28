@@ -1,0 +1,314 @@
+{
+  "git_sha": "no-git",
+  "timestamp_utc": "20260528T205635Z",
+  "label": "5090-44c49a7-matrix",
+  "jax_version": "0.10.0",
+  "jax_backend": "gpu",
+  "device": "cuda:0",
+  "hostname": "c547d76962e4",
+  "platform": "Linux-6.8.0-107-generic-x86_64-with-glibc2.41",
+  "python": "3.12.13",
+  "k": 50,
+  "warmup_outers": 2,
+  "timed_outers": 30,
+  "compute_dtype": "bfloat16",
+  "use_flash": true,
+  "results": [
+    {
+      "name": "BASE-B64-1v",
+      "shape": {
+        "name": "BASE-B64-1v",
+        "supernet": "production",
+        "variant": "base",
+        "batch_size": 64,
+        "seq_len": 512,
+        "n_variants_mode": "1v"
+      },
+      "n_variants_evaluated": 1,
+      "stochastic_variants": false,
+      "ms_per_inner_step_median": 77.23963210824877,
+      "ms_per_inner_step_p95": 77.3080969946459,
+      "ms_per_inner_step_mean": 77.16388503741473,
+      "ms_per_inner_step_stdev": 0.19030476513477365,
+      "samples_per_second": 828.5901713035885,
+      "peak_memory_mb": 7713.051025390625,
+      "k": 50,
+      "warmup_outers": 2,
+      "timed_outers": 30
+    },
+    {
+      "name": "BASE-B64-3v-det",
+      "shape": {
+        "name": "BASE-B64-3v-det",
+        "supernet": "production",
+        "variant": "base",
+        "batch_size": 64,
+        "seq_len": 512,
+        "n_variants_mode": "3v-det"
+      },
+      "n_variants_evaluated": 3,
+      "stochastic_variants": false,
+      "ms_per_inner_step_median": 148.96482529584318,
+      "ms_per_inner_step_p95": 149.19963811337948,
+      "ms_per_inner_step_mean": 148.79399615215758,
+      "ms_per_inner_step_stdev": 0.5737478903313228,
+      "samples_per_second": 429.6316252705725,
+      "peak_memory_mb": 16518.650390625,
+      "k": 50,
+      "warmup_outers": 2,
+      "timed_outers": 30
+    },
+    {
+      "name": "BASE-B64-3v-stoch",
+      "shape": {
+        "name": "BASE-B64-3v-stoch",
+        "supernet": "production",
+        "variant": "base",
+        "batch_size": 64,
+        "seq_len": 512,
+        "n_variants_mode": "3v-stoch"
+      },
+      "n_variants_evaluated": 2,
+      "stochastic_variants": true,
+      "ms_per_inner_step_median": 138.7752021290362,
+      "ms_per_inner_step_p95": 140.51878115022555,
+      "ms_per_inner_step_mean": 138.13999889728925,
+      "ms_per_inner_step_stdev": 2.270405958150199,
+      "samples_per_second": 461.17749438038226,
+      "peak_memory_mb": 20297.90185546875,
+      "k": 50,
+      "warmup_outers": 2,
+      "timed_outers": 30
+    },
+    {
+      "name": "BASE-B128-1v",
+      "shape": {
+        "name": "BASE-B128-1v",
+        "supernet": "production",
+        "variant": "base",
+        "batch_size": 128,
+        "seq_len": 512,
+        "n_variants_mode": "1v"
+      },
+      "n_variants_evaluated": 1,
+      "stochastic_variants": false,
+      "ms_per_inner_step_median": 163.7284598313272,
+      "ms_per_inner_step_p95": 164.12200619839132,
+      "ms_per_inner_step_mean": 163.75228061154485,
+      "ms_per_inner_step_stdev": 0.24320748736111747,
+      "samples_per_second": 781.7822273040704,
+      "peak_memory_mb": 20297.90185546875,
+      "k": 50,
+      "warmup_outers": 2,
+      "timed_outers": 30
+    },
+    {
+      "name": "BASE-B128-3v-det",
+      "shape": {
+        "name": "BASE-B128-3v-det",
+        "supernet": "production",
+        "variant": "base",
+        "batch_size": 128,
+        "seq_len": 512,
+        "n_variants_mode": "3v-det"
+      },
+      "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 30.44GiB."
+    },
+    {
+      "name": "BASE-B128-3v-stoch",
+      "shape": {
+        "name": "BASE-B128-3v-stoch",
+        "supernet": "production",
+        "variant": "base",
+        "batch_size": 128,
+        "seq_len": 512,
+        "n_variants_mode": "3v-stoch"
+      },
+      "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 37.17GiB."
+    },
+    {
+      "name": "BASE-B256-1v",
+      "shape": {
+        "name": "BASE-B256-1v",
+        "supernet": "production",
+        "variant": "base",
+        "batch_size": 256,
+        "seq_len": 512,
+        "n_variants_mode": "1v"
+      },
+      "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 27.23GiB."
+    },
+    {
+      "name": "BASE-B256-3v-det",
+      "shape": {
+        "name": "BASE-B256-3v-det",
+        "supernet": "production",
+        "variant": "base",
+        "batch_size": 256,
+        "seq_len": 512,
+        "n_variants_mode": "3v-det"
+      },
+      "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 61.84GiB."
+    },
+    {
+      "name": "BASE-B256-3v-stoch",
+      "shape": {
+        "name": "BASE-B256-3v-stoch",
+        "supernet": "production",
+        "variant": "base",
+        "batch_size": 256,
+        "seq_len": 512,
+        "n_variants_mode": "3v-stoch"
+      },
+      "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 74.03GiB."
+    },
+    {
+      "name": "LARGE-B64-1v",
+      "shape": {
+        "name": "LARGE-B64-1v",
+        "supernet": "production",
+        "variant": "large",
+        "batch_size": 64,
+        "seq_len": 512,
+        "n_variants_mode": "1v"
+      },
+      "n_variants_evaluated": 1,
+      "stochastic_variants": false,
+      "ms_per_inner_step_median": 76.83297068346292,
+      "ms_per_inner_step_p95": 77.22276437701657,
+      "ms_per_inner_step_mean": 76.59724648389965,
+      "ms_per_inner_step_stdev": 0.6609102526654945,
+      "samples_per_second": 832.975732041752,
+      "peak_memory_mb": 20297.90185546875,
+      "k": 50,
+      "warmup_outers": 2,
+      "timed_outers": 30
+    },
+    {
+      "name": "LARGE-B64-3v-det",
+      "shape": {
+        "name": "LARGE-B64-3v-det",
+        "supernet": "production",
+        "variant": "large",
+        "batch_size": 64,
+        "seq_len": 512,
+        "n_variants_mode": "3v-det"
+      },
+      "n_variants_evaluated": 3,
+      "stochastic_variants": false,
+      "ms_per_inner_step_median": 148.97357125766575,
+      "ms_per_inner_step_p95": 149.27136957691982,
+      "ms_per_inner_step_mean": 148.98287299027047,
+      "ms_per_inner_step_stdev": 0.18087468864246364,
+      "samples_per_second": 429.6064023953963,
+      "peak_memory_mb": 20297.90185546875,
+      "k": 50,
+      "warmup_outers": 2,
+      "timed_outers": 30
+    },
+    {
+      "name": "LARGE-B64-3v-stoch",
+      "shape": {
+        "name": "LARGE-B64-3v-stoch",
+        "supernet": "production",
+        "variant": "large",
+        "batch_size": 64,
+        "seq_len": 512,
+        "n_variants_mode": "3v-stoch"
+      },
+      "n_variants_evaluated": 2,
+      "stochastic_variants": true,
+      "ms_per_inner_step_median": 138.73451754450798,
+      "ms_per_inner_step_p95": 140.8104266463779,
+      "ms_per_inner_step_mean": 138.06657829446098,
+      "ms_per_inner_step_stdev": 2.2837173727187223,
+      "samples_per_second": 461.3127369651745,
+      "peak_memory_mb": 20297.90185546875,
+      "k": 50,
+      "warmup_outers": 2,
+      "timed_outers": 30
+    },
+    {
+      "name": "LARGE-B128-1v",
+      "shape": {
+        "name": "LARGE-B128-1v",
+        "supernet": "production",
+        "variant": "large",
+        "batch_size": 128,
+        "seq_len": 512,
+        "n_variants_mode": "1v"
+      },
+      "n_variants_evaluated": 1,
+      "stochastic_variants": false,
+      "ms_per_inner_step_median": 163.96027103997767,
+      "ms_per_inner_step_p95": 164.10120157524943,
+      "ms_per_inner_step_mean": 163.96508140303195,
+      "ms_per_inner_step_stdev": 0.08293549965418663,
+      "samples_per_second": 780.6769236725057,
+      "peak_memory_mb": 20297.90185546875,
+      "k": 50,
+      "warmup_outers": 2,
+      "timed_outers": 30
+    },
+    {
+      "name": "LARGE-B128-3v-det",
+      "shape": {
+        "name": "LARGE-B128-3v-det",
+        "supernet": "production",
+        "variant": "large",
+        "batch_size": 128,
+        "seq_len": 512,
+        "n_variants_mode": "3v-det"
+      },
+      "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 30.44GiB."
+    },
+    {
+      "name": "LARGE-B128-3v-stoch",
+      "shape": {
+        "name": "LARGE-B128-3v-stoch",
+        "supernet": "production",
+        "variant": "large",
+        "batch_size": 128,
+        "seq_len": 512,
+        "n_variants_mode": "3v-stoch"
+      },
+      "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 37.17GiB."
+    },
+    {
+      "name": "LARGE-B256-1v",
+      "shape": {
+        "name": "LARGE-B256-1v",
+        "supernet": "production",
+        "variant": "large",
+        "batch_size": 256,
+        "seq_len": 512,
+        "n_variants_mode": "1v"
+      },
+      "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 27.23GiB."
+    },
+    {
+      "name": "LARGE-B256-3v-det",
+      "shape": {
+        "name": "LARGE-B256-3v-det",
+        "supernet": "production",
+        "variant": "large",
+        "batch_size": 256,
+        "seq_len": 512,
+        "n_variants_mode": "3v-det"
+      },
+      "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 61.84GiB."
+    },
+    {
+      "name": "LARGE-B256-3v-stoch",
+      "shape": {
+        "name": "LARGE-B256-3v-stoch",
+        "supernet": "production",
+        "variant": "large",
+        "batch_size": 256,
+        "seq_len": 512,
+        "n_variants_mode": "3v-stoch"
+      },
+      "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 74.03GiB."
+    }
+  ]
+}

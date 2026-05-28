@@ -84,3 +84,7 @@ runs/
 # artifacts (they're large + per-pod ephemeral; commit them only when
 # they anchor a specific perf claim in a PR).
 bench/results/*.json
+
+# Bench-run training checkpoints (throwaway random-game; keep metrics.jsonl + result JSON)
+bench/results/**/step_*/
+bench/results/**/*.safetensors

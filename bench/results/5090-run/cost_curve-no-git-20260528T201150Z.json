@@ -1,0 +1,44 @@
+{
+  "git_sha": "no-git",
+  "timestamp_utc": "20260528T201150Z",
+  "label": "5090-44c49a7-1v",
+  "supernet": "production",
+  "batch_size": 64,
+  "k": 50,
+  "n_variants_mode": "1v",
+  "device": "cuda:0",
+  "fit_coefficients": {
+    "a": 0.1342371879301584,
+    "b": 2.9720835829405708e-05
+  },
+  "results": [
+    {
+      "seq_len": 128,
+      "ms_per_inner_step_median": 17.892345278523862,
+      "ms_per_inner_step_p95": 17.94995351182297,
+      "ms_per_inner_step_mean": 17.894677557982504,
+      "samples_per_second": 3576.948633828291
+    },
+    {
+      "seq_len": 256,
+      "ms_per_inner_step_median": 36.20222252327949,
+      "ms_per_inner_step_p95": 36.35274825571105,
+      "ms_per_inner_step_mean": 36.18527099210769,
+      "samples_per_second": 1767.847262936562
+    },
+    {
+      "seq_len": 384,
+      "ms_per_inner_step_median": 55.85359972901642,
+      "ms_per_inner_step_p95": 56.18238807935268,
+      "ms_per_inner_step_mean": 55.84911393839866,
+      "samples_per_second": 1145.8527348372759
+    },
+    {
+      "seq_len": 512,
+      "ms_per_inner_step_median": 76.57695739064366,
+      "ms_per_inner_step_p95": 76.99492744728923,
+      "ms_per_inner_step_mean": 76.5527805890888,
+      "samples_per_second": 835.7605496587628
+    }
+  ]
+}
