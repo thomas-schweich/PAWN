@@ -11,18 +11,29 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-LABEL="${1:-5090-$(git rev-parse --short HEAD)}"
+# Python launcher. On a dev checkout `uv run --extra cu128 python` resolves
+# the GPU extra; on the prebuilt runtime image (thomasschweich/pawn:jax) the
+# venv is already active on PATH and `uv run` would instead try to rebuild
+# the chess-engine workspace member from source (no Rust toolchain present)
+# and fail — so there, launch with `PYRUN=python`.
+PYRUN="${PYRUN:-uv run --extra cu128 python}"
+
+# Git SHA is unavailable in the runtime image (.git is excluded from the
+# build context); fall back to the baked-in $PAWN_GIT_HASH, then "unknown".
+_sha="$(git rev-parse --short HEAD 2>/dev/null || echo "${PAWN_GIT_HASH:-unknown}")"
+LABEL="${1:-5090-${_sha}}"
 
 echo "===================================================="
 echo "5090 bench harness — label: $LABEL"
-echo "Git SHA: $(git rev-parse --short HEAD)"
-echo "JAX device: $(uv run --extra cu128 python -c 'import jax; print(jax.devices()[0])' 2>&1 | tail -1)"
+echo "Git SHA: ${_sha}"
+echo "Launcher: $PYRUN"
+echo "JAX device: $($PYRUN -c 'import jax; print(jax.devices()[0])' 2>&1 | tail -1)"
 echo "===================================================="
 
 # Step 1: cost(T) curve at production B=64
 echo
 echo "==> Step 1a: cost(T) curve SUPERNET LARGE B=64 1v"
-uv run --extra cu128 python scripts/bench/cost_curve.py \
+$PYRUN scripts/bench/cost_curve.py \
     --supernet production --batch-size 64 --k 50 \
     --warmup-outers 2 --timed-outers 10 \
     --seq-lens 128 256 384 512 \
@@ -31,7 +42,7 @@ uv run --extra cu128 python scripts/bench/cost_curve.py \
 
 echo
 echo "==> Step 1b: cost(T) curve SUPERNET LARGE B=64 3v-stoch"
-uv run --extra cu128 python scripts/bench/cost_curve.py \
+$PYRUN scripts/bench/cost_curve.py \
     --supernet production --batch-size 64 --k 50 \
     --warmup-outers 2 --timed-outers 10 \
     --seq-lens 128 256 384 512 \
@@ -41,7 +52,7 @@ uv run --extra cu128 python scripts/bench/cost_curve.py \
 # Step 2: full bench matrix
 echo
 echo "==> Step 2: full bench matrix"
-uv run --extra cu128 python scripts/bench/run.py \
+$PYRUN scripts/bench/run.py \
     --k 50 --warmup-outers 2 --timed-outers 30 \
     --label "${LABEL}-matrix"
 
@@ -49,21 +60,21 @@ uv run --extra cu128 python scripts/bench/run.py \
 echo
 echo "==> Step 3a: end-to-end bucketed (default, AdamW, no grad-norm emit)"
 rm -rf logs/5090-bucketed 2>/dev/null
-uv run --extra cu128 python scripts/train_jax.py \
+$PYRUN scripts/train_jax.py \
     --supernet production --total-steps 500 --batch-size 64 --seq-len 512 --k 50 \
     --local-checkpoints --logs-dir logs/5090-bucketed
 
 echo
 echo "==> Step 3b: end-to-end no-bucketing"
 rm -rf logs/5090-nobucket 2>/dev/null
-uv run --extra cu128 python scripts/train_jax.py \
+$PYRUN scripts/train_jax.py \
     --supernet production --total-steps 500 --batch-size 64 --seq-len 512 --k 50 \
     --no-bucketing --local-checkpoints --logs-dir logs/5090-nobucket
 
 echo
 echo "==> Step 3c: end-to-end with all opt-ins (Lion + emit_grad_norms)"
 rm -rf logs/5090-allopt 2>/dev/null
-uv run --extra cu128 python scripts/train_jax.py \
+$PYRUN scripts/train_jax.py \
     --supernet production --total-steps 500 --batch-size 64 --seq-len 512 --k 50 \
     --optimizer lion --lr 1e-4 \
     --emit-grad-norms \
