@@ -513,6 +513,71 @@ def test_scan_step_runs_K_inner_steps() -> None:
 
 
 # ---------------------------------------------------------------------------
+# C.4 — gradient accumulation
+# ---------------------------------------------------------------------------
+
+
+def test_train_step_accumulation_steps_eq_one_matches_baseline() -> None:
+    """accumulation_steps=1 must be a no-op vs the pre-C.4 path."""
+    # Two fresh states with two fresh models — donate="all" deletes
+    # input buffers, and sharing a model object across two TrainStates
+    # would also delete its buffers when the first call runs.
+    state_a, opt_a = _tiny_train_state(_tiny_model())
+    state_b, opt_b = _tiny_train_state(_tiny_model())
+    variants = _tiny_variants()
+    ts_baseline = make_train_step(opt_a, variants)
+    ts_n1 = make_train_step(opt_b, variants, accumulation_steps=1)
+    batch_a = _small_batch()
+    batch_b = _small_batch()
+    s_base, l_base = ts_baseline(state_a, batch_a)
+    s_n1, l_n1 = ts_n1(state_b, batch_b)
+    assert jnp.allclose(l_base, l_n1, rtol=0, atol=1e-6)
+    assert jnp.allclose(s_base.model.lm_head, s_n1.model.lm_head,
+                        rtol=0, atol=1e-6)
+
+
+def test_train_step_accumulation_steps_eq_2_runs() -> None:
+    """accumulation_steps=2 with (N, B, T) batches runs cleanly and
+    produces a finite loss + an updated model.
+
+    A strict numeric-match-vs-concat test would need either (a) per-pos
+    rather than per-game loss averaging or (b) constant supervision
+    density across micros. Both are out of scope here — we instead
+    smoke-test the path runs end-to-end and the optimizer actually
+    moves the parameters.
+    """
+    model = _tiny_model()
+    lm_head_before = np.asarray(model.lm_head)
+    state, opt = _tiny_train_state(model)
+    variants = _tiny_variants()
+    ts_acc = make_train_step(
+        opt, variants, accumulation_steps=2, stochastic_variants=False,
+    )
+    B = 4
+    base1 = _small_batch(batch_size=B)
+    base2 = _small_batch(batch_size=B)
+    stacked = Batch(
+        tokens=jnp.stack([base1.tokens, base2.tokens], axis=0),
+        targets=jnp.stack([base1.targets, base2.targets], axis=0),
+        attn_mask=jnp.stack([base1.attn_mask, base2.attn_mask], axis=0),
+        loss_mask=jnp.stack([base1.loss_mask, base2.loss_mask], axis=0),
+    )
+    new_state, loss = ts_acc(state, stacked)
+    assert int(new_state.step) == 1
+    assert jnp.isfinite(loss)
+    assert not np.array_equal(lm_head_before, np.asarray(new_state.model.lm_head))
+
+
+def test_train_step_accumulation_steps_rejects_zero() -> None:
+    """accumulation_steps must be ≥ 1; reject zero / negative."""
+    model = _tiny_model()
+    _, opt = _tiny_train_state(model)
+    variants = _tiny_variants()
+    with pytest.raises(ValueError, match="accumulation_steps"):
+        make_train_step(opt, variants, accumulation_steps=0)
+
+
+# ---------------------------------------------------------------------------
 # Smoke: small-scale training run with loss-decreasing assertion
 # ---------------------------------------------------------------------------
 

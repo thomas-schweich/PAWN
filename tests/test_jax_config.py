@@ -55,7 +55,14 @@ def test_vocab_constants_match_engine_contract() -> None:
     assert OUTCOME_TOKEN_BASE == 1969
     assert N_PRETRAINING_OUTCOMES == 5
     assert N_TOTAL_OUTCOMES == 11
-    assert VOCAB_SIZE == NUM_ACTIONS + 1 + N_TOTAL_OUTCOMES == 1980
+    # A.2 (narrow): VOCAB_SIZE is the lm_head output width — action
+    # tokens + PAD. Outcome columns (1969..1979) were trimmed since
+    # outcomes are inputs only and never appear in targets. Saves
+    # ~0.6% of lm_head FLOPs at zero correctness risk; the broader
+    # PAD-column trim is deferred (needs paired generation refactor).
+    from pawn.config import N_INPUT_TOKENS
+    assert VOCAB_SIZE == NUM_ACTIONS + 1 == 1969
+    assert N_INPUT_TOKENS == NUM_ACTIONS + 1 + N_TOTAL_OUTCOMES == 1980
 
 
 def test_sequence_constants() -> None:

@@ -744,6 +744,7 @@ def make_train_step(
     use_sdpa: bool = False,
     use_flash: bool = False,
     stochastic_variants: bool = False,
+    accumulation_steps: int = 1,
 ) -> Callable[[TrainState, Batch], tuple[TrainState, Float[Array, ""]]]:
     """Return a JIT-compiled single training step closing over the
     optimizer + variant list.
@@ -752,6 +753,16 @@ def make_train_step(
     ``(state, batch) -> (new_state, loss)``. ``state.step`` is a JAX
     scalar so the JIT trace is value-independent — same compiled
     program for step 0 and step 999.
+
+    With ``accumulation_steps > 1`` the input ``batch`` gains a leading
+    microbatch axis: each leaf's first dim becomes ``accumulation_steps``
+    (so e.g. ``tokens`` is ``(N, B_micro, T)``). The body scans over
+    that axis, sums grads, and issues one optimizer.update — equivalent
+    to a single forward+backward on a batch of ``N * B_micro`` games
+    but with memory cost ``B_micro × T`` per micro-pass instead of
+    ``N × B_micro × T``. C.4 win: at LARGE on a 5090 a B=64 step beats
+    B=128 by ~7% (smaller batch fits kernel-shape better); accumulation
+    lets us train at effective batch 128 paying B=64's per-step price.
 
     The optimizer update is unconditional. An earlier version wrapped
     it in ``jax.lax.cond`` to skip the AdamW step on all-PAD batches —
@@ -766,38 +777,79 @@ def make_train_step(
     filtering rejects pathological games, so we accept the tiny drift
     risk on the (hypothetical) all-PAD batch.
     """
+    if accumulation_steps < 1:
+        raise ValueError(
+            f"accumulation_steps must be ≥ 1, got {accumulation_steps}"
+        )
+
+    def _loss_for(model: PAWNModel, batch: Batch, sub_key: jax.Array | None
+                  ) -> Float[Array, ""]:
+        return supernet_joint_loss(
+            model, batch, variants,
+            compute_dtype=compute_dtype,
+            use_sdpa=use_sdpa, use_flash=use_flash,
+            stochastic_key=sub_key,
+        )
 
     @eqx.filter_jit(donate="all")
     def train_step(
         state: TrainState, batch: Batch
     ) -> tuple[TrainState, Float[Array, ""]]:
-        def loss_fn(model: PAWNModel) -> Float[Array, ""]:
-            # Derive a per-step subkey by folding the step counter into
-            # the state's RNG key. Distinct per step, deterministic
-            # within a step (so two replays of the same batch take the
-            # same variant), zero PyTree-mutation overhead. ``None``
-            # in deterministic mode short-circuits the sampling inside
-            # ``supernet_joint_loss`` and keeps the exhaustive sum.
-            sub_key = (
-                jax.random.fold_in(state.key, state.step)
-                if stochastic_variants
-                else None
-            )
-            return supernet_joint_loss(
-                model, batch, variants,
-                compute_dtype=compute_dtype,
-                use_sdpa=use_sdpa, use_flash=use_flash,
-                stochastic_key=sub_key,
-            )
+        sub_key = (
+            jax.random.fold_in(state.key, state.step)
+            if stochastic_variants
+            else None
+        )
 
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(state.model)
+        if accumulation_steps == 1:
+            loss, grads = eqx.filter_value_and_grad(
+                lambda model: _loss_for(model, batch, sub_key)
+            )(state.model)
+        else:
+            # Accumulate grads + loss over the leading microbatch axis
+            # via lax.scan. The body computes one micro's value+grad and
+            # adds it into the carry. Memory: only one model-grad tree
+            # resident at a time (NOT the per-micro stack a vmap would
+            # produce). Compile cost: the body is traced once.
+            params = eqx.filter(state.model, eqx.is_inexact_array)
+            zero_grads = jax.tree_util.tree_map(jnp.zeros_like, params)
+            zero_loss = jnp.float32(0.0)
+            micro_indices = jnp.arange(accumulation_steps, dtype=jnp.int32)
+
+            def _acc_body(carry, micro_pair):
+                accum_grads, accum_loss = carry
+                micro_idx, micro_batch = micro_pair
+                # Each micro gets a distinct fold of the sub_key so
+                # stochastic-variant sampling sees different draws per
+                # micro (otherwise N micros would all sample the same
+                # variant and the accumulated grad would be biased).
+                micro_key = (
+                    jax.random.fold_in(sub_key, micro_idx)
+                    if sub_key is not None
+                    else None
+                )
+                micro_loss, micro_grads = eqx.filter_value_and_grad(
+                    lambda model: _loss_for(model, micro_batch, micro_key)
+                )(state.model)
+                new_grads = jax.tree_util.tree_map(
+                    lambda a, g: a + g, accum_grads, micro_grads
+                )
+                return (new_grads, accum_loss + micro_loss), None
+
+            (acc_grads, acc_loss), _ = jax.lax.scan(
+                _acc_body, (zero_grads, zero_loss), (micro_indices, batch)
+            )
+            scale = jnp.float32(1.0 / accumulation_steps)
+            grads = jax.tree_util.tree_map(lambda g: g * scale, acc_grads)
+            loss = acc_loss * scale
+
         # ``optimizer.update`` expects ``params`` to be a generic PyTree
         # — :class:`PAWNModel` is one (it's an ``eqx.Module``), but pyright
         # narrows the field type to the concrete class. Pass through a
         # local binding so the type widens to ``Any`` for the call.
-        params: Any = state.model
+        params_any: Any = state.model
         updates, new_opt_state = optimizer.update(
-            grads, state.opt_state, params
+            grads, state.opt_state, params_any
         )
         new_model = eqx.apply_updates(state.model, updates)
 

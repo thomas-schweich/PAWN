@@ -246,7 +246,11 @@ def _pack_clm(
     # 4. attn_mask: True where tokens != PAD.
     attn_mask = tokens != PAD_TOKEN
 
-    # 5. targets: tokens shifted left by 1, with PAD on the last slot.
+    # 5. targets: tokens shifted left by 1, with PAD on the trailing
+    # slot. A.2 (narrow form) keeps PAD as a target since the lm_head
+    # output still includes the PAD column; only the outcome columns
+    # (1969..1979) were trimmed, and outcome tokens never appear in
+    # targets (they're inputs at position 0 only).
     targets = np.full_like(tokens, PAD_TOKEN)
     targets[:, :-1] = tokens[:, 1:]
 
@@ -256,19 +260,8 @@ def _pack_clm(
     capped_lengths = np.minimum(game_lengths, n_move_slots)
     seq_positions = np.arange(seq_len, dtype=np.int32)[None, :]
     if prepend_outcome:
-        # `prepend_outcome=True`: positions 0..gl supervised. A zero-
-        # length game still gets position 0 supervised (predict the
-        # outcome from… nothing, in the all-PAD case — but pack_corpus
-        # is a packing helper, not a data validator, so we trust the
-        # caller).
         threshold = capped_lengths[:, None]
     else:
-        # `prepend_outcome=False`: positions 0..gl-1 supervised. For
-        # `gl == 0` (zero-length game), the previous `(gl - 1).clip(0)
-        # = 0` mistakenly supervised position 0 even though both the
-        # input and target there are PAD. Use `-1` as the no-supervised-
-        # positions sentinel so `seq_positions <= threshold` is False
-        # everywhere in that row (PR #115 review #4).
         threshold = np.maximum(capped_lengths - 1, -1)[:, None]
     loss_mask = seq_positions <= threshold
 

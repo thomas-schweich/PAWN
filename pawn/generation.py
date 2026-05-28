@@ -299,7 +299,14 @@ def autoregressive_generate(
         if temperature != 1.0:
             next_logits_arr = next_logits_arr / temperature
         if mask_illegal:
-            raw = np.asarray(env.get_legal_token_masks_batch(all_indices))
+            # Engine returns a default-1980 mask; pass the model's actual
+            # output width so engine truncates to match. (A.2: lm_head
+            # output is NUM_ACTIONS + 1 = 1969 — the PAD column is kept
+            # so termination sampling still works.)
+            mask_vocab = int(next_logits_arr.shape[1])
+            raw = np.asarray(
+                env.get_legal_token_masks_batch(all_indices, mask_vocab)
+            )
             pad_row = np.zeros((1, next_logits_arr.shape[1]), dtype=bool)
             pad_row[0, PAD_TOKEN] = True
             term_mat = terminated[:, None]

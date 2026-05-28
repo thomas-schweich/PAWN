@@ -345,7 +345,8 @@ def test_init_model_production_supernet_builds() -> None:
     model = init_model(SUPERNET, key=0)
     assert model.embed_src.shape == (64, 640)
     assert model.layers.wq.shape == (10, 640, 640)
-    assert model.lm_head.shape == (640, 1980)
+    # A.2: lm_head output is NUM_ACTIONS + 1 PAD = 1969 (outcome columns trimmed).
+    assert model.lm_head.shape == (640, 1969)
 
 
 def test_forward_pass_rejects_sequence_too_long() -> None:

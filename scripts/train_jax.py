@@ -250,10 +250,22 @@ def main(argv: list[str] | None = None) -> int:
     # (`PAWN_ALLOW_CPU=1`) auto-fall-back to the plain path regardless
     # of `cfg.use_flash`.
     use_flash = cfg.use_flash and jax.default_backend() == "gpu"
+    if cfg.accumulation_steps != 1:
+        # The trainer's batch shape would need to grow a leading
+        # accumulation axis (K, N, B, T). The current bucketed prefetcher
+        # produces (K, B, T). Wire-through is a follow-up; the trainer
+        # itself (`make_train_step`) is C.4-complete and unit-tested.
+        raise NotImplementedError(
+            f"accumulation_steps={cfg.accumulation_steps} is not yet "
+            f"wired through the data loop (use 1 for now). The "
+            f"make_train_step path supports it; the prefetcher needs "
+            f"to produce (K, N, B, T)-shaped batches."
+        )
     train_step = make_train_step(
         optimizer, variants,
         compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa, use_flash=use_flash,
         stochastic_variants=cfg.stochastic_variants,
+        accumulation_steps=cfg.accumulation_steps,
     )
     logger = MetricsLogger(
         log_dir=args.logs_dir, run_prefix="pretrain", device=_resolve_device()

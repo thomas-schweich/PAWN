@@ -277,9 +277,7 @@ def test_corpus_attn_and_loss_mask_consistency() -> None:
     corpus = pack_corpus(
         move_ids, game_lengths, outcome_tokens, seq_len=16, prepend_outcome=False
     )
-    # Where loss_mask is True, the position has a real (non-PAD) token
-    # (or the *target* is the PAD signal, which is still in the loss
-    # via the legality penalty — but attn_mask says "real input").
+    # Where loss_mask is True, the position has a real (non-PAD) token.
     for g in range(3):
         gl = int(game_lengths[g])
         # loss_mask True for positions 0..gl-1, all of which are also
