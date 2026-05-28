@@ -175,9 +175,20 @@ list_local_instances() {
 }
 
 # Fetch raw JSON for a single instance.
+#
+# NOTE: the per-instance `vastai show instance <id> --raw` path throws on
+# some CLI versions (`TypeError: 'NoneType' ... start_date` when the
+# instance has no start_date yet), returning nothing. Derive the same
+# record from the list endpoint instead — `show instances-v1 --raw` is
+# unaffected and carries identical fields (actual_status, public_ipaddr,
+# ssh_host/ssh_port, ports, gpu_name). Falls back to the (deprecated)
+# bare-array `show instances --raw` shape too.
 instance_json() {
     local id="$1"
-    vastai show instance "$id" --raw 2>/dev/null
+    vastai show instances-v1 --raw 2>/dev/null \
+        | jq -c --argjson id "$id" \
+            '(.instances // .) | map(select(.id == $id)) | .[0] // empty' \
+            2>/dev/null
 }
 
 # Pull SSH host/port from instance JSON. Echoes "host port" or empty on miss.
@@ -203,32 +214,50 @@ extract_ssh_endpoint() {
 wait_for_instance_running() {
     local instance_id="$1" name="$2"
     echo -n "Waiting for instance to be ready"
+    # Readiness is "SSH actually connects on the direct port", not
+    # "actual_status == running". On vast, actual_status frequently stays
+    # null even after cur_state flips to running, and the direct SSH port
+    # (ports["22/tcp"]) only maps once the container's sshd is listening —
+    # so a successful direct-SSH probe is the one signal that's both
+    # necessary and sufficient. We gate the SSH attempt on having an
+    # endpoint rather than on a status string, so a null actual_status
+    # can't wedge the loop.
     for i in $(seq 1 90); do
-        local json status
+        local json dhost dport phost pport host port
         json=$(instance_json "$instance_id" || true)
-        status=$(echo "$json" | jq -r '.actual_status // empty' 2>/dev/null)
+        # Direct endpoint (preferred — proxy swallows stdin on non-interactive
+        # launch). Read direct + proxy separately so we never lock onto the
+        # proxy while the direct port is still mapping.
+        read -r dhost dport < <(echo "$json" | jq -r '
+            [(.public_ipaddr // ""),
+             (.ports["22/tcp"][0].HostPort // "")] | @tsv' 2>/dev/null \
+            | tr '\t' ' ')
+        read -r phost pport < <(echo "$json" | jq -r '
+            [(.ssh_host // ""), (.ssh_port // "")] | @tsv' 2>/dev/null \
+            | tr '\t' ' ')
 
-        if [ "$status" = "running" ]; then
-            local endpoint host port
-            endpoint=$(extract_ssh_endpoint "$json")
-            if [ -n "$endpoint" ]; then
-                host="${endpoint% *}"
-                port="${endpoint#* }"
-                if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
-                       -p "$port" "root@$host" "echo ok" &>/dev/null; then
-                    echo " ready!"
-                    local gpu
-                    gpu=$(echo "$json" | jq -r '.gpu_name // "unknown"')
-                    save_instance_config "$name" "$instance_id" "$host" "$port" "$gpu"
-                    return 0
-                fi
+        host=""; port=""
+        if [ -n "$dhost" ] && [[ "$dport" =~ ^[0-9]+$ ]]; then
+            host="$dhost"; port="$dport"          # direct: always preferred
+        elif [ "$i" -ge 60 ] && [ -n "$phost" ] && [[ "$pport" =~ ^[0-9]+$ ]]; then
+            host="$phost"; port="$pport"          # proxy: only after ~5 min
+        fi
+
+        if [ -n "$host" ] && [ -n "$port" ]; then
+            if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+                   -p "$port" "root@$host" "echo ok" &>/dev/null; then
+                echo " ready!"
+                local gpu
+                gpu=$(echo "$json" | jq -r '.gpu_name // "unknown"')
+                save_instance_config "$name" "$instance_id" "$host" "$port" "$gpu"
+                return 0
             fi
         fi
         echo -n "."
         sleep 5
     done
     echo " timeout!"
-    echo "Instance may still be starting. Check: vastai show instance $instance_id"
+    echo "Instance may still be starting. Check: vastai show instances-v1"
     return 1
 }
 
