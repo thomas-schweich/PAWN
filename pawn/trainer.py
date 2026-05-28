@@ -547,12 +547,12 @@ def _branchless_clip_by_global_norm(max_norm: float) -> optax.GradientTransforma
     field — donate-friendly and zero compile overhead.
     """
 
-    def init_fn(params):
+    def init_fn(params: Any) -> Any:
         del params
         return _ClipState(g_norm=jnp.float32(0.0))
 
-    def update_fn(updates, state, params=None):
-        del params
+    def update_fn(updates: Any, state: Any, params: Any = None) -> Any:
+        del params, state
         g_norm = optax.tree.norm(updates)
         scale = max_norm / jnp.maximum(g_norm, max_norm)
         clipped = jax.tree_util.tree_map(lambda t: t * scale.astype(t.dtype), updates)
