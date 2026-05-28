@@ -62,6 +62,7 @@ __all__ = [
     "slice_batch",
     "flatten_opt_state",
     "unflatten_opt_state",
+    "get_grad_norm",
 ]
 
 
@@ -504,6 +505,14 @@ def make_lr_schedule(
 # ---------------------------------------------------------------------------
 
 
+class _ClipState(eqx.Module):
+    """State for :func:`_branchless_clip_by_global_norm` — exposes the
+    most-recent unscaled grad norm so the trainer can log clip
+    triggers (C.5).
+    """
+    g_norm: Float[Array, ""]
+
+
 def _branchless_clip_by_global_norm(max_norm: float) -> optax.GradientTransformation:
     """Branchless replacement for :func:`optax.clip_by_global_norm`.
 
@@ -531,20 +540,37 @@ def _branchless_clip_by_global_norm(max_norm: float) -> optax.GradientTransforma
     rescale is the usual clip. One pass over ``updates`` instead of
     two, no ``select`` materialisation. ~0.2-0.3 ms saved per step at
     LARGE shape. Round-3 review surfaced this (Opus conv).
+
+    The state now carries the most-recent unscaled `g_norm` so C.5's
+    clip-trigger measurement can log it without altering scan_step's
+    return signature. The state is a `eqx.Module` with one scalar
+    field — donate-friendly and zero compile overhead.
     """
 
     def init_fn(params):
         del params
-        return optax.EmptyState()
+        return _ClipState(g_norm=jnp.float32(0.0))
 
     def update_fn(updates, state, params=None):
         del params
         g_norm = optax.tree.norm(updates)
         scale = max_norm / jnp.maximum(g_norm, max_norm)
         clipped = jax.tree_util.tree_map(lambda t: t * scale.astype(t.dtype), updates)
-        return clipped, state
+        return clipped, _ClipState(g_norm=g_norm.astype(jnp.float32))
 
     return optax.GradientTransformation(init_fn, update_fn)
+
+
+def get_grad_norm(opt_state) -> Float[Array, ""]:
+    """Read the most-recent unscaled grad norm out of the optimizer
+    state. Returns 0 if the state doesn't contain a `_ClipState`
+    (e.g., the optimizer was built without our clip transformation)."""
+    # `opt_state` is a tuple from `optax.chain`. Walk the leaves until
+    # we find a `_ClipState`. If none, return 0.
+    for leaf in jax.tree_util.tree_leaves(opt_state, is_leaf=lambda x: isinstance(x, _ClipState)):
+        if isinstance(leaf, _ClipState):
+            return leaf.g_norm
+    return jnp.float32(0.0)
 
 
 def make_optimizer(
@@ -795,17 +821,39 @@ def make_scan_step(
     train_step: Callable[
         [TrainState, Batch], tuple[TrainState, Float[Array, ""]]
     ],
-) -> Callable[[TrainState, Batch], tuple[TrainState, Float[Array, "K"]]]:
+    *,
+    emit_grad_norms: bool = False,
+) -> Callable[..., tuple]:
     """Wrap a single train step into a K-step :func:`jax.lax.scan`.
 
     Input is a ``Batch`` whose leaves have a leading K axis (so
     ``batch.tokens`` is ``(K, B, T)`` etc.). Output is the final state
-    and a ``(K,)`` array of per-step losses.
+    and a ``(K,)`` array of per-step losses. With
+    ``emit_grad_norms=True`` the return also includes ``(K,)`` of
+    pre-clip grad norms drawn from the optimizer's ``_ClipState`` —
+    used by C.5's clip-trigger measurement.
 
     The body never returns to the host — that's the v2 amortisation.
     Per-chunk metrics flush between calls (the trainer loop drives the
     K-step boundaries from Python).
     """
+
+    if emit_grad_norms:
+        @eqx.filter_jit(donate="all")
+        def scan_step_with_norms(
+            state: TrainState, batches: Batch
+        ) -> tuple[TrainState, Float[Array, "K"], Float[Array, "K"]]:
+            def body(
+                carry: TrainState, batch: Batch
+            ) -> tuple[TrainState, tuple[Float[Array, ""], Float[Array, ""]]]:
+                new_carry, loss = train_step(carry, batch)
+                g_norm = get_grad_norm(new_carry.opt_state)
+                return new_carry, (loss, g_norm)
+
+            final_state, (losses, g_norms) = jax.lax.scan(body, state, batches)
+            return final_state, losses, g_norms
+
+        return scan_step_with_norms
 
     @eqx.filter_jit(donate="all")
     def scan_step(

@@ -107,6 +107,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                     help="how many K-batches' worth of games to generate "
                          "per outer prefetch call (default 3 — covers the "
                          "natural bucket distribution).")
+    ap.add_argument("--emit-grad-norms", action="store_true",
+                    help="(C.5 spike) log per-step pre-clip grad norm "
+                         "alongside loss. Slight per-step overhead from "
+                         "emitting an extra scalar per body call.")
     return ap.parse_args(argv)
 
 
@@ -266,7 +270,8 @@ def main(argv: list[str] | None = None) -> int:
     # one compiled program — eliminate per-step launch and dispatch
     # overhead." The scan body never returns to the host inside a chunk;
     # per-chunk metrics flush between chunks.
-    scan_step = make_scan_step(train_step)
+    scan_step = make_scan_step(train_step, emit_grad_norms=args.emit_grad_norms)
+    emit_grad_norms = args.emit_grad_norms
 
     rng = np.random.default_rng(0)
     indices = np.arange(cfg.batch_size, dtype=np.int64)
@@ -423,7 +428,12 @@ def main(argv: list[str] | None = None) -> int:
             edge, chunk_batches = nxt
             this_chunk_k = int(chunk_batches.tokens.shape[0])
 
-            state, chunk_losses = scan_step(state, chunk_batches)
+            if emit_grad_norms:
+                state, chunk_losses, chunk_gnorms = scan_step(state, chunk_batches)
+                chunk_gnorms_np = np.asarray(chunk_gnorms)
+            else:
+                state, chunk_losses = scan_step(state, chunk_batches)
+                chunk_gnorms_np = None
             next_step += this_chunk_k
             bucket_steps[edge] = bucket_steps.get(edge, 0) + this_chunk_k
 
@@ -437,11 +447,16 @@ def main(argv: list[str] | None = None) -> int:
             for i in range(this_chunk_k):
                 step = chunk_start + i + 1
                 if step % cfg.log_interval == 0:
+                    extra = {}
+                    if chunk_gnorms_np is not None:
+                        extra["grad_norm"] = float(chunk_gnorms_np[i])
+                        extra["did_clip"] = bool(chunk_gnorms_np[i] > cfg.max_grad_norm)
                     logger.log_train(
                         step=step, loss=float(chunk_losses_np[i]),
                         lr=np.asarray(schedule(step)).item(),
                         step_time=(time.time() - t0) / max(1, step - start),
                         bucket=edge,
+                        **extra,
                     )
 
             # Checkpoint when we cross a checkpoint boundary. Use
