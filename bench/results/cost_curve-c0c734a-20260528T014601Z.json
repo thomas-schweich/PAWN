@@ -1,0 +1,44 @@
+{
+  "git_sha": "c0c734a",
+  "timestamp_utc": "20260528T014601Z",
+  "label": "7900xt-1v-c0c734a",
+  "supernet": "production",
+  "batch_size": 16,
+  "k": 20,
+  "n_variants_mode": "1v",
+  "device": "rocm:0",
+  "fit_coefficients": {
+    "a": 0.16187259190613268,
+    "b": -1.932954481780529e-05
+  },
+  "results": [
+    {
+      "seq_len": 128,
+      "ms_per_inner_step_median": 21.30692460341379,
+      "ms_per_inner_step_p95": 21.330354856327176,
+      "ms_per_inner_step_mean": 21.300384032074362,
+      "samples_per_second": 750.9295826501626
+    },
+    {
+      "seq_len": 256,
+      "ms_per_inner_step_median": 39.90149445598945,
+      "ms_per_inner_step_p95": 39.93033875944093,
+      "ms_per_inner_step_mean": 39.89828842924908,
+      "samples_per_second": 400.98748726435997
+    },
+    {
+      "seq_len": 384,
+      "ms_per_inner_step_median": 58.76636719331145,
+      "ms_per_inner_step_p95": 58.90477110398933,
+      "ms_per_inner_step_mean": 58.813863990362734,
+      "samples_per_second": 272.2645752011204
+    },
+    {
+      "seq_len": 512,
+      "ms_per_inner_step_median": 78.12805289868265,
+      "ms_per_inner_step_p95": 78.32170818932354,
+      "ms_per_inner_step_mean": 78.16009520087391,
+      "samples_per_second": 204.79199732199882
+    }
+  ]
+}

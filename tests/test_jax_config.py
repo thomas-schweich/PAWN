@@ -244,12 +244,20 @@ def test_validate_nested_rejects_head_dim_mismatch() -> None:
         validate_nested(v1_style, SUPERNET)
 
 
-def test_validate_nested_rejects_layer_mismatch() -> None:
-    """Variants must share the supernet's depth — they're width slices,
-    not depth slices."""
+def test_validate_nested_accepts_shallower_variant() -> None:
+    """B.5: variants may use fewer layers than the supernet — sliced
+    as the supernet's first `variant.n_layers` layers."""
     shallower = ModelConfig(d_model=256, n_layers=4, n_heads=4, d_ff=1024)
+    # No raise — depth-slicing is now valid.
+    validate_nested(shallower, SUPERNET)
+
+
+def test_validate_nested_rejects_deeper_variant() -> None:
+    """Variants cannot exceed the supernet's depth — there's no
+    upstream weight to slice from."""
+    deeper = ModelConfig(d_model=256, n_layers=12, n_heads=4, d_ff=1024)
     with pytest.raises(NestingError, match="n_layers"):
-        validate_nested(shallower, SUPERNET)
+        validate_nested(deeper, SUPERNET)
 
 
 def test_validate_nested_rejects_oversized_d_model() -> None:

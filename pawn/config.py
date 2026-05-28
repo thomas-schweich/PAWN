@@ -212,16 +212,21 @@ def validate_nested(variant: ModelConfig, supernet: ModelConfig) -> None:
     exactly so the supernet's per-token, per-position, and per-head
     structure is reusable.
 
+    B.5: variants may use **fewer layers** than the supernet — a
+    variant with ``n_layers < supernet.n_layers`` is sliced as the
+    supernet's first ``variant.n_layers`` layers (a depth-and-width
+    slice). The variant's per-layer weights still nest by width
+    under the supernet's per-layer weights.
+
     Raises :class:`NestingError` on any mismatch.
     """
     if variant.head_dim != supernet.head_dim:
         raise NestingError(
             f"head_dim mismatch: variant={variant.head_dim} supernet={supernet.head_dim}"
         )
-    if variant.n_layers != supernet.n_layers:
+    if variant.n_layers > supernet.n_layers:
         raise NestingError(
-            f"n_layers mismatch: variant={variant.n_layers} supernet={supernet.n_layers} "
-            f"(variants share the supernet's depth)"
+            f"variant n_layers {variant.n_layers} exceeds supernet {supernet.n_layers}"
         )
     if variant.d_model > supernet.d_model:
         raise NestingError(

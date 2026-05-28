@@ -1147,6 +1147,12 @@ def sliced(supernet_model: PAWNModel, variant_cfg: ModelConfig) -> PAWNModel:
     """Return a new :class:`PAWNModel` at the variant shape, taking the
     inner ``[:d_V, :d_V]`` block of every weight tensor.
 
+    B.5: when ``variant_cfg.n_layers < supernet.n_layers`` we take the
+    first ``variant_cfg.n_layers`` layers of the supernet (a depth +
+    width slice). The slice direction is "outer" axis first → "inner"
+    axes after, so the per-layer leading-axis stacks shrink from
+    ``(supernet.n_layers, ...)`` to ``(variant.n_layers, ...)``.
+
     Raises :class:`pawn.config.NestingError` if ``variant_cfg`` doesn't
     nest under the supernet's config (so the slice would be undefined).
 
@@ -1159,18 +1165,19 @@ def sliced(supernet_model: PAWNModel, variant_cfg: ModelConfig) -> PAWNModel:
     validate_nested(variant_cfg, supernet_model.cfg)
     dv = variant_cfg.d_model
     dv_ff = variant_cfg.d_ff
+    nv = variant_cfg.n_layers
 
     sup_layers = supernet_model.layers
     layers = TransformerLayer(
-        attn_norm_w=sup_layers.attn_norm_w[:, :dv],
-        wq=sup_layers.wq[:, :dv, :dv],
-        wk=sup_layers.wk[:, :dv, :dv],
-        wv=sup_layers.wv[:, :dv, :dv],
-        wo=sup_layers.wo[:, :dv, :dv],
-        ffn_norm_w=sup_layers.ffn_norm_w[:, :dv],
-        w_gate=sup_layers.w_gate[:, :dv, :dv_ff],
-        w_up=sup_layers.w_up[:, :dv, :dv_ff],
-        w_down=sup_layers.w_down[:, :dv_ff, :dv],
+        attn_norm_w=sup_layers.attn_norm_w[:nv, :dv],
+        wq=sup_layers.wq[:nv, :dv, :dv],
+        wk=sup_layers.wk[:nv, :dv, :dv],
+        wv=sup_layers.wv[:nv, :dv, :dv],
+        wo=sup_layers.wo[:nv, :dv, :dv],
+        ffn_norm_w=sup_layers.ffn_norm_w[:nv, :dv],
+        w_gate=sup_layers.w_gate[:nv, :dv, :dv_ff],
+        w_up=sup_layers.w_up[:nv, :dv, :dv_ff],
+        w_down=sup_layers.w_down[:nv, :dv_ff, :dv],
     )
     return PAWNModel(
         embed_src=supernet_model.embed_src[:, :dv],

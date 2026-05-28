@@ -330,6 +330,28 @@ def test_sliced_rejects_invalid_nesting() -> None:
         sliced(supernet_model, bogus)
 
 
+def test_sliced_depth_then_width_variant() -> None:
+    """B.5: a variant with fewer layers AND smaller d_model is a
+    depth+width slice. The variant model carries the supernet's first
+    `nv` layers, each truncated to width `dv`."""
+    supernet_model = init_model(TINY_SUPERNET, key=0)
+    # TINY_SUPERNET is L=4, d=192. Try L=2, d=128 (matches TINY base width).
+    shallow = ModelConfig(d_model=128, n_layers=2, n_heads=2, d_ff=512)
+    variant = sliced(supernet_model, shallow)
+    assert variant.cfg.n_layers == 2
+    assert variant.cfg.d_model == 128
+    # Layer stack is shape (2, ...) not (4, ...)
+    assert variant.layers.wq.shape == (2, 128, 128)
+    # Width truncation: first 128 cols of supernet's first 2 layers.
+    assert jnp.allclose(
+        variant.layers.wq, supernet_model.layers.wq[:2, :128, :128]
+    )
+    # The variant runs forward without error.
+    tokens = jnp.zeros((1, 8), dtype=jnp.int32)
+    logits = variant(tokens)
+    assert logits.shape == (1, 8, TINY_SUPERNET.vocab_size)
+
+
 # ---------------------------------------------------------------------------
 # Production supernet (smoke; smaller than full training but real shape)
 # ---------------------------------------------------------------------------
