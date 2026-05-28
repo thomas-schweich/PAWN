@@ -1,0 +1,6 @@
+[
+    {"name": "BASE-B32-1v",       "supernet": "production", "variant": "base",  "batch_size": 32, "seq_len": 512, "n_variants_mode": "1v"},
+    {"name": "BASE-B32-3v-stoch", "supernet": "production", "variant": "base",  "batch_size": 32, "seq_len": 512, "n_variants_mode": "3v-stoch"},
+    {"name": "LARGE-B32-1v",      "supernet": "production", "variant": "large", "batch_size": 32, "seq_len": 512, "n_variants_mode": "1v"},
+    {"name": "LARGE-B32-3v-stoch","supernet": "production", "variant": "large", "batch_size": 32, "seq_len": 512, "n_variants_mode": "3v-stoch"}
+]

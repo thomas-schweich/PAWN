@@ -79,6 +79,9 @@ class Corpus:
             prefixed. Tells the trainer where the first move lives in
             the sequence (slot 0 vs slot 1) and what the diagnostics
             should condition on.
+        game_lengths: ``(N,)`` int32 — number of real moves (does NOT
+            include the outcome slot). Used by A.1 bucketing to pick
+            the right seq-length bucket per game.
     """
 
     tokens: NDArray[np.int32]
@@ -86,6 +89,7 @@ class Corpus:
     attn_mask: NDArray[np.bool_]
     loss_mask: NDArray[np.bool_]
     outcome_offset: NDArray[np.int32]
+    game_lengths: NDArray[np.int32]
 
     def __len__(self) -> int:
         return int(self.tokens.shape[0])
@@ -97,6 +101,57 @@ class Corpus:
     @property
     def seq_len(self) -> int:
         return int(self.tokens.shape[1])
+
+    def by_bucket(self, edges: tuple[int, ...]) -> dict[int, "Corpus"]:
+        """Partition this Corpus into per-bucket sub-corpora.
+
+        Each game's bucket = smallest edge ``e`` such that
+        ``effective_length(game) <= e``, where ``effective_length`` is
+        ``game_lengths + outcome_offset`` (the actual width of real
+        tokens including any prefix). Each returned sub-corpus has its
+        own truncated seq_len matching the bucket edge.
+
+        ``edges`` must be sorted ascending. The top edge must be >=
+        ``self.seq_len`` (every game must fit in some bucket).
+
+        Returned dict maps ``edge -> Corpus`` (sliced + width-truncated).
+        Buckets with zero games are omitted.
+        """
+        if not edges:
+            return {self.seq_len: self}
+        sorted_edges = tuple(sorted(set(edges)))
+        if sorted_edges[-1] > self.seq_len:
+            raise ValueError(
+                f"top bucket edge {sorted_edges[-1]} > corpus seq_len "
+                f"{self.seq_len}; nothing to truncate to"
+            )
+        if sorted_edges[-1] < self.seq_len:
+            raise ValueError(
+                f"top bucket edge {sorted_edges[-1]} < corpus seq_len "
+                f"{self.seq_len}; some games may overflow"
+            )
+
+        eff = (self.game_lengths + self.outcome_offset).astype(np.int32)
+        edges_arr = np.asarray(sorted_edges, dtype=np.int32)
+        # bucket_idx[i] = smallest j s.t. eff[i] <= edges[j]
+        bucket_idx = np.searchsorted(edges_arr, eff, side="left")
+        bucket_idx = np.clip(bucket_idx, 0, len(sorted_edges) - 1)
+
+        out: dict[int, Corpus] = {}
+        for j, edge in enumerate(sorted_edges):
+            mask = bucket_idx == j
+            if not mask.any():
+                continue
+            sel = np.flatnonzero(mask)
+            out[int(edge)] = Corpus(
+                tokens=self.tokens[sel, :edge].copy(),
+                targets=self.targets[sel, :edge].copy(),
+                attn_mask=self.attn_mask[sel, :edge].copy(),
+                loss_mask=self.loss_mask[sel, :edge].copy(),
+                outcome_offset=self.outcome_offset[sel].copy(),
+                game_lengths=self.game_lengths[sel].copy(),
+            )
+        return out
 
 
 def _map_termination_to_outcome(
@@ -230,6 +285,7 @@ def _pack_clm(
         attn_mask=attn_mask,
         loss_mask=loss_mask,
         outcome_offset=outcome_offset,
+        game_lengths=game_lengths.astype(np.int32),
     )
 
 

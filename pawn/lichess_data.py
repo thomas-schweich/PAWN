@@ -285,6 +285,7 @@ def _save_to_cache(corpus: Corpus, cache_dir: Path) -> None:
             "attn_mask": np.asarray(corpus.attn_mask),
             "loss_mask": np.asarray(corpus.loss_mask),
             "outcome_offset": np.asarray(corpus.outcome_offset),
+            "game_lengths": np.asarray(corpus.game_lengths),
         }
         st_save(tensors, str(tmp / "corpus.safetensors"))
         write_sentinel(tmp, _CACHE_FILES)
@@ -307,6 +308,19 @@ def _load_from_cache(cache_dir: Path) -> Corpus:
         raise CheckpointIntegrityError(
             f"cache at {cache_dir} missing tensors {sorted(missing)}"
         )
+    # game_lengths is new in the A.1 bucketing work. Pre-A.1 caches
+    # don't have it; recover by deriving from the loss_mask (positions
+    # 0..gl-1 supervised, so gl = loss_mask.sum(axis=-1) when
+    # prepend_outcome=False, gl = loss_mask.sum(axis=-1) - 1 with
+    # prefix). We don't know the prefix flag from cache alone; the
+    # outcome_offset field does — index it.
+    if "game_lengths" in raw:
+        game_lengths = raw["game_lengths"].astype(np.int32)
+    else:
+        # Recover: supervised positions == gl + prefix
+        prefix_flag = raw["outcome_offset"].astype(np.int32)
+        loss_count = raw["loss_mask"].astype(np.int32).sum(axis=-1)
+        game_lengths = (loss_count - prefix_flag).astype(np.int32)
     # Stay on host — Corpus is host-side numpy; the trainer transfers
     # per-batch.
     return Corpus(
@@ -315,6 +329,7 @@ def _load_from_cache(cache_dir: Path) -> Corpus:
         attn_mask=raw["attn_mask"],
         loss_mask=raw["loss_mask"],
         outcome_offset=raw["outcome_offset"],
+        game_lengths=game_lengths,
     )
 
 

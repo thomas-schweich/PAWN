@@ -18,6 +18,8 @@ import argparse
 import json
 import sys
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import jax
@@ -25,8 +27,14 @@ import jax.numpy as jnp
 import numpy as np
 
 from pawn.checkpoint import save_model
-from pawn.config import SUPERNET, TINY_SUPERNET, VARIANTS, TINY_VARIANTS
-from pawn.corpus import generate_corpus
+from pawn.config import (
+    PRETRAIN_BUCKETS,
+    SUPERNET,
+    TINY_SUPERNET,
+    VARIANTS,
+    TINY_VARIANTS,
+)
+from pawn.corpus import Corpus, generate_corpus
 from pawn.jax_setup import setup_jax_caching
 from pawn.lifecycle import (
     HFPushTracker,
@@ -91,6 +99,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                     action="store_false",
                     help="force the deterministic exhaustive sum over all "
                          "variants (parity / debug only).")
+    ap.add_argument("--no-bucketing", action="store_true",
+                    help="disable A.1 length bucketing — pretrain at a "
+                         "single seq_len bucket. Slower but useful for "
+                         "parity / debug.")
+    ap.add_argument("--bucket-outer-factor", type=int, default=3,
+                    help="how many K-batches' worth of games to generate "
+                         "per outer prefetch call (default 3 — covers the "
+                         "natural bucket distribution).")
     return ap.parse_args(argv)
 
 
@@ -255,6 +271,120 @@ def main(argv: list[str] | None = None) -> int:
     rng = np.random.default_rng(0)
     indices = np.arange(cfg.batch_size, dtype=np.int64)
 
+    # A.1 — Length bucketing. Read the schedule from `PRETRAIN_BUCKETS`
+    # (the single source of truth). The top edge must equal cfg.seq_len
+    # (so every game fits in some bucket). `--no-bucketing` ships the
+    # legacy single-bucket path for parity / debug.
+    if args.no_bucketing:
+        bucket_edges: tuple[int, ...] = (cfg.seq_len,)
+    else:
+        bucket_edges = tuple(e for e in PRETRAIN_BUCKETS if e <= cfg.seq_len)
+        if not bucket_edges or bucket_edges[-1] != cfg.seq_len:
+            # Add the top edge if not already present
+            bucket_edges = (*bucket_edges, cfg.seq_len) if bucket_edges else (cfg.seq_len,)
+
+    # A.4 — Async corpus prefetch + bucketed batch production. The
+    # background thread runs the Rust `generate_corpus`, bucketises into
+    # per-T sub-corpora, slices each into (K, B, T_bucket) Batches, and
+    # uploads via `jnp.asarray` (which is async). The GPU runs scan_step
+    # over the resulting queue while the next outer corpus is being
+    # generated.
+    def _build_batch_from_corpus_slice(
+        corp: Corpus, k_inner: int, batch_size: int, seq_len: int, start_idx: int
+    ) -> Batch:
+        sel = slice(start_idx, start_idx + k_inner * batch_size)
+        tokens = corp.tokens[sel, :seq_len].reshape(k_inner, batch_size, seq_len)
+        targets = corp.targets[sel, :seq_len].reshape(k_inner, batch_size, seq_len)
+        attn = corp.attn_mask[sel, :seq_len].reshape(k_inner, batch_size, seq_len)
+        lmask = corp.loss_mask[sel, :seq_len].reshape(k_inner, batch_size, seq_len)
+        return Batch(
+            tokens=jnp.asarray(tokens), targets=jnp.asarray(targets),
+            attn_mask=jnp.asarray(attn), loss_mask=jnp.asarray(lmask),
+        )
+
+    def _prepare_outer_chunk(
+        n_games: int, seed: int, edges: tuple[int, ...],
+        batch_size: int, inner_k: int,
+    ) -> list[tuple[int, Batch]]:
+        """Generate `n_games` random games, bucketise, slice into
+        K-batches per bucket, return as `[(edge, Batch), ...]` in
+        ascending-edge order. Games that don't fill a complete K-batch
+        in any bucket are dropped (acceptable when n_games >> B*K)."""
+        corpus = generate_corpus(
+            n_games=n_games, max_ply=cfg.seq_len, seq_len=cfg.seq_len, seed=seed,
+        )
+        if edges == (cfg.seq_len,):
+            # Unbucketed path: one bucket at full seq_len.
+            buckets = {cfg.seq_len: corpus}
+        else:
+            buckets = corpus.by_bucket(edges)
+        out: list[tuple[int, Batch]] = []
+        for edge in sorted(buckets):
+            sub = buckets[edge]
+            n_full_K = sub.n_games // (batch_size * inner_k)
+            for j in range(n_full_K):
+                start = j * batch_size * inner_k
+                out.append((
+                    edge,
+                    _build_batch_from_corpus_slice(
+                        sub, inner_k, batch_size, edge, start,
+                    ),
+                ))
+        return out
+
+    class BucketedPrefetcher:
+        """Yields `(edge, Batch)` tuples with one outer-chunk lookahead.
+
+        Each `next()` returns the next ready batch. When the queue is
+        empty we wait on the pending future and immediately submit the
+        next outer-chunk for the executor to start producing. The host
+        cost (Rust gen + numpy reshape + H2D enqueue) is overlapped with
+        the GPU work consuming earlier batches.
+        """
+
+        def __init__(self) -> None:
+            self._queue: deque[tuple[int, Batch]] = deque()
+            self._pending: Future[list[tuple[int, Batch]]] | None = None
+            self._closed = False
+            self.outer_factor = max(1, args.bucket_outer_factor)
+            self._submit_next()
+
+        def _next_seed(self) -> int:
+            return int(rng.integers(0, 2**31 - 1))
+
+        def _submit_next(self) -> None:
+            if self._closed:
+                return
+            seed = self._next_seed()
+            n_games = cfg.batch_size * cfg.k * self.outer_factor
+            self._pending = executor.submit(
+                _prepare_outer_chunk, n_games, seed, bucket_edges,
+                cfg.batch_size, cfg.k,
+            )
+
+        def next(self) -> tuple[int, Batch] | None:
+            while not self._queue:
+                if self._pending is None:
+                    return None
+                outer = self._pending.result()
+                # Immediately queue the next outer-chunk so its host work
+                # overlaps with the GPU work consuming this one.
+                self._submit_next()
+                self._queue.extend(outer)
+                if not self._queue:
+                    # Pathological: a generated corpus has fewer than B*K
+                    # games in ANY bucket. Try again rather than spinning.
+                    if self._pending is None:
+                        return None
+            return self._queue.popleft()
+
+        def close(self) -> None:
+            self._closed = True
+            if self._pending is not None:
+                self._pending.cancel()
+            self._pending = None
+            self._queue.clear()
+
     def _save_checkpoint(step_int: int) -> None:
         out = logger.run_dir / f"step_{step_int:08d}"
         if out.exists():
@@ -278,53 +408,63 @@ def main(argv: list[str] | None = None) -> int:
     start = int(state.step)
     t0 = time.time()
     next_step = start
-    while next_step < total_steps:
-        # Cap K at remaining steps so the final chunk lands exactly on
-        # `total_steps`. Stack K batches on a leading axis; `scan_step`
-        # runs them in one compiled program.
-        chunk_k = min(cfg.k, total_steps - next_step)
-        chunk_seed = int(rng.integers(0, 2**31 - 1))
-        chunk_corpus = generate_corpus(
-            n_games=cfg.batch_size * chunk_k,
-            max_ply=cfg.seq_len, seq_len=cfg.seq_len, seed=chunk_seed,
-        )
-        tokens = chunk_corpus.tokens.reshape(chunk_k, cfg.batch_size, cfg.seq_len)
-        targets = chunk_corpus.targets.reshape(chunk_k, cfg.batch_size, cfg.seq_len)
-        attn = chunk_corpus.attn_mask.reshape(chunk_k, cfg.batch_size, cfg.seq_len)
-        lmask = chunk_corpus.loss_mask.reshape(chunk_k, cfg.batch_size, cfg.seq_len)
-        chunk_batches = Batch(
-            tokens=jnp.asarray(tokens), targets=jnp.asarray(targets),
-            attn_mask=jnp.asarray(attn), loss_mask=jnp.asarray(lmask),
-        )
-        state, chunk_losses = scan_step(state, chunk_batches)
-        next_step += chunk_k
 
-        # One D→H per chunk, not per step.
-        chunk_losses_np = np.asarray(chunk_losses)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pawn-prefetch")
+    producer = BucketedPrefetcher()
+    # Per-bucket throughput counters (visible in the JSONL stream).
+    bucket_steps: dict[int, int] = {edge: 0 for edge in bucket_edges}
+    try:
+        while next_step < total_steps:
+            nxt = producer.next()
+            if nxt is None:
+                # Should be unreachable in practice — generator always
+                # produces at least one batch for a non-empty bucket.
+                break
+            edge, chunk_batches = nxt
+            this_chunk_k = int(chunk_batches.tokens.shape[0])
 
-        # Log every step that crossed a log_interval boundary inside the
-        # chunk — replays the within-chunk loss curve without per-step
-        # syncs.
-        chunk_start = next_step - chunk_k
-        for i in range(chunk_k):
-            step = chunk_start + i + 1
-            if step % cfg.log_interval == 0:
-                logger.log_train(
-                    step=step, loss=float(chunk_losses_np[i]),
-                    lr=np.asarray(schedule(step)).item(),
-                    step_time=(time.time() - t0) / max(1, step - start),
-                )
+            state, chunk_losses = scan_step(state, chunk_batches)
+            next_step += this_chunk_k
+            bucket_steps[edge] = bucket_steps.get(edge, 0) + this_chunk_k
 
-        if (
-            next_step % cfg.checkpoint_interval == 0
-            or next_step == total_steps
-        ):
-            if cfg.local_checkpoints or cfg.hf_repo:
+            # One D→H per chunk, not per step.
+            chunk_losses_np = np.asarray(chunk_losses)
+
+            # Log every step that crossed a log_interval boundary inside
+            # the chunk — replays the within-chunk loss curve without
+            # per-step syncs.
+            chunk_start = next_step - this_chunk_k
+            for i in range(this_chunk_k):
+                step = chunk_start + i + 1
+                if step % cfg.log_interval == 0:
+                    logger.log_train(
+                        step=step, loss=float(chunk_losses_np[i]),
+                        lr=np.asarray(schedule(step)).item(),
+                        step_time=(time.time() - t0) / max(1, step - start),
+                        bucket=edge,
+                    )
+
+            # Checkpoint when we cross a checkpoint boundary. Use
+            # division-based crossing so chunk_k doesn't have to divide
+            # checkpoint_interval. (Pre-A.1 chunks were exactly cfg.k
+            # steps; bucketing keeps that, but the test is more robust.)
+            crossed_checkpoint = (
+                next_step // cfg.checkpoint_interval
+                != (next_step - this_chunk_k) // cfg.checkpoint_interval
+            )
+            if crossed_checkpoint or next_step >= total_steps:
+                if cfg.local_checkpoints or cfg.hf_repo:
+                    _save_checkpoint(next_step)
+
+            if should_shutdown():
                 _save_checkpoint(next_step)
+                break
+    finally:
+        producer.close()
+        executor.shutdown(wait=False, cancel_futures=True)
 
-        if should_shutdown():
-            _save_checkpoint(next_step)
-            break
+    # Per-bucket step distribution at end of training.
+    print(f"Per-bucket step counts: {bucket_steps}", flush=True)
 
     if push_tracker:
         # `drain_push_queue` reports (timeouts, errors). Only `timeouts`

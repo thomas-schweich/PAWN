@@ -290,3 +290,57 @@ def test_corpus_attn_and_loss_mask_consistency() -> None:
         # are PAD inputs.
         assert np.all(corpus.loss_mask[g, gl:] == False)  # noqa: E712
         assert np.all(corpus.attn_mask[g, gl:] == False)  # noqa: E712
+
+
+# ---------------------------------------------------------------------------
+# A.1 — Bucketing (Corpus.by_bucket)
+# ---------------------------------------------------------------------------
+
+
+def test_corpus_carries_game_lengths() -> None:
+    """A.1 added a game_lengths field; populated from the Rust engine."""
+    corpus = generate_corpus(n_games=4, max_ply=64, seq_len=128, seed=11)
+    assert corpus.game_lengths.shape == (4,)
+    assert corpus.game_lengths.dtype == np.int32
+    # All lengths within [0, max_ply].
+    assert int(corpus.game_lengths.min()) >= 0
+    assert int(corpus.game_lengths.max()) <= 64
+
+
+def test_by_bucket_partitions_by_length() -> None:
+    """`by_bucket` assigns each game to the smallest edge >= its
+    effective length (game_lengths + outcome_offset). Sub-corpora are
+    truncated to the bucket's seq_len."""
+    # Synthetic — control lengths exactly.
+    move_ids, game_lengths = _synthetic_games(5, [3, 6, 10, 15, 30], max_ply=32)
+    outcome_tokens = np.array(
+        [WHITE_CHECKMATES] * 5, dtype=np.int32
+    )
+    corpus = pack_corpus(
+        move_ids, game_lengths, outcome_tokens, seq_len=32, prepend_outcome=False
+    )
+    buckets = corpus.by_bucket((8, 16, 32))
+    # gl=3,6 → bucket 8; gl=10,15 → bucket 16; gl=30 → bucket 32
+    assert set(buckets.keys()) == {8, 16, 32}
+    assert buckets[8].n_games == 2
+    assert buckets[16].n_games == 2
+    assert buckets[32].n_games == 1
+    # Width truncation
+    assert buckets[8].tokens.shape == (2, 8)
+    assert buckets[16].tokens.shape == (2, 16)
+    assert buckets[32].tokens.shape == (1, 32)
+
+
+def test_by_bucket_empty_dict_returns_self_at_full_len() -> None:
+    """No edges → degenerate single-bucket pass-through at seq_len."""
+    corpus = generate_corpus(n_games=4, max_ply=16, seq_len=32, seed=0)
+    buckets = corpus.by_bucket(())
+    assert set(buckets.keys()) == {32}
+    assert buckets[32] is corpus
+
+
+def test_by_bucket_rejects_top_edge_smaller_than_seq_len() -> None:
+    """Top edge must == seq_len so every game fits."""
+    corpus = generate_corpus(n_games=2, max_ply=16, seq_len=32, seed=0)
+    with pytest.raises(ValueError, match="top bucket edge"):
+        corpus.by_bucket((8, 16))

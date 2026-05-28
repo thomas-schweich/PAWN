@@ -58,6 +58,8 @@ __all__ = [
     "MAX_SEQ_LEN",
     "ROPE_BASE",
     "HEAD_DIM",
+    # Bucketing
+    "PRETRAIN_BUCKETS",
     # Configs
     "ModelConfig",
     "NestingError",
@@ -100,6 +102,28 @@ DRAW_BY_TIME: Final[int] = 1979
 
 MAX_SEQ_LEN: Final[int] = 512
 ROPE_BASE: Final[float] = 10000.0
+
+
+# ---------------------------------------------------------------------------
+# A.1 — Length bucketing edges
+# ---------------------------------------------------------------------------
+#
+# Single source of truth for the pretraining bucket-edge schedule. The
+# trainer compiles one program per (bucket, variant) combination and
+# the persistent compilation cache carries the result across runs.
+#
+# Edges are ascending bucket widths in tokens. The top edge MUST equal
+# the trainer's max seq_len (typically MAX_SEQ_LEN). The FLOP-model
+# search in scripts/bench/bucket_search.py over 100k random games at
+# SUPERNET shape gives:
+#     K=2 {384, 512} → 15.6% compute savings
+#     K=3 {256, 384, 512} → 20.4% compute savings  (recommended)
+#     K=4 {128, 256, 384, 512} → 21.8% (diminishing returns)
+#
+# Set this empty tuple to disable bucketing entirely (single T=seq_len
+# bucket). Trainer code handles len==0 by falling through to the
+# unbucketed path.
+PRETRAIN_BUCKETS: Final[tuple[int, ...]] = (256, 384, MAX_SEQ_LEN)
 
 
 # ---------------------------------------------------------------------------
