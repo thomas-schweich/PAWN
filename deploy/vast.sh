@@ -40,7 +40,29 @@ mkdir -p "$VAST_DIR"
 # Default instance settings
 DEFAULT_GPU="RTX_A5000"
 DEFAULT_DISK=100                       # vast.ai uses one disk (no separate volume)
-DEFAULT_IMAGE="thomasschweich/pawn:latest"
+# Default image is branch-aware (H.4): on the JAX migration branch we
+# pick the :jax tag so vast.sh-launched pods get the pre-baked JAX image.
+# Override with --image on the CLI when needed.
+DEFAULT_IMAGE_MAIN="thomasschweich/pawn:latest"
+DEFAULT_IMAGE_JAX="thomasschweich/pawn:jax"
+default_image_for_branch() {
+    local branch=""
+    branch=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    case "$branch" in
+        jax_migration|feat/jax-migration/*)
+            echo "$DEFAULT_IMAGE_JAX"
+            ;;
+        *)
+            echo "$DEFAULT_IMAGE_MAIN"
+            ;;
+    esac
+}
+DEFAULT_IMAGE="$(default_image_for_branch)"
+# Pod-affinity tracker: which (gpu, offer_id) combos we've successfully
+# launched and benchmarked. Subsequent launches prefer hosts in this file
+# so the JAX image's layers are likely already cached. Written by
+# vast.sh launch on success.
+KNOWN_GOOD_FILE="$VAST_DIR/known_good.json"
 DEFAULT_MAX_PRICE=""                   # empty = no cap
 
 # --- Helpers ---
@@ -613,6 +635,61 @@ cmd_deploy() {
     echo "=== Deploy complete ==="
 }
 
+cmd_known_good() {
+    # `vast.sh known_good list` — print the JSON tracker.
+    # `vast.sh known_good record <offer_id> <gpu> <first_step_ms>` — add a row.
+    # Records (offer_id, last_used_utc, gpu, first_step_ms) so subsequent
+    # launches can prefer warm hosts where the :jax image is likely cached.
+    local sub="${1:-list}"
+    shift || true
+    if [ ! -f "$KNOWN_GOOD_FILE" ]; then
+        echo "[]" > "$KNOWN_GOOD_FILE"
+    fi
+    case "$sub" in
+        list)
+            jq . "$KNOWN_GOOD_FILE"
+            ;;
+        record)
+            local offer_id="${1:?Usage: $0 known_good record <offer_id> <gpu> <first_step_ms>}"
+            local gpu="${2:-unknown}"
+            local first_step_ms="${3:-0}"
+            local ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            # jq -n with --arg/--argjson keeps the file as a JSON array,
+            # appending one new entry; drop any prior entry with the same
+            # offer_id so the file doesn't grow unbounded.
+            jq --arg id "$offer_id" \
+               --arg gpu "$gpu" \
+               --arg ts "$ts" \
+               --argjson ms "$first_step_ms" \
+               '[.[] | select(.offer_id != $id)] + [{offer_id: $id, gpu: $gpu, last_used_utc: $ts, first_step_ms: $ms}]' \
+               "$KNOWN_GOOD_FILE" > "$KNOWN_GOOD_FILE.tmp" \
+               && mv "$KNOWN_GOOD_FILE.tmp" "$KNOWN_GOOD_FILE"
+            echo "Recorded offer $offer_id ($gpu, ${first_step_ms}ms)"
+            ;;
+        prefer)
+            # `vast.sh known_good prefer <gpu>` — emit offer IDs (one per
+            # line) that we've previously used for this gpu, sorted by
+            # most-recent first. Caller pipes into vast.sh create --offer-id.
+            local gpu="${1:-}"
+            if [ -z "$gpu" ]; then
+                echo "Usage: $0 known_good prefer <gpu>" >&2
+                exit 1
+            fi
+            jq -r --arg gpu "$gpu" \
+                '[.[] | select(.gpu == $gpu)] | sort_by(.last_used_utc) | reverse | .[].offer_id' \
+                "$KNOWN_GOOD_FILE"
+            ;;
+        clear)
+            echo "[]" > "$KNOWN_GOOD_FILE"
+            echo "Cleared $KNOWN_GOOD_FILE"
+            ;;
+        *)
+            echo "Usage: $0 known_good {list|record|prefer|clear} [args...]" >&2
+            exit 1
+            ;;
+    esac
+}
+
 cmd_launch() {
     local name="${1:?Usage: $0 launch <name> <command...>}"
     shift
@@ -658,6 +735,7 @@ case "${1:-}" in
     setup)   shift; cmd_setup "$@" ;;
     deploy)  shift; cmd_deploy "$@" ;;
     launch)  shift; cmd_launch "$@" ;;
+    known_good|known-good) shift; cmd_known_good "$@" ;;
     *)
         echo "PAWN vast.ai Instance Manager"
         echo ""

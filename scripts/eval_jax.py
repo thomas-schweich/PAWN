@@ -8,16 +8,16 @@ import json
 import sys
 from pathlib import Path
 
-from pawn.checkpoint import load_model
+from pawn.checkpoint import load_model, resolve_checkpoint_source
 from pawn.corpus import generate_corpus
 from pawn.eval import PhaseBoundaries, compute_per_phase_accuracy
-from pawn.legacy import convert_legacy_checkpoint
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="eval_jax")
     ap.add_argument("--checkpoint", required=True,
-                    help="HF repo ID, local v1 checkpoint dir, or v2 dir")
+                    help="v2 HF repo ID or local checkpoint dir. "
+                         "(v1 PyTorch repos require `git checkout v1.0.0`.)")
     ap.add_argument("--n-games", type=int, default=512)
     ap.add_argument("--max-ply", type=int, default=128)
     ap.add_argument("--seq-len", type=int, default=128)
@@ -26,11 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
     ckpt = args.checkpoint
-    if "/" in ckpt and not Path(ckpt).exists():
-        # HF repo ID — convert via legacy.
-        ckpt_path = convert_legacy_checkpoint(ckpt)
-    else:
-        ckpt_path = Path(ckpt)
+    ckpt_path = resolve_checkpoint_source(ckpt)
     model = load_model(ckpt_path)
     corpus = generate_corpus(
         n_games=args.n_games, max_ply=args.max_ply, seq_len=args.seq_len, seed=0

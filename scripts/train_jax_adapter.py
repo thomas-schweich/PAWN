@@ -38,11 +38,10 @@ from pawn.adapters import (
     SpecializedCLMConfig as AdapterSpecializedCLMConfig,
     UnfreezeConfig,
 )
-from pawn.checkpoint import save_model
+from pawn.checkpoint import resolve_checkpoint_source, save_model
 from pawn.config import SUPERNET, TINY_SUPERNET, VARIANTS, TINY_VARIANTS
 from pawn.corpus import generate_corpus
 from pawn.jax_setup import setup_jax_caching
-from pawn.legacy import convert_legacy_checkpoint
 from pawn.lichess_data import load_lichess_corpus
 from pawn.lifecycle import (
     HFPushTracker,
@@ -331,17 +330,17 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.strategy == "specialized_clm":
         # Standalone — no backbone needed.
         backbone = init_model(TINY_SUPERNET, key=0)  # placeholder
-    elif cfg.checkpoint.startswith("thomas-schweich/") or "/" in cfg.checkpoint:
-        # HF repo → convert via legacy.
+    else:
+        # v2-only path. `resolve_checkpoint_source` handles local dirs +
+        # HF repo IDs uniformly; v1 PyTorch repos are no longer loadable
+        # (the legacy converter was removed in the H.2 housekeeping commit).
+        # Users wanting v1 artifacts check out the `v1.0.0` git tag.
         from pawn.checkpoint import load_model
-        converted = convert_legacy_checkpoint(cfg.checkpoint)
-        backbone = load_model(converted)
-        # v1 published checkpoints are standalone (each variant has its own
-        # depth — e.g. pawn-base is 8 layers, pawn-small is 8 layers), so
-        # they don't fit the v2 supernet's "all variants share n_layers"
-        # constraint and can't be sliced. Only slice when the loaded model
-        # *is* a v2 supernet shape — i.e. it has the same n_layers as the
-        # SUPERNET config. Otherwise treat the loaded model as standalone.
+        ckpt_dir = resolve_checkpoint_source(cfg.checkpoint)
+        backbone = load_model(ckpt_dir)
+        # When the loaded model has the supernet's depth we slice into a
+        # variant; otherwise treat it as standalone (e.g., a previously
+        # published from-scratch CLM run).
         target_supernet = TINY_SUPERNET if cfg.supernet == "tiny" else SUPERNET
         looks_like_supernet = backbone.cfg.n_layers == target_supernet.n_layers
         if cfg.variant != "large" and looks_like_supernet:
@@ -351,10 +350,6 @@ def main(argv: list[str] | None = None) -> int:
                 else VARIANTS[cfg.variant]
             )
             backbone = sliced(backbone, variant_cfg)
-    else:
-        # Local checkpoint dir.
-        from pawn.checkpoint import load_model
-        backbone = load_model(Path(cfg.checkpoint))
 
     # Build adapter.
     strategy_cfg = _strategy_config_from_run(cfg)

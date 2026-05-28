@@ -77,13 +77,20 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                          "(force the plain materialised QK^T path). "
                          "Flash is the default on GPU; CPU runs "
                          "auto-fall-back regardless of this flag.")
-    ap.add_argument("--stochastic-variants", action="store_true",
-                    help="enable sandwich-style variant sampling in "
-                         "supernet_joint_loss: always run the supernet "
-                         "plus one randomly-sampled non-supernet variant "
-                         "per step (scaled to keep the gradient unbiased). "
-                         "~10%% throughput at 3-variant production loss; "
-                         "off by default.")
+    # Stochastic supernet sampling is **on by default** (H.1 housekeeping).
+    # Use --no-stochastic-variants to force the exhaustive 3-variant sum
+    # (for parity tests / debug). --stochastic-variants is accepted as a
+    # no-op so existing JSON configs and shell scripts that set it
+    # explicitly still parse.
+    ap.add_argument("--stochastic-variants", dest="stochastic_variants",
+                    action="store_true", default=None,
+                    help="(default) sandwich-sample one non-supernet variant "
+                         "per step; supernet always runs. ~10%% throughput "
+                         "improvement at production 3-variant loss.")
+    ap.add_argument("--no-stochastic-variants", dest="stochastic_variants",
+                    action="store_false",
+                    help="force the deterministic exhaustive sum over all "
+                         "variants (parity / debug only).")
     return ap.parse_args(argv)
 
 
@@ -116,8 +123,11 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
     # `local_checkpoints` handling below.
     if args.use_sdpa:
         base["use_sdpa"] = True
-    if args.stochastic_variants:
-        base["stochastic_variants"] = True
+    # `stochastic_variants` default in argparse is None — only override
+    # the config value when the user explicitly passed --stochastic-variants
+    # or --no-stochastic-variants on the CLI.
+    if args.stochastic_variants is not None:
+        base["stochastic_variants"] = args.stochastic_variants
     if args.no_flash:
         base["use_flash"] = False
     if args.wandb:

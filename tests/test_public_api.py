@@ -180,12 +180,6 @@ def test_lichess_eval_public_surface() -> None:
     } <= set(lichess_eval.__all__)
 
 
-def test_legacy_public_surface() -> None:
-    from pawn import legacy
-
-    assert {"convert_legacy_checkpoint"} <= set(legacy.__all__)
-
-
 def test_lifecycle_public_surface() -> None:
     from pawn import lifecycle
 

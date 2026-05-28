@@ -3,18 +3,17 @@
 This module is the single source of truth for the model's discrete
 dimensions and the vocabulary contract. It is intentionally lightweight
 — a few frozen dataclasses + module-level constants — so it can be
-imported by non-training code (the legacy converter, the dashboard, the
-lab MCP server) without dragging in JAX. The Equinox ``PAWNModel`` in
-:mod:`pawn.model` is built from these configs but does not own them.
+imported by non-training code (the dashboard, the lab MCP server)
+without dragging in JAX. The Equinox ``PAWNModel`` in :mod:`pawn.model`
+is built from these configs but does not own them.
 
 Layout:
 
 - **Vocab constants** (``PAD_TOKEN``, ``OUTCOME_TOKEN_BASE``,
   ``NUM_ACTIONS``, ``VOCAB_SIZE``, the named outcome IDs) — must stay
   in lockstep with ``engine/src/vocab.rs``. Pre-vocab-transition
-  checkpoints used a ~60k-token vocabulary; those are accessible only
-  via the ``pre-vocab-transition`` git tag and are rejected by
-  :func:`pawn.legacy.convert_legacy_checkpoint`.
+  checkpoints used a ~60k-token vocabulary and are not loadable in v2;
+  check out the ``pre-vocab-transition`` git tag to access them.
 - **Sequence + RoPE** (``MAX_SEQ_LEN``, ``ROPE_BASE``).
 - :data:`HEAD_DIM` = 64, fixed across all nested variants so width
   slices align to whole heads and RoPE phase tables are

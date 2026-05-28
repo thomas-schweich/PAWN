@@ -22,9 +22,8 @@ import json
 import sys
 from pathlib import Path
 
-from pawn.checkpoint import load_model
+from pawn.checkpoint import load_model, resolve_checkpoint_source
 from pawn.generation import run_all_diagnostics
-from pawn.legacy import convert_legacy_checkpoint
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -83,10 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     compute_dtype = _DTYPE_MAP[args.compute_dtype]
 
     ckpt = args.checkpoint
-    if "/" in ckpt and not Path(ckpt).exists():
-        ckpt_path = convert_legacy_checkpoint(ckpt)
-    else:
-        ckpt_path = Path(ckpt)
+    ckpt_path = resolve_checkpoint_source(ckpt)
     model = load_model(ckpt_path)
 
     results = run_all_diagnostics(

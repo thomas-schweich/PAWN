@@ -12,9 +12,9 @@ generic "module has no attribute".
 
 The v2 imports are lightweight — `pawn.config` and `pawn.run_config`
 don't pull JAX into the import graph; `pawn.model` does. Consumers
-that need to stay JAX-free (the dashboard, lab MCP, legacy converter
-tests) should import the specific sub-module they need rather than
-relying on this top-level surface.
+that need to stay JAX-free (the dashboard, lab MCP) should import
+the specific sub-module they need rather than relying on this
+top-level surface.
 """
 
 from __future__ import annotations

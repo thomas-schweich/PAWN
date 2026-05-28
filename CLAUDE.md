@@ -9,8 +9,9 @@
 > **Published v1 checkpoints.** `thomas-schweich/pawn-{small,base,large}` are
 > v1 PyTorch artifacts. They stay frozen — v2 republishes to new HF repos
 > (`pawn-{small,base,large}-v2`). The bridge that lets v2 code load the v1
-> repos is `pawn.legacy.convert_legacy_checkpoint`; every benchmark or metric
-> attached to a v1 repo card is a v1 PyTorch number, not a v2 number.
+> repos was `pawn.legacy.convert_legacy_checkpoint`; that bridge was
+> removed in the H.2 housekeeping commit. v1 artifacts are accessible
+> only via the `v1.0.0` git tag.
 
 A causal transformer trained on random chess games, designed as a testbed for
 finetuning and augmentation methods at small scales. Apache 2.0.
@@ -38,7 +39,7 @@ pawn/
 │   ├── lichess_eval.py      # Elo-stratified Maia-style accuracy
 │   ├── eval_suite/          # Edge-case diagnostics, theoretical accuracy bounds, viz helpers
 │   ├── sweep.py             # Standalone Optuna driver (subprocess + in-process objectives)
-│   ├── legacy.py            # Single bridge: v1 torch HF checkpoint → JAX safetensors
+│   ├── # (legacy converter removed in H.2 — use the v1.0.0 git tag for v1 artifacts)
 │   ├── lab/                 # FastMCP lab manager (trial orchestration via pydantic configs)
 │   ├── dashboard/           # Solara dashboard (reads metrics.jsonl)
 │   └── wandb_utils.py       # Optional W&B integration
@@ -150,8 +151,8 @@ whole heads and RoPE is variant-invariant.
 > **Legacy note.** Earlier versions of this codebase used a ~60k-entry move
 > vocabulary. The current code only knows about the 1,968-action vocabulary
 > and the single canonical parquet schema. Pre-vocab-transition checkpoints
-> are rejected loudly by `pawn.legacy.convert_legacy_checkpoint` and are
-> accessible only via the `pre-vocab-transition` git tag.
+> are not loadable in v2; check out the `pre-vocab-transition` git tag if
+> you need them.
 
 ## Training
 
@@ -272,29 +273,25 @@ uv run --extra rocm python scripts/eval_vs_stockfish.py \
 
 Maia-style per-Elo-bin accuracy.
 
-### Compatibility loader (v1 HF → JAX)
+### Loading v2 checkpoints
 
 ```bash
-python -c "from pawn.legacy import convert_legacy_checkpoint; \
-           convert_legacy_checkpoint('thomas-schweich/pawn-base')"
+python -c "from pawn.checkpoint import resolve_checkpoint_source, load_model; \
+           load_model(resolve_checkpoint_source('thomas-schweich/pawn-base-v2'))"
 ```
 
-Reads a v1 torch `.safetensors` checkpoint, transposes linear weights from
-`(out, in)` to `(in, out)` JAX convention, writes a JAX checkpoint under
-`$HF_HOME/pawn-jax-converted/<variant>/`. Cached by content hash. Rejects
-pre-vocab-transition checkpoints loudly. This is the **only** v1↔v2 bridge.
+`resolve_checkpoint_source` accepts either a local directory or a HF repo ID;
+`load_model` reads the v2 safetensors layout. The v1 PyTorch converter
+(`pawn.legacy`) was removed in the H.2 housekeeping commit; v1 artifacts
+(`thomas-schweich/pawn-{small,base,large}`) are only loadable from the
+`v1.0.0` git tag.
 
 ## Checkpoints
 
-Pre-trained weights are hosted on HuggingFace and loaded by repo ID through
-the legacy converter:
-
-- `thomas-schweich/pawn-small` — v1 PyTorch, ~9.5M params
-- `thomas-schweich/pawn-base` — v1 PyTorch, ~35.8M params
-- `thomas-schweich/pawn-large` — v1 PyTorch, ~68.4M params
-
 v2 supernet-derived checkpoints publish to new repos
-(`pawn-{small,base,large}-v2` or similar).
+(`pawn-{small,base,large}-v2` or similar). The v1 artifacts
+(`thomas-schweich/pawn-{small,base,large}`) are PyTorch and not loadable in
+v2; check out the `v1.0.0` git tag if you need them.
 
 ### Checkpoint format (safetensors)
 

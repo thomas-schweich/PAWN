@@ -424,3 +424,31 @@ def load_model(target_dir: Path | str) -> PAWNModel:
     cfg = load_model_config(directory)  # verify + parse cfg
     tensors = st_load(str(directory / MODEL_FILE))
     return _tensor_dict_to_model(tensors, cfg)
+
+
+def resolve_checkpoint_source(source: str) -> Path:
+    """Resolve a checkpoint identifier to a local directory.
+
+    Local paths that exist are returned as-is. Anything else is treated
+    as a HuggingFace repo ID and fetched via
+    :func:`huggingface_hub.snapshot_download`. The result is a directory
+    suitable for :func:`load_model` / :func:`load_model_config`.
+
+    v2 checkpoints only. v1 PyTorch artifacts (the original
+    ``thomas-schweich/pawn-{small,base,large}`` repos) are no longer
+    loadable in v2 — the legacy converter was removed in the H.2
+    housekeeping commit. To use v1 checkpoints, check out the
+    ``v1.0.0`` git tag.
+    """
+    p = Path(source)
+    if p.is_dir():
+        return p
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise RuntimeError(
+            f"checkpoint source {source!r} is not a local directory and "
+            f"huggingface_hub is not installed — pip install huggingface_hub"
+        ) from e
+    local = snapshot_download(repo_id=source, repo_type="model")
+    return Path(local)

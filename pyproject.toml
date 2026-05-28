@@ -43,11 +43,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# GPU backends — each adds the JAX device plugin AND torch (torch is only used
-# by pawn.legacy, the v1-checkpoint compatibility loader; tests for the
-# converter require it). The two GPU extras are mutually exclusive.
+# GPU backends — each adds the JAX device plugin. The two GPU extras are
+# mutually exclusive. (Torch is no longer a runtime dep: the v1
+# checkpoint converter was removed in the H.2 housekeeping commit; we
+# keep the wheel available via `dev-torch` for any one-off tooling that
+# still wants it, but training never pulls it in.)
 rocm = [
-    "torch~=2.10.0",
     "triton-rocm>=3.6.0",
     "triton>=3.6.0",
     # JAX-on-ROCm: system ROCm 7.x runtime + plugin from PyPI. The base
@@ -56,7 +57,6 @@ rocm = [
     "jax-rocm7-plugin==0.10.0",
 ]
 cu128 = [
-    "torch~=2.10.0",
     "jax-cuda12-plugin[with-cuda]==0.10.0",
 ]
 # Solara dashboard for log inspection.
@@ -99,22 +99,16 @@ environments = ["sys_platform == 'linux'"]
 
 [tool.uv.sources]
 chess-engine = { workspace = true }
-torch = [
-    { index = "pytorch-rocm", extra = "rocm" },
-    { index = "pytorch-cu128", extra = "cu128" },
-]
 triton-rocm = [
     { index = "pytorch-rocm", extra = "rocm" },
 ]
 
+# pytorch-rocm carries the triton-rocm wheel even though we no longer
+# depend on torch itself; keep the index pinned so triton resolution is
+# stable across uv lockfile refreshes.
 [[tool.uv.index]]
 name = "pytorch-rocm"
 url = "https://download.pytorch.org/whl/rocm7.1"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 

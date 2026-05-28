@@ -12,9 +12,8 @@ import json
 import sys
 from pathlib import Path
 
-from pawn.checkpoint import load_model
+from pawn.checkpoint import load_model, resolve_checkpoint_source
 from pawn.corpus import Corpus
-from pawn.legacy import convert_legacy_checkpoint
 from pawn.lichess_data import load_lichess_corpus
 from pawn.lichess_eval import (
     EloBin,
@@ -34,10 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
     ckpt = args.checkpoint
-    if "/" in ckpt and not Path(ckpt).exists():
-        ckpt_path = convert_legacy_checkpoint(ckpt)
-    else:
-        ckpt_path = Path(ckpt)
+    ckpt_path = resolve_checkpoint_source(ckpt)
     model = load_model(ckpt_path)
 
     bins = default_elo_bins()

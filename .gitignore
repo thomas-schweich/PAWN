@@ -79,3 +79,8 @@ runs/
 
 # Rust scratch binaries (e.g. `rustc -o rust_out`)
 /rust_out
+
+# Bench results — keep the directory + README but ignore the JSON
+# artifacts (they're large + per-pod ephemeral; commit them only when
+# they anchor a specific perf claim in a PR).
+bench/results/*.json

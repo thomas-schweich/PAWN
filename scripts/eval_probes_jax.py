@@ -11,8 +11,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 
-from pawn.checkpoint import load_model
-from pawn.legacy import convert_legacy_checkpoint
+from pawn.checkpoint import load_model, resolve_checkpoint_source
 from pawn.probes import ProbeConfig, fit_probe
 
 
@@ -26,10 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
     ckpt = args.checkpoint
-    if "/" in ckpt and not Path(ckpt).exists():
-        ckpt_path = convert_legacy_checkpoint(ckpt)
-    else:
-        ckpt_path = Path(ckpt)
+    ckpt_path = resolve_checkpoint_source(ckpt)
     model = load_model(ckpt_path)
     d = model.cfg.d_model
 

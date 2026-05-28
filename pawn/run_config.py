@@ -156,10 +156,11 @@ class BaseRunConfig(BaseModel):
     # 149.06 ms (stochastic), i.e. ~10% throughput improvement. MatFormer
     # / matryoshka-supernet literature shows quality convergence to the
     # full sum at the cost of a small variance increase in the
-    # small-variant gradient signal. Off by default to keep the
-    # deterministic loss surface for tests and parity; flip to True for
-    # production supernet pretraining.
-    stochastic_variants: bool = False
+    # small-variant gradient signal. **On by default** (H.1 housekeeping):
+    # supernet pretraining is the production loss surface and stochastic
+    # sampling is its design intent. Tests that require the deterministic
+    # exhaustive sum opt out explicitly via ``stochastic_variants=False``.
+    stochastic_variants: bool = True
 
     # --- JAX-specific (new in v2) --------------------------------------
     # Which supernet config the run trains / slices from. ``"production"``
@@ -364,11 +365,14 @@ class AdapterConfig(BaseRunConfig):
         "rosa", "rosa-retro-sparse", "rosa-retro-bottleneck",
         "hybrid", "specialized_clm", "unfreeze",
     ]
-    # Which v1 checkpoint to adapt. Loaded through
-    # `pawn.legacy.convert_legacy_checkpoint` when this points at the
-    # published torch repos; loaded directly when this is already a JAX
-    # checkpoint dir.
-    checkpoint: str = "thomas-schweich/pawn-base"
+    # Which v2 checkpoint to adapt. Loaded through
+    # ``pawn.checkpoint.resolve_checkpoint_source`` — accepts a local
+    # directory or a HF repo ID (snapshot-downloaded then read as a v2
+    # safetensors checkpoint). v1 PyTorch artifacts are not loadable in
+    # v2; the legacy converter was removed in the H.2 housekeeping commit.
+    # Defaults to the v2 supernet base slice published from production
+    # pretraining runs.
+    checkpoint: str = "thomas-schweich/pawn-base-v2"
     # Which supernet/variant slice the adapter targets when the
     # checkpoint is supernet-derived. For v1-published checkpoints this
     # is inferred from the checkpoint's own config.
