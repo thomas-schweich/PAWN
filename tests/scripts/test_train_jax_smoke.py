@@ -21,7 +21,6 @@ SCRIPTS = (
     "eval_generation_jax",
     "eval_vs_stockfish",
     "sweep",
-    "convert_published_checkpoints",
     "run_evals_backbone",
 )
 
