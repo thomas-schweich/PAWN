@@ -222,7 +222,11 @@ wait_for_instance_running() {
     # necessary and sufficient. We gate the SSH attempt on having an
     # endpoint rather than on a status string, so a null actual_status
     # can't wedge the loop.
-    for i in $(seq 1 90); do
+    # ~12.5 min: the :jax runtime image is multi-GB, and a cold host needs
+    # to pull + extract it before the container's sshd comes up and the
+    # direct 22/tcp port maps. 7.5 min was routinely too short and produced
+    # false "timeout" reports on instances that were merely still pulling.
+    for i in $(seq 1 150); do
         local json dhost dport phost pport host port
         json=$(instance_json "$instance_id" || true)
         # Direct endpoint (preferred — proxy swallows stdin on non-interactive
