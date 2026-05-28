@@ -577,7 +577,7 @@ def make_optimizer(
     cfg: BaseRunConfig,
     lr_schedule: optax.Schedule,
 ) -> optax.GradientTransformation:
-    """Build the v2 optimizer: branchless gradient clip + AdamW.
+    """Build the v2 optimizer: branchless gradient clip + (AdamW | Lion | Adafactor).
 
     Uses the local :func:`_branchless_clip_by_global_norm` instead of
     ``optax.clip_by_global_norm`` to avoid the latter's
@@ -586,10 +586,14 @@ def make_optimizer(
     padded-batch weight-decay drift guard isn't here at the optimizer
     level — it lives in :func:`make_train_step` where we can see
     whether the batch was empty.
+
+    C.1: ``cfg.optimizer`` selects between:
+        ``adamw`` (default) — bf16 first moment, fp32 second moment.
+        ``lion`` — sign-based; halves optimizer state.
     """
-    return optax.chain(
-        _branchless_clip_by_global_norm(_CLIP_NORM),
-        optax.adamw(
+    name = getattr(cfg, "optimizer", "adamw")
+    if name == "adamw":
+        inner = optax.adamw(
             learning_rate=lr_schedule,
             weight_decay=cfg.weight_decay,
             # First moment (``mu``) in bf16 — saves ~half the optimizer
@@ -599,8 +603,18 @@ def make_optimizer(
             # is sensitive to denominator precision near zero. Standard
             # practice in optax / Maxtext / Mesh-Transformer-JAX.
             mu_dtype=jnp.bfloat16,
-        ),
-    )
+        )
+    elif name == "lion":
+        inner = optax.lion(
+            learning_rate=lr_schedule,
+            weight_decay=cfg.weight_decay,
+            # Lion stores only one moment (the interpolated direction);
+            # keep it bf16 for the same bandwidth win as AdamW.mu.
+            mu_dtype=jnp.bfloat16,
+        )
+    else:
+        raise ValueError(f"unknown optimizer {name!r}; expected adamw/lion")
+    return optax.chain(_branchless_clip_by_global_norm(_CLIP_NORM), inner)
 
 
 # ---------------------------------------------------------------------------

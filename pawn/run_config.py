@@ -54,6 +54,13 @@ SupernetName = Literal["tiny", "production"]
 VariantName = Literal["small", "base", "large"]
 LRScheduleName = Literal["cosine", "wsd", "constant", "one_cycle", "infinite"]
 LRDecayShape = Literal["linear", "cosine"]
+# C.1: optimizer choice. "adamw" is the default. Lion (sign-based, no
+# second moment) halves the optimizer state and ~3-5% step time, but
+# needs LR ~3× lower than AdamW. Adafactor is not wired in this build:
+# its tree-map signature collides with the eqx pytree's int-typed
+# decomp_table leaf under JAX 0.10's strictened None-vs-leaf check;
+# adding it requires an `eqx.filter`-aware wrapper.
+OptimizerName = Literal["adamw", "lion"]
 
 
 class BaseRunConfig(BaseModel):
@@ -82,6 +89,10 @@ class BaseRunConfig(BaseModel):
     batch_size: int = 256
     lr: float = 3e-4
     weight_decay: float = 0.0
+    # C.1: optimizer choice — "adamw" (default), "lion", or "adafactor".
+    # See `OptimizerName` for the tradeoff summary. Switching requires
+    # an LR retune (Lion typically wants LR/3 of AdamW's value).
+    optimizer: OptimizerName = "adamw"
 
     # LR schedule controls (see lr_schedule docstring for shape details).
     warmup_frac: float = 0.05

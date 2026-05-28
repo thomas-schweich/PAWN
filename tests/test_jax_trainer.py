@@ -578,6 +578,57 @@ def test_train_step_accumulation_steps_rejects_zero() -> None:
 
 
 # ---------------------------------------------------------------------------
+# C.1 — optimizer dispatch (adamw / lion / adafactor)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("optimizer_name", ["adamw", "lion"])
+def test_make_optimizer_dispatches_by_name(optimizer_name: str) -> None:
+    """Each optimizer choice builds a working chain that initializes
+    and updates the tiny model without crashing."""
+    model = _tiny_model()
+    cfg = _make_cfg(
+        lr=1e-4 if optimizer_name == "adamw" else 3e-5,
+        weight_decay=0.0 if optimizer_name == "lion" else 0.01,
+        optimizer=optimizer_name,  # type: ignore[arg-type]
+        # constant schedule + warmup_frac=0 so step 0 has a non-zero
+        # LR (otherwise the optimizer does nothing on the first step).
+        lr_schedule="constant", warmup_frac=0.0,
+    )
+    schedule = make_lr_schedule(cfg, total_steps=100)
+    opt = make_optimizer(cfg, schedule)
+    state = TrainState(
+        model=model,
+        opt_state=opt.init(eqx.filter(model, eqx.is_inexact_array)),
+        step=jnp.int32(0),
+        key=jax.random.key(0),
+    )
+    variants = _tiny_variants()
+    train_step = make_train_step(opt, variants)
+    batch = _small_batch()
+    lm_head_before = np.asarray(model.lm_head)
+    new_state, loss = train_step(state, batch)
+    assert int(new_state.step) == 1
+    assert jnp.isfinite(loss)
+    assert not np.array_equal(
+        lm_head_before, np.asarray(new_state.model.lm_head)
+    )
+
+
+def test_make_optimizer_rejects_unknown_name() -> None:
+    """Unknown optimizer names raise loudly at build time."""
+    model = _tiny_model()
+    cfg = _make_cfg()
+    # `optimizer` is a Literal field — pydantic rejects unknown values at
+    # parse time. The runtime check fires when the field is bypassed
+    # (e.g., a test setting it via object.__setattr__).
+    object.__setattr__(cfg, "optimizer", "adafactor")
+    schedule = make_lr_schedule(cfg, total_steps=100)
+    with pytest.raises(ValueError, match="unknown optimizer"):
+        make_optimizer(cfg, schedule)
+
+
+# ---------------------------------------------------------------------------
 # Smoke: small-scale training run with loss-decreasing assertion
 # ---------------------------------------------------------------------------
 
