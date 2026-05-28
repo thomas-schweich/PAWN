@@ -111,6 +111,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                     help="(C.5 spike) log per-step pre-clip grad norm "
                          "alongside loss. Slight per-step overhead from "
                          "emitting an extra scalar per body call.")
+    ap.add_argument("--optimizer", choices=("adamw", "lion"), default=None,
+                    help="(C.1) optimizer to use. Lion halves opt-state "
+                         "memory + ~3-5%% step time but needs LR ~1/3 of "
+                         "AdamW's. Default is adamw.")
     return ap.parse_args(argv)
 
 
@@ -143,6 +147,8 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
     # `local_checkpoints` handling below.
     if args.use_sdpa:
         base["use_sdpa"] = True
+    if args.optimizer is not None:
+        base["optimizer"] = args.optimizer
     # `stochastic_variants` default in argparse is None — only override
     # the config value when the user explicitly passed --stochastic-variants
     # or --no-stochastic-variants on the CLI.

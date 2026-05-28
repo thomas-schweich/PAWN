@@ -45,9 +45,9 @@ uv run --extra cu128 python scripts/bench/run.py \
     --k 50 --warmup-outers 2 --timed-outers 30 \
     --label "${LABEL}-matrix"
 
-# Step 3: end-to-end bucketed vs no-bucketing
+# Step 3: end-to-end bucketed vs no-bucketing — all features on
 echo
-echo "==> Step 3a: end-to-end bucketed (default)"
+echo "==> Step 3a: end-to-end bucketed (default, AdamW, no grad-norm emit)"
 rm -rf logs/5090-bucketed 2>/dev/null
 uv run --extra cu128 python scripts/train_jax.py \
     --supernet production --total-steps 500 --batch-size 64 --seq-len 512 --k 50 \
@@ -59,6 +59,15 @@ rm -rf logs/5090-nobucket 2>/dev/null
 uv run --extra cu128 python scripts/train_jax.py \
     --supernet production --total-steps 500 --batch-size 64 --seq-len 512 --k 50 \
     --no-bucketing --local-checkpoints --logs-dir logs/5090-nobucket
+
+echo
+echo "==> Step 3c: end-to-end with all opt-ins (Lion + emit_grad_norms)"
+rm -rf logs/5090-allopt 2>/dev/null
+uv run --extra cu128 python scripts/train_jax.py \
+    --supernet production --total-steps 500 --batch-size 64 --seq-len 512 --k 50 \
+    --optimizer lion --lr 1e-4 \
+    --emit-grad-norms \
+    --local-checkpoints --logs-dir logs/5090-allopt
 
 echo
 echo "===================================================="
