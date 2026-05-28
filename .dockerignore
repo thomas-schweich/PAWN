@@ -1,6 +1,18 @@
+# Build context exclusions. Mirrors .gitignore for the heavy local-only
+# dirs that would otherwise be shipped into BuildKit AND baked into the
+# runtime image via `COPY . .` (the runtime stage copies the whole repo).
+#
+# Without these, a single build sends 90+ GB of context and the image
+# carries every checkpoint / log / data shard ever produced locally.
+
+# VCS + editor noise
 .git
 .claude
 !.claude/skills
+.idea
+.vscode
+
+# Python build artifacts and caches
 .venv
 .env
 __pycache__
@@ -8,9 +20,29 @@ __pycache__
 *.pyo
 *.egg-info
 .mypy_cache
+.pytest_cache
+.ruff_cache
+.uv-cache
+pytest-of-*
+
+# Rust build artifacts
 target
 engine/target
+rust_out
 *.so
+
+# Local-only data + working directories (all gitignored)
+local/
+runs/
 data/
 checkpoints/
 logs/
+export/
+dist/
+deploy/pawn-deploy/
+pawn-lichess-cache/
+
+# Large local archives
+*.tar.gz
+*.zst
+*.zip
