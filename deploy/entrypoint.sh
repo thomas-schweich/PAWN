@@ -42,6 +42,13 @@ fi
 # tini (PID 1) reaps zombies and forwards signals.
 if [ -x "$(command -v sshd)" ]; then
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+    # Generate host keys on first boot. Without these, `sshd -D` exits
+    # immediately ("sshd: no hostkeys available — exiting") and port 22
+    # never opens — which looks like a host failure (connection refused,
+    # no SSH) on platforms that run our entrypoint as-is (vast.ai). RunPod
+    # masks this with its own SSH provisioning; vast does not. `-A` is a
+    # no-op when the keys already exist. Mirrors Dockerfile.datagen.
+    ssh-keygen -A 2>/dev/null || true
     echo "PAWN container ready — starting sshd"
     exec /usr/sbin/sshd -D
 fi
