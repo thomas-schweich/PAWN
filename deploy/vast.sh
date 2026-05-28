@@ -477,7 +477,13 @@ cmd_create() {
         # deploy. The documented opt-out is to touch
         # ~/.no_auto_tmux on the pod. Belt-and-suspenders: do it for
         # both /root and /home/pawn so the dev image also benefits.
-        --onstart-cmd 'touch /root/.no_auto_tmux 2>/dev/null; touch /home/pawn/.no_auto_tmux 2>/dev/null; chown pawn:pawn /home/pawn/.no_auto_tmux 2>/dev/null; true'
+        # Also strip group/other write from /root + ~/.ssh: some vast hosts
+        # hand the container a group/world-writable /root, which makes sshd
+        # StrictModes reject an otherwise-correct authorized_keys
+        # ("bad ownership or modes ... Permission denied (publickey)"). The
+        # image entrypoint hardens this too; doing it in onstart as well
+        # covers older images and any platform-injected keys.
+        --onstart-cmd 'touch /root/.no_auto_tmux 2>/dev/null; touch /home/pawn/.no_auto_tmux 2>/dev/null; chown pawn:pawn /home/pawn/.no_auto_tmux 2>/dev/null; chmod go-w /root 2>/dev/null; chmod 700 /root/.ssh 2>/dev/null; chmod 600 /root/.ssh/authorized_keys 2>/dev/null; true'
         --env "$env_str"
     )
 

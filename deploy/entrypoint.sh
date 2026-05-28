@@ -24,6 +24,23 @@ if [ -n "${PUBLIC_KEY:-}" ]; then
     chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
 fi
 
+# ── Harden the authorized_keys chain (StrictModes) ───────────────────
+# sshd refuses a key file ("bad ownership or modes for file
+# /root/.ssh/authorized_keys") if the file, ~/.ssh, OR any parent dir —
+# notably $HOME / /root itself — is group/world-writable or wrongly
+# owned. Some vast.ai hosts hand the container a group/world-writable
+# /root, so an otherwise-correct authorized_keys is rejected and every
+# login fails with "Permission denied (publickey)" despite the key being
+# present. Strip group/other write from the whole chain and fix
+# ownership. Runs unconditionally (covers keys injected by the platform,
+# not just our PUBLIC_KEY block).
+if [ -f ~/.ssh/authorized_keys ]; then
+    chown -R "$(id -u):$(id -g)" ~/.ssh 2>/dev/null || true
+    chmod go-w "$HOME" 2>/dev/null || true
+    chmod 700 ~/.ssh 2>/dev/null || true
+    chmod 600 ~/.ssh/authorized_keys 2>/dev/null || true
+fi
+
 # ── CUDA MPS (multi-process service for GPU sharing) ───────────────
 if command -v nvidia-cuda-mps-control &>/dev/null; then
     nvidia-cuda-mps-control -d 2>/dev/null && echo "CUDA MPS daemon started" \
