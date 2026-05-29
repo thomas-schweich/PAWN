@@ -216,6 +216,69 @@ def test_scan_local_dir_rejects_empty_dir(tmp_path: Path) -> None:
         _scan_parquet(str(tmp_path), "train")
 
 
+def test_hf_scan_failure_does_not_bulk_download_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the native hf:// lazy scan fails, the bulk-download fallback
+    (hf_hub_download of every shard — 262 GB for pawn-lichess-full) must
+    NOT run implicitly. Default: raise a clear opt-in error and never
+    touch huggingface_hub."""
+    import pawn.lichess_data as ld
+
+    def _boom(url: object, *a: object, **k: object) -> object:
+        raise OSError("hf:// unsupported on this build")
+
+    monkeypatch.setattr(ld.pl, "scan_parquet", _boom)
+    monkeypatch.delenv("PAWN_ALLOW_BULK_DOWNLOAD", raising=False)
+
+    # Guard: if the gate leaks through, importing/using huggingface_hub
+    # would be the 262 GB mistake — make that loud rather than networked.
+    def _must_not_call(*a: object, **k: object) -> object:  # pragma: no cover
+        raise AssertionError("bulk-download fallback ran without opt-in")
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _must_not_call)
+
+    with pytest.raises(RuntimeError, match="PAWN_ALLOW_BULK_DOWNLOAD"):
+        ld._scan_parquet("thomas-schweich/pawn-lichess-full", "train")
+
+
+def test_hf_scan_failure_bulk_download_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With PAWN_ALLOW_BULK_DOWNLOAD=1, a failed native scan proceeds to
+    the download fallback (gate opens)."""
+    import pawn.lichess_data as ld
+
+    calls: list[str] = []
+
+    def _boom_on_hf(url: object, *a: object, **k: object) -> object:
+        if isinstance(url, str) and url.startswith("hf://"):
+            raise OSError("hf:// unsupported")
+        return "scanned-local"  # the post-download scan
+
+    monkeypatch.setattr(ld.pl, "scan_parquet", _boom_on_hf)
+    monkeypatch.setenv("PAWN_ALLOW_BULK_DOWNLOAD", "1")
+
+    import huggingface_hub
+
+    class _FakeApi:
+        def list_repo_files(self, *a: object, **k: object) -> list[str]:
+            return ["data/train-0.parquet", "data/train-1.parquet"]
+
+    def _fake_dl(repo: str, pf: str, *a: object, **k: object) -> str:
+        calls.append(pf)
+        return f"/tmp/{pf}"
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _fake_dl)
+
+    result = ld._scan_parquet("thomas-schweich/pawn-lichess-full", "train")
+    assert result == "scanned-local"
+    assert calls == ["data/train-0.parquet", "data/train-1.parquet"]
+
+
 # ---------------------------------------------------------------------------
 # Cache: round-trip + cache-key sensitivity
 # ---------------------------------------------------------------------------

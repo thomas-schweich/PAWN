@@ -148,7 +148,27 @@ def _scan_parquet(source: str, split: str) -> pl.LazyFrame:
     # the hf:// scheme being unsupported on this polars build / the
     # data/ prefix being wrong on this dataset layout. Network errors,
     # auth failures, malformed parquet bodies — those propagate.
-    except (OSError, ValueError, FileNotFoundError, RuntimeError):
+    except (OSError, ValueError, FileNotFoundError, RuntimeError) as exc:
+        # The native hf:// lazy scan failed. The fallback below downloads
+        # EVERY shard for the split via huggingface_hub — for
+        # `pawn-lichess-full` that is 262 GB. Unlike the lazy scan (which
+        # range-streams only the projected columns + sliced row-groups it
+        # needs), this pulls whole files, so it must never run implicitly:
+        # a single failed scan would silently saturate a metered link.
+        # Gate it behind an explicit opt-in; default to a clear error.
+        if os.environ.get("PAWN_ALLOW_BULK_DOWNLOAD") != "1":
+            raise RuntimeError(
+                f"Native hf:// lazy scan of dataset {source!r} "
+                f"(split={split!r}) failed: {type(exc).__name__}: {exc}.\n"
+                "The fallback that downloads every shard via "
+                "huggingface_hub is disabled by default — it can pull the "
+                "entire dataset (pawn-lichess-full is 262 GB) over the "
+                "network. To opt in, re-run with "
+                "PAWN_ALLOW_BULK_DOWNLOAD=1. Better: pre-download the "
+                "shard(s) you need and pass a local directory as --pgn, or "
+                "fix the hf:// scan so it streams lazily."
+            ) from exc
+
         from huggingface_hub import HfApi, hf_hub_download
 
         api = HfApi()
