@@ -419,9 +419,12 @@ def test_train_step_updates_params_and_advances_step() -> None:
     """A single train step runs end-to-end, advances step, returns
     finite loss."""
     model = _tiny_model()
-    # Snapshot lm_head BEFORE the train step — `donate="all"` on the
+    # Snapshot embed_tokens BEFORE the train step — `donate="all"` on the
     # JIT will delete the original buffer, so a later read would raise.
-    lm_head_before = np.asarray(model.lm_head)
+    # TINY_SUPERNET ties embeddings (lm_head is None), so embed_tokens is
+    # the trainable token table *and* the output head (logits reuse its
+    # transpose); its drift covers head drift.
+    embed_tokens_before = np.asarray(model.embed_tokens)
     state, opt = _tiny_train_state(model)
     variants = _tiny_variants()
     train_step = make_train_step(opt, variants)
@@ -430,7 +433,7 @@ def test_train_step_updates_params_and_advances_step() -> None:
     assert int(new_state.step) == 1
     assert jnp.isfinite(loss)
     # Model changed.
-    assert not np.array_equal(lm_head_before, np.asarray(new_state.model.lm_head))
+    assert not np.array_equal(embed_tokens_before, np.asarray(new_state.model.embed_tokens))
 
 
 def test_train_step_jit_does_not_retrace_across_steps() -> None:
@@ -454,9 +457,10 @@ def test_train_step_padded_batch_does_not_drift_params() -> None:
     when `loss_mask.sum() == 0`, the optimizer is skipped entirely
     and `weight_decay * model_params` shouldn't apply."""
     model = _tiny_model()
-    # Snapshot params before donation deletes them.
-    lm_head_before = np.asarray(model.lm_head)
-    embed_src_before = np.asarray(model.embed_src)
+    # Snapshot params before donation deletes them. TINY_SUPERNET ties
+    # embeddings, so `embed_tokens` carries the token table and the tied
+    # head; no standalone `lm_head` exists.
+    embed_tokens_before = np.asarray(model.embed_tokens)
     cfg = _make_cfg(lr=1e-3, weight_decay=0.1)  # nontrivial wd
     sched = make_lr_schedule(cfg, total_steps=100)
     opt = make_optimizer(cfg, sched)
@@ -479,8 +483,9 @@ def test_train_step_padded_batch_does_not_drift_params() -> None:
     )
     state_after_empty, _ = train_step(state, empty_batch)
     # Params should be byte-identical (no weight-decay drift).
-    assert np.array_equal(lm_head_before, np.asarray(state_after_empty.model.lm_head))
-    assert np.array_equal(embed_src_before, np.asarray(state_after_empty.model.embed_src))
+    assert np.array_equal(
+        embed_tokens_before, np.asarray(state_after_empty.model.embed_tokens)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +537,9 @@ def test_train_step_accumulation_steps_eq_one_matches_baseline() -> None:
     s_base, l_base = ts_baseline(state_a, batch_a)
     s_n1, l_n1 = ts_n1(state_b, batch_b)
     assert jnp.allclose(l_base, l_n1, rtol=0, atol=1e-6)
-    assert jnp.allclose(s_base.model.lm_head, s_n1.model.lm_head,
+    # TINY_SUPERNET ties embeddings (lm_head is None); compare the shared
+    # embed_tokens table, which is both the trainable weight and the head.
+    assert jnp.allclose(s_base.model.embed_tokens, s_n1.model.embed_tokens,
                         rtol=0, atol=1e-6)
 
 
@@ -547,7 +554,7 @@ def test_train_step_accumulation_steps_eq_2_runs() -> None:
     moves the parameters.
     """
     model = _tiny_model()
-    lm_head_before = np.asarray(model.lm_head)
+    embed_tokens_before = np.asarray(model.embed_tokens)
     state, opt = _tiny_train_state(model)
     variants = _tiny_variants()
     ts_acc = make_train_step(
@@ -565,7 +572,9 @@ def test_train_step_accumulation_steps_eq_2_runs() -> None:
     new_state, loss = ts_acc(state, stacked)
     assert int(new_state.step) == 1
     assert jnp.isfinite(loss)
-    assert not np.array_equal(lm_head_before, np.asarray(new_state.model.lm_head))
+    assert not np.array_equal(
+        embed_tokens_before, np.asarray(new_state.model.embed_tokens)
+    )
 
 
 def test_train_step_accumulation_steps_rejects_zero() -> None:
@@ -606,12 +615,12 @@ def test_make_optimizer_dispatches_by_name(optimizer_name: str) -> None:
     variants = _tiny_variants()
     train_step = make_train_step(opt, variants)
     batch = _small_batch()
-    lm_head_before = np.asarray(model.lm_head)
+    embed_tokens_before = np.asarray(model.embed_tokens)
     new_state, loss = train_step(state, batch)
     assert int(new_state.step) == 1
     assert jnp.isfinite(loss)
     assert not np.array_equal(
-        lm_head_before, np.asarray(new_state.model.lm_head)
+        embed_tokens_before, np.asarray(new_state.model.embed_tokens)
     )
 
 

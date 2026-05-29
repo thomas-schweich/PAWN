@@ -2,17 +2,22 @@
 
 The on-disk layout for one checkpoint directory ``step_<N>/`` is:
 
-- ``model.safetensors`` — exactly the 16 trainable arrays listed in
-  :data:`pawn.model.SAVED_FIELDS`, in declaration order. The
+- ``model.safetensors`` — the trainable arrays listed in
+  :func:`pawn.model.saved_fields` for the config's ``tie_embeddings``,
+  in declaration order. A tied model omits ``lm_head`` (logits reuse
+  ``embed_tokens.T``); an untied model includes it. The
   :class:`pawn.model.PAWNModel` :attr:`decomp_table` buffer is *not*
   saved — it's rebuilt at load time from the engine vocab. RoPE phase
   tables aren't stored at all (they're a function of cfg, recomputed
   inside the forward pass).
-- ``config.json`` — ``{"version": 1, "model": {ModelConfig fields},
-  "run": {optional user-supplied dict}}``. The ``model`` block is
-  enough to reconstruct a fresh ``PAWNModel`` and align the loaded
-  tensors; the ``run`` block is reserved for the pydantic run config
-  (filled in by the trainer in S6).
+- ``config.json`` — ``{"version": 1, "mask_version": M,
+  "model": {ModelConfig fields}, "run": {optional user-supplied dict}}``.
+  The ``model`` block (which carries ``tie_embeddings`` + ``vocab_size``)
+  is enough to reconstruct a fresh ``PAWNModel`` and align the loaded
+  tensors; the ``run`` block carries the run config (the run's
+  ``conditioning`` + derived ``C``), returned by :func:`load_model` so
+  eval can rebuild the checkpoint's own sequence layout. ``mask_version``
+  is the layout/loss-mask contract tag (Chunk 4 owns its value).
 - ``optimizer.safetensors`` (optional) — flattened Optax state, written
   by :func:`save_model` when the caller passes an ``optimizer_state``
   dict. Skipped if absent. (Trainer integration arrives in S6.)
@@ -45,15 +50,16 @@ Read workflow:
    confirms the manifest. Raises :class:`IncompleteCheckpointError` if
    ``.complete`` is missing, :class:`CheckpointIntegrityError` on any
    mismatch.
-2. Parse ``config.json`` → :class:`ModelConfig`.
-3. Load the 16 tensors from ``model.safetensors`` and rebuild
+2. Parse ``config.json`` → :class:`ModelConfig` + run block.
+3. Load the per-config tensors from ``model.safetensors`` and rebuild
    :class:`PAWNModel` with them + the recomputed decomp table.
 
-:mod:`pawn.model` asserts ``len(SAVED_FIELDS) == 16`` at its own
-import. Importing this module triggers ``pawn.model`` first, so the
-same drift guard fires before ``pawn.checkpoint`` is fully loaded; a
-typo'd or extra field surfaces as an ``AssertionError`` at startup,
-not at save/load time.
+:mod:`pawn.model` asserts ``len(SAVED_FIELDS) == 12`` (the untied
+superset) at its own import, and :func:`pawn.model.saved_fields`
+derives the per-config schema from it. Importing this module triggers
+``pawn.model`` first, so the same drift guard fires before
+``pawn.checkpoint`` is fully loaded; a typo'd or extra field surfaces
+as an ``AssertionError`` at startup, not at save/load time.
 """
 
 from __future__ import annotations
@@ -79,20 +85,22 @@ from pawn._sentinel import (
 )
 from pawn.config import ModelConfig
 from pawn.model import (
-    SAVED_FIELDS,
     PAWNModel,
     TransformerLayer,
     _build_decomp_table,
+    saved_fields,
 )
 
-# pawn.model already asserts `len(SAVED_FIELDS) == 16` at import. Importing
-# checkpoint always imports model first, so that one assertion is the
+# pawn.model already asserts the untied superset has 12 fields at import,
+# and `saved_fields(tie_embeddings)` derives the per-config schema from it.
+# Importing checkpoint always imports model first, so that assertion is the
 # canonical guard against schema drift; no need to duplicate it here.
-# The test `test_save_schema_is_sixteen_fields` re-pins the contract at
-# the checkpoint API layer for documentation.
+# The test `test_save_schema_field_count` re-pins the contract at the
+# checkpoint API layer for documentation.
 
 __all__ = [
     "CHECKPOINT_FORMAT_VERSION",
+    "MASK_VERSION",
     "MODEL_FILE",
     "CONFIG_FILE",
     "OPTIMIZER_FILE",
@@ -106,6 +114,14 @@ __all__ = [
 
 
 CHECKPOINT_FORMAT_VERSION: Final[int] = 1
+
+# Layout/mask contract version baked into every ``config.json``. Chunk 4 of
+# the Phase-A redesign owns the value: it bumps this whenever the prefix
+# assembly / loss-mask / position convention changes, and the data layer
+# bakes it into the lichess cache key. A load-time assert (Chunk 4) refuses
+# a checkpoint whose ``mask_version`` doesn't match the builder's. Until the
+# conditioning prefix lands, the layout is the un-prefixed v1 contract → 0.
+MASK_VERSION: Final[int] = 0
 
 MODEL_FILE: Final[str] = "model.safetensors"
 CONFIG_FILE: Final[str] = "config.json"
@@ -122,12 +138,13 @@ def _model_to_tensor_dict(model: PAWNModel) -> dict[str, np.ndarray]:
     """Flatten a :class:`PAWNModel` into a name → numpy-array dict for
     safetensors.
 
-    Keys are the dotted paths from :data:`SAVED_FIELDS`. Arrays are
+    Keys are the dotted paths from :func:`saved_fields` for the model's
+    ``tie_embeddings`` setting (tied models omit ``lm_head``). Arrays are
     materialised via :func:`numpy.asarray` (block until device transfer
     completes).
     """
     tensors: dict[str, np.ndarray] = {}
-    for path in SAVED_FIELDS:
+    for path in saved_fields(model.cfg.tie_embeddings):
         node: Any = model
         for piece in path.split("."):
             node = getattr(node, piece)
@@ -141,13 +158,39 @@ def _tensor_dict_to_model(
 ) -> PAWNModel:
     """Rebuild a :class:`PAWNModel` from its loaded tensors + config.
 
-    Validates that every name in :data:`SAVED_FIELDS` is present in the
-    dict, and that every tensor's shape matches the expected
-    ``cfg``-derived shape (catches a checkpoint produced by a model of
-    a different size before the array is silently broadcast somewhere).
+    Validates that every name in :func:`saved_fields` (for ``cfg``'s
+    ``tie_embeddings``) is present in the dict, and that every tensor's
+    shape matches the expected ``cfg``-derived shape (catches a checkpoint
+    produced by a model of a different size before the array is silently
+    broadcast somewhere).
+
+    Tied↔untied cross-load is a hard error: a tied checkpoint omits
+    ``lm_head`` while an untied one includes it, so the missing/extra-tensor
+    guards below already fire on a mismatch — but we raise an explicit,
+    actionable message first so the failure mode is obvious rather than
+    surfacing as a bare "missing lm_head".
     """
-    saved_set = set(SAVED_FIELDS)
+    expected_fields = saved_fields(cfg.tie_embeddings)
+    saved_set = set(expected_fields)
     tensor_set = set(tensors.keys())
+
+    # Tied↔untied cross-load: detect via the lone differing field (lm_head)
+    # and raise a targeted error before the generic missing/extra messages.
+    has_lm_head = "lm_head" in tensor_set
+    if cfg.tie_embeddings and has_lm_head:
+        raise CheckpointIntegrityError(
+            "checkpoint carries an `lm_head` tensor but the saved ModelConfig "
+            "has tie_embeddings=True (tied models reuse embed_tokens.T and "
+            "store no lm_head); refusing to load an untied checkpoint into a "
+            "tied config"
+        )
+    if not cfg.tie_embeddings and not has_lm_head:
+        raise CheckpointIntegrityError(
+            "checkpoint has no `lm_head` tensor but the saved ModelConfig has "
+            "tie_embeddings=False (untied models need a standalone lm_head); "
+            "refusing to load a tied checkpoint into an untied config"
+        )
+
     missing = sorted(saved_set - tensor_set)
     extras = sorted(tensor_set - saved_set)
     if missing:
@@ -182,36 +225,33 @@ def _tensor_dict_to_model(
         w_up=jnp_at("layers.w_up"),
         w_down=jnp_at("layers.w_down"),
     )
+    lm_head = None if cfg.tie_embeddings else jnp_at("lm_head")
     return PAWNModel(
-        embed_src=jnp_at("embed_src"),
-        embed_dst=jnp_at("embed_dst"),
-        embed_promo=jnp_at("embed_promo"),
-        embed_pad=jnp_at("embed_pad"),
-        embed_outcome=jnp_at("embed_outcome"),
+        embed_tokens=jnp_at("embed_tokens"),
         layers=layers,
         final_norm_w=jnp_at("final_norm_w"),
-        lm_head=jnp_at("lm_head"),
+        lm_head=lm_head,
         decomp_table=_build_decomp_table(),
         cfg=cfg,
     )
 
 
 def _expected_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
-    """Map every :data:`SAVED_FIELDS` name to the shape implied by ``cfg``.
+    """Map every :func:`saved_fields` name (for ``cfg``'s ``tie_embeddings``)
+    to the shape implied by ``cfg``.
 
     Used at load time to refuse a tensor whose shape doesn't match the
-    ``ModelConfig`` we just parsed from ``config.json``.
+    ``ModelConfig`` we just parsed from ``config.json``. The factored
+    embedding tables (``embed_src/dst/promo``) are gone — the uniform
+    ``embed_tokens[V, d]`` table replaces them, so the 64/64/5 literals
+    no longer appear here. ``lm_head`` is only expected for untied configs.
     """
     d = cfg.d_model
     d_ff = cfg.d_ff
     L = cfg.n_layers
     V = cfg.vocab_size
-    return {
-        "embed_src": (64, d),
-        "embed_dst": (64, d),
-        "embed_promo": (5, d),
-        "embed_pad": (d,),
-        "embed_outcome": (cfg.n_outcomes, d),
+    shapes: dict[str, tuple[int, ...]] = {
+        "embed_tokens": (V, d),
         "layers.attn_norm_w": (L, d),
         "layers.wq": (L, d, d),
         "layers.wk": (L, d, d),
@@ -222,8 +262,10 @@ def _expected_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
         "layers.w_up": (L, d, d_ff),
         "layers.w_down": (L, d_ff, d),
         "final_norm_w": (d,),
-        "lm_head": (d, V),
     }
+    if not cfg.tie_embeddings:
+        shapes["lm_head"] = (d, V)
+    return shapes
 
 
 def _cfg_to_dict(cfg: ModelConfig) -> dict[str, Any]:
@@ -310,9 +352,17 @@ def save_model(
         tensors = _model_to_tensor_dict(model)
         st_save(tensors, str(tmp / MODEL_FILE))
 
-        # 2. config.json
-        payload = {
+        # 2. config.json. ``version`` is the checkpoint *format* version;
+        # ``mask_version`` is the layout/prefix/loss-mask contract version
+        # (Chunk 4 owns its value). The run block carries the run's
+        # ``conditioning`` + derived ``C`` (filled by the trainer / adapter
+        # driver) so eval can rebuild the exact sequence layout the
+        # checkpoint was trained under (plan §8.1: eval reads the
+        # checkpoint's own conditioning). ``tie_embeddings`` + ``vocab_size``
+        # are already inside the ``model`` block via ``_cfg_to_dict``.
+        payload: dict[str, Any] = {
             "version": CHECKPOINT_FORMAT_VERSION,
+            "mask_version": MASK_VERSION,
             "model": _cfg_to_dict(model.cfg),
         }
         if run_config is not None:
@@ -348,16 +398,14 @@ def save_model(
     return final
 
 
-def load_model_config(target_dir: Path | str) -> ModelConfig:
-    """Verify the sentinel and parse the :class:`ModelConfig` only.
+def _verify_and_read_config(target_dir: Path | str) -> dict[str, Any]:
+    """Verify the sentinel + manifest coverage and return the parsed
+    ``config.json`` dict.
 
-    Skips the safetensors load + JAX device transfer that
-    :func:`load_model` performs, but **does** still re-hash every file
-    in the manifest — the dashboard "show me this run's hyperparameters"
-    use case still pays for the SHA-256 streaming over the (potentially
-    multi-GB) ``model.safetensors``. If a caller knows the directory is
-    fresh-from-disk and wants to skip integrity verification, they
-    should read ``config.json`` themselves.
+    Re-hashes every file in the manifest and refuses a manifest that
+    doesn't cover both required payloads, then validates the top-level
+    ``version`` / ``mask_version`` tags. The caller pulls the ``model`` /
+    ``run`` blocks out of the returned dict.
     """
     directory = Path(target_dir)
     manifest = verify_sentinel(directory)
@@ -376,10 +424,35 @@ def load_model_config(target_dir: Path | str) -> ModelConfig:
             f"config.json version is {version!r}, expected {CHECKPOINT_FORMAT_VERSION}: "
             f"{cfg_path}"
         )
+    # ``mask_version`` is optional for forward-compat with older checkpoints
+    # written before the tag existed (they predate the conditioning prefix,
+    # so the layout is the implicit v0 contract). If present it must match.
+    mask_version = raw.get("mask_version", MASK_VERSION)
+    if mask_version != MASK_VERSION:
+        raise CheckpointIntegrityError(
+            f"config.json mask_version is {mask_version!r}, expected "
+            f"{MASK_VERSION}: {cfg_path}"
+        )
+    return raw
+
+
+def load_model_config(target_dir: Path | str) -> ModelConfig:
+    """Verify the sentinel and parse the :class:`ModelConfig` only.
+
+    Skips the safetensors load + JAX device transfer that
+    :func:`load_model` performs, but **does** still re-hash every file
+    in the manifest — the dashboard "show me this run's hyperparameters"
+    use case still pays for the SHA-256 streaming over the (potentially
+    multi-GB) ``model.safetensors``. If a caller knows the directory is
+    fresh-from-disk and wants to skip integrity verification, they
+    should read ``config.json`` themselves.
+    """
+    raw = _verify_and_read_config(target_dir)
     model_block = raw.get("model")
     if not isinstance(model_block, dict):
         raise CheckpointIntegrityError(
-            f"config.json is missing the `model` block: {cfg_path}"
+            f"config.json is missing the `model` block: "
+            f"{Path(target_dir) / CONFIG_FILE}"
         )
     return _cfg_from_dict(model_block)
 
@@ -403,8 +476,18 @@ def _require_payloads_in_manifest(
         )
 
 
-def load_model(target_dir: Path | str) -> PAWNModel:
+def load_model(
+    target_dir: Path | str,
+) -> tuple[PAWNModel, dict[str, Any] | None]:
     """Verify the sentinel and load a :class:`PAWNModel` from disk.
+
+    Returns ``(model, run_block)`` — ``run_block`` is the persisted run
+    config dict (``config.json``'s ``run`` block) or ``None`` if the
+    checkpoint was written without one. Eval/generation read the run
+    block to rebuild the exact sequence layout (conditioning + derived
+    ``C``) the checkpoint was trained under, rather than assuming a
+    hardcoded default (plan §8.1: eval reads the checkpoint's own
+    conditioning).
 
     Workflow:
 
@@ -413,17 +496,33 @@ def load_model(target_dir: Path | str) -> PAWNModel:
        :class:`IncompleteCheckpointError` if ``.complete`` is missing
        (interrupted save) or :class:`CheckpointIntegrityError` on any
        SHA-256 mismatch.
-    2. Parse ``config.json`` → :class:`ModelConfig`. The model block's
-       keys must match :class:`ModelConfig`'s fields exactly.
-    3. Load ``model.safetensors``. Every name in :data:`SAVED_FIELDS`
-       must be present, with the shape ``cfg`` implies.
+    2. Parse ``config.json`` → :class:`ModelConfig` + run block. The
+       model block's keys must match :class:`ModelConfig`'s fields
+       exactly; the top-level ``version`` / ``mask_version`` tags must
+       match this build.
+    3. Load ``model.safetensors``. Every name in
+       :func:`pawn.model.saved_fields` (for the config's
+       ``tie_embeddings``) must be present, with the shape ``cfg``
+       implies. A tied↔untied mismatch is a hard error.
     4. Rebuild the :class:`PAWNModel` (decomp table is rebuilt from
        the engine vocab).
     """
     directory = Path(target_dir)
-    cfg = load_model_config(directory)  # verify + parse cfg
+    raw = _verify_and_read_config(directory)  # verify sentinel + tags
+    model_block = raw.get("model")
+    if not isinstance(model_block, dict):
+        raise CheckpointIntegrityError(
+            f"config.json is missing the `model` block: {directory / CONFIG_FILE}"
+        )
+    cfg = _cfg_from_dict(model_block)
+    run_block = raw.get("run")
+    if run_block is not None and not isinstance(run_block, dict):
+        raise CheckpointIntegrityError(
+            f"config.json `run` block is not a dict: {directory / CONFIG_FILE}"
+        )
     tensors = st_load(str(directory / MODEL_FILE))
-    return _tensor_dict_to_model(tensors, cfg)
+    model = _tensor_dict_to_model(tensors, cfg)
+    return model, run_block
 
 
 def resolve_checkpoint_source(source: str) -> Path:

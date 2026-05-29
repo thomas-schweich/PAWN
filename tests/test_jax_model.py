@@ -6,19 +6,20 @@ has the rocm or cu128 extra installed. They run on CPU just fine
 GPU.
 
 Coverage:
-- The 16 trainable arrays land in the right shapes / dtypes.
+- The trainable arrays land in the right shapes / dtypes (tied =
+  11 leaves, untied = 12 with a standalone ``lm_head``).
 - ``init_model`` builds a runnable model for both the production
   ``SUPERNET`` and the lightweight ``TINY_SUPERNET``.
 - The forward pass produces the right shape and finite outputs.
 - The forward pass handles PAD tokens and outcome tokens correctly
-  (they don't crash the embedding lookup; the override branches fire).
+  (they don't crash the single-gather embedding lookup).
 - The attention is causal — masking out the right-hand context doesn't
   change the left-hand outputs (within tolerance).
 - ``sliced(supernet, variant_cfg)`` builds a runnable smaller model
   with the right shapes.
 - ``sliced`` rejects an invalid nesting.
-- ``SAVED_FIELDS`` has exactly 16 entries; every name resolves to an
-  array attribute on the model.
+- ``saved_fields`` returns the right schema per ``tie_embeddings`` and
+  every name resolves to an array attribute on the model.
 """
 
 from __future__ import annotations
@@ -28,12 +29,16 @@ import jax.numpy as jnp
 import pytest
 
 from pawn.config import (
+    BOS_TOKEN,
+    NULL_TOKEN,
+    N_TOTAL_OUTCOMES,
     NUM_ACTIONS,
     OUTCOME_TOKEN_BASE,
     PAD_TOKEN,
     SUPERNET,
     TINY_SUPERNET,
     TINY_VARIANTS,
+    VOCAB_SIZE,
     ModelConfig,
     NestingError,
 )
@@ -43,6 +48,7 @@ from pawn.model import (
     PAWNModel,
     init_kv_cache,
     init_model,
+    saved_fields,
     sliced,
 )
 
@@ -52,22 +58,52 @@ from pawn.model import (
 # ---------------------------------------------------------------------------
 
 
-def test_saved_fields_is_sixteen() -> None:
-    """The save schema is exactly 16 named arrays — this is the v2
-    `pawn.checkpoint` contract."""
-    assert len(SAVED_FIELDS) == 16
-    assert len(set(SAVED_FIELDS)) == 16  # No duplicates
+def test_saved_fields_untied_superset_is_twelve() -> None:
+    """`SAVED_FIELDS` is the untied superset: 12 named arrays
+    (embed_tokens + 9 layers + final_norm + lm_head), `lm_head` last."""
+    assert len(SAVED_FIELDS) == 12
+    assert len(set(SAVED_FIELDS)) == 12  # No duplicates
+    assert SAVED_FIELDS[0] == "embed_tokens"
+    assert SAVED_FIELDS[-1] == "lm_head"
+
+
+def test_saved_fields_helper_per_tie() -> None:
+    """`saved_fields(tie_embeddings)` drops `lm_head` when tied and keeps
+    it when untied; declaration order is otherwise preserved."""
+    untied = saved_fields(False)
+    tied = saved_fields(True)
+    assert untied == SAVED_FIELDS
+    assert "lm_head" not in tied
+    assert len(tied) == 11
+    # Tied schema is the untied superset minus lm_head, order preserved.
+    assert tied == tuple(f for f in SAVED_FIELDS if f != "lm_head")
 
 
 def test_saved_fields_match_pawn_model_attributes() -> None:
-    """Every name in `SAVED_FIELDS` resolves to an actual array on a
-    freshly-built model. Catches typos like `embed_pads` vs `embed_pad`."""
-    model = init_model(TINY_SUPERNET, key=0)
-    for path in SAVED_FIELDS:
-        node = model
-        for piece in path.split("."):
-            node = getattr(node, piece)
-        assert isinstance(node, jax.Array), f"{path} did not resolve to a jax.Array"
+    """Every name in the per-tie schema resolves to an actual array on a
+    freshly-built model. Catches typos like `embed_token` vs
+    `embed_tokens`. Checks both the tied (default) and untied models."""
+    for tie in (True, False):
+        cfg = _tiny_cfg(tie_embeddings=tie)
+        model = init_model(cfg, key=0)
+        for path in saved_fields(tie):
+            node = model
+            for piece in path.split("."):
+                node = getattr(node, piece)
+            assert isinstance(node, jax.Array), (
+                f"{path} did not resolve to a jax.Array (tie={tie})"
+            )
+
+
+def _tiny_cfg(*, tie_embeddings: bool) -> ModelConfig:
+    """A TINY_SUPERNET-shaped config with an explicit `tie_embeddings`."""
+    return ModelConfig(
+        d_model=TINY_SUPERNET.d_model,
+        n_layers=TINY_SUPERNET.n_layers,
+        n_heads=TINY_SUPERNET.n_heads,
+        d_ff=TINY_SUPERNET.d_ff,
+        tie_embeddings=tie_embeddings,
+    )
 
 
 def test_init_model_tiny_supernet_runs() -> None:
@@ -75,15 +111,8 @@ def test_init_model_tiny_supernet_runs() -> None:
     pass on a small batch produces the right shape and finite numbers.
     """
     model = init_model(TINY_SUPERNET, key=0)
-    # Embedding dims
-    assert model.embed_src.shape == (64, TINY_SUPERNET.d_model)
-    assert model.embed_dst.shape == (64, TINY_SUPERNET.d_model)
-    assert model.embed_promo.shape == (5, TINY_SUPERNET.d_model)
-    assert model.embed_pad.shape == (TINY_SUPERNET.d_model,)
-    assert model.embed_outcome.shape == (
-        TINY_SUPERNET.n_outcomes,
-        TINY_SUPERNET.d_model,
-    )
+    # Single uniform token table [V, d]
+    assert model.embed_tokens.shape == (TINY_SUPERNET.vocab_size, TINY_SUPERNET.d_model)
     # Stacked layer dims
     L = TINY_SUPERNET.n_layers
     d = TINY_SUPERNET.d_model
@@ -92,9 +121,52 @@ def test_init_model_tiny_supernet_runs() -> None:
     assert model.layers.wq.shape == (L, d, d)
     assert model.layers.w_gate.shape == (L, d, d_ff)
     assert model.layers.w_down.shape == (L, d_ff, d)
-    # Final + LM head
+    # Final norm. Tied by default → no standalone lm_head.
     assert model.final_norm_w.shape == (d,)
-    assert model.lm_head.shape == (d, TINY_SUPERNET.vocab_size)
+    assert TINY_SUPERNET.tie_embeddings is True
+    assert model.lm_head is None
+
+
+def test_init_model_untied_has_standalone_lm_head() -> None:
+    """An untied config gives a standalone `lm_head[d, V]`; a tied config
+    leaves it `None` (logits reuse `embed_tokens.T`)."""
+    untied = init_model(_tiny_cfg(tie_embeddings=False), key=0)
+    assert untied.lm_head is not None
+    assert untied.lm_head.shape == (TINY_SUPERNET.d_model, TINY_SUPERNET.vocab_size)
+
+    tied = init_model(_tiny_cfg(tie_embeddings=True), key=0)
+    assert tied.lm_head is None
+
+
+def test_tied_logits_equal_untied_with_transposed_head() -> None:
+    """The tied head is exactly `embed_tokens.T`. Build a matched untied
+    model — same backbone + token table, `lm_head = embed_tokens.T` — and
+    confirm the two produce identical logits. This pins that tying is the
+    weight-sharing it claims to be (not just a shape coincidence)."""
+    import dataclasses
+
+    import equinox as eqx
+
+    tied = init_model(_tiny_cfg(tie_embeddings=True), key=0)
+    # Re-tag the same arrays as an untied model with lm_head = embed_tokens.T.
+    untied = eqx.tree_at(
+        lambda m: m.lm_head,
+        dataclasses.replace(tied, cfg=_tiny_cfg(tie_embeddings=False)),
+        tied.embed_tokens.T,
+        is_leaf=lambda x: x is None,
+    )
+    assert untied.lm_head is not None
+    tokens = jnp.arange(2 * 12, dtype=jnp.int32).reshape(2, 12) % NUM_ACTIONS
+    assert jnp.array_equal(tied(tokens), untied(tokens))
+
+
+def test_tied_and_untied_logits_shape_match() -> None:
+    """Tied and untied models both emit `(B, T, V)` logits."""
+    tied = init_model(_tiny_cfg(tie_embeddings=True), key=0)
+    untied = init_model(_tiny_cfg(tie_embeddings=False), key=0)
+    tokens = jnp.zeros((2, 16), dtype=jnp.int32)
+    assert tied(tokens).shape == (2, 16, VOCAB_SIZE)
+    assert untied(tokens).shape == (2, 16, VOCAB_SIZE)
 
 
 def test_init_model_accepts_int_key_seed() -> None:
@@ -102,14 +174,14 @@ def test_init_model_accepts_int_key_seed() -> None:
     a = init_model(TINY_SUPERNET, key=0)
     b = init_model(TINY_SUPERNET, key=jax.random.key(0))
     # Same seed → identical params
-    assert jnp.array_equal(a.embed_src, b.embed_src)
+    assert jnp.array_equal(a.embed_tokens, b.embed_tokens)
     assert jnp.array_equal(a.layers.wq, b.layers.wq)
 
 
 def test_init_model_different_keys_produce_different_params() -> None:
     a = init_model(TINY_SUPERNET, key=0)
     b = init_model(TINY_SUPERNET, key=1)
-    assert not jnp.array_equal(a.embed_src, b.embed_src)
+    assert not jnp.array_equal(a.embed_tokens, b.embed_tokens)
     assert not jnp.array_equal(a.layers.wq, b.layers.wq)
 
 
@@ -122,11 +194,16 @@ def test_init_model_rmsnorm_weights_are_ones() -> None:
     assert jnp.all(model.final_norm_w == 1)
 
 
-def test_init_model_embed_pad_is_zero() -> None:
-    """`embed_pad` starts at zero so PAD positions contribute nothing
-    until training learns a non-trivial representation."""
+def test_init_model_embed_tokens_is_normal_init() -> None:
+    """`embed_tokens` is the uniform `[V, d]` table, `Normal(0, 0.02)`
+    initialised — no special zero row (v1's zero-initialised `embed_pad`
+    is gone; PAD is just another row of the shared table now)."""
     model = init_model(TINY_SUPERNET, key=0)
-    assert jnp.all(model.embed_pad == 0)
+    assert model.embed_tokens.shape == (TINY_SUPERNET.vocab_size, TINY_SUPERNET.d_model)
+    # Not degenerate: the table has real spread, no all-zero rows expected
+    # at init (random Normal).
+    assert float(jnp.std(model.embed_tokens)) > 0.0
+    assert not jnp.any(jnp.all(model.embed_tokens == 0, axis=-1))
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +222,9 @@ def test_forward_pass_shape_and_finite() -> None:
 
 
 def test_forward_pass_handles_pad_and_outcome_tokens() -> None:
-    """The factored embedding + override path doesn't crash and produces
-    finite logits when the batch contains PAD and outcome tokens."""
+    """The single-gather embedding path doesn't crash and produces
+    finite logits when the batch contains PAD and outcome tokens (every
+    id indexes the same `embed_tokens` table)."""
     model = init_model(TINY_SUPERNET, key=0)
     # Construct a sequence: outcome prefix + a few moves + PAD tail
     tokens = jnp.array(
@@ -157,6 +235,49 @@ def test_forward_pass_handles_pad_and_outcome_tokens() -> None:
     )
     logits = model(tokens)
     assert logits.shape == (1, 8, TINY_SUPERNET.vocab_size)
+    assert jnp.all(jnp.isfinite(logits))
+
+
+def test_embed_does_not_alias_control_tokens_onto_last_outcome() -> None:
+    """BOS / NULL / reserved-control ids (≥1980) embed as their *own*
+    independent rows — the load-bearing contract of the §2-vocab/§3-un-factor
+    co-land.
+
+    The old factored ``_embed`` clamped ids and aliased the Python-side
+    control tokens onto the last outcome embedding. The new ``_embed`` is a
+    plain gather into the ``[V, d]`` ``embed_tokens`` table, so every id in
+    ``[0, V)`` — including BOS (1980), NULL (1981), and the reserved columns
+    (1982–1999) — must index its own distinct, finite row. If anyone
+    reintroduced a cap (``clip(ids, 0, 1979)``) or sized the table ``< V``,
+    these ids would silently alias onto the last outcome row (1979) and the
+    rest of the suite would stay green.
+    """
+    model = init_model(TINY_SUPERNET, key=0)
+    last_outcome = OUTCOME_TOKEN_BASE + N_TOTAL_OUTCOMES - 1  # 1979
+    reserved_id = 1999  # top reserved-control column
+    control_ids = [BOS_TOKEN, NULL_TOKEN, reserved_id]
+
+    # The table is wide enough to hold every control id (no aliasing by size).
+    assert model.embed_tokens.shape[0] == VOCAB_SIZE
+    assert VOCAB_SIZE > reserved_id
+
+    tokens = jnp.array([control_ids], dtype=jnp.int32)
+    embedded = model._embed(tokens)  # pyright: ignore[reportPrivateUsage]
+    assert embedded.shape == (1, len(control_ids), TINY_SUPERNET.d_model)
+    assert jnp.all(jnp.isfinite(embedded))
+
+    for slot, tok in enumerate(control_ids):
+        # Each control id gathers exactly its own embed_tokens row …
+        assert jnp.array_equal(embedded[0, slot], model.embed_tokens[tok])
+        # … and is NOT aliased onto the last outcome row (1979), the row the
+        # v1 factored/clipped path collapsed them onto.
+        assert not jnp.array_equal(
+            model.embed_tokens[tok], model.embed_tokens[last_outcome]
+        )
+
+    # A full forward over a control-bearing sequence stays finite.
+    logits = model(tokens)
+    assert logits.shape == (1, len(control_ids), TINY_SUPERNET.vocab_size)
     assert jnp.all(jnp.isfinite(logits))
 
 
@@ -232,12 +353,13 @@ def test_sliced_small_variant_runs() -> None:
     L = small_cfg.n_layers
     d_ff = small_cfg.d_ff
 
-    assert variant_model.embed_src.shape == (64, d)
+    assert variant_model.embed_tokens.shape == (small_cfg.vocab_size, d)
     assert variant_model.layers.wq.shape == (L, d, d)
     assert variant_model.layers.w_gate.shape == (L, d, d_ff)
     assert variant_model.layers.w_down.shape == (L, d_ff, d)
     assert variant_model.final_norm_w.shape == (d,)
-    assert variant_model.lm_head.shape == (d, small_cfg.vocab_size)
+    # Tied by default → no standalone lm_head; logits reuse embed_tokens.T.
+    assert variant_model.lm_head is None
 
     # Forward pass still works at the new shape
     tokens = jnp.zeros((2, 16), dtype=jnp.int32)
@@ -251,7 +373,7 @@ def test_sliced_base_variant_runs() -> None:
     supernet_model = init_model(TINY_SUPERNET, key=0)
     base_cfg = TINY_VARIANTS["base"]
     variant_model = sliced(supernet_model, base_cfg)
-    assert variant_model.embed_src.shape == (64, base_cfg.d_model)
+    assert variant_model.embed_tokens.shape == (base_cfg.vocab_size, base_cfg.d_model)
     tokens = jnp.zeros((2, 16), dtype=jnp.int32)
     logits = variant_model(tokens)
     assert logits.shape == (2, 16, base_cfg.vocab_size)
@@ -263,32 +385,27 @@ def test_sliced_large_variant_is_identity_shape() -> None:
     supernet_model = init_model(TINY_SUPERNET, key=0)
     large_cfg = TINY_VARIANTS["large"]
     variant_model = sliced(supernet_model, large_cfg)
-    assert variant_model.embed_src.shape == supernet_model.embed_src.shape
+    assert variant_model.embed_tokens.shape == supernet_model.embed_tokens.shape
     assert variant_model.layers.wq.shape == supernet_model.layers.wq.shape
-    # The slicing is just `[:d_V, :d_V]` with d_V == d_super, so the
+    # The slicing is just `[:, :d_V]` with d_V == d_super, so the
     # underlying data is byte-identical.
-    assert jnp.array_equal(variant_model.embed_src, supernet_model.embed_src)
+    assert jnp.array_equal(variant_model.embed_tokens, supernet_model.embed_tokens)
 
 
 def test_sliced_preserves_weights() -> None:
     """Every variant weight is the inner block of the supernet's
     corresponding tensor — slicing only narrows; values don't change.
-    Spot-checks every one of the 16 trainable arrays so a transposed
-    slice index (e.g. `wk` accidentally pulling the `wv` block) would
-    surface."""
+    Spot-checks every trainable array so a transposed slice index (e.g.
+    `wk` accidentally pulling the `wv` block) would surface."""
     supernet_model = init_model(TINY_SUPERNET, key=0)
     small_cfg = TINY_VARIANTS["small"]
     variant_model = sliced(supernet_model, small_cfg)
     dv = small_cfg.d_model
     dv_ff = small_cfg.d_ff
 
-    # Embedding fields
-    assert jnp.array_equal(variant_model.embed_src, supernet_model.embed_src[:, :dv])
-    assert jnp.array_equal(variant_model.embed_dst, supernet_model.embed_dst[:, :dv])
-    assert jnp.array_equal(variant_model.embed_promo, supernet_model.embed_promo[:, :dv])
-    assert jnp.array_equal(variant_model.embed_pad, supernet_model.embed_pad[:dv])
+    # Uniform token table: width-sliced to d_V (full vocab rows kept).
     assert jnp.array_equal(
-        variant_model.embed_outcome, supernet_model.embed_outcome[:, :dv]
+        variant_model.embed_tokens, supernet_model.embed_tokens[:, :dv]
     )
     # Attention block (5 tensors × n_layers)
     sup_l = supernet_model.layers
@@ -303,10 +420,40 @@ def test_sliced_preserves_weights() -> None:
     assert jnp.array_equal(var_l.w_gate, sup_l.w_gate[:, :dv, :dv_ff])
     assert jnp.array_equal(var_l.w_up, sup_l.w_up[:, :dv, :dv_ff])
     assert jnp.array_equal(var_l.w_down, sup_l.w_down[:, :dv_ff, :dv])
-    # Final norm + output head
+    # Final norm + output head. TINY_SUPERNET is tied, so both the
+    # supernet and the slice carry lm_head=None (logits reuse
+    # embed_tokens.T, which is already width-sliced above).
     assert jnp.array_equal(
         variant_model.final_norm_w, supernet_model.final_norm_w[:dv]
     )
+    assert supernet_model.lm_head is None
+    assert variant_model.lm_head is None
+
+
+def test_sliced_untied_slices_lm_head() -> None:
+    """For an untied supernet, `sliced` narrows the standalone `lm_head`
+    along d (`[:dv, :]`) and keeps the full vocab columns."""
+    supernet_cfg = ModelConfig(
+        d_model=TINY_SUPERNET.d_model,
+        n_layers=TINY_SUPERNET.n_layers,
+        n_heads=TINY_SUPERNET.n_heads,
+        d_ff=TINY_SUPERNET.d_ff,
+        tie_embeddings=False,
+    )
+    supernet_model = init_model(supernet_cfg, key=0)
+    assert supernet_model.lm_head is not None
+    small = TINY_VARIANTS["small"]
+    variant_cfg = ModelConfig(
+        d_model=small.d_model,
+        n_layers=small.n_layers,
+        n_heads=small.n_heads,
+        d_ff=small.d_ff,
+        tie_embeddings=False,
+    )
+    variant_model = sliced(supernet_model, variant_cfg)
+    dv = small.d_model
+    assert variant_model.lm_head is not None
+    assert variant_model.lm_head.shape == (dv, small.vocab_size)
     assert jnp.array_equal(variant_model.lm_head, supernet_model.lm_head[:dv, :])
 
 
@@ -365,10 +512,11 @@ def test_init_model_production_supernet_builds() -> None:
     On a constrained CI box you might want @pytest.mark.gpu.
     """
     model = init_model(SUPERNET, key=0)
-    assert model.embed_src.shape == (64, 640)
+    # Uniform token table [V, d] = [2000, 640]; input vocab == output vocab.
+    assert model.embed_tokens.shape == (VOCAB_SIZE, 640)
     assert model.layers.wq.shape == (10, 640, 640)
-    # A.2: lm_head output is NUM_ACTIONS + 1 PAD = 1969 (outcome columns trimmed).
-    assert model.lm_head.shape == (640, 1969)
+    # SUPERNET is tied by default → logits reuse embed_tokens.T, no head.
+    assert model.lm_head is None
 
 
 def test_forward_pass_rejects_sequence_too_long() -> None:
@@ -384,17 +532,31 @@ def test_forward_pass_rejects_sequence_too_long() -> None:
 
 def test_only_inexact_arrays_count_as_trainable() -> None:
     """`eqx.filter(model, eqx.is_inexact_array)` should pick up exactly
-    the 16 trainable tensors — no buffer leak. RoPE phase tables are
-    recomputed inside `__call__`, not stored as model state, and
-    `decomp_table` is int32 so `is_inexact_array` filters it out
-    naturally."""
+    the trainable tensors — no buffer leak. A tied model has 11
+    (embed_tokens + 9 layers + final_norm); an untied model adds the
+    standalone lm_head for 12. RoPE phase tables are recomputed inside
+    `__call__`, not stored as model state, and `decomp_table` is int32 so
+    `is_inexact_array` filters it out naturally."""
     import equinox as eqx
 
-    model = init_model(TINY_SUPERNET, key=0)
-    trainable = eqx.filter(model, eqx.is_inexact_array)
-    leaves = [leaf for leaf in jax.tree_util.tree_leaves(trainable) if leaf is not None]
-    # 16 trainable tensors: 5 embed + 9 layers + 2 final/output.
-    assert len(leaves) == 16
+    tied = init_model(_tiny_cfg(tie_embeddings=True), key=0)
+    tied_leaves = [
+        leaf
+        for leaf in jax.tree_util.tree_leaves(eqx.filter(tied, eqx.is_inexact_array))
+        if leaf is not None
+    ]
+    # 11 tensors: embed_tokens + 9 layers + final_norm. lm_head is None
+    # (an empty PyTree subtree), so the optimizer never sees a head leaf.
+    assert len(tied_leaves) == 11
+
+    untied = init_model(_tiny_cfg(tie_embeddings=False), key=0)
+    untied_leaves = [
+        leaf
+        for leaf in jax.tree_util.tree_leaves(eqx.filter(untied, eqx.is_inexact_array))
+        if leaf is not None
+    ]
+    # 12 tensors: the tied set plus the standalone lm_head.
+    assert len(untied_leaves) == 12
 
 
 def test_decomp_table_shape() -> None:

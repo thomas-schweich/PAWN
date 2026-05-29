@@ -39,19 +39,22 @@ Architectural choices:
   is the form the plan §5 calls out. See :func:`_rmsnorm` for details.
 - **RoPE applied in fp32** to Q and K, then downcast — same reason.
 - **SwiGLU FFN:** ``down(silu(gate(x)) * up(x))``.
-- **Factored input embeddings:** every move token decomposes into
-  ``src_embed[s] + dst_embed[d] + promo_embed[p]``. PAD positions get
-  ``pad_embed``; outcome-token positions get
-  ``outcome_embed[token - OUTCOME_TOKEN_BASE]``. Overrides are
-  branchless (:func:`jnp.where`) so the compiler can fuse them.
-- **Output head:** a single linear over the full vocabulary. Argmax
-  callers restrict to ``[0, NUM_ACTIONS)`` so PAD and outcome tokens
-  can't be sampled — that restriction lives in :mod:`pawn.eval`, not
-  here.
+- **Uniform token embeddings:** a single ``embed_tokens[V, d]`` table is
+  gathered per token id — moves, PAD, outcomes, BOS, NULL, and the
+  reserved control columns all index the same table. (v1 factored the
+  move embedding into ``src + dst + promo`` lookups with PAD/outcome
+  overrides; that aliased the Python-side control tokens onto the last
+  outcome row, so v2 un-factors to one gather.)
+- **Output head:** when ``cfg.tie_embeddings`` (the default) the model
+  has **no** separate ``lm_head`` array — logits are
+  ``x @ embed_tokens.T`` over the full vocabulary. Untied configs keep
+  a standalone ``lm_head[d, V]``. Either way, argmax callers restrict to
+  ``[0, NUM_ACTIONS)`` so PAD and outcome tokens can't be sampled — that
+  restriction lives in :mod:`pawn.eval`, not here.
 
-Save schema: the 16 trainable arrays in declaration order — the
-:data:`SAVED_FIELDS` tuple is the canonical ordering, and this module
-asserts ``len(SAVED_FIELDS) == 16`` at import (see below). The
+Save schema: the trainable arrays in declaration order — the
+:func:`saved_fields` helper returns the canonical ordering for a given
+``tie_embeddings`` (the tied schema omits ``lm_head``). The
 non-trainable :attr:`PAWNModel.decomp_table` buffer is rebuilt at load
 time from the engine vocabulary; RoPE phase tables are recomputed
 inside the forward pass and never stored. Both stay out of the
@@ -72,8 +75,6 @@ from jaxtyping import Array, Bool, Float, Int
 
 from pawn.config import (
     NUM_ACTIONS,
-    OUTCOME_TOKEN_BASE,
-    PAD_TOKEN,
     ModelConfig,
     validate_nested,
 )
@@ -94,6 +95,7 @@ __all__ = [
     "KVCacheCallable",
     "KVCache",
     "SAVED_FIELDS",
+    "saved_fields",
     "init_model",
     "init_kv_cache",
     "sliced",
@@ -160,15 +162,15 @@ class KVCacheCallable(EffectiveCallable, Protocol):
     ) -> tuple[Float[Array, "B T_new V"], "KVCache"]: ...
 
 
-# Names of the 16 trainable arrays in safetensors declaration order.
-# The `assert` below pins the count at import; `pawn.checkpoint` imports
-# this module, so the guard fires before any save/load can run.
+# Names of the trainable arrays in safetensors declaration order. The
+# tuple below is the untied superset (12 fields, ``lm_head`` last); the
+# tied schema (11 fields) drops ``lm_head`` because the logits reuse
+# ``embed_tokens`` via the transpose. Use :func:`saved_fields` to get the
+# right list for a given ``tie_embeddings``; :data:`SAVED_FIELDS` is kept
+# as the canonical declaration order for tooling that needs every field
+# name. ``pawn.checkpoint`` imports both.
 SAVED_FIELDS: Final[tuple[str, ...]] = (
-    "embed_src",
-    "embed_dst",
-    "embed_promo",
-    "embed_pad",
-    "embed_outcome",
+    "embed_tokens",
     "layers.attn_norm_w",
     "layers.wq",
     "layers.wk",
@@ -181,7 +183,20 @@ SAVED_FIELDS: Final[tuple[str, ...]] = (
     "final_norm_w",
     "lm_head",
 )
-assert len(SAVED_FIELDS) == 16, "model save schema must be 16 fields"
+assert len(SAVED_FIELDS) == 12, "model save schema (untied superset) must be 12 fields"
+
+
+def saved_fields(tie_embeddings: bool) -> tuple[str, ...]:
+    """Return the per-field save schema for a given ``tie_embeddings``.
+
+    Tied models have no standalone ``lm_head`` array (logits reuse
+    ``embed_tokens`` via the transpose), so the tied schema omits it.
+    Declaration order is preserved so the safetensors payload stays
+    deterministic.
+    """
+    if tie_embeddings:
+        return tuple(name for name in SAVED_FIELDS if name != "lm_head")
+    return SAVED_FIELDS
 
 
 _RMSNORM_EPS: Final[float] = 1e-6
@@ -338,9 +353,12 @@ def _build_decomp_table() -> Int[Array, "n_actions 3"]:
 
     Each move token in ``[0, NUM_ACTIONS)`` decomposes into a source
     square (0–63), destination square (0–63), and promotion type
-    (0=none, 1=q, 2=r, 3=b, 4=n). PAD and outcome tokens are clamped to
-    a safe row by :meth:`PAWNModel._embed` and then overwritten
-    branchlessly.
+    (0=none, 1=q, 2=r, 3=b, 4=n).
+
+    This table is **not** used by the (un-factored) embedding path —
+    :meth:`PAWNModel._embed` gathers ``embed_tokens`` directly. It's
+    retained as a non-trainable buffer for downstream consumers (eval /
+    diagnostics) that decode a move token back into its squares.
     """
     vocab = export_move_vocabulary()
     sq_names: list[str] = list(vocab["square_names"])
@@ -446,24 +464,26 @@ class PAWNModel(eqx.Module):
     """Decoder-only transformer over the move + outcome vocabulary.
 
     See module docstring for the architectural choices and the save
-    schema. The class lays out 16 trainable array fields (declaration
-    order matching :data:`SAVED_FIELDS`), one non-trainable
+    schema. The class lays out the trainable array fields (declaration
+    order matching :func:`saved_fields`), one non-trainable
     int32 buffer (:attr:`decomp_table` — filtered out automatically by
     ``eqx.is_inexact_array``), and one static ``cfg`` reference. RoPE
     phase tables are not stored on the model; they're recomputed
     inside :meth:`__call__` per forward call and constant-folded by
     JIT when ``cfg`` is static.
+
+    ``lm_head`` is ``None`` when ``cfg.tie_embeddings`` (the default) —
+    logits then reuse ``embed_tokens`` via the transpose. ``None`` is an
+    empty PyTree subtree, so a tied model carries one fewer trainable
+    leaf than an untied one and the optimizer never sees a phantom head.
     """
 
-    # 16 trainable fields — declaration order = save order.
-    embed_src: Float[Array, "64 d"]
-    embed_dst: Float[Array, "64 d"]
-    embed_promo: Float[Array, "5 d"]
-    embed_pad: Float[Array, "d"]
-    embed_outcome: Float[Array, "n_out d"]
+    # Trainable fields — declaration order = save order (see
+    # :func:`saved_fields`). ``lm_head`` is ``None`` for tied models.
+    embed_tokens: Float[Array, "V d"]
     layers: TransformerLayer
     final_norm_w: Float[Array, "d"]
-    lm_head: Float[Array, "d V"]
+    lm_head: Float[Array, "d V"] | None
 
     # Non-trainable lookup table (int32 — `eqx.is_inexact_array` filters it
     # out automatically so the trainer's optimizer never touches it). Not
@@ -587,8 +607,8 @@ class PAWNModel(eqx.Module):
             )
         with jax.named_scope("final_norm"):
             x = _rmsnorm(x, self.final_norm_w)
-        # `_rmsnorm` returns in `x.dtype` (compute dtype if set). Cast
-        # `lm_head` to match. The trailing fp32 cast on `logits` was a
+        # `_rmsnorm` returns in `x.dtype` (compute dtype if set). Cast the
+        # head to match. The trailing fp32 cast on `logits` was a
         # ~520 MB/step HBM bandwidth tax in the bf16 training path
         # (materialised a full ``(B, T, V)`` fp32 tensor, then
         # ``log_softmax`` materialised another). The training loss
@@ -598,13 +618,8 @@ class PAWNModel(eqx.Module):
         # parity test, eval, probes) — i.e. when ``compute_dtype is
         # None``, the einsum result is already fp32 and the cast is a
         # no-op.
-        lm_head = (
-            self.lm_head.astype(compute_dtype)
-            if compute_dtype is not None
-            else self.lm_head
-        )
         with jax.named_scope("lm_head"):
-            logits = jnp.einsum("btd,dv->btv", x, lm_head)
+            logits = jnp.einsum("btd,dv->btv", x, self._head_weight(compute_dtype))
         if compute_dtype is None:
             return logits.astype(jnp.float32)
         return logits
@@ -614,39 +629,33 @@ class PAWNModel(eqx.Module):
     # -----------------------------------------------------------------------
 
     def _embed(self, input_ids: Int[Array, "B T"]) -> Float[Array, "B T d"]:
-        """Factored move embeddings + PAD/outcome overrides.
+        """Uniform token embedding: a single gather into ``embed_tokens``.
 
-        Tokens in ``[0, NUM_ACTIONS)``: ``src + dst + promo`` lookup.
-        Tokens equal to ``PAD_TOKEN``: replaced with ``embed_pad``.
-        Tokens ``>= OUTCOME_TOKEN_BASE``: replaced with
-        ``embed_outcome[token - OUTCOME_TOKEN_BASE]``.
-
-        Overrides are branchless (:func:`jnp.where`) so the layout is
-        fusion-friendly.
+        Every token id — moves, PAD, outcomes, BOS, NULL, and the
+        reserved control columns — indexes the same ``[V, d]`` table.
+        No clamping or override branches: ids are in ``[0, V)`` by
+        construction (the prefix assembler + engine emission stay within
+        the vocab), so the gather is in-bounds for all of them.
         """
         ids = input_ids.astype(jnp.int32)
-        # Clamp to a safe range so the decomp table lookup doesn't OOB
-        # on PAD / outcome positions; those positions are overwritten below.
-        safe_ids = jnp.clip(ids, 0, NUM_ACTIONS - 1)
-        decomp = self.decomp_table[safe_ids]  # (B, T, 3)
-        src_idx = decomp[..., 0]
-        dst_idx = decomp[..., 1]
-        promo_idx = decomp[..., 2]
-        emb = (
-            self.embed_src[src_idx]
-            + self.embed_dst[dst_idx]
-            + self.embed_promo[promo_idx]
-        )
+        return self.embed_tokens[ids]
 
-        pad_mask = (ids == PAD_TOKEN)[..., None]
-        emb = jnp.where(pad_mask, self.embed_pad, emb)
+    def _head_weight(
+        self, compute_dtype: jnp.dtype | None
+    ) -> Float[Array, "d V"]:
+        """Resolve the output-projection weight, honouring weight tying.
 
-        n_outcomes = self.embed_outcome.shape[0]
-        outcome_idx = jnp.clip(ids - OUTCOME_TOKEN_BASE, 0, n_outcomes - 1)
-        outcome_emb = self.embed_outcome[outcome_idx]
-        outcome_mask = (ids >= OUTCOME_TOKEN_BASE)[..., None]
-        emb = jnp.where(outcome_mask, outcome_emb, emb)
-        return emb
+        Tied (``lm_head is None``): the head is ``embed_tokens.T`` —
+        logits = ``x @ embed_tokens.T``. Untied: the standalone
+        ``lm_head[d, V]``. Cast to ``compute_dtype`` when AMP is on so
+        the einsum runs in compute dtype (XLA fuses the cast into the
+        matmul); ``None`` keeps it fp32 for the parity / eval / probe
+        callers.
+        """
+        head = self.embed_tokens.T if self.lm_head is None else self.lm_head
+        if compute_dtype is not None:
+            return head.astype(compute_dtype)
+        return head
 
     def _run_layers(
         self,
@@ -1068,12 +1077,7 @@ class PAWNModel(eqx.Module):
         x, (new_k_stack, new_v_stack) = jax.lax.scan(step, x, scan_input)
 
         x = _rmsnorm(x, self.final_norm_w)
-        lm_head = (
-            self.lm_head.astype(compute_dtype)
-            if compute_dtype is not None
-            else self.lm_head
-        )
-        logits = jnp.einsum("btd,dv->btv", x, lm_head)
+        logits = jnp.einsum("btd,dv->btv", x, self._head_weight(compute_dtype))
         new_cache = KVCache(k=new_k_stack, v=new_v_stack)
         return logits.astype(jnp.float32), new_cache
 
@@ -1103,16 +1107,18 @@ def init_model(cfg: ModelConfig, key: jax.Array | int) -> PAWNModel:
 
     All weight tensors are drawn from ``Normal(0, 0.02)`` (the v1
     convention for ``dim > 1`` params). RMSNorm weights are
-    one-initialised so the norm acts as identity at step 0;
-    ``embed_pad`` is zero-initialised. ``decomp_table`` is built from
-    the engine vocab. RoPE phase tables are *not* stored on the
-    model — :meth:`PAWNModel.__call__` recomputes them per forward
+    one-initialised so the norm acts as identity at step 0.
+    ``embed_tokens`` is the single ``[V, d]`` token table. ``lm_head``
+    is ``None`` when ``cfg.tie_embeddings`` (the default) and a separate
+    ``Normal(0, 0.02)`` ``[d, V]`` head otherwise. ``decomp_table`` is
+    built from the engine vocab. RoPE phase tables are *not* stored on
+    the model — :meth:`PAWNModel.__call__` recomputes them per forward
     pass from ``cfg.head_dim`` / ``cfg.max_seq_len`` / ``cfg.rope_base``,
     and JIT constant-folds them when ``cfg`` is static.
     """
     if isinstance(key, int):
         key = jax.random.key(key)
-    sub = jax.random.split(key, 12)
+    sub = jax.random.split(key, 9)
     d = cfg.d_model
     d_ff = cfg.d_ff
     n_layers = cfg.n_layers
@@ -1129,15 +1135,12 @@ def init_model(cfg: ModelConfig, key: jax.Array | int) -> PAWNModel:
         w_up=_normal_init(sub[5], (n_layers, d, d_ff)),
         w_down=_normal_init(sub[6], (n_layers, d_ff, d)),
     )
+    lm_head = None if cfg.tie_embeddings else _normal_init(sub[8], (d, V))
     return PAWNModel(
-        embed_src=_normal_init(sub[7], (64, d)),
-        embed_dst=_normal_init(sub[8], (64, d)),
-        embed_promo=_normal_init(sub[9], (5, d)),
-        embed_pad=jnp.zeros((d,), dtype=jnp.float32),
-        embed_outcome=_normal_init(sub[10], (cfg.n_outcomes, d)),
+        embed_tokens=_normal_init(sub[7], (V, d)),
         layers=layers,
         final_norm_w=jnp.ones((d,), dtype=jnp.float32),
-        lm_head=_normal_init(sub[11], (d, V)),
+        lm_head=lm_head,
         decomp_table=_build_decomp_table(),
         cfg=cfg,
     )
@@ -1179,15 +1182,19 @@ def sliced(supernet_model: PAWNModel, variant_cfg: ModelConfig) -> PAWNModel:
         w_up=sup_layers.w_up[:nv, :dv, :dv_ff],
         w_down=sup_layers.w_down[:nv, :dv_ff, :dv],
     )
+    # Width-slice the token table to the variant's d_V. The tied head
+    # follows for free (logits reuse ``embed_tokens.T``); only the untied
+    # standalone ``lm_head`` needs its own ``[:dv, :]`` slice.
+    lm_head = (
+        None
+        if supernet_model.lm_head is None
+        else supernet_model.lm_head[:dv, :]
+    )
     return PAWNModel(
-        embed_src=supernet_model.embed_src[:, :dv],
-        embed_dst=supernet_model.embed_dst[:, :dv],
-        embed_promo=supernet_model.embed_promo[:, :dv],
-        embed_pad=supernet_model.embed_pad[:dv],
-        embed_outcome=supernet_model.embed_outcome[:, :dv],
+        embed_tokens=supernet_model.embed_tokens[:, :dv],
         layers=layers,
         final_norm_w=supernet_model.final_norm_w[:dv],
-        lm_head=supernet_model.lm_head[:dv, :],
+        lm_head=lm_head,
         decomp_table=supernet_model.decomp_table,
         cfg=variant_cfg,
     )

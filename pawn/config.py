@@ -10,8 +10,12 @@ is built from these configs but does not own them.
 Layout:
 
 - **Vocab constants** (``PAD_TOKEN``, ``OUTCOME_TOKEN_BASE``,
-  ``NUM_ACTIONS``, ``VOCAB_SIZE``, the named outcome IDs) — must stay
-  in lockstep with ``engine/src/vocab.rs``. Pre-vocab-transition
+  ``NUM_ACTIONS``, ``BOS_TOKEN``, ``NULL_TOKEN``, ``N_CONTROL_RESERVED``,
+  ``VOCAB_SIZE``, the named outcome IDs). The action / PAD / outcome IDs
+  stay in lockstep with ``engine/src/vocab.rs``; ``BOS``/``NULL``/reserved
+  are Python-side control tokens above the engine's emission space.
+  ``VOCAB_SIZE`` (``V`` = 2000) is the model's uniform input/output vocab.
+  Pre-vocab-transition
   checkpoints used a ~60k-token vocabulary and are not loadable in v2;
   check out the ``pre-vocab-transition`` git tag to access them.
 - **Sequence + RoPE** (``MAX_SEQ_LEN``, ``ROPE_BASE``).
@@ -42,7 +46,9 @@ __all__ = [
     "OUTCOME_TOKEN_BASE",
     "N_PRETRAINING_OUTCOMES",
     "N_TOTAL_OUTCOMES",
-    "N_INPUT_TOKENS",
+    "BOS_TOKEN",
+    "NULL_TOKEN",
+    "N_CONTROL_RESERVED",
     "VOCAB_SIZE",
     "WHITE_CHECKMATES",
     "BLACK_CHECKMATES",
@@ -81,15 +87,21 @@ PAD_TOKEN: Final[int] = 1968
 OUTCOME_TOKEN_BASE: Final[int] = 1969
 N_PRETRAINING_OUTCOMES: Final[int] = 5  # Tokens 1969–1973 (natural game terminations)
 N_TOTAL_OUTCOMES: Final[int] = 11       # Tokens 1969–1979 (incl. Lichess-specific)
-# Total token IDs that may appear in inputs: 1968 actions + 1 PAD + 11 outcomes = 1980.
-# A.2 housekeeping: lm_head output covers 1969 columns — the action tokens plus PAD.
-# Outcome tokens (1969..1979) are *inputs* only (placed at position 0 under
-# prepend_outcome=True) and never appear as targets — dropping their lm_head columns
-# saves ~11/1980 = 0.6% of lm_head FLOPs with zero correctness impact. PAD stays in
-# the output vocab because the generation diagnostic path samples it as a termination
-# signal; the trade-off of dropping PAD too is examined separately in A.2-aggressive.
-N_INPUT_TOKENS: Final[int] = NUM_ACTIONS + 1 + N_TOTAL_OUTCOMES  # 1980
-VOCAB_SIZE: Final[int] = NUM_ACTIONS + 1  # 1969 — lm_head output width
+
+# Python-side control tokens. The Rust engine emits only moves + PAD + outcomes
+# (IDs 0..1979); BOS / NULL / reserved are assembled by Python (the conditioning
+# prefix) and never come off the engine. ``engine/src/vocab.rs`` keeps its own
+# ``VOCAB_SIZE = 1980`` for the engine's emission space — distinct from the
+# model's full vocab below.
+BOS_TOKEN: Final[int] = 1980            # Sequence-start, slot 0 of every prefix
+NULL_TOKEN: Final[int] = 1981           # Fills a conditioning slot a game lacks
+N_CONTROL_RESERVED: Final[int] = 18     # Tokens 1982–1999 reserved for future control kinds
+
+# Uniform input/output vocab. Input vocab == output vocab == V; there is no
+# N_INPUT_TOKENS / VOCAB_SIZE split. Reserved / NULL / control columns (≥1981)
+# exist in the embedding + logit tables but are masked to -inf before softmax-CE
+# so they can't be sampled or accrue gradient.
+VOCAB_SIZE: Final[int] = 2000           # V = 1968 actions + PAD + 11 outcomes + BOS + NULL + 18 reserved
 
 # Named outcome token IDs (kept verbatim from v1 / engine vocab.rs)
 WHITE_CHECKMATES: Final[int] = 1969
@@ -164,6 +176,7 @@ class ModelConfig:
     max_seq_len: int = MAX_SEQ_LEN
     rope_base: float = ROPE_BASE
     n_outcomes: int = N_TOTAL_OUTCOMES
+    tie_embeddings: bool = True
 
     def __post_init__(self) -> None:
         if self.d_model <= 0:
@@ -258,6 +271,14 @@ def validate_nested(variant: ModelConfig, supernet: ModelConfig) -> None:
     if variant.n_outcomes != supernet.n_outcomes:
         raise NestingError(
             f"n_outcomes mismatch: variant={variant.n_outcomes} supernet={supernet.n_outcomes}"
+        )
+    # Tied vs untied embeddings change the field set (a tied model has no
+    # standalone lm_head), so a variant must match the supernet's choice to
+    # share weight tensors under the nested slice.
+    if variant.tie_embeddings != supernet.tie_embeddings:
+        raise NestingError(
+            f"tie_embeddings mismatch: variant={variant.tie_embeddings} "
+            f"supernet={supernet.tie_embeddings}"
         )
 
 

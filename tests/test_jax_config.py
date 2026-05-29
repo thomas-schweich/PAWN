@@ -19,10 +19,13 @@ import textwrap
 import pytest
 
 from pawn.config import (
+    BOS_TOKEN,
     HEAD_DIM,
     MAX_SEQ_LEN,
+    N_CONTROL_RESERVED,
     N_PRETRAINING_OUTCOMES,
     N_TOTAL_OUTCOMES,
+    NULL_TOKEN,
     NUM_ACTIONS,
     OUTCOME_TOKEN_BASE,
     PAD_TOKEN,
@@ -44,25 +47,45 @@ from pawn.config import (
 
 
 def test_vocab_constants_match_engine_contract() -> None:
-    """The token-layout numbers are the contract the Rust engine asserts.
+    """The engine-emitted token-layout numbers are the contract the Rust
+    engine asserts.
 
-    1968 actions + 1 PAD + 11 outcomes = 1980 total. PAD == 1968, outcome
-    range starts at 1969. Changing any of these requires a coordinated
-    engine update and a new pre-vocab-transition tag.
+    1968 actions + 1 PAD + 11 outcomes occupy IDs 0..1979. PAD == 1968,
+    outcome range starts at 1969. Changing any of these requires a
+    coordinated engine update and a new pre-vocab-transition tag.
     """
     assert NUM_ACTIONS == 1968
     assert PAD_TOKEN == 1968
     assert OUTCOME_TOKEN_BASE == 1969
     assert N_PRETRAINING_OUTCOMES == 5
     assert N_TOTAL_OUTCOMES == 11
-    # A.2 (narrow): VOCAB_SIZE is the lm_head output width — action
-    # tokens + PAD. Outcome columns (1969..1979) were trimmed since
-    # outcomes are inputs only and never appear in targets. Saves
-    # ~0.6% of lm_head FLOPs at zero correctness risk; the broader
-    # PAD-column trim is deferred (needs paired generation refactor).
-    from pawn.config import N_INPUT_TOKENS
-    assert VOCAB_SIZE == NUM_ACTIONS + 1 == 1969
-    assert N_INPUT_TOKENS == NUM_ACTIONS + 1 + N_TOTAL_OUTCOMES == 1980
+
+
+def test_uniform_vocab_size() -> None:
+    """Phase A: input vocab == output vocab == V == 2000. There is no
+    N_INPUT_TOKENS / VOCAB_SIZE split; the model's embedding and logit
+    tables are both V-wide. V = 1968 actions + 1 PAD + 11 outcomes
+    (0..1979) + BOS + NULL (1980..1981) + 18 reserved (1982..1999)."""
+    assert VOCAB_SIZE == 2000
+    assert NUM_ACTIONS + 1 + N_TOTAL_OUTCOMES + 2 + N_CONTROL_RESERVED == VOCAB_SIZE
+    # The old split constant is gone — it must no longer be exported.
+    import pawn.config as config_module
+
+    assert not hasattr(config_module, "N_INPUT_TOKENS")
+    assert "N_INPUT_TOKENS" not in config_module.__all__
+
+
+def test_control_token_ids() -> None:
+    """BOS / NULL / reserved are Python-side control tokens above the
+    engine's emission space (≤1979). They occupy fixed IDs so checkpoints
+    and the prefix assembler agree on the layout."""
+    assert BOS_TOKEN == 1980
+    assert NULL_TOKEN == 1981
+    assert N_CONTROL_RESERVED == 18
+    # Reserved block is 1982..1999 inclusive, filling out to V == 2000.
+    assert NULL_TOKEN + 1 + N_CONTROL_RESERVED == VOCAB_SIZE
+    # Control tokens sit strictly above every engine-emitted token.
+    assert BOS_TOKEN > OUTCOME_TOKEN_BASE + N_TOTAL_OUTCOMES - 1
 
 
 def test_sequence_constants() -> None:
@@ -83,6 +106,7 @@ def test_model_config_valid_construction() -> None:
     assert cfg.head_dim == HEAD_DIM
     assert cfg.vocab_size == VOCAB_SIZE
     assert cfg.max_seq_len == MAX_SEQ_LEN
+    assert cfg.tie_embeddings is True  # tied by default
 
 
 def test_model_config_is_frozen() -> None:
@@ -291,9 +315,31 @@ def test_validate_nested_rejects_oversized_d_ff() -> None:
 def test_validate_nested_rejects_vocab_size_mismatch() -> None:
     """vocab_size must match exactly — a variant with a different vocab
     wouldn't share embedding tables with the supernet."""
-    cfg = ModelConfig(d_model=256, n_layers=10, n_heads=4, d_ff=1024, vocab_size=2000)
+    cfg = ModelConfig(d_model=256, n_layers=10, n_heads=4, d_ff=1024, vocab_size=1969)
     with pytest.raises(NestingError, match="vocab_size"):
         validate_nested(cfg, SUPERNET)
+
+
+def test_validate_nested_rejects_tie_embeddings_mismatch() -> None:
+    """A tied variant can't nest under an untied supernet (or vice-versa):
+    the tied model has no standalone lm_head, so the field sets differ and
+    weights can't be shared by the inner slice."""
+    untied = ModelConfig(
+        d_model=256, n_layers=10, n_heads=4, d_ff=1024, tie_embeddings=False
+    )
+    with pytest.raises(NestingError, match="tie_embeddings"):
+        validate_nested(untied, SUPERNET)  # SUPERNET ties by default
+
+
+def test_validate_nested_accepts_matching_untied() -> None:
+    """Two configs that both untie nest fine on the tie_embeddings axis."""
+    untied_super = ModelConfig(
+        d_model=640, n_layers=10, n_heads=10, d_ff=1792, tie_embeddings=False
+    )
+    untied_variant = ModelConfig(
+        d_model=256, n_layers=4, n_heads=4, d_ff=1024, tie_embeddings=False
+    )
+    validate_nested(untied_variant, untied_super)
 
 
 def test_validate_nested_rejects_max_seq_len_mismatch() -> None:

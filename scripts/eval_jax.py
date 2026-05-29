@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ckpt = args.checkpoint
     ckpt_path = resolve_checkpoint_source(ckpt)
-    model = load_model(ckpt_path)
+    model, _ = load_model(ckpt_path)
     corpus = generate_corpus(
         n_games=args.n_games, max_ply=args.max_ply, seq_len=args.seq_len, seed=0
     )

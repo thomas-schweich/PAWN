@@ -401,7 +401,7 @@ def load_resume_state(
     surfaces in logs rather than silently spiking the loss.
     """
     ckpt_dir = Path(ckpt_dir)
-    model = load_model(ckpt_dir)
+    model, _ = load_model(ckpt_dir)
     # Splice step from training_state.json if present.
     ts_path = ckpt_dir / "training_state.json"
     if ts_path.is_file():

@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ckpt = args.checkpoint
     ckpt_path = resolve_checkpoint_source(ckpt)
-    model = load_model(ckpt_path)
+    model, _ = load_model(ckpt_path)
 
     results = run_all_diagnostics(
         model,

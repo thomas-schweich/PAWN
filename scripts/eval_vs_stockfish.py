@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ckpt = args.checkpoint
     ckpt_path = resolve_checkpoint_source(ckpt)
-    model = load_model(ckpt_path)
+    model, _ = load_model(ckpt_path)
 
     bins = default_elo_bins()
     bins_corpora: dict[EloBin, Corpus] = {}

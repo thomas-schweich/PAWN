@@ -201,6 +201,70 @@ def test_each_strategy_dispatch_runs(strategy: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Backbone-frozen invariant against the un-factored field set
+# ---------------------------------------------------------------------------
+
+
+# `specialized_clm` trains a standalone model (the backbone is ignored), so
+# its "backbone" fields legitimately move; every other strategy must leave
+# the frozen backbone's embedding / head / final-norm untouched.
+_BACKBONE_HOLDING_STRATEGIES = sorted(
+    k for k in STRATEGIES if k != "specialized_clm"
+)
+
+
+@pytest.mark.parametrize("strategy", _BACKBONE_HOLDING_STRATEGIES)
+def test_each_strategy_keeps_backbone_embed_and_head_frozen(
+    strategy: str,
+) -> None:
+    """Chunk 6 invariant: after a train step the frozen backbone's
+    un-factored token table (``embed_tokens``), tied/untied head
+    (``lm_head``), and ``final_norm_w`` are bit-identical.
+
+    This is the field-set-aware guard that the old factored
+    ``embed_src``/``dst``/``promo``/``pad``/``outcome`` fields used to
+    be implicitly covered by — it pins that no adapter reconstruction
+    accidentally threads gradient into the new uniform embedding or the
+    (tied) head reused from it.
+    """
+    backbone = init_model(TINY_SUPERNET, key=0)
+    assert backbone.lm_head is None  # TINY_SUPERNET ties by default
+    cfg = _strategy_config(strategy)
+    init = dispatch_init(strategy)
+    adapter_filter = dispatch_filter(strategy)
+    adapter = init(backbone, cfg, key=jax.random.key(1))
+
+    embed_pre = np.asarray(backbone.embed_tokens)
+    final_norm_pre = np.asarray(backbone.final_norm_w)
+
+    trainable = eqx.filter(adapter, adapter_filter(adapter))
+    opt = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=1e-3),
+    )
+    opt_state = opt.init(trainable)
+    state = AdapterTrainState(
+        backbone=backbone,
+        adapter=adapter,
+        opt_state=opt_state,
+        step=jnp.int32(0),
+        key=jax.random.key(0),
+    )
+    train_step = make_adapter_train_step(strategy, opt)
+    new_state, _ = train_step(state, _make_batch())
+
+    # The backbone is held in state.backbone and never updated by the
+    # optimizer; its embedding table / head / final-norm must not move.
+    assert new_state.backbone.lm_head is None
+    assert np.array_equal(
+        np.asarray(new_state.backbone.embed_tokens), embed_pre
+    ), f"{strategy}: backbone embed_tokens drifted"
+    assert np.array_equal(
+        np.asarray(new_state.backbone.final_norm_w), final_norm_pre
+    ), f"{strategy}: backbone final_norm_w drifted"
+
+
+# ---------------------------------------------------------------------------
 # Two-tier partition: backbone gradients DCE'd
 # ---------------------------------------------------------------------------
 

@@ -2,26 +2,37 @@
 
 Coverage:
 - Round-trip: save a fresh model, load it, every saved field
-  byte-identical, forward pass matches.
+  byte-identical, forward pass matches. Both tied (default) and untied
+  (``tie_embeddings=False``) configs.
 - Atomic write: a crashed save leaves either no final dir or a complete
   one; an orphan ``.tmp`` from a prior save is cleaned up on next save.
 - Sentinel verification: a corrupted file is rejected at load.
 - Schema enforcement: extra / missing tensors are rejected; a tensor
   with the wrong shape is rejected.
-- ``config.json`` version + structure validation.
+- Tied↔untied cross-load is a hard error (the save schema differs by the
+  ``lm_head`` tensor, so a checkpoint saved tied refuses to load into an
+  untied config and vice-versa).
+- ``config.json`` version + ``mask_version`` + structure validation.
+- ``load_model`` returns ``(model, run_block)`` so eval can read the
+  checkpoint's own conditioning.
+- bf16 first-moment (``mu``) optimizer state survives the safetensors
+  round-trip bit-exact.
 - :func:`load_model_config` cheap inspection skips the safetensors load.
-- :data:`SAVED_FIELDS` has exactly 16 entries (re-pinned here so a
-  drift caught in pawn.model also shows up at the checkpoint contract).
+- The save schema is the per-``tie_embeddings`` field list (re-pinned
+  here so a drift caught in pawn.model also shows up at the checkpoint
+  contract).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Callable
 from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 
 from pawn._sentinel import (
@@ -33,13 +44,17 @@ from pawn._sentinel import (
 from pawn.checkpoint import (
     CHECKPOINT_FORMAT_VERSION,
     CONFIG_FILE,
+    MASK_VERSION,
     MODEL_FILE,
+    OPTIMIZER_FILE,
     load_model,
     load_model_config,
     save_model,
 )
-from pawn.config import TINY_SUPERNET, TINY_VARIANTS
-from pawn.model import SAVED_FIELDS, init_model, sliced
+from pawn.config import TINY_SUPERNET, TINY_VARIANTS, ModelConfig
+from pawn.model import init_model, saved_fields, sliced
+
+TINY_UNTIED: ModelConfig = dataclasses.replace(TINY_SUPERNET, tie_embeddings=False)
 
 
 def _tamper_tensors_and_rehash(
@@ -77,14 +92,25 @@ def _tamper_config_and_rehash(
     write_sentinel(out_dir, [MODEL_FILE, CONFIG_FILE])
 
 
+def _assert_fields_byte_identical(orig: object, loaded: object, fields: tuple[str, ...]) -> None:
+    """Every named (dotted) field is byte-identical between two models."""
+    for path in fields:
+        o, l = orig, loaded
+        for piece in path.split("."):
+            o, l = getattr(o, piece), getattr(l, piece)
+        assert jnp.array_equal(jnp.asarray(o), jnp.asarray(l)), (
+            f"saved field {path} changed across save/load"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Round-trip
 # ---------------------------------------------------------------------------
 
 
 def test_save_load_round_trip(tmp_path: Path) -> None:
-    """Saving and loading a fresh model yields a model with byte-identical
-    saved fields and an identical forward pass."""
+    """Saving and loading a fresh (tied) model yields a model with
+    byte-identical saved fields and an identical forward pass."""
     orig = init_model(TINY_SUPERNET, key=0)
     out_dir = tmp_path / "step_00000010"
     final_dir = save_model(orig, out_dir)
@@ -93,24 +119,42 @@ def test_save_load_round_trip(tmp_path: Path) -> None:
     assert (out_dir / MODEL_FILE).is_file()
     assert (out_dir / CONFIG_FILE).is_file()
 
-    loaded = load_model(out_dir)
+    loaded, run_block = load_model(out_dir)
+    assert run_block is None  # no run config was supplied
 
-    # Every SAVED_FIELDS tensor is byte-identical.
-    for path in SAVED_FIELDS:
-        o = orig
-        l = loaded
-        for piece in path.split("."):
-            o = getattr(o, piece)
-            l = getattr(l, piece)
-        assert jnp.array_equal(jnp.asarray(o), jnp.asarray(l)), (
-            f"saved field {path} changed across save/load"
-        )
+    # Tied model has no lm_head tensor on disk.
+    assert loaded.lm_head is None
+    _assert_fields_byte_identical(orig, loaded, saved_fields(orig.cfg.tie_embeddings))
 
     # Forward pass on a small batch matches.
     tokens = jnp.arange(32, dtype=jnp.int32).reshape(2, 16)
     out_a = orig(tokens)
     out_b = loaded(tokens)
     assert jnp.allclose(out_a, out_b, atol=1e-6)
+
+
+def test_save_load_round_trip_untied(tmp_path: Path) -> None:
+    """An untied model (`tie_embeddings=False`) round-trips with its
+    standalone `lm_head` tensor persisted and restored bit-exact."""
+    orig = init_model(TINY_UNTIED, key=0)
+    assert orig.lm_head is not None
+    out_dir = tmp_path / "untied"
+    save_model(orig, out_dir)
+
+    # The untied schema includes `lm_head` on disk.
+    from safetensors.numpy import load_file
+
+    on_disk = set(load_file(str(out_dir / MODEL_FILE)).keys())
+    assert "lm_head" in on_disk
+    assert on_disk == set(saved_fields(False))
+
+    loaded, _ = load_model(out_dir)
+    assert loaded.lm_head is not None
+    assert not loaded.cfg.tie_embeddings
+    _assert_fields_byte_identical(orig, loaded, saved_fields(False))
+
+    tokens = jnp.arange(32, dtype=jnp.int32).reshape(2, 16)
+    assert jnp.allclose(orig(tokens), loaded(tokens), atol=1e-6)
 
 
 def test_save_load_round_trip_sliced_variant(tmp_path: Path) -> None:
@@ -125,17 +169,10 @@ def test_save_load_round_trip_sliced_variant(tmp_path: Path) -> None:
     variant = sliced(supernet, TINY_VARIANTS["small"])
     out_dir = tmp_path / "small_variant"
     save_model(variant, out_dir)
-    loaded = load_model(out_dir)
+    loaded, _ = load_model(out_dir)
     assert loaded.cfg.d_model == TINY_VARIANTS["small"].d_model
 
-    # Every saved field is byte-identical
-    for path in SAVED_FIELDS:
-        o, l = variant, loaded
-        for piece in path.split("."):
-            o, l = getattr(o, piece), getattr(l, piece)
-        assert jnp.array_equal(jnp.asarray(o), jnp.asarray(l)), (
-            f"saved field {path} changed across save/load"
-        )
+    _assert_fields_byte_identical(variant, loaded, saved_fields(variant.cfg.tie_embeddings))
 
     # Forward pass on the loaded variant matches the original at atol=1e-6.
     tokens = jnp.arange(32, dtype=jnp.int32).reshape(2, 16)
@@ -145,36 +182,175 @@ def test_save_load_round_trip_sliced_variant(tmp_path: Path) -> None:
 def test_save_with_run_config_and_optimizer(tmp_path: Path) -> None:
     """Optional payloads land on disk, the manifest covers them, and the
     full `load_model` path still works with the optional payloads present
-    (regression-guards against future code that keys on manifest length)."""
+    (regression-guards against future code that keys on manifest length).
+
+    `load_model` returns the persisted run block so eval can rebuild the
+    checkpoint's own conditioning."""
     model = init_model(TINY_SUPERNET, key=0)
     out_dir = tmp_path / "step_00000020"
     fake_opt = {
         "adam_m": np.zeros(8, dtype=np.float32),
         "adam_v": np.ones(8, dtype=np.float32),
     }
+    run = {"strategy": "lora", "lora_rank": 4, "conditioning": ["outcome"], "C": 2}
     save_model(
         model,
         out_dir,
-        run_config={"strategy": "lora", "lora_rank": 4},
+        run_config=run,
         optimizer_state=fake_opt,
         training_state={"step": 1234, "rng_b64": "deadbeef"},
     )
-    assert (out_dir / "optimizer.safetensors").is_file()
+    assert (out_dir / OPTIMIZER_FILE).is_file()
     assert (out_dir / "training_state.json").is_file()
 
     # config.json carries the run block.
     raw = json.loads((out_dir / CONFIG_FILE).read_text(encoding="utf-8"))
-    assert raw["run"] == {"strategy": "lora", "lora_rank": 4}
+    assert raw["run"] == run
 
     # training_state.json round-trips intact.
     ts = json.loads((out_dir / "training_state.json").read_text(encoding="utf-8"))
     assert ts == {"step": 1234, "rng_b64": "deadbeef"}
 
-    # `load_model` still works with the optional payloads present — the
-    # extra files in the manifest don't trip integrity or schema checks.
-    loaded = load_model(out_dir)
+    # `load_model` still works with the optional payloads present, and
+    # returns the persisted run block (conditioning + C).
+    loaded, run_block = load_model(out_dir)
     assert loaded.cfg == model.cfg
-    assert jnp.array_equal(loaded.embed_src, model.embed_src)
+    assert run_block == run
+    assert jnp.array_equal(loaded.embed_tokens, model.embed_tokens)
+
+
+# ---------------------------------------------------------------------------
+# config.json: tie_embeddings / vocab_size / mask_version persistence
+# ---------------------------------------------------------------------------
+
+
+def test_config_persists_format_and_layout_metadata(tmp_path: Path) -> None:
+    """config.json persists the checkpoint format version, the layout
+    `mask_version` tag, and (inside the `model` block) `tie_embeddings`
+    + `vocab_size`."""
+    model = init_model(TINY_SUPERNET, key=0)
+    out_dir = tmp_path / "step_00000010"
+    save_model(model, out_dir)
+    raw = json.loads((out_dir / CONFIG_FILE).read_text(encoding="utf-8"))
+    assert raw["version"] == CHECKPOINT_FORMAT_VERSION
+    assert raw["mask_version"] == MASK_VERSION
+    assert raw["model"]["tie_embeddings"] is True
+    assert raw["model"]["vocab_size"] == model.cfg.vocab_size
+
+
+def test_load_rejects_wrong_mask_version(tmp_path: Path) -> None:
+    """A checkpoint whose `mask_version` doesn't match this build is
+    refused — closes the silent layout/RoPE drift the tag exists to
+    catch."""
+    model = init_model(TINY_SUPERNET, key=0)
+    out_dir = tmp_path / "step_00000010"
+    save_model(model, out_dir)
+
+    def bump_mask_version(raw: dict) -> dict:
+        raw["mask_version"] = MASK_VERSION + 7
+        return raw
+
+    _tamper_config_and_rehash(out_dir, bump_mask_version)
+    with pytest.raises(CheckpointIntegrityError, match="mask_version"):
+        load_model(out_dir)
+
+
+# ---------------------------------------------------------------------------
+# Tied↔untied cross-load rejection
+# ---------------------------------------------------------------------------
+
+
+def test_cross_load_untied_checkpoint_into_tied_config_rejected(tmp_path: Path) -> None:
+    """A checkpoint saved untied (carries `lm_head`) cannot be loaded
+    when config.json claims `tie_embeddings=True`."""
+    model = init_model(TINY_UNTIED, key=0)
+    out_dir = tmp_path / "untied_ckpt"
+    save_model(model, out_dir)
+
+    # Flip the persisted config to tied without dropping the lm_head tensor.
+    def make_tied(raw: dict) -> dict:
+        raw["model"]["tie_embeddings"] = True
+        return raw
+
+    _tamper_config_and_rehash(out_dir, make_tied)
+    with pytest.raises(CheckpointIntegrityError, match="tie_embeddings=True"):
+        load_model(out_dir)
+
+
+def test_cross_load_tied_checkpoint_into_untied_config_rejected(tmp_path: Path) -> None:
+    """A checkpoint saved tied (no `lm_head`) cannot be loaded when
+    config.json claims `tie_embeddings=False`."""
+    model = init_model(TINY_SUPERNET, key=0)
+    out_dir = tmp_path / "tied_ckpt"
+    save_model(model, out_dir)
+
+    def make_untied(raw: dict) -> dict:
+        raw["model"]["tie_embeddings"] = False
+        return raw
+
+    _tamper_config_and_rehash(out_dir, make_untied)
+    with pytest.raises(CheckpointIntegrityError, match="tie_embeddings=False"):
+        load_model(out_dir)
+
+
+# ---------------------------------------------------------------------------
+# bf16 first-moment optimizer-state round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_optimizer_bf16_mu_round_trip(tmp_path: Path) -> None:
+    """The AdamW first moment (`mu`), stored in bf16 to halve the
+    optimizer state's footprint, survives the flatten → safetensors →
+    unflatten round-trip bit-exact.
+
+    Mirrors `pawn.trainer.make_optimizer`'s adamw branch (`mu_dtype=
+    bfloat16`) and the trainer's `flatten_opt_state`/`unflatten_opt_state`
+    serialisation path, but builds the optimizer directly so the test
+    doesn't pull in the full run-config machinery."""
+    import equinox as eqx
+
+    from pawn.trainer import flatten_opt_state, unflatten_opt_state
+
+    model = init_model(TINY_SUPERNET, key=0)
+    params = eqx.filter(model, eqx.is_inexact_array)
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=1e-3, weight_decay=0.0, mu_dtype=jnp.bfloat16),
+    )
+    opt_state = optimizer.init(params)
+    # Take one update step so the moments are non-zero (a zero-fill would
+    # round-trip trivially regardless of dtype handling).
+    grads = eqx.filter(model, eqx.is_inexact_array)
+    _, opt_state = optimizer.update(grads, opt_state, params)
+
+    # The first moment must actually be bf16, else the test isn't pinning
+    # the bf16 path at all.
+    flat = flatten_opt_state(opt_state)
+    mu_keys = [k for k, v in flat.items() if v.dtype == jnp.bfloat16]
+    assert mu_keys, "expected at least one bf16 (mu) leaf in the opt_state"
+
+    out_dir = tmp_path / "step_00000010"
+    save_model(model, out_dir, optimizer_state=flat)
+
+    from safetensors.numpy import load_file
+
+    restored_flat = load_file(str(out_dir / OPTIMIZER_FILE))
+    for k in mu_keys:
+        assert restored_flat[k].dtype == jnp.bfloat16, (
+            f"bf16 leaf {k} lost its dtype across the safetensors round-trip"
+        )
+        assert np.array_equal(restored_flat[k], flat[k]), (
+            f"bf16 leaf {k} changed across the round-trip"
+        )
+
+    # And it rebuilds back into a valid opt_state PyTree.
+    template = optimizer.init(params)
+    rebuilt = unflatten_opt_state(template, restored_flat)
+    rebuilt_flat = flatten_opt_state(rebuilt)
+    for k in mu_keys:
+        assert rebuilt_flat[k].dtype == jnp.bfloat16
+        assert np.array_equal(rebuilt_flat[k], flat[k])
 
 
 # ---------------------------------------------------------------------------
@@ -289,25 +465,25 @@ def test_load_detects_missing_sentinel(tmp_path: Path) -> None:
 
 
 def test_load_rejects_missing_tensor(tmp_path: Path) -> None:
-    """A model.safetensors with one of the SAVED_FIELDS missing is
+    """A model.safetensors with one of the saved fields missing is
     rejected. The sentinel is re-hashed so the failure fires on the
     schema check, not the SHA mismatch."""
     model = init_model(TINY_SUPERNET, key=0)
     out_dir = tmp_path / "step_00000010"
     save_model(model, out_dir)
 
-    def drop_embed_pad(tensors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    def drop_embed_tokens(tensors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         d = dict(tensors)
-        del d["embed_pad"]
+        del d["embed_tokens"]
         return d
 
-    _tamper_tensors_and_rehash(out_dir, drop_embed_pad)
+    _tamper_tensors_and_rehash(out_dir, drop_embed_tokens)
     with pytest.raises(CheckpointIntegrityError, match="missing expected tensors"):
         load_model(out_dir)
 
 
 def test_load_rejects_extra_tensor(tmp_path: Path) -> None:
-    """A model.safetensors with a tensor not in SAVED_FIELDS is rejected."""
+    """A model.safetensors with a tensor not in the save schema is rejected."""
     model = init_model(TINY_SUPERNET, key=0)
     out_dir = tmp_path / "step_00000010"
     save_model(model, out_dir)
@@ -330,13 +506,13 @@ def test_load_rejects_wrong_shape(tmp_path: Path) -> None:
     out_dir = tmp_path / "step_00000010"
     save_model(model, out_dir)
 
-    def wrong_embed_src(tensors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    def wrong_embed_tokens(tensors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         d = dict(tensors)
-        d["embed_src"] = np.zeros((64, 1234), dtype=np.float32)
+        d["embed_tokens"] = np.zeros((64, 1234), dtype=np.float32)
         return d
 
-    _tamper_tensors_and_rehash(out_dir, wrong_embed_src)
-    with pytest.raises(CheckpointIntegrityError, match="wrong shape|expected"):
+    _tamper_tensors_and_rehash(out_dir, wrong_embed_tokens)
+    with pytest.raises(CheckpointIntegrityError, match="shape|expected"):
         load_model(out_dir)
 
 
@@ -404,6 +580,23 @@ def test_load_rejects_config_with_non_dict_model_block(tmp_path: Path) -> None:
         load_model(out_dir)
 
 
+def test_load_rejects_non_dict_run_block(tmp_path: Path) -> None:
+    """A `run` block present but not a dict (e.g. a list) is rejected —
+    `load_model` returns it to callers as a dict and a malformed shape
+    would surface as a confusing downstream error otherwise."""
+    model = init_model(TINY_SUPERNET, key=0)
+    out_dir = tmp_path / "step_00000010"
+    save_model(model, out_dir, run_config={"conditioning": ["outcome"]})
+
+    def break_run_block(raw: dict) -> dict:
+        raw["run"] = ["not", "a", "dict"]
+        return raw
+
+    _tamper_config_and_rehash(out_dir, break_run_block)
+    with pytest.raises(CheckpointIntegrityError, match="`run` block is not a dict"):
+        load_model(out_dir)
+
+
 # ---------------------------------------------------------------------------
 # Cheap inspection
 # ---------------------------------------------------------------------------
@@ -448,9 +641,12 @@ def test_load_rejects_manifest_missing_config_json(tmp_path: Path) -> None:
         load_model(out_dir)
 
 
-def test_save_schema_is_sixteen_fields() -> None:
-    """Re-pin the 16-field contract at the checkpoint API layer too —
-    a drift in `pawn.model.SAVED_FIELDS` would already fire its own
-    assertion at import; this is belt-and-braces."""
-    assert len(SAVED_FIELDS) == 16
+def test_save_schema_field_count() -> None:
+    """Re-pin the save-schema contract at the checkpoint API layer too —
+    a drift in `pawn.model.saved_fields` would already fire its own
+    assertion at import; this is belt-and-braces. Tied omits `lm_head`
+    (11 fields), untied includes it (12)."""
+    assert "lm_head" not in saved_fields(True)
+    assert "lm_head" in saved_fields(False)
+    assert len(saved_fields(True)) == len(saved_fields(False)) - 1
     assert CHECKPOINT_FORMAT_VERSION == 1

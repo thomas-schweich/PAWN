@@ -225,7 +225,7 @@ class BottleneckEffective(eqx.Module):
         return self.backbone.decomp_table
 
     @property
-    def lm_head(self) -> Float[Array, "d V"]:
+    def lm_head(self) -> Float[Array, "d V"] | None:
         return self.backbone.lm_head
 
     @property
@@ -237,24 +237,8 @@ class BottleneckEffective(eqx.Module):
         return self.backbone.layers
 
     @property
-    def embed_src(self) -> Float[Array, "64 d"]:
-        return self.backbone.embed_src
-
-    @property
-    def embed_dst(self) -> Float[Array, "64 d"]:
-        return self.backbone.embed_dst
-
-    @property
-    def embed_promo(self) -> Float[Array, "5 d"]:
-        return self.backbone.embed_promo
-
-    @property
-    def embed_pad(self) -> Float[Array, "d"]:
-        return self.backbone.embed_pad
-
-    @property
-    def embed_outcome(self) -> Float[Array, "n_out d"]:
-        return self.backbone.embed_outcome
+    def embed_tokens(self) -> Float[Array, "V d"]:
+        return self.backbone.embed_tokens
 
     def __call__(
         self,

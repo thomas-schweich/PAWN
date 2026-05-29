@@ -184,18 +184,10 @@ def apply_lora(backbone: PAWNModel, adapter: LoRAAdapter) -> PAWNModel:
         w_up=_add_lora_correction(layers.w_up, adapter.A_up, adapter.B_up, s),
         w_down=_add_lora_correction(layers.w_down, adapter.A_down, adapter.B_down, s),
     )
-    return PAWNModel(
-        embed_src=backbone.embed_src,
-        embed_dst=backbone.embed_dst,
-        embed_promo=backbone.embed_promo,
-        embed_pad=backbone.embed_pad,
-        embed_outcome=backbone.embed_outcome,
-        layers=new_layers,
-        final_norm_w=backbone.final_norm_w,
-        lm_head=backbone.lm_head,
-        decomp_table=backbone.decomp_table,
-        cfg=backbone.cfg,
-    )
+    # `tree_at` on the single `layers` leaf keeps every other backbone
+    # field (embeddings, head, norms, buffers) untouched and decouples
+    # this rebuild from the model's field set.
+    return eqx.tree_at(lambda m: m.layers, backbone, new_layers)
 
 
 def lora_filter(adapter: LoRAAdapter) -> LoRAAdapter:

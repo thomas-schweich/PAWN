@@ -337,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         # Users wanting v1 artifacts check out the `v1.0.0` git tag.
         from pawn.checkpoint import load_model
         ckpt_dir = resolve_checkpoint_source(cfg.checkpoint)
-        backbone = load_model(ckpt_dir)
+        backbone, _ = load_model(ckpt_dir)
         # When the loaded model has the supernet's depth we slice into a
         # variant; otherwise treat it as standalone (e.g., a previously
         # published from-scratch CLM run).
@@ -384,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
         from pawn.trainer import unflatten_opt_state
 
         ckpt_dir = Path(args.resume)
-        backbone = load_model(ckpt_dir)
+        backbone, _ = load_model(ckpt_dir)
         # Bottleneck sidecar: re-compose the wrapper. Otherwise fall
         # back to the freshly-initialised adapter (weight-folded
         # adapters bake into the backbone at save time, so they don't
