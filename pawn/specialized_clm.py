@@ -60,9 +60,13 @@ class _Block(nn.Module):
         h = self.attn_norm(x)
         q = self.wq(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.wk(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.wv(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        q = _apply_rope(q, rope_cos, rope_sin)
-        k = _apply_rope(k, rope_cos, rope_sin)
+        v = self.wv(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
+        # Force contiguous q/k/v before SDPA so flash attention's backward
+        # gets the strides it expects under torch.compile on ROCm — same
+        # fix as the main model's Attention.forward (pawn/model.py). Without
+        # it the inductor flash-backward kernel hits a stride mismatch.
+        q = _apply_rope(q, rope_cos, rope_sin).contiguous()
+        k = _apply_rope(k, rope_cos, rope_sin).contiguous()
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, -1)
         x = x + self.wo(attn_out)
