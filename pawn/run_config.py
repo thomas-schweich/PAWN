@@ -443,6 +443,13 @@ class PretrainConfig(BaseRunConfig):
     # so eval cost dominates and a smaller val set keeps cadence sane.
     val_games: int = 512
 
+    # Which variants to train jointly. None (default) = all three
+    # (small/base/large) — the supernet joint loss. A subset trains only
+    # those variants; ("large",) is a standalone-large teacher pretrain for
+    # the distillation-canonical ladder (plan §7). Distinct from `variant`
+    # above, which only selects the smoke-verification slice.
+    variants: tuple[VariantName, ...] | None = None
+
     @model_validator(mode="after")
     def _check_pretrain(self) -> "PretrainConfig":
         # `BaseRunConfig.total_steps` is `int | None = None` so the
@@ -463,6 +470,16 @@ class PretrainConfig(BaseRunConfig):
             raise ValueError(
                 f"checkpoint_interval must be positive, got {self.checkpoint_interval}"
             )
+        if self.variants is not None:
+            if len(self.variants) == 0:
+                raise ValueError(
+                    "variants, if set, must be a non-empty subset of "
+                    "small/base/large"
+                )
+            if len(set(self.variants)) != len(self.variants):
+                raise ValueError(
+                    f"variants must not contain duplicates, got {self.variants}"
+                )
         return self
 
 

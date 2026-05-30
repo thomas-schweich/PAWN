@@ -165,6 +165,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                     help="(C.1) optimizer to use. Lion halves opt-state "
                          "memory + ~3-5%% step time but needs LR ~1/3 of "
                          "AdamW's. Default is adamw.")
+    ap.add_argument("--variants", nargs="*", default=None,
+                    help="subset of {small,base,large} to train jointly "
+                         "(default: all three = supernet joint loss). e.g. "
+                         "`--variants large` trains only the full model — a "
+                         "standalone-large teacher pretrain for the "
+                         "distillation-canonical ladder (plan §7).")
     return ap.parse_args(argv)
 
 
@@ -193,6 +199,10 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
         # when omitted, so the `is not None` guard below distinguishes
         # "explicitly set to []" from "not passed".
         ("conditioning", args.conditioning),
+        # `--variants` (nargs="*") -> list when passed, None when omitted;
+        # convert to tuple. A bare `--variants` (empty list) -> () which the
+        # PretrainConfig validator rejects with a clear message.
+        ("variants", tuple(args.variants) if args.variants is not None else None),
     ):
         if val is not None:
             base[flag] = val
@@ -220,6 +230,25 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
     return PretrainConfig(**base)
 
 
+def build_variants(cfg: PretrainConfig) -> tuple[VariantSpec, ...]:
+    """The variants to train jointly for this run.
+
+    ``cfg.variants`` selects a subset of the supernet's nested variants;
+    ``None`` (the default) trains all three (small/base/large) as the
+    supernet joint loss. ``("large",)`` trains only the full model — a
+    standalone-large teacher pretrain for the distillation-canonical
+    ladder (plan §7). ``is_supernet`` is True only for ``"large"`` so the
+    full model goes through the forward unsliced; any other selected
+    variant is a width-slice of the supernet.
+    """
+    variants_dict = TINY_VARIANTS if cfg.supernet == "tiny" else VARIANTS
+    selected = cfg.variants if cfg.variants is not None else ("small", "base", "large")
+    return tuple(
+        VariantSpec(name, variants_dict[name], is_supernet=(name == "large"))
+        for name in selected
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     # `_build_config` raises a pydantic ValueError if --total-steps is
@@ -232,11 +261,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Pick supernet shape.
     supernet_cfg = TINY_SUPERNET if cfg.supernet == "tiny" else SUPERNET
-    variants_dict = TINY_VARIANTS if cfg.supernet == "tiny" else VARIANTS
-    variants = tuple(
-        VariantSpec(name, variants_dict[name], is_supernet=(name == "large"))
-        for name in ("small", "base", "large")
-    )
+    variants = build_variants(cfg)
 
     # `PretrainConfig._check_pretrain` validates that `total_steps` is
     # not None — assert it for pyright (the model_validator constraint

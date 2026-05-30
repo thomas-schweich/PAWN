@@ -43,6 +43,65 @@ def test_script_module_imports(script_name: str) -> None:
     assert hasattr(mod, "main")
 
 
+def _load_train_jax():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "scripts_train_jax_vsel", Path("scripts") / "train_jax.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_train_jax_variants_flag_and_build() -> None:
+    """`--variants` selects which variants train; default trains all three.
+
+    Routes through the real CLI path (_parse_args -> _build_config ->
+    build_variants) so the argparse merge + pydantic validation + spec
+    construction are all exercised.
+    """
+    from pydantic import ValidationError
+
+    tj = _load_train_jax()
+
+    def cfg_for(extra: list[str]):
+        args = tj._parse_args(
+            ["--supernet", "tiny", "--total-steps", "1", "--local-checkpoints", *extra]
+        )
+        return tj._build_config(args)
+
+    # Default (no --variants): all three, only `large` is the supernet.
+    cfg = cfg_for([])
+    assert cfg.variants is None
+    specs = tj.build_variants(cfg)
+    assert tuple(s.name for s in specs) == ("small", "base", "large")
+    assert sum(bool(s.is_supernet) for s in specs) == 1
+
+    # `--variants large`: a single is_supernet=True large variant
+    # (standalone-large teacher pretrain).
+    cfg = cfg_for(["--variants", "large"])
+    assert cfg.variants == ("large",)
+    specs = tj.build_variants(cfg)
+    assert len(specs) == 1
+    assert specs[0].name == "large" and specs[0].is_supernet is True
+
+    # A subset is allowed (order preserved).
+    cfg = cfg_for(["--variants", "small", "base"])
+    assert cfg.variants == ("small", "base")
+    assert tuple(s.name for s in tj.build_variants(cfg)) == ("small", "base")
+
+    # Invalid name -> pydantic Literal rejection.
+    with pytest.raises(ValidationError):
+        cfg_for(["--variants", "huge"])
+    # Duplicates and bare `--variants` (empty) -> our validators.
+    with pytest.raises(ValidationError):
+        cfg_for(["--variants", "large", "large"])
+    with pytest.raises(ValidationError):
+        cfg_for(["--variants"])
+
+
 @pytest.mark.parametrize("script_name", SCRIPTS)
 def test_script_help_works(script_name: str) -> None:
     """`--help` exits 0 — argparse is wired up correctly."""
