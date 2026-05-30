@@ -339,21 +339,23 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.total_steps is None:
         print("error: --total-steps is required", file=sys.stderr)
         return 2
-    _require_accelerator()
-    cache_path = setup_jax_caching()
-    if cache_path is not None:
-        print(f"JAX compilation cache: {cache_path}")
     if cfg.strategy not in STRATEGIES:
         print(f"error: unknown strategy {cfg.strategy!r}", file=sys.stderr)
         return 2
 
-    # Early --resume validation runs *before* any HF checkpoint
-    # download or local model load so guard failures don't waste
-    # bandwidth or compile time. Round-3 bug-detector MINOR: the
-    # prior order made the RoSA-resume test depend on HF network
-    # state in CI. We only peek at the resume-specific sidecar
-    # files; full restore happens further down once the backbone is
-    # in hand.
+    # Early --resume validation runs *before* any JAX device init /
+    # HF checkpoint download / local model load so guard failures
+    # don't waste bandwidth or compile time. Round-3 bug-detector
+    # MINOR: the prior order made the RoSA-resume test depend on HF
+    # network state in CI. This block is pure argument validation
+    # (read a JSON sidecar, check a step counter) and touches no JAX
+    # device — it deliberately runs *ahead* of `_require_accelerator()`
+    # and `setup_jax_caching()` so that on accelerator backends prone
+    # to a flaky device-init segfault (JAX-on-ROCm/WSL2), the guard
+    # message is still emitted deterministically rather than being lost
+    # when the runtime dies during device init. We only peek at the
+    # resume-specific sidecar files; full restore happens further down
+    # once the backbone is in hand.
     is_rosa_strategy = cfg.strategy in (
         "rosa", "rosa-retro-sparse", "rosa-retro-bottleneck",
     )
@@ -380,6 +382,11 @@ def main(argv: list[str] | None = None) -> int:
                 "work (exceeding total_steps) or apply stale masks. "
                 "Restart the run from step 0 instead."
             )
+
+    _require_accelerator()
+    cache_path = setup_jax_caching()
+    if cache_path is not None:
+        print(f"JAX compilation cache: {cache_path}")
 
     # Build / load backbone.
     if cfg.strategy == "specialized_clm":
