@@ -27,6 +27,7 @@ from pawn.adapter_trainer import (
     dispatch_filter,
     dispatch_init,
     generate_rosa_masks,
+    make_adapter_scan_step,
     make_adapter_train_step,
     rosa_phase1_to_phase3,
 )
@@ -55,7 +56,7 @@ from pawn.logging import MetricsLogger
 from pawn.model import PAWNModel, init_model, sliced
 from pawn.run_config import AdapterConfig
 from pawn.trainer import (
-    cross_entropy_loss, flatten_opt_state, make_lr_schedule,
+    Batch, cross_entropy_loss, flatten_opt_state, make_lr_schedule,
     make_optimizer, slice_batch,
 )
 
@@ -112,6 +113,54 @@ def _resolve_cadence(cfg: AdapterConfig, n_train_games: int) -> _Cadence:
         data_seed=data_seed,
         epoch_steps=epoch_steps,
     )
+
+
+def _step_time(elapsed: float, step: int, run_start: int) -> float:
+    """Mean wall-time per step for the *current* run (§8.3 step_time fix).
+
+    ``elapsed`` is the seconds since the loop's ``t0``; ``step`` is the
+    absolute step just reached; ``run_start`` is the absolute step the run
+    began from (``resume_step`` on a resume, else 0). Dividing by the *number
+    of steps this run actually executed* (``step - run_start``) — not the
+    absolute ``step`` — keeps the reported per-step time honest after a
+    resume, where the old absolute-``step`` divisor understated it by folding
+    in steps from the prior run. ``max(1, …)`` guards the degenerate
+    ``step == run_start`` first-row case.
+
+    Pure + JAX-free so the divisor is unit-testable directly.
+    """
+    return elapsed / max(1, step - run_start)
+
+
+def _chunk_bound(
+    absolute: int,
+    remaining: int,
+    k: int,
+    eval_interval: int,
+    checkpoint_interval: int,
+) -> int:
+    """Size of the next host-loop chunk (the core C3 boundary-shrink).
+
+    ``absolute`` is the number of steps already completed in this phase;
+    ``remaining`` is how many are still owed. A chunk is the ``lax.scan``
+    K-step unit: the scan only surfaces the *final* carry, so the chunk must
+    never straddle an ``eval_interval`` / ``checkpoint_interval`` boundary —
+    otherwise the host can't read the exact post-step state to eval or
+    checkpoint on it. The chunk is therefore capped to ``k`` and ``remaining``
+    and then shortened to land on whichever boundary is closest.
+
+    ``eval_interval - (absolute % eval_interval)`` is the distance to the next
+    eval boundary: when ``absolute`` is itself a multiple of the interval this
+    is a full ``eval_interval`` (the boundary at ``absolute`` is already past),
+    and otherwise it lands exactly on the next multiple. The same holds for the
+    checkpoint distance. Dropping the ``- (absolute % …)`` term, or shifting
+    the boundary test elsewhere, would let chunks cross boundaries and silently
+    skip evals/checkpoints — so the arithmetic is pure + JAX-free here to be
+    unit-testable directly.
+    """
+    to_eval = eval_interval - (absolute % eval_interval)
+    to_ckpt = checkpoint_interval - (absolute % checkpoint_interval)
+    return min(k, remaining, to_eval, to_ckpt)
 
 
 class _AdapterResume(NamedTuple):
@@ -648,6 +697,11 @@ def main(argv: list[str] | None = None) -> int:
         cfg.strategy, optimizer,
         compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa, use_flash=use_flash,
     )
+    # H11 (§8.3): drive the train loop through the K-step ``lax.scan`` so the
+    # whole inner chunk is one compiled program (no per-step dispatch). The
+    # single-step ``train_step`` is kept only as the scan body; eval uses the
+    # forward-only ``val_step`` below.
+    scan_step = make_adapter_scan_step(train_step)
 
     apply_fn = STRATEGIES[cfg.strategy].apply
 
@@ -811,30 +865,80 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.time()
     final_step = 0
     is_rosa = is_rosa_strategy
+    # H11 (§8.3): ``run_start`` is the absolute step the run began from —
+    # ``resume_step`` for a resumed non-RoSA run, 0 otherwise (RoSA rejects
+    # ``--resume`` upstream). The ``step_time`` divisor must be
+    # ``(step - run_start)`` so a resume reports the per-step wall time of
+    # the *current* run rather than dividing this run's elapsed time by the
+    # absolute step counter (which would understate it after a resume).
+    run_start = resume_step
+
+    def _gather_chunk(n: int) -> Batch:
+        """Pre-gather ``n`` train batches into one ``(n, B, T)`` Batch.
+
+        Each scan element is a ``(B, T)`` batch, so the leading axis is the
+        K-step axis the :func:`make_adapter_scan_step` ``lax.scan`` iterates.
+        Sampling ``(n, B)`` game indices in one draw keeps the train stream's
+        RNG sequence identical to the single-step loop (``rng`` is consumed
+        in the same order)."""
+        idx = rng.integers(0, corpus.n_games, size=(n, cfg.batch_size))
+        return Batch(
+            tokens=jnp.asarray(corpus.tokens[idx]),
+            targets=jnp.asarray(corpus.targets[idx]),
+            attn_mask=jnp.asarray(corpus.attn_mask[idx]),
+            loss_mask=jnp.asarray(corpus.loss_mask[idx]),
+        )
 
     def _run_steps(
         state: AdapterTrainState,
-        step_fn: object,  # eqx-jitted closure
+        scan_fn: object,  # eqx-jitted K-step lax.scan closure
         n_steps: int,
         start_step: int,
     ) -> tuple[AdapterTrainState, int]:
-        """Inner loop chunk used by both non-RoSA paths and per-phase
-        RoSA orchestration. Returns ``(new_state, last_step_done)``
-        where ``last_step_done`` is the absolute step counter the loop
-        reached so the outer scope can drive checkpoints and resumes."""
+        """Drive ``n_steps`` adapter steps through the K-step ``lax.scan``
+        (H11). Used by both the non-RoSA path and per-phase RoSA
+        orchestration. Returns ``(new_state, last_step_done)`` where
+        ``last_step_done`` is the absolute step counter the loop reached so
+        the outer scope can drive checkpoints and resumes.
+
+        Each chunk is capped to ``cfg.k`` and shortened so it never crosses
+        an ``eval_interval`` / ``checkpoint_interval`` boundary — the scan
+        only surfaces the *final* carry state, so eval (forward-only,
+        single-step) and checkpointing run on the host at the exact boundary
+        step. Per-step training losses come back as a ``(chunk,)`` array and
+        are replayed at each ``log_interval`` boundary without a per-step
+        host sync."""
         nonlocal final_step
-        for offset in range(n_steps):
-            absolute = start_step + offset
-            idx = rng.integers(0, corpus.n_games, size=cfg.batch_size)
-            batch = slice_batch(corpus, idx)
-            state, loss = step_fn(state, batch)  # type: ignore[operator]
-            final_step = absolute + 1
-            if final_step % cfg.log_interval == 0:
-                logger.log_train(
-                    step=final_step, loss=float(loss),
-                    lr=np.asarray(schedule(int(state.step))).item(),
-                    step_time=(time.time() - t0) / final_step,
-                )
+        done = 0
+        while done < n_steps:
+            absolute = start_step + done  # steps already completed this phase
+            remaining = n_steps - done
+            # Shrink the chunk so its trailing edge lands on the next
+            # eval / checkpoint boundary (whichever is closest) — that's
+            # where the host needs the exact post-step state.
+            chunk = _chunk_bound(
+                absolute,
+                remaining,
+                cfg.k,
+                eval_interval,
+                cfg.checkpoint_interval,
+            )
+            batches = _gather_chunk(chunk)
+            state, losses = scan_fn(state, batches)  # type: ignore[operator]
+            losses_np = np.asarray(losses)
+            chunk_start = absolute  # absolute step *before* this chunk
+            for i in range(chunk):
+                step = chunk_start + i + 1
+                if step % cfg.log_interval == 0:
+                    logger.log_train(
+                        step=step, loss=float(losses_np[i]),
+                        lr=np.asarray(schedule(step)).item(),
+                        step_time=_step_time(
+                            time.time() - t0, step, run_start
+                        ),
+                    )
+            done += chunk
+            final_step = start_step + done
             if final_step % eval_interval == 0:
                 val_idx = val_rng.integers(
                     0, val_corpus.n_games, size=cfg.batch_size
@@ -859,7 +963,7 @@ def main(argv: list[str] | None = None) -> int:
         warmup_n = min(rosa_cfg.rosa_warmup_steps, effective_total_steps)
         # `--resume + RoSA` is rejected upstream (where args.resume is
         # parsed) so resume_step is guaranteed to be 0 here.
-        state, last = _run_steps(state, train_step, warmup_n, start_step=0)
+        state, last = _run_steps(state, scan_step, warmup_n, start_step=0)
         if not should_shutdown() and warmup_n < effective_total_steps:
             # Phase 2: gather `mask_samples` batches and accumulate
             # |grad|^grad_alpha on each sparse delta to derive the
@@ -899,9 +1003,10 @@ def main(argv: list[str] | None = None) -> int:
                 compute_dtype=compute_dtype,
                 use_sdpa=cfg.use_sdpa, use_flash=use_flash,
             )
+            scan_step = make_adapter_scan_step(train_step)
             phase3_remaining = effective_total_steps - warmup_n
             state, _ = _run_steps(
-                state, train_step, phase3_remaining, start_step=warmup_n,
+                state, scan_step, phase3_remaining, start_step=warmup_n,
             )
     else:
         # `resume_step` is the absolute step the saved checkpoint
@@ -910,7 +1015,7 @@ def main(argv: list[str] | None = None) -> int:
         # plain total_steps) budget.
         remaining = max(0, effective_total_steps - resume_step)
         state, _ = _run_steps(
-            state, train_step, remaining, start_step=resume_step,
+            state, scan_step, remaining, start_step=resume_step,
         )
     # Always emit a final checkpoint at run-end, even when
     # `total_steps < checkpoint_interval` (short LoRA smokes, sweeps,

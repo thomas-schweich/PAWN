@@ -1629,3 +1629,280 @@ def test_wrapper_resumed_step_equals_uninterrupted_step(
                 "mismatch on the typed-sidecar resume path (H3)"
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# C3 — adapter K-step lax.scan loop (H11, §8.3): the scan path must produce
+# the same trajectory as the single-step loop over K steps within fp32 noise,
+# and the `step_time` resume divisor must divide by (step - run_start).
+# ---------------------------------------------------------------------------
+
+
+def _stack_batches(batches: list[Batch]) -> Batch:
+    """Stack a list of ``(B, T)`` batches into one ``(K, B, T)`` Batch —
+    the leading axis is the K-step axis the ``make_adapter_scan_step``
+    ``lax.scan`` iterates (mirrors ``train_jax_adapter._gather_chunk``)."""
+    return Batch(
+        tokens=jnp.stack([b.tokens for b in batches]),
+        targets=jnp.stack([b.targets for b in batches]),
+        attn_mask=jnp.stack([b.attn_mask for b in batches]),
+        loss_mask=jnp.stack([b.loss_mask for b in batches]),
+    )
+
+
+def _fresh_lora_state() -> tuple[
+    AdapterTrainState, optax.GradientTransformation
+]:
+    """A cold LoRA adapter + fp32 AdamW optimizer over a TINY backbone.
+
+    fp32 moments (weight_decay=0) keep the scan-vs-single-step comparison free
+    of the bf16 quantisation noise the production ``make_optimizer`` would add,
+    so a genuine trajectory divergence isn't masked."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = LoRAConfig(rank=2, targets="qkvo")
+    adapter = dispatch_init("lora")(backbone, cfg, key=jax.random.key(1))
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=1e-3, weight_decay=0.0),
+    )
+    flt = dispatch_filter("lora")(adapter)
+    opt_state = optimizer.init(eqx.filter(adapter, flt))
+    state = AdapterTrainState(
+        backbone=backbone, adapter=adapter, opt_state=opt_state,
+        step=jnp.int32(0), key=jax.random.key(0),
+    )
+    return state, optimizer
+
+
+def test_adapter_scan_matches_single_step_trajectory() -> None:
+    """H11: the K-step ``lax.scan`` loop lands on the same adapter params and
+    emits the same per-step losses as K independent single-step dispatches,
+    within fp32 noise. This is the load-bearing correctness contract for
+    swapping the per-step dispatch loop for the scan.
+
+    Both paths start from an identical cold state and consume an identical
+    sequence of ``K`` batches; the only difference is single-step vs scanned
+    execution. ``make_adapter_train_step`` donates its input buffers, so the
+    two paths are built from *separate* freshly-initialised states."""
+    K = 4
+    # A distinct batch per step so a body that wrongly reused one element
+    # (or scanned in the wrong order) would diverge.
+    batches = [_make_batch(seq_len=16, n=4) for _ in range(K)]
+    # Vary the token content across steps so the per-step losses differ.
+    batches = [
+        eqx.tree_at(
+            lambda b: b.tokens, b,
+            (b.tokens + jnp.int32(i)) % jnp.int32(TINY_SUPERNET.vocab_size),
+        )
+        for i, b in enumerate(batches)
+    ]
+
+    # --- single-step reference ---
+    ref_state, ref_opt = _fresh_lora_state()
+    ref_step = make_adapter_train_step("lora", ref_opt)
+    single_losses: list[float] = []
+    for b in batches:
+        ref_state, loss = ref_step(ref_state, b)
+        single_losses.append(float(loss))
+
+    # --- K-step scan ---
+    scan_state, scan_opt = _fresh_lora_state()
+    scan_step = make_adapter_scan_step(make_adapter_train_step("lora", scan_opt))
+    stacked = _stack_batches(batches)
+    scan_state, scan_losses = scan_step(scan_state, stacked)
+    scan_losses_np = np.asarray(scan_losses)
+
+    # Step counter advanced by exactly K through the scan.
+    assert int(scan_state.step) == int(ref_state.step) == K
+
+    # Per-step losses agree.
+    assert scan_losses_np.shape == (K,)
+    np.testing.assert_allclose(
+        scan_losses_np, np.asarray(single_losses), rtol=0, atol=1e-5,
+        err_msg="scan per-step losses diverged from the single-step loop",
+    )
+
+    # Final adapter params agree leaf-for-leaf.
+    ref_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(ref_state.adapter, eqx.is_inexact_array)
+    )
+    scan_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(scan_state.adapter, eqx.is_inexact_array)
+    )
+    assert len(ref_leaves) == len(scan_leaves)
+    for ref, got in zip(ref_leaves, scan_leaves):
+        np.testing.assert_allclose(
+            np.asarray(got), np.asarray(ref), rtol=0, atol=1e-5,
+            err_msg=(
+                "K-step scan adapter params diverged from the single-step "
+                "trajectory (H11)"
+            ),
+        )
+
+    # Optimizer moments agree too — a warm resume off the scan path must index
+    # the same params the single-step path would have produced.
+    ref_opt_leaves = _opt_inexact_leaves(ref_state.opt_state)
+    scan_opt_leaves = _opt_inexact_leaves(scan_state.opt_state)
+    assert len(ref_opt_leaves) == len(scan_opt_leaves)
+    for ref, got in zip(ref_opt_leaves, scan_opt_leaves):
+        np.testing.assert_allclose(
+            got, ref, rtol=0, atol=1e-5,
+            err_msg="scan opt-state moments diverged from the single-step loop",
+        )
+
+
+def test_step_time_divides_by_steps_since_run_start() -> None:
+    """§8.3: the adapter ``step_time`` divisor is ``(step - run_start)``, not
+    the absolute ``step``. After a resume at ``run_start`` steps, dividing the
+    *current* run's elapsed wall-time by the absolute step counter would
+    understate per-step time; the resume-aware divisor reports it honestly.
+    """
+    mod = _load_train_jax_adapter()
+    step_time = mod._step_time
+
+    # Fresh run (run_start == 0): plain elapsed / step.
+    assert step_time(10.0, 5, 0) == pytest.approx(2.0)
+
+    # Resumed run: 10 s of *this* run's wall-time spread over the 5 steps it
+    # actually executed since resuming at step 100 — NOT over 105.
+    assert step_time(10.0, 105, 100) == pytest.approx(2.0)
+    # The buggy absolute-step divisor would have reported ~0.095 s/step here.
+    assert step_time(10.0, 105, 100) != pytest.approx(10.0 / 105)
+
+    # Degenerate first-row guard: step == run_start divides by 1, not 0.
+    assert step_time(3.0, 100, 100) == pytest.approx(3.0)
+
+
+def test_chunk_bound_never_crosses_eval_or_checkpoint_boundary() -> None:
+    """C3: ``_chunk_bound`` caps each host-loop chunk to ``k``/``remaining``
+    and shortens it so its trailing edge lands on the next eval / checkpoint
+    boundary — the ``lax.scan`` only surfaces the *final* carry, so a chunk
+    that straddled a boundary would deny the host the exact post-step state
+    and silently skip the eval / checkpoint there.
+    """
+    chunk_bound = _load_train_jax_adapter()._chunk_bound
+
+    # Plenty of room: capped only by ``k`` / ``remaining``.
+    assert chunk_bound(0, 100, k=8, eval_interval=10, checkpoint_interval=20) == 8
+    assert chunk_bound(0, 3, k=8, eval_interval=10, checkpoint_interval=20) == 3
+
+    # Standing on a boundary (``absolute`` a multiple of the interval): the
+    # boundary already past contributes a *full* interval of room, so the
+    # next boundary — not a zero-length chunk — bounds the step.
+    assert chunk_bound(10, 100, k=50, eval_interval=10, checkpoint_interval=20) == 10
+    assert chunk_bound(20, 100, k=50, eval_interval=10, checkpoint_interval=20) == 10
+
+    # Eval boundary is the nearer one and clips the chunk to land on it.
+    assert chunk_bound(7, 100, k=50, eval_interval=10, checkpoint_interval=20) == 3
+    # Checkpoint boundary is nearer than the eval one here.
+    assert chunk_bound(18, 100, k=50, eval_interval=100, checkpoint_interval=20) == 2
+
+    # Dropping the ``- (absolute % …)`` term (a plausible regression) would
+    # return ``min(k, remaining, eval_interval, ckpt_interval)`` and let the
+    # chunk overrun the boundary — pin that it does NOT.
+    naive = min(50, 100, 10, 20)
+    assert chunk_bound(7, 100, k=50, eval_interval=10, checkpoint_interval=20) != naive
+
+
+def _drive_host_loop(
+    n_steps: int,
+    *,
+    k: int,
+    eval_interval: int,
+    checkpoint_interval: int,
+    log_interval: int,
+    start_step: int = 0,
+) -> dict[str, list[int]]:
+    """Pure replica of ``_run_steps``' host-driving structure (the C3
+    boundary loop), recording where chunks land and where eval / checkpoint /
+    log fire. Mirrors the script line-for-line: ``_chunk_bound`` sizes each
+    chunk, losses are replayed per-step at ``log_interval`` boundaries, and
+    eval / checkpoint fire on ``final_step % interval == 0``.
+    """
+    chunk_bound = _load_train_jax_adapter()._chunk_bound
+    chunk_ends: list[int] = []
+    evals: list[int] = []
+    ckpts: list[int] = []
+    logs: list[int] = []
+    done = 0
+    while done < n_steps:
+        absolute = start_step + done
+        remaining = n_steps - done
+        chunk = chunk_bound(absolute, remaining, k, eval_interval, checkpoint_interval)
+        assert chunk > 0, "host loop would spin forever on a zero-length chunk"
+        chunk_start = absolute
+        for i in range(chunk):
+            step = chunk_start + i + 1
+            if step % log_interval == 0:
+                logs.append(step)
+        done += chunk
+        final_step = start_step + done
+        chunk_ends.append(final_step)
+        if final_step % eval_interval == 0:
+            evals.append(final_step)
+        if final_step % checkpoint_interval == 0:
+            ckpts.append(final_step)
+    return {"chunk_ends": chunk_ends, "evals": evals, "ckpts": ckpts, "logs": logs}
+
+
+def test_run_steps_fires_eval_and_checkpoint_on_every_boundary() -> None:
+    """C3: drive the host loop over a multi-chunk run with
+    ``eval_interval != checkpoint_interval != k`` and assert (a) eval fires at
+    every eval boundary, (b) checkpoint at every checkpoint boundary, (c) no
+    chunk crosses a boundary, (d) per-step losses are logged at every
+    ``log_interval`` boundary. A regression that let chunks straddle a boundary
+    would silently drop the eval / checkpoint there and leave the suite green
+    without this guard.
+    """
+    n_steps, k, eval_interval, ckpt_interval, log_interval = 100, 7, 5, 20, 10
+    rec = _drive_host_loop(
+        n_steps,
+        k=k,
+        eval_interval=eval_interval,
+        checkpoint_interval=ckpt_interval,
+        log_interval=log_interval,
+    )
+
+    # (a) eval fires exactly at every eval boundary in (0, n_steps].
+    assert rec["evals"] == list(range(eval_interval, n_steps + 1, eval_interval))
+    # (b) checkpoint fires exactly at every checkpoint boundary.
+    assert rec["ckpts"] == list(range(ckpt_interval, n_steps + 1, ckpt_interval))
+    # (d) per-step losses logged at every log boundary.
+    assert rec["logs"] == list(range(log_interval, n_steps + 1, log_interval))
+
+    # (c) no chunk crosses a boundary: every chunk end at or before a boundary,
+    # and each chunk no larger than k. Walk consecutive chunk ends.
+    prev = 0
+    for end in rec["chunk_ends"]:
+        size = end - prev
+        assert 0 < size <= k, f"chunk {prev}->{end} exceeds k={k}"
+        # No eval boundary strictly inside (prev, end).
+        for b in range(eval_interval, end, eval_interval):
+            assert not (prev < b < end), f"chunk {prev}->{end} crosses eval @ {b}"
+        for b in range(ckpt_interval, end, ckpt_interval):
+            assert not (prev < b < end), f"chunk {prev}->{end} crosses ckpt @ {b}"
+        prev = end
+    assert rec["chunk_ends"][-1] == n_steps
+
+
+def test_run_steps_resume_offsets_boundaries_by_start_step() -> None:
+    """C3: when a phase starts mid-run (``start_step != 0``, e.g. RoSA Phase 2
+    or a resume), boundaries are measured on the *absolute* step counter, so
+    eval / checkpoint still fire on absolute multiples — not on offsets from
+    ``start_step``.
+    """
+    start_step, n_steps = 13, 27  # absolute steps 13..40
+    rec = _drive_host_loop(
+        n_steps,
+        k=6,
+        eval_interval=5,
+        checkpoint_interval=20,
+        log_interval=10,
+        start_step=start_step,
+    )
+    end = start_step + n_steps  # 40
+    assert rec["evals"] == list(range(15, end + 1, 5))  # 15,20,...,40
+    assert rec["ckpts"] == [20, 40]
+    assert rec["logs"] == [20, 30, 40]
+    # First chunk shrinks to land on absolute step 15, not 13 + min(k,…).
+    assert rec["chunk_ends"][0] == 15
