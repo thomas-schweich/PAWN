@@ -37,7 +37,7 @@ from pawn.distill import (
     make_distill_scan_step,
     make_distill_train_step,
 )
-from pawn.jax_setup import setup_jax_caching
+from pawn.jax_setup import require_accelerator, resolve_device, setup_jax_caching
 from pawn.lichess_data import load_lichess_corpus
 from pawn.lifecycle import (
     HFPushTracker,
@@ -54,31 +54,6 @@ from pawn.trainer import (
     make_optimizer,
     slice_batch,
 )
-
-
-def _resolve_device() -> str:
-    """Return the device label for MetricsLogger / GPU-stats source."""
-    backend = jax.default_backend()
-    if backend == "gpu":
-        dev_str = str(jax.devices()[0]).lower()
-        if "rocm" in dev_str:
-            return "rocm"
-        return "cuda"
-    if backend == "tpu":
-        return "tpu"
-    return "cpu"
-
-
-def _require_accelerator() -> None:
-    """Refuse to run training on CPU unless ``PAWN_ALLOW_CPU=1`` is set."""
-    import os
-
-    if jax.default_backend() == "cpu" and os.environ.get("PAWN_ALLOW_CPU") != "1":
-        raise SystemExit(
-            "JAX resolved to the CPU backend; refusing to run training. "
-            "Install a GPU jaxlib plugin (--extra rocm or --extra cu128), "
-            "or set PAWN_ALLOW_CPU=1 to override."
-        )
 
 
 def _student_config(cfg: DistillConfig) -> ModelConfig:
@@ -188,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.total_steps is None:
         print("error: --total-steps is required", file=sys.stderr)
         return 2
-    _require_accelerator()
+    require_accelerator()
     cache_path = setup_jax_caching()
     if cache_path is not None:
         print(f"JAX compilation cache: {cache_path}")
@@ -278,7 +253,7 @@ def main(argv: list[str] | None = None) -> int:
 
     logger = MetricsLogger(
         log_dir=args.logs_dir, run_prefix=f"distill-{cfg.objective}",
-        device=_resolve_device(),
+        device=resolve_device(),
     )
     logger.log_config(run_type="distill", config=cfg.model_dump())
 

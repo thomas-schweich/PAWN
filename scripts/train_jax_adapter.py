@@ -44,7 +44,7 @@ from pawn.adapters import (
 from pawn.checkpoint import resolve_checkpoint_source, save_model
 from pawn.config import SUPERNET, TINY_SUPERNET, VARIANTS, TINY_VARIANTS
 from pawn.corpus import generate_corpus
-from pawn.jax_setup import setup_jax_caching
+from pawn.jax_setup import require_accelerator, resolve_device, setup_jax_caching
 from pawn.lichess_data import load_lichess_corpus
 from pawn.lifecycle import (
     HFPushTracker,
@@ -381,51 +381,6 @@ def restore_adapter_resume_state(
     )
 
 
-def _resolve_device() -> str:
-    """Return the device label for MetricsLogger / GPU-stats source.
-
-    Reads ``jax.default_backend()`` so the logger picks the right
-    ``smi`` shell-out (``rocm-smi`` on ROCm, ``nvidia-smi`` on CUDA)
-    instead of hardcoding ``cuda``. Falls back to ``cpu`` when JAX
-    reports no accelerator — the script then exits unless the operator
-    has set ``PAWN_ALLOW_CPU=1`` (parity with the v1 escape hatch
-    pinned in plan §6).
-    """
-    import jax
-
-    backend = jax.default_backend()
-    if backend == "gpu":
-        # `jax.devices()[0]` reports `rocm:0` on ROCm and `cuda:0` on
-        # NVIDIA; the prefix is what the MetricsLogger keys on.
-        dev_str = str(jax.devices()[0]).lower()
-        if "rocm" in dev_str:
-            return "rocm"
-        return "cuda"
-    if backend == "tpu":
-        return "tpu"
-    return "cpu"
-
-
-def _require_accelerator() -> None:
-    """Refuse to run training on CPU unless ``PAWN_ALLOW_CPU=1`` is set.
-
-    JAX silently falls back to CPU if no GPU plugin is installed; without
-    this guard, an operator can start a multi-hour run and only notice
-    much later (per CLAUDE.md / plan §6 the v1 escape hatch is
-    ``PAWN_ALLOW_CPU=1``; preserve it).
-    """
-    import os
-
-    import jax
-
-    if jax.default_backend() == "cpu" and os.environ.get("PAWN_ALLOW_CPU") != "1":
-        raise SystemExit(
-            "JAX resolved to the CPU backend; refusing to run training. "
-            "Install a GPU jaxlib plugin (--extra rocm or --extra cu128), "
-            "or set PAWN_ALLOW_CPU=1 to override."
-        )
-
-
 def _strategy_config_from_run(cfg: AdapterConfig) -> object:
     """Build the adapter's strategy Config from the AdapterConfig fields."""
     s = cfg.strategy
@@ -620,7 +575,7 @@ def main(argv: list[str] | None = None) -> int:
     # MINOR: the prior order made the RoSA-resume test depend on HF
     # network state in CI. This block is pure argument validation
     # (read a JSON sidecar, check a step counter) and touches no JAX
-    # device — it deliberately runs *ahead* of `_require_accelerator()`
+    # device — it deliberately runs *ahead* of `require_accelerator()`
     # and `setup_jax_caching()` so that on accelerator backends prone
     # to a flaky device-init segfault (JAX-on-ROCm/WSL2), the guard
     # message is still emitted deterministically rather than being lost
@@ -654,7 +609,7 @@ def main(argv: list[str] | None = None) -> int:
                 "Restart the run from step 0 instead."
             )
 
-    _require_accelerator()
+    require_accelerator()
     cache_path = setup_jax_caching()
     if cache_path is not None:
         print(f"JAX compilation cache: {cache_path}")
@@ -731,7 +686,7 @@ def main(argv: list[str] | None = None) -> int:
     # we cold-start opt_state so warm moments never index cold params.
     #
     # `resume_step` is already extracted upstream (right after
-    # `_require_accelerator`) so the RoSA / training-state checks fire before
+    # `require_accelerator`) so the RoSA / training-state checks fire before
     # any HF download.
     resume_step = resume_step_early
     if args.resume is not None:
@@ -841,7 +796,7 @@ def main(argv: list[str] | None = None) -> int:
 
     logger = MetricsLogger(
         log_dir=args.logs_dir, run_prefix=f"adapter-{cfg.strategy}",
-        device=_resolve_device(), suffix=cfg.variant,
+        device=resolve_device(), suffix=cfg.variant,
     )
     logger.log_config(run_type="adapter", config=cfg.model_dump())
 

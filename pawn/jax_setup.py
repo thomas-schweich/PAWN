@@ -30,6 +30,48 @@ import os
 from pathlib import Path
 
 
+def resolve_device() -> str:
+    """Device label for :class:`~pawn.logging.MetricsLogger` / GPU-stats source.
+
+    Reads ``jax.default_backend()`` so the logger picks the right ``*-smi``
+    shell-out (``rocm-smi`` on ROCm, ``nvidia-smi`` on CUDA) instead of
+    hardcoding ``cuda``. Falls back to ``cpu`` when JAX reports no
+    accelerator — training entry points then exit via
+    :func:`require_accelerator` unless ``PAWN_ALLOW_CPU=1`` is set.
+    """
+    import jax
+
+    backend = jax.default_backend()
+    if backend == "gpu":
+        # ``jax.devices()[0]`` reports ``rocm:0`` on ROCm and ``cuda:0`` on
+        # NVIDIA; the prefix is what the MetricsLogger keys on.
+        dev_str = str(jax.devices()[0]).lower()
+        if "rocm" in dev_str:
+            return "rocm"
+        return "cuda"
+    if backend == "tpu":
+        return "tpu"
+    return "cpu"
+
+
+def require_accelerator() -> None:
+    """Refuse to run training on CPU unless ``PAWN_ALLOW_CPU=1`` is set.
+
+    JAX silently falls back to CPU if no GPU plugin is installed; without
+    this guard, an operator can start a multi-hour run and only notice much
+    later (per CLAUDE.md / plan §6 the v1 escape hatch is
+    ``PAWN_ALLOW_CPU=1``; preserve it).
+    """
+    import jax
+
+    if jax.default_backend() == "cpu" and os.environ.get("PAWN_ALLOW_CPU") != "1":
+        raise SystemExit(
+            "JAX resolved to the CPU backend; refusing to run training. "
+            "Install a GPU jaxlib plugin (--extra rocm or --extra cu128), "
+            "or set PAWN_ALLOW_CPU=1 to override."
+        )
+
+
 def setup_jax_caching(cache_dir: str | Path | None = None) -> Path | None:
     """Enable JAX's persistent compilation cache.
 

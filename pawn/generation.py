@@ -50,10 +50,8 @@ from jaxtyping import Array, Float, Int
 import chess_engine as engine
 from pawn.config import (
     BLACK_CHECKMATES,
-    DRAW_BY_AGREEMENT,
     DRAW_BY_RULE,
     NUM_ACTIONS,
-    OUTCOME_TOKEN_BASE,
     PAD_TOKEN,
     PLY_LIMIT,
     STALEMATE,
@@ -99,9 +97,11 @@ DIAGNOSTIC_NAMES = (
 )
 
 
-# v1 parity: the 5 outcome tokens used as conditioning inputs in
-# autoregressive generation tests. (DRAW_BY_AGREEMENT is exercised
-# separately by `improbable_task_test`.)
+# v1 parity: the 5 natural-termination outcome tokens used as
+# conditioning inputs in autoregressive generation tests. These are the
+# only outcomes the engine's random-game generator can produce, so they
+# are the only ones whose ``outcome_match_rate`` is meaningful;
+# ``improbable_task_test`` conditions on the rarest of them (STALEMATE).
 OUTCOME_TOKENS: dict[str, int] = {
     "WHITE_CHECKMATES": WHITE_CHECKMATES,
     "BLACK_CHECKMATES": BLACK_CHECKMATES,
@@ -742,12 +742,26 @@ def improbable_task_test(
     cache_dtype: jnp.dtype | None = None,
     compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, Any]:
-    """Outcome conditioning = DRAW_BY_AGREEMENT (very low prior). Reports
-    top-1 prob + entropy + AR analysis."""
+    """Outcome conditioning = STALEMATE (rare but *producible*). Reports
+    top-1 prob + entropy + AR analysis.
+
+    The conditioning outcome must be one the engine can actually
+    terminate on, otherwise ``ar_analysis["outcome_match_rate"]`` is
+    pinned at 0 by construction and the diagnostic measures nothing.
+    The pretraining corpus only ever labels the five natural
+    terminations in :data:`OUTCOME_TOKENS` (checkmate ×2, stalemate,
+    draw-by-rule, ply-limit); the Lichess-specific tokens
+    (``DRAW_BY_AGREEMENT`` etc.) never appear as a *random-game*
+    termination, so the engine's :func:`autoregressive_generate` can
+    never produce them. ``STALEMATE`` is the rarest of the five
+    producible outcomes (§8.4), so it preserves the "very low prior"
+    intent while keeping the AR match rate a meaningful signal — the
+    earlier ``DRAW_BY_AGREEMENT`` conditioning was unreachable.
+    """
     if not outcome_prefix_trained:
         return _skipped("improbable_task_test")
     # First-move prediction lives at the last prefix slot ``C-1``.
-    tokens, attn, C = _single_row_prefixed(DRAW_BY_AGREEMENT, seq_len)  # noqa: N806
+    tokens, attn, C = _single_row_prefixed(STALEMATE, seq_len)  # noqa: N806
     logits = model(tokens, attn, compute_dtype=compute_dtype)
     probs = jax.nn.softmax(logits[0, C - 1, :NUM_ACTIONS], axis=-1)
     result: dict[str, Any] = {
@@ -757,11 +771,11 @@ def improbable_task_test(
     }
     if n_games > 0:
         gen = autoregressive_generate(
-            model, DRAW_BY_AGREEMENT, n_games,
+            model, STALEMATE, n_games,
             mask_illegal=True, max_seq_len=seq_len,
             cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         )
-        result["ar_analysis"] = analyze_generated_games(gen, "DRAW_BY_AGREEMENT")
+        result["ar_analysis"] = analyze_generated_games(gen, "STALEMATE")
     return result
 
 

@@ -25,6 +25,7 @@ from pathlib import Path
 from pawn.checkpoint import load_model, resolve_checkpoint_source
 from pawn.corpus import conditioning_from_run_block
 from pawn.generation import run_all_diagnostics
+from pawn.jax_setup import setup_jax_caching
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -82,6 +83,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--output", type=Path, default=None)
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    # Enable the persistent compilation cache before any decode jit compiles
+    # (the KV-cached generation path shares HLO across diagnostic runs).
+    cache_path = setup_jax_caching()
+    if cache_path is not None:
+        print(f"JAX compilation cache: {cache_path}")
 
     import jax.numpy as jnp
     _DTYPE_MAP = {

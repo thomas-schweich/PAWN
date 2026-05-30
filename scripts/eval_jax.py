@@ -11,6 +11,7 @@ from pathlib import Path
 from pawn.checkpoint import load_model, resolve_checkpoint_source
 from pawn.corpus import conditioning_from_run_block, generate_corpus
 from pawn.eval import compute_per_phase_accuracy
+from pawn.jax_setup import setup_jax_caching
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -24,6 +25,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--output", type=Path, default=None)
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    # Enable the persistent compilation cache before any eval forward jit
+    # compiles — the eval forward shares the model HLO with training, so the
+    # cache hits across eval / pretrain processes at matching shape/dtype.
+    cache_path = setup_jax_caching()
+    if cache_path is not None:
+        print(f"JAX compilation cache: {cache_path}")
 
     ckpt = args.checkpoint
     ckpt_path = resolve_checkpoint_source(ckpt)

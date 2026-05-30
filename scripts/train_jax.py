@@ -36,7 +36,7 @@ from pawn.config import (
     TINY_VARIANTS,
 )
 from pawn.corpus import Corpus, generate_corpus
-from pawn.jax_setup import setup_jax_caching
+from pawn.jax_setup import require_accelerator, resolve_device, setup_jax_caching
 from pawn.lifecycle import (
     HFPushTracker,
     build_training_state,
@@ -220,48 +220,12 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
     return PretrainConfig(**base)
 
 
-def _resolve_device() -> str:
-    """Device label for MetricsLogger / GPU-stats source.
-
-    Mirrors `scripts/train_jax_adapter._resolve_device` so the logger
-    picks the right `*-smi` shell-out regardless of the JAX backend.
-    """
-    import jax
-
-    backend = jax.default_backend()
-    if backend == "gpu":
-        dev_str = str(jax.devices()[0]).lower()
-        if "rocm" in dev_str:
-            return "rocm"
-        return "cuda"
-    if backend == "tpu":
-        return "tpu"
-    return "cpu"
-
-
-def _require_accelerator() -> None:
-    """Refuse to run training on CPU unless `PAWN_ALLOW_CPU=1` is set.
-
-    Mirrors the v1 escape hatch pinned in plan §6 / CLAUDE.md.
-    """
-    import os
-
-    import jax
-
-    if jax.default_backend() == "cpu" and os.environ.get("PAWN_ALLOW_CPU") != "1":
-        raise SystemExit(
-            "JAX resolved to the CPU backend; refusing to run training. "
-            "Install a GPU jaxlib plugin (--extra rocm or --extra cu128), "
-            "or set PAWN_ALLOW_CPU=1 to override."
-        )
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     # `_build_config` raises a pydantic ValueError if --total-steps is
     # missing — no per-field runtime check needed here.
     cfg = _build_config(args)
-    _require_accelerator()
+    require_accelerator()
     cache_path = setup_jax_caching()
     if cache_path is not None:
         print(f"JAX compilation cache: {cache_path}")
@@ -330,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
         accumulation_steps=cfg.accumulation_steps,
     )
     logger = MetricsLogger(
-        log_dir=args.logs_dir, run_prefix="pretrain", device=_resolve_device()
+        log_dir=args.logs_dir, run_prefix="pretrain", device=resolve_device()
     )
     logger.log_config(run_type="pretrain", model=cfg.model_dump())
 

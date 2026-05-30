@@ -37,7 +37,13 @@ Architectural choices:
   intermediate dtype is already float32), so the legacy converter's
   fp32 parity test agrees on both; the v2 layout is one fewer cast and
   is the form the plan §5 calls out. See :func:`_rmsnorm` for details.
-- **RoPE applied in fp32** to Q and K, then downcast — same reason.
+- **RoPE applied in the compute dtype.** The cos/sin tables are built in
+  fp32 (:func:`_build_rope`) but downcast to ``x.dtype`` at the point of
+  application (:func:`_apply_rope`), so the rotation runs in bf16/fp16
+  under a low-precision forward and stays fp32 only when ``x`` is fp32.
+  The rotation is unit-norm, so its sole precision concern is per-element
+  accumulation — negligible at ``T<=512`` (below bf16's noise floor), and
+  it avoids a full ``(B, H, T, d_head)`` fp32 materialisation per Q/K.
 - **SwiGLU FFN:** ``down(silu(gate(x)) * up(x))``.
 - **Uniform token embeddings:** a single ``embed_tokens[V, d]`` table is
   gathered per token id — moves, PAD, outcomes, BOS, NULL, and the
@@ -239,9 +245,11 @@ def _build_rope(
     """Precompute RoPE phase tables.
 
     Returns ``(cos, sin)`` each of shape ``(max_seq_len, head_dim // 2)``,
-    in fp32. The per-step RoPE application upcasts Q/K to fp32 before
-    multiplying through, so storing the tables in fp32 is the canonical
-    form.
+    in fp32. fp32 is the canonical *storage* dtype; :func:`_apply_rope`
+    downcasts the tables to the activation dtype at application time, so
+    the rotation runs in the forward's compute dtype (fp32 only when the
+    activations are fp32). Building in fp32 keeps the phase angles exact
+    regardless of the eventual compute precision.
     """
     half = head_dim // 2
     inv_freq = 1.0 / (

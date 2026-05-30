@@ -62,7 +62,7 @@ def test_script_help_works(script_name: str) -> None:
 def _subprocess_env() -> "dict[str, str]":
     """Subprocess env for CPU-friendly script tests.
 
-    `_require_accelerator()` refuses to run on CPU unless
+    `pawn.jax_setup.require_accelerator()` refuses to run on CPU unless
     `PAWN_ALLOW_CPU=1` is set (parity with v1). Round-3 codex P2: the
     subprocess tests below need this override or they fail before
     reaching the guard they're trying to pin on CPU-only CI.

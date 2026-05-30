@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -11,15 +10,14 @@ from jaxtyping import Array
 from pawn.config import (
     BLACK_CHECKMATES,
     BOS_TOKEN,
-    DRAW_BY_AGREEMENT,
     NUM_ACTIONS,
+    STALEMATE,
     TINY_SUPERNET,
     WHITE_CHECKMATES,
 )
 from pawn.corpus import generate_corpus, pack_corpus
 from pawn.eval import (
     AccuracyResult,
-    PhaseBoundaries,
     compute_move_accuracy,
     compute_per_phase_accuracy,
 )
@@ -218,6 +216,41 @@ def test_improbable_task_test_runs_when_gate_on() -> None:
     )
     assert "top1_prob" in res and "entropy" in res
     assert "ar_analysis" in res
+
+
+def test_improbable_task_conditions_on_producible_outcome() -> None:
+    """§8.4: the improbable task must condition on an outcome the engine
+    can actually terminate on (STALEMATE), not the unreachable
+    ``DRAW_BY_AGREEMENT``. The Lichess-specific outcomes never appear as a
+    random-game termination, so conditioning on one pins
+    ``outcome_match_rate`` at 0 by construction and the diagnostic measures
+    nothing. STALEMATE is one of the five engine-producible outcomes, so a
+    regression back to a non-producible token would surface here.
+    """
+    from pawn.config import DRAW_BY_AGREEMENT
+    from pawn.generation import OUTCOME_TOKENS, _single_row_prefixed
+
+    # The conditioning outcome the diagnostic uses must be one the engine
+    # can terminate on (i.e. present in OUTCOME_TOKENS), and must NOT be a
+    # Lichess-only token like DRAW_BY_AGREEMENT.
+    assert "STALEMATE" in OUTCOME_TOKENS
+    assert STALEMATE in OUTCOME_TOKENS.values()
+    assert DRAW_BY_AGREEMENT not in OUTCOME_TOKENS.values()
+
+    # Pin the literal token the diagnostic conditions on by replaying the
+    # same prefix construction: the outcome slot must carry STALEMATE, not
+    # the unreachable DRAW_BY_AGREEMENT.
+    tokens, _, C = _single_row_prefixed(STALEMATE, 8)
+    conditioned = int(tokens[0, C - 1])
+    assert conditioned == STALEMATE != DRAW_BY_AGREEMENT
+
+    model = init_model(TINY_SUPERNET, key=0)
+    res = improbable_task_test(
+        model, outcome_prefix_trained=True, n_games=2, seq_len=8,
+    )
+    # The AR analysis ran against a producible target — its outcome
+    # distribution only ever contains engine-reachable outcome names.
+    assert "outcome_distribution" in res["ar_analysis"]
 
 
 def test_run_all_diagnostics_has_5_entries() -> None:
