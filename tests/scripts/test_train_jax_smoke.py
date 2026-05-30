@@ -283,3 +283,173 @@ def test_train_jax_adapter_rejects_resume_without_training_state(tmp_path) -> No
     assert result.returncode != 0, (
         "Resume against a sidecar-less dir should fail"
     )
+
+
+# ---------------------------------------------------------------------------
+# B2 — inert-knob parity: mate_boost / accumulation_steps / adapter cadence
+# ---------------------------------------------------------------------------
+
+
+def _load_adapter_module():  # type: ignore[no-untyped-def]
+    """Import `scripts/train_jax_adapter.py` as a module to reach
+    `_resolve_cadence` (the pure cadence/sampling resolver)."""
+    import importlib.util
+
+    script_path = Path("scripts") / "train_jax_adapter.py"
+    spec = importlib.util.spec_from_file_location(
+        "scripts_train_jax_adapter_cadence", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _adapter_cfg(**overrides: object):  # type: ignore[no-untyped-def]
+    from typing import Any
+
+    from pawn.run_config import AdapterConfig
+
+    base: dict[str, Any] = dict(
+        local_checkpoints=True, total_steps=100, strategy="lora", lora_rank=4,
+        batch_size=4,
+    )
+    base.update(overrides)
+    return AdapterConfig(**base)
+
+
+def test_resolve_cadence_data_seed_changes_sampling_seed() -> None:
+    """B2: `data_seed` is consumed — it seeds the train sampler (and the
+    val sampler at `data_seed + 1`). Different `data_seed` ⇒ different seed
+    drives different game orders."""
+    mod = _load_adapter_module()
+    c_default = mod._resolve_cadence(_adapter_cfg(), n_train_games=1000)
+    assert c_default.data_seed == 0  # None → 0
+    c_seeded = mod._resolve_cadence(
+        _adapter_cfg(data_seed=42), n_train_games=1000
+    )
+    assert c_seeded.data_seed == 42
+    # The seed actually changes the sampled game order.
+    import numpy as np
+
+    a = np.random.default_rng(c_default.data_seed).integers(0, 1000, size=8)
+    b = np.random.default_rng(c_seeded.data_seed).integers(0, 1000, size=8)
+    assert not np.array_equal(a, b)
+
+
+def test_resolve_cadence_epochs_steps_per_epoch_set_budget() -> None:
+    """B2: `epochs` × `steps_per_epoch` resolve the step budget (v1
+    semantics). With them unset the budget is `total_steps` and the
+    step-based `eval_interval` drives val (epochs/val_every are no-ops)."""
+    mod = _load_adapter_module()
+    # Unset steps_per_epoch → total_steps is the budget; epochs ignored.
+    c_none = mod._resolve_cadence(
+        _adapter_cfg(total_steps=100, epochs=7), n_train_games=1000
+    )
+    assert c_none.effective_total_steps == 100
+    assert c_none.eval_interval == 100  # eval_interval None → log_interval
+
+    # Explicit int steps_per_epoch → epochs × steps_per_epoch.
+    c_int = mod._resolve_cadence(
+        _adapter_cfg(epochs=3, steps_per_epoch=10, val_every=2),
+        n_train_games=1000,
+    )
+    assert c_int.epoch_steps == 10
+    assert c_int.effective_total_steps == 30
+    assert c_int.eval_interval == 20  # val_every × epoch_steps
+
+    # steps_per_epoch="all" → n_train_games // batch_size.
+    c_all = mod._resolve_cadence(
+        _adapter_cfg(epochs=2, steps_per_epoch="all", batch_size=4),
+        n_train_games=400,
+    )
+    assert c_all.epoch_steps == 100  # 400 // 4
+    assert c_all.effective_total_steps == 200
+
+
+def test_resolve_cadence_val_every_changes_eval_interval() -> None:
+    """B2: `val_every` is consumed — it scales the eval cadence in epoch
+    units (only meaningful when steps_per_epoch defines an epoch)."""
+    mod = _load_adapter_module()
+    c1 = mod._resolve_cadence(
+        _adapter_cfg(steps_per_epoch=10, val_every=1), n_train_games=1000
+    )
+    c3 = mod._resolve_cadence(
+        _adapter_cfg(steps_per_epoch=10, val_every=3), n_train_games=1000
+    )
+    assert c1.eval_interval == 10
+    assert c3.eval_interval == 30
+    assert c3.eval_interval != c1.eval_interval
+
+
+def test_mate_boost_threaded_into_generate_corpus() -> None:
+    """B2: `mate_boost` is consumed by `generate_corpus` (it maps onto the
+    engine's mate-biasing arg). A positive boost changes the generated
+    corpus for a fixed seed, proving the field is no longer inert."""
+    import numpy as np
+
+    from pawn.corpus import generate_corpus
+
+    plain = generate_corpus(
+        n_games=64, max_ply=60, seq_len=64, seed=7, mate_boost=0.0
+    )
+    boosted = generate_corpus(
+        n_games=64, max_ply=60, seq_len=64, seed=7, mate_boost=5.0
+    )
+    assert not np.array_equal(plain.tokens, boosted.tokens), (
+        "mate_boost did not reach the engine — corpus identical to the "
+        "mate_boost=0 baseline"
+    )
+
+
+def test_discard_ply_limit_threaded_into_generate_corpus() -> None:
+    """B2: the sibling `discard_ply_limit` engine knob is likewise threaded
+    through `generate_corpus` (consumed, not inert)."""
+    import numpy as np
+
+    from pawn.corpus import generate_corpus
+
+    keep = generate_corpus(
+        n_games=128, max_ply=20, seq_len=24, seed=3, discard_ply_limit=False
+    )
+    drop = generate_corpus(
+        n_games=128, max_ply=20, seq_len=24, seed=3, discard_ply_limit=True
+    )
+    assert not np.array_equal(keep.tokens, drop.tokens)
+
+
+def test_train_jax_accumulation_steps_runs(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """B2 smoke: `--accumulation-steps 2` runs end-to-end (no
+    NotImplementedError) and writes a checkpoint — the prefetcher now emits
+    `(K, N, B, T)` batches that the accumulation kernel consumes."""
+    import subprocess
+
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax.py",
+            "--supernet", "tiny", "--total-steps", "4",
+            "--accumulation-steps", "2",
+            "--batch-size", "4", "--seq-len", "32", "--k", "2",
+            "--checkpoint-interval", "2",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=_subprocess_env(),
+    )
+    assert "NotImplementedError" not in (result.stdout + result.stderr), (
+        f"accumulation path still raised NotImplementedError:\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert result.returncode == 0, (
+        f"accumulation_steps=2 pretrain failed:\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    ckpts = sorted(logs_dir.glob("*/step_*"))
+    assert ckpts, (
+        f"no checkpoint written under {logs_dir}; "
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )

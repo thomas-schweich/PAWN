@@ -408,6 +408,15 @@ class BaseRunConfig(BaseModel):
             )
         if self.lr <= 0:
             raise ValueError(f"lr must be positive, got {self.lr}")
+        # H10: the global-norm clip threshold is threaded into
+        # `make_optimizer`'s branchless clip as `max_norm / max(g_norm,
+        # max_norm)`. A non-positive threshold makes that scale 0 (or
+        # negative), silently zeroing or sign-flipping every gradient, so
+        # reject it at parse time rather than producing a no-learning run.
+        if self.max_grad_norm <= 0:
+            raise ValueError(
+                f"max_grad_norm must be positive, got {self.max_grad_norm}"
+            )
         return self
 
 

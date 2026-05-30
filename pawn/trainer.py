@@ -19,10 +19,10 @@ Public surface:
   one_cycle / infinite) Optax schedule. The cross-field validators
   on :class:`pawn.run_config.BaseRunConfig` are what bound the
   fraction values; the trainer just stitches the Optax pieces.
-- :func:`make_optimizer` — ``optax.chain(clip_by_global_norm(1.0),
-  adamw(lr_schedule, weight_decay=wd))`` with a `lax.cond` guard
-  against padded-batch weight-decay drift (skip update when the
-  loss mask is empty).
+- :func:`make_optimizer` — ``optax.chain(clip_by_global_norm(
+  cfg.max_grad_norm), adamw(lr_schedule, weight_decay=wd))`` with a
+  `lax.cond` guard against padded-batch weight-decay drift (skip update
+  when the loss mask is empty).
 - :func:`make_train_step` — `@eqx.filter_jit` single training step
   with the supernet joint loss baked in.
 - :func:`make_scan_step` — wraps a single train step into a K-step
@@ -69,8 +69,6 @@ __all__ = [
     "mask_distill_columns",
 ]
 
-
-_CLIP_NORM: Final[float] = 1.0
 
 # First logit column that must be masked to -inf before the softmax-CE.
 # Columns ``[NULL_TOKEN .. V)`` are NULL + the reserved control IDs
@@ -691,6 +689,16 @@ def make_optimizer(
     C.1: ``cfg.optimizer`` selects between:
         ``adamw`` (default) — bf16 first moment, fp32 second moment.
         ``lion`` — sign-based; halves optimizer state.
+
+    H10: the global-norm clip threshold is ``cfg.max_grad_norm`` (default
+    1.0), threaded through to :func:`_branchless_clip_by_global_norm`. The
+    old code hardcoded the threshold at a module-level ``1.0`` constant
+    regardless of the config, so a run with ``max_grad_norm=0.5`` still
+    clipped at 1.0
+    while the ``did_clip`` metric (``train_jax.py``) compared the pre-clip
+    norm against the *config* value — the two disagreed for any non-default
+    threshold. Reading the config here keeps the actual clip and the
+    ``did_clip`` measurement consistent.
     """
     name = getattr(cfg, "optimizer", "adamw")
     if name == "adamw":
@@ -715,7 +723,9 @@ def make_optimizer(
         )
     else:
         raise ValueError(f"unknown optimizer {name!r}; expected adamw/lion")
-    return optax.chain(_branchless_clip_by_global_norm(_CLIP_NORM), inner)
+    return optax.chain(
+        _branchless_clip_by_global_norm(cfg.max_grad_norm), inner
+    )
 
 
 # ---------------------------------------------------------------------------

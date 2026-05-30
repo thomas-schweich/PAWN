@@ -584,6 +584,21 @@ def test_lr_must_be_positive() -> None:
         PretrainConfig(**_pretrain_kwargs(lr=0))
 
 
+def test_max_grad_norm_must_be_positive() -> None:
+    """H10: a non-positive clip threshold zeroes/sign-flips every gradient
+    in `make_optimizer`'s branchless clip, so reject it at parse time."""
+    for bad in (0.0, -0.5):
+        with pytest.raises(ValueError, match="max_grad_norm"):
+            PretrainConfig(**_pretrain_kwargs(max_grad_norm=bad))
+
+
+def test_max_grad_norm_accepts_non_default_positive() -> None:
+    """A positive non-default threshold (e.g. 0.5) parses and is carried on
+    the config for `make_optimizer` to thread into the clip (H10)."""
+    cfg = PretrainConfig(**_pretrain_kwargs(max_grad_norm=0.5))
+    assert cfg.max_grad_norm == 0.5
+
+
 def test_adapter_cadence_must_be_positive() -> None:
     """epochs / val_every / checkpoint_interval are downstream loop
     bounds; zero or negative breaks the trainer's modulo logic."""

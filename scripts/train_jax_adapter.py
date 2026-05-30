@@ -13,6 +13,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import equinox as eqx
 import jax
@@ -56,6 +57,60 @@ from pawn.trainer import (
     cross_entropy_loss, flatten_opt_state, make_lr_schedule,
     make_optimizer, slice_batch,
 )
+
+
+class _Cadence(NamedTuple):
+    """Resolved adapter loop cadence/sampling knobs (B2 / plan §8.3).
+
+    ``effective_total_steps`` is the step budget the loop runs;
+    ``eval_interval`` is the validation cadence in steps; ``data_seed`` is
+    the train-stream RNG seed (val uses ``data_seed + 1``); ``epoch_steps``
+    is one epoch's step count (carried for diagnostics)."""
+
+    effective_total_steps: int
+    eval_interval: int
+    data_seed: int
+    epoch_steps: int
+
+
+def _resolve_cadence(cfg: AdapterConfig, n_train_games: int) -> _Cadence:
+    """Resolve the previously-inert ``epochs`` / ``steps_per_epoch`` /
+    ``data_seed`` / ``val_every`` knobs into concrete loop parameters.
+
+    Ports v1's ``total_steps = epochs × steps_per_epoch`` budget and
+    ``epoch % val_every`` validation cadence onto v2's step-based loop:
+
+    - ``data_seed`` (``None`` → 0) seeds the batch-sampling RNG.
+    - ``steps_per_epoch`` is canonical for adapters (CLAUDE.md): an int is
+      used verbatim, ``"all"`` resolves to ``n_train_games // batch_size``,
+      and ``None`` falls back to ``cfg.total_steps`` as a single whole-run
+      epoch (so ``epochs`` is then a no-op multiplier on the required
+      ``total_steps`` budget and the step-based ``eval_interval`` drives
+      validation).
+    - When ``steps_per_epoch`` is set the budget is ``epochs × epoch_steps``
+      and validation runs every ``val_every × epoch_steps`` steps.
+
+    Pure + JAX-free so the resolution can be unit-tested directly.
+    """
+    assert cfg.total_steps is not None  # AdapterConfig requires it
+    if cfg.steps_per_epoch is None:
+        epoch_steps = cfg.total_steps
+        effective_total_steps = cfg.total_steps
+        eval_interval = cfg.eval_interval or cfg.log_interval
+    else:
+        if cfg.steps_per_epoch == "all":
+            epoch_steps = max(1, n_train_games // cfg.batch_size)
+        else:
+            epoch_steps = cfg.steps_per_epoch
+        effective_total_steps = cfg.epochs * epoch_steps
+        eval_interval = cfg.val_every * epoch_steps
+    data_seed = cfg.data_seed if cfg.data_seed is not None else 0
+    return _Cadence(
+        effective_total_steps=effective_total_steps,
+        eval_interval=eval_interval,
+        data_seed=data_seed,
+        epoch_steps=epoch_steps,
+    )
 
 
 def _resolve_device() -> str:
@@ -566,12 +621,20 @@ def main(argv: list[str] | None = None) -> int:
         if push_tracker:
             push_checkpoint_async(out, push_tracker)
 
-    rng = np.random.default_rng(0)
-    val_rng = np.random.default_rng(1)
-    # eval_interval defaults to log_interval when unset so every
-    # train-row gets a paired val-row (val-loss is what the sweep
-    # objective and §3 criterion 7's "val loss decreases" key on).
-    eval_interval = cfg.eval_interval or cfg.log_interval
+    # B2 / plan §8.3: consume the previously-inert cadence/sampling knobs
+    # (``epochs`` / ``steps_per_epoch`` / ``data_seed`` / ``val_every``) via
+    # the pure :func:`_resolve_cadence` helper now that the corpus has
+    # materialised (``steps_per_epoch="all"`` needs ``corpus.n_games``).
+    # ``data_seed`` seeds the train sampler; the held-out val stream uses
+    # ``data_seed + 1`` to stay decorrelated. The LR schedule keeps
+    # ``cfg.total_steps`` as its decay timeline; a resolved budget that
+    # differs is exactly the ``actual ≠ planned`` case
+    # ``schedule_health.json`` records.
+    cadence = _resolve_cadence(cfg, corpus.n_games)
+    effective_total_steps = cadence.effective_total_steps
+    eval_interval = cadence.eval_interval
+    rng = np.random.default_rng(cadence.data_seed)
+    val_rng = np.random.default_rng(cadence.data_seed + 1)
     t0 = time.time()
     final_step = 0
     is_rosa = is_rosa_strategy
@@ -620,11 +683,11 @@ def main(argv: list[str] | None = None) -> int:
         # lora_active=True, sparse_active=False; bottleneck branch is
         # silenced via apply_rosa's sparse_active gate).
         rosa_cfg = state.adapter.cfg
-        warmup_n = min(rosa_cfg.rosa_warmup_steps, cfg.total_steps)
+        warmup_n = min(rosa_cfg.rosa_warmup_steps, effective_total_steps)
         # `--resume + RoSA` is rejected upstream (where args.resume is
         # parsed) so resume_step is guaranteed to be 0 here.
         state, last = _run_steps(state, train_step, warmup_n, start_step=0)
-        if not should_shutdown() and warmup_n < cfg.total_steps:
+        if not should_shutdown() and warmup_n < effective_total_steps:
             # Phase 2: gather `mask_samples` batches and accumulate
             # |grad|^grad_alpha on each sparse delta to derive the
             # density-thresholded boolean masks. The deltas are zeroed
@@ -663,15 +726,16 @@ def main(argv: list[str] | None = None) -> int:
                 compute_dtype=compute_dtype,
                 use_sdpa=cfg.use_sdpa, use_flash=use_flash,
             )
-            phase3_remaining = cfg.total_steps - warmup_n
+            phase3_remaining = effective_total_steps - warmup_n
             state, _ = _run_steps(
                 state, train_step, phase3_remaining, start_step=warmup_n,
             )
     else:
         # `resume_step` is the absolute step the saved checkpoint
-        # reached; remaining work is `cfg.total_steps - resume_step`
-        # so the run honours the original total-steps budget.
-        remaining = max(0, cfg.total_steps - resume_step)
+        # reached; remaining work is `effective_total_steps - resume_step`
+        # so the run honours the resolved (epochs × steps_per_epoch, or
+        # plain total_steps) budget.
+        remaining = max(0, effective_total_steps - resume_step)
         state, _ = _run_steps(
             state, train_step, remaining, start_step=resume_step,
         )

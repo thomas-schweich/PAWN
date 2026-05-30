@@ -64,6 +64,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--config", type=Path, default=None, help="JSON run config")
     ap.add_argument("--supernet", choices=("tiny", "production"), default=None)
     ap.add_argument("--total-steps", type=int, default=None)
+    ap.add_argument("--accumulation-steps", type=int, default=None,
+                    help="(B2) micro-batches accumulated per optimizer step. "
+                         ">1 emits (K, N, B, T) batches so the trainer's "
+                         "accumulation scan sums N micro-grads before each "
+                         "update — effective batch N×B at B's per-step memory "
+                         "cost. Default 1 (no accumulation).")
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--seq-len", type=int, default=None)
     ap.add_argument("--k", type=int, default=None)
@@ -137,6 +143,7 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
     for flag, val in (
         ("supernet", args.supernet),
         ("total_steps", args.total_steps),
+        ("accumulation_steps", args.accumulation_steps),
         ("batch_size", args.batch_size),
         ("seq_len", args.seq_len),
         ("k", args.k),
@@ -273,17 +280,14 @@ def main(argv: list[str] | None = None) -> int:
     # (`PAWN_ALLOW_CPU=1`) auto-fall-back to the plain path regardless
     # of `cfg.use_flash`.
     use_flash = cfg.use_flash and jax.default_backend() == "gpu"
-    if cfg.accumulation_steps != 1:
-        # The trainer's batch shape would need to grow a leading
-        # accumulation axis (K, N, B, T). The current bucketed prefetcher
-        # produces (K, B, T). Wire-through is a follow-up; the trainer
-        # itself (`make_train_step`) is C.4-complete and unit-tested.
-        raise NotImplementedError(
-            f"accumulation_steps={cfg.accumulation_steps} is not yet "
-            f"wired through the data loop (use 1 for now). The "
-            f"make_train_step path supports it; the prefetcher needs "
-            f"to produce (K, N, B, T)-shaped batches."
-        )
+    # B2 / plan §8.3: gradient accumulation is now wired through the data
+    # loop. With ``accumulation_steps == N > 1`` the bucketed prefetcher
+    # emits batches with an extra leading microbatch axis — each scan
+    # element is ``(N, B, T)`` so the full per-chunk tensor is
+    # ``(K, N, B, T)`` — and ``make_train_step`` scans the N axis,
+    # summing micro-grads before a single optimizer update. ``N == 1``
+    # keeps the legacy ``(K, B, T)`` shape (no extra axis).
+    accumulation_steps = cfg.accumulation_steps
     train_step = make_train_step(
         optimizer, variants,
         compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa, use_flash=use_flash,
@@ -330,13 +334,23 @@ def main(argv: list[str] | None = None) -> int:
     # over the resulting queue while the next outer corpus is being
     # generated.
     def _build_batch_from_corpus_slice(
-        corp: Corpus, k_inner: int, batch_size: int, seq_len: int, start_idx: int
+        corp: Corpus, k_inner: int, batch_size: int, seq_len: int,
+        start_idx: int, accum: int,
     ) -> Batch:
-        sel = slice(start_idx, start_idx + k_inner * batch_size)
-        tokens = corp.tokens[sel, :seq_len].reshape(k_inner, batch_size, seq_len)
-        targets = corp.targets[sel, :seq_len].reshape(k_inner, batch_size, seq_len)
-        attn = corp.attn_mask[sel, :seq_len].reshape(k_inner, batch_size, seq_len)
-        lmask = corp.loss_mask[sel, :seq_len].reshape(k_inner, batch_size, seq_len)
+        # With ``accum > 1`` the scan element gains a leading microbatch
+        # axis, so each leaf is reshaped to ``(K, N, B, T)``; ``accum == 1``
+        # keeps the legacy ``(K, B, T)`` shape (no extra axis, so the
+        # accumulation-free scan body is unchanged).
+        group = k_inner * accum * batch_size
+        sel = slice(start_idx, start_idx + group)
+        if accum == 1:
+            shape: tuple[int, ...] = (k_inner, batch_size, seq_len)
+        else:
+            shape = (k_inner, accum, batch_size, seq_len)
+        tokens = corp.tokens[sel, :seq_len].reshape(shape)
+        targets = corp.targets[sel, :seq_len].reshape(shape)
+        attn = corp.attn_mask[sel, :seq_len].reshape(shape)
+        lmask = corp.loss_mask[sel, :seq_len].reshape(shape)
         return Batch(
             tokens=jnp.asarray(tokens), targets=jnp.asarray(targets),
             attn_mask=jnp.asarray(attn), loss_mask=jnp.asarray(lmask),
@@ -344,15 +358,22 @@ def main(argv: list[str] | None = None) -> int:
 
     def _prepare_outer_chunk(
         n_games: int, seed: int, edges: tuple[int, ...],
-        batch_size: int, inner_k: int,
+        batch_size: int, inner_k: int, accum: int,
     ) -> list[tuple[int, Batch]]:
         """Generate `n_games` random games, bucketise, slice into
         K-batches per bucket, return as `[(edge, Batch), ...]` in
         ascending-edge order. Games that don't fill a complete K-batch
-        in any bucket are dropped (acceptable when n_games >> B*K)."""
+        in any bucket are dropped (acceptable when n_games >> B*K).
+
+        With ``accum > 1`` each K-batch consumes ``inner_k * accum *
+        batch_size`` games and is shaped ``(K, accum, B, T)`` so the
+        trainer's accumulation scan can sum ``accum`` micro-grads per
+        optimizer step."""
         corpus = generate_corpus(
             n_games=n_games, max_ply=cfg.seq_len, seq_len=cfg.seq_len, seed=seed,
             conditioning=cfg.conditioning,
+            mate_boost=cfg.mate_boost,
+            discard_ply_limit=cfg.discard_ply_limit,
         )
         if edges == (cfg.seq_len,):
             # Unbucketed path: one bucket at full seq_len.
@@ -360,15 +381,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             buckets = corpus.by_bucket(edges)
         out: list[tuple[int, Batch]] = []
+        games_per_K = batch_size * inner_k * accum
         for edge in sorted(buckets):
             sub = buckets[edge]
-            n_full_K = sub.n_games // (batch_size * inner_k)
+            n_full_K = sub.n_games // games_per_K
             for j in range(n_full_K):
-                start = j * batch_size * inner_k
+                start = j * games_per_K
                 out.append((
                     edge,
                     _build_batch_from_corpus_slice(
-                        sub, inner_k, batch_size, edge, start,
+                        sub, inner_k, batch_size, edge, start, accum,
                     ),
                 ))
         return out
@@ -397,10 +419,16 @@ def main(argv: list[str] | None = None) -> int:
             if self._closed:
                 return
             seed = self._next_seed()
-            n_games = cfg.batch_size * cfg.k * self.outer_factor
+            # Each scan step consumes ``B * accumulation_steps`` games (the
+            # micro-batches summed into one optimizer update), so scale the
+            # outer-chunk size by ``accumulation_steps`` to keep the same
+            # ~``outer_factor`` K-batches of lookahead.
+            n_games = (
+                cfg.batch_size * cfg.k * accumulation_steps * self.outer_factor
+            )
             self._pending = executor.submit(
                 _prepare_outer_chunk, n_games, seed, bucket_edges,
-                cfg.batch_size, cfg.k,
+                cfg.batch_size, cfg.k, accumulation_steps,
             )
 
         def next(self) -> tuple[int, Batch] | None:

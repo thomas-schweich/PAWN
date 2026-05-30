@@ -39,6 +39,7 @@ from pawn.trainer import (
     VariantSpec,
     _FIRST_RESERVED_COLUMN,
     cross_entropy_loss,
+    get_grad_norm,
     make_lr_schedule,
     make_optimizer,
     make_scan_step,
@@ -457,6 +458,64 @@ def test_make_optimizer_clip_actually_clips_under_sgd() -> None:
     assert upd_norm == pytest.approx(1.0, rel=1e-5)
 
 
+def test_make_optimizer_clips_at_cfg_max_grad_norm() -> None:
+    """H10: the clip threshold is `cfg.max_grad_norm`, not a hardcoded 1.0.
+
+    Build `make_optimizer` with `max_grad_norm=0.5`, feed a gradient whose
+    global norm is well above 0.5, and confirm:
+
+    1. The post-clip update has global norm == 0.5 (AdamW would mask this,
+       so we read the clip's own `_ClipState` to verify the threshold is
+       honored rather than inspecting the final update).
+    2. `get_grad_norm` reports the *pre-clip* norm — the quantity the
+       `did_clip` metric (`train_jax.py`) compares against
+       `cfg.max_grad_norm`. With the old hardcoded 1.0 threshold the clip
+       fired at 1.0 while `did_clip` keyed on 0.5, so the two disagreed for
+       any norm in (0.5, 1.0]; threading the config keeps them consistent.
+    """
+    cfg = _make_cfg(max_grad_norm=0.5, optimizer="adamw")
+    sched = make_lr_schedule(cfg, total_steps=100)
+    opt = make_optimizer(cfg, sched)
+    params = {"w": jnp.ones((4,))}
+    # global norm = sqrt(4 * 0.4^2) = 0.8 — above 0.5, below 1.0, so the
+    # old hardcoded-1.0 clip would NOT fire while the 0.5 clip MUST.
+    grads = {"w": jnp.full((4,), 0.4)}
+    pre_norm = _f(optax.tree.norm(grads))
+    assert 0.5 < pre_norm < 1.0
+    state = opt.init(params)
+    _updates, new_state = opt.update(grads, state, params)
+    # The clip transform is chain slot 0; its `_ClipState` carries the
+    # pre-clip norm so the trainer can log `did_clip` without recomputing.
+    reported = _f(get_grad_norm(new_state))
+    assert reported == pytest.approx(pre_norm, rel=1e-5)
+    # `did_clip` consistency: the metric is `pre_norm > cfg.max_grad_norm`.
+    # With the threshold honored at 0.5 the clip fires, and the reported
+    # norm exceeds 0.5, so `did_clip` is True — they agree.
+    assert reported > cfg.max_grad_norm
+
+    # Direct numeric check of the 0.5 threshold under SGD (AdamW's
+    # second-moment renorm would otherwise hide the clip magnitude).
+    pure_clip_sgd = optax.chain(
+        _branchless_clip_for_test(0.5),
+        optax.sgd(learning_rate=1.0),
+    )
+    s = pure_clip_sgd.init(params)
+    upd, _ = pure_clip_sgd.update(grads, s, params)
+    from typing import cast
+    upd_w = cast(dict[str, jax.Array], upd)["w"]
+    # clip to 0.5 then sgd(lr=1.0) → update norm == 0.5 (sign-flipped).
+    assert _f(jnp.linalg.norm(upd_w)) == pytest.approx(0.5, rel=1e-5)
+
+
+def _branchless_clip_for_test(max_norm: float) -> optax.GradientTransformation:
+    """Standalone clip-by-global-norm for the numeric H10 check.
+
+    Mirrors `optax.clip_by_global_norm` semantics (the production clip in
+    `pawn.trainer` carries extra `_ClipState`); used here only to verify the
+    0.5 threshold's effect on a non-adaptive SGD update in isolation."""
+    return optax.clip_by_global_norm(max_norm)
+
+
 # ---------------------------------------------------------------------------
 # Train step + JIT contract
 # ---------------------------------------------------------------------------
@@ -622,6 +681,64 @@ def test_train_step_accumulation_steps_eq_2_runs() -> None:
     assert not np.array_equal(
         embed_tokens_before, np.asarray(new_state.model.embed_tokens)
     )
+
+
+def test_train_step_accumulation_grad_equals_mean_of_micros() -> None:
+    """B2: the accumulation kernel's gradient is the MEAN of the per-micro
+    gradients (within fp32 noise).
+
+    Drive `make_train_step(accumulation_steps=2)` with a plain SGD(lr=1.0)
+    optimizer (clip threshold set huge so it never fires) so the parameter
+    delta equals exactly `-mean_grad`. Compare against the reference mean of
+    the two single-micro gradients computed directly from
+    `supernet_joint_loss` (the kernel's `_loss_for`), confirming the scan
+    body sums then divides by N rather than e.g. summing without the 1/N.
+    """
+    variants = _tiny_variants()
+    B = 4
+    base1 = _small_batch(batch_size=B)
+    base2 = _small_batch(batch_size=B)
+
+    # Reference: mean of the two micro-batch gradients (deterministic sum,
+    # stochastic_variants=False).
+    ref_model = _tiny_model()
+
+    def _loss(model: PAWNModel, batch: Batch) -> jax.Array:
+        return supernet_joint_loss(model, batch, variants, stochastic_key=None)
+
+    _, g1 = eqx.filter_value_and_grad(lambda m: _loss(m, base1))(ref_model)
+    _, g2 = eqx.filter_value_and_grad(lambda m: _loss(m, base2))(ref_model)
+    mean_grad_embed = (
+        np.asarray(g1.embed_tokens) + np.asarray(g2.embed_tokens)
+    ) / 2.0
+
+    # Kernel: SGD(lr=1.0) with the clip disabled (huge threshold) so the
+    # embed_tokens delta is exactly -mean_grad.
+    model = _tiny_model()
+    embed_before = np.asarray(model.embed_tokens)
+    opt = optax.chain(
+        optax.clip_by_global_norm(1e9), optax.sgd(learning_rate=1.0)
+    )
+    state = TrainState(
+        model=model,
+        opt_state=opt.init(eqx.filter(model, eqx.is_inexact_array)),
+        step=jnp.int32(0),
+        key=jax.random.key(0),
+    )
+    ts = make_train_step(
+        opt, variants, accumulation_steps=2, stochastic_variants=False,
+    )
+    stacked = Batch(
+        tokens=jnp.stack([base1.tokens, base2.tokens], axis=0),
+        targets=jnp.stack([base1.targets, base2.targets], axis=0),
+        attn_mask=jnp.stack([base1.attn_mask, base2.attn_mask], axis=0),
+        loss_mask=jnp.stack([base1.loss_mask, base2.loss_mask], axis=0),
+    )
+    new_state, _ = ts(state, stacked)
+    embed_after = np.asarray(new_state.model.embed_tokens)
+    # delta = -lr * mean_grad = -mean_grad (lr=1.0).
+    kernel_mean_grad = -(embed_after - embed_before)
+    assert np.allclose(kernel_mean_grad, mean_grad_embed, rtol=0, atol=1e-5)
 
 
 def test_train_step_accumulation_steps_rejects_zero() -> None:

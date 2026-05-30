@@ -511,6 +511,8 @@ def generate_corpus(
     seed: int,
     *,
     conditioning: Sequence[str] = (),
+    mate_boost: float = 0.0,
+    discard_ply_limit: bool = False,
 ) -> Corpus:
     """Generate ``n_games`` random self-play games via the Rust engine and
     pack them into a :class:`Corpus`.
@@ -522,13 +524,25 @@ def generate_corpus(
     ``C = 1 + len(conditioning)``.
 
     ``seed`` is the engine RNG seed for reproducible runs.
+
+    ``mate_boost`` (B2 / plan §8.3) biases the engine's random move
+    selection toward checkmating lines — ``0.0`` (the default) is pure
+    uniform self-play; a positive value upweights mate-delivering moves so
+    the corpus carries a higher density of decisive terminations. It maps
+    onto :data:`pawn.run_config.BaseRunConfig.mate_boost` and is the only
+    consumer of that field; ``train_jax.py`` passes ``cfg.mate_boost``
+    here. ``discard_ply_limit`` drops games that hit the ``max_ply`` cap
+    (``PlyLimit`` termination) instead of keeping the truncated tail, so
+    the corpus contains only naturally-terminated games — it maps onto
+    :data:`pawn.run_config.BaseRunConfig.discard_ply_limit`.
     """
     if n_games <= 0:
         raise ValueError(f"n_games must be positive, got {n_games}")
     if max_ply <= 0:
         raise ValueError(f"max_ply must be positive, got {max_ply}")
     move_ids, game_lengths, term_codes = engine.generate_random_games(
-        n_games, max_ply, seed
+        n_games, max_ply, seed,
+        discard_ply_limit=discard_ply_limit, mate_boost=mate_boost,
     )
     outcome_tokens = _map_termination_to_outcome(term_codes, game_lengths)
     return _pack_clm(
