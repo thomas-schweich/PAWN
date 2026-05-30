@@ -288,6 +288,148 @@ def test_train_jax_adapter_rejects_resume_without_training_state(tmp_path) -> No
 
 
 # ---------------------------------------------------------------------------
+# B1 — distillation script wiring (parity with the train_jax / adapter smokes)
+# ---------------------------------------------------------------------------
+
+
+def _dir_digest(root: Path) -> "dict[str, str]":
+    """Map each file under ``root`` to a SHA-256 of its bytes.
+
+    Used to prove the frozen teacher checkpoint is bit-identical before and
+    after a distillation run (the teacher must receive zero gradient and is
+    never re-saved). Compares every payload file, not just the count.
+    """
+    import hashlib
+
+    digests: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            digests[str(path.relative_to(root))] = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+    return digests
+
+
+def test_train_jax_distill_runs_and_roundtrips(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """B1 smoke (spec smoke item 2): a tiny teacher→student distillation runs
+    end-to-end, writes a student checkpoint that round-trips through
+    `load_model`, and leaves the frozen teacher checkpoint bit-identical.
+
+    Mirrors `test_train_jax_accumulation_steps_runs` /
+    `test_train_jax_conditioning_threaded_into_corpus` — the distill script is
+    otherwise covered only by the generic import + `--help` smoke, so the
+    teacher-load → scan-loop → `_save` round-trip wiring is unexercised. This
+    pins:
+      * rc == 0 through the real `make_distill_scan_step` driver + `val_step`,
+      * a `distill_step_*` checkpoint is written and `load_model` reads it back,
+      * the teacher checkpoint dir bytes are unchanged (zero teacher grad +
+        no re-save), parity with the spec's "teacher bit-identical after".
+    """
+    import subprocess
+
+    from pawn.checkpoint import load_model, save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    # A real loadable v2 teacher checkpoint (default conditioning → C=1, which
+    # the distill run inherits and matches).
+    teacher = init_model(TINY_SUPERNET, key=0)
+    teacher_dir = tmp_path / "teacher"
+    save_model(
+        teacher, teacher_dir, training_state={"step": 0}, run_config={}
+    )
+    teacher_before = _dir_digest(teacher_dir)
+
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax_distill.py",
+            "--distill-from", str(teacher_dir),
+            "--student-supernet", "tiny",
+            "--no-pgn", "--objective", "mix",
+            "--total-steps", "4",
+            "--batch-size", "4", "--seq-len", "32", "--k", "2",
+            "--checkpoint-interval", "2", "--log-interval", "1",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"tiny distill failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+
+    ckpts = sorted(logs_dir.glob("*/distill_step_*"))
+    assert ckpts, (
+        f"no student checkpoint written under {logs_dir}; "
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    # The student checkpoint round-trips through the canonical v2 loader.
+    _student, run_block = load_model(ckpts[-1])
+    assert run_block is not None, "student checkpoint dropped its run block"
+    assert run_block.get("run_type") == "distill"
+
+    # The frozen teacher must be bit-identical — zero gradient, never re-saved.
+    teacher_after = _dir_digest(teacher_dir)
+    assert teacher_after == teacher_before, (
+        "teacher checkpoint bytes changed across the distill run; the teacher "
+        "must be frozen (zero gradient) and is never re-saved"
+    )
+
+
+def test_train_jax_distill_rejects_conditioning_mismatch(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """B1 / Phase-A C-guard: a distill run whose run-config conditioning
+    disagrees with the teacher's persisted conditioning must fail loudly
+    (the load-time C-assert), not silently shift every move's absolute RoPE
+    offset. Parity with `test_train_jax_adapter_rejects_conditioning_mismatch`.
+
+    Builds a tiny teacher persisting `conditioning=["outcome"]` (C=2), then
+    runs distill with the default empty conditioning (C=1) and asserts the
+    `conditioning mismatch` SystemExit at train_jax_distill.py fires.
+    """
+    import subprocess
+
+    from pawn.checkpoint import save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    teacher = init_model(TINY_SUPERNET, key=0)
+    teacher_dir = tmp_path / "teacher_c2"
+    save_model(
+        teacher, teacher_dir, training_state={"step": 0},
+        run_config={"conditioning": ["outcome"]},
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax_distill.py",
+            "--distill-from", str(teacher_dir),
+            "--student-supernet", "tiny",
+            "--no-pgn", "--objective", "mix",
+            "--total-steps", "2",
+            "--batch-size", "4", "--seq-len", "32", "--k", "1",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(tmp_path / "logs"),
+            # NB: no --conditioning → cfg.conditioning defaults to [] (C=1),
+            # which disagrees with the teacher's persisted C=2.
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=_subprocess_env(),
+    )
+    combined = result.stdout + result.stderr
+    assert "conditioning mismatch" in combined, (
+        f"Expected the teacher-vs-run-config C-mismatch guard; got "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.returncode != 0, "conditioning mismatch should fail"
+
+
+# ---------------------------------------------------------------------------
 # B2 — inert-knob parity: mate_boost / accumulation_steps / adapter cadence
 # ---------------------------------------------------------------------------
 

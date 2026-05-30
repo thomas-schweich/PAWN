@@ -150,6 +150,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                     help="disable the Pallas flash-attention kernel")
     ap.add_argument("--logs-dir", type=Path, default=Path("logs"))
     ap.add_argument("--log-interval", type=int, default=None)
+    ap.add_argument("--checkpoint-interval", type=int, default=None,
+                    dest="checkpoint_interval",
+                    help="steps between student checkpoints (boundary-crossing "
+                         "cadence; mirrors scripts/train_jax.py)")
     return ap.parse_args(argv)
 
 
