@@ -25,6 +25,7 @@ list of :class:`EdgeCaseResult`.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import jax.numpy as jnp
@@ -32,6 +33,11 @@ import numpy as np
 
 import chess_engine as engine
 from pawn.config import NUM_ACTIONS, PAD_TOKEN
+from pawn.corpus import (
+    _map_termination_to_outcome,
+    build_prefix,
+    conditioning_to_C,
+)
 from pawn.model import EffectiveCallable, PAWNModel
 
 __all__ = [
@@ -111,12 +117,36 @@ class EdgeCaseResult:
     n_positions: int
 
 
+def _resolve_outcome_tokens(
+    term_codes: np.ndarray | None,
+    game_lengths: np.ndarray,
+) -> np.ndarray:
+    """Per-game outcome token IDs for the ``"outcome"`` conditioning slot.
+
+    Maps the engine's termination codes through the same
+    :func:`pawn.corpus._map_termination_to_outcome` the trainer uses, so
+    the diagnostic prefix carries the exact outcome token the model was
+    conditioned on. When ``term_codes`` is unavailable the games carry no
+    resolvable outcome; we fall back to a ``< 0`` sentinel that
+    :func:`pawn.corpus.build_prefix` resolves to ``NULL_TOKEN`` (only
+    consumed when ``"outcome"`` is actually in the conditioning list).
+    """
+    n = int(np.asarray(game_lengths).shape[0])
+    if term_codes is None:
+        return np.full(n, -1, dtype=np.int32)
+    return _map_termination_to_outcome(
+        np.asarray(term_codes), np.asarray(game_lengths)
+    )
+
+
 def _compute_per_bit_accuracy(
     model: "PAWNModel | EffectiveCallable",
     move_ids: np.ndarray,
     game_lengths: np.ndarray,
     bits: np.ndarray,
+    outcome_tokens: np.ndarray,
     *,
+    conditioning: Sequence[str],
     batch_size: int,
 ) -> list[EdgeCaseResult]:
     """Shared per-bit accuracy core for both
@@ -124,44 +154,92 @@ def _compute_per_bit_accuracy(
     :func:`compute_edge_case_accuracy_quota`.
 
     ``bits`` is the ``(n, max_ply)`` uint64 from
-    :func:`chess_engine.compute_edge_stats_per_ply`. The function runs
-    the model in fixed-batch chunks, computes per-position argmax over
-    the action vocab, and aggregates per-label accuracy.
+    :func:`chess_engine.compute_edge_stats_per_ply`: ``bits[g, j]`` is
+    the edge-case bitfield of the position the model plays ``move[j]``
+    *from*, for ``j < game_length[g]``; ``bits[g, game_length[g]]`` is
+    the *terminal* position reached after the last move (checkmate /
+    stalemate live exclusively there). See ``engine/src/edgestats.rs``
+    (``compute_edge_stats_per_ply`` writes ``length + 1`` plies).
+
+    Layout (Phase-A): tokens are assembled with the run's conditioning
+    prefix ``[BOS][cond…]`` of width ``C = 1 + len(conditioning)`` so the
+    model sees the same absolute-RoPE layout it trained under; ``move[j]``
+    lands at sequence slot ``C + j`` and is predicted at slot ``C + j - 1``
+    (target ``tokens[:, C + j]``).
+
+    Per-bit alignment (H5): the prediction made at slot ``s`` concerns
+    ply ``j = s + 1 - C`` (the move it predicts is ``move[j]``), so each
+    seq-slot correctness is matched against ``bits[:, j]`` — i.e. ``bits``
+    shifted right by ``C`` along the sequence axis. The terminal ply
+    ``j = game_length`` has a PAD target (no move follows the final move);
+    we score whether the model predicts the game is over there
+    (``argmax`` over the *full* vocab equals PAD) rather than scoring a
+    move-argmax against PAD, which previously forced the checkmate /
+    stalemate labels to ``accuracy=0`` (the attn mask zeroed that slot).
     """
     bit_table = engine.edge_case_bits()
     n, max_ply = move_ids.shape
-    seq_len = max_ply
+    C = conditioning_to_C(conditioning)
+    move_ids = move_ids.astype(np.int32)
+    game_lengths = np.asarray(game_lengths, dtype=np.int32)
 
+    # Sequence: [BOS][cond…][move_0 … move_{L-1}][PAD …]. One trailing slot
+    # past the last move holds the predict-PAD (terminal) target, so the
+    # terminal ply j = game_length is representable for every game whose
+    # terminal bits fit (game_length < max_ply, the engine's own guard).
+    seq_len = C + max_ply
     tokens = np.full((n, seq_len), PAD_TOKEN, dtype=np.int32)
-    positions = np.arange(max_ply, dtype=np.int32)[None]
-    valid = positions < game_lengths[:, None]
-    tokens = np.where(valid, move_ids.astype(np.int32), PAD_TOKEN)
+    tokens[:, :C] = build_prefix(conditioning, outcome_tokens, n)
+    move_positions = np.arange(max_ply, dtype=np.int32)[None]
+    valid_move = move_positions < game_lengths[:, None]
+    tokens[:, C:] = np.where(valid_move, move_ids, PAD_TOKEN)
     attn = tokens != PAD_TOKEN
 
+    # Target at slot s is tokens[:, s + 1]; the PAD trailing slot is benign
+    # (the per-bit masks below decide which slots count).
     targets = np.full_like(tokens, PAD_TOKEN)
     targets[:, :-1] = tokens[:, 1:]
 
-    pred_chunks: list[np.ndarray] = []
+    action_pred_chunks: list[np.ndarray] = []
+    full_pred_chunks: list[np.ndarray] = []
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
         t = jnp.asarray(tokens[start:end])
         a = jnp.asarray(attn[start:end])
         logits = model(t, a)
-        pred = np.asarray(jnp.argmax(logits[..., :NUM_ACTIONS], axis=-1))
-        pred_chunks.append(pred)
-    pred_all = np.concatenate(pred_chunks, axis=0)
-    correct = (pred_all == targets) & attn
+        action_pred = np.asarray(jnp.argmax(logits[..., :NUM_ACTIONS], axis=-1))
+        full_pred = np.asarray(jnp.argmax(logits, axis=-1))
+        action_pred_chunks.append(action_pred)
+        full_pred_chunks.append(full_pred)
+    action_pred = np.concatenate(action_pred_chunks, axis=0)
+    full_pred = np.concatenate(full_pred_chunks, axis=0)
+
+    # Per-slot correctness. For a move target (the common case) the model
+    # must argmax the right action; for the terminal predict-PAD slot it
+    # must argmax PAD over the full vocab (game-is-over). The terminal slot
+    # is where targets == PAD inside the supervised window; everywhere else
+    # uses the action argmax.
+    is_pad_target = targets == PAD_TOKEN
+    move_correct = (action_pred == targets) & ~is_pad_target
+    terminal_correct = (full_pred == PAD_TOKEN) & is_pad_target
+    correct_slot = move_correct | terminal_correct
+
+    # Align bits onto sequence slots: slot s scores ply j = s + 1 - C, so
+    # aligned_bits[:, s] = bits[:, s + 1 - C] for s + 1 - C in [0, max_ply).
+    aligned_bits = np.zeros((n, seq_len), dtype=bits.dtype)
+    # Valid source plies j map to slots s = C - 1 + j for j in [0, max_ply).
+    aligned_bits[:, C - 1 : C - 1 + max_ply] = bits
 
     results: list[EdgeCaseResult] = []
     for label in EDGE_CASE_LABELS:
         bit_name = _LABEL_TO_BIT_NAME[label]
         mask_value = bit_table[bit_name]
-        mask = (bits & mask_value).astype(bool)
+        mask = (aligned_bits & mask_value).astype(bool)
         n_pos = int(mask.sum())
         if n_pos == 0:
             results.append(EdgeCaseResult(label=label, accuracy=0.0, n_positions=0))
             continue
-        n_correct = int((correct & mask).sum())
+        n_correct = int((correct_slot & mask).sum())
         results.append(
             EdgeCaseResult(label=label, accuracy=n_correct / n_pos, n_positions=n_pos)
         )
@@ -173,6 +251,8 @@ def compute_edge_case_accuracy(
     move_ids: np.ndarray,
     game_lengths: np.ndarray,
     *,
+    term_codes: np.ndarray | None = None,
+    conditioning: Sequence[str] = (),
     batch_size: int = 16,
 ) -> list[EdgeCaseResult]:
     """Compute per-edge-case move accuracy on a pre-existing corpus.
@@ -183,6 +263,13 @@ def compute_edge_case_accuracy(
     ``engine.compute_edge_stats_per_ply`` to flag positions, runs the
     model's forward pass, and computes per-bit argmax accuracy.
 
+    ``conditioning`` is the checkpoint's prefix-kind list (Phase-A); the
+    tokens are assembled with that ``[BOS][cond…]`` prefix so the model
+    runs on its in-distribution absolute-RoPE layout. ``term_codes`` (the
+    engine's per-game termination codes) resolves the ``"outcome"``
+    conditioning slot when present; with no ``"outcome"`` kind in
+    ``conditioning`` it is unused and may be omitted.
+
     Returns a list of :class:`EdgeCaseResult`, one per label in
     :data:`EDGE_CASE_LABELS`. Rare edge cases (checkmate, stalemate)
     may have ``n_positions == 0`` on a small random corpus — use
@@ -191,8 +278,10 @@ def compute_edge_case_accuracy(
     move_ids = np.ascontiguousarray(move_ids, dtype=np.int16)
     game_lengths = np.asarray(game_lengths, dtype=np.int16)
     bits, _, _ = engine.compute_edge_stats_per_ply(move_ids, game_lengths)
+    outcome_tokens = _resolve_outcome_tokens(term_codes, game_lengths)
     return _compute_per_bit_accuracy(
-        model, move_ids, game_lengths, bits, batch_size=batch_size,
+        model, move_ids, game_lengths, bits, outcome_tokens,
+        conditioning=conditioning, batch_size=batch_size,
     )
 
 
@@ -203,6 +292,7 @@ def compute_edge_case_accuracy_quota(
     max_ply: int = 256,
     seed: int = 42,
     max_simulated_factor: float = 500.0,
+    conditioning: Sequence[str] = (),
     batch_size: int = 16,
 ) -> list[EdgeCaseResult]:
     """Compute per-edge-case move accuracy with quota-controlled coverage.
@@ -228,10 +318,12 @@ def compute_edge_case_accuracy_quota(
     output = engine.generate_diagnostic_sets(
         quotas_w, quotas_b, total_games, max_ply, seed, max_simulated_factor,
     )
-    move_ids, game_lengths, _term_codes, per_ply_stats, *_ = output
+    move_ids, game_lengths, term_codes, per_ply_stats, *_ = output
     move_ids_np = np.asarray(move_ids, dtype=np.int16)
     game_lengths_np = np.asarray(game_lengths, dtype=np.int16)
     bits = np.asarray(per_ply_stats, dtype=np.uint64)
+    outcome_tokens = _resolve_outcome_tokens(np.asarray(term_codes), game_lengths_np)
     return _compute_per_bit_accuracy(
-        model, move_ids_np, game_lengths_np, bits, batch_size=batch_size,
+        model, move_ids_np, game_lengths_np, bits, outcome_tokens,
+        conditioning=conditioning, batch_size=batch_size,
     )

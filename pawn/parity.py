@@ -431,6 +431,9 @@ def _fit_probe_safe(
         d = hidden.shape[-1]
         return ProbeResult(
             accuracy=0.0,
+            train_accuracy=0.0,
+            n_train=0,
+            n_val=0,
             weight=jnp.zeros((d, n_classes), dtype=jnp.float32),
             bias=jnp.zeros((n_classes,), dtype=jnp.float32),
         )

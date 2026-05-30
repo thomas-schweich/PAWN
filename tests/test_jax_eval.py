@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jaxtyping import Array
 
 from pawn.config import (
     BLACK_CHECKMATES,
@@ -387,8 +388,8 @@ def test_autoregressive_generate_rejects_mismatched_low_precision_pair() -> None
 
 
 def test_fit_probe_converges_on_separable_data() -> None:
-    """Synthetic separable hidden states + labels; probe should reach
-    high accuracy."""
+    """Synthetic separable hidden states + labels; the held-out probe
+    should reach high accuracy and report a real val split (H6)."""
     rng = np.random.default_rng(0)
     n_per_class = 64
     d = 32
@@ -401,9 +402,144 @@ def test_fit_probe_converges_on_separable_data() -> None:
         labels.extend([c] * n_per_class)
     hidden_arr = jnp.asarray(np.concatenate(hidden, axis=0), dtype=jnp.float32)
     labels_arr = jnp.asarray(labels, dtype=jnp.int32)
-    cfg = ProbeConfig(n_classes=n_classes, lr=1e-2, n_epochs=10, batch_size=32)
+    cfg = ProbeConfig(
+        n_classes=n_classes, lr=1e-2, n_epochs=10, batch_size=32, val_frac=0.25,
+    )
     result = fit_probe(hidden_arr, labels_arr, cfg, key=0)
+    # `accuracy` is the HELD-OUT number now (H6): the probe must generalise,
+    # not memorise. A real val split was carved.
     assert result.accuracy > 0.9
+    assert result.n_val > 0
+    assert result.n_train + result.n_val == n_per_class * n_classes
+
+
+def test_fit_probe_reports_held_out_not_in_sample() -> None:
+    """H6 regression guard: `fit_probe` must score on data it never
+    trained on, not re-report the in-sample number (`probes.py:81-96`).
+
+    We give the probe pure-noise labels (no recoverable signal) with an
+    *overcomplete* feature dimension (`d >> n_train`), so the linear probe
+    can — and does — memorise the train split to ~100% accuracy. Because the
+    labels carry no signal, held-out accuracy must collapse toward chance
+    (0.5). A genuine held-out split therefore shows a large train→val gap; a
+    pure in-sample report (the old behaviour, where `accuracy ==
+    train_accuracy`) would show ~no gap at all. The non-strict
+    `train_accuracy >= accuracy` of the previous version was satisfiable by
+    equality and could not distinguish the two — here we require a strict,
+    sizeable gap and a val accuracy bounded well below the memorised train
+    accuracy.
+    """
+    rng = np.random.default_rng(7)
+    n = 120
+    d = 256  # overcomplete: d >> n_train, so the probe can memorise any labels
+    x = rng.normal(size=(n, d)).astype("float32")
+    # Pure-noise labels — uncorrelated with the features, so nothing
+    # generalises and held-out accuracy is bounded near chance.
+    y = rng.integers(0, 2, size=n).astype("int32")
+    cfg = ProbeConfig(n_classes=2, lr=5e-2, n_epochs=300, batch_size=64, val_frac=0.3)
+    result = fit_probe(jnp.asarray(x), jnp.asarray(y), cfg, key=0)
+    assert result.n_val > 0
+    # The probe memorised the train split (overcomplete, noise labels).
+    assert result.train_accuracy > 0.95
+    # Held-out accuracy collapses toward chance — far below the memorised
+    # train accuracy. An in-sample report (accuracy == train_accuracy) would
+    # land near ~1.0 and fail both of the following.
+    assert result.accuracy < 0.8
+    assert result.train_accuracy - result.accuracy > 0.2
+
+
+def test_run_layer_probes_side_to_move_above_chance_held_out() -> None:
+    """H6 end-to-end: forward the FROZEN model on engine games, extract
+    per-layer hidden states, label side-to-move via
+    `engine.extract_board_states`, and fit a held-out probe per layer.
+
+    Side-to-move is positionally separable (ply parity → RoPE position),
+    so even an untrained backbone's early-layer residual stream carries
+    it well above the 0.5 chance rate — and crucially the reported
+    accuracy is on held-out positions."""
+    from pawn.probes import run_layer_probes, side_to_move_labeler
+
+    model = init_model(TINY_SUPERNET, key=0)
+    import chess_engine as engine
+
+    move_ids, game_lengths, _ = engine.generate_random_games(96, 40, 11)
+    results = run_layer_probes(
+        model, move_ids, game_lengths,
+        n_classes=2, labeler=side_to_move_labeler,
+        n_epochs=15, val_frac=0.25, key=0,
+    )
+    # One probe per layer + the post-embedding stream.
+    assert set(results.keys()) == set(range(TINY_SUPERNET.n_layers + 1))
+    for r in results.values():
+        assert r.n_val > 0
+        assert r.n_train > 0
+    # The best layer must clear chance by a real margin on held-out data.
+    best = max(r.accuracy for r in results.values())
+    assert best > 0.6, f"side-to-move probe at chance: best held-out acc={best}"
+
+
+def test_extract_probe_dataset_labels_match_engine_board() -> None:
+    """The probe dataset's labels must come from the engine's ground-truth
+    board states (H6), not a synthetic stand-in. We extract an occupancy
+    feature and independently recompute it from
+    `engine.extract_board_states`; they must agree exactly.
+
+    This pins the load-bearing H6 alignment in `extract_probe_dataset`: each
+    residual-stream slot `C + t` is labeled by the engine board at ply
+    `p_idx = t + 1` (the board the model has just transitioned into after
+    consuming `move[t]`). We replicate that deterministic index construction
+    here and compare the returned labels element-wise against occupancy
+    recomputed directly from `engine.extract_board_states`, so a labeler that
+    returned all-zeros, indexed the wrong square, or used the wrong
+    `(g_idx, p_idx)` / an off-by-one in `p_idx` would fail.
+    """
+    from pawn.corpus import conditioning_to_C
+    from pawn.probes import extract_probe_dataset, occupancy_labeler
+
+    model = init_model(TINY_SUPERNET, key=0)
+    import chess_engine as engine
+
+    move_ids, game_lengths, _ = engine.generate_random_games(8, 24, 5)
+    square = 28  # e4
+    hidden, labels = extract_probe_dataset(
+        model, move_ids, game_lengths,
+        layer=TINY_SUPERNET.n_layers, labeler=occupancy_labeler(square),
+    )
+    labels_np = np.asarray(labels)
+    # One feature row per supervised (game, ply) position; labels are 0/1.
+    assert hidden.shape[0] == labels_np.shape[0]
+    assert hidden.shape[0] > 0
+    assert set(np.unique(labels_np).tolist()) <= {0, 1}
+    assert hidden.shape[-1] == TINY_SUPERNET.d_model
+
+    # Independently reconstruct the (g_idx, p_idx) the dataset supervises,
+    # mirroring extract_probe_dataset: for each game, t in [0, gl-1) with
+    # slot C+t labeled by the board at ply t+1. With no conditioning C == 1.
+    C = conditioning_to_C(())
+    assert C == 1
+    gl = np.asarray(game_lengths, dtype=np.int64)
+    g_list: list[np.ndarray] = []
+    p_list: list[np.ndarray] = []
+    for g in range(len(gl)):
+        usable = int(gl[g]) - 1
+        if usable <= 0:
+            continue
+        t = np.arange(usable, dtype=np.int64)
+        g_list.append(np.full(usable, g, dtype=np.int64))
+        p_list.append(t + 1)  # label the board BEFORE move[t+1]
+    g_idx = np.concatenate(g_list)
+    p_idx = np.concatenate(p_list)
+
+    # Recompute square-28 occupancy directly from the engine's ground-truth
+    # boards and require exact agreement with the returned labels.
+    states = engine.extract_board_states(move_ids, game_lengths)
+    boards = np.asarray(states[0])  # (N, max_ply, 8, 8) int8
+    rank, file = divmod(square, 8)
+    expected_occ = (boards[g_idx, p_idx, rank, file] != 0).astype(np.int64)
+    assert labels_np.shape[0] == expected_occ.shape[0]
+    np.testing.assert_array_equal(labels_np, expected_occ)
+    # Both classes must appear — an all-constant labeler can't pass.
+    assert set(np.unique(expected_occ).tolist()) == {0, 1}
 
 
 # ---------------------------------------------------------------------------
@@ -495,3 +631,250 @@ def test_edge_case_accuracy_quota_guarantees_coverage() -> None:
             f"quota-controlled sampling missed label {label!r}"
         )
         assert 0.0 <= by_label[label].accuracy <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# H5: edge-case alignment (off-by-one + terminal-label PAD scoring)
+# ---------------------------------------------------------------------------
+
+
+class _OracleBase:
+    """Minimal :class:`pawn.model.EffectiveCallable` stand-in for the
+    edge-case diagnostic — the diagnostic only calls ``model(tokens,
+    attn)`` and never touches ``cfg``, but exposing ``cfg`` keeps the
+    Protocol satisfied for the type checker."""
+
+    @property
+    def cfg(self):  # type: ignore[no-untyped-def]
+        return TINY_SUPERNET
+
+    def __call__(
+        self,
+        input_ids: Array,
+        attention_mask: Array | None = None,
+        *,
+        compute_dtype=None,  # type: ignore[no-untyped-def]
+        use_sdpa: bool = False,
+        use_flash: bool = False,
+    ) -> Array:
+        raise NotImplementedError
+
+
+class _NextTokenOracle(_OracleBase):
+    """A stand-in model whose argmax at every slot is the true next token.
+
+    The diagnostic builds tokens as ``[BOS][cond…][move…][PAD…]`` and the
+    model at slot ``s`` predicts ``tokens[:, s+1]``. This oracle returns
+    one-hot-ish logits peaking exactly on that next token (full vocab), so
+    every supervised prediction is correct *iff* the diagnostic aligns the
+    edge-case bit to the right slot."""
+
+    def __call__(
+        self,
+        input_ids: Array,
+        attention_mask: Array | None = None,
+        *,
+        compute_dtype=None,  # type: ignore[no-untyped-def]
+        use_sdpa: bool = False,
+        use_flash: bool = False,
+    ) -> Array:
+        from pawn.config import PAD_TOKEN
+
+        toks = np.asarray(input_ids)
+        b, t = toks.shape
+        tgt = np.full((b, t), PAD_TOKEN, dtype=np.int64)
+        tgt[:, :-1] = toks[:, 1:]
+        logits = np.full((b, t, 1982), -30.0, dtype=np.float32)
+        rows = np.arange(b)[:, None]
+        cols = np.arange(t)[None, :]
+        logits[rows, cols, tgt] = 30.0
+        return jnp.asarray(logits)
+
+
+@pytest.mark.parametrize("conditioning", [(), ("outcome",)])
+def test_edge_case_alignment_scores_in_check_and_terminal(
+    conditioning: tuple[str, ...],
+) -> None:
+    """H5 wiring + terminal-PAD coverage: with the off-by-one fixed and the
+    terminal label scored against the predict-PAD target, an oracle that
+    always predicts the true next token scores ``accuracy == 1.0`` on BOTH
+    a non-terminal label (``in_check``) and a terminal label
+    (``checkmate``). Verified for the BOS-only (C=1) and outcome-prefixed
+    (C=2) layouts.
+
+    NOTE: a perfect next-token oracle is correct at *every* slot, so this
+    test alone cannot discriminate the exact bit→slot alignment offset (a
+    ±1 shift still leaves both labels at 1.0). The off-by-one is pinned
+    separately by
+    :func:`test_edge_case_alignment_offset_is_C_minus_1`, which uses a
+    slot-varying oracle whose per-label accuracy changes under a shift."""
+    import chess_engine as engine
+
+    from pawn.eval_suite.diagnostics import compute_edge_case_accuracy
+
+    move_ids, game_lengths, term_codes = engine.generate_random_games(400, 80, 7)
+    res = compute_edge_case_accuracy(
+        _NextTokenOracle(), move_ids, game_lengths,
+        term_codes=term_codes, conditioning=conditioning, batch_size=64,
+    )
+    by = {r.label: r for r in res}
+    # Both labels must be present with coverage on the random pool.
+    assert by["in_check"].n_positions > 0
+    assert by["checkmate"].n_positions > 0
+    # Perfect next-token oracle ⇒ perfect per-label accuracy under correct
+    # alignment (move labels) and correct terminal PAD scoring.
+    assert by["in_check"].accuracy == 1.0
+    assert by["checkmate"].accuracy == 1.0
+
+
+class _EvenSlotOracle(_OracleBase):
+    """A stand-in whose argmax is the true next token only on EVEN sequence
+    slots; on odd slots it deliberately peaks a *wrong* action.
+
+    Unlike :class:`_NextTokenOracle` (correct at every slot, hence blind to
+    the bit→slot alignment), this oracle's per-slot correctness varies with
+    slot parity, so a per-label edge-case accuracy depends on *which* slots
+    the bits are aligned onto. A ±1 shift of the bit→slot mapping (the H5
+    off-by-one) flips the parity of every masked slot and therefore changes
+    the reported accuracy — letting a test pin the exact offset."""
+
+    def __call__(
+        self,
+        input_ids: Array,
+        attention_mask: Array | None = None,
+        *,
+        compute_dtype=None,  # type: ignore[no-untyped-def]
+        use_sdpa: bool = False,
+        use_flash: bool = False,
+    ) -> Array:
+        from pawn.config import PAD_TOKEN
+
+        toks = np.asarray(input_ids)
+        b, t = toks.shape
+        tgt = np.full((b, t), PAD_TOKEN, dtype=np.int64)
+        tgt[:, :-1] = toks[:, 1:]
+        cols = np.arange(t)[None, :]
+        even = np.broadcast_to(cols % 2 == 0, (b, t))
+        # On even slots: the true next token. On odd slots: a wrong action
+        # (0, or 1 when the truth is 0) so move-target slots score as wrong.
+        wrong = np.where(tgt == 0, 1, 0)
+        peak = np.where(even, tgt, wrong)
+        logits = np.full((b, t, 1982), -30.0, dtype=np.float32)
+        rows = np.arange(b)[:, None]
+        logits[rows, cols, peak] = 30.0
+        return jnp.asarray(logits)
+
+
+@pytest.mark.parametrize("conditioning", [(), ("outcome",)])
+def test_edge_case_alignment_offset_is_C_minus_1(
+    conditioning: tuple[str, ...],
+) -> None:
+    """H5 (discriminating): the bit→slot alignment is exactly ``s = C-1+j``.
+
+    A perfect oracle cannot catch a ±1 shift (it's correct everywhere), so
+    we use a slot-varying oracle (:class:`_EvenSlotOracle`, correct only on
+    even slots). For ``in_check`` plies ``j`` (which always carry a move
+    target), the diagnostic scores slot ``s = C-1+j`` and the oracle is
+    correct there iff ``s`` is even. We independently recompute that
+    reference accuracy from the engine bits and require the diagnostic to
+    match it EXACTLY, *and* require the correct-alignment reference to
+    differ from both the +1 and −1 shifted references — so a regression
+    that shifts the mapping by ±1 would change the diagnostic output and
+    fail the exact-match assertion."""
+    import chess_engine as engine
+
+    from pawn.corpus import conditioning_to_C
+    from pawn.eval_suite.diagnostics import compute_edge_case_accuracy
+
+    move_ids, game_lengths, term_codes = engine.generate_random_games(400, 80, 7)
+    move_ids = np.asarray(move_ids, dtype=np.int16)
+    game_lengths = np.asarray(game_lengths, dtype=np.int16)
+    C = conditioning_to_C(conditioning)
+
+    # Reference: per-ply in_check bits → masked plies j → correct slot
+    # s = C-1+j. Slot-varying oracle is correct iff s is even.
+    bits, _, _ = engine.compute_edge_stats_per_ply(move_ids, game_lengths)
+    in_check_mask = engine.edge_case_bits()["IN_CHECK"]
+    masked = (np.asarray(bits) & in_check_mask).astype(bool)
+    _g_idx, j_idx = np.where(masked)
+    assert j_idx.size > 0  # need coverage to discriminate
+
+    def ref_acc(delta: int) -> float:
+        s = (C - 1) + j_idx + delta
+        return float((s % 2 == 0).mean())
+
+    correct_ref = ref_acc(0)
+
+    res = compute_edge_case_accuracy(
+        _EvenSlotOracle(), move_ids, game_lengths,
+        term_codes=term_codes, conditioning=conditioning, batch_size=64,
+    )
+    by = {r.label: r for r in res}
+    assert by["in_check"].n_positions == int(j_idx.size)
+    # The diagnostic must reproduce the C-1+j alignment exactly.
+    assert by["in_check"].accuracy == pytest.approx(correct_ref, abs=1e-9)
+    # And the value must be alignment-sensitive: a ±1 shift gives a
+    # DIFFERENT reference, so the exact-match above genuinely pins C-1.
+    assert ref_acc(+1) != pytest.approx(correct_ref, abs=1e-9)
+    assert ref_acc(-1) != pytest.approx(correct_ref, abs=1e-9)
+
+
+def test_edge_case_terminal_label_not_forced_to_zero() -> None:
+    """H5 regression: the checkmate/stalemate terminal labels used to be
+    scored against a PAD target on a slot the attention mask zeroed,
+    forcing ``accuracy == 0`` regardless of the model. A model that
+    *fails* to predict game-over (always emits a real move, never PAD)
+    must now score ``checkmate`` accuracy of 0.0, while a model that
+    predicts PAD scores 1.0 — i.e. the metric actually discriminates the
+    terminal behaviour instead of being pinned at 0."""
+    import chess_engine as engine
+
+    from pawn.config import PAD_TOKEN
+    from pawn.eval_suite.diagnostics import compute_edge_case_accuracy
+
+    class _NeverPAD(_OracleBase):
+        def __call__(
+            self,
+            input_ids: Array,
+            attention_mask: Array | None = None,
+            *,
+            compute_dtype=None,  # type: ignore[no-untyped-def]
+            use_sdpa: bool = False,
+            use_flash: bool = False,
+        ) -> Array:
+            b, t = np.asarray(input_ids).shape
+            logits = np.full((b, t, 1982), -30.0, dtype=np.float32)
+            logits[:, :, 0] = 30.0  # always action 0, never PAD
+            return jnp.asarray(logits)
+
+    class _AlwaysPAD(_OracleBase):
+        def __call__(
+            self,
+            input_ids: Array,
+            attention_mask: Array | None = None,
+            *,
+            compute_dtype=None,  # type: ignore[no-untyped-def]
+            use_sdpa: bool = False,
+            use_flash: bool = False,
+        ) -> Array:
+            b, t = np.asarray(input_ids).shape
+            logits = np.full((b, t, 1982), -30.0, dtype=np.float32)
+            logits[:, :, PAD_TOKEN] = 30.0  # always predict game-over
+            return jnp.asarray(logits)
+
+    move_ids, game_lengths, term_codes = engine.generate_random_games(400, 80, 7)
+    never = {
+        r.label: r
+        for r in compute_edge_case_accuracy(
+            _NeverPAD(), move_ids, game_lengths, term_codes=term_codes, batch_size=64,
+        )
+    }
+    always = {
+        r.label: r
+        for r in compute_edge_case_accuracy(
+            _AlwaysPAD(), move_ids, game_lengths, term_codes=term_codes, batch_size=64,
+        )
+    }
+    assert never["checkmate"].n_positions > 0
+    assert never["checkmate"].accuracy == 0.0
+    assert always["checkmate"].accuracy == 1.0

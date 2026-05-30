@@ -624,6 +624,45 @@ class PAWNModel(eqx.Module):
             return logits.astype(jnp.float32)
         return logits
 
+    def hidden_states(
+        self,
+        input_ids: Int[Array, "B T"],
+        attention_mask: Int[Array, "B T"] | None = None,
+    ) -> Float[Array, "L1 B T d"]:
+        """Per-layer residual-stream hidden states for linear probing.
+
+        Returns a stack of shape ``(n_layers + 1, B, T, d)`` in fp32: index
+        ``0`` is the post-embedding residual stream and index ``i`` (for
+        ``i in 1..n_layers``) is the output of transformer block ``i`` (its
+        post-FFN residual). The final entry is *not* run through
+        :attr:`final_norm_w` — probes read the raw per-layer residual
+        stream, which is the standard probing target.
+
+        The forward runs in fp32 (``compute_dtype=None``) and through the
+        plain materialised-``QK^T`` attention path so the extracted states
+        are precision-stable and backend-agnostic; the probe trainer keeps
+        the backbone frozen, so no gradient flows here.
+        """
+        T = input_ids.shape[-1]
+        if T > self.cfg.max_seq_len:
+            raise ValueError(
+                f"sequence length {T} exceeds cfg.max_seq_len {self.cfg.max_seq_len}"
+            )
+        x = self._embed(input_ids)
+        rope_cos, rope_sin = _build_rope(self.cfg.head_dim, T, self.cfg.rope_base)
+        causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+        if attention_mask is None:
+            mask = causal[None, None, :, :]
+        else:
+            pad = attention_mask.astype(jnp.bool_)[:, None, None, :]
+            mask = causal[None, None, :, :] & pad
+        per_layer = self._run_layers_collect(
+            x, rope_cos, rope_sin, mask, attention_mask,
+        )
+        # Prepend the post-embedding stream so callers can probe the input
+        # representation (layer 0) alongside every block output.
+        return jnp.concatenate([x[None], per_layer], axis=0)
+
     # -----------------------------------------------------------------------
     # Forward-pass internals
     # -----------------------------------------------------------------------
@@ -853,6 +892,62 @@ class PAWNModel(eqx.Module):
             )
         x, _ = jax.lax.scan(step, x, scan_input, unroll=unroll)
         return x
+
+    def _run_layers_collect(
+        self,
+        x: Float[Array, "B T d"],
+        rope_cos: Float[Array, "T half"],
+        rope_sin: Float[Array, "T half"],
+        mask: Bool[Array, "B 1 T T"],
+        attention_mask: Int[Array, "B T"] | None,
+    ) -> Float[Array, "L B T d"]:
+        """Per-layer output stack — the probe-only sibling of
+        :meth:`_run_layers`.
+
+        Runs the plain fp32 materialised-``QK^T`` attention path (no AMP,
+        no adapter hooks, no SDPA/Pallas) and emits the post-FFN residual
+        of every block via :func:`jax.lax.scan`'s ``ys`` channel, giving a
+        ``(n_layers, B, T, d)`` stack. Kept separate from
+        :meth:`_run_layers` so the hot training/eval path never threads an
+        extra output through its scan; the precision and masking exactly
+        mirror the ``compute_dtype is None`` branch of :meth:`_run_layers`,
+        so probe states match what the final-logit forward sees.
+        """
+        head_dim = self.cfg.head_dim
+        n_heads = self.cfg.n_heads
+        inv_scale = head_dim ** -0.5
+
+        def step(
+            carry: Float[Array, "B T d"],
+            layer: TransformerLayer,
+        ) -> tuple[Float[Array, "B T d"], Float[Array, "B T d"]]:
+            h = carry
+            normed = _rmsnorm(h, layer.attn_norm_w)
+            B, T, D = normed.shape  # noqa: N806
+            q = jnp.einsum("btd,de->bte", normed, layer.wq)
+            k = jnp.einsum("btd,de->bte", normed, layer.wk)
+            v = jnp.einsum("btd,de->bte", normed, layer.wv)
+            q = q.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+            k = k.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+            v = v.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+            q = _apply_rope(q, rope_cos, rope_sin)
+            k = _apply_rope(k, rope_cos, rope_sin)
+            scores = jnp.einsum("bhid,bhjd->bhij", q, k) * inv_scale
+            mask_neg_inf = jnp.finfo(jnp.float32).min
+            scores = jnp.where(mask, scores.astype(jnp.float32), mask_neg_inf)
+            attn = jax.nn.softmax(scores, axis=-1)
+            attn_out = jnp.einsum("bhij,bhjd->bhid", attn, v)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, D)
+            h = h + jnp.einsum("btd,de->bte", attn_out, layer.wo)
+            normed = _rmsnorm(h, layer.ffn_norm_w)
+            gate = jnp.einsum("btd,df->btf", normed, layer.w_gate)
+            up = jnp.einsum("btd,df->btf", normed, layer.w_up)
+            ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, layer.w_down)
+            h = h + ffn_out
+            return h, h
+
+        _, per_layer = jax.lax.scan(step, x, self.layers)
+        return per_layer
 
     # -----------------------------------------------------------------------
     # KV-cached generation path

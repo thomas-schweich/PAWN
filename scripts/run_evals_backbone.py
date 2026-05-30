@@ -16,6 +16,23 @@ import sys
 from pathlib import Path
 
 
+def _is_real_probe_payload(payload: object) -> bool:
+    """True when a probes.json carries genuine per-layer held-out probe
+    output (H6) — a ``layers`` map with at least one entry that reports a
+    held-out split (``n_val > 0``). Guards against emitting a placeholder
+    or partial probe result into the aggregated eval bundle.
+    """
+    if not isinstance(payload, dict):
+        return False
+    layers = payload.get("layers")
+    if not isinstance(layers, dict) or not layers:
+        return False
+    return any(
+        isinstance(v, dict) and isinstance(v.get("n_val"), int) and v["n_val"] > 0
+        for v in layers.values()
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="run_evals_backbone")
     ap.add_argument("--checkpoints", nargs="+", required=True)
@@ -39,15 +56,22 @@ def main(argv: list[str] | None = None) -> int:
         results["accuracy"] = (
             json.loads(acc_path.read_text()) if acc_path.exists() else None
         )
+        # Probes (H6): the real per-layer, held-out probe path. We only
+        # surface `results["probes"]` when the probe script produced an
+        # output carrying genuine per-layer held-out accuracies — i.e. it
+        # ran the frozen-forward + engine-label pipeline. A missing/partial
+        # file (subprocess failure) leaves the key absent rather than
+        # emitting placeholder noise.
         prob_path = cdir / "probes.json"
         subprocess.run(
             [sys.executable, "scripts/eval_probes_jax.py",
              "--checkpoint", ckpt, "--output", str(prob_path)],
             check=False,
         )
-        results["probes"] = (
-            json.loads(prob_path.read_text()) if prob_path.exists() else None
-        )
+        if prob_path.exists():
+            probe_payload = json.loads(prob_path.read_text())
+            if _is_real_probe_payload(probe_payload):
+                results["probes"] = probe_payload
         gen_path = cdir / "generation.json"
         gen_args = [sys.executable, "scripts/eval_generation_jax.py",
                     "--checkpoint", ckpt, "--output", str(gen_path)]

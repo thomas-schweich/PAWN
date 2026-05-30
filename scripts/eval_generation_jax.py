@@ -96,10 +96,13 @@ def main(argv: list[str] | None = None) -> int:
     ckpt_path = resolve_checkpoint_source(ckpt)
     model, run_block = load_model(ckpt_path)
 
+    # The checkpoint's own conditioning layout (plan §8.1) — used both to
+    # auto-detect the outcome gate and to assemble in-distribution edge-case
+    # tokens with the matching [BOS][cond…] prefix.
+    conditioning = conditioning_from_run_block(run_block)
     # Auto-detect outcome conditioning from the checkpoint's run block when
     # the operator didn't pass an explicit gate flag.
     if args.trained is None:
-        conditioning = conditioning_from_run_block(run_block)
         outcome_prefix_trained = "outcome" in conditioning
     else:
         outcome_prefix_trained = args.trained
@@ -116,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.edge_cases:
         from pawn.eval_suite.diagnostics import compute_edge_case_accuracy_quota
         edge = compute_edge_case_accuracy_quota(
-            model, per_label=args.edge_per_label,
+            model, per_label=args.edge_per_label, conditioning=conditioning,
         )
         results["edge_cases"] = {
             r.label: {"accuracy": r.accuracy, "n_positions": r.n_positions}
