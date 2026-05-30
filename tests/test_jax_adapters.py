@@ -1386,36 +1386,24 @@ def _save_adapter_checkpoint(
     state: AdapterTrainState,
     out,  # type: ignore[no-untyped-def]
 ) -> None:
-    """Write a checkpoint directory exactly as ``train_jax_adapter._save``
-    does for ``strategy``: the *effective* (folded backbone / wrapper
-    backbone) as ``model.safetensors`` + warm ``optimizer.safetensors``, plus
-    the strategy-appropriate sidecar (typed ``adapter.safetensors`` for
-    bottleneck/FiLM, raw ``adapter_resume_state.eqx`` for the weight-folding
-    and hybrid strategies)."""
-    from pawn.adapters.bottleneck import (
-        BottleneckEffective,
-        save_bottleneck_adapter,
-    )
-    from pawn.adapters.film import FiLMEffective, save_film_adapter
-    from pawn.adapters.hybrid import HybridAdapter
-    from pawn.checkpoint import save_adapter_resume_state, save_model
+    """Write a checkpoint directory through the SHIPPED save-side branch
+    selector ``train_jax_adapter.write_adapter_checkpoint`` — the exact
+    helper ``_save`` delegates to. Driving the real save path (rather than
+    re-implementing the sidecar selection) is what makes a regression in the
+    shipped save dispatch — e.g. the hybrid resume-sidecar guard — visible to
+    these tests (H3)."""
     from pawn.trainer import flatten_opt_state
 
+    write_adapter_checkpoint = _load_train_jax_adapter().write_adapter_checkpoint
     effective = dispatch_apply(strategy)(state.backbone, state.adapter)
-    opt = flatten_opt_state(state.opt_state)
-    ts = {"step": int(state.step)}
-    if isinstance(effective, BottleneckEffective):
-        save_model(effective.backbone, out, optimizer_state=opt, training_state=ts)
-        save_bottleneck_adapter(effective.adapter, out)
-    elif isinstance(effective, FiLMEffective):
-        save_model(effective.backbone, out, optimizer_state=opt, training_state=ts)
-        save_film_adapter(effective.adapter, out)
-        if isinstance(state.adapter, HybridAdapter):
-            save_adapter_resume_state(state.backbone, state.adapter, out)
-    else:
-        assert isinstance(effective, PAWNModel)
-        save_model(effective, out, optimizer_state=opt, training_state=ts)
-        save_adapter_resume_state(state.backbone, state.adapter, out)
+    write_adapter_checkpoint(
+        effective=effective,
+        backbone=state.backbone,
+        adapter=state.adapter,
+        out=out,
+        optimizer_state=flatten_opt_state(state.opt_state),
+        step=int(state.step),
+    )
 
 
 def _resume_via_script(
@@ -1549,16 +1537,30 @@ def test_script_resume_cold_starts_opt_state_when_sidecar_missing(
     ), "warm and cold moments coincide; pick a strategy that actually trains"
 
 
-@pytest.mark.parametrize("strategy", ("bottleneck", "film"))
+# The full strategy set the script-driven round-trip must cover: the two
+# wrapper strategies (bottleneck / FiLM restore through their typed sidecar)
+# AND every weight-folding strategy (lora / sparse / unfreeze / hybrid /
+# specialized_clm restore through the raw resume sidecar). Driving ALL of
+# them through the REAL ``write_adapter_checkpoint`` save +
+# ``restore_adapter_resume_state`` resume — not the inline re-implementation —
+# is the H3 acceptance: a save-side regression (e.g. the hybrid resume-sidecar
+# guard) now fails a script-driven test instead of staying green.
+_SCRIPT_RESUME_STRATEGIES = (
+    "bottleneck", "film", *_WEIGHT_FOLD_RESUME_STRATEGIES,
+)
+
+
+@pytest.mark.parametrize("strategy", _SCRIPT_RESUME_STRATEGIES)
 def test_wrapper_resume_via_script_restores_params_exactly(
     strategy: str, tmp_path,  # type: ignore[no-untyped-def]
 ) -> None:
-    """Wrapper strategies (bottleneck / FiLM) restore through the *typed*
-    sidecar (``load_bottleneck_adapter`` / ``load_film_adapter``). After
-    save→resume the adapter params equal the saved ones leaf-for-leaf — the
-    precondition for the warm Adam moments to index the rebuilt adapter (the
-    same H3 invariant the weight-fold path asserts, for the two strategies
-    that path's fix builds on)."""
+    """Every adapter strategy restores its params leaf-for-leaf through the
+    SHIPPED save + resume code path (``write_adapter_checkpoint`` →
+    ``restore_adapter_resume_state``): wrappers (bottleneck / FiLM) via their
+    typed sidecar, weight-folding strategies (lora / sparse / unfreeze /
+    hybrid / specialized_clm) via the raw resume sidecar. Faithful param
+    restore is the precondition for the warm Adam moments to index the rebuilt
+    adapter (H3)."""
     state, optimizer, cold_bb, cold_ad = _trained_adapter_state(
         strategy, n_steps=5, key_seed=4,
     )
@@ -1582,16 +1584,20 @@ def test_wrapper_resume_via_script_restores_params_exactly(
         )
 
 
-@pytest.mark.parametrize("strategy", ("bottleneck", "film"))
+@pytest.mark.parametrize("strategy", _SCRIPT_RESUME_STRATEGIES)
 def test_wrapper_resumed_step_equals_uninterrupted_step(
     strategy: str, tmp_path,  # type: ignore[no-untyped-def]
 ) -> None:
-    """A step taken after the wrapper typed-sidecar resume equals the
-    equivalent uninterrupted step within fp32 noise (H3 acceptance for
-    bottleneck / FiLM). The warm Adam moments must still index the correct
-    params after the adapter is cold-rebuilt from the typed sidecar and the
-    opt_state is re-templated on it — a leaf-order mismatch between the
-    rebuilt adapter and the saved flat opt_state would corrupt this step."""
+    """A step taken after the SHIPPED save→resume round-trip equals the
+    equivalent uninterrupted step within fp32 noise (H3 acceptance), for every
+    strategy. The warm Adam moments must still index the correct params after
+    the adapter is rebuilt (from the typed sidecar for wrappers, the raw
+    resume sidecar for weight-folding strategies) and the opt_state is
+    re-templated on it — a leaf-order mismatch between the rebuilt adapter and
+    the saved flat opt_state, or a missing save-side sidecar, would corrupt
+    this step. This drives the real ``write_adapter_checkpoint`` /
+    ``restore_adapter_resume_state``, so a save-side hybrid-guard regression
+    fails here instead of staying green."""
     K = 6
     ref_state, _opt, _bb, _ad = _trained_adapter_state(
         strategy, n_steps=K, key_seed=5,

@@ -181,6 +181,84 @@ class _AdapterResume(NamedTuple):
     adapter_restored: bool
 
 
+def write_adapter_checkpoint(
+    *,
+    effective: Any,
+    backbone: PAWNModel,
+    adapter: Any,
+    out: "Path",
+    optimizer_state: dict[str, np.ndarray],
+    step: int,
+    run_config: dict[str, Any] | None = None,
+) -> None:
+    """Write an adapter checkpoint, selecting the strategy-appropriate sidecar.
+
+    This is the single save-side branch selector that mirrors
+    :func:`restore_adapter_resume_state` on the resume side. Factored out of
+    ``main`` so the save path the trainer actually ships is unit-tested
+    against the same code rather than re-implemented in tests (H3).
+
+    ``effective = apply_fn(backbone, adapter)``. Three layouts:
+
+    * ``BottleneckEffective`` — save the frozen ``backbone`` + the typed
+      ``adapter.safetensors`` sidecar (the Houlsby MLP can't fold).
+    * ``FiLMEffective`` — save the effective backbone (carries any folded
+      LoRA corrections for hybrid) + the FiLM typed sidecar. For ``hybrid``
+      (a ``HybridAdapter`` whose LoRA half folds *irreversibly* into the
+      saved backbone) ALSO write the raw ``(backbone, adapter)`` resume
+      sidecar so ``--resume`` restores both halves exactly — a FiLM-sidecar-
+      only resume would cold-start the LoRA params under a warm optimiser
+      (H3). Pure FiLM has no folded half and skips this.
+    * ``PAWNModel`` — the weight-folded path (lora / sparse / unfreeze /
+      specialized_clm). The folded ``model.safetensors`` is one-way (sparse
+      masks aren't recoverable), so persist the raw ``(backbone, adapter)``
+      resume sidecar; the warm Adam moments index exactly that split.
+    """
+    from pawn.adapters.bottleneck import (
+        BottleneckEffective,
+        save_bottleneck_adapter,
+    )
+    from pawn.adapters.film import FiLMEffective, save_film_adapter
+    from pawn.adapters.hybrid import HybridAdapter
+    from pawn.checkpoint import save_adapter_resume_state
+
+    training_state = {"step": int(step)}
+    if isinstance(effective, BottleneckEffective):
+        save_model(
+            effective.backbone, out,
+            run_config=run_config,
+            optimizer_state=optimizer_state,
+            training_state=training_state,
+        )
+        save_bottleneck_adapter(effective.adapter, out)
+    elif isinstance(effective, FiLMEffective):
+        save_model(
+            effective.backbone, out,
+            run_config=run_config,
+            optimizer_state=optimizer_state,
+            training_state=training_state,
+        )
+        save_film_adapter(effective.adapter, out)
+        if isinstance(adapter, HybridAdapter):
+            save_adapter_resume_state(backbone, adapter, out)
+    else:
+        # PAWNModel — the standard weight-folded save path. The narrowing
+        # assertion satisfies pyright: the only apply_fn return types in v2
+        # are PAWNModel / BottleneckEffective / FiLMEffective; the branches
+        # above peeled off the wrappers, leaving the PAWNModel case here.
+        assert isinstance(effective, PAWNModel), (
+            f"unexpected effective type {type(effective).__name__}; "
+            "extend the save dispatch in write_adapter_checkpoint"
+        )
+        save_model(
+            effective, out,
+            run_config=run_config,
+            optimizer_state=optimizer_state,
+            training_state=training_state,
+        )
+        save_adapter_resume_state(backbone, adapter, out)
+
+
 def restore_adapter_resume_state(
     *,
     strategy: str,
@@ -780,71 +858,20 @@ def main(argv: list[str] | None = None) -> int:
         Checkpoints land under the MetricsLogger's per-run directory so
         two concurrent runs can't collide on the same path.
         """
-        from pawn.adapters.bottleneck import (
-            BottleneckEffective,
-            save_bottleneck_adapter,
-        )
-        from pawn.adapters.film import FiLMEffective, save_film_adapter
         effective = apply_fn(state.backbone, state.adapter)
         out = logger.run_dir / f"adapter_step_{step_int:08d}"
-        if isinstance(effective, BottleneckEffective):
-            save_model(
-                effective.backbone, out,
-                run_config=cfg.model_dump(),
-                optimizer_state=flatten_opt_state(state.opt_state),
-                training_state={"step": int(state.step)},
-            )
-            save_bottleneck_adapter(effective.adapter, out)
-        elif isinstance(effective, FiLMEffective):
-            # FiLM (and hybrid, which composes LoRA-folded weights with a
-            # FiLM wrapper) can't collapse its residual-stream / output-
-            # logit modulation into the backbone weights. Save the
-            # effective backbone (carries any folded LoRA corrections for
-            # hybrid) plus the FiLM slabs as a sidecar — mirrors the
-            # bottleneck two-file layout.
-            save_model(
-                effective.backbone, out,
-                run_config=cfg.model_dump(),
-                optimizer_state=flatten_opt_state(state.opt_state),
-                training_state={"step": int(state.step)},
-            )
-            save_film_adapter(effective.adapter, out)
-            # Hybrid's LoRA half is folded *irreversibly* into the saved
-            # backbone above and the FiLM sidecar only carries the FiLM half,
-            # so a FiLM-sidecar-only resume would cold-start the LoRA params
-            # under a warm optimiser (H3). Persist the raw frozen backbone +
-            # the *full* HybridAdapter (LoRA + FiLM) so `--resume` restores
-            # both halves exactly. Pure FiLM has no folded half and skips this.
-            from pawn.adapters.hybrid import HybridAdapter
-            if isinstance(state.adapter, HybridAdapter):
-                from pawn.checkpoint import save_adapter_resume_state
-                save_adapter_resume_state(state.backbone, state.adapter, out)
-        else:
-            # PAWNModel — the standard weight-folded save path. The
-            # narrowing assertion satisfies pyright: the only two
-            # apply_fn return types in v2 are PAWNModel and
-            # BottleneckEffective; the isinstance branch above peeled
-            # off the wrapper, leaving the PAWNModel case here.
-            from pawn.model import PAWNModel as _PAWNModel
-            assert isinstance(effective, _PAWNModel), (
-                f"unexpected effective type {type(effective).__name__}; "
-                "extend the save dispatch in train_jax_adapter._save"
-            )
-            save_model(
-                effective, out,
-                run_config=cfg.model_dump(),
-                optimizer_state=flatten_opt_state(state.opt_state),
-                training_state={"step": int(state.step)},
-            )
-            # The folded `model.safetensors` above is one-way (sparse masks
-            # aren't even recoverable from it), so persist the raw frozen
-            # backbone + trained adapter PyTree as a resume sidecar. On
-            # `--resume` this restores the exact (backbone, adapter) split the
-            # warm Adam moments index — without it, lora/sparse/hybrid/
-            # specialized_clm would cold-start their params under a warm
-            # optimiser state and corrupt the first post-resume step (H3).
-            from pawn.checkpoint import save_adapter_resume_state
-            save_adapter_resume_state(state.backbone, state.adapter, out)
+        # Single save-side branch selector, shared with the resume tests so
+        # the shipped sidecar selection (incl. the hybrid resume-sidecar
+        # guard) is unit-tested rather than re-implemented (H3).
+        write_adapter_checkpoint(
+            effective=effective,
+            backbone=state.backbone,
+            adapter=state.adapter,
+            out=out,
+            optimizer_state=flatten_opt_state(state.opt_state),
+            step=int(state.step),
+            run_config=cfg.model_dump(),
+        )
         if push_tracker:
             push_checkpoint_async(out, push_tracker)
 
