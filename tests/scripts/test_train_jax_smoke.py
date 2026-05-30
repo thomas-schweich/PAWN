@@ -16,7 +16,9 @@ import pytest
 SCRIPTS = (
     "train_jax",
     "train_jax_adapter",
+    "train_jax_distill",
     "eval_jax",
+    "eval_parity",
     "eval_probes_jax",
     "eval_generation_jax",
     "eval_vs_stockfish",
