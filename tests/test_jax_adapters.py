@@ -1104,3 +1104,528 @@ def test_unfreeze_masked_slots_do_not_drift_under_weight_decay() -> None:
                 "the snap-back hook is not enforcing the invariant"
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# C2 — adapter resume opt-state (H3): a warm Adam state must never be applied
+# to cold-started adapter params on --resume. The weight-folding strategies
+# (lora / sparse / unfreeze / specialized_clm / hybrid) publish the *folded*
+# effective model but persist the raw (backbone, adapter) PyTree to a resume
+# sidecar so the resume path restores the exact params the warm moments index.
+# ---------------------------------------------------------------------------
+
+
+# Strategies whose `apply_fn` folds into / returns a bare PAWNModel-shaped
+# effective and therefore rely on the `adapter_resume_state.eqx` sidecar
+# (as opposed to bottleneck/FiLM, which save the raw frozen backbone + a
+# typed `adapter.safetensors`). These are exactly the strategies the C2 fix
+# routes through `save_adapter_resume_state` in `train_jax_adapter._save`.
+_WEIGHT_FOLD_RESUME_STRATEGIES = (
+    "lora", "sparse", "unfreeze", "hybrid", "specialized_clm",
+)
+
+
+def _make_resume_optimizer() -> optax.GradientTransformation:
+    """An AdamW chain with the production clip — fp32 moments so the
+    save→resume round-trip is bit-exact through ``flatten_opt_state`` /
+    ``unflatten_opt_state`` (the real ``make_optimizer`` keeps ``mu`` in
+    bf16, which adds quantisation noise we don't want masking a genuine
+    warm/cold-mismatch regression)."""
+    return optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=1e-3, weight_decay=0.0),
+    )
+
+
+def _trained_adapter_state(
+    strategy: str, *, n_steps: int, key_seed: int,
+) -> tuple[AdapterTrainState, optax.GradientTransformation, PAWNModel, Any]:
+    """Cold-init an adapter against a TINY backbone and run ``n_steps``
+    real train steps. Returns the post-training state plus the optimizer,
+    the frozen backbone, and the *cold* adapter template (for resume).
+
+    The cold template is what the resume path rebuilds before splicing the
+    sidecar in, so handing it back lets the round-trip tests deserialise
+    into the identical structure the script would."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = _strategy_config(strategy)
+    cold_adapter = dispatch_init(strategy)(
+        backbone, cfg, key=jax.random.key(key_seed),
+    )
+    optimizer = _make_resume_optimizer()
+    flt = dispatch_filter(strategy)(cold_adapter)
+    opt_state = optimizer.init(eqx.filter(cold_adapter, flt))
+    state = AdapterTrainState(
+        backbone=backbone, adapter=cold_adapter, opt_state=opt_state,
+        step=jnp.int32(0), key=jax.random.key(0),
+    )
+    train_step = make_adapter_train_step(strategy, optimizer)
+    batch = _make_batch()
+    for _ in range(n_steps):
+        state, _ = train_step(state, batch)
+    return state, optimizer, backbone, cold_adapter
+
+
+def _save_then_resume(
+    strategy: str,
+    state: AdapterTrainState,
+    optimizer: optax.GradientTransformation,
+    cold_backbone: PAWNModel,
+    cold_adapter: Any,
+    tmp_dir,  # type: ignore[no-untyped-def]
+) -> AdapterTrainState:
+    """Mirror the script's save + resume for a weight-folding strategy.
+
+    Save side: write the folded effective as ``model.safetensors`` (what
+    downstream eval reads), the flattened opt_state, and the raw
+    ``(backbone, adapter)`` resume sidecar. Resume side: reload the folded
+    model (run-block / forward fallback), then deserialise the raw
+    ``(backbone, adapter)`` into freshly cold templates and warm-load the
+    opt_state — exactly what ``train_jax_adapter`` does on ``--resume``."""
+    from pawn.adapters.film import FiLMEffective, save_film_adapter
+    from pawn.checkpoint import (
+        OPTIMIZER_FILE,
+        load_adapter_resume_state,
+        load_model,
+        save_adapter_resume_state,
+        save_model,
+    )
+    from pawn.trainer import flatten_opt_state, unflatten_opt_state
+
+    apply_fn = dispatch_apply(strategy)
+    effective = apply_fn(state.backbone, state.adapter)
+    out = tmp_dir / "adapter_step_00000010"
+    if isinstance(effective, FiLMEffective):
+        # hybrid: the apply composes LoRA-folded weights into a FiLM wrapper.
+        # Mirror the script — save the folded backbone + FiLM typed sidecar +
+        # the full-adapter resume sidecar.
+        save_model(
+            effective.backbone, out,
+            optimizer_state=flatten_opt_state(state.opt_state),
+            training_state={"step": int(state.step)},
+        )
+        save_film_adapter(effective.adapter, out)
+        save_adapter_resume_state(state.backbone, state.adapter, out)
+    else:
+        # specialized_clm's apply returns the standalone model; lora / sparse
+        # / unfreeze fold into a PAWNModel. Either way it's a bare PAWNModel.
+        assert isinstance(effective, PAWNModel)
+        save_model(
+            effective, out,
+            optimizer_state=flatten_opt_state(state.opt_state),
+            training_state={"step": int(state.step)},
+        )
+        save_adapter_resume_state(state.backbone, state.adapter, out)
+
+    # --- resume ---
+    loaded_backbone, _ = load_model(out)  # forward fallback / run block
+    del loaded_backbone  # weight-folding path uses the sidecar, not this
+    r_backbone, r_adapter = load_adapter_resume_state(
+        cold_backbone, cold_adapter, out,
+    )
+    flt = dispatch_filter(strategy)(r_adapter)
+    opt_state = optimizer.init(eqx.filter(r_adapter, flt))
+    from safetensors.numpy import load_file as st_load
+    flat = st_load(str(out / OPTIMIZER_FILE))
+    opt_state = unflatten_opt_state(opt_state, flat)
+    return AdapterTrainState(
+        backbone=r_backbone, adapter=r_adapter, opt_state=opt_state,
+        step=state.step, key=state.key,
+    )
+
+
+@pytest.mark.parametrize("strategy", _WEIGHT_FOLD_RESUME_STRATEGIES)
+def test_resume_sidecar_restores_adapter_params_exactly(
+    strategy: str, tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """After save→resume the restored adapter params equal the saved ones
+    leaf-for-leaf (including non-trainable leaves like sparse masks and the
+    standalone specialized_clm model). This is the precondition for the warm
+    Adam moments to index the same params they were trained against (H3)."""
+    state, optimizer, cold_bb, cold_ad = _trained_adapter_state(
+        strategy, n_steps=5, key_seed=1,
+    )
+    resumed = _save_then_resume(
+        strategy, state, optimizer, cold_bb, cold_ad, tmp_path,
+    )
+    saved_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(state.adapter, eqx.is_array)
+    )
+    restored_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(resumed.adapter, eqx.is_array)
+    )
+    assert len(saved_leaves) == len(restored_leaves)
+    assert saved_leaves, "expected at least one array leaf in the adapter"
+    for a, b in zip(saved_leaves, restored_leaves):
+        np.testing.assert_array_equal(
+            np.asarray(a), np.asarray(b),
+            err_msg=f"{strategy}: adapter leaf changed across save→resume",
+        )
+    # The restored backbone (raw frozen backbone) must also match the saved
+    # one — for sparse the trained mask lives nowhere else, and re-folding a
+    # cold delta onto a folded backbone would otherwise double-apply.
+    bb_saved = jax.tree_util.tree_leaves(
+        eqx.filter(state.backbone, eqx.is_array)
+    )
+    bb_restored = jax.tree_util.tree_leaves(
+        eqx.filter(resumed.backbone, eqx.is_array)
+    )
+    for a, b in zip(bb_saved, bb_restored):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+@pytest.mark.parametrize("strategy", _WEIGHT_FOLD_RESUME_STRATEGIES)
+def test_resumed_step_equals_uninterrupted_step(
+    strategy: str, tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """A step taken after save→resume equals the equivalent step in an
+    uninterrupted run within fp32 noise (H3 acceptance): the warm Adam
+    moments and the restored adapter params correspond, so there is no
+    first-post-resume-step corruption.
+
+    Run K steps uninterrupted; separately run K-1 steps, save, resume,
+    and take the K-th step. Compare the final adapter params."""
+    K = 6
+    # Uninterrupted reference: K full steps.
+    ref_state, _opt, _bb, _ad = _trained_adapter_state(
+        strategy, n_steps=K, key_seed=2,
+    )
+    # Interrupted: K-1 steps, save, resume, then the K-th step.
+    mid_state, optimizer, cold_bb, cold_ad = _trained_adapter_state(
+        strategy, n_steps=K - 1, key_seed=2,
+    )
+    resumed = _save_then_resume(
+        strategy, mid_state, optimizer, cold_bb, cold_ad, tmp_path,
+    )
+    train_step = make_adapter_train_step(strategy, optimizer)
+    batch = _make_batch()
+    resumed, _ = train_step(resumed, batch)
+
+    # The step counter advanced identically.
+    assert int(resumed.step) == int(ref_state.step) == K
+    ref_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(ref_state.adapter, eqx.is_inexact_array)
+    )
+    res_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(resumed.adapter, eqx.is_inexact_array)
+    )
+    assert len(ref_leaves) == len(res_leaves)
+    for ref, res in zip(ref_leaves, res_leaves):
+        np.testing.assert_allclose(
+            np.asarray(res), np.asarray(ref), rtol=0, atol=1e-5,
+            err_msg=(
+                f"{strategy}: the post-resume step diverged from the "
+                "uninterrupted trajectory — warm opt-state / adapter "
+                "mismatch (H3)"
+            ),
+        )
+
+
+def test_resume_sidecar_roundtrip_is_self_describing(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """``save_adapter_resume_state`` writes ``adapter_resume_state.eqx`` and
+    ``load_adapter_resume_state`` reads it back; a missing sidecar raises
+    FileNotFoundError so the resume path can predicate on its presence (the
+    cold-start-opt fallback)."""
+    from pawn.checkpoint import (
+        ADAPTER_RESUME_FILE,
+        load_adapter_resume_state,
+        save_adapter_resume_state,
+    )
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("lora")(
+        backbone, LoRAConfig(rank=2), key=jax.random.key(0),
+    )
+    out = tmp_path / "ckpt"
+    out.mkdir()
+    save_adapter_resume_state(backbone, adapter, out)
+    assert (out / ADAPTER_RESUME_FILE).is_file()
+
+    cold = dispatch_init("lora")(
+        backbone, LoRAConfig(rank=2), key=jax.random.key(99),
+    )
+    r_bb, r_ad = load_adapter_resume_state(backbone, cold, out)
+    # The restored A matrices match the saved ones, not the cold template's.
+    assert r_ad.A_q is not None and adapter.A_q is not None
+    np.testing.assert_array_equal(np.asarray(r_ad.A_q), np.asarray(adapter.A_q))
+    assert isinstance(r_bb, PAWNModel)
+
+    with pytest.raises(FileNotFoundError, match=ADAPTER_RESUME_FILE):
+        load_adapter_resume_state(backbone, cold, tmp_path / "empty")
+
+
+# ---------------------------------------------------------------------------
+# C2 — script-level resume path. The H3 branch selection + cold-start fallback
+# live inside `train_jax_adapter` (factored into
+# `restore_adapter_resume_state`); these tests drive that real code path —
+# including the wrapper (bottleneck / FiLM) typed-sidecar restore and the
+# cold-start fallback when the sidecar is absent — rather than re-implementing
+# the save/resume sequence inline.
+# ---------------------------------------------------------------------------
+
+
+def _load_train_jax_adapter():  # type: ignore[no-untyped-def]
+    """Import ``scripts/train_jax_adapter.py`` as a module to reach the
+    script-level ``restore_adapter_resume_state`` helper (the resume branch
+    selection + H3 cold-start decision factored out of ``main``)."""
+    import importlib.util
+    from pathlib import Path
+
+    script_path = Path("scripts") / "train_jax_adapter.py"
+    spec = importlib.util.spec_from_file_location(
+        "scripts_train_jax_adapter_resume", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _save_adapter_checkpoint(
+    strategy: str,
+    state: AdapterTrainState,
+    out,  # type: ignore[no-untyped-def]
+) -> None:
+    """Write a checkpoint directory exactly as ``train_jax_adapter._save``
+    does for ``strategy``: the *effective* (folded backbone / wrapper
+    backbone) as ``model.safetensors`` + warm ``optimizer.safetensors``, plus
+    the strategy-appropriate sidecar (typed ``adapter.safetensors`` for
+    bottleneck/FiLM, raw ``adapter_resume_state.eqx`` for the weight-folding
+    and hybrid strategies)."""
+    from pawn.adapters.bottleneck import (
+        BottleneckEffective,
+        save_bottleneck_adapter,
+    )
+    from pawn.adapters.film import FiLMEffective, save_film_adapter
+    from pawn.adapters.hybrid import HybridAdapter
+    from pawn.checkpoint import save_adapter_resume_state, save_model
+    from pawn.trainer import flatten_opt_state
+
+    effective = dispatch_apply(strategy)(state.backbone, state.adapter)
+    opt = flatten_opt_state(state.opt_state)
+    ts = {"step": int(state.step)}
+    if isinstance(effective, BottleneckEffective):
+        save_model(effective.backbone, out, optimizer_state=opt, training_state=ts)
+        save_bottleneck_adapter(effective.adapter, out)
+    elif isinstance(effective, FiLMEffective):
+        save_model(effective.backbone, out, optimizer_state=opt, training_state=ts)
+        save_film_adapter(effective.adapter, out)
+        if isinstance(state.adapter, HybridAdapter):
+            save_adapter_resume_state(state.backbone, state.adapter, out)
+    else:
+        assert isinstance(effective, PAWNModel)
+        save_model(effective, out, optimizer_state=opt, training_state=ts)
+        save_adapter_resume_state(state.backbone, state.adapter, out)
+
+
+def _resume_via_script(
+    strategy: str,
+    out,  # type: ignore[no-untyped-def]
+    cold_backbone: PAWNModel,
+    cold_adapter: Any,
+    optimizer: optax.GradientTransformation,
+):  # type: ignore[no-untyped-def]
+    """Drive the script's real resume branch selection + H3 cold-start
+    decision via ``train_jax_adapter.restore_adapter_resume_state``."""
+    from pawn.checkpoint import load_model
+
+    restore_adapter_resume_state = _load_train_jax_adapter().restore_adapter_resume_state
+
+    loaded_backbone, _run_block = load_model(out)
+    return restore_adapter_resume_state(
+        strategy=strategy,
+        strategy_cfg=_strategy_config(strategy),
+        ckpt_dir=out,
+        loaded_backbone=loaded_backbone,
+        cold_backbone=cold_backbone,
+        cold_adapter=cold_adapter,
+        optimizer=optimizer,
+    )
+
+
+def _opt_inexact_leaves(opt_state: Any) -> list[np.ndarray]:
+    return [
+        np.asarray(x)
+        for x in jax.tree_util.tree_leaves(
+            eqx.filter(opt_state, eqx.is_inexact_array)
+        )
+    ]
+
+
+def test_script_resume_warm_loads_opt_state_when_sidecar_present(
+    tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """When the strategy's sidecar is present, the script-level resume path
+    fully restores the adapter and *warm-loads* the saved Adam moments —
+    i.e. ``restore_adapter_resume_state`` reports ``adapter_restored`` and the
+    resumed opt_state matches the saved warm one (not a cold init)."""
+    strategy = "lora"
+    state, optimizer, cold_bb, cold_ad = _trained_adapter_state(
+        strategy, n_steps=5, key_seed=1,
+    )
+    out = tmp_path / "adapter_step_00000005"
+    _save_adapter_checkpoint(strategy, state, out)
+
+    resumed = _resume_via_script(strategy, out, cold_bb, cold_ad, optimizer)
+    assert resumed.adapter_restored is True
+
+    # The warm moments round-trip back: the resumed opt_state equals the saved
+    # warm opt_state and is NOT the all-zero cold init.
+    saved = _opt_inexact_leaves(state.opt_state)
+    got = _opt_inexact_leaves(resumed.opt_state)
+    assert len(saved) == len(got)
+    any_nonzero = False
+    for s, g in zip(saved, got):
+        np.testing.assert_allclose(g, s, rtol=0, atol=0)
+        any_nonzero = any_nonzero or bool(np.any(s != 0.0))
+    assert any_nonzero, "expected non-zero warm Adam moments after 5 steps"
+
+
+@pytest.mark.parametrize("strategy", ("lora", "bottleneck", "film"))
+def test_script_resume_cold_starts_opt_state_when_sidecar_missing(
+    strategy: str, tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """H3 safety net: when the resume sidecar the strategy depends on is
+    *absent* (e.g. a legacy / ``model.safetensors``-only checkpoint), the
+    script keeps opt_state COLD rather than splicing the warm
+    ``optimizer.safetensors`` onto a cold-rebuilt adapter. A regression that
+    loaded ``OPTIMIZER_FILE`` unconditionally would fail here.
+
+    We save a real checkpoint (warm opt_state + sidecar), then delete the
+    sidecar the strategy needs and confirm ``restore_adapter_resume_state``
+    (a) reports ``adapter_restored is False`` and (b) returns a cold
+    opt_state — leaf-identical to a fresh ``optimizer.init`` and provably
+    different from the saved warm moments still on disk in ``OPTIMIZER_FILE``.
+    """
+    from pawn.adapters.bottleneck import ADAPTER_SAFETENSORS as BN_SIDECAR
+    from pawn.adapters.film import ADAPTER_SAFETENSORS as FILM_SIDECAR
+    from pawn.checkpoint import ADAPTER_RESUME_FILE, OPTIMIZER_FILE
+
+    state, optimizer, cold_bb, cold_ad = _trained_adapter_state(
+        strategy, n_steps=5, key_seed=3,
+    )
+    out = tmp_path / "adapter_step_00000005"
+    _save_adapter_checkpoint(strategy, state, out)
+
+    # The warm optimizer file is on disk — the regression we guard against is
+    # loading it unconditionally despite no usable adapter sidecar.
+    assert (out / OPTIMIZER_FILE).is_file()
+    warm_moments = _opt_inexact_leaves(state.opt_state)
+    assert any(bool(np.any(m != 0.0)) for m in warm_moments)
+
+    # Remove every adapter sidecar so no restore branch can fire.
+    for sidecar in (ADAPTER_RESUME_FILE, BN_SIDECAR, FILM_SIDECAR):
+        p = out / sidecar
+        if p.is_file():
+            p.unlink()
+
+    resumed = _resume_via_script(strategy, out, cold_bb, cold_ad, optimizer)
+
+    # (a) The script recognised the adapter could not be restored.
+    assert resumed.adapter_restored is False
+
+    # (b) opt_state is cold — leaf-identical to a fresh init on the cold
+    # adapter, and provably NOT the warm moments still sitting in
+    # OPTIMIZER_FILE.
+    flt = dispatch_filter(strategy)(cold_ad)
+    cold_opt = optimizer.init(eqx.filter(cold_ad, flt))
+    cold_leaves = _opt_inexact_leaves(cold_opt)
+    got_leaves = _opt_inexact_leaves(resumed.opt_state)
+    assert len(got_leaves) == len(cold_leaves) == len(warm_moments)
+    for got, cold, warm in zip(got_leaves, cold_leaves, warm_moments):
+        np.testing.assert_array_equal(
+            got, cold,
+            err_msg=(
+                f"{strategy}: opt_state was not cold-started when the resume "
+                "sidecar was missing — warm Adam moments were spliced onto a "
+                "cold adapter (H3 regression)"
+            ),
+        )
+    # The cold opt_state must differ from the warm moments on disk for at
+    # least one leaf — otherwise the cold/warm distinction is untestable.
+    assert any(
+        bool(np.any(cold != warm))
+        for cold, warm in zip(cold_leaves, warm_moments)
+    ), "warm and cold moments coincide; pick a strategy that actually trains"
+
+
+@pytest.mark.parametrize("strategy", ("bottleneck", "film"))
+def test_wrapper_resume_via_script_restores_params_exactly(
+    strategy: str, tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """Wrapper strategies (bottleneck / FiLM) restore through the *typed*
+    sidecar (``load_bottleneck_adapter`` / ``load_film_adapter``). After
+    save→resume the adapter params equal the saved ones leaf-for-leaf — the
+    precondition for the warm Adam moments to index the rebuilt adapter (the
+    same H3 invariant the weight-fold path asserts, for the two strategies
+    that path's fix builds on)."""
+    state, optimizer, cold_bb, cold_ad = _trained_adapter_state(
+        strategy, n_steps=5, key_seed=4,
+    )
+    out = tmp_path / "adapter_step_00000005"
+    _save_adapter_checkpoint(strategy, state, out)
+    resumed = _resume_via_script(strategy, out, cold_bb, cold_ad, optimizer)
+    assert resumed.adapter_restored is True
+
+    saved_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(state.adapter, eqx.is_array)
+    )
+    restored_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(resumed.adapter, eqx.is_array)
+    )
+    assert len(saved_leaves) == len(restored_leaves)
+    assert saved_leaves, "expected at least one array leaf in the adapter"
+    for a, b in zip(saved_leaves, restored_leaves):
+        np.testing.assert_array_equal(
+            np.asarray(a), np.asarray(b),
+            err_msg=f"{strategy}: adapter leaf changed across save→resume",
+        )
+
+
+@pytest.mark.parametrize("strategy", ("bottleneck", "film"))
+def test_wrapper_resumed_step_equals_uninterrupted_step(
+    strategy: str, tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """A step taken after the wrapper typed-sidecar resume equals the
+    equivalent uninterrupted step within fp32 noise (H3 acceptance for
+    bottleneck / FiLM). The warm Adam moments must still index the correct
+    params after the adapter is cold-rebuilt from the typed sidecar and the
+    opt_state is re-templated on it — a leaf-order mismatch between the
+    rebuilt adapter and the saved flat opt_state would corrupt this step."""
+    K = 6
+    ref_state, _opt, _bb, _ad = _trained_adapter_state(
+        strategy, n_steps=K, key_seed=5,
+    )
+    mid_state, optimizer, cold_bb, cold_ad = _trained_adapter_state(
+        strategy, n_steps=K - 1, key_seed=5,
+    )
+    out = tmp_path / "adapter_step_00000005"
+    _save_adapter_checkpoint(strategy, mid_state, out)
+    resumed = _resume_via_script(strategy, out, cold_bb, cold_ad, optimizer)
+    assert resumed.adapter_restored is True
+
+    resumed_state = AdapterTrainState(
+        backbone=resumed.backbone, adapter=resumed.adapter,
+        opt_state=resumed.opt_state, step=mid_state.step, key=mid_state.key,
+    )
+    train_step = make_adapter_train_step(strategy, optimizer)
+    batch = _make_batch()
+    resumed_state, _ = train_step(resumed_state, batch)
+
+    assert int(resumed_state.step) == int(ref_state.step) == K
+    ref_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(ref_state.adapter, eqx.is_inexact_array)
+    )
+    res_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(resumed_state.adapter, eqx.is_inexact_array)
+    )
+    assert len(ref_leaves) == len(res_leaves)
+    for ref, res in zip(ref_leaves, res_leaves):
+        np.testing.assert_allclose(
+            np.asarray(res), np.asarray(ref), rtol=0, atol=1e-5,
+            err_msg=(
+                f"{strategy}: the post-resume step diverged from the "
+                "uninterrupted trajectory — warm opt-state / adapter "
+                "mismatch on the typed-sidecar resume path (H3)"
+            ),
+        )

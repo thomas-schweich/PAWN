@@ -71,6 +71,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Final
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -105,11 +106,14 @@ __all__ = [
     "CONFIG_FILE",
     "OPTIMIZER_FILE",
     "TRAINING_STATE_FILE",
+    "ADAPTER_RESUME_FILE",
     "CheckpointIntegrityError",
     "IncompleteCheckpointError",
     "save_model",
     "load_model",
     "load_model_config",
+    "save_adapter_resume_state",
+    "load_adapter_resume_state",
 ]
 
 
@@ -127,6 +131,13 @@ MODEL_FILE: Final[str] = "model.safetensors"
 CONFIG_FILE: Final[str] = "config.json"
 OPTIMIZER_FILE: Final[str] = "optimizer.safetensors"
 TRAINING_STATE_FILE: Final[str] = "training_state.json"
+# Resume sidecar for weight-folding adapters (lora / sparse / unfreeze /
+# specialized_clm / hybrid). ``model.safetensors`` carries the *folded*
+# effective model for downstream eval / publish; this sidecar carries the
+# *raw* frozen backbone + the trained adapter PyTree so ``--resume`` can
+# re-derive the exact (backbone, adapter) split the warm Adam moments were
+# trained against. See :func:`save_adapter_resume_state`.
+ADAPTER_RESUME_FILE: Final[str] = "adapter_resume_state.eqx"
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +534,66 @@ def load_model(
     tensors = st_load(str(directory / MODEL_FILE))
     model = _tensor_dict_to_model(tensors, cfg)
     return model, run_block
+
+
+def save_adapter_resume_state(
+    backbone: PAWNModel, adapter: Any, ckpt_dir: Path | str
+) -> Path:
+    """Serialise the raw ``(backbone, adapter)`` PyTree into a resume sidecar.
+
+    The published ``model.safetensors`` for a weight-folding adapter holds
+    the *folded* effective model (``apply_fn(backbone, adapter)``) so
+    downstream eval treats it as an ordinary checkpoint. That fold is one-way
+    (and, for sparse, the trained mask isn't recoverable from it at all), so a
+    faithful ``--resume`` can't reconstruct the pre-fold split from
+    ``model.safetensors`` alone. This sidecar persists the *raw* frozen
+    backbone and the trained adapter PyTree verbatim via
+    :func:`equinox.tree_serialise_leaves`, so the resume path can restore the
+    identical (backbone, adapter) the warm Adam moments were trained against —
+    no cold-started params under a warm optimiser state (H3).
+
+    The frozen backbone is constant across the run; persisting it per
+    checkpoint trades a little disk for a correctness guarantee that holds
+    even when the original ``--checkpoint`` source is no longer reachable.
+
+    Returns the written sidecar :class:`Path`. Like the typed bottleneck / FiLM
+    sidecars, this lands next to the finalised ``model.safetensors`` *after*
+    :func:`save_model`'s atomic rename, so it is not part of the ``.complete``
+    integrity manifest — the resume path predicates on its presence and falls
+    back to a cold opt-state when it's absent.
+    """
+    out = Path(ckpt_dir) / ADAPTER_RESUME_FILE
+    eqx.tree_serialise_leaves(out, (backbone, adapter))
+    return out
+
+
+def load_adapter_resume_state(
+    backbone_like: PAWNModel, adapter_like: Any, ckpt_dir: Path | str
+) -> tuple[PAWNModel, Any]:
+    """Restore the raw ``(backbone, adapter)`` PyTree from the resume sidecar.
+
+    ``backbone_like`` / ``adapter_like`` are freshly-built templates of the
+    exact same PyTree structure as the saved pair — typically the loaded
+    (folded) backbone and the freshly cold-initialised adapter. They provide
+    the treedef + leaf shapes/dtypes; :func:`equinox.tree_deserialise_leaves`
+    overwrites every array leaf with the saved value, so the returned pair is
+    the raw frozen backbone and the trained adapter (including non-trainable
+    leaves like sparse masks).
+
+    Raises :class:`FileNotFoundError` if the sidecar isn't present — callers
+    that need an "is this a resumable folded-adapter checkpoint" probe should
+    test ``(ckpt_dir / ADAPTER_RESUME_FILE).is_file()`` first.
+    """
+    path = Path(ckpt_dir) / ADAPTER_RESUME_FILE
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"no {ADAPTER_RESUME_FILE} in {ckpt_dir} — this checkpoint was "
+            "written without the weight-folding adapter resume sidecar"
+        )
+    backbone, adapter = eqx.tree_deserialise_leaves(
+        path, (backbone_like, adapter_like)
+    )
+    return backbone, adapter
 
 
 def resolve_checkpoint_source(source: str) -> Path:

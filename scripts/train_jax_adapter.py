@@ -13,12 +13,13 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 
 from pawn.adapter_trainer import (
     STRATEGIES,
@@ -51,7 +52,7 @@ from pawn.lifecycle import (
     push_checkpoint_async,
 )
 from pawn.logging import MetricsLogger
-from pawn.model import init_model, sliced
+from pawn.model import PAWNModel, init_model, sliced
 from pawn.run_config import AdapterConfig
 from pawn.trainer import (
     cross_entropy_loss, flatten_opt_state, make_lr_schedule,
@@ -110,6 +111,132 @@ def _resolve_cadence(cfg: AdapterConfig, n_train_games: int) -> _Cadence:
         eval_interval=eval_interval,
         data_seed=data_seed,
         epoch_steps=epoch_steps,
+    )
+
+
+class _AdapterResume(NamedTuple):
+    """Result of the ``--resume`` restore branch (H3).
+
+    ``backbone`` / ``adapter`` are the spliced PyTrees the loop trains;
+    ``opt_state`` is the optimizer state to resume from. ``adapter_restored``
+    records whether the trained adapter was faithfully recovered from a
+    sidecar — when it is ``False`` the adapter came back cold and
+    ``opt_state`` is *cold-started* (never warm-loaded from
+    ``OPTIMIZER_FILE``) so warm Adam moments can't be spliced onto cold
+    params, the H3 corruption C2 fixes.
+    """
+
+    backbone: PAWNModel
+    adapter: Any  # one of the *Adapter types — eqx.Module
+    opt_state: optax.OptState
+    adapter_restored: bool
+
+
+def restore_adapter_resume_state(
+    *,
+    strategy: str,
+    strategy_cfg: object,
+    ckpt_dir: "Path",
+    loaded_backbone: PAWNModel,
+    cold_backbone: PAWNModel,
+    cold_adapter: Any,
+    optimizer: optax.GradientTransformation,
+) -> _AdapterResume:
+    """Select the resume restore branch and decide warm-vs-cold opt_state.
+
+    Factored out of ``main`` so the branch selection + the H3 cold-start
+    fallback are unit-testable in isolation. Three sidecar families restore
+    the trained adapter faithfully; absent the expected sidecar the adapter
+    can only come back cold, and then ``opt_state`` is cold-started so warm
+    Adam moments never index cold params.
+
+    Inputs:
+      * ``loaded_backbone`` — the backbone read from ``model.safetensors``
+        (folded effective for weight-folding adapters; raw frozen backbone
+        for the wrapper adapters).
+      * ``cold_backbone`` / ``cold_adapter`` — freshly cold-built templates
+        carrying the exact PyTree structure for the resume-sidecar
+        deserialise.
+    """
+    from pawn.adapters.bottleneck import (
+        ADAPTER_SAFETENSORS,
+        BottleneckConfig,
+        load_bottleneck_adapter,
+    )
+    from pawn.adapters.film import FiLMConfig, load_film_adapter
+    from pawn.checkpoint import (
+        ADAPTER_RESUME_FILE,
+        OPTIMIZER_FILE,
+        load_adapter_resume_state,
+    )
+    from pawn.trainer import unflatten_opt_state
+
+    typed_sidecar = ckpt_dir / ADAPTER_SAFETENSORS
+    resume_sidecar = ckpt_dir / ADAPTER_RESUME_FILE
+    adapter_fully_restored = False
+    if typed_sidecar.is_file() and isinstance(strategy_cfg, BottleneckConfig):
+        # Bottleneck: the whole adapter lives in the typed sidecar; the
+        # saved `model.safetensors` is the untouched frozen backbone
+        # (wrappers don't fold). Full restore.
+        backbone = loaded_backbone
+        adapter: Any = load_bottleneck_adapter(ckpt_dir, strategy_cfg)
+        adapter_fully_restored = True
+    elif typed_sidecar.is_file() and isinstance(strategy_cfg, FiLMConfig):
+        # FiLM: the entire trained adapter (gamma/beta + optional output
+        # FiLM) lives in the typed sidecar; the saved `model.safetensors`
+        # is the raw frozen backbone. Full restore.
+        backbone = loaded_backbone
+        adapter = load_film_adapter(ckpt_dir, strategy_cfg)
+        adapter_fully_restored = True
+    elif resume_sidecar.is_file():
+        # Weight-folding adapters: the folded `model.safetensors` is
+        # one-way (sparse masks aren't recoverable from it), so restore the
+        # raw (backbone, adapter) split from the resume sidecar. The
+        # freshly-built `backbone` / `adapter` templates carry the matching
+        # PyTree structure; the deserialise overwrites every leaf
+        # (including sparse masks and the specialized_clm standalone model)
+        # with the saved value. Full restore.
+        backbone, adapter = load_adapter_resume_state(
+            cold_backbone, cold_adapter, ckpt_dir
+        )
+        adapter_fully_restored = True
+    else:
+        # No usable sidecar — fall back to the folded backbone so the
+        # forward at least runs; the cold adapter + cold opt_state below
+        # keep H3 safe.
+        backbone = loaded_backbone
+        adapter = cold_adapter
+    # Build the optimizer template *after* the adapter rebuild so the
+    # opt-state shape matches what the restored adapter trains.
+    flt = dispatch_filter(strategy)(adapter)
+    opt_state: optax.OptState = optimizer.init(eqx.filter(adapter, flt))
+    opt_path = ckpt_dir / OPTIMIZER_FILE
+    if not adapter_fully_restored:
+        # No usable sidecar for this strategy — the adapter came back
+        # cold. Never splice warm Adam moments onto cold params; that
+        # corrupts the first post-resume step (H3). Cold-start opt_state.
+        print(
+            f"[train_jax_adapter] adapter for strategy {strategy!r} "
+            "could not be fully restored from the checkpoint (no resume "
+            "sidecar); cold-starting opt_state to avoid a warm/cold "
+            "mismatch.",
+            file=sys.stderr,
+        )
+    elif opt_path.is_file():
+        from safetensors.numpy import load_file as st_load
+        flat = st_load(str(opt_path))
+        opt_state = unflatten_opt_state(opt_state, flat)
+    else:
+        print(
+            f"[train_jax_adapter] WARNING: no {OPTIMIZER_FILE} in "
+            f"{ckpt_dir}; resuming with fresh opt_state.",
+            file=sys.stderr,
+        )
+    return _AdapterResume(
+        backbone=backbone,
+        adapter=adapter,
+        opt_state=opt_state,
+        adapter_restored=adapter_fully_restored,
     )
 
 
@@ -436,33 +563,35 @@ def main(argv: list[str] | None = None) -> int:
     schedule = make_lr_schedule(cfg, cfg.total_steps)
     optimizer = make_optimizer(cfg, schedule)
 
-    # Resume: splice adapter + step + opt-state from a checkpoint dir.
-    # The backbone is taken from the checkpoint (the saved `model.safetensors`
-    # *is* the backbone for bottleneck-style adapters; for weight-folded
-    # adapters it's the folded effective model — both load cleanly via
-    # `pawn.checkpoint.load_model` since the v2 schema treats them
-    # identically). Bottleneck and FiLM adapters auto-detect the
-    # `adapter.safetensors` sidecar and fully restore the trained PyTree;
-    # weight-folded adapters (lora / sparse / unfreeze) ride in the loaded
-    # backbone with an identity (cold) adapter that the warm opt-state
-    # still indexes correctly. Strategies whose adapter can NOT be fully
-    # restored (hybrid's folded LoRA half, specialized_clm, rosa) cold-start
-    # the opt-state so warm Adam moments never index cold params (H3).
+    # Resume: splice (backbone, adapter, opt_state, step) from a checkpoint.
+    #
+    # The warm optimizer state (Adam moments + clip counter) only stays
+    # consistent if the adapter PyTree it indexes is restored to the *exact*
+    # params it was trained against — applying warm moments to cold-started
+    # params corrupts the first post-resume step (H3). Two sidecar families
+    # carry the trained adapter:
+    #
+    #   * Wrapper adapters (bottleneck / FiLM) write the *raw* frozen backbone
+    #     as `model.safetensors` plus a typed `adapter.safetensors` holding
+    #     the whole trained adapter. Load the backbone + the typed sidecar →
+    #     full restore.
+    #   * Weight-folding adapters (lora / sparse / unfreeze / specialized_clm
+    #     / hybrid) publish the *folded* effective model as `model.safetensors`
+    #     (one-way; sparse masks aren't even recoverable from it), and write
+    #     the raw `(backbone, adapter)` PyTree to
+    #     `adapter_resume_state.eqx`. Load that sidecar → exact (backbone,
+    #     adapter) restore, so the warm moments index the same params.
+    #
+    # When the expected sidecar is absent (an older checkpoint, or a manual
+    # `model.safetensors`-only drop), the adapter can't be faithfully restored;
+    # we cold-start opt_state so warm moments never index cold params.
+    #
     # `resume_step` is already extracted upstream (right after
-    # `_require_accelerator`) so the RoSA / training-state checks
-    # fire before any HF download. Below we restore the backbone +
-    # adapter + optimizer state from the checkpoint.
+    # `_require_accelerator`) so the RoSA / training-state checks fire before
+    # any HF download.
     resume_step = resume_step_early
     if args.resume is not None:
-        from pawn.adapters.bottleneck import (
-            ADAPTER_SAFETENSORS,
-            BottleneckConfig,
-            load_bottleneck_adapter,
-        )
-        from pawn.adapters.film import FiLMConfig, load_film_adapter
-        from pawn.checkpoint import OPTIMIZER_FILE, load_model
-        from pawn.trainer import unflatten_opt_state
-
+        from pawn.checkpoint import load_model
         from pawn.corpus import (
             assert_conditioning_C,
             conditioning_from_run_block,
@@ -470,7 +599,13 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         ckpt_dir = Path(args.resume)
-        backbone, backbone_run_block = load_model(ckpt_dir)
+        # `backbone` / `adapter` entering here are the freshly-built templates
+        # (cold init against `cfg`). They carry the exact PyTree structure the
+        # save-time `state.backbone` / `state.adapter` had, so they double as
+        # deserialise templates for the resume sidecar. Read the folded
+        # `model.safetensors` separately for the run block + the
+        # wrapper-adapter (bottleneck/FiLM) frozen-backbone restore.
+        loaded_backbone, backbone_run_block = load_model(ckpt_dir)
         # Same load-time C-mismatch guard as the initial-load path: the
         # corpus below is built with `cfg.conditioning`, so the resumed
         # backbone's persisted conditioning must agree or moves drift.
@@ -478,72 +613,21 @@ def main(argv: list[str] | None = None) -> int:
             conditioning_from_run_block(backbone_run_block)
         )
         assert_conditioning_C(cfg.conditioning, resume_C)
-        # Sidecar restore. The warm optimizer state (Adam moments + clip
-        # counter) only stays consistent if the adapter PyTree it indexes
-        # is *fully* restored. We track `adapter_fully_restored` per
-        # strategy and only warm-load the optimizer when the trained
-        # adapter params came back; otherwise we cold-start the opt-state
-        # so warm moments are never spliced onto cold-started params (H3).
-        sidecar = ckpt_dir / ADAPTER_SAFETENSORS
-        adapter_fully_restored = False
-        if sidecar.is_file() and isinstance(strategy_cfg, BottleneckConfig):
-            # Bottleneck: the whole adapter lives in the sidecar; the saved
-            # backbone is the untouched frozen backbone. Full restore.
-            adapter = load_bottleneck_adapter(ckpt_dir, strategy_cfg)
-            adapter_fully_restored = True
-        elif sidecar.is_file() and isinstance(strategy_cfg, FiLMConfig):
-            # FiLM: the entire trained adapter (gamma/beta + optional output
-            # FiLM) lives in the sidecar; the saved backbone is untouched.
-            # Full restore — the C1 save side emits this sidecar and this is
-            # the read side it was missing.
-            adapter = load_film_adapter(ckpt_dir, strategy_cfg)
-            adapter_fully_restored = True
-        elif sidecar.is_file() and isinstance(strategy_cfg, HybridConfig):
-            # Hybrid: the FiLM half lives in the sidecar, but the LoRA half
-            # is folded *irreversibly* into the saved backbone at save time
-            # (`apply_hybrid` returns `FiLMEffective(backbone=apply_lora(...))`
-            # and the fold is lossy). So we can restore the FiLM half from
-            # the sidecar but the LoRA half necessarily comes back cold
-            # (identity: random A, zero B). Restore FiLM for forward
-            # correctness, but the adapter is NOT fully restored (LoRA cold),
-            # so the warm opt-state would mismatch the LoRA moments. Flag it
-            # so the opt-state cold-starts below.
-            restored_film = load_film_adapter(ckpt_dir, strategy_cfg.film)
-            adapter = eqx.tree_at(lambda a: a.film, adapter, restored_film)
-            adapter_fully_restored = False
-        # weight-folded adapters (lora / sparse / unfreeze) have no sidecar:
-        # their delta is baked into the saved backbone at save time, so the
-        # backbone reload *is* the adapter restore. The freshly-initialised
-        # adapter PyTree from the initial-load path is identity (zero delta),
-        # so re-folding it onto the already-folded backbone is a no-op and
-        # the warm opt-state correctly indexes the (identity) adapter params.
-        if cfg.strategy in ("lora", "sparse", "unfreeze"):
-            adapter_fully_restored = True
-        # Build the optimizer template *after* adapter rebuild so the
-        # opt-state shape matches what the loaded adapter trains.
-        flt = dispatch_filter(cfg.strategy)(adapter)
-        opt_state = optimizer.init(eqx.filter(adapter, flt))
-        opt_path = ckpt_dir / OPTIMIZER_FILE
-        if not adapter_fully_restored:
-            # Cold-started (or partially restored) adapter: never splice warm
-            # Adam moments onto cold params — that corrupts the first
-            # post-resume step (H3). Cold-start the opt-state to match.
-            print(
-                f"[train_jax_adapter] adapter for strategy {cfg.strategy!r} "
-                "could not be fully restored from the checkpoint; "
-                "cold-starting opt_state to avoid a warm/cold mismatch.",
-                file=sys.stderr,
-            )
-        elif opt_path.is_file():
-            from safetensors.numpy import load_file as st_load
-            flat = st_load(str(opt_path))
-            opt_state = unflatten_opt_state(opt_state, flat)
-        else:
-            print(
-                f"[train_jax_adapter] WARNING: no {OPTIMIZER_FILE} in "
-                f"{args.resume}; resuming with fresh opt_state.",
-                file=sys.stderr,
-            )
+
+        # Branch selection + H3 cold-start fallback are factored into
+        # `restore_adapter_resume_state` so they can be unit-tested.
+        resumed = restore_adapter_resume_state(
+            strategy=cfg.strategy,
+            strategy_cfg=strategy_cfg,
+            ckpt_dir=ckpt_dir,
+            loaded_backbone=loaded_backbone,
+            cold_backbone=backbone,
+            cold_adapter=adapter,
+            optimizer=optimizer,
+        )
+        backbone = resumed.backbone
+        adapter = resumed.adapter
+        opt_state = resumed.opt_state
     else:
         flt = dispatch_filter(cfg.strategy)(adapter)
         opt_state = optimizer.init(eqx.filter(adapter, flt))
@@ -671,6 +755,16 @@ def main(argv: list[str] | None = None) -> int:
                 training_state={"step": int(state.step)},
             )
             save_film_adapter(effective.adapter, out)
+            # Hybrid's LoRA half is folded *irreversibly* into the saved
+            # backbone above and the FiLM sidecar only carries the FiLM half,
+            # so a FiLM-sidecar-only resume would cold-start the LoRA params
+            # under a warm optimiser (H3). Persist the raw frozen backbone +
+            # the *full* HybridAdapter (LoRA + FiLM) so `--resume` restores
+            # both halves exactly. Pure FiLM has no folded half and skips this.
+            from pawn.adapters.hybrid import HybridAdapter
+            if isinstance(state.adapter, HybridAdapter):
+                from pawn.checkpoint import save_adapter_resume_state
+                save_adapter_resume_state(state.backbone, state.adapter, out)
         else:
             # PAWNModel — the standard weight-folded save path. The
             # narrowing assertion satisfies pyright: the only two
@@ -688,6 +782,15 @@ def main(argv: list[str] | None = None) -> int:
                 optimizer_state=flatten_opt_state(state.opt_state),
                 training_state={"step": int(state.step)},
             )
+            # The folded `model.safetensors` above is one-way (sparse masks
+            # aren't even recoverable from it), so persist the raw frozen
+            # backbone + trained adapter PyTree as a resume sidecar. On
+            # `--resume` this restores the exact (backbone, adapter) split the
+            # warm Adam moments index — without it, lora/sparse/hybrid/
+            # specialized_clm would cold-start their params under a warm
+            # optimiser state and corrupt the first post-resume step (H3).
+            from pawn.checkpoint import save_adapter_resume_state
+            save_adapter_resume_state(state.backbone, state.adapter, out)
         if push_tracker:
             push_checkpoint_async(out, push_tracker)
 
