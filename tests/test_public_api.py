@@ -79,7 +79,16 @@ def test_model_public_surface() -> None:
     from pawn import model
 
     assert {"PAWNModel", "TransformerLayer", "SAVED_FIELDS", "init_model", "sliced"} <= set(model.__all__)
-    assert len(model.SAVED_FIELDS) == 16
+    # Post un-factor/tie (spec §3): the canonical declaration order is the
+    # 12-field untied superset (factored embed_src/dst/promo/pad/outcome are
+    # gone, replaced by a single tied `embed_tokens`). The per-`tie_embeddings`
+    # save schema drops `lm_head` when tied.
+    assert len(model.SAVED_FIELDS) == 12
+    assert "lm_head" in model.SAVED_FIELDS
+    assert model.saved_fields(tie_embeddings=False) == model.SAVED_FIELDS
+    assert model.saved_fields(tie_embeddings=True) == tuple(
+        name for name in model.SAVED_FIELDS if name != "lm_head"
+    )
 
 
 def test_checkpoint_public_surface() -> None:
