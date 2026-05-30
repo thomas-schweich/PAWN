@@ -1,7 +1,11 @@
 """LoRA + FiLM hybrid adapter — both methods composed on the same backbone.
 
-Apply LoRA's effective-weight corrections first, then FiLM's gamma
-scaling on the (post-LoRA) layer norms.
+Apply LoRA's effective-weight corrections first (folded into the
+backbone's weight tensors), then wrap the LoRA-corrected backbone with
+true FiLM (residual-stream ``gamma * h + beta`` + optional output-logit
+modulation). LoRA returns a folded :class:`PAWNModel`; FiLM wraps it in
+a :class:`FiLMEffective`, so the composition is
+``FiLMEffective(backbone=lora_corrected_backbone)``.
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ import jax
 from pawn.adapters.film import (
     FiLMAdapter,
     FiLMConfig,
+    FiLMEffective,
     apply_film,
     init_film_adapter,
 )
@@ -63,8 +68,14 @@ def init_hybrid_adapter(
     )
 
 
-def apply_hybrid(backbone: PAWNModel, adapter: HybridAdapter) -> PAWNModel:
-    """LoRA then FiLM — the v1 layering convention."""
+def apply_hybrid(backbone: PAWNModel, adapter: HybridAdapter) -> FiLMEffective:
+    """LoRA then FiLM — the v1 layering convention.
+
+    LoRA folds into the backbone weights (returns a :class:`PAWNModel`);
+    FiLM then wraps that LoRA-corrected backbone in a
+    :class:`FiLMEffective` so its residual-stream / output-logit
+    modulation rides on top of the LoRA corrections.
+    """
     return apply_film(apply_lora(backbone, adapter.lora), adapter.film)
 
 

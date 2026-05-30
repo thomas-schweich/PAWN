@@ -25,6 +25,7 @@ from pawn.adapter_trainer import (
 )
 from pawn.adapters import (
     BottleneckConfig,
+    FiLMAdapter,
     FiLMConfig,
     HybridConfig,
     LoRAConfig,
@@ -34,6 +35,7 @@ from pawn.adapters import (
     UnfreezeConfig,
 )
 from pawn.adapters.bottleneck import BottleneckEffective
+from pawn.adapters.film import FiLMEffective
 from pawn.config import TINY_SUPERNET
 from pawn.corpus import generate_corpus
 from pawn.model import PAWNModel, init_model
@@ -43,9 +45,11 @@ from pawn.trainer import Batch, slice_batch
 # `apply_fn` may return either the patched ``PAWNModel`` (for adapters that
 # fold corrections into the backbone weights — LoRA, sparse, FiLM,
 # unfreeze, ...) or a callable wrapper such as ``BottleneckEffective`` (for
-# adapters whose semantics require post-sublayer residual injection). The
-# trainer + eval scripts treat both uniformly; the test accepts either.
-_EFFECTIVE_TYPES = (PAWNModel, BottleneckEffective)
+# adapters whose semantics require post-sublayer residual injection —
+# BottleneckEffective for the Houlsby MLP, FiLMEffective for true FiLM's
+# residual-stream + output-logit modulation). The trainer + eval scripts
+# treat all three uniformly; the test accepts any of them.
+_EFFECTIVE_TYPES = (PAWNModel, BottleneckEffective, FiLMEffective)
 
 
 # ---------------------------------------------------------------------------
@@ -716,26 +720,32 @@ def test_film_init_gamma_ones_beta_zeros() -> None:
 
 
 def test_film_param_shapes_match_n_layers_times_d_model() -> None:
-    """v1 parity: FiLM has 2 trainable param slabs per layer
-    (gamma + beta), each shape ``(n_layers, d_model)``; optional
-    output FiLM adds a third slab of shape ``(d_model,)``."""
+    """Real FiLM (H2): the per-layer gamma + beta slabs are each shape
+    ``(n_layers, d_model)`` (residual-stream modulation); the optional
+    output FiLM modulates the logits, so its slabs are ``(vocab_size,)``
+    — **not** ``(d_model,)`` (the stale v1-parity shape this asserts
+    against). Output FiLM at logit space is the post-Phase-A uniform
+    ``V``-wide head."""
     backbone = init_model(TINY_SUPERNET, key=0)
     adapter = dispatch_init("film")(
         backbone, FiLMConfig(use_output_film=True), key=jax.random.key(0),
     )
     n_layers = TINY_SUPERNET.n_layers
     d_model = TINY_SUPERNET.d_model
+    vocab_size = TINY_SUPERNET.vocab_size
     assert adapter.gamma.shape == (n_layers, d_model)
     assert adapter.beta.shape == (n_layers, d_model)
     assert adapter.output_gamma is not None
-    assert adapter.output_gamma.shape == (d_model,)
+    assert adapter.output_gamma.shape == (vocab_size,)
     assert adapter.output_beta is not None
-    assert adapter.output_beta.shape == (d_model,)
+    assert adapter.output_beta.shape == (vocab_size,)
 
 
 def test_film_identity_at_init_matches_backbone_logits() -> None:
-    """v1 parity: at init the residual is identity, so the effective
-    forward should match the bare backbone within bf16 tolerance."""
+    """Real FiLM (H2): at init gamma=1, beta=0 (both per-layer and
+    output), so ``h = 1 * h + 0 = h`` in the residual stream and
+    ``logits = 1 * logits + 0`` — the effective forward is *exactly*
+    identical to the bare backbone (no fp32 fold-into-norm noise)."""
     backbone = init_model(TINY_SUPERNET, key=0)
     adapter = dispatch_init("film")(
         backbone, FiLMConfig(use_output_film=True), key=jax.random.key(0),
@@ -744,10 +754,143 @@ def test_film_identity_at_init_matches_backbone_logits() -> None:
     tokens = jnp.zeros((2, 16), dtype=jnp.int32)
     bare = backbone(tokens)
     filmed = effective(tokens)
-    # FiLM folds beta into attn_norm_w (not as a residual) so the
-    # identity is "approximately identity" — within fp32 noise on
-    # untrained random weights.
-    assert jnp.allclose(bare, filmed, atol=1e-5, rtol=0)
+    # True residual-stream FiLM with the identity init is a pointwise
+    # multiply-by-1 / add-0, so the result is bit-identical to the
+    # backbone modulo XLA op-ordering noise.
+    assert jnp.allclose(bare, filmed, atol=1e-6, rtol=0)
+
+
+def test_film_output_film_modulates_logits_against_reference() -> None:
+    """Real FiLM (H2): with per-layer modulation held at identity
+    (gamma=1, beta=0) and a **non-trivial** output FiLM, the effective
+    logits equal the explicit reference
+    ``output_gamma * backbone_logits + output_beta`` over the uniform
+    ``V``-wide vocabulary. This pins both the math and that output FiLM
+    lives in logit space (shape ``(vocab_size,)``)."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    base = dispatch_init("film")(
+        backbone, FiLMConfig(use_output_film=True), key=jax.random.key(0),
+    )
+    vocab_size = TINY_SUPERNET.vocab_size
+    # Non-trivial output gamma/beta over the V-wide logit axis.
+    og = 1.0 + 0.5 * jax.random.normal(jax.random.key(11), (vocab_size,))
+    ob = 0.3 * jax.random.normal(jax.random.key(12), (vocab_size,))
+    adapter = eqx.tree_at(
+        lambda a: (a.output_gamma, a.output_beta), base, (og, ob)
+    )
+    assert adapter.output_gamma is not None
+    assert adapter.output_gamma.shape == (vocab_size,)
+
+    effective = dispatch_apply("film")(backbone, adapter)
+    tokens = jnp.zeros((2, 16), dtype=jnp.int32)
+    bare = backbone(tokens)
+    filmed = effective(tokens)
+    # Per-layer modulation is identity here, so the only difference is
+    # the output FiLM applied to the V-wide logits.
+    reference = og[None, None, :] * bare + ob[None, None, :]
+    assert jnp.allclose(filmed, reference, atol=1e-5, rtol=0)
+    # And it provably differs from the un-modulated backbone.
+    assert not jnp.allclose(filmed, bare, atol=1e-3, rtol=0)
+
+
+def test_film_per_layer_modulation_changes_residual_and_logits() -> None:
+    """Real FiLM (H2): a **non-trivial** per-layer gamma/beta provably
+    changes the residual stream (and therefore the logits) relative to
+    the bare backbone — the modulation is a genuine residual-stream
+    shift ``h = gamma_l * h + beta_l``, not a no-op fold into a norm
+    weight.
+
+    The reference checks the *single-layer* case exactly: with a
+    one-layer backbone, FiLM at the (sole) ffn_hook applies
+    ``h = gamma_0 * h_layer_out + beta_0`` to the layer output *before*
+    the final norm + head, so the effective logits equal the backbone
+    forward recomputed with that explicit shift spliced in."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    base = dispatch_init("film")(
+        backbone, FiLMConfig(use_output_film=False), key=jax.random.key(0),
+    )
+    n_layers = TINY_SUPERNET.n_layers
+    d_model = TINY_SUPERNET.d_model
+    gamma = 1.0 + 0.2 * jax.random.normal(
+        jax.random.key(21), (n_layers, d_model)
+    )
+    beta = 0.1 * jax.random.normal(jax.random.key(22), (n_layers, d_model))
+    adapter = eqx.tree_at(lambda a: (a.gamma, a.beta), base, (gamma, beta))
+
+    effective = dispatch_apply("film")(backbone, adapter)
+    tokens = jnp.zeros((2, 16), dtype=jnp.int32)
+    bare = backbone(tokens)
+    filmed = effective(tokens)
+    # Non-identity per-layer FiLM must move the logits.
+    assert not jnp.allclose(filmed, bare, atol=1e-3, rtol=0)
+
+    # Explicit single-layer reference: run a 1-layer backbone, capture
+    # the layer output via the same ffn_hook the wrapper uses, apply the
+    # explicit `gamma_0 * h + beta_0`, then finish the head ourselves and
+    # compare against the FiLMEffective output.
+    from pawn.config import ModelConfig
+    one_layer_cfg = ModelConfig(
+        d_model=d_model,
+        n_layers=1,
+        n_heads=TINY_SUPERNET.n_heads,
+        d_ff=TINY_SUPERNET.d_ff,
+        vocab_size=TINY_SUPERNET.vocab_size,
+        max_seq_len=TINY_SUPERNET.max_seq_len,
+    )
+    bb1 = init_model(one_layer_cfg, key=3)
+    g0 = 1.0 + 0.2 * jax.random.normal(jax.random.key(31), (1, d_model))
+    b0 = 0.1 * jax.random.normal(jax.random.key(32), (1, d_model))
+    film1 = FiLMAdapter(
+        gamma=g0, beta=b0, output_gamma=None, output_beta=None,
+        cfg=FiLMConfig(use_output_film=False),
+    )
+    eff1 = dispatch_apply("film")(bb1, film1)
+    filmed1 = eff1(tokens)
+
+    # Explicit reference: an inline single-layer forward (no scan, no
+    # side-effecting hook) reproducing PAWNModel.__call__ for n_layers=1,
+    # with the explicit `gamma_0 * h_out + beta_0` shift applied to the
+    # post-FFN-residual hidden state before the final norm + head. This
+    # is the `gamma * h + beta` residual-stream reference the H2 spec
+    # asks for.
+    from pawn.model import _apply_rope, _build_rope, _rmsnorm
+    lyr = bb1.layers  # leaves carry a leading n_layers=1 axis
+    n_heads = one_layer_cfg.n_heads
+    head_dim = one_layer_cfg.head_dim
+    inv_scale = head_dim ** -0.5
+    x = bb1.embed_tokens[tokens]  # (B, T, d)
+    B, T, D = x.shape
+    rope_cos, rope_sin = _build_rope(head_dim, T, one_layer_cfg.rope_base)
+    # ---- attention sublayer (pre-norm + residual) ----
+    normed = _rmsnorm(x, lyr.attn_norm_w[0])
+    q = jnp.einsum("btd,de->bte", normed, lyr.wq[0])
+    k = jnp.einsum("btd,de->bte", normed, lyr.wk[0])
+    v = jnp.einsum("btd,de->bte", normed, lyr.wv[0])
+    q = q.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+    k = k.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+    v = v.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+    q = _apply_rope(q, rope_cos, rope_sin)
+    k = _apply_rope(k, rope_cos, rope_sin)
+    causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))[None, None, :, :]
+    scores = jnp.einsum("bhid,bhjd->bhij", q, k) * inv_scale
+    scores = jnp.where(causal, scores, jnp.finfo(jnp.float32).min)
+    attn = jax.nn.softmax(scores, axis=-1)
+    attn_out = jnp.einsum("bhij,bhjd->bhid", attn, v)
+    attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, D)
+    h = x + jnp.einsum("btd,de->bte", attn_out, lyr.wo[0])
+    # ---- ffn sublayer (pre-norm + residual) ----
+    normed = _rmsnorm(h, lyr.ffn_norm_w[0])
+    gate = jnp.einsum("btd,df->btf", normed, lyr.w_gate[0])
+    up = jnp.einsum("btd,df->btf", normed, lyr.w_up[0])
+    ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, lyr.w_down[0])
+    h_out = h + ffn_out
+    # ---- explicit FiLM shift on the residual stream, then norm + head ----
+    shifted = g0[0][None, None, :] * h_out + b0[0][None, None, :]
+    head = bb1.embed_tokens.T if bb1.lm_head is None else bb1.lm_head
+    ref_logits = jnp.einsum(
+        "btd,dv->btv", _rmsnorm(shifted, bb1.final_norm_w), head
+    ).astype(jnp.float32)
+    assert jnp.allclose(filmed1, ref_logits, atol=1e-5, rtol=0)
 
 
 def test_film_without_output_film_skips_output_slab() -> None:
@@ -759,6 +902,118 @@ def test_film_without_output_film_skips_output_slab() -> None:
     )
     assert adapter.output_gamma is None
     assert adapter.output_beta is None
+
+
+def test_film_save_load_roundtrip(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A FiLM adapter saved via ``save_film_adapter`` reloads bit-identical
+    via ``load_film_adapter``. This is the load-bearing invariant for the
+    trainer's --resume path (C1 added the sidecar write; the resume block
+    reads it back): a re-composed wrapper must produce the same logits as
+    the one that wrote the sidecar.
+
+    Mirrors ``test_bottleneck_save_load_roundtrip`` — perturb gamma/beta
+    (and the output slabs) off identity so the round-trip is non-degenerate,
+    then assert the reloaded slabs match tensor-by-tensor and the
+    apply_film logits agree."""
+    from pawn.adapters.film import (
+        ADAPTER_SAFETENSORS,
+        apply_film,
+        load_film_adapter,
+        save_film_adapter,
+    )
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = FiLMConfig(use_output_film=True)
+    base = dispatch_init("film")(backbone, cfg, key=jax.random.key(0))
+    # Perturb every slab off the identity init (gamma=1, beta=0) so the
+    # round-trip exercises real values, not the trivial-equal init.
+    n_layers = TINY_SUPERNET.n_layers
+    d_model = TINY_SUPERNET.d_model
+    vocab_size = TINY_SUPERNET.vocab_size
+    gamma = 1.0 + 0.2 * jax.random.normal(jax.random.key(41), (n_layers, d_model))
+    beta = 0.1 * jax.random.normal(jax.random.key(42), (n_layers, d_model))
+    og = 1.0 + 0.3 * jax.random.normal(jax.random.key(43), (vocab_size,))
+    ob = 0.2 * jax.random.normal(jax.random.key(44), (vocab_size,))
+    adapter = eqx.tree_at(
+        lambda a: (a.gamma, a.beta, a.output_gamma, a.output_beta),
+        base, (gamma, beta, og, ob),
+    )
+
+    save_film_adapter(adapter, tmp_path)
+    assert (tmp_path / ADAPTER_SAFETENSORS).is_file()
+
+    loaded = load_film_adapter(tmp_path, cfg)
+    assert loaded.cfg == cfg
+    for field_name in ("gamma", "beta", "output_gamma", "output_beta"):
+        orig = getattr(adapter, field_name)
+        new = getattr(loaded, field_name)
+        assert orig is not None
+        assert new is not None
+        assert jnp.array_equal(orig, new)
+
+    # Forward parity: the re-loaded wrapper produces the same logits.
+    tokens = jnp.zeros((2, 16), dtype=jnp.int32)
+    orig_logits = apply_film(backbone, adapter)(tokens)
+    new_logits = apply_film(backbone, loaded)(tokens)
+    assert jnp.allclose(orig_logits, new_logits, atol=1e-6, rtol=0)
+
+
+def test_film_save_load_roundtrip_no_output_film(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """``use_output_film=False`` writes only the per-layer slabs; the
+    output slabs correctly stay None through the round-trip (the
+    ``_ADAPTER_FIELDS`` loop skips the None leaves at save time and
+    ``load_film_adapter`` restores them as None)."""
+    from pawn.adapters.film import load_film_adapter, save_film_adapter
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = FiLMConfig(use_output_film=False)
+    base = dispatch_init("film")(backbone, cfg, key=jax.random.key(0))
+    n_layers = TINY_SUPERNET.n_layers
+    d_model = TINY_SUPERNET.d_model
+    gamma = 1.0 + 0.2 * jax.random.normal(jax.random.key(51), (n_layers, d_model))
+    beta = 0.1 * jax.random.normal(jax.random.key(52), (n_layers, d_model))
+    adapter = eqx.tree_at(lambda a: (a.gamma, a.beta), base, (gamma, beta))
+
+    save_film_adapter(adapter, tmp_path)
+    loaded = load_film_adapter(tmp_path, cfg)
+    assert loaded.output_gamma is None
+    assert loaded.output_beta is None
+    assert jnp.array_equal(loaded.gamma, gamma)
+    assert jnp.array_equal(loaded.beta, beta)
+
+
+def test_film_load_rejects_missing_sidecar(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """An empty directory raises FileNotFoundError — the trainer's resume
+    path predicates on the sidecar's existence, so this is the expected
+    exception type (mirrors the bottleneck guard)."""
+    from pawn.adapters.film import load_film_adapter
+
+    cfg = FiLMConfig(use_output_film=True)
+    with pytest.raises(FileNotFoundError, match="adapter.safetensors"):
+        load_film_adapter(tmp_path, cfg)
+
+
+def test_film_load_rejects_output_film_mismatch(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Saving with ``use_output_film=True`` then loading with a cfg that
+    expects no output FiLM (and the reverse) must raise — silently loading
+    a mismatched adapter would corrupt the resume. This is the
+    ``cfg.use_output_film != has_output`` ValueError branch."""
+    from pawn.adapters.film import load_film_adapter, save_film_adapter
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    # Save WITH output FiLM; load expecting NONE → mismatch.
+    save_cfg = FiLMConfig(use_output_film=True)
+    adapter = dispatch_init("film")(backbone, save_cfg, key=jax.random.key(0))
+    save_film_adapter(adapter, tmp_path)
+    with pytest.raises(ValueError, match="sidecar mismatch"):
+        load_film_adapter(tmp_path, FiLMConfig(use_output_film=False))
+
+    # And the reverse: save WITHOUT output FiLM; load expecting it.
+    save_cfg = FiLMConfig(use_output_film=False)
+    adapter = dispatch_init("film")(backbone, save_cfg, key=jax.random.key(0))
+    save_film_adapter(adapter, tmp_path)
+    with pytest.raises(ValueError, match="sidecar mismatch"):
+        load_film_adapter(tmp_path, FiLMConfig(use_output_film=True))
 
 
 def test_lora_targets_qv_skips_k_and_o() -> None:

@@ -41,7 +41,12 @@ from pawn.adapters.bottleneck import (
     BottleneckConfig,
     init_bottleneck_adapter,
 )
-from pawn.adapters.film import FiLMAdapter, FiLMConfig, init_film_adapter
+from pawn.adapters.film import (
+    FiLMAdapter,
+    FiLMConfig,
+    FiLMEffective,
+    init_film_adapter,
+)
 from pawn.adapters.hybrid import HybridAdapter, HybridConfig, init_hybrid_adapter
 from pawn.adapters.lora import LoRAAdapter, LoRAConfig, init_lora_adapter
 from pawn.adapters.rosa import RoSAAdapter, RoSAConfig, init_rosa_adapter
@@ -77,6 +82,7 @@ __all__ = [
     "init_lora_adapter",
     "FiLMAdapter",
     "FiLMConfig",
+    "FiLMEffective",
     "init_film_adapter",
     "BottleneckAdapter",
     "BottleneckConfig",
