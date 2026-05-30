@@ -88,3 +88,10 @@ bench/results/*.json
 # Bench-run training checkpoints (throwaway random-game; keep metrics.jsonl + result JSON)
 bench/results/**/step_*/
 bench/results/**/*.safetensors
+
+# v2 migration housekeeping — untrack accidentally-committed artifacts (kept on disk)
+/JAX_MIGRATION_REVIEW.md
+/JAX_MIGRATION_REVIEW_findings.json
+/bench/results/
+/checkpoints/
+*.db
