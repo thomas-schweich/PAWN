@@ -1,9 +1,13 @@
 """Optional Weights & Biases metric mirror.
 
-Every v2 training entry point funnels through `init_wandb` /
-`log_metrics` / `finish_wandb` for consistent run naming + lifecycle.
-The module is **torch-free** (wandb is the only dependency, and it's
-behind the `wandb` extra per plan §10 S1).
+Both v2 training entry points (`scripts/train_jax.py` and
+`scripts/train_jax_adapter.py`) call `init_wandb` / `log_metrics` /
+`finish_wandb` when `--wandb` is set, for consistent run naming +
+lifecycle. The mirror is gated on the `--wandb` flag *and* the `wandb`
+extra being installed: requesting `--wandb` without the extra is a hard
+error (`require_wandb_available`), not a silent no-op. The module is
+**torch-free** (wandb is the only dependency, and it's behind the
+`wandb` extra per plan §10 S1).
 
 Reproducibility metadata (slug, git hash, hostname, platform) is
 embedded in the W&B config so a sweep over checkpoints stays
@@ -24,7 +28,34 @@ __all__ = [
     "init_wandb",
     "log_metrics",
     "finish_wandb",
+    "wandb_available",
+    "require_wandb_available",
 ]
+
+
+def wandb_available() -> bool:
+    """Return True iff the optional ``wandb`` package can be imported."""
+    import importlib.util
+
+    return importlib.util.find_spec("wandb") is not None
+
+
+def require_wandb_available() -> None:
+    """Hard-error if ``--wandb`` was requested but the extra isn't installed.
+
+    The entry points call this when ``cfg.wandb`` is True so a missing
+    extra surfaces as a clear, actionable failure *before* training starts
+    rather than as a silent no-op that drops every metric (the old
+    behaviour: :func:`init_wandb` swallowed the ``ImportError`` and returned
+    ``None``).
+    """
+    if not wandb_available():
+        raise SystemExit(
+            "--wandb was requested but the `wandb` package is not installed. "
+            "Re-run with the wandb extra, e.g. "
+            "`uv run --extra rocm --extra wandb python scripts/train_jax.py ...`, "
+            "or drop --wandb."
+        )
 
 
 def init_wandb(

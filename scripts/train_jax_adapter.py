@@ -48,11 +48,20 @@ from pawn.jax_setup import setup_jax_caching
 from pawn.lichess_data import load_lichess_corpus
 from pawn.lifecycle import (
     HFPushTracker,
+    build_training_state,
     drain_push_queue,
     install_sigterm_handler,
     push_checkpoint_async,
+    read_resume_rng_blocks,
+    write_schedule_health,
 )
-from pawn.logging import MetricsLogger
+from pawn.logging import MetricsLogger, get_git_info
+from pawn.wandb_utils import (
+    finish_wandb,
+    init_wandb,
+    log_metrics,
+    require_wandb_available,
+)
 from pawn.model import PAWNModel, init_model, sliced
 from pawn.run_config import AdapterConfig
 from pawn.trainer import (
@@ -190,6 +199,7 @@ def write_adapter_checkpoint(
     optimizer_state: dict[str, np.ndarray],
     step: int,
     run_config: dict[str, Any] | None = None,
+    training_state: dict[str, Any] | None = None,
 ) -> None:
     """Write an adapter checkpoint, selecting the strategy-appropriate sidecar.
 
@@ -222,7 +232,11 @@ def write_adapter_checkpoint(
     from pawn.adapters.hybrid import HybridAdapter
     from pawn.checkpoint import save_adapter_resume_state
 
-    training_state = {"step": int(step)}
+    # H7: the caller may pass a richer training_state (scheduler + RNG
+    # blocks) so a resume can restore the data-stream RNG. Default to the
+    # bare step counter when omitted (back-compat with prior callers/tests).
+    if training_state is None:
+        training_state = {"step": int(step)}
     if isinstance(effective, BottleneckEffective):
         save_model(
             effective.backbone, out,
@@ -534,6 +548,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                          "Flash is the default on GPU; CPU runs "
                          "auto-fall-back regardless of this flag.")
     ap.add_argument("--logs-dir", type=Path, default=Path("logs"))
+    ap.add_argument("--wandb", action="store_true",
+                    help="enable the Weights & Biases metric mirror "
+                         "(requires --extra wandb). Hard-errors if the "
+                         "extra isn't installed.")
     ap.add_argument("--log-interval", type=int, default=None,
                     help="Steps between metrics rows; defaults to the "
                          "BaseRunConfig log_interval (100)")
@@ -550,12 +568,11 @@ def _build_config(args: argparse.Namespace) -> AdapterConfig:
     # `not None`, and silently overrode a JSON `"use_sdpa": true`).
     # These are AdapterConfig fields, so they round-trip through the
     # pydantic config — but we only merge from CLI when actually set.
-    # NOTE: `--wandb` is intentionally absent — the adapter parser
-    # doesn't register it (the pretrain script does). Adding it here
-    # would be a no-op because `getattr(args, "wandb", False)` always
-    # returns False on the adapter side. (Round-2 bug-detector MINOR.)
+    # `--wandb` is now registered on the adapter parser too (H7: wandb
+    # wired into *both* entry points), so it joins the opt-in store_true
+    # set below rather than being silently dropped.
     _CLI_STORE_TRUE_FLAGS = ("use_sdpa", "use_output_film", "no_adapt_attn",
-                             "no_adapt_ffn")
+                             "no_adapt_ffn", "wandb")
     for flag, val in vars(args).items():
         if flag in (
             "config", "no_pgn", "local_checkpoints", "logs_dir", "resume",
@@ -828,6 +845,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     logger.log_config(run_type="adapter", config=cfg.model_dump())
 
+    # W&B mirror — gated on `--wandb` (cfg.wandb) *and* the `wandb` extra.
+    # `--wandb` without the extra is a hard error (H7: wandb wired into
+    # both entry points; no silent metric drop).
+    wandb_run = None
+    if cfg.wandb:
+        require_wandb_available()
+        wandb_run = init_wandb(
+            project=cfg.wandb_project, slug=logger.slug,
+            run_config=cfg.model_dump(),
+            git_hash=get_git_info().get("git_hash"),
+        )
+
     push_tracker = HFPushTracker(repo_id=cfg.hf_repo) if cfg.hf_repo else None
     should_shutdown = install_sigterm_handler()
 
@@ -860,6 +889,16 @@ def main(argv: list[str] | None = None) -> int:
         """
         effective = apply_fn(state.backbone, state.adapter)
         out = logger.run_dir / f"adapter_step_{step_int:08d}"
+        # H7: persist the scheduler identity + the JAX key + both numpy
+        # data-stream RNGs (train + val) so a `--resume` continues the exact
+        # same batch-index sequence rather than replaying from the seed.
+        training_state = build_training_state(
+            step=int(state.step),
+            schedule=cfg.lr_schedule,
+            lr_peak=cfg.lr,
+            rng_key=state.key,
+            numpy_rngs={"train": rng, "val": val_rng},
+        )
         # Single save-side branch selector, shared with the resume tests so
         # the shipped sidecar selection (incl. the hybrid resume-sidecar
         # guard) is unit-tested rather than re-implemented (H3).
@@ -871,6 +910,7 @@ def main(argv: list[str] | None = None) -> int:
             optimizer_state=flatten_opt_state(state.opt_state),
             step=int(state.step),
             run_config=cfg.model_dump(),
+            training_state=training_state,
         )
         if push_tracker:
             push_checkpoint_async(out, push_tracker)
@@ -889,6 +929,21 @@ def main(argv: list[str] | None = None) -> int:
     eval_interval = cadence.eval_interval
     rng = np.random.default_rng(cadence.data_seed)
     val_rng = np.random.default_rng(cadence.data_seed + 1)
+    # H7: on resume, restore the persisted data-stream RNG state so the
+    # resumed run continues the *same* batch-index sequence rather than
+    # replaying from the seed (which would re-train on already-seen batches).
+    # RoSA rejects --resume upstream, so this only affects the non-RoSA path.
+    if args.resume is not None:
+        _resume_key, _resume_np = read_resume_rng_blocks(Path(args.resume))
+        if "train" in _resume_np:
+            rng = _resume_np["train"]
+        if "val" in _resume_np:
+            val_rng = _resume_np["val"]
+        if _resume_key is not None:
+            state = AdapterTrainState(
+                backbone=state.backbone, adapter=state.adapter,
+                opt_state=state.opt_state, step=state.step, key=_resume_key,
+            )
     t0 = time.time()
     final_step = 0
     is_rosa = is_rosa_strategy
@@ -917,7 +972,6 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     def _run_steps(
-        state: AdapterTrainState,
         scan_fn: object,  # eqx-jitted K-step lax.scan closure
         n_steps: int,
         start_step: int,
@@ -934,8 +988,17 @@ def main(argv: list[str] | None = None) -> int:
         single-step) and checkpointing run on the host at the exact boundary
         step. Per-step training losses come back as a ``(chunk,)`` array and
         are replayed at each ``log_interval`` boundary without a per-step
-        host sync."""
-        nonlocal final_step
+        host sync.
+
+        ``state`` is the enclosing-scope carry (declared ``nonlocal``), not a
+        parameter: the chunk loop advances it in place each iteration so the
+        in-loop checkpoint path and ``_save`` — which read ``state.adapter`` /
+        ``state.opt_state`` / ``state.step`` as free variables off that same
+        cell — observe the *post-step* state at every boundary. Before this
+        was wired through the enclosing binding, an intermediate checkpoint
+        (``total_steps > checkpoint_interval``) saved the cold-init adapter /
+        previous-phase carry with a stale step counter (OBS-R3-1)."""
+        nonlocal final_step, state
         done = 0
         while done < n_steps:
             absolute = start_step + done  # steps already completed this phase
@@ -957,13 +1020,15 @@ def main(argv: list[str] | None = None) -> int:
             for i in range(chunk):
                 step = chunk_start + i + 1
                 if step % cfg.log_interval == 0:
-                    logger.log_train(
-                        step=step, loss=float(losses_np[i]),
+                    train_metrics = dict(
+                        loss=float(losses_np[i]),
                         lr=np.asarray(schedule(step)).item(),
                         step_time=_step_time(
                             time.time() - t0, step, run_start
                         ),
                     )
+                    logger.log_train(step=step, **train_metrics)
+                    log_metrics(wandb_run, train_metrics, step=step)
             done += chunk
             final_step = start_step + done
             if final_step % eval_interval == 0:
@@ -976,81 +1041,115 @@ def main(argv: list[str] | None = None) -> int:
                     step=final_step, val_loss=val_loss,
                     val_source=cfg.pgn_val_split if not args.no_pgn else "random",
                 )
+                log_metrics(wandb_run, {"val_loss": val_loss}, step=final_step)
             if final_step % cfg.checkpoint_interval == 0:
                 _save(final_step)
             if should_shutdown():
                 return state, final_step
         return state, final_step
 
-    if is_rosa:
-        # Phase 1: LoRA warmup (state.adapter init'd with
-        # lora_active=True, sparse_active=False; bottleneck branch is
-        # silenced via apply_rosa's sparse_active gate).
-        rosa_cfg = state.adapter.cfg
-        warmup_n = min(rosa_cfg.rosa_warmup_steps, effective_total_steps)
-        # `--resume + RoSA` is rejected upstream (where args.resume is
-        # parsed) so resume_step is guaranteed to be 0 here.
-        state, last = _run_steps(state, scan_step, warmup_n, start_step=0)
-        if not should_shutdown() and warmup_n < effective_total_steps:
-            # Phase 2: gather `mask_samples` batches and accumulate
-            # |grad|^grad_alpha on each sparse delta to derive the
-            # density-thresholded boolean masks. The deltas are zeroed
-            # before Phase 3 so the sparse contribution starts at zero.
-            mask_batches: list = []
-            for _ in range(rosa_cfg.mask_samples):
-                idx = rng.integers(0, corpus.n_games, size=cfg.batch_size)
-                mask_batches.append(slice_batch(corpus, idx))
-            new_sparse = generate_rosa_masks(
-                state.backbone, state.adapter, mask_batches,
-                compute_dtype=compute_dtype,
-            )
-            # Phase 3: re-init LoRA (kaiming A, zero B), install masks,
-            # flip toggles per mode (rosa keeps LoRA on; retro modes
-            # drop LoRA). The optimizer is re-initialised because the
-            # branch toggles change which arrays receive gradients.
-            new_adapter = rosa_phase1_to_phase3(
-                state.adapter, new_sparse, key=jax.random.key(1),
-            )
-            flt = dispatch_filter(cfg.strategy)(new_adapter)
-            opt_state = optimizer.init(eqx.filter(new_adapter, flt))
-            state = AdapterTrainState(
-                backbone=state.backbone,
-                adapter=new_adapter,
-                opt_state=opt_state,
-                step=state.step,
-                key=state.key,
-            )
-            # Phase 3 train step has the same `apply_rosa` closure but
-            # the adapter's toggles are now Phase-3-shaped, so the
-            # composed forward includes sparse (and bottleneck where
-            # appropriate). Re-build the jitted step to pick up the new
-            # opt_state shape.
-            train_step = make_adapter_train_step(
-                cfg.strategy, optimizer,
-                compute_dtype=compute_dtype,
-                use_sdpa=cfg.use_sdpa, use_flash=use_flash,
-            )
-            scan_step = make_adapter_scan_step(train_step)
-            phase3_remaining = effective_total_steps - warmup_n
+    # H7: write schedule_health.json at *every* exit path (normal,
+    # SIGTERM, exception). `reason_for_stop` defaults to `completed`
+    # (full-budget run); SIGTERM and exceptions overwrite it. The
+    # planned budget is the resolved `effective_total_steps`; `final_step`
+    # is what actually ran (their disagreement on a `completed` stop is
+    # the structural-bug signal the lab runner flags).
+    reason_for_stop = "completed"
+    try:
+        if is_rosa:
+            # Phase 1: LoRA warmup (state.adapter init'd with
+            # lora_active=True, sparse_active=False; bottleneck branch is
+            # silenced via apply_rosa's sparse_active gate).
+            rosa_cfg = state.adapter.cfg
+            warmup_n = min(rosa_cfg.rosa_warmup_steps, effective_total_steps)
+            # `--resume + RoSA` is rejected upstream (where args.resume is
+            # parsed) so resume_step is guaranteed to be 0 here.
+            state, last = _run_steps(scan_step, warmup_n, start_step=0)
+            if not should_shutdown() and warmup_n < effective_total_steps:
+                # Phase 2: gather `mask_samples` batches and accumulate
+                # |grad|^grad_alpha on each sparse delta to derive the
+                # density-thresholded boolean masks. The deltas are zeroed
+                # before Phase 3 so the sparse contribution starts at zero.
+                mask_batches: list = []
+                for _ in range(rosa_cfg.mask_samples):
+                    idx = rng.integers(0, corpus.n_games, size=cfg.batch_size)
+                    mask_batches.append(slice_batch(corpus, idx))
+                new_sparse = generate_rosa_masks(
+                    state.backbone, state.adapter, mask_batches,
+                    compute_dtype=compute_dtype,
+                )
+                # Phase 3: re-init LoRA (kaiming A, zero B), install masks,
+                # flip toggles per mode (rosa keeps LoRA on; retro modes
+                # drop LoRA). The optimizer is re-initialised because the
+                # branch toggles change which arrays receive gradients.
+                new_adapter = rosa_phase1_to_phase3(
+                    state.adapter, new_sparse, key=jax.random.key(1),
+                )
+                flt = dispatch_filter(cfg.strategy)(new_adapter)
+                opt_state = optimizer.init(eqx.filter(new_adapter, flt))
+                state = AdapterTrainState(
+                    backbone=state.backbone,
+                    adapter=new_adapter,
+                    opt_state=opt_state,
+                    step=state.step,
+                    key=state.key,
+                )
+                # Phase 3 train step has the same `apply_rosa` closure but
+                # the adapter's toggles are now Phase-3-shaped, so the
+                # composed forward includes sparse (and bottleneck where
+                # appropriate). Re-build the jitted step to pick up the new
+                # opt_state shape.
+                train_step = make_adapter_train_step(
+                    cfg.strategy, optimizer,
+                    compute_dtype=compute_dtype,
+                    use_sdpa=cfg.use_sdpa, use_flash=use_flash,
+                )
+                scan_step = make_adapter_scan_step(train_step)
+                phase3_remaining = effective_total_steps - warmup_n
+                state, _ = _run_steps(
+                    scan_step, phase3_remaining, start_step=warmup_n,
+                )
+        else:
+            # `resume_step` is the absolute step the saved checkpoint
+            # reached; remaining work is `effective_total_steps - resume_step`
+            # so the run honours the resolved (epochs × steps_per_epoch, or
+            # plain total_steps) budget.
+            remaining = max(0, effective_total_steps - resume_step)
             state, _ = _run_steps(
-                state, scan_step, phase3_remaining, start_step=warmup_n,
+                scan_step, remaining, start_step=resume_step,
             )
-    else:
-        # `resume_step` is the absolute step the saved checkpoint
-        # reached; remaining work is `effective_total_steps - resume_step`
-        # so the run honours the resolved (epochs × steps_per_epoch, or
-        # plain total_steps) budget.
-        remaining = max(0, effective_total_steps - resume_step)
-        state, _ = _run_steps(
-            state, scan_step, remaining, start_step=resume_step,
+        # Always emit a final checkpoint at run-end, even when
+        # `total_steps < checkpoint_interval` (short LoRA smokes, sweeps,
+        # the §3 criterion 7 acceptance command). Without this the trained
+        # adapter weights are discarded silently when the loop exits before
+        # crossing a checkpoint boundary.
+        if final_step > 0 and final_step % cfg.checkpoint_interval != 0:
+            _save(final_step)
+        if should_shutdown():
+            reason_for_stop = "sigterm"
+        elif final_step == 0 and resume_step > 0:
+            # Resumed at/past the resolved budget — no steps ran. The
+            # actual step count is the saved checkpoint's, not 0.
+            reason_for_stop = "resume_no_op"
+    except BaseException:
+        reason_for_stop = "exception"
+        raise
+    finally:
+        # `actual` is what ran this session, or the resumed step on a no-op.
+        actual_total = final_step if final_step > 0 else resume_step
+        actual_final_lr = float(
+            np.asarray(schedule(max(0, actual_total - 1))).item()
         )
-    # Always emit a final checkpoint at run-end, even when
-    # `total_steps < checkpoint_interval` (short LoRA smokes, sweeps,
-    # the §3 criterion 7 acceptance command). Without this the trained
-    # adapter weights are discarded silently when the loop exits before
-    # crossing a checkpoint boundary.
-    if final_step > 0 and final_step % cfg.checkpoint_interval != 0:
-        _save(final_step)
+        write_schedule_health(
+            logger.run_dir,
+            schedule=cfg.lr_schedule,
+            planned_total_steps=effective_total_steps,
+            actual_total_steps=actual_total,
+            lr_peak=cfg.lr,
+            actual_final_lr=actual_final_lr,
+            reason_for_stop=reason_for_stop,
+        )
+        finish_wandb(wandb_run)
     if push_tracker:
         # Mirror `scripts/train_jax.py` — only `timeouts > 0` implies a
         # worker is stuck; `errors > 0` is an exit-cleanly upload

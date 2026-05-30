@@ -685,3 +685,614 @@ def test_write_config_json_creates_sibling_file(tmp_path: Path) -> None:
         del os.environ["PAWN_GIT_HASH"]
         del os.environ["PAWN_GIT_TAG"]
         _reset_git_info_cache()
+
+
+# ---------------------------------------------------------------------------
+# H7 — schedule_health.json is written at every trainer exit path
+# ---------------------------------------------------------------------------
+
+
+def _only_run_dir(logs_dir: Path) -> Path:
+    """Return the single MetricsLogger run dir created under `logs_dir`."""
+    candidates = [d for d in logs_dir.iterdir() if d.is_dir()]
+    assert len(candidates) == 1, f"expected one run dir, got {candidates}"
+    return candidates[0]
+
+
+def _gpu_only() -> None:
+    import jax
+
+    if jax.default_backend() != "gpu":
+        pytest.skip("training entry points require the GPU backend")
+
+
+def test_pretrain_writes_schedule_health_on_normal_exit(
+    tmp_path: Path,
+) -> None:
+    """A tiny full-budget pretrain run writes schedule_health.json with
+    `reason_for_stop == "completed"` and actual == planned (H7)."""
+    _gpu_only()
+    # Import the script module by path (scripts/ isn't a package).
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "scripts_train_jax_h7a", Path("scripts/train_jax.py")
+    )
+    assert spec is not None and spec.loader is not None
+    train_jax = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train_jax)
+
+    logs_dir = tmp_path / "logs"
+    rc = train_jax.main([
+        "--supernet", "tiny", "--total-steps", "4", "--batch-size", "2",
+        "--seq-len", "32", "--k", "2", "--no-bucketing",
+        "--local-checkpoints", "--logs-dir", str(logs_dir),
+        "--lr-schedule", "cosine",
+    ])
+    assert rc == 0
+    run_dir = _only_run_dir(logs_dir)
+    health = json.loads((run_dir / "schedule_health.json").read_text())
+    assert health["reason_for_stop"] == "completed"
+    assert health["planned_total_steps"] == 4
+    assert health["actual_total_steps"] == 4
+    assert health["schedule"] == "cosine"
+    assert health["should_reach_zero"] is True
+
+
+def test_pretrain_schedule_health_clamps_overshoot_on_completed(
+    tmp_path: Path,
+) -> None:
+    """OBS-1: when the chunk size does NOT divide the planned budget, the
+    final chunk overshoots (`next_step > total_steps`), but a `completed`
+    run must still report `actual_total_steps == planned_total_steps` so
+    the H7 structural-mismatch tripwire stays unreachable on healthy runs.
+
+    Budget 6, k=4 → chunk 0 produces 4 steps, chunk 1 overshoots to 8 > 6.
+    Without the clamp, `actual_total_steps` would be 8 and trip the red
+    WARNING banner + the lab runner's `structural_mismatch`.
+    """
+    _gpu_only()
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "scripts_train_jax_obs1", Path("scripts/train_jax.py")
+    )
+    assert spec is not None and spec.loader is not None
+    train_jax = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train_jax)
+
+    logs_dir = tmp_path / "logs"
+    rc = train_jax.main([
+        "--supernet", "tiny", "--total-steps", "6", "--batch-size", "2",
+        "--seq-len", "32", "--k", "4", "--no-bucketing",
+        "--local-checkpoints", "--logs-dir", str(logs_dir),
+        "--lr-schedule", "cosine",
+    ])
+    assert rc == 0
+    run_dir = _only_run_dir(logs_dir)
+    health = json.loads((run_dir / "schedule_health.json").read_text())
+    assert health["reason_for_stop"] == "completed"
+    assert health["planned_total_steps"] == 6
+    # Clamped despite the chunk-granularity overshoot (raw next_step == 8).
+    assert health["actual_total_steps"] == 6
+    assert health["completion_ratio"] == 1.0
+
+
+def test_pretrain_writes_schedule_health_on_sigterm(
+    tmp_path: Path,
+) -> None:
+    """When SIGTERM fires mid-run, the trainer still writes
+    schedule_health.json with `reason_for_stop == "sigterm"` and an
+    actual step count below the planned budget (H7)."""
+    _gpu_only()
+    import importlib.util
+
+    from pawn.lifecycle import _reset_shutdown_state_for_tests
+
+    spec = importlib.util.spec_from_file_location(
+        "scripts_train_jax_h7b", Path("scripts/train_jax.py")
+    )
+    assert spec is not None and spec.loader is not None
+    train_jax = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train_jax)
+
+    _reset_shutdown_state_for_tests()
+    logs_dir = tmp_path / "logs"
+
+    # Patch the lifecycle SIGTERM install so the very first poll reports
+    # "shutdown requested" — simulates SIGTERM arriving after chunk 1
+    # without depending on signal-delivery timing.
+    import pawn.lifecycle as lifecycle
+
+    real_install = lifecycle.install_sigterm_handler
+
+    def _fake_install(on_shutdown=None):  # noqa: ANN001
+        del on_shutdown
+        state = {"polls": 0}
+
+        def should_shutdown() -> bool:
+            state["polls"] += 1
+            # Let one chunk complete, then request shutdown.
+            return state["polls"] > 1
+
+        return should_shutdown
+
+    with mock.patch.object(
+        train_jax, "install_sigterm_handler", _fake_install
+    ):
+        rc = train_jax.main([
+            "--supernet", "tiny", "--total-steps", "1000",
+            "--batch-size", "2", "--seq-len", "32", "--k", "2",
+            "--no-bucketing", "--local-checkpoints",
+            "--logs-dir", str(logs_dir), "--lr-schedule", "cosine",
+        ])
+    assert rc == 0
+    run_dir = _only_run_dir(logs_dir)
+    health = json.loads((run_dir / "schedule_health.json").read_text())
+    assert health["reason_for_stop"] == "sigterm"
+    assert health["actual_total_steps"] < health["planned_total_steps"]
+    assert health["planned_total_steps"] == 1000
+
+
+def test_adapter_resume_is_bit_reproducible(tmp_path: Path) -> None:
+    """An adapter run that checkpoints mid-way and resumes reaches the
+    *same* adapter weights as an uninterrupted run of the same length
+    (H7: scheduler + RNG persisted and restored on resume).
+
+    The adapter loop samples per-step batch indices from a numpy
+    ``default_rng(data_seed)`` over a fixed corpus (``--no-pgn`` → a
+    seed-0 random corpus), so the *only* sources of randomness across the
+    resume boundary are: the trained adapter + warm opt-state (restored
+    from the resume sidecar + ``optimizer.safetensors``) and the
+    data-stream RNG (restored from ``training_state.json``).
+
+    The resumed run must land on the uninterrupted reference's final
+    adapter to within the optimizer-state storage precision. (Adam's
+    first-moment ``mu`` is persisted in bfloat16 in
+    ``optimizer.safetensors`` — a deliberate memory trade-off — so a warm
+    resume rounds ``mu`` to bf16 and can't be *bit*-identical. The tight
+    tolerance below is still ~3 orders of magnitude smaller than the
+    divergence a *cold* RNG / opt-state would produce, so it is a real
+    regression tripwire for the H7 restore path: drop the RNG restore and
+    the data stream desyncs, blowing the assertion wide open.) Two
+    identical (non-resumed) runs are bit-exact on this hardware, so the
+    only slack here is the bf16-``mu`` round-trip.
+    """
+    _gpu_only()
+    import importlib.util
+
+    import jax
+    import jax.numpy as jnp
+
+    from pawn.checkpoint import load_model
+
+    def _load_script(path: str, tag: str):  # noqa: ANN202
+        spec = importlib.util.spec_from_file_location(
+            f"scripts_{tag}", Path(f"scripts/{path}.py")
+        )
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    # Build a tiny local backbone for the adapter to fine-tune (avoids the
+    # default HF `pawn-base-v2` fetch).
+    bb_logs = tmp_path / "bb"
+    rc = _load_script("train_jax", "bb").main([
+        "--supernet", "tiny", "--total-steps", "2", "--batch-size", "2",
+        "--seq-len", "32", "--k", "2", "--no-bucketing",
+        "--local-checkpoints", "--logs-dir", str(bb_logs),
+        "--checkpoint-interval", "2",
+    ])
+    assert rc == 0
+    backbone_ckpt = _only_run_dir(bb_logs) / "step_00000002"
+    assert backbone_ckpt.is_dir()
+
+    # lr_schedule defaults to cosine; the adapter loop always writes a
+    # final checkpoint at run-end, so the 2-step run emits
+    # `adapter_step_00000002` without needing a custom checkpoint_interval.
+    common = [
+        "--strategy", "lora", "--supernet", "tiny", "--variant", "base",
+        "--checkpoint", str(backbone_ckpt),
+        "--lora-rank", "2", "--no-pgn", "--batch-size", "2",
+        "--seq-len", "32", "--k", "1", "--local-checkpoints",
+    ]
+
+    # Uninterrupted reference: 4 steps.
+    ref_logs = tmp_path / "ref"
+    rc = _load_script("train_jax_adapter", "ref").main(
+        [*common, "--total-steps", "4", "--logs-dir", str(ref_logs)]
+    )
+    assert rc == 0
+    ref_run = _only_run_dir(ref_logs)
+    ref_model, _ = load_model(ref_run / "adapter_step_00000004")
+
+    # Interrupted: run 2 steps, then resume to 4 from the step-2 checkpoint.
+    a_logs = tmp_path / "a"
+    rc = _load_script("train_jax_adapter", "a").main(
+        [*common, "--total-steps", "2", "--logs-dir", str(a_logs)]
+    )
+    assert rc == 0
+    a_run = _only_run_dir(a_logs)
+    resume_ckpt = a_run / "adapter_step_00000002"
+    assert resume_ckpt.is_dir()
+
+    b_logs = tmp_path / "b"
+    rc = _load_script("train_jax_adapter", "b").main([
+        *common, "--total-steps", "4", "--logs-dir", str(b_logs),
+        "--resume", str(resume_ckpt),
+    ])
+    assert rc == 0
+    b_run = _only_run_dir(b_logs)
+    resumed_model, _ = load_model(b_run / "adapter_step_00000004")
+
+    # Compare the (folded) effective-model array leaves bit-exactly.
+    import equinox as eqx
+
+    ref_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(ref_model, eqx.is_inexact_array)
+    )
+    res_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(resumed_model, eqx.is_inexact_array)
+    )
+    assert len(ref_leaves) == len(res_leaves)
+    max_abs_diff = 0.0
+    for r, s in zip(ref_leaves, res_leaves):
+        max_abs_diff = max(
+            max_abs_diff,
+            float(jnp.max(jnp.abs(jnp.asarray(r) - jnp.asarray(s)))),
+        )
+    # Tight: a cold RNG / opt-state resume desyncs the data stream and
+    # produces O(1e-1+) divergence. The bf16-`mu` round-trip alone is
+    # ~1e-4 here, so this bound proves the RNG + warm opt-state restore.
+    assert max_abs_diff < 1e-2, (
+        f"resumed adapter diverged from the uninterrupted reference by "
+        f"{max_abs_diff:.3e} (> 1e-2); the RNG/opt-state resume restore is "
+        f"not faithful"
+    )
+
+
+def test_adapter_intermediate_checkpoint_is_fresh(tmp_path: Path) -> None:
+    """An adapter run that crosses a checkpoint boundary *mid-loop* writes
+    the *advanced* PyTree, not the cold-init carry (OBS-R3-1).
+
+    The in-loop checkpoint path (``final_step % checkpoint_interval == 0``)
+    runs from inside the nested ``_run_steps`` driver, which advances the
+    carry per chunk. ``_save`` reads ``state.adapter`` / ``state.step`` as
+    free variables off the *enclosing* binding; before that binding was kept
+    in sync (``nonlocal state``), the intermediate ``adapter_step_*`` saved
+    the cold-init adapter (effective == backbone, since LoRA's B is
+    zero-init) and a stale ``training_state.json['step']`` that disagreed with
+    the fresh checkpoint dir name.
+
+    This run is the production shape the resume test can't reach: it sets
+    ``checkpoint_interval=2`` *below* ``total_steps=4`` so the loop fires the
+    in-loop ``_save(2)`` before the run-end ``_save`` — and asserts that
+    intermediate effective model has moved off the backbone (B is no longer
+    zero after 2 trained steps) and that its persisted step counter is 2.
+    """
+    _gpu_only()
+
+    import equinox as eqx
+    import jax
+    import jax.numpy as jnp
+
+    from pawn.adapter_trainer import STRATEGIES, dispatch_init
+    from pawn.adapters import LoRAConfig
+    from pawn.checkpoint import load_model
+    from pawn.config import TINY_VARIANTS
+    from pawn.model import sliced
+
+    backbone_ckpt = _tiny_backbone_ckpt(tmp_path)
+
+    # Build the cold-init effective model the trainer would start from:
+    # slice the tiny supernet to the `base` variant, init the LoRA adapter
+    # with the same key the trainer uses (jax.random.key(0)), and apply.
+    # LoRA's B is zero-init, so this effective model equals the sliced
+    # backbone at step 0 — exactly the PyTree a stale save would round-trip.
+    backbone_model, _ = load_model(backbone_ckpt)
+    sliced_backbone = sliced(backbone_model, TINY_VARIANTS["base"])
+    cold_adapter = dispatch_init("lora")(
+        sliced_backbone, LoRAConfig(rank=2), key=jax.random.key(0)
+    )
+    cold_effective = STRATEGIES["lora"].apply(sliced_backbone, cold_adapter)
+
+    # checkpoint_interval lives on the run config, not the adapter CLI, so
+    # route it through a --config JSON.
+    cfg_path = tmp_path / "adapter.json"
+    cfg_path.write_text(json.dumps({"checkpoint_interval": 2}))
+
+    logs_dir = tmp_path / "logs"
+    rc = _load_script("train_jax_adapter", "obs_r3_1").main([
+        "--config", str(cfg_path),
+        "--strategy", "lora", "--supernet", "tiny", "--variant", "base",
+        "--checkpoint", str(backbone_ckpt), "--lora-rank", "2",
+        "--no-pgn", "--batch-size", "2", "--seq-len", "32", "--k", "1",
+        "--total-steps", "4", "--local-checkpoints",
+        "--logs-dir", str(logs_dir),
+    ])
+    assert rc == 0
+    run_dir = _only_run_dir(logs_dir)
+
+    # The intermediate checkpoint must exist and have been written from the
+    # in-loop path (step 2 < total_steps 4).
+    inter = run_dir / "adapter_step_00000002"
+    assert inter.is_dir(), "intermediate checkpoint not written"
+
+    # (c) the persisted step counter matches the fresh dir name, not the
+    # stale cold-init `state.step` (= 0 on a fresh run).
+    training_state = json.loads((inter / "training_state.json").read_text())
+    assert training_state["step"] == 2, (
+        f"intermediate training_state.json step is "
+        f"{training_state['step']!r}, expected 2 — stale state.step persisted"
+    )
+
+    # (a) the saved effective model must differ from the cold-init effective
+    # model. A stale save would round-trip to `cold_effective` bit-for-bit.
+    inter_model, _ = load_model(inter)
+    cold_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(cold_effective, eqx.is_inexact_array)
+    )
+    inter_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(inter_model, eqx.is_inexact_array)
+    )
+    assert len(cold_leaves) == len(inter_leaves)
+    max_abs_diff = max(
+        (
+            float(jnp.max(jnp.abs(jnp.asarray(c) - jnp.asarray(i))))
+            for c, i in zip(cold_leaves, inter_leaves)
+        ),
+        default=0.0,
+    )
+    assert max_abs_diff > 0.0, (
+        "intermediate adapter checkpoint is identical to the cold-init "
+        "effective model — the in-loop _save persisted a stale PyTree "
+        "instead of the advanced step-2 carry (OBS-R3-1)"
+    )
+
+
+def _load_script(path: str, tag: str):  # noqa: ANN202
+    """Import a ``scripts/<path>.py`` entry point by file location.
+
+    ``scripts/`` is not a package, so the integration tests load each
+    trainer module by path. Each call uses a fresh module name so repeated
+    loads don't collide in ``sys.modules``.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        f"scripts_{tag}", Path(f"scripts/{path}.py")
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _tiny_backbone_ckpt(tmp_path: Path) -> Path:
+    """Pretrain a tiny 2-step backbone and return its checkpoint dir.
+
+    Shared by the adapter schedule_health tests so they fine-tune a local
+    backbone instead of fetching the default HF ``pawn-base-v2``.
+    """
+    bb_logs = tmp_path / "bb"
+    rc = _load_script("train_jax", "bb_h7").main([
+        "--supernet", "tiny", "--total-steps", "2", "--batch-size", "2",
+        "--seq-len", "32", "--k", "2", "--no-bucketing",
+        "--local-checkpoints", "--logs-dir", str(bb_logs),
+        "--checkpoint-interval", "2",
+    ])
+    assert rc == 0
+    ckpt = _only_run_dir(bb_logs) / "step_00000002"
+    assert ckpt.is_dir()
+    return ckpt
+
+
+def test_adapter_writes_schedule_health_on_normal_exit(tmp_path: Path) -> None:
+    """A tiny full-budget adapter run writes schedule_health.json with
+    `reason_for_stop == "completed"` and actual == planned (H7, adapter
+    exit path)."""
+    _gpu_only()
+    backbone_ckpt = _tiny_backbone_ckpt(tmp_path)
+
+    logs_dir = tmp_path / "logs"
+    rc = _load_script("train_jax_adapter", "adapter_h7a").main([
+        "--strategy", "lora", "--supernet", "tiny", "--variant", "base",
+        "--checkpoint", str(backbone_ckpt), "--lora-rank", "2",
+        "--no-pgn", "--batch-size", "2", "--seq-len", "32", "--k", "1",
+        "--total-steps", "4", "--local-checkpoints",
+        "--logs-dir", str(logs_dir),
+    ])
+    assert rc == 0
+    run_dir = _only_run_dir(logs_dir)
+    health = json.loads((run_dir / "schedule_health.json").read_text())
+    assert health["reason_for_stop"] == "completed"
+    assert health["planned_total_steps"] == 4
+    assert health["actual_total_steps"] == 4
+    assert health["schedule"] == "cosine"
+
+
+def test_adapter_writes_schedule_health_on_sigterm(tmp_path: Path) -> None:
+    """When SIGTERM fires mid-run, the adapter trainer still writes
+    schedule_health.json with `reason_for_stop == "sigterm"` and an actual
+    step count below the planned budget (H7, adapter exit path)."""
+    _gpu_only()
+    from pawn.lifecycle import _reset_shutdown_state_for_tests
+
+    _reset_shutdown_state_for_tests()
+    backbone_ckpt = _tiny_backbone_ckpt(tmp_path)
+
+    adapter = _load_script("train_jax_adapter", "adapter_h7b")
+
+    def _fake_install(on_shutdown=None):  # noqa: ANN001
+        del on_shutdown
+        state = {"polls": 0}
+
+        def should_shutdown() -> bool:
+            state["polls"] += 1
+            # Let one chunk complete, then request shutdown.
+            return state["polls"] > 1
+
+        return should_shutdown
+
+    logs_dir = tmp_path / "logs"
+    with mock.patch.object(
+        adapter, "install_sigterm_handler", _fake_install
+    ):
+        rc = adapter.main([
+            "--strategy", "lora", "--supernet", "tiny", "--variant", "base",
+            "--checkpoint", str(backbone_ckpt), "--lora-rank", "2",
+            "--no-pgn", "--batch-size", "2", "--seq-len", "32", "--k", "1",
+            "--total-steps", "1000", "--local-checkpoints",
+            "--logs-dir", str(logs_dir),
+        ])
+    assert rc == 0
+    run_dir = _only_run_dir(logs_dir)
+    health = json.loads((run_dir / "schedule_health.json").read_text())
+    assert health["reason_for_stop"] == "sigterm"
+    assert health["planned_total_steps"] == 1000
+    assert health["actual_total_steps"] < health["planned_total_steps"]
+
+
+def test_adapter_writes_schedule_health_on_resume_no_op(
+    tmp_path: Path,
+) -> None:
+    """Resuming an adapter run at/past its resolved budget runs zero steps
+    and writes schedule_health.json with `reason_for_stop == "resume_no_op"`
+    and `actual_total_steps` == the resumed checkpoint's step (H7)."""
+    _gpu_only()
+    backbone_ckpt = _tiny_backbone_ckpt(tmp_path)
+
+    common = [
+        "--strategy", "lora", "--supernet", "tiny", "--variant", "base",
+        "--checkpoint", str(backbone_ckpt), "--lora-rank", "2",
+        "--no-pgn", "--batch-size", "2", "--seq-len", "32", "--k", "1",
+        "--local-checkpoints",
+    ]
+
+    # First run: 2 steps, writes adapter_step_00000002.
+    a_logs = tmp_path / "a"
+    rc = _load_script("train_jax_adapter", "adapter_h7c1").main(
+        [*common, "--total-steps", "2", "--logs-dir", str(a_logs)]
+    )
+    assert rc == 0
+    resume_ckpt = _only_run_dir(a_logs) / "adapter_step_00000002"
+    assert resume_ckpt.is_dir()
+
+    # Resume with the SAME budget (2): nothing left to run → resume_no_op.
+    b_logs = tmp_path / "b"
+    rc = _load_script("train_jax_adapter", "adapter_h7c2").main([
+        *common, "--total-steps", "2", "--logs-dir", str(b_logs),
+        "--resume", str(resume_ckpt),
+    ])
+    assert rc == 0
+    run_dir = _only_run_dir(b_logs)
+    health = json.loads((run_dir / "schedule_health.json").read_text())
+    assert health["reason_for_stop"] == "resume_no_op"
+    assert health["planned_total_steps"] == 2
+    assert health["actual_total_steps"] == 2
+
+
+def test_pretrain_resume_is_bit_reproducible(tmp_path: Path) -> None:
+    """A pretrain run that checkpoints mid-way and resumes reaches the
+    *same* supernet weights as an uninterrupted run of the same length
+    (H7 / D2: data-stream + scheduler + opt-state persisted/restored).
+
+    The pretrain data stream draws each outer-chunk's engine seed from a
+    *pure function* of ``(BASE_DATA_SEED, chunk_index)`` (no stateful
+    look-ahead Generator), and the checkpoint persists the *consume anchor*
+    (chunk index + intra-chunk batch offset). On resume the prefetcher
+    re-derives from that anchor and skips the already-consumed leading
+    batches, so the resumed batch sequence is bit-identical to the
+    uninterrupted run's tail.
+
+    This guards the exact gap the OBS-2 / D2-1 review finding identified:
+    the buggy predecessor persisted a look-ahead-advanced ``numpy`` rng
+    whose next draw skipped the in-flight (submitted-but-untrained) outer
+    chunk, silently dropping ~one outer-chunk of training and diverging
+    from the uninterrupted run. The tolerance below is the same bf16-``mu``
+    round-trip slack the adapter test uses — a cold/desynced data stream
+    would blow it open by orders of magnitude.
+    """
+    _gpu_only()
+    import importlib.util
+
+    import equinox as eqx
+    import jax
+    import jax.numpy as jnp
+
+    from pawn.checkpoint import load_model
+
+    def _load_script(tag: str):  # noqa: ANN202
+        spec = importlib.util.spec_from_file_location(
+            f"scripts_pretrain_{tag}", Path("scripts/train_jax.py")
+        )
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    # K=2 → each prefetched batch is 2 steps; checkpoint-interval 2 lands a
+    # checkpoint after every batch. `--no-bucketing` keeps a single bucket so
+    # one outer-chunk yields several (3 × outer_factor=1 → here outer_factor
+    # default 3) K-batches; consuming 4 steps draws the first two batches of
+    # outer-chunk 0 (so the mid-chunk resume anchor is (chunk=0, offset=1)).
+    common = [
+        "--supernet", "tiny", "--batch-size", "2", "--seq-len", "32",
+        "--k", "2", "--no-bucketing", "--local-checkpoints",
+        "--checkpoint-interval", "2",
+    ]
+
+    # Uninterrupted reference: 4 steps.
+    ref_logs = tmp_path / "ref"
+    rc = _load_script("ref").main(
+        [*common, "--total-steps", "4", "--logs-dir", str(ref_logs)]
+    )
+    assert rc == 0
+    ref_run = _only_run_dir(ref_logs)
+    ref_model, _ = load_model(ref_run / "step_00000004")
+
+    # Interrupted: run 2 steps, then resume to 4 from the step-2 checkpoint.
+    a_logs = tmp_path / "a"
+    rc = _load_script("a").main(
+        [*common, "--total-steps", "2", "--logs-dir", str(a_logs)]
+    )
+    assert rc == 0
+    a_run = _only_run_dir(a_logs)
+    resume_ckpt = a_run / "step_00000002"
+    assert resume_ckpt.is_dir()
+    # The persisted anchor must be the *mid-chunk* consume position, proving
+    # the prefetcher tracked the in-flight chunk rather than re-drawing past
+    # it. With B*K*outer_factor games in outer-chunk 0 (≥ 2 K-batches), step 2
+    # lands after one consumed batch → (chunk=0, offset=1).
+    ts = json.loads((resume_ckpt / "training_state.json").read_text())
+    assert ts["data_anchor"]["chunk_index"] == 0
+    assert ts["data_anchor"]["batch_offset"] == 1
+
+    b_logs = tmp_path / "b"
+    rc = _load_script("b").main([
+        *common, "--total-steps", "4", "--logs-dir", str(b_logs),
+        "--resume", str(resume_ckpt),
+    ])
+    assert rc == 0
+    b_run = _only_run_dir(b_logs)
+    resumed_model, _ = load_model(b_run / "step_00000004")
+
+    ref_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(ref_model, eqx.is_inexact_array)
+    )
+    res_leaves = jax.tree_util.tree_leaves(
+        eqx.filter(resumed_model, eqx.is_inexact_array)
+    )
+    assert len(ref_leaves) == len(res_leaves)
+    max_abs_diff = 0.0
+    for r, s in zip(ref_leaves, res_leaves):
+        max_abs_diff = max(
+            max_abs_diff,
+            float(jnp.max(jnp.abs(jnp.asarray(r) - jnp.asarray(s)))),
+        )
+    assert max_abs_diff < 1e-2, (
+        f"resumed pretrain diverged from the uninterrupted reference by "
+        f"{max_abs_diff:.3e} (> 1e-2); the data-stream anchor / opt-state "
+        f"resume restore is not faithful (prefetcher look-ahead skip?)"
+    )

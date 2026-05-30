@@ -21,8 +21,14 @@ The on-disk layout for one checkpoint directory ``step_<N>/`` is:
 - ``optimizer.safetensors`` (optional) — flattened Optax state, written
   by :func:`save_model` when the caller passes an ``optimizer_state``
   dict. Skipped if absent. (Trainer integration arrives in S6.)
-- ``training_state.json`` (optional) — ``{"step", "scheduler", "rng"}``
-  plus any user-supplied metadata; same opt-in shape as the optimizer.
+- ``training_state.json`` (optional) — ``{"step", "scheduler",
+  "rng_key", "numpy_rngs"}`` plus any user-supplied metadata; same opt-in
+  shape as the optimizer. ``scheduler`` records the LR-schedule identity +
+  peak (the schedule is a pure function of cfg, so its name is enough to
+  reconstruct it); ``rng_key`` is the serialised JAX PRNG key and
+  ``numpy_rngs`` the data-stream ``numpy.random.Generator`` states, so a
+  ``--resume`` is bit-reproducible vs an uninterrupted run (H7). The
+  payload is assembled by :func:`pawn.lifecycle.build_training_state`.
 - ``.complete`` — the SHA-256 manifest from :func:`pawn._sentinel.write_sentinel`.
   Every load verifies it.
 

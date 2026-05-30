@@ -39,12 +39,21 @@ from pawn.corpus import Corpus, generate_corpus
 from pawn.jax_setup import setup_jax_caching
 from pawn.lifecycle import (
     HFPushTracker,
+    build_training_state,
     drain_push_queue,
     install_sigterm_handler,
     load_resume_state,
     push_checkpoint_async,
+    read_resume_data_anchor,
+    write_schedule_health,
 )
-from pawn.logging import MetricsLogger
+from pawn.logging import MetricsLogger, get_git_info
+from pawn.wandb_utils import (
+    finish_wandb,
+    init_wandb,
+    log_metrics,
+    require_wandb_available,
+)
 from pawn.model import init_model
 from pawn.run_config import PretrainConfig
 from pawn.trainer import (
@@ -57,6 +66,32 @@ from pawn.trainer import (
     make_scan_step,
     make_train_step,
 )
+
+
+# H7 / D2 — base seed for the pretrain data stream. Outer-chunk seeds are
+# derived deterministically from `(BASE_DATA_SEED, chunk_index)` so the seed
+# for a given chunk is independent of when the prefetcher submitted it. Fixed
+# (not configurable) to match the prior seed-0 contract; the per-chunk
+# randomness comes from the chunk index, not a runtime seed field.
+BASE_DATA_SEED: int = 0
+
+
+def _derive_chunk_seed(base_seed: int, chunk_index: int) -> int:
+    """Deterministic engine seed for outer-chunk ``chunk_index``.
+
+    A pure function of ``(base_seed, chunk_index)`` — the data-stream RNG is
+    NOT a stateful generator with prefetcher look-ahead (which silently
+    skipped the in-flight chunk on resume; H7 / D2 review finding). Using a
+    SHA-256 digest of the two integers decorrelates adjacent chunk seeds (so
+    the engine's per-chunk games look independent) while keeping the seed at
+    a given index reproducible regardless of prefetch timing. The result is
+    masked to the engine's accepted ``[0, 2**31 - 1)`` seed range.
+    """
+    import hashlib
+
+    payload = f"{int(base_seed)}:{int(chunk_index)}".encode("ascii")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], "big") % (2**31 - 1)
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -299,6 +334,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     logger.log_config(run_type="pretrain", model=cfg.model_dump())
 
+    # W&B mirror — gated on `--wandb` (cfg.wandb) *and* the `wandb` extra.
+    # `--wandb` without the extra is a hard error (no silent metric drop).
+    wandb_run = None
+    if cfg.wandb:
+        require_wandb_available()
+        wandb_run = init_wandb(
+            project=cfg.wandb_project, slug=logger.slug,
+            run_config=cfg.model_dump(),
+            git_hash=get_git_info().get("git_hash"),
+        )
+
     # HF push tracker (optional).
     push_tracker = HFPushTracker(repo_id=cfg.hf_repo) if cfg.hf_repo else None
 
@@ -312,7 +358,17 @@ def main(argv: list[str] | None = None) -> int:
     scan_step = make_scan_step(train_step, emit_grad_norms=args.emit_grad_norms)
     emit_grad_norms = args.emit_grad_norms
 
-    rng = np.random.default_rng(0)
+    # H7 / D2 — bit-reproducible data stream. The outer-chunk seeds are a
+    # pure function of `(BASE_DATA_SEED, chunk_index)` (see
+    # `_derive_chunk_seed`), *not* a stateful numpy Generator with one-chunk
+    # look-ahead. That severs the seed sequence from the prefetcher's eager
+    # pre-submit so the seed at a given chunk index is identical regardless
+    # of construction timing — the resume anchor is just the *consume*
+    # position (chunk index + intra-chunk batch offset), restored below.
+    resume_chunk = 0
+    resume_skip = 0
+    if cfg.resume:
+        resume_chunk, resume_skip = read_resume_data_anchor(Path(cfg.resume))
     indices = np.arange(cfg.batch_size, dtype=np.int64)
 
     # A.1 — Length bucketing. Read the schedule from `PRETRAIN_BUCKETS`
@@ -403,22 +459,50 @@ def main(argv: list[str] | None = None) -> int:
         next outer-chunk for the executor to start producing. The host
         cost (Rust gen + numpy reshape + H2D enqueue) is overlapped with
         the GPU work consuming earlier batches.
+
+        **Resumable, bit-reproducible data stream (H7 / D2).** The outer-
+        chunk seeds are a *pure function* of ``(base_seed, chunk_index)``
+        via :func:`_derive_chunk_seed`, **not** a stateful ``rng`` with
+        look-ahead. This severs the data-stream RNG from the prefetcher's
+        eager one-chunk look-ahead: the seed produced for outer-chunk ``i``
+        is identical regardless of when (or whether) the prefetcher
+        pre-submitted chunk ``i+1``. The resume anchor is therefore just
+        the *consume* position — the index of the outer-chunk that owns the
+        next batch to be popped, plus how many of that chunk's batches have
+        already been consumed (a checkpoint can land mid-outer-chunk because
+        one chunk yields several K-batches). On resume the prefetcher
+        re-derives from that chunk index and skips the already-consumed
+        leading batches, so the resumed batch sequence is bit-identical to
+        the uninterrupted run's tail. The buggy predecessor persisted a
+        look-ahead-advanced ``rng`` whose next draw skipped the in-flight
+        (submitted-but-untrained) chunk on resume.
         """
 
-        def __init__(self) -> None:
+        def __init__(self, resume_chunk: int = 0, resume_skip: int = 0) -> None:
             self._queue: deque[tuple[int, Batch]] = deque()
             self._pending: Future[list[tuple[int, Batch]]] | None = None
             self._closed = False
             self.outer_factor = max(1, args.bucket_outer_factor)
+            # `_submit_index` is the index of the *next* outer-chunk to
+            # submit; its seed is `_derive_chunk_seed(base_seed, idx)`.
+            self._submit_index = resume_chunk
+            # `_skip_remaining` drops the leading batches of the first
+            # produced chunk that the interrupted run already consumed
+            # before the checkpoint (mid-outer-chunk resume).
+            self._skip_remaining = resume_skip
+            # Consume cursor: the chunk index + intra-chunk batch offset of
+            # the *next* batch `next()` will return. Persisted at checkpoint
+            # time as the bit-reproducible resume anchor.
+            self._consume_chunk = resume_chunk
+            self._consume_offset = resume_skip
             self._submit_next()
-
-        def _next_seed(self) -> int:
-            return int(rng.integers(0, 2**31 - 1))
 
         def _submit_next(self) -> None:
             if self._closed:
                 return
-            seed = self._next_seed()
+            idx = self._submit_index
+            seed = _derive_chunk_seed(BASE_DATA_SEED, idx)
+            self._submit_index += 1
             # Each scan step consumes ``B * accumulation_steps`` games (the
             # micro-batches summed into one optimizer update), so scale the
             # outer-chunk size by ``accumulation_steps`` to keep the same
@@ -439,13 +523,51 @@ def main(argv: list[str] | None = None) -> int:
                 # Immediately queue the next outer-chunk so its host work
                 # overlaps with the GPU work consuming this one.
                 self._submit_next()
+                # Drop the leading batches already consumed pre-checkpoint
+                # (mid-outer-chunk resume). `_skip_remaining` is non-zero
+                # only for the first produced chunk after a resume.
+                if self._skip_remaining:
+                    drop = min(self._skip_remaining, len(outer))
+                    outer = outer[drop:]
+                    self._skip_remaining -= drop
                 self._queue.extend(outer)
                 if not self._queue:
                     # Pathological: a generated corpus has fewer than B*K
                     # games in ANY bucket. Try again rather than spinning.
                     if self._pending is None:
                         return None
-            return self._queue.popleft()
+            batch = self._queue.popleft()
+            # Advance the consume cursor. A boundary between outer-chunks is
+            # crossed when the queue empties *and* a fresh chunk is fetched;
+            # we detect that by tracking how many batches remain queued from
+            # the current chunk. Simpler: re-derive the cursor from the
+            # number of batches consumed so far is brittle under bucket-
+            # dependent chunk sizes, so track per-batch via `_advance_cursor`.
+            self._advance_cursor()
+            return batch
+
+        def _advance_cursor(self) -> None:
+            """Move the consume cursor forward by one batch.
+
+            The cursor names the *next* batch to return: ``(chunk_index,
+            offset_within_chunk)``. When a chunk is exhausted the offset
+            wraps to 0 and the chunk index advances. ``_queue`` plus
+            ``_skip_remaining`` is empty exactly when the current chunk has
+            no more batches queued, so the next pop belongs to the next
+            outer-chunk.
+            """
+            self._consume_offset += 1
+            if not self._queue:
+                # Just emptied the current chunk's queued batches → the next
+                # batch starts the following outer-chunk.
+                self._consume_chunk += 1
+                self._consume_offset = 0
+
+        def resume_anchor(self) -> tuple[int, int]:
+            """Return ``(chunk_index, batches_consumed_in_chunk)`` for the
+            *next* batch to be consumed — the bit-reproducible resume anchor
+            persisted in ``training_state.json``."""
+            return self._consume_chunk, self._consume_offset
 
         def close(self) -> None:
             self._closed = True
@@ -453,6 +575,19 @@ def main(argv: list[str] | None = None) -> int:
                 self._pending.cancel()
             self._pending = None
             self._queue.clear()
+
+    def _data_anchor_block(prefetcher: "BucketedPrefetcher") -> dict[str, int]:
+        """Serialise the prefetcher's consume anchor for the checkpoint.
+
+        ``{"base_seed", "chunk_index", "batch_offset"}`` is everything a
+        resumed run needs to re-derive the data stream from the exact batch
+        the interrupted run was about to consume (H7 / D2)."""
+        chunk_index, batch_offset = prefetcher.resume_anchor()
+        return {
+            "base_seed": BASE_DATA_SEED,
+            "chunk_index": chunk_index,
+            "batch_offset": batch_offset,
+        }
 
     def _save_checkpoint(step_int: int) -> None:
         out = logger.run_dir / f"step_{step_int:08d}"
@@ -469,7 +604,22 @@ def main(argv: list[str] | None = None) -> int:
             state.model, out,
             run_config=cfg.model_dump(),
             optimizer_state=opt_tensors,
-            training_state={"step": int(state.step)},
+            training_state=build_training_state(
+                step=int(state.step),
+                schedule=cfg.lr_schedule,
+                lr_peak=cfg.lr,
+                rng_key=state.key,
+                # Persist the data-stream *consume anchor* — the outer-chunk
+                # index + intra-chunk batch offset of the next batch the
+                # prefetcher will hand out. Outer-chunk seeds derive purely
+                # from `(BASE_DATA_SEED, chunk_index)`, so re-deriving from
+                # this anchor on resume reproduces the exact tail of the
+                # uninterrupted run's batch sequence (bit-reproducible
+                # resume; H7 / D2). This replaces the old look-ahead-polluted
+                # `numpy_rngs={"data": rng}`, which skipped the in-flight
+                # (submitted-but-untrained) chunk on resume.
+                extra={"data_anchor": _data_anchor_block(producer)},
+            ),
         )
         if push_tracker:
             push_checkpoint_async(out, push_tracker)
@@ -479,15 +629,22 @@ def main(argv: list[str] | None = None) -> int:
     next_step = start
 
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pawn-prefetch")
-    producer = BucketedPrefetcher()
+    producer = BucketedPrefetcher(
+        resume_chunk=resume_chunk, resume_skip=resume_skip
+    )
     # Per-bucket throughput counters (visible in the JSONL stream).
     bucket_steps: dict[int, int] = {edge: 0 for edge in bucket_edges}
+    # Stop-reason tracking for schedule_health.json (H7). `step_limit` is
+    # the normal full-budget completion; the SIGTERM / loader-exhausted
+    # paths overwrite it below. `exception` is set in the except clause.
+    reason_for_stop = "completed"
     try:
         while next_step < total_steps:
             nxt = producer.next()
             if nxt is None:
                 # Should be unreachable in practice — generator always
                 # produces at least one batch for a non-empty bucket.
+                reason_for_stop = "loader_exhausted"
                 break
             edge, chunk_batches = nxt
             this_chunk_k = int(chunk_batches.tokens.shape[0])
@@ -515,13 +672,16 @@ def main(argv: list[str] | None = None) -> int:
                     if chunk_gnorms_np is not None:
                         extra["grad_norm"] = float(chunk_gnorms_np[i])
                         extra["did_clip"] = bool(chunk_gnorms_np[i] > cfg.max_grad_norm)
-                    logger.log_train(
-                        step=step, loss=float(chunk_losses_np[i]),
-                        lr=np.asarray(schedule(step)).item(),
+                    lr_now = np.asarray(schedule(step)).item()
+                    train_metrics = dict(
+                        loss=float(chunk_losses_np[i]),
+                        lr=lr_now,
                         step_time=(time.time() - t0) / max(1, step - start),
                         bucket=edge,
                         **extra,
                     )
+                    logger.log_train(step=step, **train_metrics)
+                    log_metrics(wandb_run, train_metrics, step=step)
 
             # Checkpoint when we cross a checkpoint boundary. Use
             # division-based crossing so chunk_k doesn't have to divide
@@ -537,10 +697,55 @@ def main(argv: list[str] | None = None) -> int:
 
             if should_shutdown():
                 _save_checkpoint(next_step)
+                reason_for_stop = "sigterm"
                 break
+        else:
+            # `while` exited via its condition (next_step >= total_steps):
+            # the full planned budget ran. `completed` already set above.
+            reason_for_stop = "completed"
+    except BaseException:
+        reason_for_stop = "exception"
+        raise
     finally:
         producer.close()
         executor.shutdown(wait=False, cancel_futures=True)
+        # H7: write schedule_health.json at *every* exit path (normal,
+        # SIGTERM, exception) so a post-hoc reader can tell whether the LR
+        # schedule ran to completion. `reason_for_stop == "completed"`
+        # with `actual == planned` is the healthy full-run case. The final
+        # LR is the schedule value at the last step actually applied
+        # (`next_step - 1`, clamped to the start so a 0-step run is sane).
+        last_lr = float(
+            np.asarray(schedule(max(start, next_step - 1))).item()
+        )
+        # OBS-1: on a `completed` stop, clamp `actual_total_steps` to the
+        # planned budget. The pretrain loop is `while next_step < total_steps`
+        # and advances by whole K-batches (`next_step += this_chunk_k`), so the
+        # final chunk OVERSHOOTS whenever `cfg.k ∤ (total_steps - start)` —
+        # `next_step` lands exactly on `total_steps` only when the chunk size
+        # divides the remaining budget, which is the exception, not the rule.
+        # That overshoot is a chunk-granularity artifact, not a real schedule
+        # shortfall: a `completed` run never *under*-runs the budget. Reporting
+        # the raw `next_step` would trip `write_schedule_health`'s red banner
+        # AND the lab runner's `structural_mismatch` on healthy runs, gutting
+        # the H7 tripwire's signal. Genuine early exits (sigterm /
+        # loader_exhausted / exception) report the real `next_step` so a true
+        # schedule shortfall still surfaces.
+        actual_total_steps = (
+            min(next_step, total_steps)
+            if reason_for_stop == "completed"
+            else next_step
+        )
+        write_schedule_health(
+            logger.run_dir,
+            schedule=cfg.lr_schedule,
+            planned_total_steps=total_steps,
+            actual_total_steps=actual_total_steps,
+            lr_peak=cfg.lr,
+            actual_final_lr=last_lr,
+            reason_for_stop=reason_for_stop,
+        )
+        finish_wandb(wandb_run)
 
     # Per-bucket step distribution at end of training.
     print(f"Per-bucket step counts: {bucket_steps}", flush=True)

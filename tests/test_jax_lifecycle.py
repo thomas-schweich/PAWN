@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import threading
@@ -20,11 +21,20 @@ from pawn.checkpoint import save_model
 from pawn.config import TINY_SUPERNET
 from pawn.lifecycle import (
     HFPushTracker,
+    SCHEDULES_THAT_REACH_ZERO,
     _reset_shutdown_state_for_tests,
+    build_training_state,
+    deserialize_jax_key,
+    deserialize_numpy_rng,
     drain_push_queue,
     install_sigterm_handler,
     load_resume_state,
     push_checkpoint_async,
+    read_resume_data_anchor,
+    read_resume_rng_blocks,
+    serialize_jax_key,
+    serialize_numpy_rng,
+    write_schedule_health,
 )
 from pawn.model import init_model
 
@@ -604,3 +614,196 @@ def test_load_resume_state_skips_guard_when_conditioning_none(tmp_path: Path) ->
     # checkpoint is C=2.
     state = load_resume_state(out_dir, opt, key=jax.random.key(0))
     assert int(state.step) == 10
+
+
+# ---------------------------------------------------------------------------
+# H7 — schedule_health.json (observability contract)
+# ---------------------------------------------------------------------------
+
+
+def test_write_schedule_health_records_all_fields(tmp_path: Path) -> None:
+    """The helper writes every field the contract pins and returns the
+    same dict it serialised."""
+    health = write_schedule_health(
+        tmp_path,
+        schedule="cosine",
+        planned_total_steps=1000,
+        actual_total_steps=1000,
+        lr_peak=3e-4,
+        actual_final_lr=0.0,
+        reason_for_stop="completed",
+    )
+    on_disk = json.loads((tmp_path / "schedule_health.json").read_text())
+    assert on_disk == health
+    for key in (
+        "format_version", "schedule", "should_reach_zero",
+        "planned_total_steps", "actual_total_steps", "completion_ratio",
+        "lr_peak", "actual_final_lr", "reason_for_stop",
+    ):
+        assert key in health
+    assert health["should_reach_zero"] is True  # cosine reaches zero
+    assert health["reason_for_stop"] == "completed"
+    assert health["completion_ratio"] == 1.0
+
+
+def test_write_schedule_health_constant_schedule_not_zero_reaching() -> None:
+    """`constant` is not in the zero-reaching set, so a step mismatch on
+    it never triggers the structural-bug banner."""
+    assert "constant" not in SCHEDULES_THAT_REACH_ZERO
+    assert "cosine" in SCHEDULES_THAT_REACH_ZERO
+
+
+def test_write_schedule_health_banner_on_structural_mismatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`actual != planned` AND a zero-reaching schedule AND a
+    `completed`/`step_limit` reason prints the red banner (structural-bug
+    signal). SIGTERM with the same mismatch stays silent."""
+    write_schedule_health(
+        tmp_path, schedule="cosine",
+        planned_total_steps=1000, actual_total_steps=500,
+        lr_peak=3e-4, actual_final_lr=1e-4, reason_for_stop="completed",
+    )
+    err = capsys.readouterr().err
+    assert "did not run to completion" in err
+
+    write_schedule_health(
+        tmp_path, schedule="cosine",
+        planned_total_steps=1000, actual_total_steps=500,
+        lr_peak=3e-4, actual_final_lr=1e-4, reason_for_stop="sigterm",
+    )
+    err = capsys.readouterr().err
+    assert "did not run to completion" not in err
+
+
+# ---------------------------------------------------------------------------
+# H7 — RNG + scheduler persistence
+# ---------------------------------------------------------------------------
+
+
+def test_serialize_jax_key_roundtrip() -> None:
+    """A JAX PRNG key survives the JSON-safe round-trip bit-exactly and
+    draws the same downstream randomness."""
+    key = jax.random.key(12345)
+    block = serialize_jax_key(key)
+    # JSON-safe: dumps without error.
+    assert json.loads(json.dumps(block)) == block
+    restored = deserialize_jax_key(block)
+    assert bool(
+        (jax.random.key_data(restored) == jax.random.key_data(key)).all()
+    )
+    # Equivalent randomness.
+    a = jax.random.normal(key, (8,))
+    b = jax.random.normal(restored, (8,))
+    assert jnp.allclose(a, b)
+
+
+def test_serialize_numpy_rng_roundtrip() -> None:
+    """A numpy Generator's bit-generator state round-trips so a resumed
+    data stream continues the *same* sequence."""
+    rng = np.random.default_rng(7)
+    rng.integers(0, 100, size=10)  # advance the state
+    block = serialize_numpy_rng(rng)
+    assert json.loads(json.dumps(block)) == block
+    restored = deserialize_numpy_rng(block)
+    # Both generators must now produce identical draws.
+    assert (
+        rng.integers(0, 1000, size=20) == restored.integers(0, 1000, size=20)
+    ).all()
+
+
+def test_build_training_state_assembles_blocks() -> None:
+    rng = np.random.default_rng(3)
+    state = build_training_state(
+        step=42, schedule="wsd", lr_peak=1e-3,
+        rng_key=jax.random.key(1), numpy_rngs={"train": rng},
+    )
+    assert state["step"] == 42
+    assert state["scheduler"] == {"schedule": "wsd", "lr_peak": 1e-3}
+    assert state["rng_key"]["encoding"] == "jax_key_data_uint32_b64"
+    assert "train" in state["numpy_rngs"]
+    # Whole payload must be JSON-serialisable (checkpoint writes it).
+    json.dumps(state)
+
+
+def test_read_resume_rng_blocks_reads_persisted_state(tmp_path: Path) -> None:
+    """`read_resume_rng_blocks` recovers the JAX key + numpy generators
+    that `build_training_state` persisted."""
+    key = jax.random.key(99)
+    train_rng = np.random.default_rng(11)
+    train_rng.integers(0, 10, size=5)
+    state = build_training_state(
+        step=10, rng_key=key, numpy_rngs={"train": train_rng},
+    )
+    out_dir = tmp_path / "step_00000010"
+    save_model(
+        init_model(TINY_SUPERNET, key=0), out_dir, training_state=state,
+    )
+    jax_key, np_rngs = read_resume_rng_blocks(out_dir)
+    assert jax_key is not None
+    assert bool(
+        (jax.random.key_data(jax_key) == jax.random.key_data(key)).all()
+    )
+    assert "train" in np_rngs
+    assert (
+        train_rng.integers(0, 1000, size=8)
+        == np_rngs["train"].integers(0, 1000, size=8)
+    ).all()
+
+
+def test_read_resume_rng_blocks_empty_when_absent(tmp_path: Path) -> None:
+    """Older checkpoints without RNG blocks yield (None, {})."""
+    out_dir = tmp_path / "step_00000010"
+    save_model(
+        init_model(TINY_SUPERNET, key=0), out_dir, training_state={"step": 10},
+    )
+    jax_key, np_rngs = read_resume_rng_blocks(out_dir)
+    assert jax_key is None
+    assert np_rngs == {}
+
+
+def test_read_resume_data_anchor_round_trips(tmp_path: Path) -> None:
+    """`read_resume_data_anchor` recovers the pretrain prefetcher consume
+    anchor (chunk index + intra-chunk batch offset) persisted under the
+    `data_anchor` block (H7 / D2)."""
+    state = build_training_state(
+        step=10, extra={
+            "data_anchor": {
+                "base_seed": 0, "chunk_index": 3, "batch_offset": 2,
+            }
+        },
+    )
+    out_dir = tmp_path / "step_00000010"
+    save_model(
+        init_model(TINY_SUPERNET, key=0), out_dir, training_state=state,
+    )
+    chunk_index, batch_offset = read_resume_data_anchor(out_dir)
+    assert chunk_index == 3
+    assert batch_offset == 2
+
+
+def test_read_resume_data_anchor_falls_back_to_zero(tmp_path: Path) -> None:
+    """Checkpoints without a `data_anchor` block (older / look-ahead-rng
+    predecessors) yield (0, 0) so the data stream restarts from the
+    beginning rather than skipping batches."""
+    out_dir = tmp_path / "step_00000010"
+    save_model(
+        init_model(TINY_SUPERNET, key=0), out_dir, training_state={"step": 10},
+    )
+    assert read_resume_data_anchor(out_dir) == (0, 0)
+
+
+def test_load_resume_state_restores_persisted_jax_key(tmp_path: Path) -> None:
+    """When `training_state.json` carries `rng_key`, `load_resume_state`
+    restores it instead of using the caller-supplied key."""
+    saved_key = jax.random.key(54321)
+    state_dict = build_training_state(step=10, rng_key=saved_key)
+    out_dir = tmp_path / "step_00000010"
+    save_model(init_model(TINY_SUPERNET, key=0), out_dir,
+               training_state=state_dict)
+    opt = optax.adamw(1e-3)
+    # Pass a *different* key; the persisted one must win.
+    state = load_resume_state(out_dir, opt, key=jax.random.key(0))
+    assert bool(
+        (jax.random.key_data(state.key) == jax.random.key_data(saved_key)).all()
+    )

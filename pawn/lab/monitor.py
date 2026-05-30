@@ -521,10 +521,30 @@ def read_cotrain_val_summary(trial: Trial) -> dict[str, Any] | None:
 
 
 def check_health(trial: Trial) -> str | None:
-    """Return a health issue string, or None if healthy."""
+    """Return a health issue string, or None if healthy.
+
+    Two health signals are surfaced:
+
+    1. NaN/Inf train loss after warmup (a diverged run).
+    2. The H7 schedule-health structural-mismatch banner (plan §8.3): a
+       finished trial whose ``schedule_health.json`` reports
+       ``reason_for_stop == "completed"`` yet ``actual_total_steps !=
+       planned_total_steps``. The trainer writes this file at every exit
+       path; the lab runner reads it here and flags the structural bug so
+       an operator sees the banner without replaying the run.
+    """
     loss = trial.last_train_loss
     if loss is not None and (math.isnan(loss) or math.isinf(loss)):
         threshold = min(500, trial.total_steps // 5) if trial.total_steps > 0 else 500
         if trial.current_step > threshold:
             return "NaN/Inf loss"
+    # H7: surface the schedule-health structural-mismatch banner from the
+    # trial's run dir. Imported lazily to keep the metrics-reading path free
+    # of the runner module.
+    if trial.run_dir is not None:
+        from pawn.lab.runner import audit_schedule_health
+
+        audit = audit_schedule_health(trial.run_dir)
+        if audit["structural_mismatch"]:
+            return audit["banner"]
     return None

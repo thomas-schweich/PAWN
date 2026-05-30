@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import json
+import unittest.mock as mock
 from pathlib import Path
 
 import pytest
 import optuna
 
 from pawn.dashboard.metrics import MetricsBundle, discover_runs, load_metrics
-from pawn.lab.runner import lab_launch, lab_schema, validate_config
+from pawn.lab.runner import (
+    audit_schedule_health,
+    lab_launch,
+    lab_schema,
+    read_schedule_health,
+    validate_config,
+)
 from pawn.sweep import (
     STRATEGY_SUGGESTERS,
     _params_to_argv,
@@ -17,7 +24,13 @@ from pawn.sweep import (
     suggest_lora,
     suggest_rosa,
 )
-from pawn.wandb_utils import finish_wandb, init_wandb, log_metrics
+from pawn.wandb_utils import (
+    finish_wandb,
+    init_wandb,
+    log_metrics,
+    require_wandb_available,
+    wandb_available,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -245,3 +258,127 @@ def test_init_wandb_disabled_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
         project="pawn", slug="test", run_config={}, enabled=True
     )
     assert run is None
+
+
+# ---------------------------------------------------------------------------
+# W&B — gating (H7: --wandb without the extra is a hard error)
+# ---------------------------------------------------------------------------
+
+
+def test_require_wandb_available_errors_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--wandb` requested but the `wandb` extra absent → SystemExit with
+    an actionable message. (Simulate the missing extra by patching the
+    availability probe.)"""
+    monkeypatch.setattr("pawn.wandb_utils.wandb_available", lambda: False)
+    with pytest.raises(SystemExit, match="wandb"):
+        require_wandb_available()
+
+
+def test_require_wandb_available_passes_when_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the extra is installed, the gate is a no-op."""
+    monkeypatch.setattr("pawn.wandb_utils.wandb_available", lambda: True)
+    require_wandb_available()  # must not raise
+
+
+def test_init_wandb_invokes_mirror_with_mock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the extra present, init_wandb forwards to `wandb.init` and
+    `log_metrics` forwards to the run's `.log`. Uses a mocked wandb module
+    so no network/login is required."""
+    import sys
+    import types
+
+    # The test conftest pins PAWN_WANDB_MODE=disabled globally (so no real
+    # W&B run is ever created); override to "offline" here so init_wandb
+    # reaches the (mocked) wandb.init call rather than short-circuiting.
+    monkeypatch.setenv("PAWN_WANDB_MODE", "offline")
+    fake_run = mock.MagicMock(name="wandb_run")
+    fake_wandb = types.ModuleType("wandb")
+    fake_wandb.init = mock.MagicMock(return_value=fake_run)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    run = init_wandb(
+        project="pawn", slug="run-xyz", run_config={"lr": 1e-3},
+        git_hash="deadbeef", enabled=True,
+    )
+    assert run is fake_run
+    fake_wandb.init.assert_called_once()  # type: ignore[attr-defined]
+    _, kwargs = fake_wandb.init.call_args  # type: ignore[attr-defined]
+    assert kwargs["name"] == "run-xyz"
+    assert kwargs["config"]["lr"] == 1e-3
+    assert kwargs["config"]["git_hash"] == "deadbeef"
+
+    log_metrics(run, {"loss": 0.5}, step=10)
+    fake_run.log.assert_called_once_with({"loss": 0.5}, step=10)
+    finish_wandb(run)
+    fake_run.finish.assert_called_once()
+
+
+def test_wandb_available_returns_bool() -> None:
+    assert isinstance(wandb_available(), bool)
+
+
+# ---------------------------------------------------------------------------
+# H7 — lab runner reads schedule_health.json + flags structural mismatch
+# ---------------------------------------------------------------------------
+
+
+def _write_health(run_dir: Path, **fields: object) -> None:
+    base = {
+        "format_version": 1,
+        "schedule": "cosine",
+        "should_reach_zero": True,
+        "planned_total_steps": 1000,
+        "actual_total_steps": 1000,
+        "completion_ratio": 1.0,
+        "lr_peak": 3e-4,
+        "actual_final_lr": 0.0,
+        "reason_for_stop": "completed",
+    }
+    base.update(fields)
+    (run_dir / "schedule_health.json").write_text(json.dumps(base))
+
+
+def test_read_schedule_health_absent_returns_none(tmp_path: Path) -> None:
+    assert read_schedule_health(tmp_path) is None
+
+
+def test_audit_schedule_health_clean_full_run(tmp_path: Path) -> None:
+    """A `completed` run whose actual == planned is healthy: no banner."""
+    _write_health(tmp_path)
+    audit = audit_schedule_health(tmp_path)
+    assert audit["present"] is True
+    assert audit["structural_mismatch"] is False
+    assert audit["banner"] is None
+
+
+def test_audit_schedule_health_flags_structural_mismatch(
+    tmp_path: Path,
+) -> None:
+    """`actual != planned` AND reason_for_stop == 'completed' is the
+    structural-bug signal: the lab runner raises the flag + banner."""
+    _write_health(tmp_path, actual_total_steps=500, reason_for_stop="completed")
+    audit = audit_schedule_health(tmp_path)
+    assert audit["structural_mismatch"] is True
+    assert audit["banner"] is not None
+    assert "STRUCTURAL MISMATCH" in audit["banner"]
+
+
+def test_audit_schedule_health_sigterm_is_not_mismatch(tmp_path: Path) -> None:
+    """A SIGTERM early exit with actual != planned is a *legitimate*
+    early stop, not the structural-bug signal."""
+    _write_health(tmp_path, actual_total_steps=500, reason_for_stop="sigterm")
+    audit = audit_schedule_health(tmp_path)
+    assert audit["structural_mismatch"] is False
+    assert audit["banner"] is None
+
+
+def test_audit_schedule_health_absent_file(tmp_path: Path) -> None:
+    audit = audit_schedule_health(tmp_path)
+    assert audit["present"] is False
+    assert audit["structural_mismatch"] is False
