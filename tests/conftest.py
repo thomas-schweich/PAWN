@@ -56,6 +56,39 @@ def pytest_collection_modifyitems(config, items):
 
 
 # ---------------------------------------------------------------------------
+# JAX persistent compilation cache (session-scoped, autouse)
+# ---------------------------------------------------------------------------
+#
+# Phase C tests compile slow ROCm kernels; without a persistent cache every
+# pytest process re-pays the XLA/ROCm compile cost on first jit. Enabling
+# ``setup_jax_caching()`` keys executables by ``(jaxlib version, GPU
+# platform, HLO hash)`` and writes them to disk, so they're reused across
+# every pytest invocation — and the cache dir is shared with the
+# training/bench scripts that already call it, giving cross-hits on matching
+# TINY configs.
+#
+# This MUST run before any ``jax.jit`` / ``eqx.filter_jit`` compile, hence
+# ``autouse=True`` with session scope: pytest instantiates session-scoped
+# autouse fixtures before the first test body executes. It's correctness-
+# neutral (a stale-cache miss after a jaxlib/driver upgrade just falls back
+# to recompilation) and ``setup_jax_caching`` is idempotent, so the single
+# call here is sufficient for the whole session.
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _jax_compilation_cache() -> None:
+    """Enable JAX's persistent compilation cache for the whole test session.
+
+    Importing :mod:`pawn.jax_setup` is cheap; the function itself imports
+    ``jax`` lazily, so this doesn't drag JAX into tests that never touch it
+    beyond the (already-paid) configuration call.
+    """
+    from pawn.jax_setup import setup_jax_caching
+
+    setup_jax_caching()
+
+
+# ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
 
