@@ -21,6 +21,7 @@ from pawn.corpus import (
     assert_conditioning_C,
     build_loss_mask,
     build_prefix,
+    conditioning_from_run_block,
     conditioning_to_C,
     generate_corpus,
     pack_corpus,
@@ -479,3 +480,35 @@ def test_assert_conditioning_C_raises_on_mismatch() -> None:
     with pytest.raises(ValueError, match="conditioning mismatch"):
         # conditioning=["outcome"] → C=2, but the checkpoint was trained C=1.
         assert_conditioning_C(["outcome"], checkpoint_C=1)
+
+
+# ---------------------------------------------------------------------------
+# conditioning_from_run_block — eval reads the checkpoint's own conditioning
+# ---------------------------------------------------------------------------
+
+
+def test_conditioning_from_run_block_extracts_list() -> None:
+    """Eval reads the conditioning the checkpoint was trained under from
+    the persisted run block (= ``BaseRunConfig.model_dump()``)."""
+    assert conditioning_from_run_block({"conditioning": ["outcome"]}) == ["outcome"]
+    assert conditioning_from_run_block({"conditioning": []}) == []
+
+
+def test_conditioning_from_run_block_defaults_to_empty() -> None:
+    """A checkpoint with no run block (predates the prefix) or a block
+    missing the key falls back to the BOS-only C=1 layout."""
+    assert conditioning_from_run_block(None) == []
+    assert conditioning_from_run_block({}) == []
+    assert conditioning_from_run_block({"lr": 1e-4}) == []
+
+
+def test_conditioning_from_run_block_validates_kinds() -> None:
+    """A corrupted block with an unknown kind raises rather than silently
+    producing a bad prefix."""
+    with pytest.raises(ValueError, match="unknown conditioning kind"):
+        conditioning_from_run_block({"conditioning": ["bogus"]})
+
+
+def test_conditioning_from_run_block_rejects_non_list() -> None:
+    with pytest.raises(ValueError, match="must be a list"):
+        conditioning_from_run_block({"conditioning": "outcome"})

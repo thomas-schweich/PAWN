@@ -118,18 +118,34 @@ def compute_per_phase_accuracy(
 ) -> AccuracyResult:
     """Move accuracy broken down by game phase.
 
-    A position at sequence index ``t`` belongs to:
-    - opening if ``t < phases.opening_end``,
-    - midgame if ``phases.opening_end <= t < phases.midgame_end``,
+    Phase membership is keyed on the **ply** a position predicts, not its
+    raw sequence index. The conditioning prefix (Phase-A Chunk 4) shifts
+    every move ``C`` slots to the right, where ``C`` is the prefix width
+    persisted as ``corpus.outcome_offset`` (constant across the corpus).
+    A position at sequence index ``t`` therefore predicts ply ``t - C``;
+    binning on the raw ``t`` would smear the boundaries by ``C`` and
+    mislabel the first ``C`` plies as opening padding (plan §8.1).
+
+    A position at ply ``p = t - C`` belongs to:
+    - opening if ``p < phases.opening_end``,
+    - midgame if ``phases.opening_end <= p < phases.midgame_end``,
     - endgame otherwise.
 
-    Within each phase, only supervised positions contribute.
+    Within each phase, only supervised positions contribute (the prefix
+    slots are never supervised, so the negative-ply prefix region drops
+    out of every phase regardless of how it bins).
     """
     seq_len = corpus.seq_len
+    # ``outcome_offset`` is the constant prefix width C for every game in
+    # the corpus (the slot where the first move lives). Read it off the
+    # corpus rather than hardcoding a default so the binning tracks the
+    # checkpoint's own conditioning layout.
+    C = int(corpus.outcome_offset[0]) if corpus.n_games > 0 else 1
     positions = np.arange(seq_len)
-    opening_pos = positions < phases.opening_end
-    midgame_pos = (positions >= phases.opening_end) & (positions < phases.midgame_end)
-    endgame_pos = positions >= phases.midgame_end
+    ply = positions - C
+    opening_pos = ply < phases.opening_end
+    midgame_pos = (ply >= phases.opening_end) & (ply < phases.midgame_end)
+    endgame_pos = ply >= phases.midgame_end
 
     n = corpus.n_games
     total_correct = total_sup = 0

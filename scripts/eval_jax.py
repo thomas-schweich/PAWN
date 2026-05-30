@@ -9,8 +9,8 @@ import sys
 from pathlib import Path
 
 from pawn.checkpoint import load_model, resolve_checkpoint_source
-from pawn.corpus import generate_corpus
-from pawn.eval import PhaseBoundaries, compute_per_phase_accuracy
+from pawn.corpus import conditioning_from_run_block, generate_corpus
+from pawn.eval import compute_per_phase_accuracy
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,9 +27,15 @@ def main(argv: list[str] | None = None) -> int:
 
     ckpt = args.checkpoint
     ckpt_path = resolve_checkpoint_source(ckpt)
-    model, _ = load_model(ckpt_path)
+    model, run_block = load_model(ckpt_path)
+    # Build the corpus with the checkpoint's own conditioning so the move
+    # positions land at the same absolute offset the model was trained
+    # under (plan §8.1). A checkpoint written without a run block predates
+    # the conditioning prefix → the BOS-only ``[]`` layout (C=1).
+    conditioning = conditioning_from_run_block(run_block)
     corpus = generate_corpus(
-        n_games=args.n_games, max_ply=args.max_ply, seq_len=args.seq_len, seed=0
+        n_games=args.n_games, max_ply=args.max_ply, seq_len=args.seq_len, seed=0,
+        conditioning=conditioning,
     )
     result = compute_per_phase_accuracy(
         model, corpus, batch_size=args.batch_size,

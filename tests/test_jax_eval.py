@@ -9,12 +9,13 @@ import pytest
 
 from pawn.config import (
     BLACK_CHECKMATES,
+    BOS_TOKEN,
     DRAW_BY_AGREEMENT,
     NUM_ACTIONS,
     TINY_SUPERNET,
     WHITE_CHECKMATES,
 )
-from pawn.corpus import generate_corpus
+from pawn.corpus import generate_corpus, pack_corpus
 from pawn.eval import (
     AccuracyResult,
     PhaseBoundaries,
@@ -60,6 +61,55 @@ def test_compute_per_phase_accuracy_returns_breakdown() -> None:
     # Each phase fraction is finite.
     for v in (result.opening, result.midgame, result.endgame):
         assert 0.0 <= v <= 1.0
+
+
+def test_per_phase_bins_by_ply_with_C_offset() -> None:
+    """Phase membership keys on the ply a position predicts (``t - C``),
+    not the raw sequence slot. The conditioning prefix shifts every move
+    ``C`` slots right; binning on raw ``t`` would mislabel the first ``C``
+    plies. We verify by comparing two corpora built from the *same* games
+    but with C=1 (BOS only) vs C=2 (BOS + outcome): the per-phase
+    *supervised counts* must be identical, because the +C offset cancels
+    the prefix shift. A raw-``t`` binning would instead push ``C`` extra
+    positions out of `opening` into `midgame` for the wider prefix.
+
+    The counts (n_opening / n_midgame / n_endgame) depend only on the
+    loss-mask + C, not on model predictions, so this is deterministic.
+    """
+    # One game, 40 real moves — straddles the opening (<20) / midgame
+    # (20..60) boundary so the bin split is non-trivial.
+    move_ids = np.arange(1, 41, dtype=np.int32)[None, :]  # (1, 40) legal action ids
+    game_lengths = np.array([40], dtype=np.int32)
+    outcome_tokens = np.array([WHITE_CHECKMATES], dtype=np.int32)
+
+    # seq_len large enough to hold C + 40 moves under either conditioning.
+    corpus_c1 = pack_corpus(
+        move_ids, game_lengths, outcome_tokens, seq_len=64, conditioning=[],
+    )
+    corpus_c2 = pack_corpus(
+        move_ids, game_lengths, outcome_tokens, seq_len=64,
+        conditioning=["outcome"],
+    )
+    assert int(corpus_c1.outcome_offset[0]) == 1
+    assert int(corpus_c2.outcome_offset[0]) == 2
+
+    model = init_model(TINY_SUPERNET, key=0)
+    res_c1 = compute_per_phase_accuracy(model, corpus_c1, batch_size=1)
+    res_c2 = compute_per_phase_accuracy(model, corpus_c2, batch_size=1)
+
+    # The +C offset makes the per-phase supervised counts invariant to the
+    # prefix width: same games ⇒ same ply distribution ⇒ same bin counts.
+    assert res_c1.n_total == res_c2.n_total == 40
+    assert res_c1.n_opening == res_c2.n_opening
+    assert res_c1.n_midgame == res_c2.n_midgame
+    assert res_c1.n_endgame == res_c2.n_endgame
+    # Independent expectation: with phases (opening_end=20, midgame_end=60)
+    # and supervised plies p = t - C ∈ {-1, 0, …, 38} (40 positions), the
+    # opening bin (p < 20) holds plies {-1..19} = 21 positions and the
+    # midgame bin (20 <= p < 60) holds {20..38} = 19 positions.
+    assert res_c1.n_opening == 21
+    assert res_c1.n_midgame == 19
+    assert res_c1.n_endgame == 0
 
 
 def test_argmax_never_picks_pad_or_outcome_tokens() -> None:
@@ -200,6 +250,66 @@ def test_autoregressive_generate_kv_cache_matches_full_forward() -> None:
     assert np.array_equal(gen_plain["game_lengths"], gen_cached["game_lengths"])
 
 
+def test_autoregressive_generate_lays_down_c_wide_prefix() -> None:
+    """Phase-A Chunk 4: generation lays the full ``[BOS][cond…]`` prefix
+    (C = 1 + len(conditioning)) into slots ``[0, C)`` and starts moves at
+    slot ``C``, replacing the v1 hardcoded outcome-at-slot-0 layout.
+    With the default ``conditioning=("outcome",)`` ⇒ C=2: slot 0 = BOS,
+    slot 1 = the outcome token."""
+    from pawn.config import BOS_TOKEN, NULL_TOKEN
+    from pawn.generation import WHITE_CHECKMATES, autoregressive_generate
+
+    model = init_model(TINY_SUPERNET, key=0)
+    gen = autoregressive_generate(
+        model, WHITE_CHECKMATES, n_games=3,
+        mask_illegal=True, max_seq_len=12, seed=0,
+    )
+    seqs = gen["sequences"]
+    assert (seqs[:, 0] == BOS_TOKEN).all()
+    assert (seqs[:, 1] == WHITE_CHECKMATES).all()
+    # No NULL leaked into the prefix (outcome resolves to a real token).
+    assert not (seqs == NULL_TOKEN).any()
+    # The prefix width C is reported for downstream analysis.
+    assert int(gen["conditioning_offset"]) == 2
+
+
+def test_autoregressive_generate_kv_cache_matches_full_forward_with_prefix() -> None:
+    """KV-cache vs full-forward parity must hold when the decode starts
+    from a non-trivial move prefix on top of the C-wide conditioning
+    prefix. The cached prefill processes ``[0, C + prefix_len)`` from
+    ``pos_start=0`` and decodes from ``pos_start = C - 1 + prefix_len``;
+    the full-forward path recomputes the whole window each step. Both must
+    produce bit-identical sequences (shared Gumbel RNG + numerically
+    equivalent logits)."""
+    from pawn.generation import WHITE_CHECKMATES, autoregressive_generate
+
+    model = init_model(TINY_SUPERNET, key=0)
+    # Two games, each seeded with the same legal, non-terminating 2-ply
+    # opening line (token 45 = a legal white opening move; token 1388 = a
+    # legal black reply).
+    prefix_moves = np.array([[45, 1388], [45, 1388]], dtype=np.int32)
+    prefix_lengths = np.array([2, 2], dtype=np.int32)
+
+    gen_plain = autoregressive_generate(
+        model, WHITE_CHECKMATES, n_games=2, use_kv_cache=False,
+        mask_illegal=True, max_seq_len=12, seed=0,
+        prefix_moves=prefix_moves, prefix_lengths=prefix_lengths,
+    )
+    gen_cached = autoregressive_generate(
+        model, WHITE_CHECKMATES, n_games=2, use_kv_cache=True,
+        mask_illegal=True, max_seq_len=12, seed=0,
+        prefix_moves=prefix_moves, prefix_lengths=prefix_lengths,
+    )
+    assert np.array_equal(gen_plain["sequences"], gen_cached["sequences"])
+    assert np.array_equal(gen_plain["term_codes"], gen_cached["term_codes"])
+    assert np.array_equal(gen_plain["game_lengths"], gen_cached["game_lengths"])
+    # The prefix moves landed at slots [C, C+prefix_len): C=2 → slots 2,3.
+    assert (gen_plain["sequences"][:, 2] == 45).all()
+    assert (gen_plain["sequences"][:, 3] == 1388).all()
+    # The games kept decoding past the prefix (not terminated at load).
+    assert (gen_plain["game_lengths"] >= 2).all()
+
+
 def test_autoregressive_generate_bf16_cache_runs() -> None:
     """The `cache_dtype=jnp.bfloat16` path (paired with `compute_dtype`)
     must run end-to-end. Round-3 test-risk MEDIUM: the bf16-cache opt-in
@@ -221,8 +331,11 @@ def test_autoregressive_generate_bf16_cache_runs() -> None:
     assert gen["sequences"].shape == (2, 8)
     assert gen["sequences"].dtype == np.int32
     assert gen["term_codes"].shape == (2,)
-    # Outcome token at pos 0 is preserved regardless of dtype.
-    assert (gen["sequences"][:, 0] == WHITE_CHECKMATES).all()
+    # Phase-A Chunk 4 layout: slot 0 is BOS, the outcome conditioning lives
+    # at slot 1 (the default `conditioning=("outcome",)` ⇒ C=2). Both are
+    # preserved regardless of cache dtype.
+    assert (gen["sequences"][:, 0] == BOS_TOKEN).all()
+    assert (gen["sequences"][:, 1] == WHITE_CHECKMATES).all()
 
 
 def test_autoregressive_generate_rejects_bf16_cache_with_fp32_compute() -> None:

@@ -44,7 +44,7 @@ import numpy as np
 import optax
 from jaxtyping import Array, Bool, Float, Int
 
-from pawn.config import ModelConfig
+from pawn.config import ModelConfig, NULL_TOKEN
 from pawn.corpus import Corpus
 from pawn.model import EffectiveCallable, PAWNModel, sliced
 from pawn.run_config import BaseRunConfig
@@ -67,6 +67,19 @@ __all__ = [
 
 
 _CLIP_NORM: Final[float] = 1.0
+
+# First logit column that must be masked to -inf before the softmax-CE.
+# Columns ``[NULL_TOKEN .. V)`` are NULL + the reserved control IDs
+# (1981–1999): they exist in the uniform ``V``-wide embedding / logit
+# tables (Phase-A Chunk 2) but are never legitimate prediction targets,
+# so masking them to -inf keeps them out of the softmax denominator
+# (no dilution of move-token mass) and zeros their backward gradient.
+# BOS (1980) is excluded — it sits one below ``NULL_TOKEN`` and, like
+# PAD / outcome columns, is left in the softmax (it is never a target so
+# it accrues only the benign softmax-denominator gradient). The
+# threshold matches the plan's "reserved/NULL/control columns (≥1981)"
+# acceptance gate; Phase B's distillation-KL will reuse the same mask.
+_FIRST_RESERVED_COLUMN: Final[int] = NULL_TOKEN
 
 
 # ---------------------------------------------------------------------------
@@ -214,8 +227,24 @@ def cross_entropy_loss(
     # review (Opus conv) caught the previous comment overstating the
     # forward saving here.
     with jax.named_scope("cross_entropy"):
+        # Mask the reserved / NULL / control columns (IDs ≥ NULL_TOKEN)
+        # to -inf before the softmax so they neither dilute the move-token
+        # probability mass nor accrue gradient. The autograd graph through
+        # the constant -inf substitution is detached at those columns, so
+        # the corresponding rows of ``embed_tokens`` (and, when untied,
+        # ``lm_head``) receive exactly zero gradient. Done in fp32 (the CE
+        # runs in fp32 for numerical stability); -inf is representable so
+        # ``exp(-inf) = 0`` keeps the denominator finite as long as at
+        # least one move/PAD/outcome/BOS column survives — which it always
+        # does (columns ``[0, NULL_TOKEN)`` are untouched).
+        logits_f32 = logits.astype(jnp.float32)
+        v = logits_f32.shape[-1]
+        reserved_cols = (
+            jnp.arange(v, dtype=jnp.int32) >= jnp.int32(_FIRST_RESERVED_COLUMN)
+        )
+        masked_logits = jnp.where(reserved_cols, -jnp.inf, logits_f32)
         per_pos_loss = optax.softmax_cross_entropy_with_integer_labels(
-            logits.astype(jnp.float32), batch.targets,
+            masked_logits, batch.targets,
             where=batch.loss_mask.astype(jnp.bool_)[..., None],
         )  # (B, T), zero at PAD positions thanks to ``where=``
         n_real = jnp.maximum(batch.loss_mask.sum(), 1)

@@ -219,6 +219,37 @@ def test_save_with_run_config_and_optimizer(tmp_path: Path) -> None:
     assert jnp.array_equal(loaded.embed_tokens, model.embed_tokens)
 
 
+def test_eval_reads_checkpoint_conditioning_round_trip(tmp_path: Path) -> None:
+    """Chunk 5: eval rebuilds the corpus from the checkpoint's *own*
+    conditioning, read back through ``load_model`` →
+    ``conditioning_from_run_block``. Save a checkpoint whose run block
+    records ``conditioning=["outcome"]``; the helper must recover exactly
+    that list so the eval corpus lands at the trained offset C=2 (plan
+    §8.1). A checkpoint with no run block falls back to the BOS-only C=1
+    layout."""
+    from pawn.corpus import conditioning_from_run_block, conditioning_to_C
+
+    model = init_model(TINY_SUPERNET, key=0)
+
+    out_outcome = tmp_path / "outcome_ckpt"
+    save_model(
+        model, out_outcome,
+        run_config={"conditioning": ["outcome"], "C": 2, "lr": 3e-4},
+    )
+    _, run_block = load_model(out_outcome)
+    recovered = conditioning_from_run_block(run_block)
+    assert recovered == ["outcome"]
+    assert conditioning_to_C(recovered) == 2
+
+    # No run block ⇒ BOS-only layout.
+    out_bare = tmp_path / "bare_ckpt"
+    save_model(model, out_bare)
+    _, bare_block = load_model(out_bare)
+    assert bare_block is None
+    assert conditioning_from_run_block(bare_block) == []
+    assert conditioning_to_C(conditioning_from_run_block(bare_block)) == 1
+
+
 # ---------------------------------------------------------------------------
 # config.json: tie_embeddings / vocab_size / mask_version persistence
 # ---------------------------------------------------------------------------

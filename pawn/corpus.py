@@ -64,7 +64,39 @@ __all__ = [
     "build_loss_mask",
     "conditioning_to_C",
     "assert_conditioning_C",
+    "conditioning_from_run_block",
 ]
+
+
+def conditioning_from_run_block(run_block: Mapping[str, object] | None) -> list[str]:
+    """Extract a checkpoint's ``conditioning`` list from its persisted run block.
+
+    ``run_block`` is the ``config.json`` ``run`` dict returned by
+    :func:`pawn.checkpoint.load_model` — ``BaseRunConfig.model_dump()``,
+    which carries the run's ``conditioning`` field. Eval / generation read
+    it so they rebuild the exact sequence layout the checkpoint was trained
+    under (plan §8.1) instead of assuming a hardcoded default.
+
+    Returns ``[]`` (the BOS-only ``C=1`` layout) when the checkpoint has no
+    run block (it predates the conditioning prefix) or the block omits the
+    key. Every entry is validated against
+    :data:`pawn.config.CONDITIONING_KINDS` so a corrupted block can't
+    silently produce a bad prefix.
+    """
+    if not run_block:
+        return []
+    raw = run_block.get("conditioning")
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(
+            f"run block `conditioning` must be a list of kinds, got "
+            f"{type(raw).__name__}: {raw!r}"
+        )
+    conditioning = [str(k) for k in raw]
+    # Validate via the shared helper (raises on an unknown kind).
+    conditioning_to_C(conditioning)
+    return conditioning
 
 
 def conditioning_to_C(conditioning: Sequence[str]) -> int:

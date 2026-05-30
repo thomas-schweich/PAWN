@@ -23,16 +23,27 @@ import sys
 from pathlib import Path
 
 from pawn.checkpoint import load_model, resolve_checkpoint_source
+from pawn.corpus import conditioning_from_run_block
 from pawn.generation import run_all_diagnostics
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="eval_generation_jax")
     ap.add_argument("--checkpoint", required=True)
-    gate = ap.add_mutually_exclusive_group(required=True)
-    gate.add_argument("--outcome-prefix-trained", dest="trained", action="store_true")
+    # The gate defaults to auto-detection from the checkpoint's persisted
+    # conditioning (plan §8.1: eval reads the checkpoint's own conditioning)
+    # — a checkpoint trained with conditioning=["outcome"] runs the
+    # diagnostics; one without it reports `_skipped`. The explicit flags
+    # override the auto-detection (e.g. to force the skip path for a parity
+    # check, or to run diagnostics on a checkpoint whose run block is
+    # absent).
+    gate = ap.add_mutually_exclusive_group(required=False)
     gate.add_argument(
-        "--no-outcome-prefix-trained", dest="trained", action="store_false"
+        "--outcome-prefix-trained", dest="trained",
+        action="store_true", default=None,
+    )
+    gate.add_argument(
+        "--no-outcome-prefix-trained", dest="trained", action="store_false",
     )
     ap.add_argument(
         "--edge-cases", action="store_true",
@@ -83,11 +94,19 @@ def main(argv: list[str] | None = None) -> int:
 
     ckpt = args.checkpoint
     ckpt_path = resolve_checkpoint_source(ckpt)
-    model, _ = load_model(ckpt_path)
+    model, run_block = load_model(ckpt_path)
+
+    # Auto-detect outcome conditioning from the checkpoint's run block when
+    # the operator didn't pass an explicit gate flag.
+    if args.trained is None:
+        conditioning = conditioning_from_run_block(run_block)
+        outcome_prefix_trained = "outcome" in conditioning
+    else:
+        outcome_prefix_trained = args.trained
 
     results = run_all_diagnostics(
         model,
-        outcome_prefix_trained=args.trained,
+        outcome_prefix_trained=outcome_prefix_trained,
         n_per_outcome=args.gen_n_per_outcome,
         max_seq_len=args.gen_max_seq_len,
         cache_dtype=cache_dtype,

@@ -39,6 +39,7 @@ KV-cache parity test).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, cast
 
 import jax
@@ -58,6 +59,7 @@ from pawn.config import (
     STALEMATE,
     WHITE_CHECKMATES,
 )
+from pawn.corpus import build_prefix, conditioning_to_C
 from pawn.model import (
     EffectiveCallable,
     KVCache,
@@ -65,6 +67,14 @@ from pawn.model import (
     PAWNModel,
     init_kv_cache,
 )
+
+# Default conditioning for the generation diagnostics: a single
+# ``"outcome"`` slot (prefix width ``C = 2`` → ``[BOS][outcome]``). Every
+# diagnostic conditions on the outcome token, so this is the layout they
+# were written for; callers wanting a different prefix pass their own
+# ``conditioning`` list (resolved against the checkpoint's persisted run
+# block by the eval driver).
+_OUTCOME_CONDITIONING: Sequence[str] = ("outcome",)
 
 __all__ = [
     "DIAGNOSTIC_NAMES",
@@ -102,9 +112,9 @@ OUTCOME_TOKENS: dict[str, int] = {
 
 
 _SKIP_REASON = (
-    "model was not trained with prepend_outcome=True; this diagnostic "
-    "conditions on the outcome token at position 0 and is uninterpretable "
-    "without it"
+    "model was not trained with an outcome conditioning slot "
+    "(conditioning=[\"outcome\"]); this diagnostic conditions on the "
+    "outcome token in the prefix and is uninterpretable without it"
 )
 
 
@@ -116,6 +126,36 @@ def _argmax_action(logits: Float[Array, "B T V"]) -> Int[Array, "B T"]:
     """Argmax restricted to ``[0, NUM_ACTIONS)`` so PAD / outcome tokens
     can't be sampled."""
     return jnp.argmax(logits[..., :NUM_ACTIONS], axis=-1)
+
+
+def _single_row_prefixed(
+    outcome_token: int,
+    seq_len: int,
+    *,
+    moves: np.ndarray | None = None,
+    conditioning: Sequence[str] = _OUTCOME_CONDITIONING,
+) -> tuple[Int[Array, "1 T"], Int[Array, "1 T"], int]:
+    """Build a one-row ``(tokens, attn, C)`` buffer with the C-wide prefix.
+
+    Lays ``[BOS][cond…]`` into slots ``[0, C)`` via the shared
+    :func:`pawn.corpus.build_prefix` (so the diagnostics use the exact
+    layout the model trained under), optionally appends ``moves`` at slots
+    ``[C, C+len(moves))``, and sets the attention mask True over the real
+    span. Returns the prefix width ``C`` so the caller reads logits /
+    argmax at the right slot (the next move after ``m`` prefix moves is
+    predicted at slot ``C - 1 + m``).
+    """
+    C = conditioning_to_C(conditioning)  # noqa: N806
+    prefix = build_prefix(conditioning, np.full(1, outcome_token, dtype=np.int32), 1)
+    tokens = jnp.full((1, seq_len), PAD_TOKEN, dtype=jnp.int32)
+    tokens = tokens.at[0, :C].set(jnp.asarray(prefix[0]))
+    real = C
+    if moves is not None:
+        m = int(np.asarray(moves).shape[0])
+        tokens = tokens.at[0, C : C + m].set(jnp.asarray(moves, dtype=jnp.int32))
+        real = C + m
+    attn = jnp.zeros((1, seq_len), dtype=jnp.bool_).at[0, :real].set(True)
+    return tokens, attn, C
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +203,7 @@ def autoregressive_generate(
     use_kv_cache: bool | None = None,
     cache_dtype: jnp.dtype | None = None,
     compute_dtype: jnp.dtype | None = None,
+    conditioning: Sequence[str] = _OUTCOME_CONDITIONING,
 ) -> dict[str, np.ndarray]:
     """Generate ``n_games`` games autoregressively from ``model``.
 
@@ -170,6 +211,16 @@ def autoregressive_generate(
     contract — same input shapes, same output dict keys. Game state is
     tracked by :class:`chess_engine.PyBatchRLEnv` so legal-move masking
     and termination detection match the v1 engine.
+
+    ``conditioning`` (default ``("outcome",)``) is the ordered control-kind
+    list assembled into the fixed-width prefix the model was trained under
+    (Phase-A Chunk 4). The sequence is laid out as ``[BOS][cond…][ply…]``:
+    slot 0 is BOS, slots ``1..C-1`` carry the resolved control token per
+    kind (the ``"outcome"`` kind resolves to ``outcome_token``; other kinds
+    NULL-fill since the diagnostics only vary the outcome), and the first
+    move lands at slot ``C = 1 + len(conditioning)``. Decoding starts from
+    ``pos_start = C-1`` — the last prefix slot, whose logits predict
+    ``ply_1`` — replacing the v1 hardcoded outcome-at-slot-0 layout.
 
     ``use_kv_cache`` (default: auto-detect): when the ``model`` exposes
     :meth:`PAWNModel.forward_with_cache`, use the cached decode path —
@@ -199,6 +250,10 @@ def autoregressive_generate(
         forfeit_ply:     (n_games,) int32 — ply of first illegal move (-1
                                             if none); only meaningful in
                                             ``mask_illegal=False`` mode
+        conditioning_offset: 0-d int32 — the prefix width ``C`` (move
+                                            ``g`` lives at slot
+                                            ``C + g - 1``), read by
+                                            :func:`analyze_generated_games`
 
     ``mask_illegal=True`` forces every sampled token to be a legal move
     in the current position; ``False`` permits the model to sample an
@@ -234,13 +289,27 @@ def autoregressive_generate(
             "cache writes."
         )
 
-    # Sequences buffer + initial outcome conditioning.
-    sequences = np.full((n_games, max_seq_len), PAD_TOKEN, dtype=np.int32)
-    sequences[:, 0] = outcome_token
+    # ---- Conditioning prefix (Phase-A Chunk 4) ----------------------------
+    # Lay the full ``C``-wide ``[BOS][cond…]`` prefix into slots ``[0, C)``
+    # via the shared assembler so generation uses the *same* layout the
+    # trainer / corpus packer use. The ``"outcome"`` kind resolves to
+    # ``outcome_token`` for every game; any other kind NULL-fills (the
+    # diagnostics only vary the outcome). Moves then start at slot ``C``.
+    C = conditioning_to_C(conditioning)  # noqa: N806
+    if max_seq_len <= C:
+        raise ValueError(
+            f"max_seq_len ({max_seq_len}) must exceed the conditioning prefix "
+            f"width C={C} so at least one move slot remains"
+        )
+    outcome_tokens = np.full(n_games, outcome_token, dtype=np.int32)
+    prefix = build_prefix(conditioning, outcome_tokens, n_games)  # (n, C)
 
-    # `max_ply` for the engine is the move-positions budget (post-
-    # outcome-token), so subtract one from the total seq budget.
-    max_move_positions = max_seq_len - 1
+    sequences = np.full((n_games, max_seq_len), PAD_TOKEN, dtype=np.int32)
+    sequences[:, :C] = prefix
+
+    # `max_ply` for the engine is the move-positions budget (the slots
+    # after the C-wide prefix), so subtract C from the total seq budget.
+    max_move_positions = max_seq_len - C
     env = engine.PyBatchRLEnv(n_games, max_ply=max_move_positions, seed=seed)
     env.reset()
     terminated = np.zeros(n_games, dtype=bool)
@@ -249,7 +318,7 @@ def autoregressive_generate(
     term_codes = np.full(n_games, -1, dtype=np.int8)
     all_indices = np.arange(n_games, dtype=np.uint32)
 
-    # ---- Prefix application (v1 parity) -----------------------------------
+    # ---- Prefix-move application (v1 parity) ------------------------------
     prefix_end = 0
     if prefix_moves is not None and prefix_lengths is not None:
         padded = np.zeros((n_games, max_move_positions), dtype=np.uint16)
@@ -263,7 +332,7 @@ def autoregressive_generate(
         prefix_tc = env.load_prefixes(padded, lengths_u32)
         for i in range(n_games):
             pl = int(clamped_pls[i])
-            sequences[i, 1 : pl + 1] = prefix_moves[i, :pl]
+            sequences[i, C : C + pl] = prefix_moves[i, :pl]
             if prefix_tc[i] >= 0:
                 terminated[i] = True
                 terminated_at[i] = pl
@@ -317,10 +386,14 @@ def autoregressive_generate(
         )
         sampled = (next_logits_arr + gumbel).argmax(axis=-1).astype(np.int32)
         sequences[:, pos] = sampled
+        # Slot ``pos`` holds the move at env-ply ``pos - C`` (the prefix
+        # occupies slots ``[0, C)``). A PAD emitted at ``pos`` means the
+        # game produced ``pos - C`` real moves before stopping.
+        ply = pos - C
         pad_mask = active & (sampled == PAD_TOKEN)
         if pad_mask.any():
             terminated[pad_mask] = True
-            terminated_at[pad_mask] = pos - 1
+            terminated_at[pad_mask] = ply
             term_codes[pad_mask] = -2
         move_mask = active & ~pad_mask & ~terminated
         if move_mask.any():
@@ -332,15 +405,19 @@ def autoregressive_generate(
             illegal = ~legality
             if illegal.any():
                 forfeit_global = mv_idx[illegal]
-                forfeit_ply[forfeit_global] = pos - 1
+                forfeit_ply[forfeit_global] = ply
                 terminated[forfeit_global] = True
-                terminated_at[forfeit_global] = pos - 1
+                terminated_at[forfeit_global] = ply
                 term_codes[forfeit_global] = -3
             termed = legality & (step_tc >= 0)
             if termed.any():
                 tg = mv_idx[termed]
                 terminated[tg] = True
-                terminated_at[tg] = pos
+                # A terminating *move* at slot ``pos`` is the
+                # ``(pos - C + 1)``-th move, so the game length counts it
+                # in (one more than the PAD case ``pos - C``). With the v1
+                # C=1 layout this reduces to ``pos``.
+                terminated_at[tg] = ply + 1
                 term_codes[tg] = step_tc[termed]
         return sampled
 
@@ -378,8 +455,11 @@ def autoregressive_generate(
                 tokens, cache_in, pos_start, compute_dtype=compute_dtype,
             )
 
-        # Prefill: outcome + any prefix in one call.
-        prefill_len = prefix_end + 1
+        # Prefill: the full C-wide prefix + any prefix moves in one call.
+        # ``logits[:, -1]`` is the prediction at the last prefilled slot
+        # (``prefill_len - 1``); with no prefix moves that is slot ``C-1``,
+        # i.e. decoding starts from ``pos_start = C-1``.
+        prefill_len = prefix_end + C
         tokens_jax = jnp.asarray(sequences[:, :prefill_len])
         logits_jax, cache = _forward_cached(
             tokens_jax, cache, jnp.int32(0),
@@ -403,7 +483,7 @@ def autoregressive_generate(
         ) -> Float[Array, "B T V"]:
             return model(t, a, compute_dtype=compute_dtype)
 
-        prefill_len = prefix_end + 1
+        prefill_len = prefix_end + C
         tokens_jax = jnp.asarray(sequences[:, :prefill_len])
         attn_jax = jnp.ones_like(tokens_jax, dtype=jnp.bool_)
         logits_jax = _forward(tokens_jax, attn_jax)
@@ -428,6 +508,10 @@ def autoregressive_generate(
         "term_codes": term_codes,
         "game_lengths": terminated_at.astype(np.int32),
         "forfeit_ply": forfeit_ply,
+        # Prefix width C, so downstream analysis can map a move-count game
+        # length back to its absolute slot (move ``g`` lives at slot
+        # ``C + g - 1``). Stored as a 0-d int array for dict-shape parity.
+        "conditioning_offset": np.asarray(C, dtype=np.int32),
     }
 
 
@@ -443,6 +527,11 @@ def analyze_generated_games(
     term_codes = gen["term_codes"]
     game_lengths = gen["game_lengths"]
     forfeit_ply = gen["forfeit_ply"]
+    # Prefix width C (default 1 for back-compat with pre-Chunk-4 dicts).
+    # A move-count game length ``gl`` ends at absolute slot ``C + gl - 1``
+    # (move ``g`` lives at slot ``C + g - 1``), so the post-terminal region
+    # starts at ``C + gl``.
+    C = int(gen.get("conditioning_offset", np.int32(1)))  # noqa: N806
     n = len(sequences)
     max_seq_len = sequences.shape[1]
 
@@ -463,7 +552,7 @@ def analyze_generated_games(
     n_post_terminal_move = 0
     for i in range(n):
         gl = int(game_lengths[i])
-        post_start = gl + 1
+        post_start = C + gl
         if post_start < max_seq_len:
             post = sequences[i, post_start:]
             n_post_terminal_tokens += len(post)
@@ -552,14 +641,13 @@ def prefix_continuation_test(
     prefix_np = np.asarray(prefix, dtype=np.int32)
     p = int(prefix_np.shape[0])
 
-    # Cheap single-shot next-move argmax (the previous behaviour).
-    tokens = jnp.full((1, seq_len), PAD_TOKEN, dtype=jnp.int32)
-    tokens = tokens.at[0, 0].set(outcome_token)
-    tokens = tokens.at[0, 1 : 1 + p].set(jnp.asarray(prefix_np))
-    attn = jnp.zeros((1, seq_len), dtype=jnp.bool_)
-    attn = attn.at[0, : 1 + p].set(True)
+    # Cheap single-shot next-move argmax (the previous behaviour). The
+    # next move after ``p`` prefix moves is predicted at slot ``C-1+p``.
+    tokens, attn, C = _single_row_prefixed(  # noqa: N806
+        outcome_token, seq_len, moves=prefix_np,
+    )
     logits = model(tokens, attn, compute_dtype=compute_dtype)
-    next_argmax = int(_argmax_action(logits)[0, p])
+    next_argmax = int(_argmax_action(logits)[0, C - 1 + p])
 
     result: dict[str, Any] = {
         "diagnostic": "prefix_continuation_test",
@@ -620,17 +708,16 @@ def impossible_task_test(
     cache_dtype: jnp.dtype | None = None,
     compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, Any]:
-    """Outcome at slot 0 = 'white checkmates' but no opening move can
+    """Outcome conditioning = 'white checkmates' but no opening move can
     deliver mate-in-1. Reports the top-1 prob + entropy of the model's
     first-move distribution AND, when ``n_games > 0``, the
     autoregressive analysis (forfeit rate is the headline)."""
     if not outcome_prefix_trained:
         return _skipped("impossible_task_test")
-    tokens = jnp.full((1, seq_len), PAD_TOKEN, dtype=jnp.int32)
-    tokens = tokens.at[0, 0].set(WHITE_CHECKMATES)
-    attn = jnp.zeros((1, seq_len), dtype=jnp.bool_).at[0, 0].set(True)
+    # First-move prediction lives at the last prefix slot ``C-1``.
+    tokens, attn, C = _single_row_prefixed(WHITE_CHECKMATES, seq_len)  # noqa: N806
     logits = model(tokens, attn, compute_dtype=compute_dtype)
-    probs = jax.nn.softmax(logits[0, 1, :NUM_ACTIONS], axis=-1)
+    probs = jax.nn.softmax(logits[0, C - 1, :NUM_ACTIONS], axis=-1)
     result: dict[str, Any] = {
         "diagnostic": "impossible_task_test",
         "top1_prob": float(probs.max()),
@@ -655,15 +742,14 @@ def improbable_task_test(
     cache_dtype: jnp.dtype | None = None,
     compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, Any]:
-    """Outcome at slot 0 = DRAW_BY_AGREEMENT (very low prior). Reports
+    """Outcome conditioning = DRAW_BY_AGREEMENT (very low prior). Reports
     top-1 prob + entropy + AR analysis."""
     if not outcome_prefix_trained:
         return _skipped("improbable_task_test")
-    tokens = jnp.full((1, seq_len), PAD_TOKEN, dtype=jnp.int32)
-    tokens = tokens.at[0, 0].set(DRAW_BY_AGREEMENT)
-    attn = jnp.zeros((1, seq_len), dtype=jnp.bool_).at[0, 0].set(True)
+    # First-move prediction lives at the last prefix slot ``C-1``.
+    tokens, attn, C = _single_row_prefixed(DRAW_BY_AGREEMENT, seq_len)  # noqa: N806
     logits = model(tokens, attn, compute_dtype=compute_dtype)
-    probs = jax.nn.softmax(logits[0, 1, :NUM_ACTIONS], axis=-1)
+    probs = jax.nn.softmax(logits[0, C - 1, :NUM_ACTIONS], axis=-1)
     result: dict[str, Any] = {
         "diagnostic": "improbable_task_test",
         "top1_prob": float(probs.max()),

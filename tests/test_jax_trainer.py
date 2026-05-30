@@ -37,6 +37,7 @@ from pawn.trainer import (
     Batch,
     TrainState,
     VariantSpec,
+    _FIRST_RESERVED_COLUMN,
     cross_entropy_loss,
     make_lr_schedule,
     make_optimizer,
@@ -146,6 +147,52 @@ def test_cross_entropy_loss_zero_on_fully_padded_batch() -> None:
     )
     loss = cross_entropy_loss(model, empty_batch)
     assert float(loss) == 0.0
+
+
+def test_cross_entropy_loss_masks_reserved_columns() -> None:
+    """Reserved / NULL / control columns (IDs >= NULL_TOKEN) must be
+    masked to -inf before the softmax, so they neither dilute the
+    move-token probability mass nor change the loss. We verify by
+    inflating those columns' logits via the embedding table: because the
+    head is tied (logits = x @ embed_tokens.T), scaling the reserved rows
+    of `embed_tokens` scales their logit columns. The masked CE must be
+    invariant to that perturbation."""
+    model = _tiny_model()
+    batch = _small_batch()
+    base_loss = float(cross_entropy_loss(model, batch))
+
+    # Blow up the reserved rows of the embedding table by a large factor —
+    # without masking, these would dominate the softmax denominator and
+    # shrink the loss. With masking they're -inf and contribute nothing.
+    # (`np.array(...)` forces a writable copy — `np.asarray` of a JAX array
+    # yields a read-only view.)
+    embed = np.array(model.embed_tokens)
+    embed[_FIRST_RESERVED_COLUMN:] *= 1e3
+    perturbed = eqx.tree_at(
+        lambda m: m.embed_tokens, model, jnp.asarray(embed)
+    )
+    perturbed_loss = float(cross_entropy_loss(perturbed, batch))
+    assert perturbed_loss == pytest.approx(base_loss, abs=1e-4)
+
+
+def test_cross_entropy_loss_reserved_rows_get_zero_grad() -> None:
+    """Acceptance gate: reserved / NULL / control columns (>= NULL_TOKEN)
+    receive exactly zero gradient after a loss/grad — the -inf softmax
+    mask detaches them from the autograd graph. For a tied model the
+    reserved *rows* of `embed_tokens` are both the (unused) input
+    embeddings for those ids and their (masked) output logit columns; the
+    grad through the CE must be all-zero there."""
+    model = _tiny_model()
+    batch = _small_batch()
+    grads = eqx.filter_grad(cross_entropy_loss)(model, batch)
+    g_embed = np.asarray(grads.embed_tokens)
+    reserved_grad = g_embed[_FIRST_RESERVED_COLUMN:]
+    assert np.all(reserved_grad == 0.0), (
+        "reserved/NULL/control embedding rows must get zero gradient"
+    )
+    # Sanity: at least some non-reserved rows DO get gradient, so the test
+    # isn't trivially passing on an all-zero grad tree.
+    assert np.any(g_embed[:_FIRST_RESERVED_COLUMN] != 0.0)
 
 
 def test_supernet_joint_loss_sums_variants() -> None:

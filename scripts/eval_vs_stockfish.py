@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 from pawn.checkpoint import load_model, resolve_checkpoint_source
-from pawn.corpus import Corpus
+from pawn.corpus import Corpus, conditioning_from_run_block
 from pawn.lichess_data import load_lichess_corpus
 from pawn.lichess_eval import (
     EloBin,
@@ -34,7 +34,12 @@ def main(argv: list[str] | None = None) -> int:
 
     ckpt = args.checkpoint
     ckpt_path = resolve_checkpoint_source(ckpt)
-    model, _ = load_model(ckpt_path)
+    model, run_block = load_model(ckpt_path)
+    # Build every Elo-bin corpus with the checkpoint's own conditioning so
+    # the move positions match the layout the model was trained under
+    # (plan §8.1) — a hardcoded default would shift the absolute RoPE
+    # offset and corrupt the per-move accuracy.
+    conditioning = conditioning_from_run_block(run_block)
 
     bins = default_elo_bins()
     bins_corpora: dict[EloBin, Corpus] = {}
@@ -44,6 +49,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.pgn, split=args.split,
                 elo_min=b.lo, elo_max=b.hi,
                 seq_len=args.seq_len, max_games=args.max_games_per_bin,
+                conditioning=conditioning,
             )
         except (ValueError, FileNotFoundError):
             continue
