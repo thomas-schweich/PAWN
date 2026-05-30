@@ -1,0 +1,6 @@
+run	batch	outer_factor	optimizer	ms_per_step	games_per_sec	status
+allin	16	3	adamw	119.9	133	ok
+allin	16	6	adamw	103.6	154	ok
+allin	16	12	adamw	112.0	143	ok
+allin	16	3	lion	120.0	133	ok
+allin	32	3	lion	NA	NA	OOM

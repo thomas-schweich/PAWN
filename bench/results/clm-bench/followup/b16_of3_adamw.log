@@ -1,0 +1,5 @@
+W20260529 14:21:36.775265 129336267591552 agent.cpp:608] sysfs nodes path '/sys/class/kfd/kfd/topology/nodes' does not exist
+An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to gpu.
+JAX compilation cache: /home/tas/.cache/jax-pawn
+Per-bucket step counts: {256: 0, 384: 500, 512: 500}
+Warning: Resource leak detected by SharedSignalPool, 508 Signals leaked.

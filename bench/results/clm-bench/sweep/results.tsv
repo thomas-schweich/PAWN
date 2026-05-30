@@ -1,0 +1,16 @@
+config	batch	ms_per_step	games_per_sec	status
+v1-cotrain	4	90.0	43	ok
+v2-matched	4	50.7	79	ok
+v2-allin	4	38.9	103	ok
+v1-cotrain	8	140.0	56	ok
+v2-matched	8	87.7	91	ok
+v2-allin	8	66.9	120	ok
+v1-cotrain	16	250.0	64	ok
+v2-matched	16	161.9	99	ok
+v2-allin	16	121.4	132	ok
+v1-cotrain	32	500.0	64	ok
+v2-matched	32	333.6	96	ok
+v2-allin	32	NA	NA	OOM
+v1-cotrain	64	1060.0	60	ok
+v2-matched	64	NA	NA	OOM
+v2-allin	64	NA	NA	OOM

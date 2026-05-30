@@ -1,0 +1,24 @@
+W20260528 23:06:18.785148 131473724407680 agent.cpp:608] sysfs nodes path '/sys/class/kfd/kfd/topology/nodes' does not exist
+An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to gpu.
+W0528 23:07:34.222345 1400883 hlo_rematerialization.cc:3233] Can't reduce memory use below 14.22GiB (15272530814 bytes) by rematerialization; only reduced to 17.74GiB (19048734576 bytes), down from 18.68GiB (20053796468 bytes) originally
+W0528 23:09:11.254491 1400883 hlo_rematerialization.cc:3233] Can't reduce memory use below 14.22GiB (15269028734 bytes) by rematerialization; only reduced to 22.94GiB (24627383312 bytes), down from 24.12GiB (25894528628 bytes) originally
+W0528 23:09:49.096238 1400760 bfc_allocator.cc:502] Allocator (GPU_0_bfc) ran out of memory trying to allocate 18.73GiB (rounded to 20114523904)requested by op 
+If the cause is memory fragmentation maybe the environment variable 'TF_GPU_ALLOCATOR=cuda_malloc_async' will improve the situation. 
+Current allocation summary follows.
+Current allocation summary follows.
+W0528 23:09:49.096345 1400760 bfc_allocator.cc:513] ****________________________________________________________________________________________________
+JAX compilation cache: /home/tas/.cache/jax-pawn
+Traceback (most recent call last):
+  File "/home/tas/pawn/scripts/train_jax.py", line 518, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/home/tas/pawn/scripts/train_jax.py", line 453, in main
+    state, chunk_losses = scan_step(state, chunk_batches)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/tas/pawn/.venv/lib/python3.12/site-packages/equinox/_jit.py", line 209, in __call__
+    return _call(self, False, args, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/tas/pawn/.venv/lib/python3.12/site-packages/equinox/_jit.py", line 271, in _call
+    marker.block_until_ready()
+jax.errors.JaxRuntimeError: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 18.73GiB.
+Warning: Resource leak detected by SharedSignalPool, 508 Signals leaked.

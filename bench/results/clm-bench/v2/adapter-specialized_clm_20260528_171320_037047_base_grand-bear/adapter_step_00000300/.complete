@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "files": {
+    "config.json": "d189de072869b1307224e080d9543f857d83263023b871e6b6ede66bda741f7d",
+    "model.safetensors": "8d5b73dbcc01654a1206af9dba05ede4ee821af643708d08b0b66964218f1248",
+    "optimizer.safetensors": "938ce382a2ebe280a0d5d789d9ad45cbfbdade6f46fe87410d3f2e27f7423481",
+    "training_state.json": "848696604e1f5f2ac4dae11b3daa9fb53d6db5c605f2e14117a30ea1d6813018"
+  }
+}

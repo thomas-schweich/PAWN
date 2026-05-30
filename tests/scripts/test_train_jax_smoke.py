@@ -119,6 +119,82 @@ def test_train_jax_adapter_rejects_rosa_resume(tmp_path) -> None:  # type: ignor
     assert result.returncode != 0, "RoSA --resume should fail"
 
 
+def test_train_jax_conditioning_threaded_into_corpus(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A `--conditioning outcome` pretrain must TRAIN under C=2, not just
+    record C=2 in config.json.
+
+    Regression guard for SC-1 / A1: the trainer used to build the corpus
+    with the default `conditioning=()` (C=1, BOS-only) while persisting
+    `conditioning=["outcome"]` (C=2) — so the model trained at one
+    absolute-RoPE offset and every eval/read path (which derives C from
+    the persisted block) placed moves at a different offset. This pins
+    that the train-time C and the persisted C can never diverge again:
+
+    1. Run a tiny real pretrain with `--conditioning outcome`.
+    2. The written checkpoint's run block records `conditioning=["outcome"]`.
+    3. Rebuilding the corpus the way eval does (from that run block)
+       lands moves at `outcome_offset[0] == C == 2` — the same C the
+       trainer actually packed, because both now derive from the one
+       persisted `conditioning` field.
+    """
+    import subprocess
+
+    from pawn.checkpoint import load_model
+    from pawn.corpus import (
+        conditioning_from_run_block,
+        conditioning_to_C,
+        generate_corpus,
+    )
+
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax.py",
+            "--supernet", "tiny", "--total-steps", "4",
+            "--batch-size", "4", "--seq-len", "32", "--k", "2",
+            "--conditioning", "outcome",
+            "--checkpoint-interval", "2",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"tiny pretrain failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+
+    ckpts = sorted(logs_dir.glob("*/step_*"))
+    assert ckpts, (
+        f"no checkpoint written under {logs_dir}; "
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    _model, run_block = load_model(ckpts[-1])
+    # The persisted run block must record the conditioning the run used.
+    conditioning = conditioning_from_run_block(run_block)
+    assert conditioning == ["outcome"], (
+        f"checkpoint run block conditioning={conditioning!r}, expected "
+        f"['outcome'] — the trainer dropped cfg.conditioning on the floor"
+    )
+    C = conditioning_to_C(conditioning)
+    assert C == 2
+
+    # Rebuild the corpus exactly as eval_jax does (from the persisted
+    # block). If the trainer had built C=1 while persisting C=2, this
+    # eval-side corpus would place moves one absolute-RoPE slot away
+    # from where the model trained. The per-game prefix width is the
+    # constant C, recorded in `outcome_offset`.
+    corpus = generate_corpus(
+        n_games=8, max_ply=32, seq_len=32, seed=0,
+        conditioning=conditioning,
+    )
+    assert int(corpus.outcome_offset[0]) == C, (
+        f"corpus prefix width {int(corpus.outcome_offset[0])} != C={C}"
+    )
+
+
 def test_train_jax_adapter_rejects_resume_without_training_state(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """--resume against a directory missing `training_state.json` must
     fail loudly. The prior code silently treated the absent file as

@@ -28,6 +28,7 @@ import numpy as np
 
 from pawn.checkpoint import save_model
 from pawn.config import (
+    CONDITIONING_KINDS,
     PRETRAIN_BUCKETS,
     SUPERNET,
     TINY_SUPERNET,
@@ -66,6 +67,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--seq-len", type=int, default=None)
     ap.add_argument("--k", type=int, default=None)
+    ap.add_argument("--conditioning", nargs="*", default=None,
+                    choices=sorted(CONDITIONING_KINDS),
+                    help="ordered control-token kinds to prepend after BOS "
+                         "(e.g. `outcome`). The sequence layout is "
+                         "[BOS][cond...][ply...][PAD...]; prefix width is "
+                         "C = 1 + len(conditioning). Default is BOS-only "
+                         "(C=1). Persisted to config.json so eval rebuilds "
+                         "the corpus at the same C.")
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--lr-schedule", default=None)
     ap.add_argument("--warmup-frac", type=float, default=None)
@@ -137,6 +146,11 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
         ("checkpoint_interval", args.checkpoint_interval),
         ("hf_repo", args.hf_repo),
         ("resume", str(args.resume) if args.resume else None),
+        # `--conditioning` with nargs="*" yields a list when passed
+        # (possibly empty for `--conditioning` with no args) and None
+        # when omitted, so the `is not None` guard below distinguishes
+        # "explicitly set to []" from "not passed".
+        ("conditioning", args.conditioning),
     ):
         if val is not None:
             base[flag] = val
@@ -335,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         in any bucket are dropped (acceptable when n_games >> B*K)."""
         corpus = generate_corpus(
             n_games=n_games, max_ply=cfg.seq_len, seq_len=cfg.seq_len, seed=seed,
+            conditioning=cfg.conditioning,
         )
         if edges == (cfg.seq_len,):
             # Unbucketed path: one bucket at full seq_len.

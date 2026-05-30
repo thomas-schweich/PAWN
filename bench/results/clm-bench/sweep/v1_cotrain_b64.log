@@ -1,0 +1,835 @@
+GPU: AMD Radeon RX 7900 XT (ROCm)
+  torch.compile: enabled (inductor)
+  AMP: enabled (fp16)
+  SDPA backend: default
+=== Co-Training [fair-turtle] ===
+Device: cuda
+Batch size: 64
+Total steps: 1000
+Variants: small, base, large
+LR: 3.00e-04
+
+  small: 8,936,960 params (256d/8L)
+  base: 34,651,136 params (512d/8L)
+  large: 66,909,440 params (640d/10L)
+
+Generating shared validation set...
+  [small] torch.compile enabled
+  [base] torch.compile enabled
+  [large] torch.compile enabled
+
+Starting training from step 0
+  [small] JSONL: /home/tas/pawn/bench/results/clm-bench/sweep/v1_cotrain_b64/run_20260528_224610_small_fair-turtle/metrics.jsonl
+  [base] JSONL: /home/tas/pawn/bench/results/clm-bench/sweep/v1_cotrain_b64/run_20260528_224610_base_fair-turtle/metrics.jsonl
+  [large] JSONL: /home/tas/pawn/bench/results/clm-bench/sweep/v1_cotrain_b64/run_20260528_224610_large_fair-turtle/metrics.jsonl
+
+step       5 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.6029 | acc 0.001 | lr 3.00e-05 | gn 0.96
+   base: loss 7.5753 | acc 0.001 | lr 3.00e-05 | gn 1.14
+  large: loss 7.5909 | acc 0.001 | lr 3.00e-05 | gn 1.32
+step      10 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.5429 | acc 0.000 | lr 6.00e-05 | gn 0.52
+   base: loss 7.4554 | acc 0.002 | lr 6.00e-05 | gn 0.65
+  large: loss 7.4468 | acc 0.002 | lr 6.00e-05 | gn 0.73
+step      15 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.4826 | acc 0.002 | lr 9.00e-05 | gn 0.43
+   base: loss 7.3711 | acc 0.003 | lr 9.00e-05 | gn 0.49
+  large: loss 7.3506 | acc 0.003 | lr 9.00e-05 | gn 0.51
+HSA exception: MemoryRegion::BlockAllocator::alloc failed.
+HSA exception: MemoryRegion::BlockAllocator::alloc failed.
+step      20 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.4238 | acc 0.002 | lr 1.20e-04 | gn 0.36
+   base: loss 7.2858 | acc 0.003 | lr 1.20e-04 | gn 0.37
+  large: loss 7.2564 | acc 0.003 | lr 1.20e-04 | gn 0.38
+step      25 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.3420 | acc 0.002 | lr 1.50e-04 | gn 0.31
+   base: loss 7.1947 | acc 0.002 | lr 1.50e-04 | gn 0.29
+  large: loss 7.1615 | acc 0.003 | lr 1.50e-04 | gn 0.30
+step      30 | 60 g/s | 1.07s | active: small, base, large
+  small: loss 7.2875 | acc 0.002 | lr 1.80e-04 | gn 0.25
+   base: loss 7.1643 | acc 0.003 | lr 1.80e-04 | gn 0.24
+  large: loss 7.1527 | acc 0.004 | lr 1.80e-04 | gn 0.67
+step      35 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 7.2348 | acc 0.002 | lr 2.10e-04 | gn 0.20
+   base: loss 7.1464 | acc 0.004 | lr 2.10e-04 | gn 0.32
+  large: loss 7.1285 | acc 0.004 | lr 2.10e-04 | gn 0.24
+step      40 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 7.1762 | acc 0.004 | lr 2.40e-04 | gn 0.18
+   base: loss 7.1074 | acc 0.004 | lr 2.40e-04 | gn 0.35
+  large: loss 7.0898 | acc 0.005 | lr 2.40e-04 | gn 0.28
+step      45 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.1717 | acc 0.004 | lr 2.70e-04 | gn 0.20
+   base: loss 7.1041 | acc 0.004 | lr 2.70e-04 | gn 0.25
+  large: loss 7.0917 | acc 0.004 | lr 2.70e-04 | gn 0.24
+step      50 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 7.1515 | acc 0.004 | lr 3.00e-04 | gn 0.28
+   base: loss 7.0838 | acc 0.004 | lr 3.00e-04 | gn 0.24
+  large: loss 7.0726 | acc 0.004 | lr 3.00e-04 | gn 0.22
+step      55 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 7.1251 | acc 0.004 | lr 3.00e-04 | gn 0.39
+   base: loss 7.0595 | acc 0.004 | lr 3.00e-04 | gn 0.23
+  large: loss 7.0497 | acc 0.004 | lr 3.00e-04 | gn 0.22
+step      60 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 7.0920 | acc 0.004 | lr 3.00e-04 | gn 0.18
+   base: loss 7.0362 | acc 0.004 | lr 3.00e-04 | gn 0.20
+  large: loss 7.0296 | acc 0.004 | lr 3.00e-04 | gn 0.23
+step      65 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.0920 | acc 0.005 | lr 3.00e-04 | gn 0.25
+   base: loss 7.0420 | acc 0.004 | lr 3.00e-04 | gn 0.20
+  large: loss 7.0340 | acc 0.005 | lr 3.00e-04 | gn 0.23
+step      70 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.0836 | acc 0.004 | lr 3.00e-04 | gn 0.25
+   base: loss 7.0459 | acc 0.004 | lr 3.00e-04 | gn 0.20
+  large: loss 7.0389 | acc 0.005 | lr 3.00e-04 | gn 0.22
+step      75 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.0878 | acc 0.005 | lr 3.00e-04 | gn 0.14
+   base: loss 7.0527 | acc 0.005 | lr 3.00e-04 | gn 0.20
+  large: loss 7.0470 | acc 0.005 | lr 3.00e-04 | gn 0.22
+step      80 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.0626 | acc 0.004 | lr 2.99e-04 | gn 0.14
+   base: loss 7.0338 | acc 0.006 | lr 2.99e-04 | gn 0.20
+  large: loss 7.0281 | acc 0.005 | lr 2.99e-04 | gn 0.21
+step      85 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.0646 | acc 0.004 | lr 2.99e-04 | gn 0.15
+   base: loss 7.0323 | acc 0.005 | lr 2.99e-04 | gn 0.21
+  large: loss 7.0209 | acc 0.005 | lr 2.99e-04 | gn 0.23
+step      90 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.0606 | acc 0.004 | lr 2.99e-04 | gn 0.14
+   base: loss 7.0310 | acc 0.006 | lr 2.99e-04 | gn 0.21
+  large: loss 7.0187 | acc 0.006 | lr 2.99e-04 | gn 0.24
+step      95 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.0737 | acc 0.005 | lr 2.99e-04 | gn 0.13
+   base: loss 7.0331 | acc 0.006 | lr 2.99e-04 | gn 0.20
+  large: loss 7.0159 | acc 0.006 | lr 2.99e-04 | gn 0.24
+step     100 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.0412 | acc 0.006 | lr 2.98e-04 | gn 0.14
+   base: loss 6.9916 | acc 0.008 | lr 2.98e-04 | gn 0.31
+  large: loss 6.9711 | acc 0.007 | lr 2.98e-04 | gn 0.23
+step     105 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 7.0485 | acc 0.006 | lr 2.98e-04 | gn 0.15
+   base: loss 6.9894 | acc 0.007 | lr 2.98e-04 | gn 0.29
+  large: loss 6.9685 | acc 0.007 | lr 2.98e-04 | gn 0.27
+step     110 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.0169 | acc 0.005 | lr 2.97e-04 | gn 0.16
+   base: loss 6.9298 | acc 0.006 | lr 2.97e-04 | gn 0.85
+  large: loss 6.9345 | acc 0.006 | lr 2.97e-04 | gn 1.06
+step     115 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.0348 | acc 0.006 | lr 2.97e-04 | gn 0.16
+   base: loss 6.9313 | acc 0.009 | lr 2.97e-04 | gn 1.28
+  large: loss 6.9304 | acc 0.008 | lr 2.97e-04 | gn 0.56
+step     120 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 7.0226 | acc 0.007 | lr 2.96e-04 | gn 0.16
+   base: loss 6.8617 | acc 0.013 | lr 2.96e-04 | gn 1.04
+  large: loss 6.8770 | acc 0.009 | lr 2.96e-04 | gn 0.39
+step     125 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 6.9949 | acc 0.005 | lr 2.96e-04 | gn 0.41
+   base: loss 6.7231 | acc 0.024 | lr 2.96e-04 | gn 1.48
+  large: loss 6.7998 | acc 0.010 | lr 2.96e-04 | gn 0.57
+step     130 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 6.9636 | acc 0.006 | lr 2.95e-04 | gn 0.33
+   base: loss 6.4997 | acc 0.038 | lr 2.95e-04 | gn 1.63
+  large: loss 6.6910 | acc 0.018 | lr 2.95e-04 | gn 1.07
+step     135 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 6.9738 | acc 0.007 | lr 2.95e-04 | gn 0.25
+   base: loss 6.3419 | acc 0.040 | lr 2.95e-04 | gn 0.74
+  large: loss 6.5804 | acc 0.028 | lr 2.95e-04 | gn 1.53
+step     140 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 6.9716 | acc 0.006 | lr 2.94e-04 | gn 0.38
+   base: loss 6.2450 | acc 0.040 | lr 2.94e-04 | gn 0.42
+  large: loss 6.3641 | acc 0.041 | lr 2.94e-04 | gn 1.37
+step     145 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 6.9394 | acc 0.006 | lr 2.93e-04 | gn 0.52
+   base: loss 6.0517 | acc 0.043 | lr 2.93e-04 | gn 0.39
+  large: loss 6.0919 | acc 0.043 | lr 2.93e-04 | gn 0.48
+step     150 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 6.9130 | acc 0.008 | lr 2.93e-04 | gn 0.44
+   base: loss 5.9981 | acc 0.045 | lr 2.93e-04 | gn 0.45
+  large: loss 6.0130 | acc 0.046 | lr 2.93e-04 | gn 0.40
+step     155 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 6.9016 | acc 0.007 | lr 2.92e-04 | gn 0.46
+   base: loss 6.0095 | acc 0.042 | lr 2.92e-04 | gn 0.39
+  large: loss 6.0159 | acc 0.042 | lr 2.92e-04 | gn 0.41
+step     160 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 6.8876 | acc 0.008 | lr 2.91e-04 | gn 0.33
+   base: loss 5.9249 | acc 0.045 | lr 2.91e-04 | gn 0.48
+  large: loss 5.9256 | acc 0.045 | lr 2.91e-04 | gn 0.63
+step     165 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 6.8807 | acc 0.007 | lr 2.90e-04 | gn 0.40
+   base: loss 5.8980 | acc 0.043 | lr 2.90e-04 | gn 0.56
+  large: loss 5.9048 | acc 0.043 | lr 2.90e-04 | gn 0.72
+step     170 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 6.8633 | acc 0.008 | lr 2.90e-04 | gn 0.23
+   base: loss 5.8296 | acc 0.042 | lr 2.90e-04 | gn 0.55
+  large: loss 5.8620 | acc 0.041 | lr 2.90e-04 | gn 0.63
+step     175 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 6.7986 | acc 0.010 | lr 2.89e-04 | gn 0.89
+   base: loss 5.6174 | acc 0.049 | lr 2.89e-04 | gn 0.69
+  large: loss 5.6469 | acc 0.048 | lr 2.89e-04 | gn 0.78
+step     180 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 6.7926 | acc 0.015 | lr 2.88e-04 | gn 0.61
+   base: loss 5.7258 | acc 0.041 | lr 2.88e-04 | gn 0.80
+  large: loss 5.7332 | acc 0.044 | lr 2.88e-04 | gn 0.92
+step     185 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 6.6781 | acc 0.025 | lr 2.87e-04 | gn 1.09
+   base: loss 5.5423 | acc 0.045 | lr 2.87e-04 | gn 0.68
+  large: loss 5.5406 | acc 0.045 | lr 2.87e-04 | gn 0.86
+step     190 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 6.5940 | acc 0.037 | lr 2.86e-04 | gn 0.51
+   base: loss 5.5575 | acc 0.046 | lr 2.86e-04 | gn 0.82
+  large: loss 5.5454 | acc 0.046 | lr 2.86e-04 | gn 0.66
+step     195 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 6.5035 | acc 0.042 | lr 2.85e-04 | gn 0.51
+   base: loss 5.5012 | acc 0.043 | lr 2.85e-04 | gn 0.71
+  large: loss 5.4875 | acc 0.044 | lr 2.85e-04 | gn 0.65
+step     200 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 6.4252 | acc 0.039 | lr 2.84e-04 | gn 0.51
+   base: loss 5.4711 | acc 0.043 | lr 2.84e-04 | gn 0.72
+  large: loss 5.4590 | acc 0.045 | lr 2.84e-04 | gn 1.10
+step     205 | 60 g/s | 1.07s | active: small, base, large
+  small: loss 6.3205 | acc 0.042 | lr 2.83e-04 | gn 0.37
+   base: loss 5.3523 | acc 0.051 | lr 2.83e-04 | gn 0.74
+  large: loss 5.3448 | acc 0.048 | lr 2.83e-04 | gn 1.18
+step     210 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 6.2372 | acc 0.042 | lr 2.82e-04 | gn 0.41
+   base: loss 5.3185 | acc 0.049 | lr 2.82e-04 | gn 0.94
+  large: loss 5.2768 | acc 0.051 | lr 2.82e-04 | gn 1.39
+step     215 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 6.1792 | acc 0.042 | lr 2.80e-04 | gn 0.35
+   base: loss 5.2987 | acc 0.050 | lr 2.80e-04 | gn 0.98
+  large: loss 5.2442 | acc 0.050 | lr 2.80e-04 | gn 1.46
+step     220 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 6.1411 | acc 0.042 | lr 2.79e-04 | gn 0.43
+   base: loss 5.2848 | acc 0.049 | lr 2.79e-04 | gn 0.79
+  large: loss 5.2165 | acc 0.051 | lr 2.79e-04 | gn 1.74
+step     225 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 6.0393 | acc 0.042 | lr 2.78e-04 | gn 0.44
+   base: loss 5.1771 | acc 0.047 | lr 2.78e-04 | gn 0.95
+  large: loss 5.0861 | acc 0.049 | lr 2.78e-04 | gn 1.50
+step     230 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 6.0101 | acc 0.045 | lr 2.77e-04 | gn 0.85
+   base: loss 5.2074 | acc 0.050 | lr 2.77e-04 | gn 1.00
+  large: loss 5.0967 | acc 0.051 | lr 2.77e-04 | gn 1.66
+step     235 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.9240 | acc 0.045 | lr 2.76e-04 | gn 0.69
+   base: loss 5.0931 | acc 0.051 | lr 2.76e-04 | gn 1.43
+  large: loss 4.9793 | acc 0.051 | lr 2.76e-04 | gn 1.85
+step     240 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.9773 | acc 0.043 | lr 2.74e-04 | gn 0.52
+   base: loss 5.1579 | acc 0.050 | lr 2.74e-04 | gn 1.38
+  large: loss 5.0436 | acc 0.051 | lr 2.74e-04 | gn 1.78
+step     245 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.9307 | acc 0.041 | lr 2.73e-04 | gn 0.82
+   base: loss 5.1659 | acc 0.048 | lr 2.73e-04 | gn 1.18
+  large: loss 5.0586 | acc 0.047 | lr 2.73e-04 | gn 2.20
+step     250 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.8632 | acc 0.044 | lr 2.72e-04 | gn 0.84
+   base: loss 5.1099 | acc 0.051 | lr 2.72e-04 | gn 1.38
+  large: loss 4.9974 | acc 0.051 | lr 2.72e-04 | gn 1.68
+step     255 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.8110 | acc 0.046 | lr 2.70e-04 | gn 0.86
+   base: loss 5.0810 | acc 0.051 | lr 2.70e-04 | gn 1.63
+  large: loss 4.9746 | acc 0.051 | lr 2.70e-04 | gn 2.17
+step     260 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 5.7668 | acc 0.044 | lr 2.69e-04 | gn 0.80
+   base: loss 5.0757 | acc 0.050 | lr 2.69e-04 | gn 3.07
+  large: loss 4.9591 | acc 0.050 | lr 2.69e-04 | gn 2.30
+step     265 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.6734 | acc 0.046 | lr 2.67e-04 | gn 0.78
+   base: loss 4.9686 | acc 0.054 | lr 2.67e-04 | gn 2.04
+  large: loss 4.8607 | acc 0.055 | lr 2.67e-04 | gn 2.16
+step     270 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.6942 | acc 0.044 | lr 2.66e-04 | gn 0.97
+   base: loss 4.9970 | acc 0.050 | lr 2.66e-04 | gn 2.13
+  large: loss 4.8948 | acc 0.050 | lr 2.66e-04 | gn 1.77
+step     275 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.7186 | acc 0.042 | lr 2.64e-04 | gn 0.99
+   base: loss 5.0074 | acc 0.050 | lr 2.64e-04 | gn 1.49
+  large: loss 4.9099 | acc 0.051 | lr 2.64e-04 | gn 2.23
+step     280 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.6334 | acc 0.045 | lr 2.63e-04 | gn 1.54
+   base: loss 4.9112 | acc 0.052 | lr 2.63e-04 | gn 1.96
+  large: loss 4.8171 | acc 0.053 | lr 2.63e-04 | gn 2.49
+step     285 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.5457 | acc 0.046 | lr 2.61e-04 | gn 1.06
+   base: loss 4.8488 | acc 0.053 | lr 2.61e-04 | gn 1.65
+  large: loss 4.7542 | acc 0.055 | lr 2.61e-04 | gn 3.01
+step     290 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.5437 | acc 0.047 | lr 2.60e-04 | gn 1.53
+   base: loss 4.8388 | acc 0.055 | lr 2.60e-04 | gn 2.45
+  large: loss 4.7417 | acc 0.057 | lr 2.60e-04 | gn 3.50
+step     295 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.6345 | acc 0.040 | lr 2.58e-04 | gn 1.16
+   base: loss 4.9493 | acc 0.049 | lr 2.58e-04 | gn 2.73
+  large: loss 4.8460 | acc 0.049 | lr 2.58e-04 | gn 2.38
+step     300 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.5349 | acc 0.044 | lr 2.56e-04 | gn 1.06
+   base: loss 4.8315 | acc 0.054 | lr 2.56e-04 | gn 3.35
+  large: loss 4.7373 | acc 0.054 | lr 2.56e-04 | gn 3.06
+step     305 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.4780 | acc 0.045 | lr 2.55e-04 | gn 1.45
+   base: loss 4.7769 | acc 0.056 | lr 2.55e-04 | gn 3.07
+  large: loss 4.6778 | acc 0.055 | lr 2.55e-04 | gn 3.14
+step     310 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.4892 | acc 0.049 | lr 2.53e-04 | gn 1.07
+   base: loss 4.8211 | acc 0.055 | lr 2.53e-04 | gn 3.35
+  large: loss 4.7156 | acc 0.054 | lr 2.53e-04 | gn 2.18
+step     315 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.5213 | acc 0.047 | lr 2.51e-04 | gn 0.93
+   base: loss 4.8357 | acc 0.053 | lr 2.51e-04 | gn 2.45
+  large: loss 4.7356 | acc 0.050 | lr 2.51e-04 | gn 3.06
+step     320 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.4589 | acc 0.045 | lr 2.50e-04 | gn 1.49
+   base: loss 4.8041 | acc 0.051 | lr 2.50e-04 | gn 2.64
+  large: loss 4.6989 | acc 0.053 | lr 2.50e-04 | gn 2.47
+step     325 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 5.4037 | acc 0.049 | lr 2.48e-04 | gn 1.78
+   base: loss 4.7591 | acc 0.056 | lr 2.48e-04 | gn 3.01
+  large: loss 4.6701 | acc 0.055 | lr 2.48e-04 | gn 4.26
+step     330 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.3949 | acc 0.048 | lr 2.46e-04 | gn 1.98
+   base: loss 4.7591 | acc 0.052 | lr 2.46e-04 | gn 2.29
+  large: loss 4.6779 | acc 0.053 | lr 2.46e-04 | gn 4.04
+step     335 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.4177 | acc 0.044 | lr 2.44e-04 | gn 2.24
+   base: loss 4.8011 | acc 0.052 | lr 2.44e-04 | gn 5.09
+  large: loss 4.6771 | acc 0.053 | lr 2.44e-04 | gn 3.40
+step     340 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.4107 | acc 0.048 | lr 2.43e-04 | gn 2.31
+   base: loss 4.7939 | acc 0.052 | lr 2.43e-04 | gn 3.24
+  large: loss 4.6865 | acc 0.052 | lr 2.43e-04 | gn 2.80
+step     345 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.3131 | acc 0.046 | lr 2.41e-04 | gn 1.64
+   base: loss 4.7051 | acc 0.054 | lr 2.41e-04 | gn 3.23
+  large: loss 4.6014 | acc 0.056 | lr 2.41e-04 | gn 4.38
+step     350 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.2871 | acc 0.048 | lr 2.39e-04 | gn 1.87
+   base: loss 4.7327 | acc 0.058 | lr 2.39e-04 | gn 4.66
+  large: loss 4.6188 | acc 0.057 | lr 2.39e-04 | gn 3.67
+step     355 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.2324 | acc 0.049 | lr 2.37e-04 | gn 2.46
+   base: loss 4.6916 | acc 0.058 | lr 2.37e-04 | gn 4.19
+  large: loss 4.5735 | acc 0.056 | lr 2.37e-04 | gn 3.56
+step     360 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.2326 | acc 0.047 | lr 2.35e-04 | gn 3.04
+   base: loss 4.6771 | acc 0.052 | lr 2.35e-04 | gn 3.86
+  large: loss 4.5546 | acc 0.053 | lr 2.35e-04 | gn 4.08
+step     365 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.1484 | acc 0.054 | lr 2.33e-04 | gn 2.90
+   base: loss 4.6298 | acc 0.057 | lr 2.33e-04 | gn 3.64
+  large: loss 4.5115 | acc 0.056 | lr 2.33e-04 | gn 3.65
+step     370 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.0685 | acc 0.053 | lr 2.31e-04 | gn 2.16
+   base: loss 4.5705 | acc 0.061 | lr 2.31e-04 | gn 2.93
+  large: loss 4.4517 | acc 0.059 | lr 2.31e-04 | gn 3.11
+step     375 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 5.1554 | acc 0.049 | lr 2.29e-04 | gn 2.87
+   base: loss 4.6569 | acc 0.057 | lr 2.29e-04 | gn 3.36
+  large: loss 4.5269 | acc 0.056 | lr 2.29e-04 | gn 2.72
+step     380 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.1677 | acc 0.049 | lr 2.27e-04 | gn 3.29
+   base: loss 4.6566 | acc 0.053 | lr 2.27e-04 | gn 2.78
+  large: loss 4.5409 | acc 0.059 | lr 2.27e-04 | gn 3.46
+step     385 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.0810 | acc 0.055 | lr 2.25e-04 | gn 2.76
+   base: loss 4.5883 | acc 0.059 | lr 2.25e-04 | gn 2.98
+  large: loss 4.4629 | acc 0.057 | lr 2.25e-04 | gn 3.41
+step     390 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.1754 | acc 0.045 | lr 2.23e-04 | gn 2.69
+   base: loss 4.6604 | acc 0.055 | lr 2.23e-04 | gn 4.72
+  large: loss 4.5160 | acc 0.056 | lr 2.23e-04 | gn 3.52
+step     395 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.0701 | acc 0.051 | lr 2.21e-04 | gn 3.62
+   base: loss 4.5843 | acc 0.059 | lr 2.21e-04 | gn 4.49
+  large: loss 4.4465 | acc 0.057 | lr 2.21e-04 | gn 3.28
+step     400 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.0441 | acc 0.053 | lr 2.19e-04 | gn 3.31
+   base: loss 4.5653 | acc 0.055 | lr 2.19e-04 | gn 3.15
+  large: loss 4.4527 | acc 0.055 | lr 2.19e-04 | gn 4.69
+step     405 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.1631 | acc 0.046 | lr 2.17e-04 | gn 3.97
+   base: loss 4.6789 | acc 0.052 | lr 2.17e-04 | gn 3.56
+  large: loss 4.5605 | acc 0.053 | lr 2.17e-04 | gn 4.56
+step     410 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.0733 | acc 0.048 | lr 2.15e-04 | gn 4.46
+   base: loss 4.5936 | acc 0.054 | lr 2.15e-04 | gn 3.20
+  large: loss 4.4577 | acc 0.058 | lr 2.15e-04 | gn 4.05
+step     415 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.0250 | acc 0.051 | lr 2.13e-04 | gn 4.17
+   base: loss 4.5529 | acc 0.055 | lr 2.13e-04 | gn 3.93
+  large: loss 4.4149 | acc 0.059 | lr 2.13e-04 | gn 3.17
+step     420 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 5.1571 | acc 0.046 | lr 2.11e-04 | gn 4.37
+   base: loss 4.6919 | acc 0.049 | lr 2.11e-04 | gn 3.80
+  large: loss 4.5355 | acc 0.053 | lr 2.11e-04 | gn 2.65
+step     425 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.0808 | acc 0.047 | lr 2.09e-04 | gn 3.31
+   base: loss 4.6207 | acc 0.055 | lr 2.09e-04 | gn 3.91
+  large: loss 4.4987 | acc 0.056 | lr 2.09e-04 | gn 4.23
+step     430 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9373 | acc 0.051 | lr 2.07e-04 | gn 5.29
+   base: loss 4.4808 | acc 0.060 | lr 2.07e-04 | gn 4.91
+  large: loss 4.3440 | acc 0.062 | lr 2.07e-04 | gn 3.46
+step     435 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 4.9127 | acc 0.055 | lr 2.05e-04 | gn 5.74
+   base: loss 4.4613 | acc 0.060 | lr 2.05e-04 | gn 3.96
+  large: loss 4.3313 | acc 0.064 | lr 2.05e-04 | gn 2.99
+step     440 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.0825 | acc 0.046 | lr 2.02e-04 | gn 3.43
+   base: loss 4.6245 | acc 0.053 | lr 2.02e-04 | gn 3.24
+  large: loss 4.4838 | acc 0.056 | lr 2.02e-04 | gn 3.75
+step     445 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.0193 | acc 0.048 | lr 2.00e-04 | gn 3.53
+   base: loss 4.5533 | acc 0.057 | lr 2.00e-04 | gn 2.75
+  large: loss 4.4165 | acc 0.057 | lr 2.00e-04 | gn 3.36
+step     450 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.0298 | acc 0.045 | lr 1.98e-04 | gn 4.52
+   base: loss 4.5720 | acc 0.053 | lr 1.98e-04 | gn 3.98
+  large: loss 4.4259 | acc 0.055 | lr 1.98e-04 | gn 3.44
+step     455 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 5.0392 | acc 0.048 | lr 1.96e-04 | gn 3.94
+   base: loss 4.5881 | acc 0.054 | lr 1.96e-04 | gn 4.00
+  large: loss 4.4284 | acc 0.056 | lr 1.96e-04 | gn 3.07
+step     460 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 5.0289 | acc 0.045 | lr 1.94e-04 | gn 4.72
+   base: loss 4.5731 | acc 0.051 | lr 1.94e-04 | gn 2.88
+  large: loss 4.4368 | acc 0.052 | lr 1.94e-04 | gn 4.74
+step     465 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9556 | acc 0.054 | lr 1.92e-04 | gn 5.58
+   base: loss 4.5116 | acc 0.058 | lr 1.92e-04 | gn 3.91
+  large: loss 4.3668 | acc 0.061 | lr 1.92e-04 | gn 3.84
+step     470 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9616 | acc 0.051 | lr 1.89e-04 | gn 5.21
+   base: loss 4.5138 | acc 0.054 | lr 1.89e-04 | gn 4.34
+  large: loss 4.3736 | acc 0.056 | lr 1.89e-04 | gn 4.97
+step     475 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8860 | acc 0.051 | lr 1.87e-04 | gn 4.99
+   base: loss 4.4495 | acc 0.057 | lr 1.87e-04 | gn 3.94
+  large: loss 4.3132 | acc 0.060 | lr 1.87e-04 | gn 3.17
+step     480 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9502 | acc 0.049 | lr 1.85e-04 | gn 5.03
+   base: loss 4.4921 | acc 0.055 | lr 1.85e-04 | gn 3.90
+  large: loss 4.3570 | acc 0.056 | lr 1.85e-04 | gn 4.46
+step     485 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.9404 | acc 0.049 | lr 1.83e-04 | gn 3.53
+   base: loss 4.5087 | acc 0.056 | lr 1.83e-04 | gn 3.72
+  large: loss 4.3637 | acc 0.057 | lr 1.83e-04 | gn 2.92
+step     490 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9865 | acc 0.048 | lr 1.81e-04 | gn 4.32
+   base: loss 4.5327 | acc 0.054 | lr 1.81e-04 | gn 3.57
+  large: loss 4.3898 | acc 0.054 | lr 1.81e-04 | gn 3.20
+step     495 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.9701 | acc 0.048 | lr 1.78e-04 | gn 2.98
+   base: loss 4.5087 | acc 0.052 | lr 1.78e-04 | gn 3.65
+  large: loss 4.3716 | acc 0.055 | lr 1.78e-04 | gn 3.20
+step     500 | 60 g/s | 1.07s | active: small, base, large
+  small: loss 4.9361 | acc 0.051 | lr 1.76e-04 | gn 5.75
+   base: loss 4.4869 | acc 0.056 | lr 1.76e-04 | gn 2.50
+  large: loss 4.3361 | acc 0.057 | lr 1.76e-04 | gn 3.76
+step     505 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9100 | acc 0.049 | lr 1.74e-04 | gn 3.99
+   base: loss 4.4533 | acc 0.061 | lr 1.74e-04 | gn 3.65
+  large: loss 4.3109 | acc 0.060 | lr 1.74e-04 | gn 3.07
+step     510 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9603 | acc 0.047 | lr 1.72e-04 | gn 4.35
+   base: loss 4.4957 | acc 0.053 | lr 1.72e-04 | gn 3.87
+  large: loss 4.3449 | acc 0.056 | lr 1.72e-04 | gn 3.49
+step     515 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9192 | acc 0.049 | lr 1.69e-04 | gn 5.75
+   base: loss 4.4747 | acc 0.054 | lr 1.69e-04 | gn 4.50
+  large: loss 4.3221 | acc 0.059 | lr 1.69e-04 | gn 3.07
+step     520 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.8462 | acc 0.052 | lr 1.67e-04 | gn 4.98
+   base: loss 4.4036 | acc 0.059 | lr 1.67e-04 | gn 3.83
+  large: loss 4.2496 | acc 0.060 | lr 1.67e-04 | gn 3.47
+step     525 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9219 | acc 0.048 | lr 1.65e-04 | gn 7.95
+   base: loss 4.4552 | acc 0.056 | lr 1.65e-04 | gn 3.84
+  large: loss 4.3004 | acc 0.056 | lr 1.65e-04 | gn 2.67
+step     530 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8590 | acc 0.049 | lr 1.63e-04 | gn 5.07
+   base: loss 4.4003 | acc 0.053 | lr 1.63e-04 | gn 3.03
+  large: loss 4.2492 | acc 0.056 | lr 1.63e-04 | gn 4.04
+step     535 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9113 | acc 0.049 | lr 1.61e-04 | gn 4.18
+   base: loss 4.4668 | acc 0.055 | lr 1.61e-04 | gn 4.06
+  large: loss 4.3232 | acc 0.056 | lr 1.61e-04 | gn 3.43
+step     540 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9492 | acc 0.046 | lr 1.58e-04 | gn 4.23
+   base: loss 4.5225 | acc 0.050 | lr 1.58e-04 | gn 4.03
+  large: loss 4.3701 | acc 0.051 | lr 1.58e-04 | gn 3.53
+step     545 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9083 | acc 0.049 | lr 1.56e-04 | gn 4.04
+   base: loss 4.4551 | acc 0.056 | lr 1.56e-04 | gn 3.41
+  large: loss 4.3068 | acc 0.057 | lr 1.56e-04 | gn 3.77
+step     550 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8757 | acc 0.051 | lr 1.54e-04 | gn 4.85
+   base: loss 4.4245 | acc 0.056 | lr 1.54e-04 | gn 3.36
+  large: loss 4.2798 | acc 0.057 | lr 1.54e-04 | gn 3.52
+step     555 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 4.8643 | acc 0.052 | lr 1.52e-04 | gn 5.02
+   base: loss 4.4101 | acc 0.057 | lr 1.52e-04 | gn 3.59
+  large: loss 4.2701 | acc 0.057 | lr 1.52e-04 | gn 3.38
+step     560 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9276 | acc 0.046 | lr 1.49e-04 | gn 4.01
+   base: loss 4.4639 | acc 0.052 | lr 1.49e-04 | gn 3.53
+  large: loss 4.3090 | acc 0.055 | lr 1.49e-04 | gn 4.37
+step     565 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.9232 | acc 0.048 | lr 1.47e-04 | gn 5.34
+   base: loss 4.4628 | acc 0.055 | lr 1.47e-04 | gn 4.40
+  large: loss 4.3066 | acc 0.054 | lr 1.47e-04 | gn 3.33
+step     570 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.9218 | acc 0.047 | lr 1.45e-04 | gn 4.75
+   base: loss 4.4557 | acc 0.055 | lr 1.45e-04 | gn 3.60
+  large: loss 4.3046 | acc 0.055 | lr 1.45e-04 | gn 3.10
+step     575 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8010 | acc 0.051 | lr 1.43e-04 | gn 4.89
+   base: loss 4.3553 | acc 0.058 | lr 1.43e-04 | gn 4.03
+  large: loss 4.2080 | acc 0.058 | lr 1.43e-04 | gn 3.42
+step     580 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.7716 | acc 0.053 | lr 1.41e-04 | gn 5.13
+   base: loss 4.3243 | acc 0.061 | lr 1.41e-04 | gn 3.41
+  large: loss 4.1913 | acc 0.059 | lr 1.41e-04 | gn 3.78
+step     585 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.7857 | acc 0.054 | lr 1.38e-04 | gn 5.67
+   base: loss 4.3237 | acc 0.060 | lr 1.38e-04 | gn 3.55
+  large: loss 4.1879 | acc 0.059 | lr 1.38e-04 | gn 3.38
+step     590 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.8835 | acc 0.048 | lr 1.36e-04 | gn 4.30
+   base: loss 4.4354 | acc 0.053 | lr 1.36e-04 | gn 4.08
+  large: loss 4.2835 | acc 0.057 | lr 1.36e-04 | gn 3.37
+step     595 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.8296 | acc 0.050 | lr 1.34e-04 | gn 4.56
+   base: loss 4.3701 | acc 0.057 | lr 1.34e-04 | gn 3.83
+  large: loss 4.2127 | acc 0.058 | lr 1.34e-04 | gn 3.03
+step     600 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8430 | acc 0.048 | lr 1.32e-04 | gn 4.72
+   base: loss 4.3763 | acc 0.057 | lr 1.32e-04 | gn 2.87
+  large: loss 4.2297 | acc 0.057 | lr 1.32e-04 | gn 2.47
+step     605 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8420 | acc 0.051 | lr 1.30e-04 | gn 3.79
+   base: loss 4.3849 | acc 0.058 | lr 1.30e-04 | gn 4.45
+  large: loss 4.2251 | acc 0.058 | lr 1.30e-04 | gn 2.82
+step     610 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7913 | acc 0.050 | lr 1.28e-04 | gn 4.74
+   base: loss 4.3125 | acc 0.057 | lr 1.28e-04 | gn 4.42
+  large: loss 4.1562 | acc 0.058 | lr 1.28e-04 | gn 3.10
+step     615 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8210 | acc 0.054 | lr 1.25e-04 | gn 3.80
+   base: loss 4.3660 | acc 0.059 | lr 1.25e-04 | gn 3.57
+  large: loss 4.2121 | acc 0.062 | lr 1.25e-04 | gn 2.92
+step     620 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7103 | acc 0.055 | lr 1.23e-04 | gn 4.54
+   base: loss 4.2752 | acc 0.064 | lr 1.23e-04 | gn 3.50
+  large: loss 4.1274 | acc 0.064 | lr 1.23e-04 | gn 3.14
+step     625 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.8908 | acc 0.050 | lr 1.21e-04 | gn 4.31
+   base: loss 4.4306 | acc 0.057 | lr 1.21e-04 | gn 3.79
+  large: loss 4.2862 | acc 0.056 | lr 1.21e-04 | gn 2.79
+step     630 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8578 | acc 0.047 | lr 1.19e-04 | gn 4.52
+   base: loss 4.4045 | acc 0.058 | lr 1.19e-04 | gn 2.49
+  large: loss 4.2447 | acc 0.057 | lr 1.19e-04 | gn 3.23
+step     635 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7137 | acc 0.054 | lr 1.17e-04 | gn 3.68
+   base: loss 4.2820 | acc 0.059 | lr 1.17e-04 | gn 3.65
+  large: loss 4.1304 | acc 0.058 | lr 1.17e-04 | gn 3.42
+step     640 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8003 | acc 0.049 | lr 1.15e-04 | gn 5.77
+   base: loss 4.3310 | acc 0.057 | lr 1.15e-04 | gn 4.41
+  large: loss 4.1685 | acc 0.058 | lr 1.15e-04 | gn 3.10
+step     645 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8313 | acc 0.046 | lr 1.13e-04 | gn 5.17
+   base: loss 4.3520 | acc 0.052 | lr 1.13e-04 | gn 4.33
+  large: loss 4.1861 | acc 0.053 | lr 1.13e-04 | gn 2.66
+step     650 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7320 | acc 0.054 | lr 1.11e-04 | gn 4.90
+   base: loss 4.2768 | acc 0.059 | lr 1.11e-04 | gn 3.23
+  large: loss 4.1225 | acc 0.059 | lr 1.11e-04 | gn 3.33
+step     655 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7662 | acc 0.050 | lr 1.09e-04 | gn 4.00
+   base: loss 4.3340 | acc 0.057 | lr 1.09e-04 | gn 2.64
+  large: loss 4.1867 | acc 0.058 | lr 1.09e-04 | gn 3.52
+step     660 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7239 | acc 0.053 | lr 1.07e-04 | gn 5.72
+   base: loss 4.2569 | acc 0.060 | lr 1.07e-04 | gn 3.98
+  large: loss 4.0949 | acc 0.062 | lr 1.07e-04 | gn 2.94
+step     665 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8230 | acc 0.049 | lr 1.05e-04 | gn 3.85
+   base: loss 4.3373 | acc 0.055 | lr 1.05e-04 | gn 3.36
+  large: loss 4.1732 | acc 0.058 | lr 1.05e-04 | gn 3.16
+step     670 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7670 | acc 0.052 | lr 1.03e-04 | gn 5.61
+   base: loss 4.3033 | acc 0.058 | lr 1.03e-04 | gn 5.06
+  large: loss 4.1427 | acc 0.059 | lr 1.03e-04 | gn 3.87
+step     675 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7570 | acc 0.053 | lr 1.01e-04 | gn 4.11
+   base: loss 4.2833 | acc 0.061 | lr 1.01e-04 | gn 3.52
+  large: loss 4.1273 | acc 0.061 | lr 1.01e-04 | gn 2.79
+step     680 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8629 | acc 0.049 | lr 9.88e-05 | gn 4.74
+   base: loss 4.3938 | acc 0.055 | lr 9.88e-05 | gn 3.91
+  large: loss 4.2371 | acc 0.053 | lr 9.88e-05 | gn 2.73
+step     685 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7140 | acc 0.051 | lr 9.69e-05 | gn 4.72
+   base: loss 4.2466 | acc 0.059 | lr 9.69e-05 | gn 3.30
+  large: loss 4.0901 | acc 0.060 | lr 9.69e-05 | gn 2.82
+step     690 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.8682 | acc 0.046 | lr 9.49e-05 | gn 4.21
+   base: loss 4.3874 | acc 0.055 | lr 9.49e-05 | gn 3.43
+  large: loss 4.2229 | acc 0.056 | lr 9.49e-05 | gn 2.78
+step     695 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6095 | acc 0.059 | lr 9.30e-05 | gn 3.97
+   base: loss 4.1550 | acc 0.062 | lr 9.30e-05 | gn 2.91
+  large: loss 4.0153 | acc 0.064 | lr 9.30e-05 | gn 2.93
+step     700 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.6835 | acc 0.055 | lr 9.12e-05 | gn 4.33
+   base: loss 4.2191 | acc 0.061 | lr 9.12e-05 | gn 3.64
+  large: loss 4.0644 | acc 0.062 | lr 9.12e-05 | gn 2.89
+step     705 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6934 | acc 0.054 | lr 8.93e-05 | gn 4.44
+   base: loss 4.2493 | acc 0.060 | lr 8.93e-05 | gn 2.78
+  large: loss 4.0971 | acc 0.060 | lr 8.93e-05 | gn 2.52
+step     710 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6942 | acc 0.052 | lr 8.75e-05 | gn 4.68
+   base: loss 4.2367 | acc 0.061 | lr 8.75e-05 | gn 2.99
+  large: loss 4.0924 | acc 0.062 | lr 8.75e-05 | gn 3.33
+step     715 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.8485 | acc 0.045 | lr 8.56e-05 | gn 4.38
+   base: loss 4.3551 | acc 0.053 | lr 8.56e-05 | gn 3.80
+  large: loss 4.1930 | acc 0.057 | lr 8.56e-05 | gn 3.02
+step     720 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7042 | acc 0.048 | lr 8.39e-05 | gn 4.42
+   base: loss 4.2130 | acc 0.059 | lr 8.39e-05 | gn 3.42
+  large: loss 4.0571 | acc 0.059 | lr 8.39e-05 | gn 2.94
+step     725 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7096 | acc 0.052 | lr 8.21e-05 | gn 5.18
+   base: loss 4.2320 | acc 0.060 | lr 8.21e-05 | gn 3.36
+  large: loss 4.0756 | acc 0.059 | lr 8.21e-05 | gn 2.61
+step     730 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.7384 | acc 0.051 | lr 8.03e-05 | gn 4.59
+   base: loss 4.2653 | acc 0.057 | lr 8.03e-05 | gn 3.61
+  large: loss 4.1012 | acc 0.057 | lr 8.03e-05 | gn 2.69
+step     735 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.5743 | acc 0.057 | lr 7.86e-05 | gn 4.60
+   base: loss 4.1171 | acc 0.064 | lr 7.86e-05 | gn 2.70
+  large: loss 3.9677 | acc 0.064 | lr 7.86e-05 | gn 2.53
+step     740 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6736 | acc 0.055 | lr 7.69e-05 | gn 3.88
+   base: loss 4.2047 | acc 0.061 | lr 7.69e-05 | gn 3.36
+  large: loss 4.0450 | acc 0.062 | lr 7.69e-05 | gn 2.52
+step     745 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.7389 | acc 0.050 | lr 7.52e-05 | gn 4.25
+   base: loss 4.2774 | acc 0.058 | lr 7.52e-05 | gn 3.34
+  large: loss 4.1166 | acc 0.058 | lr 7.52e-05 | gn 3.25
+step     750 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6475 | acc 0.055 | lr 7.36e-05 | gn 4.50
+   base: loss 4.1737 | acc 0.062 | lr 7.36e-05 | gn 3.24
+  large: loss 4.0202 | acc 0.061 | lr 7.36e-05 | gn 3.03
+step     755 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6820 | acc 0.052 | lr 7.19e-05 | gn 4.63
+   base: loss 4.2121 | acc 0.057 | lr 7.19e-05 | gn 3.89
+  large: loss 4.0512 | acc 0.059 | lr 7.19e-05 | gn 2.98
+step     760 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.7521 | acc 0.050 | lr 7.03e-05 | gn 4.23
+   base: loss 4.2960 | acc 0.057 | lr 7.03e-05 | gn 3.84
+  large: loss 4.1361 | acc 0.058 | lr 7.03e-05 | gn 2.49
+step     765 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7166 | acc 0.052 | lr 6.88e-05 | gn 5.12
+   base: loss 4.2287 | acc 0.055 | lr 6.88e-05 | gn 3.58
+  large: loss 4.0651 | acc 0.060 | lr 6.88e-05 | gn 2.61
+step     770 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.6408 | acc 0.055 | lr 6.72e-05 | gn 3.84
+   base: loss 4.1638 | acc 0.065 | lr 6.72e-05 | gn 2.88
+  large: loss 4.0176 | acc 0.063 | lr 6.72e-05 | gn 2.83
+step     775 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7059 | acc 0.048 | lr 6.57e-05 | gn 4.49
+   base: loss 4.2241 | acc 0.058 | lr 6.57e-05 | gn 3.74
+  large: loss 4.0639 | acc 0.058 | lr 6.57e-05 | gn 2.46
+step     780 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.7174 | acc 0.051 | lr 6.42e-05 | gn 5.16
+   base: loss 4.2278 | acc 0.058 | lr 6.42e-05 | gn 3.73
+  large: loss 4.0649 | acc 0.056 | lr 6.42e-05 | gn 2.92
+step     785 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7242 | acc 0.049 | lr 6.27e-05 | gn 3.54
+   base: loss 4.2379 | acc 0.056 | lr 6.27e-05 | gn 2.75
+  large: loss 4.0774 | acc 0.056 | lr 6.27e-05 | gn 2.61
+step     790 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7251 | acc 0.049 | lr 6.13e-05 | gn 4.25
+   base: loss 4.2385 | acc 0.057 | lr 6.13e-05 | gn 2.57
+  large: loss 4.0895 | acc 0.056 | lr 6.13e-05 | gn 2.87
+step     795 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7504 | acc 0.046 | lr 5.99e-05 | gn 3.59
+   base: loss 4.2597 | acc 0.055 | lr 5.99e-05 | gn 3.24
+  large: loss 4.0988 | acc 0.059 | lr 5.99e-05 | gn 2.41
+step     800 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7374 | acc 0.052 | lr 5.85e-05 | gn 5.15
+   base: loss 4.2572 | acc 0.055 | lr 5.85e-05 | gn 3.67
+  large: loss 4.0940 | acc 0.057 | lr 5.85e-05 | gn 2.71
+step     805 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.7884 | acc 0.047 | lr 5.71e-05 | gn 5.59
+   base: loss 4.2908 | acc 0.056 | lr 5.71e-05 | gn 3.81
+  large: loss 4.1304 | acc 0.056 | lr 5.71e-05 | gn 2.51
+step     810 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6698 | acc 0.053 | lr 5.58e-05 | gn 4.15
+   base: loss 4.1817 | acc 0.061 | lr 5.58e-05 | gn 2.72
+  large: loss 4.0293 | acc 0.060 | lr 5.58e-05 | gn 3.05
+step     815 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6167 | acc 0.058 | lr 5.45e-05 | gn 4.70
+   base: loss 4.1574 | acc 0.063 | lr 5.45e-05 | gn 2.79
+  large: loss 4.0000 | acc 0.064 | lr 5.45e-05 | gn 2.50
+step     820 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6791 | acc 0.050 | lr 5.32e-05 | gn 4.81
+   base: loss 4.2053 | acc 0.060 | lr 5.32e-05 | gn 3.86
+  large: loss 4.0518 | acc 0.060 | lr 5.32e-05 | gn 2.58
+step     825 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6981 | acc 0.052 | lr 5.20e-05 | gn 4.63
+   base: loss 4.1758 | acc 0.060 | lr 5.20e-05 | gn 2.75
+  large: loss 4.0188 | acc 0.061 | lr 5.20e-05 | gn 2.61
+step     830 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7502 | acc 0.045 | lr 5.08e-05 | gn 3.88
+   base: loss 4.2602 | acc 0.054 | lr 5.08e-05 | gn 2.87
+  large: loss 4.0996 | acc 0.056 | lr 5.08e-05 | gn 2.49
+step     835 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.5601 | acc 0.056 | lr 4.96e-05 | gn 5.03
+   base: loss 4.0907 | acc 0.065 | lr 4.96e-05 | gn 2.66
+  large: loss 3.9421 | acc 0.064 | lr 4.96e-05 | gn 2.70
+step     840 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.6639 | acc 0.054 | lr 4.85e-05 | gn 4.62
+   base: loss 4.1871 | acc 0.062 | lr 4.85e-05 | gn 2.95
+  large: loss 4.0214 | acc 0.060 | lr 4.85e-05 | gn 2.45
+step     845 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6090 | acc 0.054 | lr 4.73e-05 | gn 4.51
+   base: loss 4.1290 | acc 0.063 | lr 4.73e-05 | gn 3.07
+  large: loss 3.9752 | acc 0.062 | lr 4.73e-05 | gn 2.91
+step     850 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6461 | acc 0.050 | lr 4.63e-05 | gn 3.68
+   base: loss 4.1565 | acc 0.059 | lr 4.63e-05 | gn 2.80
+  large: loss 3.9973 | acc 0.060 | lr 4.63e-05 | gn 2.72
+step     855 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.6071 | acc 0.055 | lr 4.52e-05 | gn 3.94
+   base: loss 4.1356 | acc 0.062 | lr 4.52e-05 | gn 3.13
+  large: loss 3.9862 | acc 0.062 | lr 4.52e-05 | gn 2.49
+step     860 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7313 | acc 0.050 | lr 4.42e-05 | gn 3.49
+   base: loss 4.2324 | acc 0.055 | lr 4.42e-05 | gn 3.56
+  large: loss 4.0688 | acc 0.058 | lr 4.42e-05 | gn 2.32
+step     865 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.5982 | acc 0.054 | lr 4.32e-05 | gn 4.05
+   base: loss 4.1233 | acc 0.062 | lr 4.32e-05 | gn 2.93
+  large: loss 3.9673 | acc 0.063 | lr 4.32e-05 | gn 2.15
+step     870 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6773 | acc 0.053 | lr 4.23e-05 | gn 3.84
+   base: loss 4.1749 | acc 0.059 | lr 4.23e-05 | gn 2.96
+  large: loss 4.0268 | acc 0.061 | lr 4.23e-05 | gn 2.34
+step     875 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6481 | acc 0.052 | lr 4.14e-05 | gn 3.96
+   base: loss 4.1770 | acc 0.061 | lr 4.14e-05 | gn 2.61
+  large: loss 4.0148 | acc 0.062 | lr 4.14e-05 | gn 2.08
+step     880 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6538 | acc 0.053 | lr 4.05e-05 | gn 4.03
+   base: loss 4.1592 | acc 0.059 | lr 4.05e-05 | gn 3.53
+  large: loss 4.0067 | acc 0.059 | lr 4.05e-05 | gn 2.39
+step     885 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6338 | acc 0.053 | lr 3.96e-05 | gn 3.97
+   base: loss 4.1545 | acc 0.059 | lr 3.96e-05 | gn 3.31
+  large: loss 4.0097 | acc 0.060 | lr 3.96e-05 | gn 2.40
+step     890 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6209 | acc 0.056 | lr 3.88e-05 | gn 3.68
+   base: loss 4.1319 | acc 0.060 | lr 3.88e-05 | gn 3.22
+  large: loss 3.9773 | acc 0.062 | lr 3.88e-05 | gn 2.48
+step     895 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.7212 | acc 0.051 | lr 3.81e-05 | gn 4.43
+   base: loss 4.2412 | acc 0.053 | lr 3.81e-05 | gn 2.78
+  large: loss 4.0858 | acc 0.053 | lr 3.81e-05 | gn 2.18
+step     900 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.5923 | acc 0.057 | lr 3.73e-05 | gn 4.42
+   base: loss 4.1052 | acc 0.064 | lr 3.73e-05 | gn 2.77
+  large: loss 3.9508 | acc 0.065 | lr 3.73e-05 | gn 2.62
+step     905 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7125 | acc 0.050 | lr 3.66e-05 | gn 3.80
+   base: loss 4.2146 | acc 0.056 | lr 3.66e-05 | gn 2.95
+  large: loss 4.0655 | acc 0.055 | lr 3.66e-05 | gn 2.70
+step     910 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.5815 | acc 0.052 | lr 3.59e-05 | gn 4.62
+   base: loss 4.1004 | acc 0.059 | lr 3.59e-05 | gn 2.52
+  large: loss 3.9500 | acc 0.061 | lr 3.59e-05 | gn 2.61
+step     915 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6178 | acc 0.055 | lr 3.53e-05 | gn 3.93
+   base: loss 4.1252 | acc 0.061 | lr 3.53e-05 | gn 2.54
+  large: loss 3.9724 | acc 0.062 | lr 3.53e-05 | gn 2.69
+step     920 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.5160 | acc 0.059 | lr 3.47e-05 | gn 3.91
+   base: loss 4.0390 | acc 0.066 | lr 3.47e-05 | gn 2.65
+  large: loss 3.8979 | acc 0.065 | lr 3.47e-05 | gn 2.29
+step     925 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6029 | acc 0.058 | lr 3.41e-05 | gn 3.05
+   base: loss 4.1309 | acc 0.062 | lr 3.41e-05 | gn 3.08
+  large: loss 3.9831 | acc 0.064 | lr 3.41e-05 | gn 2.86
+step     930 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.6165 | acc 0.055 | lr 3.36e-05 | gn 3.55
+   base: loss 4.1278 | acc 0.064 | lr 3.36e-05 | gn 2.89
+  large: loss 3.9729 | acc 0.063 | lr 3.36e-05 | gn 2.29
+step     935 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6365 | acc 0.054 | lr 3.31e-05 | gn 4.08
+   base: loss 4.1721 | acc 0.057 | lr 3.31e-05 | gn 3.01
+  large: loss 4.0263 | acc 0.056 | lr 3.31e-05 | gn 2.51
+step     940 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.5819 | acc 0.054 | lr 3.26e-05 | gn 4.04
+   base: loss 4.1076 | acc 0.062 | lr 3.26e-05 | gn 2.62
+  large: loss 3.9518 | acc 0.063 | lr 3.26e-05 | gn 2.33
+step     945 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.5776 | acc 0.055 | lr 3.22e-05 | gn 3.70
+   base: loss 4.0635 | acc 0.063 | lr 3.22e-05 | gn 2.64
+  large: loss 3.9135 | acc 0.062 | lr 3.22e-05 | gn 2.29
+step     950 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6422 | acc 0.052 | lr 3.18e-05 | gn 3.89
+   base: loss 4.1358 | acc 0.058 | lr 3.18e-05 | gn 2.33
+  large: loss 3.9833 | acc 0.060 | lr 3.18e-05 | gn 2.46
+step     955 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.5098 | acc 0.061 | lr 3.15e-05 | gn 4.28
+   base: loss 4.0354 | acc 0.069 | lr 3.15e-05 | gn 2.64
+  large: loss 3.8819 | acc 0.066 | lr 3.15e-05 | gn 1.97
+step     960 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6400 | acc 0.053 | lr 3.12e-05 | gn 3.74
+   base: loss 4.1298 | acc 0.059 | lr 3.12e-05 | gn 2.77
+  large: loss 3.9748 | acc 0.059 | lr 3.12e-05 | gn 2.64
+step     965 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6049 | acc 0.055 | lr 3.09e-05 | gn 3.69
+   base: loss 4.1148 | acc 0.062 | lr 3.09e-05 | gn 2.79
+  large: loss 3.9639 | acc 0.061 | lr 3.09e-05 | gn 2.62
+step     970 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6086 | acc 0.052 | lr 3.07e-05 | gn 4.02
+   base: loss 4.1220 | acc 0.060 | lr 3.07e-05 | gn 2.78
+  large: loss 3.9663 | acc 0.062 | lr 3.07e-05 | gn 2.44
+step     975 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.6969 | acc 0.049 | lr 3.05e-05 | gn 4.10
+   base: loss 4.1893 | acc 0.056 | lr 3.05e-05 | gn 2.78
+  large: loss 4.0356 | acc 0.059 | lr 3.05e-05 | gn 2.33
+step     980 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.7188 | acc 0.050 | lr 3.03e-05 | gn 3.80
+   base: loss 4.2087 | acc 0.058 | lr 3.03e-05 | gn 3.16
+  large: loss 4.0502 | acc 0.057 | lr 3.03e-05 | gn 2.04
+step     985 | 61 g/s | 1.06s | active: small, base, large
+  small: loss 4.6441 | acc 0.053 | lr 3.02e-05 | gn 4.58
+   base: loss 4.1645 | acc 0.058 | lr 3.02e-05 | gn 3.12
+  large: loss 4.0042 | acc 0.059 | lr 3.02e-05 | gn 2.28
+step     990 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.7437 | acc 0.048 | lr 3.01e-05 | gn 3.65
+   base: loss 4.2234 | acc 0.056 | lr 3.01e-05 | gn 2.69
+  large: loss 4.0616 | acc 0.054 | lr 3.01e-05 | gn 2.85
+step     995 | 61 g/s | 1.05s | active: small, base, large
+  small: loss 4.7825 | acc 0.045 | lr 3.00e-05 | gn 3.73
+   base: loss 4.2756 | acc 0.054 | lr 3.00e-05 | gn 2.97
+  large: loss 4.1186 | acc 0.055 | lr 3.00e-05 | gn 2.23
+step    1000 | 60 g/s | 1.06s | active: small, base, large
+  small: loss 4.6158 | acc 0.051 | lr 3.00e-05 | gn 3.49
+   base: loss 4.1186 | acc 0.058 | lr 3.00e-05 | gn 2.79
+  large: loss 3.9651 | acc 0.059 | lr 3.00e-05 | gn 2.38
+
+Training complete at step 1000
+  [small] Checkpoint saved: /home/tas/pawn/bench/results/clm-bench/sweep/v1_cotrain_b64/run_20260528_224610_small_fair-turtle/checkpoints/step_00001000
+  [base] Checkpoint saved: /home/tas/pawn/bench/results/clm-bench/sweep/v1_cotrain_b64/run_20260528_224610_base_fair-turtle/checkpoints/step_00001000
+  [large] Checkpoint saved: /home/tas/pawn/bench/results/clm-bench/sweep/v1_cotrain_b64/run_20260528_224610_large_fair-turtle/checkpoints/step_00001000
+
+All done.
+Warning: Resource leak detected by SharedSignalPool, 5 Signals leaked.

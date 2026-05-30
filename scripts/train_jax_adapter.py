@@ -442,10 +442,12 @@ def main(argv: list[str] | None = None) -> int:
         corpus = generate_corpus(
             n_games=max(cfg.batch_size * 10, 1000),
             max_ply=cfg.seq_len, seq_len=cfg.seq_len, seed=0,
+            conditioning=cfg.conditioning,
         )
         val_corpus = generate_corpus(
             n_games=max(cfg.batch_size * 4, 100),
             max_ply=cfg.seq_len, seq_len=cfg.seq_len, seed=1,
+            conditioning=cfg.conditioning,
         )
     else:
         corpus = load_lichess_corpus(
@@ -455,6 +457,7 @@ def main(argv: list[str] | None = None) -> int:
             min_ply=cfg.min_ply,
             seq_len=cfg.seq_len,
             max_games=getattr(cfg, "max_games", None),
+            conditioning=cfg.conditioning,
         )
         val_corpus = load_lichess_corpus(
             cfg.pgn,
@@ -463,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
             min_ply=cfg.min_ply,
             seq_len=cfg.seq_len,
             max_games=getattr(cfg, "val_games", None),
+            conditioning=cfg.conditioning,
         )
 
     logger = MetricsLogger(
