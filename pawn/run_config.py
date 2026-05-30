@@ -24,6 +24,8 @@ Discriminated union (``run_type``):
   standalone from-scratch CLM (no backbone), distinct from
   ``--strategy specialized_clm`` which dispatches through the
   adapter trainer.
+- ``"distill"`` → :class:`DistillConfig` — distil a frozen teacher
+  checkpoint into a from-scratch student (plan §7/§7.1, logit-only KL/CE).
 
 Every model sets ``extra="forbid"`` so a stale field (renamed flag,
 misspelled JSON key) raises at config-load time rather than silently
@@ -48,6 +50,7 @@ __all__ = [
     "PretrainConfig",
     "AdapterConfig",
     "SpecializedCLMConfig",
+    "DistillConfig",
     "RunConfig",
 ]
 
@@ -64,6 +67,10 @@ LRDecayShape = Literal["linear", "cosine"]
 # decomp_table leaf under JAX 0.10's strictened None-vs-leaf check;
 # adding it requires an `eqx.filter`-aware wrapper.
 OptimizerName = Literal["adamw", "lion"]
+# B1: distillation objective. ``kl`` matches the teacher's soft targets only,
+# ``ce`` is ground-truth cross-entropy only, ``mix`` interpolates
+# ``alpha·ce + (1-alpha)·kl``.
+DistillObjective = Literal["kl", "ce", "mix"]
 
 
 class BaseRunConfig(BaseModel):
@@ -805,11 +812,132 @@ class SpecializedCLMConfig(BaseRunConfig):
         return self
 
 
+class DistillConfig(BaseRunConfig):
+    """Distil a frozen teacher checkpoint into a from-scratch student.
+
+    The canonical-ladder mechanism (plan §7): a frozen teacher supplies
+    soft targets that a from-scratch student (specialized_clm shapes)
+    matches via a temperature-scaled KL (optionally mixed with ground-truth
+    cross-entropy). Logit-only — the student is **not** a width slice of the
+    teacher, so there is no hidden-state matching.
+
+    The student's architecture comes from either ``student_supernet`` (a
+    ``tiny``/``production`` :data:`pawn.config.SUPERNET` preset) or the four
+    explicit ``d_model`` / ``n_layers`` / ``n_heads`` / ``d_ff`` dims. The
+    teacher's conditioning / ``C`` is inherited at load time from its own
+    checkpoint (reuse of the Phase-A load-time C-assert), so this config
+    only carries the student + objective knobs.
+    """
+
+    run_type: Literal["distill"] = "distill"
+
+    # --- Teacher -------------------------------------------------------
+    # The frozen teacher checkpoint to distil from — a local v2 checkpoint
+    # directory or a HF repo ID (resolved via
+    # ``pawn.checkpoint.resolve_checkpoint_source``). Required; the CLI maps
+    # ``--distill-from`` onto it.
+    distill_from: str
+
+    # --- Objective -----------------------------------------------------
+    objective: DistillObjective = "mix"
+    # Softmax temperature for the KL term (Hinton et al. 2015). >1 softens
+    # the teacher distribution; the KL is scaled by ``temperature²`` to keep
+    # its gradient comparable to the CE term.
+    temperature: float = 2.0
+    # mix weight: ``alpha·ce + (1-alpha)·kl``. alpha=1 ⇒ pure CE, alpha=0 ⇒
+    # pure KL.
+    alpha: float = 0.5
+
+    # --- Student architecture ------------------------------------------
+    # Preset student shape. ``None`` ⇒ the four explicit dims are required.
+    student_supernet: SupernetName | None = None
+    d_model: int | None = None
+    n_layers: int | None = None
+    n_heads: int | None = None
+    d_ff: int | None = None
+
+    # --- Data source (same shape as AdapterConfig) ---------------------
+    pgn: str = "thomas-schweich/pawn-lichess-full"
+    pgn_val_split: str | None = "validation"
+
+    # --- Cadence -------------------------------------------------------
+    checkpoint_interval: int = 5000
+
+    @model_validator(mode="after")
+    def _check_distill(self) -> "DistillConfig":
+        if self.total_steps is None:
+            raise ValueError(
+                "DistillConfig requires total_steps; pass --total-steps N "
+                "or set it in the JSON config"
+            )
+        if self.objective in ("kl", "mix") and self.temperature <= 0:
+            raise ValueError(
+                f"temperature must be positive, got {self.temperature}"
+            )
+        if self.objective == "mix" and not 0.0 <= self.alpha <= 1.0:
+            raise ValueError(
+                f"alpha must be in [0, 1] for objective=mix, got {self.alpha}"
+            )
+        if self.checkpoint_interval <= 0:
+            raise ValueError(
+                f"checkpoint_interval must be positive, got "
+                f"{self.checkpoint_interval}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_student_arch(self) -> "DistillConfig":
+        """Exactly one of ``student_supernet`` or the explicit-dim quad
+        must specify the student shape — never both, never neither.
+
+        A preset + partial dims would silently ignore the dims; a missing
+        preset + partial dims would crash at student init. Surface both as
+        a parse-time ValueError so the discriminated-union dispatch fails
+        loudly.
+        """
+        explicit = (self.d_model, self.n_layers, self.n_heads, self.d_ff)
+        any_explicit = any(v is not None for v in explicit)
+        all_explicit = all(v is not None for v in explicit)
+        if self.student_supernet is not None:
+            if any_explicit:
+                raise ValueError(
+                    "pass either student_supernet OR explicit student dims "
+                    "(d_model/n_layers/n_heads/d_ff), not both"
+                )
+            return self
+        if not all_explicit:
+            raise ValueError(
+                "DistillConfig requires either student_supernet or all four "
+                "explicit student dims (d_model, n_layers, n_heads, d_ff)"
+            )
+        # All four explicit dims present — validate them (mirrors
+        # SpecializedCLMConfig._check_arch).
+        assert (
+            self.d_model is not None and self.n_layers is not None
+            and self.n_heads is not None and self.d_ff is not None
+        )
+        if self.d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {self.d_model}")
+        if self.n_layers <= 0:
+            raise ValueError(f"n_layers must be positive, got {self.n_layers}")
+        if self.n_heads <= 0:
+            raise ValueError(f"n_heads must be positive, got {self.n_heads}")
+        if self.d_ff <= 0:
+            raise ValueError(f"d_ff must be positive, got {self.d_ff}")
+        if self.d_model % self.n_heads != 0:
+            raise ValueError(
+                f"d_model ({self.d_model}) must be divisible by n_heads "
+                f"({self.n_heads}); otherwise attention head_dim is "
+                f"non-integer and the model crashes at first forward"
+            )
+        return self
+
+
 # Discriminated union: pydantic dispatches by run_type at parse time.
 # `pawn.lab` returns this via `lab_schema`; CLI drivers in S13 build
 # the appropriate subclass and the trainer reads the right discriminator.
 RunConfig = Annotated[
-    Union[PretrainConfig, AdapterConfig, SpecializedCLMConfig],
+    Union[PretrainConfig, AdapterConfig, SpecializedCLMConfig, DistillConfig],
     Field(discriminator="run_type"),
 ]
 """Discriminated union of all v2 JAX run-config types."""

@@ -91,9 +91,11 @@ def test_read_best_val_loss_returns_inf_on_no_records(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_lab_schema_returns_three_run_types() -> None:
+def test_lab_schema_returns_all_run_types() -> None:
     schema = lab_schema()
-    assert set(schema.keys()) == {"pretrain", "adapter", "specialized_clm"}
+    assert set(schema.keys()) == {
+        "pretrain", "adapter", "specialized_clm", "distill",
+    }
     # Each schema is a JSON Schema dict.
     for k, s in schema.items():
         assert "properties" in s

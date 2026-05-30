@@ -22,6 +22,7 @@ from typing import Any
 
 from pawn.run_config import (
     AdapterConfig,
+    DistillConfig,
     PretrainConfig,
     SpecializedCLMConfig,
 )
@@ -43,12 +44,14 @@ def lab_schema() -> dict[str, Any]:
             "pretrain": {<JSON Schema dict>},
             "adapter": {<JSON Schema dict>},
             "specialized_clm": {<JSON Schema dict>},
+            "distill": {<JSON Schema dict>},
         }
     """
     return {
         "pretrain": PretrainConfig.model_json_schema(),
         "adapter": AdapterConfig.model_json_schema(),
         "specialized_clm": SpecializedCLMConfig.model_json_schema(),
+        "distill": DistillConfig.model_json_schema(),
     }
 
 
@@ -69,9 +72,11 @@ def validate_config(config: Mapping[str, Any]) -> Any:
         return AdapterConfig(**config)
     if run_type == "specialized_clm":
         return SpecializedCLMConfig(**config)
+    if run_type == "distill":
+        return DistillConfig(**config)
     raise ValueError(
         f"unknown run_type {run_type!r}; valid: pretrain / adapter / "
-        f"specialized_clm"
+        f"specialized_clm / distill"
     )
 
 
@@ -99,6 +104,7 @@ def lab_launch(
         "pretrain": "scripts/train_jax.py",
         "adapter": "scripts/train_jax_adapter.py",
         "specialized_clm": "scripts/train_jax_adapter.py",
+        "distill": "scripts/train_jax_distill.py",
     }
     script = script_map[run_type]
     # Spawn (the script reads its own --config JSON; we hand it the

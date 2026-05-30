@@ -44,7 +44,7 @@ import numpy as np
 import optax
 from jaxtyping import Array, Bool, Float, Int
 
-from pawn.config import ModelConfig, NULL_TOKEN
+from pawn.config import ModelConfig, NULL_TOKEN, PAD_TOKEN
 from pawn.corpus import Corpus
 from pawn.model import EffectiveCallable, PAWNModel, sliced
 from pawn.run_config import BaseRunConfig
@@ -63,6 +63,10 @@ __all__ = [
     "flatten_opt_state",
     "unflatten_opt_state",
     "get_grad_norm",
+    "reserved_column_mask",
+    "mask_reserved_columns",
+    "distill_column_mask",
+    "mask_distill_columns",
 ]
 
 
@@ -155,6 +159,78 @@ class VariantSpec:
 
 
 # ---------------------------------------------------------------------------
+# Reserved / NULL / control column masking (Phase-A §2 column-mask helper)
+# ---------------------------------------------------------------------------
+
+
+def reserved_column_mask(v: int) -> Bool[Array, "v"]:
+    """Boolean ``(V,)`` vector — True at columns that must be masked out.
+
+    Columns ``[NULL_TOKEN .. V)`` are NULL + the reserved control IDs:
+    they live in the uniform ``V``-wide logit table (Phase-A Chunk 2) but
+    are never legitimate prediction targets. The :class:`cross_entropy_loss`
+    softmax and the Phase-B distillation KL both feed this mask through
+    :func:`mask_reserved_columns` so the dead columns neither dilute the
+    move-token probability mass nor accrue backward gradient. Factored out
+    of the inline ``cross_entropy_loss`` computation so the distillation
+    path reuses the *same* threshold rather than re-deriving it.
+    """
+    return jnp.arange(v, dtype=jnp.int32) >= jnp.int32(_FIRST_RESERVED_COLUMN)
+
+
+def mask_reserved_columns(
+    logits: Float[Array, "... V"],
+) -> Float[Array, "... V"]:
+    """Set the reserved / NULL / control columns of ``logits`` to ``-inf``.
+
+    ``-inf`` is representable, so ``exp(-inf) = 0`` keeps the softmax
+    denominator finite as long as at least one move / PAD / outcome / BOS
+    column survives (columns ``[0, NULL_TOKEN)`` are always untouched). The
+    autograd graph through the constant ``-inf`` substitution is detached at
+    those columns, so the corresponding embedding / ``lm_head`` rows receive
+    exactly zero gradient.
+    """
+    v = logits.shape[-1]
+    reserved = reserved_column_mask(v)
+    return jnp.where(reserved, -jnp.inf, logits)
+
+
+def distill_column_mask(v: int) -> Bool[Array, "v"]:
+    """Boolean ``(V,)`` vector — True at columns excluded from the KL.
+
+    Distillation masks a **strictly larger** set of columns than the
+    integer-label CE softmax: columns ``[PAD_TOKEN .. V)`` — PAD, the 11
+    outcome tokens, BOS, NULL, and the reserved control block — are all
+    excluded from both the student and teacher softmax (plan §7 / Phase-B
+    spec, Stage B1). The CE softmax can leave PAD / outcome / BOS columns
+    in (their only contribution is the benign softmax-denominator gradient,
+    since they are never integer targets), but for *soft-target* KL the
+    teacher's softmax would otherwise place real probability mass on those
+    columns and distil it into the student. Masking at ``PAD_TOKEN`` keeps
+    the KL distribution on the supervised move-token support only.
+    """
+    return jnp.arange(v, dtype=jnp.int32) >= jnp.int32(PAD_TOKEN)
+
+
+def mask_distill_columns(
+    logits: Float[Array, "... V"],
+) -> Float[Array, "... V"]:
+    """Set the PAD / outcome / BOS / NULL / reserved columns to ``-inf``.
+
+    The distillation counterpart of :func:`mask_reserved_columns`: it masks
+    columns ``[PAD_TOKEN .. V)`` (a superset of the CE reserved block) so the
+    KL softmax normalises over the supervised move-token support alone and
+    the teacher's soft target carries zero mass on PAD / outcome / BOS / NULL
+    columns (Phase-B spec, Stage B1). ``exp(-inf) = 0`` keeps the denominator
+    finite as long as at least one move column survives, and the constant
+    ``-inf`` substitution detaches the backward gradient on those columns.
+    """
+    v = logits.shape[-1]
+    masked = distill_column_mask(v)
+    return jnp.where(masked, -jnp.inf, logits)
+
+
+# ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
 
@@ -238,11 +314,7 @@ def cross_entropy_loss(
         # least one move/PAD/outcome/BOS column survives — which it always
         # does (columns ``[0, NULL_TOKEN)`` are untouched).
         logits_f32 = logits.astype(jnp.float32)
-        v = logits_f32.shape[-1]
-        reserved_cols = (
-            jnp.arange(v, dtype=jnp.int32) >= jnp.int32(_FIRST_RESERVED_COLUMN)
-        )
-        masked_logits = jnp.where(reserved_cols, -jnp.inf, logits_f32)
+        masked_logits = mask_reserved_columns(logits_f32)
         per_pos_loss = optax.softmax_cross_entropy_with_integer_labels(
             masked_logits, batch.targets,
             where=batch.loss_mask.astype(jnp.bool_)[..., None],

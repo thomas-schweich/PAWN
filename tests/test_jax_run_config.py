@@ -22,6 +22,7 @@ import pytest
 from pawn.config import MAX_SEQ_LEN
 from pawn.run_config import (
     AdapterConfig,
+    DistillConfig,
     PretrainConfig,
     RunConfig,
     SpecializedCLMConfig,
@@ -66,6 +67,17 @@ def _specialized_kwargs(**overrides: Any) -> dict[str, Any]:
     return base
 
 
+def _distill_kwargs(**overrides: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "local_checkpoints": True,
+        "total_steps": 100,
+        "distill_from": "thomas-schweich/pawn-base-v2",
+        "student_supernet": "tiny",
+    }
+    base.update(overrides)
+    return base
+
+
 # ---------------------------------------------------------------------------
 # Shape: durable v1 field names + plan §10 S3 defaults
 # ---------------------------------------------------------------------------
@@ -92,6 +104,62 @@ def test_specialized_minimal_valid() -> None:
     cfg = SpecializedCLMConfig(**_specialized_kwargs())
     assert cfg.run_type == "specialized_clm"
     assert cfg.d_model == 64
+
+
+def test_distill_minimal_valid() -> None:
+    cfg = DistillConfig(**_distill_kwargs())
+    assert cfg.run_type == "distill"
+    assert cfg.distill_from == "thomas-schweich/pawn-base-v2"
+    assert cfg.student_supernet == "tiny"
+    assert cfg.objective == "mix"
+    assert cfg.temperature == 2.0
+    assert cfg.alpha == 0.5
+
+
+def test_distill_explicit_student_dims_valid() -> None:
+    cfg = DistillConfig(**_distill_kwargs(
+        student_supernet=None, d_model=64, n_layers=2, n_heads=2, d_ff=128,
+    ))
+    assert cfg.d_model == 64 and cfg.student_supernet is None
+
+
+def test_distill_rejects_preset_and_explicit_dims() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        DistillConfig(**_distill_kwargs(d_model=64))
+
+
+def test_distill_rejects_no_student_arch() -> None:
+    with pytest.raises(ValueError, match="student_supernet or all four"):
+        DistillConfig(**_distill_kwargs(student_supernet=None))
+
+
+def test_distill_rejects_partial_explicit_dims() -> None:
+    with pytest.raises(ValueError, match="all four"):
+        DistillConfig(**_distill_kwargs(
+            student_supernet=None, d_model=64, n_layers=2,
+        ))
+
+
+def test_distill_rejects_nonpositive_temperature() -> None:
+    with pytest.raises(ValueError, match="temperature must be positive"):
+        DistillConfig(**_distill_kwargs(objective="kl", temperature=0.0))
+
+
+def test_distill_rejects_alpha_out_of_unit_interval() -> None:
+    with pytest.raises(ValueError, match="alpha must be in"):
+        DistillConfig(**_distill_kwargs(objective="mix", alpha=1.5))
+
+
+def test_distill_round_trips_through_json() -> None:
+    cfg = DistillConfig(**_distill_kwargs(objective="kl", temperature=3.0))
+    dumped = json.dumps(cfg.model_dump())
+    reloaded = DistillConfig(**json.loads(dumped))
+    assert reloaded.model_dump() == cfg.model_dump()
+
+
+def test_distill_rejects_unknown_field() -> None:
+    with pytest.raises(ValueError):
+        DistillConfig(**_distill_kwargs(distil_temp=2.0))
 
 
 def test_use_output_film_default_is_true() -> None:
