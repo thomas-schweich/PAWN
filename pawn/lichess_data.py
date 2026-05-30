@@ -51,8 +51,8 @@ from pawn._sentinel import (
     verify_sentinel,
     write_sentinel,
 )
-from pawn.config import PAD_TOKEN
-from pawn.corpus import Corpus, pack_corpus
+from pawn.config import MASK_VERSION, PAD_TOKEN
+from pawn.corpus import Corpus, conditioning_to_C, pack_corpus
 
 __all__ = [
     "load_lichess_corpus",
@@ -65,7 +65,12 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 _CACHE_FILES = ("corpus.safetensors",)
-_CACHE_VERSION = 1
+# Bumped to 2 in Phase-A Chunk 4: the on-disk corpus layout changed to
+# ``[BOS][cond…][ply…]`` with the first-move-supervised loss mask, and the
+# cache key now folds in the conditioning-derived ``C`` + ``mask_version``.
+# A v1 cache entry is byte-incompatible, so the version bump alone forces a
+# rebuild (distinct key) even before the new params are considered.
+_CACHE_VERSION = 2
 
 
 def _default_cache_root() -> Path:
@@ -87,15 +92,21 @@ def _cache_key(
     min_ply: int,
     seq_len: int,
     max_games: int | None,
-    prepend_outcome: bool,
+    conditioning: Sequence[str],
 ) -> str:
     """SHA-256 of the filter params, hex-encoded. Same inputs → same hash
     → same cache entry. Any change in any of these params produces a
     different cache directory; the user pays the filter+pack cost once.
+
+    The ordered ``conditioning`` list, its derived prefix width ``C``, and
+    the global ``mask_version`` all fold into the key: a corpus packed
+    under one prefix/loss-mask contract must never be served to a run
+    that expects another (silent absolute-RoPE drift).
     """
     payload = json.dumps(
         {
             "version": _CACHE_VERSION,
+            "mask_version": MASK_VERSION,
             "source": source,
             "split": split,
             "elo_min": elo_min,
@@ -103,7 +114,8 @@ def _cache_key(
             "min_ply": min_ply,
             "seq_len": seq_len,
             "max_games": max_games,
-            "prepend_outcome": prepend_outcome,
+            "conditioning": list(conditioning),
+            "C": conditioning_to_C(conditioning),
         },
         sort_keys=True,
     ).encode("utf-8")
@@ -242,7 +254,7 @@ def _pack_dataframe(
     df: pl.DataFrame,
     *,
     seq_len: int,
-    prepend_outcome: bool,
+    conditioning: Sequence[str],
 ) -> Corpus:
     """Turn a filtered DataFrame into a :class:`Corpus` via
     :func:`pawn.corpus.pack_corpus`."""
@@ -275,7 +287,7 @@ def _pack_dataframe(
         game_lengths,
         outcome_tokens,
         seq_len=seq_len,
-        prepend_outcome=prepend_outcome,
+        conditioning=conditioning,
     )
 
 
@@ -328,19 +340,18 @@ def _load_from_cache(cache_dir: Path) -> Corpus:
         raise CheckpointIntegrityError(
             f"cache at {cache_dir} missing tensors {sorted(missing)}"
         )
-    # game_lengths is new in the A.1 bucketing work. Pre-A.1 caches
-    # don't have it; recover by deriving from the loss_mask (positions
-    # 0..gl-1 supervised, so gl = loss_mask.sum(axis=-1) when
-    # prepend_outcome=False, gl = loss_mask.sum(axis=-1) - 1 with
-    # prefix). We don't know the prefix flag from cache alone; the
-    # outcome_offset field does — index it.
+    # game_lengths is normally present (every cache written since the A.1
+    # bucketing work saves it). Recovery path: under the Chunk-4 loss-mask
+    # contract the supervised positions are exactly
+    # ``[C-1 .. C-1 + game_length - 1]``, so ``loss_mask.sum(axis=-1) ==
+    # game_length`` regardless of the prefix width — no ``outcome_offset``
+    # correction needed. (Pre-Chunk-4 caches live under a different cache
+    # key after the _CACHE_VERSION bump, so they're never read here.)
     if "game_lengths" in raw:
         game_lengths = raw["game_lengths"].astype(np.int32)
     else:
-        # Recover: supervised positions == gl + prefix
-        prefix_flag = raw["outcome_offset"].astype(np.int32)
         loss_count = raw["loss_mask"].astype(np.int32).sum(axis=-1)
-        game_lengths = (loss_count - prefix_flag).astype(np.int32)
+        game_lengths = loss_count.astype(np.int32)
     # Stay on host — Corpus is host-side numpy; the trainer transfers
     # per-batch.
     return Corpus(
@@ -367,7 +378,7 @@ def load_lichess_corpus(
     min_ply: int = 10,
     seq_len: int = 512,
     max_games: int | None = None,
-    prepend_outcome: bool = False,
+    conditioning: Sequence[str] = (),
     cache_dir: str | Path | None = None,
 ) -> Corpus:
     """Load a Lichess parquet slice into a :class:`Corpus`, cached on disk.
@@ -383,20 +394,23 @@ def load_lichess_corpus(
     (exclusive, both players) / ``min_ply`` (drop short games) /
     ``max_games`` (take the first N after filtering).
 
-    ``prepend_outcome=True`` writes the outcome token at slot 0 (the
-    layout the generation diagnostics in S8 require).
+    ``conditioning`` is the ordered list of control kinds to prepend
+    (see :data:`pawn.config.CONDITIONING_KINDS`); ``["outcome"]`` is the
+    layout the generation diagnostics in S8 require. The default ``()``
+    prepends only BOS (``C = 1``).
 
     Caches the resulting :class:`Corpus` under
     ``$HF_HOME/pawn-lichess-cache/<sha>/`` (override via ``cache_dir``).
-    The cache key is the SHA-256 of all filter params — change any one
-    and you get a fresh cache entry. The first run does the
+    The cache key is the SHA-256 of all filter params **plus** the
+    conditioning-derived ``C`` and the global ``mask_version`` — change
+    any one and you get a fresh cache entry. The first run does the
     filter+pack work; subsequent runs verify the sentinel and load
     directly.
     """
     cache_root = Path(cache_dir) if cache_dir is not None else _default_cache_root()
     cache_root.mkdir(parents=True, exist_ok=True)
     sha = _cache_key(
-        source, split, elo_min, elo_max, min_ply, seq_len, max_games, prepend_outcome
+        source, split, elo_min, elo_max, min_ply, seq_len, max_games, conditioning
     )
     final_dir = cache_root / sha
 
@@ -411,7 +425,7 @@ def load_lichess_corpus(
     df = _filter_lichess(
         lf, elo_min=elo_min, elo_max=elo_max, min_ply=min_ply, max_games=max_games
     )
-    corpus = _pack_dataframe(df, seq_len=seq_len, prepend_outcome=prepend_outcome)
+    corpus = _pack_dataframe(df, seq_len=seq_len, conditioning=conditioning)
     _save_to_cache(corpus, final_dir)
     return corpus
 

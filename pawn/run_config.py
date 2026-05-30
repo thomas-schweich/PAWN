@@ -36,9 +36,12 @@ are the public surfaces the lab MCP server's ``lab_schema`` returns.
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, Union
+import warnings
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from pawn.config import CONDITIONING_KINDS, MAX_SEQ_LEN
 
 __all__ = [
     "BaseRunConfig",
@@ -117,9 +120,22 @@ class BaseRunConfig(BaseModel):
 
     # --- Ablations -----------------------------------------------------
     mate_boost: float = 0.0
-    # Prepend the game-outcome token at position 0 for outcome-conditioned
-    # training. All 5 generation diagnostics in S8 gate on this flag.
-    prepend_outcome: bool = False
+    # Ordered control-token kinds prepended to every sequence as the
+    # conditioning prefix. The sequence is assembled as
+    # ``[BOS][cond…][ply…][PAD…]``; each entry resolves to one control
+    # token per game (see :data:`pawn.config.CONDITIONING_KINDS` for the
+    # valid kinds and :mod:`pawn.corpus` for the resolution). The prefix
+    # width is ``C = 1 + len(conditioning)`` (BOS is always present, so
+    # ``C >= 1`` even with no conditioning). The 5 generation diagnostics
+    # in S8 condition on whatever kinds appear here (``["outcome"]`` is
+    # the outcome-conditioned setup they were written for).
+    #
+    # Replaces the v1 ``prepend_outcome: bool`` flag —
+    # ``prepend_outcome=True`` ⇒ ``conditioning=["outcome"]``. The legacy
+    # JSON key is migrated with a deprecation warning by
+    # ``_migrate_prepend_outcome`` (mode="before") so old configs still
+    # load under ``extra="forbid"``.
+    conditioning: list[str] = Field(default_factory=list)
     discard_ply_limit: bool = False
 
     # --- Mixed precision (v1-parity field name) -------------------------
@@ -202,9 +218,90 @@ class BaseRunConfig(BaseModel):
     wandb_project: str = "pawn"
     cache_dir: str | None = None
 
+    @property
+    def C(self) -> int:
+        """Conditioning prefix width ``C = 1 + len(conditioning)``.
+
+        Move position ``i`` (0-indexed) lives at sequence slot ``C + i``;
+        the loss is supervised on slots ``[C-1 .. C-1 + game_length - 1]``.
+        BOS is always present, so ``C >= 1``.
+        """
+        return 1 + len(self.conditioning)
+
     # -------------------------------------------------------------------
     # Cross-field validators
     # -------------------------------------------------------------------
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_prepend_outcome(cls, data: Any) -> Any:
+        """Migrate the v1 ``prepend_outcome: bool`` key to ``conditioning``.
+
+        ``prepend_outcome=True`` ⇒ ``conditioning=["outcome"]``;
+        ``prepend_outcome=False`` ⇒ ``conditioning=[]``. Emit a
+        ``DeprecationWarning`` so users update their JSON configs. Without
+        this, ``extra="forbid"`` would reject the legacy key with an
+        opaque "extra field" error instead of a pointer to the new one.
+        """
+        if not isinstance(data, dict) or "prepend_outcome" not in data:
+            return data
+        legacy = data.pop("prepend_outcome")
+        if "conditioning" in data:
+            raise ValueError(
+                "pass either the legacy `prepend_outcome` flag or the new "
+                "`conditioning` list, not both"
+            )
+        warnings.warn(
+            "`prepend_outcome` is deprecated; use "
+            "`conditioning=[\"outcome\"]` (True) or `conditioning=[]` "
+            "(False) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        data["conditioning"] = ["outcome"] if legacy else []
+        return data
+
+    @model_validator(mode="after")
+    def _check_conditioning(self) -> "BaseRunConfig":
+        """Every conditioning kind must be registered, and no kind may
+        repeat (a duplicate slot would silently double-condition)."""
+        seen: set[str] = set()
+        for kind in self.conditioning:
+            if kind not in CONDITIONING_KINDS:
+                raise ValueError(
+                    f"unknown conditioning kind {kind!r}; valid kinds are "
+                    f"{sorted(CONDITIONING_KINDS)}"
+                )
+            if kind in seen:
+                raise ValueError(
+                    f"duplicate conditioning kind {kind!r}; each kind may "
+                    f"appear at most once"
+                )
+            seen.add(kind)
+        return self
+
+    @model_validator(mode="after")
+    def _check_seq_len_budget(self) -> "BaseRunConfig":
+        """``seq_len`` must fit the conditioning prefix AND at least one
+        move slot inside ``max_seq_len``.
+
+        Net-new in Chunk 4: previously only a runtime ``T > max_seq_len``
+        check existed in ``pawn.model``. The prefix consumes ``C`` slots
+        (even when every conditioning value resolves to NULL), so the
+        budget is ``C < seq_len <= MAX_SEQ_LEN``.
+        """
+        if self.seq_len > MAX_SEQ_LEN:
+            raise ValueError(
+                f"seq_len ({self.seq_len}) must be <= MAX_SEQ_LEN "
+                f"({MAX_SEQ_LEN})"
+            )
+        if self.seq_len <= self.C:
+            raise ValueError(
+                f"seq_len ({self.seq_len}) must exceed the conditioning "
+                f"prefix width C={self.C} (= 1 BOS + {self.C - 1} "
+                f"conditioning slot(s)) so at least one move slot remains"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_checkpoint_mode(self) -> "BaseRunConfig":

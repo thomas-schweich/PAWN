@@ -50,6 +50,8 @@ __all__ = [
     "NULL_TOKEN",
     "N_CONTROL_RESERVED",
     "VOCAB_SIZE",
+    "CONDITIONING_KINDS",
+    "MASK_VERSION",
     "WHITE_CHECKMATES",
     "BLACK_CHECKMATES",
     "STALEMATE",
@@ -102,6 +104,38 @@ N_CONTROL_RESERVED: Final[int] = 18     # Tokens 1982–1999 reserved for future
 # exist in the embedding + logit tables but are masked to -inf before softmax-CE
 # so they can't be sampled or accrue gradient.
 VOCAB_SIZE: Final[int] = 2000           # V = 1968 actions + PAD + 11 outcomes + BOS + NULL + 18 reserved
+
+# ---------------------------------------------------------------------------
+# Conditioning prefix (Phase-A Chunk 4)
+# ---------------------------------------------------------------------------
+#
+# Every sequence is assembled as ``[BOS][cond…][ply…][PAD…]`` where the
+# ``[cond…]`` slots carry one control token per entry in the run's
+# ``conditioning`` list. ``CONDITIONING_KINDS`` is the registry of valid
+# kinds; ``BaseRunConfig.conditioning`` is validated against it and the
+# shared assembler in :mod:`pawn.corpus` resolves each kind to its
+# per-game token (or :data:`NULL_TOKEN` when a game lacks that value).
+#
+# The prefix width is ``C = 1 + len(conditioning)`` — BOS is always
+# present, so ``C >= 1`` even with no conditioning. Move position ``i``
+# (0-indexed) lives at sequence slot ``C + i``; the loss is supervised
+# on slots ``[C-1 .. C-1 + game_length - 1]`` (the first-move
+# ``prefix→ply_1`` prediction IS supervised, the predict-PAD slot is not).
+#
+# The registry is a frozenset so it is hashable + order-independent; the
+# *order* a run conditions in is the order of its ``conditioning`` list,
+# not this set.
+CONDITIONING_KINDS: Final[frozenset[str]] = frozenset({"outcome"})
+
+# Layout/mask contract version. Bumped whenever the prefix-assembly /
+# loss-mask / move-position convention changes. Baked into every
+# ``config.json`` (via :mod:`pawn.checkpoint`) AND the lichess on-disk
+# cache key (:mod:`pawn.lichess_data`); a load-time assert refuses a
+# checkpoint / cache entry whose ``mask_version`` doesn't match the
+# builder's. Version 1 is the ``[BOS][cond…][ply…]`` layout with the
+# first-move-supervised / predict-PAD-excluded loss mask (Chunk 4); the
+# pre-Chunk-4 un-prefixed v1 contract was the implicit version 0.
+MASK_VERSION: Final[int] = 1
 
 # Named outcome token IDs (kept verbatim from v1 / engine vocab.rs)
 WHITE_CHECKMATES: Final[int] = 1969

@@ -83,7 +83,7 @@ from pawn._sentinel import (
     verify_sentinel,
     write_sentinel,
 )
-from pawn.config import ModelConfig
+from pawn.config import MASK_VERSION, ModelConfig
 from pawn.model import (
     PAWNModel,
     TransformerLayer,
@@ -115,13 +115,13 @@ __all__ = [
 
 CHECKPOINT_FORMAT_VERSION: Final[int] = 1
 
-# Layout/mask contract version baked into every ``config.json``. Chunk 4 of
-# the Phase-A redesign owns the value: it bumps this whenever the prefix
-# assembly / loss-mask / position convention changes, and the data layer
-# bakes it into the lichess cache key. A load-time assert (Chunk 4) refuses
-# a checkpoint whose ``mask_version`` doesn't match the builder's. Until the
-# conditioning prefix lands, the layout is the un-prefixed v1 contract → 0.
-MASK_VERSION: Final[int] = 0
+# Layout/mask contract version baked into every ``config.json``. Owned by
+# :data:`pawn.config.MASK_VERSION` (single source of truth shared with the
+# lichess cache key) and re-exported here for the checkpoint API surface.
+# It bumps whenever the prefix-assembly / loss-mask / move-position
+# convention changes; the load-time assert in ``_verify_and_read_config``
+# refuses a checkpoint whose ``mask_version`` doesn't match the builder's.
+# (Already listed in ``__all__`` above; the import above binds the name.)
 
 MODEL_FILE: Final[str] = "model.safetensors"
 CONFIG_FILE: Final[str] = "config.json"

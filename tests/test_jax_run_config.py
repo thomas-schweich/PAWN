@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from pawn.config import MAX_SEQ_LEN
 from pawn.run_config import (
     AdapterConfig,
     PretrainConfig,
@@ -406,6 +407,82 @@ def test_batch_size_must_be_positive() -> None:
 def test_max_corpus_gb_must_be_positive() -> None:
     with pytest.raises(ValueError, match="max_corpus_gb"):
         PretrainConfig(**_pretrain_kwargs(max_corpus_gb=0))
+
+
+# Conditioning + seq_len budget (Chunk 4) -----------------------------------
+
+
+def test_conditioning_default_empty_gives_C_one() -> None:
+    """No conditioning → BOS-only prefix, C == 1."""
+    cfg = PretrainConfig(**_pretrain_kwargs())
+    assert cfg.conditioning == []
+    assert cfg.C == 1
+
+
+def test_conditioning_outcome_gives_C_two() -> None:
+    """conditioning=["outcome"] → C == 1 + 1 == 2."""
+    cfg = PretrainConfig(**_pretrain_kwargs(conditioning=["outcome"]))
+    assert cfg.conditioning == ["outcome"]
+    assert cfg.C == 2
+
+
+def test_conditioning_unknown_kind_rejected() -> None:
+    """A kind not in CONDITIONING_KINDS is rejected with the registry
+    message."""
+    with pytest.raises(ValueError, match="unknown conditioning kind"):
+        PretrainConfig(**_pretrain_kwargs(conditioning=["bogus"]))
+
+
+def test_conditioning_duplicate_kind_rejected() -> None:
+    """A repeated kind would silently double-condition; reject it."""
+    with pytest.raises(ValueError, match="duplicate conditioning kind"):
+        PretrainConfig(**_pretrain_kwargs(conditioning=["outcome", "outcome"]))
+
+
+def test_prepend_outcome_true_migrates_to_conditioning_with_warning() -> None:
+    """The legacy `prepend_outcome=True` key migrates to
+    `conditioning=["outcome"]` and emits a DeprecationWarning."""
+    with pytest.warns(DeprecationWarning, match="prepend_outcome"):
+        cfg = PretrainConfig(**_pretrain_kwargs(prepend_outcome=True))
+    assert cfg.conditioning == ["outcome"]
+    assert cfg.C == 2
+
+
+def test_prepend_outcome_false_migrates_to_empty_conditioning() -> None:
+    """`prepend_outcome=False` migrates to an empty conditioning list."""
+    with pytest.warns(DeprecationWarning, match="prepend_outcome"):
+        cfg = PretrainConfig(**_pretrain_kwargs(prepend_outcome=False))
+    assert cfg.conditioning == []
+    assert cfg.C == 1
+
+
+def test_prepend_outcome_and_conditioning_both_set_rejected() -> None:
+    """Passing both the legacy key and the new list is ambiguous → error."""
+    with pytest.raises(ValueError, match="not both"):
+        PretrainConfig(
+            **_pretrain_kwargs(prepend_outcome=True, conditioning=["outcome"])
+        )
+
+
+def test_seq_len_exceeding_max_seq_len_rejected() -> None:
+    """`seq_len > MAX_SEQ_LEN` is rejected by the net-new budget validator."""
+    with pytest.raises(ValueError, match="MAX_SEQ_LEN"):
+        PretrainConfig(**_pretrain_kwargs(seq_len=MAX_SEQ_LEN + 1))
+
+
+def test_seq_len_must_exceed_conditioning_prefix_width() -> None:
+    """`seq_len <= C` leaves no move slot — rejected. With
+    conditioning=["outcome"], C=2, so seq_len=2 is too small."""
+    with pytest.raises(ValueError, match="prefix width"):
+        PretrainConfig(**_pretrain_kwargs(seq_len=2, conditioning=["outcome"]))
+
+
+def test_seq_len_budget_happy_case_with_conditioning() -> None:
+    """A seq_len that fits the prefix plus at least one move slot is
+    accepted."""
+    cfg = PretrainConfig(**_pretrain_kwargs(seq_len=64, conditioning=["outcome"]))
+    assert cfg.seq_len == 64
+    assert cfg.C == 2
 
 
 def test_total_steps_must_be_positive_when_set() -> None:

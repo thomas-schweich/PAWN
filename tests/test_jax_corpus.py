@@ -7,7 +7,9 @@ import pytest
 
 from pawn.config import (
     BLACK_CHECKMATES,
+    BOS_TOKEN,
     DRAW_BY_RULE,
+    NULL_TOKEN,
     PAD_TOKEN,
     PLY_LIMIT,
     STALEMATE,
@@ -16,6 +18,10 @@ from pawn.config import (
 from pawn.corpus import (
     Corpus,
     _map_termination_to_outcome,
+    assert_conditioning_C,
+    build_loss_mask,
+    build_prefix,
+    conditioning_to_C,
     generate_corpus,
     pack_corpus,
 )
@@ -46,25 +52,27 @@ def test_generate_corpus_reproducible_via_seed() -> None:
     assert np.array_equal(a.tokens, b.tokens)
 
 
-def test_generate_corpus_pure_moves_layout() -> None:
-    """Default `prepend_outcome=False` puts moves at slot 0; outcome
-    offsets are 0 per game."""
+def test_generate_corpus_no_conditioning_layout() -> None:
+    """Default empty conditioning → BOS at slot 0, moves at slot 1;
+    outcome_offset == C == 1 per game."""
     corpus = generate_corpus(n_games=4, max_ply=32, seq_len=64, seed=1)
-    assert np.all(corpus.outcome_offset == 0)
-    # Slot 0 is a real move (not a PAD or outcome token).
-    assert np.all(corpus.tokens[:, 0] != PAD_TOKEN)
-
-
-def test_generate_corpus_outcome_prefixed_layout() -> None:
-    """`prepend_outcome=True` writes the outcome token at slot 0;
-    outcome_offset becomes 1."""
-    corpus = generate_corpus(
-        n_games=4, max_ply=32, seq_len=64, seed=1, prepend_outcome=True
-    )
     assert np.all(corpus.outcome_offset == 1)
-    # Slot 0 holds an outcome token (>= OUTCOME_TOKEN_BASE).
+    # Slot 0 is BOS; slot 1 is the first real move.
+    assert np.all(corpus.tokens[:, 0] == BOS_TOKEN)
+    assert np.all(corpus.tokens[:, 1] != PAD_TOKEN)
+
+
+def test_generate_corpus_outcome_conditioned_layout() -> None:
+    """`conditioning=["outcome"]` → BOS at slot 0, outcome at slot 1,
+    moves at slot 2; outcome_offset == C == 2."""
+    corpus = generate_corpus(
+        n_games=4, max_ply=32, seq_len=64, seed=1, conditioning=["outcome"]
+    )
+    assert np.all(corpus.outcome_offset == 2)
+    assert np.all(corpus.tokens[:, 0] == BOS_TOKEN)
+    # Slot 1 holds an outcome token (>= OUTCOME_TOKEN_BASE).
     from pawn.config import OUTCOME_TOKEN_BASE
-    assert np.all(corpus.tokens[:, 0] >= OUTCOME_TOKEN_BASE)
+    assert np.all(corpus.tokens[:, 1] >= OUTCOME_TOKEN_BASE)
 
 
 def test_generate_corpus_rejects_zero_games() -> None:
@@ -94,67 +102,80 @@ def _synthetic_games(
     return move_ids, np.asarray(lengths, dtype=np.int16)
 
 
-def test_pack_corpus_pure_moves_basic() -> None:
-    """A two-game corpus with lengths [5, 10] produces correct tokens,
-    targets, attn_mask, loss_mask, and outcome_offset."""
+def test_pack_corpus_no_conditioning_basic() -> None:
+    """A two-game corpus with lengths [5, 10] under empty conditioning:
+    BOS at slot 0, moves at slots 1..gl, loss covers C-1..C-1+gl-1."""
     move_ids, game_lengths = _synthetic_games(2, [5, 10])
     outcome_tokens = np.array([WHITE_CHECKMATES, DRAW_BY_RULE], dtype=np.int32)
     corpus = pack_corpus(
-        move_ids, game_lengths, outcome_tokens, seq_len=16, prepend_outcome=False
+        move_ids, game_lengths, outcome_tokens, seq_len=16, conditioning=()
     )
-    # Tokens: game 0 has 5 real moves then PAD.
-    assert corpus.tokens[0, 0] == 1
-    assert corpus.tokens[0, 4] == 5
-    assert corpus.tokens[0, 5] == PAD_TOKEN
-    # attn_mask True on real moves.
-    expected_attn_0 = np.array([True] * 5 + [False] * 11)
+    # C == 1: slot 0 is BOS, moves occupy slots 1..5.
+    assert int(corpus.tokens[0, 0]) == BOS_TOKEN
+    assert corpus.tokens[0, 1] == 1
+    assert corpus.tokens[0, 5] == 5
+    assert corpus.tokens[0, 6] == PAD_TOKEN
+    # attn_mask True on BOS + 5 real moves = 6 positions.
+    expected_attn_0 = np.array([True] * 6 + [False] * 10)
     assert np.array_equal(corpus.attn_mask[0], expected_attn_0)
-    # targets = tokens shifted left.
-    assert corpus.targets[0, 0] == 2  # first target is the 2nd move
-    assert corpus.targets[0, 3] == 5
-    assert corpus.targets[0, 4] == PAD_TOKEN  # gl-th target is PAD
-    # loss_mask: positions 0..gl-1 = 0..4 supervised (5 positions).
+    # targets = tokens shifted left. Slot 0 (BOS) predicts ply_1 = move 1.
+    assert corpus.targets[0, 0] == 1  # BOS -> first move (supervised)
+    assert corpus.targets[0, 4] == 5  # predicts the 5th move
+    assert corpus.targets[0, 5] == PAD_TOKEN  # predict-PAD slot
+    # loss_mask: C-1=0 .. C-1+gl-1=4 → 5 positions (= game_length).
     assert int(corpus.loss_mask[0].sum()) == 5
     assert int(corpus.loss_mask[1].sum()) == 10
-    # outcome_offset is 0 in pure-moves layout.
-    assert int(corpus.outcome_offset[0]) == 0
+    # First-move BOS->ply_1 is supervised; predict-PAD slot is not.
+    assert bool(corpus.loss_mask[0, 0])
+    assert not bool(corpus.loss_mask[0, 5])
+    # outcome_offset holds C == 1.
+    assert int(corpus.outcome_offset[0]) == 1
 
 
-def test_pack_corpus_outcome_prefixed_basic() -> None:
-    """Outcome-prefixed layout: outcome at slot 0, moves shift right,
-    loss_mask covers one MORE position than pure-moves (gl+1 vs gl)."""
+def test_pack_corpus_outcome_conditioned_basic() -> None:
+    """Outcome-conditioned layout (C=2): BOS at slot 0, outcome at slot
+    1, moves at slots 2..gl+1. loss covers C-1..C-1+gl-1 (== game_length
+    positions, same count as no-conditioning — the prefix slot count
+    doesn't change how many moves get supervised)."""
     move_ids, game_lengths = _synthetic_games(2, [5, 10])
     outcome_tokens = np.array([WHITE_CHECKMATES, DRAW_BY_RULE], dtype=np.int32)
     corpus = pack_corpus(
-        move_ids, game_lengths, outcome_tokens, seq_len=16, prepend_outcome=True
+        move_ids, game_lengths, outcome_tokens, seq_len=16,
+        conditioning=["outcome"],
     )
-    # Slot 0 is the outcome.
-    assert int(corpus.tokens[0, 0]) == WHITE_CHECKMATES
-    assert int(corpus.tokens[1, 0]) == DRAW_BY_RULE
-    # Moves start at slot 1.
-    assert int(corpus.tokens[0, 1]) == 1  # first move
-    assert int(corpus.tokens[0, 5]) == 5  # last move (5 moves, slots 1..5)
-    assert int(corpus.tokens[0, 6]) == PAD_TOKEN
-    # outcome_offset == 1.
-    assert int(corpus.outcome_offset[0]) == 1
-    # loss_mask covers gl+1 positions.
-    assert int(corpus.loss_mask[0].sum()) == 6  # gl=5, gl+1=6
-    assert int(corpus.loss_mask[1].sum()) == 11  # gl=10, gl+1=11
+    # Slot 0 BOS, slot 1 outcome.
+    assert int(corpus.tokens[0, 0]) == BOS_TOKEN
+    assert int(corpus.tokens[0, 1]) == WHITE_CHECKMATES
+    assert int(corpus.tokens[1, 1]) == DRAW_BY_RULE
+    # Moves start at slot 2.
+    assert int(corpus.tokens[0, 2]) == 1  # first move
+    assert int(corpus.tokens[0, 6]) == 5  # last move (5 moves, slots 2..6)
+    assert int(corpus.tokens[0, 7]) == PAD_TOKEN
+    # outcome_offset == C == 2.
+    assert int(corpus.outcome_offset[0]) == 2
+    # loss_mask: C-1=1 .. C-1+gl-1. game 0 gl=5 → slots 1..5 (5 positions);
+    # the slot-1 (outcome) position predicts ply_1 (first move supervised).
+    assert int(corpus.loss_mask[0].sum()) == 5
+    assert int(corpus.loss_mask[1].sum()) == 10
+    assert bool(corpus.loss_mask[0, 1])  # outcome-slot -> ply_1 supervised
+    assert not bool(corpus.loss_mask[0, 0])  # BOS slot not supervised
+    assert not bool(corpus.loss_mask[0, 6])  # predict-PAD slot not supervised
 
 
 def test_pack_corpus_truncates_long_games_to_seq_len() -> None:
     """A game longer than seq_len gets truncated; loss_mask doesn't
-    overflow."""
+    overflow. C=1 → 1 BOS slot + (seq_len-1) move slots."""
     move_ids, game_lengths = _synthetic_games(1, [20], max_ply=24)
     outcome_tokens = np.array([DRAW_BY_RULE], dtype=np.int32)
     corpus = pack_corpus(
-        move_ids, game_lengths, outcome_tokens, seq_len=8, prepend_outcome=False
+        move_ids, game_lengths, outcome_tokens, seq_len=8, conditioning=()
     )
-    # 8 slots, all real moves (truncated from 20).
+    # 8 slots: 1 BOS + 7 real moves (truncated from 20), no PAD.
     assert int(corpus.attn_mask[0].sum()) == 8
-    # loss_mask: capped_lengths = min(20, 8) = 8. threshold = 8 - 1 = 7.
-    # Positions 0..7 inclusive = 8 supervised positions.
-    assert int(corpus.loss_mask[0].sum()) == 8
+    # loss_mask: n_move_slots = 8 - 1 = 7, capped = min(20, 7) = 7.
+    # Supervised slots C-1=0 .. C-1+7-1=6 = 7 positions; slot 7 (the last
+    # move, with no next-token target in-window) is excluded.
+    assert int(corpus.loss_mask[0].sum()) == 7
 
 
 def test_pack_corpus_handles_pad_in_input() -> None:
@@ -165,10 +186,13 @@ def test_pack_corpus_handles_pad_in_input() -> None:
     game_lengths = np.array([3], dtype=np.int16)
     outcome_tokens = np.array([WHITE_CHECKMATES], dtype=np.int32)
     corpus = pack_corpus(
-        move_ids, game_lengths, outcome_tokens, seq_len=8, prepend_outcome=False
+        move_ids, game_lengths, outcome_tokens, seq_len=8, conditioning=()
     )
-    # Positions 3..7 should be PAD, NOT 999.
-    for i in range(3, 8):
+    # C=1: BOS at slot 0, moves [10,20,30] at slots 1..3, PAD at 4..7
+    # (the junk 999s past game_length must be PAD, not leaked).
+    assert int(corpus.tokens[0, 0]) == BOS_TOKEN
+    assert [int(corpus.tokens[0, i]) for i in (1, 2, 3)] == [10, 20, 30]
+    for i in range(4, 8):
         assert int(corpus.tokens[0, i]) == PAD_TOKEN
 
 
@@ -206,7 +230,7 @@ def test_pack_corpus_zero_length_game_has_empty_loss_mask() -> None:
     lengths = np.array([3, 0], dtype=np.int16)
     outcome = np.zeros((2,), dtype=np.int32)
     corpus = pack_corpus(
-        move_ids, lengths, outcome, seq_len=8, prepend_outcome=False
+        move_ids, lengths, outcome, seq_len=8, conditioning=()
     )
     assert bool(corpus.loss_mask[0].any()), (
         "non-empty game should still supervise its real moves"
@@ -214,6 +238,10 @@ def test_pack_corpus_zero_length_game_has_empty_loss_mask() -> None:
     assert not bool(corpus.loss_mask[1].any()), (
         "zero-length game should have an empty loss mask"
     )
+    # A zero-length game still has its BOS slot present (attn_mask True at
+    # slot 0) but supervises nothing.
+    assert bool(corpus.attn_mask[1, 0])
+    assert int(corpus.tokens[1, 0]) == BOS_TOKEN
 
 
 # ---------------------------------------------------------------------------
@@ -268,26 +296,29 @@ def test_corpus_is_frozen() -> None:
 
 
 def test_corpus_attn_and_loss_mask_consistency() -> None:
-    """attn_mask is True wherever tokens are real; loss_mask is a
-    (non-strict) subset of attn_mask at the supervised positions."""
+    """attn_mask is True over the BOS prefix + real moves; loss_mask is a
+    subset of attn_mask. Layout (C=1): slot 0 BOS, slots 1..gl moves."""
     move_ids, game_lengths = _synthetic_games(3, [4, 8, 12])
     outcome_tokens = np.array(
         [WHITE_CHECKMATES, DRAW_BY_RULE, STALEMATE], dtype=np.int32
     )
     corpus = pack_corpus(
-        move_ids, game_lengths, outcome_tokens, seq_len=16, prepend_outcome=False
+        move_ids, game_lengths, outcome_tokens, seq_len=16, conditioning=()
     )
-    # Where loss_mask is True, the position has a real (non-PAD) token.
+    C = 1
     for g in range(3):
         gl = int(game_lengths[g])
-        # loss_mask True for positions 0..gl-1, all of which are also
-        # input-real (attn_mask True).
-        assert np.all(corpus.loss_mask[g, :gl] == True)  # noqa: E712
-        assert np.all(corpus.attn_mask[g, :gl] == True)  # noqa: E712
-        # Positions past gl-1 are not in the loss; positions past gl-1
-        # are PAD inputs.
-        assert np.all(corpus.loss_mask[g, gl:] == False)  # noqa: E712
-        assert np.all(corpus.attn_mask[g, gl:] == False)  # noqa: E712
+        real_width = C + gl  # BOS + gl moves
+        # attn_mask True over [0 .. C+gl-1], PAD afterwards.
+        assert np.all(corpus.attn_mask[g, :real_width] == True)  # noqa: E712
+        assert np.all(corpus.attn_mask[g, real_width:] == False)  # noqa: E712
+        # loss_mask True over [C-1 .. C-1+gl-1]; everything there is real.
+        lo, hi = C - 1, C - 1 + gl  # hi exclusive
+        assert np.all(corpus.loss_mask[g, lo:hi] == True)  # noqa: E712
+        assert np.all(corpus.loss_mask[g, :lo] == False)  # noqa: E712
+        assert np.all(corpus.loss_mask[g, hi:] == False)  # noqa: E712
+        # loss_mask ⊆ attn_mask.
+        assert np.all(corpus.attn_mask[g][corpus.loss_mask[g]] == True)  # noqa: E712
 
 
 # ---------------------------------------------------------------------------
@@ -315,10 +346,11 @@ def test_by_bucket_partitions_by_length() -> None:
         [WHITE_CHECKMATES] * 5, dtype=np.int32
     )
     corpus = pack_corpus(
-        move_ids, game_lengths, outcome_tokens, seq_len=32, prepend_outcome=False
+        move_ids, game_lengths, outcome_tokens, seq_len=32, conditioning=()
     )
     buckets = corpus.by_bucket((8, 16, 32))
-    # gl=3,6 → bucket 8; gl=10,15 → bucket 16; gl=30 → bucket 32
+    # Effective length = game_lengths + outcome_offset; with conditioning=()
+    # the prefix is BOS-only (C=1), so eff = gl+1: 4,7→bucket 8; 11,16→16; 31→32.
     assert set(buckets.keys()) == {8, 16, 32}
     assert buckets[8].n_games == 2
     assert buckets[16].n_games == 2
@@ -342,3 +374,108 @@ def test_by_bucket_rejects_top_edge_smaller_than_seq_len() -> None:
     corpus = generate_corpus(n_games=2, max_ply=16, seq_len=32, seed=0)
     with pytest.raises(ValueError, match="top bucket edge"):
         corpus.by_bucket((8, 16))
+
+
+# ---------------------------------------------------------------------------
+# Chunk 4 — direct unit tests for the shared layout helpers
+# ---------------------------------------------------------------------------
+
+
+def test_conditioning_to_C_counts_bos_plus_kinds() -> None:
+    """C = 1 (BOS) + len(conditioning)."""
+    assert conditioning_to_C(()) == 1
+    assert conditioning_to_C(["outcome"]) == 2
+
+
+def test_conditioning_to_C_rejects_unknown_kind() -> None:
+    """A typo'd / unregistered kind is a hard error, not a silent
+    NULL-only slot."""
+    with pytest.raises(ValueError, match="unknown conditioning kind"):
+        conditioning_to_C(["bogus"])
+
+
+def test_build_loss_mask_c1_first_move_supervised_predict_pad_excluded() -> None:
+    """C=1: supervised slots are exactly [C-1 .. C-1 + gl - 1] = [0 .. gl-1].
+    The first move (slot 0 → ply_1) IS supervised; the predict-PAD slot
+    (slot gl) is NOT."""
+    game_lengths = np.array([3, 5], dtype=np.int32)
+    mask = build_loss_mask(1, game_lengths, seq_len=8)
+    assert mask.shape == (2, 8)
+    # Row 0: gl=3 → slots 0,1,2 True; 3.. False.
+    assert mask[0].tolist() == [True, True, True, False, False, False, False, False]
+    # Row 1: gl=5 → slots 0..4 True; 5.. (incl. predict-PAD at 5) False.
+    assert mask[1].tolist() == [True, True, True, True, True, False, False, False]
+
+
+def test_build_loss_mask_c2_offset_by_one() -> None:
+    """C=2: prefix occupies slots 0 (BOS) and 1 (cond); the last prefix
+    slot (C-1 == 1) predicts ply_1, so supervised slots are
+    [1 .. 1 + gl - 1]."""
+    game_lengths = np.array([3], dtype=np.int32)
+    mask = build_loss_mask(2, game_lengths, seq_len=8)
+    # gl=3 → slots 1,2,3 True; slot 0 (BOS→cond, not a move) and slot 4
+    # (predict-PAD) False.
+    assert mask[0].tolist() == [False, True, True, True, False, False, False, False]
+
+
+def test_build_loss_mask_truncates_game_to_fit_seq_len() -> None:
+    """A game longer than the available move slots (seq_len - C) is capped
+    so the mask never overruns."""
+    game_lengths = np.array([20], dtype=np.int32)
+    mask = build_loss_mask(2, game_lengths, seq_len=8)
+    # n_move_slots = 8 - 2 = 6 → supervised [1 .. 6], the remaining slot 7
+    # is the predict-PAD slot and stays False.
+    assert int(mask[0].sum()) == 6
+    assert mask[0].tolist() == [False, True, True, True, True, True, True, False]
+
+
+def test_build_loss_mask_zero_length_game_is_all_false() -> None:
+    """A zero-length game supervises no positions."""
+    game_lengths = np.array([0], dtype=np.int32)
+    mask = build_loss_mask(1, game_lengths, seq_len=8)
+    assert not mask[0].any()
+
+
+def test_build_prefix_bos_at_slot_zero_and_outcome_resolved() -> None:
+    """Slot 0 is always BOS; the `outcome` kind resolves to the per-game
+    outcome token in slot 1."""
+    outcome_tokens = np.array(
+        [WHITE_CHECKMATES, DRAW_BY_RULE], dtype=np.int32
+    )
+    prefix = build_prefix(["outcome"], outcome_tokens, n=2)
+    assert prefix.shape == (2, 2)
+    assert np.all(prefix[:, 0] == BOS_TOKEN)
+    assert prefix[0, 1] == WHITE_CHECKMATES
+    assert prefix[1, 1] == DRAW_BY_RULE
+
+
+def test_build_prefix_bos_only_when_no_conditioning() -> None:
+    """conditioning=() → C=1, a single BOS slot."""
+    outcome_tokens = np.array([WHITE_CHECKMATES], dtype=np.int32)
+    prefix = build_prefix((), outcome_tokens, n=1)
+    assert prefix.shape == (1, 1)
+    assert prefix[0, 0] == BOS_TOKEN
+
+
+def test_build_prefix_null_fills_unknown_outcome() -> None:
+    """A game whose outcome is genuinely unknown (sentinel < 0) resolves
+    to NULL_TOKEN rather than holding an out-of-vocab value."""
+    outcome_tokens = np.array([WHITE_CHECKMATES, -1], dtype=np.int32)
+    prefix = build_prefix(["outcome"], outcome_tokens, n=2)
+    assert prefix[0, 1] == WHITE_CHECKMATES
+    assert prefix[1, 1] == NULL_TOKEN
+
+
+def test_assert_conditioning_C_passes_on_match() -> None:
+    """A builder whose conditioning implies the checkpoint's C is fine."""
+    # conditioning=["outcome"] → C=2.
+    assert_conditioning_C(["outcome"], checkpoint_C=2)
+    # conditioning=() → C=1.
+    assert_conditioning_C((), checkpoint_C=1)
+
+
+def test_assert_conditioning_C_raises_on_mismatch() -> None:
+    """A C mismatch is the silent-RoPE-drift guard — it must raise."""
+    with pytest.raises(ValueError, match="conditioning mismatch"):
+        # conditioning=["outcome"] → C=2, but the checkpoint was trained C=1.
+        assert_conditioning_C(["outcome"], checkpoint_C=1)

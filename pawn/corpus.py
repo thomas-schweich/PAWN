@@ -1,4 +1,4 @@
-"""Random-game corpus + the shared CLM packing helper.
+"""Random-game corpus + the shared CLM packing / prefix helpers.
 
 A :class:`Corpus` is the v2 data unit consumed by every JAX-side
 trainer (pretrain, adapter, specialized_clm). It is a tight bundle of
@@ -16,14 +16,28 @@ Two entry points produce a :class:`Corpus`:
   game lengths + outcome tokens) into the same shape. The Lichess
   data path in :mod:`pawn.lichess_data` (S5.C2) uses this.
 
-The outcome-prefixed layout (``prepend_outcome=True``) writes the
-game's outcome token at slot 0 and shifts moves right by one;
-acceptance criterion 11's five generation diagnostics gate on this
-flag.
+**Conditioning prefix (Phase-A Chunk 4).** Every sequence is assembled
+as ``[BOS][cond…][ply…][PAD…]``: slot 0 is always :data:`BOS_TOKEN`,
+slots ``1..C-1`` carry one control token per entry in the run's
+``conditioning`` list (resolved per-kind, :data:`NULL_TOKEN` where a
+game lacks the value), and the game's moves start at slot ``C`` where
+``C = 1 + len(conditioning)``. The two shared helpers
+:func:`build_prefix` and :func:`build_loss_mask` are the *single* owners
+of this layout — both :func:`pack_corpus` here and
+:mod:`pawn.lichess_data` route through them so there is exactly one
+off-by-one to reason about.
+
+The loss is supervised on positions ``[C-1 .. C-1 + game_length - 1]``:
+the last prefix slot (``C-1``) predicts ``ply_1`` (the first move IS
+supervised), and the predict-PAD slot (``C-1 + game_length``) is NOT.
+This is a deliberate change from the pre-Chunk-4 contract, which
+supervised the predict-PAD slot but never the first move — it shifts
+which positions count toward per-move accuracy vs v1.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -32,7 +46,10 @@ from numpy.typing import NDArray
 import chess_engine as engine
 from pawn.config import (
     BLACK_CHECKMATES,
+    BOS_TOKEN,
+    CONDITIONING_KINDS,
     DRAW_BY_RULE,
+    NULL_TOKEN,
     PAD_TOKEN,
     PLY_LIMIT,
     STALEMATE,
@@ -43,7 +60,48 @@ __all__ = [
     "Corpus",
     "generate_corpus",
     "pack_corpus",
+    "build_prefix",
+    "build_loss_mask",
+    "conditioning_to_C",
+    "assert_conditioning_C",
 ]
+
+
+def conditioning_to_C(conditioning: Sequence[str]) -> int:
+    """Prefix width ``C = 1 + len(conditioning)`` (BOS always present).
+
+    Every entry must be a known kind in
+    :data:`pawn.config.CONDITIONING_KINDS`; an unknown kind is a hard
+    error so a typo'd ``--conditioning`` value can't silently produce a
+    NULL-only prefix slot.
+    """
+    for kind in conditioning:
+        if kind not in CONDITIONING_KINDS:
+            raise ValueError(
+                f"unknown conditioning kind {kind!r}; valid kinds are "
+                f"{sorted(CONDITIONING_KINDS)}"
+            )
+    return 1 + len(conditioning)
+
+
+def assert_conditioning_C(builder_conditioning: Sequence[str], checkpoint_C: int) -> None:
+    """Assert a builder's conditioning-derived ``C`` matches a checkpoint's.
+
+    Move positions sit at a fixed, run-constant offset ``C``; absolute
+    RoPE phases therefore drift silently if a checkpoint trained with
+    one ``C`` is evaluated against a corpus assembled with another. Call
+    this at the eval/build boundary (with the checkpoint's persisted
+    ``C``) to turn that silent drift into a loud failure.
+    """
+    builder_C = conditioning_to_C(builder_conditioning)
+    if builder_C != checkpoint_C:
+        raise ValueError(
+            f"conditioning mismatch: builder conditioning "
+            f"{list(builder_conditioning)!r} implies C={builder_C}, but the "
+            f"checkpoint was trained with C={checkpoint_C}. Move positions "
+            f"would land at a different absolute offset (RoPE drift). Rebuild "
+            f"the corpus with the checkpoint's own conditioning."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,17 +129,18 @@ class Corpus:
             (not PAD). Attention applies a causal × pad mask combo at
             forward time.
         loss_mask: ``(N, T)`` bool — True at positions where the loss
-            is supervised. With ``prepend_outcome=False`` the model
-            sees one fewer supervised position than the prefixed mode
-            (it can't supervise position 0 from move m_2, only the
-            outcome-prefixed mode places a target on slot 0).
-        outcome_offset: ``(N,)`` int32 — 0 if pure moves, 1 if outcome
-            prefixed. Tells the trainer where the first move lives in
-            the sequence (slot 0 vs slot 1) and what the diagnostics
-            should condition on.
+            is supervised: exactly ``[C-1 .. C-1 + game_length - 1]``.
+            The last prefix slot (``C-1``) predicts ``ply_1`` (first
+            move supervised); the predict-PAD slot is excluded.
+        outcome_offset: ``(N,)`` int32 — the prefix width ``C`` (the
+            slot where this game's first move lives), constant across
+            all games in a corpus. ``C = 1`` with no conditioning (BOS
+            only); ``C = 1 + len(conditioning)`` otherwise. Named
+            ``outcome_offset`` for cache back-compat; it is the
+            move-start offset, not a 0/1 outcome flag.
         game_lengths: ``(N,)`` int32 — number of real moves (does NOT
-            include the outcome slot). Used by A.1 bucketing to pick
-            the right seq-length bucket per game.
+            include the BOS/conditioning prefix slots). Used by A.1
+            bucketing to pick the right seq-length bucket per game.
     """
 
     tokens: NDArray[np.int32]
@@ -184,26 +243,131 @@ def _map_termination_to_outcome(
     return outcomes
 
 
+# ---------------------------------------------------------------------------
+# Shared prefix + loss-mask assembler (the single owner of the layout)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_outcome_slot(
+    outcome_tokens: NDArray[np.int32],
+) -> NDArray[np.int32]:
+    """Resolve the ``"outcome"`` conditioning kind to a per-game token.
+
+    Every game has an outcome token, so this is the identity in practice;
+    a sentinel ``< 0`` (a game whose outcome is genuinely unknown) maps
+    to :data:`NULL_TOKEN` so the prefix slot is filled rather than left
+    holding an out-of-vocab value.
+    """
+    return np.where(outcome_tokens >= 0, outcome_tokens, NULL_TOKEN).astype(
+        np.int32
+    )
+
+
+# Registry: conditioning kind → resolver(outcome_tokens) -> (N,) int32 of the
+# per-game control token for that kind. The kind *names* are pinned in
+# :data:`pawn.config.CONDITIONING_KINDS`; this dict supplies the resolution
+# logic. Extending the registry (e.g. an Elo-bucket kind) means adding a name
+# there and a resolver here — both must stay in lockstep.
+_CONDITIONING_RESOLVERS: Mapping[
+    str, Callable[[NDArray[np.int32]], NDArray[np.int32]]
+] = {
+    "outcome": _resolve_outcome_slot,
+}
+
+
+def build_prefix(
+    conditioning: Sequence[str],
+    outcome_tokens: NDArray[np.int32],
+    n: int,
+) -> NDArray[np.int32]:
+    """Assemble the ``(n, C)`` control prefix for every game.
+
+    Slot 0 is always :data:`BOS_TOKEN`; slots ``1..C-1`` hold the
+    resolved control token for ``conditioning[0..]`` in order, or
+    :data:`NULL_TOKEN` where a game lacks that kind's value. The prefix
+    width is ``C = 1 + len(conditioning)``.
+
+    The single owner of the prefix layout — both :func:`pack_corpus` and
+    :mod:`pawn.lichess_data` route through it.
+    """
+    C = conditioning_to_C(conditioning)
+    outcome_tokens = np.asarray(outcome_tokens, dtype=np.int32)
+    if outcome_tokens.shape != (n,):
+        raise ValueError(
+            f"outcome_tokens must be ({n},) matching n={n}, got shape "
+            f"{outcome_tokens.shape}"
+        )
+    prefix = np.empty((n, C), dtype=np.int32)
+    prefix[:, 0] = BOS_TOKEN
+    for slot, kind in enumerate(conditioning, start=1):
+        resolver = _CONDITIONING_RESOLVERS.get(kind)
+        if resolver is None:
+            # Registered in CONDITIONING_KINDS (so conditioning_to_C accepted
+            # it) but no resolver wired here — a developer-side bug, not user
+            # input. Fail loud rather than silently NULL-filling.
+            raise ValueError(
+                f"conditioning kind {kind!r} is registered but has no "
+                f"resolver in pawn.corpus._CONDITIONING_RESOLVERS"
+            )
+        prefix[:, slot] = resolver(outcome_tokens)
+    return prefix
+
+
+def build_loss_mask(
+    C: int,
+    game_lengths: NDArray[np.int32],
+    seq_len: int,
+) -> NDArray[np.bool_]:
+    """``(n, seq_len)`` bool mask, True exactly on the supervised slots.
+
+    Supervised positions are ``[C-1 .. C-1 + game_length - 1]``: the last
+    prefix slot (``C-1``) predicts ``ply_1`` (the first move IS
+    supervised) and the predict-PAD slot (``C-1 + game_length``) is NOT.
+    ``game_length`` is clamped to the moves that actually fit in
+    ``seq_len`` (``seq_len - C`` move slots), so a truncated game's mask
+    never overruns. A zero-length game supervises no positions.
+
+    This is a deliberate change from the pre-Chunk-4 mask, which
+    supervised the predict-PAD slot and never the first move; it shifts
+    which positions count toward per-move accuracy vs v1.
+    """
+    game_lengths = np.asarray(game_lengths, dtype=np.int32)
+    n_move_slots = max(seq_len - C, 0)
+    capped = np.minimum(game_lengths, n_move_slots)
+    seq_positions = np.arange(seq_len, dtype=np.int32)[None, :]
+    lo = C - 1
+    # hi = last supervised slot = C-1 + capped - 1. For a zero-length game
+    # capped==0 so hi == lo-1 < lo and the mask is all-False for that row.
+    hi = (lo + capped - 1)[:, None]
+    return (seq_positions >= lo) & (seq_positions <= hi)
+
+
+# ---------------------------------------------------------------------------
+# Packing
+# ---------------------------------------------------------------------------
+
+
 def _pack_clm(
     move_ids: np.ndarray,
     game_lengths: np.ndarray,
     outcome_tokens: np.ndarray,
     *,
     seq_len: int,
-    prepend_outcome: bool = False,
+    conditioning: Sequence[str] = (),
 ) -> Corpus:
     """Shared packing helper — turns engine / parquet output into a Corpus.
 
     ``move_ids`` is ``(N, max_ply)`` int16 with PAD past ``game_length``;
     ``game_lengths`` is ``(N,)`` int (number of moves, never including
-    an outcome slot); ``outcome_tokens`` is ``(N,)`` int (the outcome
-    token for the game).
+    the prefix slots); ``outcome_tokens`` is ``(N,)`` int (the outcome
+    token for the game, used to resolve the ``"outcome"`` conditioning
+    kind when present).
 
-    Output sequence width is always ``seq_len``. With
-    ``prepend_outcome=True``, slot 0 holds the outcome token and moves
-    occupy slots 1..gl+1. With ``prepend_outcome=False`` (default),
-    moves start at slot 0 and the outcome token isn't placed in the
-    sequence at all.
+    Output sequence width is always ``seq_len``. The sequence is laid
+    out as ``[BOS][cond…][ply…][PAD…]`` via the shared
+    :func:`build_prefix` / :func:`build_loss_mask` helpers, so moves
+    start at slot ``C = 1 + len(conditioning)`` and the first move is
+    supervised by the last prefix slot.
     """
     move_ids = np.asarray(move_ids, dtype=np.int32)
     game_lengths = np.asarray(game_lengths, dtype=np.int32)
@@ -225,48 +389,47 @@ def _pack_clm(
         raise ValueError(f"seq_len must be positive, got {seq_len}")
 
     n, max_ply = move_ids.shape
-    n_move_slots = seq_len - 1 if prepend_outcome else seq_len
-    move_start = 1 if prepend_outcome else 0
+    C = conditioning_to_C(conditioning)
+    if seq_len <= C:
+        raise ValueError(
+            f"seq_len ({seq_len}) must exceed the conditioning prefix width "
+            f"C={C} (= 1 BOS + {C - 1} conditioning slot(s)) so at least one "
+            f"move slot remains"
+        )
+    n_move_slots = seq_len - C
 
-    # 1. Initial tokens buffer — all PAD.
+    # 1. Initial tokens buffer — all PAD, then lay the BOS+conditioning
+    # prefix into slots 0..C-1 via the shared assembler.
     tokens = np.full((n, seq_len), PAD_TOKEN, dtype=np.int32)
-    if prepend_outcome:
-        tokens[:, 0] = outcome_tokens
+    tokens[:, :C] = build_prefix(conditioning, outcome_tokens, n)
 
-    # 2. Clean move IDs (zero past game_length so trailing junk from the
+    # 2. Clean move IDs (PAD past game_length so trailing junk from the
     # engine doesn't leak into the sequence).
     positions = np.arange(max_ply, dtype=np.int32)[None, :]  # (1, max_ply)
     valid_move = positions < game_lengths[:, None]
     clean_moves = np.where(valid_move, move_ids, PAD_TOKEN)
 
-    # 3. Copy the moves into the right slots.
+    # 3. Copy the moves into slots C..C+n_to_copy-1.
     n_to_copy = min(max_ply, n_move_slots)
-    tokens[:, move_start : move_start + n_to_copy] = clean_moves[:, :n_to_copy]
+    tokens[:, C : C + n_to_copy] = clean_moves[:, :n_to_copy]
 
-    # 4. attn_mask: True where tokens != PAD.
+    # 4. attn_mask: True where tokens != PAD. The BOS/conditioning prefix
+    # is real (no interior PAD — preserves the right-pad invariant).
     attn_mask = tokens != PAD_TOKEN
 
-    # 5. targets: tokens shifted left by 1, with PAD on the trailing
-    # slot. A.2 (narrow form) keeps PAD as a target since the lm_head
-    # output still includes the PAD column; only the outcome columns
-    # (1969..1979) were trimmed, and outcome tokens never appear in
-    # targets (they're inputs at position 0 only).
+    # 5. targets: tokens shifted left by 1, with PAD on the trailing slot.
+    # The output vocab includes the PAD column, so PAD-as-target is benign;
+    # the loss_mask is what restricts supervision to real moves.
     targets = np.full_like(tokens, PAD_TOKEN)
     targets[:, :-1] = tokens[:, 1:]
 
-    # 6. loss_mask: positions where we supervise.
-    # prepend_outcome=True: positions 0..gl  → gl+1 supervised positions.
-    # prepend_outcome=False: positions 0..gl-1 → gl supervised positions.
-    capped_lengths = np.minimum(game_lengths, n_move_slots)
-    seq_positions = np.arange(seq_len, dtype=np.int32)[None, :]
-    if prepend_outcome:
-        threshold = capped_lengths[:, None]
-    else:
-        threshold = np.maximum(capped_lengths - 1, -1)[:, None]
-    loss_mask = seq_positions <= threshold
+    # 6. loss_mask: True on [C-1 .. C-1 + game_length - 1] via the shared
+    # helper (first move supervised, predict-PAD slot excluded).
+    loss_mask = build_loss_mask(C, game_lengths, seq_len)
 
-    # outcome_offset is one int per game (0 or 1).
-    outcome_offset = np.full(n, move_start, dtype=np.int32)
+    # outcome_offset carries the constant prefix width C (the slot where
+    # moves start) — see the Corpus field docstring.
+    outcome_offset = np.full(n, C, dtype=np.int32)
 
     # Stay on host. The trainer's prefetch loop is responsible for
     # batched device transfer; eagerly materialising a multi-GB Lichess
@@ -288,7 +451,7 @@ def pack_corpus(
     outcome_tokens: np.ndarray,
     *,
     seq_len: int,
-    prepend_outcome: bool = False,
+    conditioning: Sequence[str] = (),
 ) -> Corpus:
     """Pack pre-tokenised games into a :class:`Corpus`.
 
@@ -296,14 +459,16 @@ def pack_corpus(
     outcome tokens (e.g. Lichess parquet via
     :mod:`pawn.lichess_data`). ``outcome_tokens`` is the per-game
     outcome **token ID** (one of the :data:`pawn.config.WHITE_CHECKMATES`
-    / etc. constants).
+    / etc. constants). ``conditioning`` is the ordered list of control
+    kinds to prepend (see :data:`pawn.config.CONDITIONING_KINDS`);
+    the default ``()`` prepends only BOS (``C = 1``).
     """
     return _pack_clm(
         move_ids,
         game_lengths,
         outcome_tokens,
         seq_len=seq_len,
-        prepend_outcome=prepend_outcome,
+        conditioning=conditioning,
     )
 
 
@@ -313,7 +478,7 @@ def generate_corpus(
     seq_len: int,
     seed: int,
     *,
-    prepend_outcome: bool = False,
+    conditioning: Sequence[str] = (),
 ) -> Corpus:
     """Generate ``n_games`` random self-play games via the Rust engine and
     pack them into a :class:`Corpus`.
@@ -321,7 +486,8 @@ def generate_corpus(
     ``max_ply`` is the per-game length cap inside the engine; the
     engine truncates with a ``PlyLimit`` termination code if a game
     runs past it. ``seq_len`` is the output sequence width; the
-    packing helper truncates moves past ``seq_len - move_start``.
+    packing helper truncates moves past ``seq_len - C`` where
+    ``C = 1 + len(conditioning)``.
 
     ``seed`` is the engine RNG seed for reproducible runs.
     """
@@ -338,5 +504,5 @@ def generate_corpus(
         game_lengths,
         outcome_tokens,
         seq_len=seq_len,
-        prepend_outcome=prepend_outcome,
+        conditioning=conditioning,
     )

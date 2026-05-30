@@ -24,7 +24,7 @@ import polars as pl
 import pytest
 
 from pawn._sentinel import SENTINEL_NAME, CheckpointIntegrityError, write_sentinel
-from pawn.config import PAD_TOKEN, DRAW_BY_RULE, WHITE_CHECKMATES
+from pawn.config import BOS_TOKEN, PAD_TOKEN, DRAW_BY_RULE, WHITE_CHECKMATES
 from pawn.lichess_data import (
     _cache_key,
     _default_cache_root,
@@ -304,7 +304,7 @@ def test_cache_round_trip_arrays_byte_equal(tmp_path: Path) -> None:
     # Second call should hit the cache — verify by reading the same
     # dir back manually.
     sha = _cache_key(
-        str(tmp_path), "train", 1800, None, 0, 16, None, False
+        str(tmp_path), "train", 1800, None, 0, 16, None, ()
     )
     cached = _load_from_cache(cache_root / sha)
     assert np.array_equal(orig.tokens, cached.tokens)
@@ -317,16 +317,47 @@ def test_cache_round_trip_arrays_byte_equal(tmp_path: Path) -> None:
 def test_cache_key_sensitive_to_filter_params(tmp_path: Path) -> None:
     """Different filter params produce different SHA → different cache
     directories."""
-    base = _cache_key("repo", "train", 1800, 2000, 10, 512, 100, False)
+    base = _cache_key("repo", "train", 1800, 2000, 10, 512, 100, ())
     # Each change produces a distinct key.
-    assert _cache_key("repo", "train", 1801, 2000, 10, 512, 100, False) != base
-    assert _cache_key("repo", "train", 1800, 2001, 10, 512, 100, False) != base
-    assert _cache_key("repo", "train", 1800, 2000, 11, 512, 100, False) != base
-    assert _cache_key("repo", "train", 1800, 2000, 10, 256, 100, False) != base
-    assert _cache_key("repo", "train", 1800, 2000, 10, 512, 200, False) != base
-    assert _cache_key("repo", "train", 1800, 2000, 10, 512, 100, True) != base
-    assert _cache_key("repo", "validation", 1800, 2000, 10, 512, 100, False) != base
-    assert _cache_key("other-repo", "train", 1800, 2000, 10, 512, 100, False) != base
+    assert _cache_key("repo", "train", 1801, 2000, 10, 512, 100, ()) != base
+    assert _cache_key("repo", "train", 1800, 2001, 10, 512, 100, ()) != base
+    assert _cache_key("repo", "train", 1800, 2000, 11, 512, 100, ()) != base
+    assert _cache_key("repo", "train", 1800, 2000, 10, 256, 100, ()) != base
+    assert _cache_key("repo", "train", 1800, 2000, 10, 512, 200, ()) != base
+    assert _cache_key("repo", "validation", 1800, 2000, 10, 512, 100, ()) != base
+    assert _cache_key("other-repo", "train", 1800, 2000, 10, 512, 100, ()) != base
+
+
+def test_cache_key_includes_conditioning_and_C(tmp_path: Path) -> None:
+    """The cache key folds in the conditioning list and its derived prefix
+    width ``C``: a corpus packed under one prefix/loss-mask contract must
+    never be served to a run that expects another (silent RoPE drift).
+    Spec Chunk 4: 'cache-key includes C'."""
+    no_cond = _cache_key("repo", "train", 1800, 2000, 10, 512, 100, ())
+    outcome = _cache_key(
+        "repo", "train", 1800, 2000, 10, 512, 100, ("outcome",)
+    )
+    # Different conditioning (and thus different C) → different key.
+    assert outcome != no_cond
+    # Stable: same conditioning list → same key regardless of container type.
+    assert _cache_key(
+        "repo", "train", 1800, 2000, 10, 512, 100, ["outcome"]
+    ) == outcome
+
+
+def test_cache_key_changes_when_cache_version_bumps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``_CACHE_VERSION`` bump (and the ``mask_version`` tag) participate
+    in the key, so a layout change forces a distinct cache entry even when
+    every filter param is identical."""
+    import pawn.lichess_data as ld
+
+    base = _cache_key("repo", "train", 1800, 2000, 10, 512, 100, ())
+    monkeypatch.setattr(ld, "_CACHE_VERSION", ld._CACHE_VERSION + 1)
+    assert _cache_key("repo", "train", 1800, 2000, 10, 512, 100, ()) != base
+    monkeypatch.setattr(ld, "MASK_VERSION", ld.MASK_VERSION + 1)
+    assert _cache_key("repo", "train", 1800, 2000, 10, 512, 100, ()) != base
 
 
 def test_cache_recovers_from_corrupted_entry(tmp_path: Path) -> None:
@@ -346,7 +377,7 @@ def test_cache_recovers_from_corrupted_entry(tmp_path: Path) -> None:
         cache_dir=cache_root,
     )
     # Find the cache entry and corrupt the sentinel.
-    sha = _cache_key(str(tmp_path), "train", 1800, None, 10, 16, None, False)
+    sha = _cache_key(str(tmp_path), "train", 1800, None, 10, 16, None, ())
     sentinel = cache_root / sha / SENTINEL_NAME
     sentinel.write_text("not valid json {")
     # Reload — the loader rebuilds.
@@ -374,7 +405,7 @@ def test_cache_detects_tampering_of_corpus_file(tmp_path: Path) -> None:
         str(tmp_path), split="train", elo_min=1800, seq_len=16,
         cache_dir=cache_root,
     )
-    sha = _cache_key(str(tmp_path), "train", 1800, None, 10, 16, None, False)
+    sha = _cache_key(str(tmp_path), "train", 1800, None, 10, 16, None, ())
     payload = cache_root / sha / "corpus.safetensors"
     data = payload.read_bytes()
     payload.write_bytes(data[:-32] + b"\x00" * 32)
@@ -419,8 +450,10 @@ def test_load_lichess_corpus_end_to_end(tmp_path: Path) -> None:
     )
     assert corpus.n_games == 5
     assert corpus.seq_len == 16
-    # Each game has 12 moves so attn_mask covers 12 positions.
-    assert int(corpus.attn_mask[0].sum()) == 12
+    # Default conditioning=() → C=1 (BOS-only prefix). The BOS slot is a
+    # real (non-PAD) token, so attn_mask covers BOS + 12 moves = 13.
+    assert int(corpus.attn_mask[0].sum()) == 13
+    assert int(corpus.outcome_offset[0]) == 1
 
 
 def test_load_lichess_corpus_rejects_empty_filter_result(tmp_path: Path) -> None:
@@ -506,8 +539,12 @@ def test_load_lichess_corpus_validation_excludes_train_shards(
 
 
 def test_pack_corpus_truncates_long_games_with_outcome_prefix(tmp_path: Path) -> None:
-    """outcome_prefixed truncation: gl=20, seq_len=8 → outcome at slot
-    0, first 7 moves at slots 1..7, loss_mask covers all 8 positions."""
+    """Outcome-conditioned truncation under the Chunk-4 layout: gl=20,
+    seq_len=8, conditioning=["outcome"] → C=2, slot 0 = BOS, slot 1 =
+    the outcome token, the first 6 moves at slots 2..7. The loss is
+    supervised on [C-1 .. C-1 + min(gl, seq_len-C) - 1] = [1 .. 6] (6
+    positions: the last prefix slot predicts ply_1, the predict-PAD slot
+    is excluded), and outcome_offset == C == 2."""
     rows = [
         {"tokens": list(range(1, 21)), "game_length": 20,
          "outcome_token": WHITE_CHECKMATES,
@@ -520,15 +557,19 @@ def test_pack_corpus_truncates_long_games_with_outcome_prefix(tmp_path: Path) ->
         elo_min=1800,
         min_ply=0,
         seq_len=8,
-        prepend_outcome=True,
+        conditioning=["outcome"],
         cache_dir=tmp_path / "cache",
     )
-    assert corpus.tokens[0, 0] == WHITE_CHECKMATES
-    assert corpus.tokens[0, 1] == 1
-    assert corpus.tokens[0, 7] == 7
-    # outcome + 7 moves = 8 supervised positions.
-    assert int(corpus.loss_mask[0].sum()) == 8
-    assert int(corpus.outcome_offset[0]) == 1
+    assert corpus.tokens[0, 0] == BOS_TOKEN
+    assert corpus.tokens[0, 1] == WHITE_CHECKMATES
+    # Moves start at slot C=2: slot 2 holds the first move (token 1),
+    # slot 7 holds the 6th fitted move (token 6).
+    assert corpus.tokens[0, 2] == 1
+    assert corpus.tokens[0, 7] == 6
+    # Supervised slots [1 .. 6] = 6 positions (first move supervised,
+    # predict-PAD excluded).
+    assert int(corpus.loss_mask[0].sum()) == 6
+    assert int(corpus.outcome_offset[0]) == 2
 
 
 # ---------------------------------------------------------------------------
