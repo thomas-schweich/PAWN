@@ -554,3 +554,53 @@ def test_load_resume_state_warns_on_missing_opt_state(
     err = capsys.readouterr().err
     assert "no optimizer.safetensors" in err
     assert "cold-start" in err
+
+
+def test_load_resume_state_accepts_matching_conditioning(tmp_path: Path) -> None:
+    """Phase-A spec Chunk 4: resuming with the same conditioning the
+    checkpoint was trained under passes the load-time C guard."""
+    model = init_model(TINY_SUPERNET, key=0)
+    out_dir = tmp_path / "step_00000010"
+    save_model(
+        model, out_dir, training_state={"step": 10},
+        run_config={"conditioning": ["outcome"]},
+    )
+    opt = optax.adamw(1e-3)
+    state = load_resume_state(
+        out_dir, opt, key=jax.random.key(0), conditioning=["outcome"],
+    )
+    assert int(state.step) == 10
+
+
+def test_load_resume_state_rejects_mismatched_conditioning(tmp_path: Path) -> None:
+    """Phase-A spec Chunk 4: resuming a C=2 checkpoint with a C=1 run
+    (default empty conditioning) must fail loudly rather than silently
+    shift every move's absolute RoPE offset."""
+    model = init_model(TINY_SUPERNET, key=0)
+    out_dir = tmp_path / "step_00000010"
+    save_model(
+        model, out_dir, training_state={"step": 10},
+        run_config={"conditioning": ["outcome"]},
+    )
+    opt = optax.adamw(1e-3)
+    with pytest.raises(ValueError, match="conditioning mismatch"):
+        load_resume_state(
+            out_dir, opt, key=jax.random.key(0), conditioning=[],
+        )
+
+
+def test_load_resume_state_skips_guard_when_conditioning_none(tmp_path: Path) -> None:
+    """When the caller does not pass `conditioning` the guard is a no-op
+    (preserves the bare-resume call path for tooling that has no run
+    config to cross-check)."""
+    model = init_model(TINY_SUPERNET, key=0)
+    out_dir = tmp_path / "step_00000010"
+    save_model(
+        model, out_dir, training_state={"step": 10},
+        run_config={"conditioning": ["outcome"]},
+    )
+    opt = optax.adamw(1e-3)
+    # No `conditioning=` kwarg → no cross-check even though the
+    # checkpoint is C=2.
+    state = load_resume_state(out_dir, opt, key=jax.random.key(0))
+    assert int(state.step) == 10

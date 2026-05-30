@@ -336,8 +336,22 @@ def main(argv: list[str] | None = None) -> int:
         # (the legacy converter was removed in the H.2 housekeeping commit).
         # Users wanting v1 artifacts check out the `v1.0.0` git tag.
         from pawn.checkpoint import load_model
+        from pawn.corpus import (
+            assert_conditioning_C,
+            conditioning_from_run_block,
+            conditioning_to_C,
+        )
         ckpt_dir = resolve_checkpoint_source(cfg.checkpoint)
-        backbone, _ = load_model(ckpt_dir)
+        backbone, backbone_run_block = load_model(ckpt_dir)
+        # Load-time C-mismatch guard (Phase-A spec Chunk 4): the corpus is
+        # built below with `cfg.conditioning`, so a backbone trained under a
+        # different conditioning width would place every move at a different
+        # absolute RoPE offset (silent drift). Cross-check against the
+        # backbone's persisted conditioning and fail loudly on a mismatch.
+        backbone_C = conditioning_to_C(
+            conditioning_from_run_block(backbone_run_block)
+        )
+        assert_conditioning_C(cfg.conditioning, backbone_C)
         # When the loaded model has the supernet's depth we slice into a
         # variant; otherwise treat it as standalone (e.g., a previously
         # published from-scratch CLM run).
@@ -383,8 +397,21 @@ def main(argv: list[str] | None = None) -> int:
         from pawn.checkpoint import OPTIMIZER_FILE, load_model
         from pawn.trainer import unflatten_opt_state
 
+        from pawn.corpus import (
+            assert_conditioning_C,
+            conditioning_from_run_block,
+            conditioning_to_C,
+        )
+
         ckpt_dir = Path(args.resume)
-        backbone, _ = load_model(ckpt_dir)
+        backbone, backbone_run_block = load_model(ckpt_dir)
+        # Same load-time C-mismatch guard as the initial-load path: the
+        # corpus below is built with `cfg.conditioning`, so the resumed
+        # backbone's persisted conditioning must agree or moves drift.
+        resume_C = conditioning_to_C(
+            conditioning_from_run_block(backbone_run_block)
+        )
+        assert_conditioning_C(cfg.conditioning, resume_C)
         # Bottleneck sidecar: re-compose the wrapper. Otherwise fall
         # back to the freshly-initialised adapter (weight-folded
         # adapters bake into the backbone at save time, so they don't

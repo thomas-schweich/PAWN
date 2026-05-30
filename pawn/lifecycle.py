@@ -29,7 +29,7 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import (
     CancelledError,
     Future,
@@ -382,6 +382,7 @@ def load_resume_state(
     ckpt_dir: Path | str,
     optimizer: optax.GradientTransformation,
     key: jax.Array,
+    conditioning: Sequence[str] | None = None,
 ) -> TrainState:
     """Build a :class:`TrainState` from a saved checkpoint directory.
 
@@ -390,6 +391,16 @@ def load_resume_state(
     a TrainState ready to continue training. ``state.step`` is spliced
     from the saved value so the metrics log stays monotonic across
     the resume.
+
+    When ``conditioning`` is supplied (the active run's
+    ``cfg.conditioning``), the checkpoint's persisted conditioning is
+    read from its run block and cross-checked via
+    :func:`pawn.corpus.assert_conditioning_C` before returning. This is
+    the load-time ``C``-mismatch guard (Phase-A spec Chunk 4): resuming
+    a checkpoint trained at one prefix width ``C`` against a run that
+    builds its corpus at a different ``C`` would silently shift every
+    move to a different absolute offset (RoPE drift). The guard turns
+    that into a loud failure at the resume boundary instead.
 
     If the checkpoint includes ``optimizer.safetensors`` (written by
     :func:`pawn.checkpoint.save_model` when the trainer passed
@@ -401,7 +412,19 @@ def load_resume_state(
     surfaces in logs rather than silently spiking the loss.
     """
     ckpt_dir = Path(ckpt_dir)
-    model, _ = load_model(ckpt_dir)
+    model, run_block = load_model(ckpt_dir)
+    # Load-time C-mismatch guard (Phase-A spec Chunk 4): if the active run
+    # declares its conditioning, assert it matches the checkpoint's so
+    # resumed move positions land at the same absolute RoPE offset.
+    if conditioning is not None:
+        from pawn.corpus import (
+            assert_conditioning_C,
+            conditioning_from_run_block,
+            conditioning_to_C,
+        )
+
+        checkpoint_C = conditioning_to_C(conditioning_from_run_block(run_block))
+        assert_conditioning_C(conditioning, checkpoint_C)
     # Splice step from training_state.json if present.
     ts_path = ckpt_dir / "training_state.json"
     if ts_path.is_file():

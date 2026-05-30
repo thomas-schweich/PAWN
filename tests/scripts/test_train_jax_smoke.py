@@ -119,6 +119,55 @@ def test_train_jax_adapter_rejects_rosa_resume(tmp_path) -> None:  # type: ignor
     assert result.returncode != 0, "RoSA --resume should fail"
 
 
+def test_train_jax_adapter_rejects_conditioning_mismatch(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Phase-A spec Chunk 4 / C1: an adapter run whose `--conditioning`
+    disagrees with the backbone's persisted conditioning must fail loudly
+    (the load-time C guard), not silently shift every move's absolute
+    RoPE offset.
+
+    Builds a tiny backbone checkpoint persisting `conditioning=["outcome"]`
+    (C=2), then runs the adapter with the default empty conditioning
+    (C=1) and asserts the `assert_conditioning_C` failure surfaces.
+    """
+    import subprocess
+
+    from pawn.checkpoint import save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    ckpt_dir = tmp_path / "backbone"
+    save_model(
+        backbone, ckpt_dir, training_state={"step": 0},
+        run_config={"conditioning": ["outcome"]},
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax_adapter.py",
+            "--strategy", "lora",
+            "--supernet", "tiny", "--variant", "small",
+            "--checkpoint", str(ckpt_dir),
+            "--no-pgn", "--total-steps", "2",
+            "--batch-size", "4", "--seq-len", "16", "--k", "1",
+            "--lora-rank", "2",
+            "--local-checkpoints", "--lr", "1e-3",
+            # NB: no --conditioning → cfg.conditioning defaults to [] (C=1),
+            # which disagrees with the backbone's persisted C=2.
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=_subprocess_env(),
+    )
+    combined = result.stdout + result.stderr
+    assert "conditioning mismatch" in combined, (
+        f"Expected the load-time C-mismatch guard; got "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.returncode != 0, "conditioning mismatch should fail"
+
+
 def test_train_jax_conditioning_threaded_into_corpus(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """A `--conditioning outcome` pretrain must TRAIN under C=2, not just
     record C=2 in config.json.

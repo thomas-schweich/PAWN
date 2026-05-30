@@ -242,7 +242,10 @@ def main(argv: list[str] | None = None) -> int:
     schedule = make_lr_schedule(cfg, total_steps)
     optimizer = make_optimizer(cfg, schedule)
     if cfg.resume:
-        state = load_resume_state(Path(cfg.resume), optimizer, jax.random.key(0))
+        state = load_resume_state(
+            Path(cfg.resume), optimizer, jax.random.key(0),
+            conditioning=cfg.conditioning,
+        )
     else:
         import equinox as eqx
         # PretrainConfig doesn't carry a runtime seed field — the supernet
