@@ -19,8 +19,10 @@ from pawn.lab.runner import (
 )
 from pawn.sweep import (
     STRATEGY_SUGGESTERS,
-    _params_to_argv,
+    AdapterObjective,
     _read_best_val_loss,
+    adapter_strategy_for,
+    params_to_config_json,
     suggest_lora,
     suggest_rosa,
 )
@@ -72,13 +74,108 @@ def test_suggest_rosa_includes_v1_hyperparams() -> None:
     assert params["grad_alpha"] in (1, 2)
 
 
-def test_params_to_argv_handles_bool_and_int() -> None:
-    """Bool True → flag with no value; False → omitted; int → flag + value."""
-    argv = _params_to_argv({"lora_rank": 4, "use_output_film": True, "no_adapt_attn": False})
-    assert "--lora-rank" in argv
-    assert "4" in argv
-    assert "--use-output-film" in argv
-    assert "--no-adapt-attn" not in argv  # False omitted
+def test_params_to_config_json_preserves_native_types() -> None:
+    """H8: suggested params round-trip through a JSON `--config` body as
+    native types (bool stays bool, int stays int) — not kebab CLI flags
+    the adapter argparse never registered. The body carries `run_type` and
+    the resolved adapter `strategy`."""
+    body = params_to_config_json(
+        "bottleneck",
+        {"lora_rank": 4, "use_output_film": True, "no_adapt_attn": False},
+    )
+    assert body["run_type"] == "adapter"
+    assert body["strategy"] == "bottleneck"
+    assert body["lora_rank"] == 4
+    assert body["use_output_film"] is True
+    assert body["no_adapt_attn"] is False  # native False preserved, not dropped
+    # The body must be JSON-serialisable (this is what gets written to
+    # `--config`); native bool/int survive the round-trip unchanged.
+    assert json.loads(json.dumps(body)) == body
+
+
+def test_rosa_ratio_maps_to_consumed_rosa_strategy() -> None:
+    """H9: `rosa-ratio` is a sweep-only key with no `--strategy` of its
+    own. `adapter_strategy_for` resolves it to the real `rosa` strategy,
+    and its suggester emits only consumed `AdapterConfig` fields (a concrete
+    `bottleneck_dim`, never the unconsumed `bottleneck_ratio` key that the
+    old code emitted and `extra=forbid` rejected)."""
+    assert adapter_strategy_for("rosa-ratio") == "rosa"
+    # Non-alias strategies pass through unchanged.
+    assert adapter_strategy_for("bottleneck") == "bottleneck"
+    study = optuna.create_study()
+    params = STRATEGY_SUGGESTERS["rosa-ratio"](study.ask())
+    assert "bottleneck_ratio" not in params  # raw ratio is not a config field
+    assert params["rosa_mode"] == "retro-bottleneck"
+    assert isinstance(params["bottleneck_dim"], int)
+    assert params["bottleneck_dim"] >= 1
+
+
+def _load_adapter_script():
+    """Import `scripts/train_jax_adapter.py` by path (scripts/ isn't a
+    package). Imports JAX at module load — used only by the argparse +
+    pydantic acceptance test and the GPU sweep smokes below."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "scripts_train_jax_adapter_accept", Path("scripts/train_jax_adapter.py")
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("sweep_strategy", sorted(STRATEGY_SUGGESTERS))
+def test_suggested_params_accepted_by_adapter_argparse_and_pydantic(
+    sweep_strategy: str, tmp_path: Path
+) -> None:
+    """H8/H9 acceptance gate: every `STRATEGY_SUGGESTERS` entry's suggested
+    params, serialized to a `--config` JSON exactly as `AdapterObjective`
+    does, are accepted by `train_jax_adapter.py`'s argparse + `AdapterConfig`
+    pydantic boundary — no `SystemExit` (argparse exit-2), no
+    `pydantic.ValidationError` (`extra=forbid` / required-field).
+
+    This is the previously-broken path: kebab CLI flags for
+    `bottleneck_n_hidden` / `sparse_targets` / `rosa_*` / `mask_samples` /
+    `grad_alpha` were never registered (exit-2), and `bottleneck_ratio` was
+    not a config field (`extra=forbid`). The JSON `--config` round-trip plus
+    the `rosa-ratio`→`rosa` alias fix both regimes.
+    """
+    adapter = _load_adapter_script()
+    study = optuna.create_study()
+    # Mirror AdapterObjective: suggest params, render the config body, write
+    # it to disk, and build the argv the objective would run.
+    params = STRATEGY_SUGGESTERS[sweep_strategy](study.ask(), n_layers=4)
+    body = params_to_config_json(sweep_strategy, params)
+    config_path = tmp_path / "trial_config.json"
+    config_path.write_text(json.dumps(body))
+    argv = [
+        "--config", str(config_path),
+        "--strategy", adapter_strategy_for(sweep_strategy),
+        "--logs-dir", str(tmp_path / "logs"),
+        # base_args the sweep CLI supplies (scripts/sweep.py); these don't
+        # collide with the suggested params and satisfy the required
+        # total_steps / checkpoint-mode pydantic gates.
+        "--supernet", "tiny", "--variant", "base",
+        "--total-steps", "10", "--log-interval", "2",
+        "--no-pgn", "--batch-size", "8", "--seq-len", "32", "--k", "5",
+        "--local-checkpoints",
+    ]
+    # Must not raise SystemExit (argparse) or ValidationError (pydantic).
+    args = adapter._parse_args(argv)
+    cfg = adapter._build_config(args)
+    # The resolved strategy must be a real adapter strategy, and the config
+    # must carry the suggested values (spot-check the non-default knobs).
+    from pawn.adapter_trainer import STRATEGIES
+
+    assert cfg.strategy in STRATEGIES
+    assert cfg.strategy == adapter_strategy_for(sweep_strategy)
+    for key, val in params.items():
+        # `rosa_mode` is the sub-mode selector; every other suggested key is
+        # a direct AdapterConfig field that must survive the round-trip.
+        assert getattr(cfg, key) == val, (
+            f"{sweep_strategy}: config dropped suggested {key}={val!r}"
+        )
 
 
 def test_read_best_val_loss_finds_minimum(tmp_path: Path) -> None:
@@ -97,6 +194,74 @@ def test_read_best_val_loss_finds_minimum(tmp_path: Path) -> None:
 
 def test_read_best_val_loss_returns_inf_on_no_records(tmp_path: Path) -> None:
     assert _read_best_val_loss(tmp_path) == float("inf")
+
+
+# ---------------------------------------------------------------------------
+# Sweep — end-to-end tiny-trial smoke (subprocess per trial; GPU-only)
+# ---------------------------------------------------------------------------
+
+
+def _gpu_only() -> None:
+    import jax
+
+    if jax.default_backend() != "gpu":
+        pytest.skip("sweep subprocess trains via train_jax_adapter (GPU-only)")
+
+
+def _local_tiny_backbone(ckpt_dir: Path) -> Path:
+    """Persist a TINY_SUPERNET-shaped local backbone checkpoint so the sweep
+    smokes don't depend on the (unpublished) `pawn-base-v2` HF repo — the
+    spec's "local backbone" smoke setup."""
+    from pawn.checkpoint import save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    save_model(
+        backbone, ckpt_dir, training_state={"step": 0},
+        run_config={"conditioning": []},
+    )
+    return ckpt_dir
+
+
+def _run_tiny_sweep(strategy: str, logs_dir: Path, n_trials: int = 2) -> float:
+    """Drive a tiny in-process Optuna sweep through `AdapterObjective`, which
+    subprocesses `scripts/train_jax_adapter.py` per trial. Returns
+    `study.best_value` — a finite value proves the previously-broken
+    argparse/pydantic path now produces non-pruned trials (no all-prune)."""
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = _local_tiny_backbone(logs_dir / "backbone")
+    study = optuna.create_study(direction="minimize")
+    base_args = [
+        "--supernet", "tiny", "--variant", "small",
+        "--checkpoint", str(ckpt),
+        "--total-steps", "10", "--log-interval", "2",
+        "--no-pgn", "--batch-size", "8", "--seq-len", "32", "--k", "5",
+        "--local-checkpoints",
+    ]
+    obj = AdapterObjective(
+        strategy=strategy, base_args=base_args, logs_dir=logs_dir, n_layers=4,
+    )
+    study.optimize(obj, n_trials=n_trials)
+    return study.best_value
+
+
+@pytest.mark.parametrize(
+    "strategy", ["bottleneck", "sparse", "rosa", "rosa-ratio"]
+)
+def test_tiny_sweep_yields_finite_best_value(
+    strategy: str, tmp_path: Path
+) -> None:
+    """E1 smoke: a 2-trial sweep for each previously-broken strategy
+    (`bottleneck`/`sparse` had unregistered kebab flags; a `rosa` sub-mode
+    had unregistered `rosa_*` flags; `rosa-ratio` emitted a non-field key)
+    completes with a finite `best_value` rather than 100% pruned (H8/H9)."""
+    _gpu_only()
+    best = _run_tiny_sweep(strategy, tmp_path / "sweep", n_trials=2)
+    assert best != float("inf")
+    import math
+
+    assert math.isfinite(best), f"{strategy}: best_value not finite: {best}"
 
 
 # ---------------------------------------------------------------------------

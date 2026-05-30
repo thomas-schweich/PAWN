@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,8 @@ __all__ = [
     "suggest_unfreeze",
     "suggest_specialized_clm",
     "STRATEGY_SUGGESTERS",
+    "adapter_strategy_for",
+    "params_to_config_json",
 ]
 
 
@@ -112,14 +115,38 @@ def suggest_rosa_retro_bottleneck(trial: optuna.Trial, **_kw: Any) -> dict[str, 
 
 def suggest_rosa_ratio(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     """Sweep over the bottleneck-vs-sparse parameter split (RoSA-specific
-    v1 sweep)."""
+    v1 sweep).
+
+    H9: ``rosa-ratio`` is a *sweep-only* strategy key — it is not a valid
+    adapter ``--strategy`` (``STRATEGIES`` has no ``rosa-ratio`` entry). The
+    objective maps it onto the real ``rosa`` strategy via
+    :func:`adapter_strategy_for`; the sub-mode this suggester sweeps is
+    ``retro-bottleneck`` (the only RoSA mode that actually instantiates a
+    Houlsby bottleneck), so the bottleneck-vs-sparse split is a meaningful
+    knob here. The historical ``bottleneck_ratio`` ∈ (0, 1) is translated
+    into the *consumed* ``bottleneck_dim`` AdapterConfig field — the prior
+    code emitted a raw ``bottleneck_ratio`` key that no config or adapter
+    consumed, so every trial was rejected by ``extra="forbid"``.
+
+    ``bottleneck_dim`` is derived as ``round(ratio · _ROSA_RATIO_DIM_SPAN)``
+    (clamped to ≥1) so the swept ratio maps onto a small positive integer
+    bottleneck width.
+    """
+    ratio = trial.suggest_float("bottleneck_ratio", 0.1, 0.9)
+    bottleneck_dim = max(1, round(ratio * _ROSA_RATIO_DIM_SPAN))
     return {
-        "rosa_mode": "rosa",
+        "rosa_mode": "retro-bottleneck",
         "lora_rank": trial.suggest_int("lora_rank", 1, 8),
         "density": trial.suggest_float("density", 0.001, 0.1, log=True),
-        "bottleneck_ratio": trial.suggest_float("bottleneck_ratio", 0.1, 0.9),
+        "bottleneck_dim": bottleneck_dim,
         "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
     }
+
+
+# The integer bottleneck width that a swept ``bottleneck_ratio`` of 1.0
+# would map to (``bottleneck_dim = round(ratio · span)``). Picked so the
+# (0.1, 0.9) ratio range spans a small-but-non-degenerate set of widths.
+_ROSA_RATIO_DIM_SPAN = 32
 
 
 def suggest_unfreeze(
@@ -173,27 +200,54 @@ STRATEGY_SUGGESTERS: dict[str, Callable[..., dict[str, Any]]] = {
 }
 
 
+# Sweep-only strategy keys that are NOT valid adapter `--strategy` values —
+# they map onto a real `STRATEGIES` strategy whose `rosa_mode` the suggester
+# sets explicitly (H9). `rosa-ratio` sweeps the bottleneck-vs-sparse split of
+# the `rosa` strategy in its `retro-bottleneck` sub-mode.
+_SWEEP_STRATEGY_ALIASES: dict[str, str] = {
+    "rosa-ratio": "rosa",
+}
+
+
+def adapter_strategy_for(sweep_strategy: str) -> str:
+    """Map a `STRATEGY_SUGGESTERS` key onto the adapter `--strategy` it runs.
+
+    Most sweep keys are identical to the adapter strategy; sweep-only
+    aliases (currently just `rosa-ratio`) resolve to the real strategy the
+    `train_jax_adapter` argparse + pydantic accept (H9)."""
+    return _SWEEP_STRATEGY_ALIASES.get(sweep_strategy, sweep_strategy)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _params_to_argv(params: dict[str, Any]) -> list[str]:
-    """Convert a suggested-params dict into CLI argv (kebab-case flags).
+def params_to_config_json(strategy: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Build the JSON `--config` body for one suggested trial (H8).
 
-    `{"lora_rank": 4}` becomes `["--lora-rank", "4"]`. Boolean True
-    becomes a flag with no value (e.g. `["--use-output-film"]`); False
-    is omitted (the v1 contract).
+    The previous design rendered the suggested-params dict into kebab-cased
+    CLI argv (`{"lora_rank": 4}` → `["--lora-rank", "4"]`). Many suggested
+    keys (`bottleneck_n_hidden`, `sparse_targets`, `rosa_warmup_steps`,
+    `mask_samples`, `grad_alpha`, …) have **no** registered argparse flag in
+    `scripts/train_jax_adapter.py`, so argparse exited 2 and every trial was
+    pruned. Routing the params through a temp-JSON `--config` instead lets
+    them round-trip through `AdapterConfig` (pydantic) directly — the
+    `--config` path in `_build_config` `json.loads`es this body and merges
+    CLI flags on top.
+
+    The returned dict carries the suggested params verbatim (every key is an
+    `AdapterConfig` field — `extra="forbid"` would reject a stray one) plus
+    `run_type="adapter"` and the resolved adapter `strategy` (sweep-only
+    aliases like `rosa-ratio` are mapped to their real strategy via
+    :func:`adapter_strategy_for`). Boolean and int values are preserved as
+    native JSON types rather than stringified, so the config validates with
+    the right field types.
     """
-    args: list[str] = []
-    for k, v in params.items():
-        flag = "--" + k.replace("_", "-")
-        if isinstance(v, bool):
-            if v:
-                args.append(flag)
-        else:
-            args.extend([flag, str(v)])
-    return args
+    body: dict[str, Any] = dict(params)
+    body["run_type"] = "adapter"
+    body["strategy"] = adapter_strategy_for(strategy)
+    return body
 
 
 def _read_best_val_loss(logs_dir: Path) -> float:
@@ -247,7 +301,11 @@ class AdapterObjective:
     base_args: list[str]  # supernet/variant/total-steps/etc.
     logs_dir: Path
     script: str = "scripts/train_jax_adapter.py"
-    python: str = "python"
+    # Use the interpreter running the sweep (which has the `pawn` package +
+    # the ROCm JAX plugin resolved) rather than a bare `python` off PATH,
+    # which may resolve to a different env (§8.4-low). `field(...)` because
+    # `sys.executable` is evaluated at class-definition import time.
+    python: str = field(default_factory=lambda: sys.executable)
     timeout: float | None = None
     # Backbone depth hint forwarded to suggesters that need it
     # (currently only `suggest_unfreeze`). Defaults to the production
@@ -260,11 +318,22 @@ class AdapterObjective:
             raise ValueError(f"no suggester for strategy {self.strategy!r}")
         params = suggester(trial, n_layers=self.n_layers)
         trial_logs = self.logs_dir / f"trial_{trial.number:05d}"
+        trial_logs.mkdir(parents=True, exist_ok=True)
+        # H8: route the suggested params through a temp-JSON `--config` so
+        # they round-trip through `AdapterConfig` (pydantic) rather than
+        # through kebab-cased CLI flags the adapter argparse never
+        # registered (which exited 2 → every trial pruned). The resolved
+        # adapter `--strategy` (sweep-only aliases mapped) is set on the
+        # config body *and* passed on the CLI so it wins over the config.
+        config_body = params_to_config_json(self.strategy, params)
+        config_path = trial_logs / "sweep_trial_config.json"
+        config_path.write_text(json.dumps(config_body), encoding="utf-8")
         cmd = [
             self.python, self.script,
-            "--strategy", self.strategy,
+            "--config", str(config_path),
+            "--strategy", adapter_strategy_for(self.strategy),
             "--logs-dir", str(trial_logs),
-        ] + self.base_args + _params_to_argv(params)
+        ] + self.base_args
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=self.timeout
         )

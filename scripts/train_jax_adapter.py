@@ -431,7 +431,7 @@ def _strategy_config_from_run(cfg: AdapterConfig) -> object:
             cast(RoSAMode, cfg.rosa_mode) if cfg.rosa_mode is not None
             else suffix_to_mode[s]
         )
-        return RoSAConfig(
+        rosa_kwargs: dict[str, Any] = dict(
             mode=mode,
             lora_rank=cfg.lora_rank or 4,
             density=cfg.density or 0.01,
@@ -443,6 +443,15 @@ def _strategy_config_from_run(cfg: AdapterConfig) -> object:
             sparse_targets=cfg.sparse_targets or "qkvo",
             sparse_ffn=cfg.sparse_ffn,
         )
+        # `bottleneck_dim` is the Houlsby width used by the `retro-bottleneck`
+        # RoSA sub-mode (unused for `rosa` / `retro-sparse`). Thread it through
+        # only when set so RoSAConfig's own default (8) stands otherwise. The
+        # `rosa-ratio` sweep (H9) drives this knob — it maps onto the `rosa`
+        # strategy in `retro-bottleneck` mode and translates its swept ratio
+        # into this field, so it must be consumed here rather than dropped.
+        if cfg.bottleneck_dim is not None:
+            rosa_kwargs["bottleneck_dim"] = cfg.bottleneck_dim
+        return RoSAConfig(**rosa_kwargs)
     if s == "unfreeze":
         return UnfreezeConfig(layers=cfg.unfreeze_layers or "5,6,7")
     if s == "specialized_clm":

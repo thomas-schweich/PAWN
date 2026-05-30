@@ -18,6 +18,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--n-trials", type=int, default=3)
     ap.add_argument("--supernet", default="tiny")
     ap.add_argument("--variant", default="base")
+    ap.add_argument("--checkpoint", default=None,
+                    help="Backbone checkpoint each trial adapts (local dir "
+                         "or HF repo ID). Defaults to the AdapterConfig "
+                         "default (the published v2 base slice); point this "
+                         "at a local tiny backbone for offline smoke sweeps.")
     ap.add_argument("--storage", default=None,
                     help="Optuna storage URL, e.g. sqlite:///./lora.db")
     ap.add_argument("--logs-dir", type=Path, default=Path("logs/sweep"))
@@ -34,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     base_args = [
         "--supernet", args.supernet,
         "--variant", args.variant,
+        *(["--checkpoint", args.checkpoint] if args.checkpoint else []),
         "--total-steps", str(args.total_steps),
         # Pick a log_interval well below the sweep's --total-steps so each
         # trial actually emits a val_loss row (the objective parses
