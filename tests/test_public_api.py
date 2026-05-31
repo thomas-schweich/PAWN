@@ -164,6 +164,18 @@ def test_eval_public_surface() -> None:
     } <= set(pawn_eval.__all__)
 
 
+def test_eval_suite_diagnostics_public_surface() -> None:
+    from pawn.eval_suite import diagnostics
+
+    assert {
+        "EdgeCaseResult", "SampledDiagnosticResult",
+        "EDGE_CASE_LABELS", "TERMINAL_LABELS",
+        "compute_edge_case_accuracy", "compute_edge_case_accuracy_quota",
+        "compute_edge_case_diagnostics", "compute_edge_case_diagnostics_quota",
+        "default_diagnostic_quotas",
+    } <= set(diagnostics.__all__)
+
+
 def test_generation_public_surface_has_five_diagnostics() -> None:
     from pawn import generation
 

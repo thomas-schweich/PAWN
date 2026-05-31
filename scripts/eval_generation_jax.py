@@ -7,12 +7,15 @@ The diagnostics run real autoregressive generation (see
 padding ratio).
 
 ``--edge-cases`` additionally runs the engine-quota-controlled
-edge-case accuracy via
-:func:`pawn.eval_suite.diagnostics.compute_edge_case_accuracy_quota`,
+edge-case diagnostics via
+:func:`pawn.eval_suite.diagnostics.compute_edge_case_diagnostics_quota`,
 which guarantees coverage for every label in
 :data:`pawn.eval_suite.diagnostics.EDGE_CASE_LABELS` (in_check,
 double_check, pin_restricts, ep_available, castle_legal_*,
-castle_blocked_check, promotion_available, checkmate, stalemate).
+castle_blocked_check, promotion_available, checkmate, stalemate) and
+emits both the v2 argmax-accuracy and the v1 sampled distributional
+metrics (mean_legal_rate / mean_pad_prob / mean_entropy) per label so the
+model-card and viz consumers find their schema.
 """
 
 from __future__ import annotations
@@ -213,13 +216,22 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.edge_cases:
-        from pawn.eval_suite.diagnostics import compute_edge_case_accuracy_quota
-        edge = compute_edge_case_accuracy_quota(
-            model, per_label=args.edge_per_label, conditioning=conditioning,
+        from pawn.eval_suite.diagnostics import (
+            compute_edge_case_diagnostics_quota,
         )
+        # Both the argmax-accuracy (v2 superset) and the v1 sampled
+        # distributional metrics (mean_legal_rate / mean_pad_prob /
+        # mean_entropy). The model-card and viz consumers key off the
+        # sampled metrics; `accuracy` is the additional v2 signal. Print
+        # the quota fill-rate table (v1 parity).
+        accuracy, sampled = compute_edge_case_diagnostics_quota(
+            model, per_label=args.edge_per_label, conditioning=conditioning,
+            report=True,
+        )
+        acc_by_label = {r.label: r for r in accuracy}
         results["edge_cases"] = {
-            r.label: {"accuracy": r.accuracy, "n_positions": r.n_positions}
-            for r in edge
+            s.label: {**s.to_dict(), "accuracy": acc_by_label[s.label].accuracy}
+            for s in sampled
         }
 
     print(json.dumps(results, indent=2, default=str))

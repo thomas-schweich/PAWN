@@ -13,6 +13,7 @@ from pawn.config import (
     NUM_ACTIONS,
     STALEMATE,
     TINY_SUPERNET,
+    VOCAB_SIZE,
     WHITE_CHECKMATES,
 )
 from pawn.corpus import generate_corpus, pack_corpus
@@ -1677,6 +1678,95 @@ def test_edge_case_accuracy_quota_guarantees_coverage() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-category sampled distributional metrics (v1 surface restored)
+# ---------------------------------------------------------------------------
+
+
+def test_edge_case_diagnostics_returns_sampled_schema() -> None:
+    """`compute_edge_case_diagnostics` returns the v1 sampled-metrics keys
+    the model-card / viz consumers read (mean_legal_rate, std_legal_rate,
+    mean_pad_prob, mean_entropy, std_entropy, terminal, n_positions)
+    alongside the v2 argmax-accuracy."""
+    import chess_engine as engine
+
+    from pawn.eval_suite.diagnostics import (
+        EDGE_CASE_LABELS,
+        TERMINAL_LABELS,
+        compute_edge_case_diagnostics,
+    )
+
+    model = init_model(TINY_SUPERNET, key=0)
+    move_ids, game_lengths, term_codes = engine.generate_random_games(64, 48, 3)
+    accuracy, sampled = compute_edge_case_diagnostics(
+        model, move_ids, game_lengths, term_codes=term_codes, batch_size=16
+    )
+    assert [r.label for r in accuracy] == list(EDGE_CASE_LABELS)
+    assert [r.label for r in sampled] == list(EDGE_CASE_LABELS)
+    for s in sampled:
+        d = s.to_dict()
+        # Exact v1 key set the consumers read.
+        assert set(d) == {
+            "n_positions", "terminal", "mean_legal_rate", "std_legal_rate",
+            "mean_pad_prob", "mean_entropy", "std_entropy",
+        }
+        assert d["terminal"] == (s.label in TERMINAL_LABELS)
+        assert 0.0 <= s.mean_legal_rate <= 1.0
+        assert 0.0 <= s.mean_pad_prob <= 1.0
+        assert s.mean_entropy >= 0.0
+
+
+def test_edge_case_sampled_legal_rate_is_analytic_softmax_mass() -> None:
+    """The restored sampled `mean_legal_rate` is the softmax mass on the
+    engine's legal-token set. A next-token oracle (all mass on the true
+    next move, which is always legal) scores ~1.0 legal-rate on a
+    non-terminal label, while the terminal-PAD `mean_pad_prob` is ~1.0 on
+    `checkmate` — i.e. the metric genuinely measures the distribution at
+    the diagnostic position, not the argmax."""
+    import chess_engine as engine
+
+    from pawn.eval_suite.diagnostics import compute_edge_case_diagnostics
+
+    move_ids, game_lengths, term_codes = engine.generate_random_games(400, 80, 7)
+    _accuracy, sampled = compute_edge_case_diagnostics(
+        _NextTokenOracle(), move_ids, game_lengths,
+        term_codes=term_codes, batch_size=64,
+    )
+    by = {s.label: s for s in sampled}
+    assert by["in_check"].n_positions > 0
+    assert by["checkmate"].n_positions > 0
+    # Non-terminal: the true next token is a legal move ⇒ legal mass ≈ 1.
+    assert by["in_check"].mean_legal_rate == pytest.approx(1.0, abs=1e-4)
+    # Terminal: the true next token is PAD ⇒ pad prob ≈ 1, legal mass ≈ 0.
+    assert by["checkmate"].mean_pad_prob == pytest.approx(1.0, abs=1e-4)
+    assert by["checkmate"].mean_legal_rate == pytest.approx(0.0, abs=1e-4)
+
+
+def test_edge_case_diagnostics_quota_reports_fill_rate(capsys) -> None:  # type: ignore[no-untyped-def]
+    """`compute_edge_case_diagnostics_quota(report=True)` prints the
+    per-label OK/SHORT quota fill-rate table (v1 parity) and returns both
+    accuracy and sampled metrics with guaranteed per-label coverage."""
+    from pawn.eval_suite.diagnostics import (
+        EDGE_CASE_LABELS,
+        compute_edge_case_diagnostics_quota,
+    )
+
+    model = init_model(TINY_SUPERNET, key=0)
+    accuracy, sampled = compute_edge_case_diagnostics_quota(
+        model, per_label=4, max_ply=256, batch_size=4, report=True,
+    )
+    out = capsys.readouterr().out
+    # Every label appears in the fill-rate table with an OK/SHORT verdict.
+    for label in EDGE_CASE_LABELS:
+        assert label in out
+    assert "OK" in out or "SHORT" in out
+    by_acc = {r.label: r for r in accuracy}
+    by_s = {s.label: s for s in sampled}
+    for label in EDGE_CASE_LABELS:
+        assert by_acc[label].n_positions > 0
+        assert by_s[label].n_positions > 0
+
+
+# ---------------------------------------------------------------------------
 # H5: edge-case alignment (off-by-one + terminal-label PAD scoring)
 # ---------------------------------------------------------------------------
 
@@ -1727,11 +1817,118 @@ class _NextTokenOracle(_OracleBase):
         b, t = toks.shape
         tgt = np.full((b, t), PAD_TOKEN, dtype=np.int64)
         tgt[:, :-1] = toks[:, 1:]
-        logits = np.full((b, t, 1982), -30.0, dtype=np.float32)
+        logits = np.full((b, t, VOCAB_SIZE), -30.0, dtype=np.float32)
         rows = np.arange(b)[:, None]
         cols = np.arange(t)[None, :]
         logits[rows, cols, tgt] = 30.0
         return jnp.asarray(logits)
+
+
+class _CountingOracle(_NextTokenOracle):
+    """Next-token oracle that records how many times the model is invoked.
+
+    Used to pin that the combined accuracy+sampled diagnostic runs a
+    *single* forward pass per batch (not one for accuracy and a second for
+    the sampled metrics)."""
+
+    def __init__(self) -> None:
+        self.n_calls = 0
+
+    def __call__(
+        self,
+        input_ids: Array,
+        attention_mask: Array | None = None,
+        *,
+        compute_dtype=None,  # type: ignore[no-untyped-def]
+        use_sdpa: bool = False,
+        use_flash: bool = False,
+    ) -> Array:
+        self.n_calls += 1
+        return super().__call__(
+            input_ids, attention_mask,
+            compute_dtype=compute_dtype, use_sdpa=use_sdpa, use_flash=use_flash,
+        )
+
+
+def test_edge_case_diagnostics_single_forward_pass_per_batch() -> None:
+    """The combined accuracy+sampled diagnostic forwards the model exactly
+    once per batch.
+
+    Both surfaces derive from the one `logits` array, so a corpus split
+    into `ceil(n / batch_size)` batches must invoke the model exactly that
+    many times — not 2× (a regression to a separate accuracy pass and
+    sampled pass would double the count). The accuracy-only path likewise
+    runs once per batch."""
+    import math
+
+    import chess_engine as engine
+
+    from pawn.eval_suite.diagnostics import (
+        compute_edge_case_accuracy,
+        compute_edge_case_diagnostics,
+    )
+
+    n_games, batch_size = 40, 16
+    move_ids, game_lengths, term_codes = engine.generate_random_games(n_games, 48, 3)
+    expected_batches = math.ceil(n_games / batch_size)
+
+    combined = _CountingOracle()
+    compute_edge_case_diagnostics(
+        combined, move_ids, game_lengths,
+        term_codes=term_codes, batch_size=batch_size,
+    )
+    assert combined.n_calls == expected_batches
+
+    acc_only = _CountingOracle()
+    compute_edge_case_accuracy(
+        acc_only, move_ids, game_lengths,
+        term_codes=term_codes, batch_size=batch_size,
+    )
+    assert acc_only.n_calls == expected_batches
+
+
+def test_edge_case_diagnostics_matches_independent_passes() -> None:
+    """The single-pass combined diagnostic returns numerically identical
+    accuracy and sampled results to the standalone accuracy / sampled-only
+    derivations — proving the merge changed forward-pass *count*, not
+    values."""
+    import chess_engine as engine
+
+    from pawn.eval_suite.diagnostics import (
+        _compute_per_bit_all,
+        _resolve_outcome_tokens,
+        compute_edge_case_accuracy,
+        compute_edge_case_diagnostics,
+    )
+
+    move_ids, game_lengths, term_codes = engine.generate_random_games(64, 48, 3)
+    accuracy, sampled = compute_edge_case_diagnostics(
+        _NextTokenOracle(), move_ids, game_lengths,
+        term_codes=term_codes, batch_size=16,
+    )
+    # Accuracy must equal the accuracy-only public path exactly.
+    acc_only = compute_edge_case_accuracy(
+        _NextTokenOracle(), move_ids, game_lengths,
+        term_codes=term_codes, batch_size=16,
+    )
+    assert [(r.label, r.accuracy, r.n_positions) for r in accuracy] == [
+        (r.label, r.accuracy, r.n_positions) for r in acc_only
+    ]
+    # Sampled-only derivation (want_accuracy=False) must equal the combined
+    # sampled list — the gating must not change values.
+    move_np = np.ascontiguousarray(move_ids, dtype=np.int16)
+    glen_np = np.asarray(game_lengths, dtype=np.int16)
+    bits, _, _ = engine.compute_edge_stats_per_ply(move_np, glen_np)
+    bits = np.asarray(bits, dtype=np.uint64)
+    outcome = _resolve_outcome_tokens(np.asarray(term_codes), glen_np)
+    none_acc, sampled_only = _compute_per_bit_all(
+        _NextTokenOracle(), move_np, glen_np, bits, outcome,
+        conditioning=(), batch_size=16,
+        want_accuracy=False, want_sampled=True,
+    )
+    assert none_acc is None
+    assert sampled_only is not None
+    assert [s.to_dict() for s in sampled] == [s.to_dict() for s in sampled_only]
 
 
 @pytest.mark.parametrize("conditioning", [(), ("outcome",)])
@@ -1802,7 +1999,7 @@ class _EvenSlotOracle(_OracleBase):
         # (0, or 1 when the truth is 0) so move-target slots score as wrong.
         wrong = np.where(tgt == 0, 1, 0)
         peak = np.where(even, tgt, wrong)
-        logits = np.full((b, t, 1982), -30.0, dtype=np.float32)
+        logits = np.full((b, t, VOCAB_SIZE), -30.0, dtype=np.float32)
         rows = np.arange(b)[:, None]
         logits[rows, cols, peak] = 30.0
         return jnp.asarray(logits)
@@ -1886,7 +2083,7 @@ def test_edge_case_terminal_label_not_forced_to_zero() -> None:
             use_flash: bool = False,
         ) -> Array:
             b, t = np.asarray(input_ids).shape
-            logits = np.full((b, t, 1982), -30.0, dtype=np.float32)
+            logits = np.full((b, t, VOCAB_SIZE), -30.0, dtype=np.float32)
             logits[:, :, 0] = 30.0  # always action 0, never PAD
             return jnp.asarray(logits)
 
@@ -1901,7 +2098,7 @@ def test_edge_case_terminal_label_not_forced_to_zero() -> None:
             use_flash: bool = False,
         ) -> Array:
             b, t = np.asarray(input_ids).shape
-            logits = np.full((b, t, 1982), -30.0, dtype=np.float32)
+            logits = np.full((b, t, VOCAB_SIZE), -30.0, dtype=np.float32)
             logits[:, :, PAD_TOKEN] = 30.0  # always predict game-over
             return jnp.asarray(logits)
 

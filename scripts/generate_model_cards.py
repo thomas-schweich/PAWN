@@ -130,13 +130,17 @@ PROBE_NAMES = {
     "game_phase": "Game phase",
 }
 
+# Keys match the v2 edge-case label surface
+# (pawn.eval_suite.diagnostics.EDGE_CASE_LABELS): the castle labels were
+# renamed from v1's `castle_legal_k`/`castle_legal_q` to the spelled-out
+# `castle_legal_kingside`/`castle_legal_queenside`.
 DIAGNOSTIC_NAMES = {
     "in_check": "In check",
     "double_check": "Double check",
     "pin_restricts": "Pin restricts movement",
     "ep_available": "En passant available",
-    "castle_legal_k": "Castling legal (kingside)",
-    "castle_legal_q": "Castling legal (queenside)",
+    "castle_legal_kingside": "Castling legal (kingside)",
+    "castle_legal_queenside": "Castling legal (queenside)",
     "castle_blocked_check": "Castling blocked by check",
     "promotion_available": "Promotion available",
     "checkmate": "Checkmate (terminal)",

@@ -52,6 +52,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--checkpoints", nargs="+", required=True)
     ap.add_argument("--output-dir", type=Path, required=True)
     ap.add_argument("--outcome-prefix-trained", action="store_true")
+    # Edge-case diagnostics (engine quota-controlled coverage of all 10
+    # labels). Off by default so the cheap generation suite stays fast;
+    # the model card's `diagnostics` table is only populated when this is
+    # passed. `--edge-per-label` controls per-(colour, label) coverage.
+    ap.add_argument("--edge-cases", action="store_true")
+    ap.add_argument("--edge-per-label", type=int, default=10)
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -97,10 +103,24 @@ def main(argv: list[str] | None = None) -> int:
             if args.outcome_prefix_trained
             else "--no-outcome-prefix-trained"
         )
+        if args.edge_cases:
+            gen_args += ["--edge-cases",
+                         "--edge-per-label", str(args.edge_per_label)]
         subprocess.run(gen_args, check=False)
-        results["generation"] = (
+        generation = (
             json.loads(gen_path.read_text()) if gen_path.exists() else None
         )
+        results["generation"] = generation
+        # Surface the edge-case diagnostics under the top-level
+        # `diagnostics` key the model-card consumer
+        # (`generate_model_cards.format_diagnostic`) reads. Edge data lives
+        # in `generation["edge_cases"]` (per-label sampled metrics +
+        # accuracy); only present when --edge-cases ran and the script
+        # emitted it.
+        if isinstance(generation, dict):
+            edge = generation.get("edge_cases")
+            if isinstance(edge, dict):
+                results["diagnostics"] = edge
         lich_path = cdir / "lichess.json"
         subprocess.run(
             [sys.executable, "scripts/eval_vs_stockfish.py",
