@@ -20,8 +20,8 @@ from .metrics import (
     detect_run_type,
     get_run_meta,
     list_trials,
-    load_metrics,
     load_notes,
+    load_run_buckets,
     load_runs,
     save_notes,
     sync_hf_metrics,
@@ -1346,11 +1346,11 @@ def Dashboard(log_dir_override: Path | None = None):
         AutoRefresh(interval=interval)
 
     data = solara.use_memo(
-        lambda: load_metrics(log_dir.value, selected_run.value) if selected_run.value else {},
+        lambda: load_run_buckets(log_dir.value, selected_run.value) if selected_run.value else {},
         dependencies=[selected_run.value, metrics_tick.value],
     )
     compare_data = solara.use_memo(
-        lambda: load_metrics(log_dir.value, compare_run.value) if compare_run.value else {},
+        lambda: load_run_buckets(log_dir.value, compare_run.value) if compare_run.value else {},
         dependencies=[compare_run.value, metrics_tick.value],
     )
     configs = data.get("config", []) if data else []

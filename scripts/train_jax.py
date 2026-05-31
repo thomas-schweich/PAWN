@@ -25,6 +25,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jaxtyping import Array, Float
 
 from pawn.checkpoint import save_model
 from pawn.config import (
@@ -54,7 +55,7 @@ from pawn.wandb_utils import (
     log_metrics,
     require_wandb_available,
 )
-from pawn.model import init_model
+from pawn.model import PAWNModel, init_model, sliced
 from pawn.run_config import PretrainConfig
 from pawn.trainer import (
     Batch,
@@ -65,6 +66,7 @@ from pawn.trainer import (
     make_optimizer,
     make_scan_step,
     make_train_step,
+    top1_accuracy,
 )
 
 
@@ -363,6 +365,35 @@ def build_variants(cfg: PretrainConfig) -> tuple[VariantSpec, ...]:
     )
 
 
+def widest_trained_variant(variants: tuple[VariantSpec, ...]) -> VariantSpec:
+    """The widest variant actually trained this run (max ``d_model``).
+
+    The supernet joint loss only updates the inner ``[:d_V, :d_V]`` slice of
+    each selected variant (``--variants``, caf6a53), so the widest TRAINED
+    width is the largest ``d_model`` among ``variants`` — *not* necessarily
+    the full supernet. ``train/accuracy`` is measured on this variant so the
+    metric never reads untrained outer dims (see :func:`accuracy_model`).
+    """
+    return max(variants, key=lambda s: s.cfg.d_model)
+
+
+def accuracy_model(model: PAWNModel, widest: VariantSpec) -> PAWNModel:
+    """The model the ``train/accuracy`` forward runs on.
+
+    When ``widest`` is the supernet itself (``is_supernet``) the full model
+    *is* the variant, so the slice would be a no-op and we return ``model``
+    unchanged (default small+base+large path — identical to before). For a
+    ``--variants`` subset that excludes ``large`` the outer
+    ``[d_widest:d_supernet]`` dims stay at init, so we ``sliced`` down to the
+    widest trained width; the forward then never mixes trained inner dims
+    with untrained outer dims (which would report near-random accuracy for a
+    healthy run).
+    """
+    if widest.is_supernet:
+        return model
+    return sliced(model, widest.cfg)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     # `_build_config` raises a pydantic ValueError if --total-steps is
@@ -446,6 +477,8 @@ def main(argv: list[str] | None = None) -> int:
             project=cfg.wandb_project, slug=logger.slug,
             run_config=cfg.model_dump(),
             git_hash=get_git_info().get("git_hash"),
+            job_type="pretrain",
+            run_dir_name=logger.run_dir.name,
         )
 
     # HF push tracker (optional).
@@ -458,7 +491,51 @@ def main(argv: list[str] | None = None) -> int:
     # one compiled program — eliminate per-step launch and dispatch
     # overhead." The scan body never returns to the host inside a chunk;
     # per-chunk metrics flush between chunks.
-    scan_step = make_scan_step(train_step, emit_grad_norms=args.emit_grad_norms)
+    # Per-step top-1 accuracy on the widest TRAINED variant — the v2 parity
+    # of v1's pretrain `train/accuracy` metric
+    # (`git show main:pawn/trainer.py:1030,1145`). The supernet joint loss
+    # only updates the inner `[:d_V, :d_V]` slice of whatever variants are
+    # selected (`--variants`, caf6a53), so the *full* unsliced model is a
+    # meaningful accuracy forward only when the largest variant (`large` =
+    # the supernet itself) is in the selection. For any subset that excludes
+    # it (e.g. `--variants small base`), the outer `[d_base:d_large]` weights
+    # stay at init while the inner slices train fine; a full-model forward
+    # would then mix trained inner dims with untrained outer dims and report
+    # a misleadingly low accuracy for a healthy run. So we measure on the
+    # widest selected variant: if it is the supernet, use `model` directly
+    # (slice is a no-op); otherwise `sliced(model, spec.cfg)` first.
+    #
+    # It is stacked alongside the per-step losses inside the `lax.scan`, so
+    # the chart-feeding metric costs one extra per-chunk D→H copy and no
+    # extra host round trips. Restricting the argmax to the move-token
+    # support (`mask_reserved_columns`) matches the eval contract's
+    # `[0, NUM_ACTIONS)` restriction. With accumulation the scan element
+    # carries a leading microbatch axis (`(N, B, T)`); we measure accuracy
+    # on the first micro so the metric is well-defined without paying N
+    # forwards.
+    widest_variant = widest_trained_variant(variants)
+
+    def _first_micro(batch: Batch) -> Batch:
+        # In accumulation mode each scan element is `(N, B, T)` per leaf;
+        # take micro 0 so the accuracy forward runs on a single `(B, T)`
+        # batch. Equinox `Batch` is a PyTree, so a leaf-wise index works.
+        return jax.tree_util.tree_map(lambda x: x[0], batch)
+
+    def _supernet_accuracy(model: PAWNModel, batch: Batch) -> Float[Array, ""]:
+        b = batch if accumulation_steps == 1 else _first_micro(batch)
+        # `is_supernet` ⇒ full model is the variant (slice is a no-op);
+        # otherwise slice down to the widest trained width so the forward
+        # never reads untrained outer dims.
+        return top1_accuracy(
+            accuracy_model(model, widest_variant), b,
+            compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa, use_flash=use_flash,
+        )
+
+    scan_step = make_scan_step(
+        train_step,
+        emit_grad_norms=args.emit_grad_norms,
+        accuracy_fn=_supernet_accuracy,
+    )
     emit_grad_norms = args.emit_grad_norms
 
     # H7 / D2 — bit-reproducible data stream. The outer-chunk seeds are a
@@ -753,16 +830,19 @@ def main(argv: list[str] | None = None) -> int:
             this_chunk_k = int(chunk_batches.tokens.shape[0])
 
             if emit_grad_norms:
-                state, chunk_losses, chunk_gnorms = scan_step(state, chunk_batches)
+                state, chunk_losses, chunk_gnorms, chunk_accs = scan_step(
+                    state, chunk_batches
+                )
                 chunk_gnorms_np = np.asarray(chunk_gnorms)
             else:
-                state, chunk_losses = scan_step(state, chunk_batches)
+                state, chunk_losses, chunk_accs = scan_step(state, chunk_batches)
                 chunk_gnorms_np = None
             next_step += this_chunk_k
             bucket_steps[edge] = bucket_steps.get(edge, 0) + this_chunk_k
 
             # One D→H per chunk, not per step.
             chunk_losses_np = np.asarray(chunk_losses)
+            chunk_accs_np = np.asarray(chunk_accs)
 
             # Log every step that crossed a log_interval boundary inside
             # the chunk — replays the within-chunk loss curve without
@@ -776,8 +856,22 @@ def main(argv: list[str] | None = None) -> int:
                         extra["grad_norm"] = float(chunk_gnorms_np[i])
                         extra["did_clip"] = bool(chunk_gnorms_np[i] > cfg.max_grad_norm)
                     lr_now = np.asarray(schedule(step)).item()
+                    step_loss = float(chunk_losses_np[i])
+                    step_acc = float(chunk_accs_np[i])
+                    # Dashboard `pawn` run_type keys its loss chart + KPIs on
+                    # `train/loss` and its accuracy chart on `train/accuracy`
+                    # (pawn/dashboard/charts.py:344,373; sol.py:552-563). Emit
+                    # the namespaced keys as canonical and keep the bare `loss`
+                    # / `accuracy` aliases so older log readers (sweep / lab
+                    # monitors that fall back to the bare names) still resolve
+                    # them. `train/accuracy` is the widest TRAINED variant's
+                    # top-1 (see `_supernet_accuracy`) — v1 parity
+                    # (`git show main:pawn/trainer.py:1145`).
                     train_metrics = dict(
-                        loss=float(chunk_losses_np[i]),
+                        {
+                            "train/loss": step_loss, "loss": step_loss,
+                            "train/accuracy": step_acc, "accuracy": step_acc,
+                        },
                         lr=lr_now,
                         step_time=(time.time() - t0) / max(1, step - start),
                         bucket=edge,
@@ -848,7 +942,9 @@ def main(argv: list[str] | None = None) -> int:
             actual_final_lr=last_lr,
             reason_for_stop=reason_for_stop,
         )
-        finish_wandb(wandb_run)
+        # A clean completion / SIGTERM / resume-no-op exits 0; an in-loop
+        # exception is the only failed-run signal worth flagging in W&B.
+        finish_wandb(wandb_run, exit_code=1 if reason_for_stop == "exception" else 0)
 
     # Per-bucket step distribution at end of training.
     print(f"Per-bucket step counts: {bucket_steps}", flush=True)

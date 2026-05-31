@@ -60,6 +60,26 @@ def _load_train_jax():
     return mod
 
 
+def _cfg_for_variants(tj, variants: list[str]) -> "PretrainConfig":  # noqa: F821
+    """Build a tiny PretrainConfig through the real CLI path, optionally
+    restricting `--variants` to a subset."""
+    extra = ["--variants", *variants] if variants else []
+    args = tj._parse_args(
+        ["--supernet", "tiny", "--total-steps", "1", "--local-checkpoints", *extra]
+    )
+    return tj._build_config(args)
+
+
+# The tiny supernet config the accuracy-on-trained-width tests slice against.
+def _tiny_supernet_cfg():
+    from pawn.config import TINY_SUPERNET
+
+    return TINY_SUPERNET
+
+
+_TINY_SUPERNET_CFG = _tiny_supernet_cfg()
+
+
 def test_train_jax_variants_flag_and_build() -> None:
     """`--variants` selects which variants train; default trains all three.
 
@@ -105,6 +125,105 @@ def test_train_jax_variants_flag_and_build() -> None:
         cfg_for(["--variants", "large", "large"])
     with pytest.raises(ValidationError):
         cfg_for(["--variants"])
+
+
+def test_widest_trained_variant_and_accuracy_model_picks_trained_width() -> None:
+    """`train/accuracy` must be measured on the widest TRAINED variant.
+
+    The supernet joint loss only updates the inner ``[:d_V, :d_V]`` slice of
+    each selected variant (caf6a53). So for a ``--variants`` subset that
+    excludes ``large`` the full unsliced model's outer dims stay at init —
+    a full-model accuracy forward would mix trained inner dims with
+    untrained outer dims and report near-random accuracy for a healthy run.
+    This pins that `accuracy_model` slices down to the widest trained width
+    in that case, and is a no-op when ``large`` is selected (default path).
+    """
+    from pawn.config import TINY_VARIANTS
+    from pawn.model import init_model
+
+    tj = _load_train_jax()
+    model = init_model(_TINY_SUPERNET_CFG, key=0)
+
+    # Default (small+base+large): widest is large = the supernet, so the
+    # accuracy model is the full unsliced model (no slice — old behaviour).
+    default_specs = tj.build_variants(_cfg_for_variants(tj, []))
+    widest_default = tj.widest_trained_variant(default_specs)
+    assert widest_default.name == "large" and widest_default.is_supernet
+    assert tj.accuracy_model(model, widest_default) is model
+
+    # Subset excluding large: widest is `base`, NOT the supernet, so the
+    # accuracy model is sliced down to base's width (never reads the
+    # untrained outer `[d_base:d_large]` dims).
+    subset_specs = tj.build_variants(_cfg_for_variants(tj, ["small", "base"]))
+    widest_subset = tj.widest_trained_variant(subset_specs)
+    assert widest_subset.name == "base" and not widest_subset.is_supernet
+    acc_model = tj.accuracy_model(model, widest_subset)
+    assert acc_model is not model
+    assert acc_model.cfg.d_model == TINY_VARIANTS["base"].d_model
+    assert acc_model.cfg.d_model < _TINY_SUPERNET_CFG.d_model
+
+
+def test_accuracy_model_is_invariant_to_untrained_outer_dims() -> None:
+    """The accuracy metric must not depend on the untrained outer dims.
+
+    When `large` is excluded the outer `[d_base:d_large]` weight block stays
+    at init and is never updated by the joint loss. `accuracy_model` slices
+    down to the widest trained width, so the accuracy forward must be
+    *invariant* to any change in those outer dims — whereas the full
+    unsliced forward (the old, buggy `train/accuracy` source) is NOT
+    invariant: it reads the untrained outer dims and reports a value that
+    swings with arbitrary init noise out there.
+
+    We verify by perturbing only the outer block of one weight tensor and
+    checking the sliced accuracy is unchanged while the full-model accuracy
+    moves.
+    """
+    import equinox as eqx
+    import jax
+    import numpy as np
+
+    from pawn.corpus import generate_corpus
+    from pawn.model import init_model
+    from pawn.trainer import slice_batch, top1_accuracy
+
+    tj = _load_train_jax()
+
+    variants = tj.build_variants(_cfg_for_variants(tj, ["small", "base"]))
+    widest = tj.widest_trained_variant(variants)
+    assert not widest.is_supernet
+    d_trained = widest.cfg.d_model
+    d_full = _TINY_SUPERNET_CFG.d_model
+    assert d_trained < d_full  # there ARE untrained outer dims to perturb
+
+    model = init_model(_TINY_SUPERNET_CFG, key=0)
+    corpus = generate_corpus(n_games=8, max_ply=32, seq_len=32, seed=0)
+    batch = slice_batch(corpus, np.arange(8))
+
+    base_sliced = float(top1_accuracy(tj.accuracy_model(model, widest), batch))
+    base_full = float(top1_accuracy(model, batch))
+
+    # Perturb ONLY the untrained outer block `[d_trained:, d_trained:]` of
+    # every layer's wq stack. The trained inner slice `[:d_trained, :d_trained]`
+    # is untouched, so the sliced forward must be bit-identical.
+    def _perturb_outer(m):  # noqa: ANN001 — local PyTree edit
+        wq = m.layers.wq
+        outer_mask = (
+            (jax.numpy.arange(wq.shape[1])[None, :, None] >= d_trained)
+            | (jax.numpy.arange(wq.shape[2])[None, None, :] >= d_trained)
+        )
+        new_wq = jax.numpy.where(outer_mask, wq + 5.0, wq)
+        return eqx.tree_at(lambda mm: mm.layers.wq, m, new_wq)
+
+    perturbed = _perturb_outer(model)
+
+    pert_sliced = float(top1_accuracy(tj.accuracy_model(perturbed, widest), batch))
+    pert_full = float(top1_accuracy(perturbed, batch))
+
+    # Sliced accuracy (the fix): invariant to the untrained outer dims.
+    assert pert_sliced == base_sliced
+    # Full-model accuracy (the old bug): contaminated by the outer dims, so a
+    # large perturbation out there moves the reported value.
+    assert pert_full != base_full
 
 
 @pytest.mark.parametrize("script_name", SCRIPTS)

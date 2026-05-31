@@ -484,6 +484,71 @@ def test_init_wandb_invokes_mirror_with_mock(
     fake_run.finish.assert_called_once()
 
 
+def test_init_wandb_forwards_job_type_group_and_run_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`init_wandb` exposes the v1 `job_type` / `group` / run-name knobs so
+    a single project can separate pretrain vs adapter runs and resumed
+    siblings join one group. `run_dir_name` overrides the W&B run name
+    (v1 used `logger.run_dir.name`); `group` defaults to the slug."""
+    import sys
+    import types
+
+    monkeypatch.setenv("PAWN_WANDB_MODE", "offline")
+    fake_run = mock.MagicMock(name="wandb_run")
+    fake_wandb = types.ModuleType("wandb")
+    fake_wandb.init = mock.MagicMock(return_value=fake_run)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    run = init_wandb(
+        project="pawn", slug="bold-fox", run_config={"lr": 1e-3},
+        git_hash="deadbeef", enabled=True,
+        job_type="adapter", group="sweep-42",
+        run_dir_name="lora_20260530_000000_000000_bold-fox",
+    )
+    assert run is fake_run
+    _, kwargs = fake_wandb.init.call_args  # type: ignore[attr-defined]
+    assert kwargs["name"] == "lora_20260530_000000_000000_bold-fox"
+    assert kwargs["group"] == "sweep-42"
+    assert kwargs["job_type"] == "adapter"
+    assert "job_type:adapter" in kwargs["tags"]
+    assert "git:deadbeef" in kwargs["tags"]
+
+
+def test_init_wandb_group_defaults_to_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without an explicit `group`, resumed sibling processes still join
+    one group via the slug (v1 Option-A resume)."""
+    import sys
+    import types
+
+    monkeypatch.setenv("PAWN_WANDB_MODE", "offline")
+    fake_run = mock.MagicMock(name="wandb_run")
+    fake_wandb = types.ModuleType("wandb")
+    fake_wandb.init = mock.MagicMock(return_value=fake_run)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+    init_wandb(project="pawn", slug="bold-fox", run_config={}, enabled=True)
+    _, kwargs = fake_wandb.init.call_args  # type: ignore[attr-defined]
+    assert kwargs["group"] == "bold-fox"
+    assert kwargs["name"] == "bold-fox"
+
+
+def test_finish_wandb_forwards_exit_code() -> None:
+    """`finish_wandb` records a non-zero exit code so a crashed / SIGTERM'd
+    run surfaces as failed in the W&B UI (v1 parity)."""
+    fake_run = mock.MagicMock(name="wandb_run")
+    finish_wandb(fake_run, exit_code=1)
+    fake_run.finish.assert_called_once_with(exit_code=1)
+
+
+def test_finish_wandb_default_exit_code_zero() -> None:
+    fake_run = mock.MagicMock(name="wandb_run")
+    finish_wandb(fake_run)
+    fake_run.finish.assert_called_once_with(exit_code=0)
+
+
 def test_wandb_available_returns_bool() -> None:
     assert isinstance(wandb_available(), bool)
 

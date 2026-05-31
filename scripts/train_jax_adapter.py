@@ -839,6 +839,8 @@ def main(argv: list[str] | None = None) -> int:
             project=cfg.wandb_project, slug=logger.slug,
             run_config=cfg.model_dump(),
             git_hash=get_git_info().get("git_hash"),
+            job_type="adapter",
+            run_dir_name=logger.run_dir.name,
         )
 
     push_tracker = HFPushTracker(repo_id=cfg.hf_repo) if cfg.hf_repo else None
@@ -1133,7 +1135,9 @@ def main(argv: list[str] | None = None) -> int:
             actual_final_lr=actual_final_lr,
             reason_for_stop=reason_for_stop,
         )
-        finish_wandb(wandb_run)
+        # Only an in-loop exception is a failed run; completed / sigterm /
+        # resume_no_op are clean exits.
+        finish_wandb(wandb_run, exit_code=1 if reason_for_stop == "exception" else 0)
     if push_tracker:
         # Mirror `scripts/train_jax.py` — only `timeouts > 0` implies a
         # worker is stuck; `errors > 0` is an exit-cleanly upload

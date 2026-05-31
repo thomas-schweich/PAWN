@@ -468,14 +468,91 @@ class MetricsLogger:
         self._write(record)
 
     def log_val(self, step: int, **metrics: Any) -> None:
-        """Write a ``type=val`` record.
+        """Write a ``type=val`` record carrying the v1 ``val/*`` schema.
 
-        Same shape as :meth:`log_train` — the discriminator is what
-        the dashboard splits on.
+        This is the schema enabler the pretrain / adapter validation loops
+        write through. Well-known scalar metrics passed un-namespaced are
+        promoted to their ``val/`` dashboard keys (criterion 15 +
+        ``pawn/dashboard/charts.py``):
+
+        Two source spellings are accepted for every scalar: the bare name
+        (``loss``, ``accuracy``, ``top5``, …) that a from-scratch pretrain
+        validation loop would pass, and the ``val_``-prefixed name
+        (``val_loss``, ``val_top1``, ``val_top5``, …) that the **live**
+        adapter / distill validation loops already pass
+        (``scripts/train_jax_adapter.py`` /
+        ``scripts/train_jax_distill.py`` both call
+        ``log_val(step=…, val_loss=…, val_source=…)``). Without the
+        ``val_``-prefixed sources the promotion would be dead on every
+        production caller — the namespaced ``val/*`` keys the ``pawn``
+        charts read (``pawn/dashboard/charts.py``) would never be written.
+
+        ===============  =====================================
+        kwarg            emitted dashboard key
+        ===============  =====================================
+        ``loss`` / ``val_loss``       ``val/loss`` (+ derived ``val/perplexity``)
+        ``accuracy`` / ``val_top1``   ``val/accuracy``
+        ``top1`` / ``val_top1``       ``val/top1``
+        ``top5`` /                    ``val/top5`` (and ``val/top5_accuracy``
+        ``top5_accuracy`` / ``val_top5``  for the pawn accuracy chart)
+        ``legal_move_rate``       ``val/legal_move_rate``
+        ``late_legal_move_rate``  ``val/late_legal_move_rate``
+        ``game_completion_rate``  ``val/game_completion_rate``
+        ``avg_plies_completed``   ``val/avg_plies_completed``
+        ``opening`` / ``midgame`` / ``endgame``  per-phase ``val/<phase>``
+        ===============  =====================================
+
+        The un-namespaced kwargs are also retained on the record (the v1
+        contract — sweep/lab monitors fall back to the bare names), and any
+        kwarg already carrying a ``val/`` prefix (or any other free-form
+        field, e.g. ``patience``) passes through untouched. ``perplexity``
+        is derived from ``loss`` only when the caller didn't already supply
+        a ``val/perplexity``.
         """
         _reject_reserved_kwargs(metrics)
         record: dict[str, Any] = {}
         record.update(metrics)
+
+        # Promote well-known scalar metrics to their `val/*` dashboard keys.
+        # Source kwarg → list of namespaced keys it feeds. The raw kwarg is
+        # retained for back-compat; the namespaced key is only set when the
+        # caller didn't already provide it explicitly. Both the bare and the
+        # `val_`-prefixed spellings are mapped so the live adapter / distill
+        # callers (which pass `val_loss`) populate `val/loss` too.
+        _PROMOTIONS: dict[str, tuple[str, ...]] = {
+            "loss": ("val/loss",),
+            "val_loss": ("val/loss",),
+            "accuracy": ("val/accuracy",),
+            "top1": ("val/top1",),
+            "val_top1": ("val/top1", "val/accuracy"),
+            "top5": ("val/top5", "val/top5_accuracy"),
+            "top5_accuracy": ("val/top5", "val/top5_accuracy"),
+            "val_top5": ("val/top5", "val/top5_accuracy"),
+            "perplexity": ("val/perplexity",),
+            "legal_move_rate": ("val/legal_move_rate",),
+            "late_legal_move_rate": ("val/late_legal_move_rate",),
+            "game_completion_rate": ("val/game_completion_rate",),
+            "avg_plies_completed": ("val/avg_plies_completed",),
+            "opening": ("val/opening",),
+            "midgame": ("val/midgame",),
+            "endgame": ("val/endgame",),
+        }
+        for src, targets in _PROMOTIONS.items():
+            if src not in metrics:
+                continue
+            for key in targets:
+                record.setdefault(key, metrics[src])
+
+        # Derive perplexity from val/loss when the caller didn't supply it
+        # (matches v1 trainer.py: `exp(min(val/loss, 20))`). Skip non-finite
+        # losses — `_sanitize` would null the derived value anyway.
+        if "val/perplexity" not in record:
+            loss_val = record.get("val/loss")
+            if isinstance(loss_val, (int, float)) and not (
+                math.isnan(loss_val) or math.isinf(loss_val)
+            ):
+                record["val/perplexity"] = math.exp(min(float(loss_val), 20.0))
+
         record["type"] = "val"
         record["step"] = step
         self._add_baseline(record, include_resources=True)

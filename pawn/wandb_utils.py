@@ -65,12 +65,26 @@ def init_wandb(
     run_config: Mapping[str, Any],
     git_hash: str | None = None,
     enabled: bool = True,
+    job_type: str | None = None,
+    group: str | None = None,
+    run_dir_name: str | None = None,
 ) -> Any:
     """Initialise a W&B run for this training session.
 
     Returns the W&B ``run`` object (or ``None`` when disabled). Tags
-    include ``git:<hash>`` for cross-resume grouping; the run name is
-    the slug. Config carries the resolved run config + host metadata.
+    include ``git:<hash>`` for cross-resume grouping; the run name is the
+    slug (or ``run_dir_name`` when supplied, mirroring v1's
+    ``logger.run_dir.name``). Config carries the resolved run config + host
+    metadata.
+
+    Args:
+        job_type: optional W&B job-type label (e.g. ``"pretrain"`` /
+            ``"adapter"``) so a single project can separate run kinds.
+        group: optional run group; defaults to ``slug`` so resumed
+            sibling processes join one group (v1 Option-A resume).
+        run_dir_name: optional explicit run name. Defaults to ``slug``;
+            pass the local run-dir name so the W&B UI and the on-disk run
+            directory cross-reference (v1 parity).
     """
     if not enabled:
         return None
@@ -105,12 +119,15 @@ def init_wandb(
     tags = []
     if git_hash:
         tags.append(f"git:{git_hash[:8]}")
+    if job_type:
+        tags.append(f"job_type:{job_type}")
     return wandb.init(
         project=project,
-        name=slug,
+        name=run_dir_name or slug,
         config=cfg,
         tags=tags,
-        group=slug,
+        group=group or slug,
+        job_type=job_type,
         mode=mode,
     )
 
@@ -126,7 +143,10 @@ def log_metrics(
         run.log(dict(metrics))
 
 
-def finish_wandb(run: Any) -> None:
+def finish_wandb(run: Any, exit_code: int = 0) -> None:
+    """Close a W&B run, recording ``exit_code`` (0 = clean) so a crashed or
+    SIGTERM'd run surfaces as failed in the W&B UI. No-op when ``run`` is
+    ``None``."""
     if run is None:
         return
-    run.finish()
+    run.finish(exit_code=exit_code)

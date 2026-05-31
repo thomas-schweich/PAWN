@@ -46,6 +46,7 @@ from pawn.trainer import (
     make_train_step,
     slice_batch,
     supernet_joint_loss,
+    top1_accuracy,
 )
 
 
@@ -194,6 +195,52 @@ def test_cross_entropy_loss_reserved_rows_get_zero_grad() -> None:
     # Sanity: at least some non-reserved rows DO get gradient, so the test
     # isn't trivially passing on an all-zero grad tree.
     assert np.any(g_embed[:_FIRST_RESERVED_COLUMN] != 0.0)
+
+
+def test_top1_accuracy_returns_finite_rate() -> None:
+    """`top1_accuracy` (the v2 pretrain `train/accuracy` source) is a finite
+    scalar in [0, 1]."""
+    model = _tiny_model()
+    batch = _small_batch()
+    acc = top1_accuracy(model, batch)
+    assert acc.shape == ()
+    assert jnp.isfinite(acc)
+    assert 0.0 <= float(acc) <= 1.0
+
+
+def test_top1_accuracy_perfect_when_argmax_matches_targets() -> None:
+    """A batch whose targets equal the model's restricted argmax scores a
+    perfect 1.0 — the formula is `mean(argmax == target | supervised)`,
+    matching v1 (`git show main:pawn/trainer.py:1030`)."""
+    model = _tiny_model()
+    batch = _small_batch()
+    # Forward + restricted argmax give the predictions the metric scores
+    # itself against; using them AS the targets must yield exactly 1.0.
+    from pawn.trainer import mask_reserved_columns
+
+    logits = model(batch.tokens, batch.attn_mask)
+    preds = jnp.argmax(mask_reserved_columns(logits.astype(jnp.float32)), axis=-1)
+    aligned = Batch(
+        tokens=batch.tokens,
+        targets=preds.astype(batch.targets.dtype),
+        attn_mask=batch.attn_mask,
+        loss_mask=batch.loss_mask,
+    )
+    acc = top1_accuracy(model, aligned)
+    assert float(acc) == pytest.approx(1.0)
+
+
+def test_top1_accuracy_zero_on_fully_padded_batch() -> None:
+    """All-False loss_mask → 0 correct / 1 (clip) denom → exactly 0.0."""
+    model = _tiny_model()
+    batch = _small_batch()
+    empty = Batch(
+        tokens=batch.tokens,
+        targets=batch.targets,
+        attn_mask=batch.attn_mask,
+        loss_mask=jnp.zeros_like(batch.loss_mask),
+    )
+    assert float(top1_accuracy(model, empty)) == 0.0
 
 
 def test_supernet_joint_loss_sums_variants() -> None:

@@ -54,6 +54,7 @@ __all__ = [
     "TrainState",
     "VariantSpec",
     "cross_entropy_loss",
+    "top1_accuracy",
     "supernet_joint_loss",
     "make_lr_schedule",
     "make_optimizer",
@@ -319,6 +320,45 @@ def cross_entropy_loss(
         )  # (B, T), zero at PAD positions thanks to ``where=``
         n_real = jnp.maximum(batch.loss_mask.sum(), 1)
         return per_pos_loss.sum() / n_real
+
+
+def top1_accuracy(
+    model: "PAWNModel | EffectiveCallable",
+    batch: Batch,
+    *,
+    compute_dtype: jnp.dtype | None = None,
+    use_sdpa: bool = False,
+    use_flash: bool = False,
+) -> Float[Array, ""]:
+    """Mean next-token top-1 accuracy on a single variant + batch.
+
+    The v2 parity of v1's pretrain ``train/accuracy`` metric
+    (``git show main:pawn/trainer.py:1030`` —
+    ``(valid_logits.argmax(-1) == valid_targets).float().mean()``):
+    the fraction of supervised positions whose argmax prediction matches
+    the target token. PAD positions (``loss_mask`` False) are excluded
+    from both numerator and denominator.
+
+    The argmax is taken over the move-token support only — reserved /
+    NULL / control columns are masked to ``-inf`` exactly as the loss
+    softmax does (:func:`mask_reserved_columns`), so a reserved column
+    can never win the argmax and inflate the "wrong" count. This mirrors
+    the eval-time restriction to ``[0, NUM_ACTIONS)`` documented in the
+    project eval contract.
+
+    Returns a 0-d fp32 JAX array. A fully-padded batch returns 0 / 1 = 0.
+    """
+    with jax.named_scope("forward_accuracy"):
+        logits = model(
+            batch.tokens, batch.attn_mask,
+            compute_dtype=compute_dtype, use_sdpa=use_sdpa, use_flash=use_flash,
+        )
+    masked_logits = mask_reserved_columns(logits.astype(jnp.float32))
+    preds = jnp.argmax(masked_logits, axis=-1)  # (B, T)
+    mask = batch.loss_mask.astype(jnp.bool_)
+    correct = jnp.where(mask, preds == batch.targets, False)
+    n_real = jnp.maximum(mask.sum(), 1)
+    return correct.sum().astype(jnp.float32) / n_real.astype(jnp.float32)
 
 
 def supernet_joint_loss(
@@ -1000,6 +1040,7 @@ def make_scan_step(
     ],
     *,
     emit_grad_norms: bool = False,
+    accuracy_fn: Callable[[PAWNModel, Batch], Float[Array, ""]] | None = None,
 ) -> Callable[..., tuple]:
     """Wrap a single train step into a K-step :func:`jax.lax.scan`.
 
@@ -1010,10 +1051,69 @@ def make_scan_step(
     pre-clip grad norms drawn from the optimizer's ``_ClipState`` —
     used by C.5's clip-trigger measurement.
 
+    With ``accuracy_fn`` supplied the return also includes a trailing
+    ``(K,)`` array of per-step top-1 accuracies — the v2 parity of v1's
+    pretrain ``train/accuracy`` metric. The function is evaluated on the
+    **pre-step** model in the carry (the same weights that produced that
+    step's loss), so the loss and accuracy describe the same forward. It
+    runs inside the scan body, so the per-chunk D→H sync count is
+    unchanged (one stacked array more per chunk, no extra host round
+    trips). The output tuple ordering is
+    ``(state, losses[, g_norms], accuracy)`` — grad norms, when present,
+    precede accuracy.
+
     The body never returns to the host — that's the v2 amortisation.
     Per-chunk metrics flush between calls (the trainer loop drives the
     K-step boundaries from Python).
     """
+
+    if emit_grad_norms and accuracy_fn is not None:
+        acc_fn = accuracy_fn
+
+        @eqx.filter_jit(donate="all")
+        def scan_step_norms_acc(
+            state: TrainState, batches: Batch
+        ) -> tuple[
+            TrainState, Float[Array, "K"], Float[Array, "K"], Float[Array, "K"]
+        ]:
+            def body(
+                carry: TrainState, batch: Batch
+            ) -> tuple[
+                TrainState,
+                tuple[Float[Array, ""], Float[Array, ""], Float[Array, ""]],
+            ]:
+                acc = acc_fn(carry.model, batch)
+                new_carry, loss = train_step(carry, batch)
+                g_norm = get_grad_norm(new_carry.opt_state)
+                return new_carry, (loss, g_norm, acc)
+
+            final_state, (losses, g_norms, accs) = jax.lax.scan(
+                body, state, batches
+            )
+            return final_state, losses, g_norms, accs
+
+        return scan_step_norms_acc
+
+    if accuracy_fn is not None:
+        acc_fn = accuracy_fn
+
+        @eqx.filter_jit(donate="all")
+        def scan_step_acc(
+            state: TrainState, batches: Batch
+        ) -> tuple[TrainState, Float[Array, "K"], Float[Array, "K"]]:
+            def body(
+                carry: TrainState, batch: Batch
+            ) -> tuple[
+                TrainState, tuple[Float[Array, ""], Float[Array, ""]]
+            ]:
+                acc = acc_fn(carry.model, batch)
+                new_carry, loss = train_step(carry, batch)
+                return new_carry, (loss, acc)
+
+            final_state, (losses, accs) = jax.lax.scan(body, state, batches)
+            return final_state, losses, accs
+
+        return scan_step_acc
 
     if emit_grad_norms:
         @eqx.filter_jit(donate="all")

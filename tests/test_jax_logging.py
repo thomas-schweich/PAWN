@@ -17,6 +17,7 @@ Coverage per plan §10 S4 verification list:
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -135,6 +136,118 @@ def test_log_val_writes_type_val_record(tmp_path: Path) -> None:
     records = _read_records(logger.path)
     assert records[0]["type"] == "val"
     assert records[0]["loss"] == 2.7
+
+
+def test_log_val_emits_namespaced_schema(tmp_path: Path) -> None:
+    """`log_val` is the v1 `val/*` schema enabler (criterion 15): plain
+    scalar kwargs are promoted to the namespaced dashboard keys the chart
+    grid consumes (`pawn/dashboard/charts.py`), and `val/perplexity` is
+    derived from `val/loss`. The bare kwargs are retained for the
+    sweep/lab monitors that fall back to un-namespaced names."""
+    with MetricsLogger(tmp_path, slug="s", device="cpu") as logger:
+        logger.log_val(
+            step=100,
+            loss=2.0,
+            accuracy=0.30,
+            top1=0.30,
+            top5=0.55,
+            legal_move_rate=0.98,
+            late_legal_move_rate=0.95,
+            game_completion_rate=0.80,
+            avg_plies_completed=42.0,
+            opening=0.40,
+            midgame=0.28,
+            endgame=0.22,
+        )
+    rec = _read_records(logger.path)[0]
+    assert rec["type"] == "val"
+    # Namespaced dashboard keys.
+    assert rec["val/loss"] == 2.0
+    assert rec["val/accuracy"] == 0.30
+    assert rec["val/top1"] == 0.30
+    assert rec["val/top5"] == 0.55
+    assert rec["val/top5_accuracy"] == 0.55  # pawn accuracy chart key
+    assert rec["val/legal_move_rate"] == 0.98
+    assert rec["val/late_legal_move_rate"] == 0.95
+    assert rec["val/game_completion_rate"] == 0.80
+    assert rec["val/avg_plies_completed"] == 42.0
+    assert rec["val/opening"] == 0.40
+    assert rec["val/midgame"] == 0.28
+    assert rec["val/endgame"] == 0.22
+    # Derived perplexity = exp(val/loss).
+    assert rec["val/perplexity"] == pytest.approx(math.exp(2.0))
+    # Bare back-compat names survive.
+    assert rec["loss"] == 2.0
+    assert rec["accuracy"] == 0.30
+
+
+def test_log_val_live_caller_spelling_populates_namespaced_keys(
+    tmp_path: Path,
+) -> None:
+    """The live adapter / distill validation loops call
+    ``log_val(step=…, val_loss=…, val_source=…)`` (see
+    ``scripts/train_jax_adapter.py`` and ``scripts/train_jax_distill.py``).
+
+    This pins that the `val_`-prefixed spelling — the ONLY spelling any
+    production caller passes — still populates the namespaced `val/*`
+    dashboard keys (and the derived `val/perplexity`). Without the
+    `val_loss` promotion source the namespaced keys would never be written
+    on any live path, leaving the `pawn` charts blank for every real run.
+    """
+    with MetricsLogger(tmp_path, slug="s", device="cpu") as logger:
+        logger.log_val(step=200, val_loss=1.5, val_source="validation")
+    rec = _read_records(logger.path)[0]
+    assert rec["type"] == "val"
+    assert rec["val/loss"] == 1.5
+    assert rec["val/perplexity"] == pytest.approx(math.exp(1.5))
+    # The bare caller kwargs are retained for the adapter chart specs
+    # (charts.py reads `val_loss` for `_ADAPTER_TYPES`) and the run-source.
+    assert rec["val_loss"] == 1.5
+    assert rec["val_source"] == "validation"
+
+
+def test_log_val_live_caller_top1_top5_populate_accuracy_keys(
+    tmp_path: Path,
+) -> None:
+    """A val loop that also reports `val_top1` / `val_top5` populates the
+    `val/accuracy` + `val/top5_accuracy` keys the `pawn` accuracy chart
+    reads — the `val_top1` source feeds `val/accuracy` and `val/top1`."""
+    with MetricsLogger(tmp_path, slug="s", device="cpu") as logger:
+        logger.log_val(step=10, val_loss=2.0, val_top1=0.33, val_top5=0.61)
+    rec = _read_records(logger.path)[0]
+    assert rec["val/accuracy"] == 0.33
+    assert rec["val/top1"] == 0.33
+    assert rec["val/top5"] == 0.61
+    assert rec["val/top5_accuracy"] == 0.61
+
+
+def test_log_val_respects_explicit_namespaced_keys(tmp_path: Path) -> None:
+    """A caller that already passes `val/...` keys (or a `val/perplexity`)
+    isn't clobbered by the promotion / derivation logic."""
+    with MetricsLogger(tmp_path, slug="s", device="cpu") as logger:
+        # log_val can't take `val/loss=` as a kwarg (slash isn't a valid
+        # identifier), so callers pass already-namespaced metrics via **{}.
+        logger.log_val(step=5, **{
+            "val/loss": 3.0,
+            "val/perplexity": 7.0,  # explicit — must NOT be re-derived
+            "patience": 4,
+        })
+    rec = _read_records(logger.path)[0]
+    assert rec["val/loss"] == 3.0
+    assert rec["val/perplexity"] == 7.0  # not exp(3.0)
+    assert rec["patience"] == 4
+
+
+def test_log_val_skips_perplexity_on_nonfinite_loss(tmp_path: Path) -> None:
+    """A NaN/Inf loss can't yield a finite perplexity — the derived key is
+    simply not added (rather than producing `exp(nan)` → null clutter)."""
+    with MetricsLogger(tmp_path, slug="s", device="cpu") as logger:
+        logger.log_val(step=1, loss=float("nan"))
+    rec = _read_records(logger.path)[0]
+    assert "val/perplexity" not in rec
+    # The NaN loss itself is sanitised to null on both the bare + namespaced key.
+    assert rec["loss"] is None
+    assert rec["val/loss"] is None
 
 
 def test_all_records_carry_baseline_fields(tmp_path: Path) -> None:
@@ -737,6 +850,60 @@ def test_pretrain_writes_schedule_health_on_normal_exit(
     assert health["actual_total_steps"] == 4
     assert health["schedule"] == "cosine"
     assert health["should_reach_zero"] is True
+
+
+def test_pretrain_emits_train_loss_dashboard_key(tmp_path: Path) -> None:
+    """The pretrainer must emit `train/loss` AND `train/accuracy` — the
+    keys the dashboard's `pawn` run_type keys its loss + accuracy charts
+    and KPI tiles on (`pawn/dashboard/charts.py:344,373`,
+    `sol.py:552-563`). It previously emitted only the bare `loss` and no
+    accuracy at all, leaving the loss chart empty and the accuracy panel
+    blank. The bare `loss` / `accuracy` aliases are retained for the
+    sweep/lab monitors that fall back to them. `train/accuracy` is the
+    supernet (largest variant) top-1 — v1 parity
+    (`git show main:pawn/trainer.py:1145`)."""
+    _gpu_only()
+    import importlib.util
+
+    from pawn.dashboard.metrics import detect_run_type, load_run_buckets
+
+    spec = importlib.util.spec_from_file_location(
+        "scripts_train_jax_trainloss", Path("scripts/train_jax.py")
+    )
+    assert spec is not None and spec.loader is not None
+    train_jax = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train_jax)
+
+    logs_dir = tmp_path / "logs"
+    rc = train_jax.main([
+        "--supernet", "tiny", "--total-steps", "4", "--batch-size", "2",
+        "--seq-len", "32", "--k", "2", "--no-bucketing",
+        "--local-checkpoints", "--logs-dir", str(logs_dir),
+        "--log-interval", "1",
+    ])
+    assert rc == 0
+    run_dir = _only_run_dir(logs_dir)
+    buckets = load_run_buckets(logs_dir, run_dir.name)
+
+    # Dashboard routes this run as the `pawn` (pretrain) type.
+    assert buckets["config"]
+    assert detect_run_type(buckets["config"][-1]) == "pawn"
+
+    train = buckets["train"]
+    assert train, "no train records written"
+    # Every logged train record carries both the namespaced keys and the
+    # back-compat aliases, with identical values. `train/accuracy` is a
+    # finite rate in [0, 1] (it can legitimately be 0 on a 4-step tiny run).
+    for rec in train:
+        assert "train/loss" in rec, f"train record missing train/loss: {rec.keys()}"
+        assert rec["train/loss"] == rec["loss"]
+        assert "train/accuracy" in rec, (
+            f"train record missing train/accuracy: {rec.keys()}"
+        )
+        assert rec["train/accuracy"] == rec["accuracy"]
+        acc = rec["train/accuracy"]
+        assert isinstance(acc, (int, float))
+        assert 0.0 <= acc <= 1.0
 
 
 def test_pretrain_schedule_health_clamps_overshoot_on_completed(
