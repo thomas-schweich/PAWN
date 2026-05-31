@@ -98,3 +98,7 @@ bench/results/**/*.safetensors
 
 # LR-sweep throwaway artifacts (metrics + per-trial final checkpoints)
 logs/lr_sweep/
+
+# workflow scratch artifacts
+.wf_*.mjs
+.wf_audit_structured.json
