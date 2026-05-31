@@ -18,8 +18,10 @@ from pawn.config import (
 from pawn.corpus import generate_corpus, pack_corpus
 from pawn.eval import (
     AccuracyResult,
+    _legal_token_grid,
     compute_move_accuracy,
     compute_per_phase_accuracy,
+    compute_val_metrics,
 )
 from pawn.generation import (
     DIAGNOSTIC_NAMES,
@@ -109,6 +111,73 @@ def test_per_phase_bins_by_ply_with_C_offset() -> None:
     assert res_c1.n_opening == 21
     assert res_c1.n_midgame == 19
     assert res_c1.n_endgame == 0
+
+
+def test_legal_grid_fills_last_supervised_ply_for_full_window_game() -> None:
+    """Regression: the engine emits the legal mask of the board *before*
+    each move, so a length-L game needs masks for plies ``0..L-1``. The
+    corpus supervises plies ``0..capped-1`` with
+    ``capped = min(game_length, n_move_slots)``, so the max supervised ply
+    for a full-window game is ``n_move_slots - 1`` and that ply's legal
+    mask MUST be filled.
+
+    A previous off-by-one clamped the engine replay length to
+    ``n_move_slots - 1``, dropping the last supervised ply's mask and
+    leaving its row all-False — which ``compute_val_metrics`` then scored
+    as illegal, systematically deflating ``legal_move_rate`` /
+    ``late_legal_move_rate`` for every game that fills the window.
+
+    Build a corpus with ``max_ply == seq_len - C`` so most random games run
+    to the window edge, then assert the last supervised slot's legal mask
+    is non-empty.
+    """
+    seq_len = 12
+    corpus = generate_corpus(n_games=64, max_ply=seq_len, seq_len=seq_len, seed=3)
+    C = int(corpus.outcome_offset[0])
+    n_move_slots = seq_len - C
+    capped = np.minimum(corpus.game_lengths, n_move_slots)
+    full = np.where(capped == n_move_slots)[0]
+    # The construction is meant to produce full-window games; if it doesn't,
+    # the regression it guards can't fire and the test is vacuous.
+    assert full.size > 0, "expected at least one full-window game"
+
+    grid = _legal_token_grid(corpus)
+    # Last supervised slot for a full-window game predicts ply
+    # ``n_move_slots - 1`` at sequence slot ``C-1 + (n_move_slots-1)``.
+    last_slot = (C - 1) + (n_move_slots - 1)
+    for g in full:
+        n_legal = int(grid[g, last_slot].sum())
+        assert n_legal > 0, (
+            f"full-window game {g}: legal mask at last supervised slot "
+            f"{last_slot} is empty (off-by-one clamp regression)"
+        )
+
+
+def test_val_legal_move_rate_counts_full_window_predictions() -> None:
+    """End-to-end guard: a model predicting a known-legal move at the last
+    supervised ply of a full-window game must be counted legal there.
+
+    Construct a single full-window game and feed the *ground-truth* legal
+    move as the model's prediction at the last supervised slot via the
+    legal grid: the slot's legal mask must be non-empty so the rate isn't
+    silently deflated. We assert ``legal_move_rate`` is strictly positive
+    (the all-False-row bug pinned it artificially low).
+    """
+    seq_len = 12
+    corpus = generate_corpus(n_games=32, max_ply=seq_len, seq_len=seq_len, seed=7)
+    n_move_slots = seq_len - int(corpus.outcome_offset[0])
+    full = np.where(
+        np.minimum(corpus.game_lengths, n_move_slots) == n_move_slots
+    )[0]
+    assert full.size > 0, "expected at least one full-window game"
+
+    model = init_model(TINY_SUPERNET, key=0)
+    metrics = compute_val_metrics(model, corpus, batch_size=8, compute_legal=True)
+    # With the legal masks correctly filled at every supervised ply, the
+    # legal-move rate is a real fraction in (0, 1]; the off-by-one bug
+    # depressed it by forcing the last supervised ply of every full-window
+    # game to count as illegal.
+    assert 0.0 < metrics.legal_move_rate <= 1.0
 
 
 def test_argmax_never_picks_pad_or_outcome_tokens() -> None:

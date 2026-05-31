@@ -783,6 +783,174 @@ def test_train_jax_accumulation_steps_runs(tmp_path) -> None:  # type: ignore[no
 
 
 # ---------------------------------------------------------------------------
+# Held-out validation loop + patience early-stop + pause (v1 parity). These
+# drive the real `train_jax.py` loop end-to-end and read metrics.jsonl back.
+# ---------------------------------------------------------------------------
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    import json as _json
+
+    return [
+        _json.loads(line)
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def test_train_jax_validation_loop_emits_val_records(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`--val-every N` runs the held-out validation pass and writes
+    `type=val` records carrying the v1 `val/*` schema (val/loss, val/top1,
+    val/top5, val/perplexity, val/legal_move_rate, per-phase). Regression
+    guard for the major audit gap: the v2 pretrain loop previously emitted
+    NO val records at all."""
+    import subprocess
+
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax.py",
+            "--supernet", "tiny", "--total-steps", "6",
+            "--batch-size", "4", "--seq-len", "32", "--k", "2",
+            "--val-every", "2", "--val-games", "8",
+            "--checkpoint-interval", "6",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True, text=True, timeout=600, env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"pretrain with --val-every failed:\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    metrics = sorted(logs_dir.glob("*/metrics.jsonl"))
+    assert metrics, f"no metrics.jsonl under {logs_dir}"
+    records = _read_jsonl(metrics[-1])
+    val_records = [r for r in records if r.get("type") == "val"]
+    assert val_records, (
+        "no type=val records emitted despite --val-every 2 — the held-out "
+        f"validation loop did not run. stdout={result.stdout}"
+    )
+    # The v1 val/* schema keys must be present on a val record.
+    vr = val_records[0]
+    for key in (
+        "val/loss", "val/top1", "val/top5", "val/perplexity",
+        "val/legal_move_rate",
+    ):
+        assert key in vr, f"val record missing {key}: {sorted(vr)}"
+    # Sanity on value ranges.
+    assert 0.0 <= vr["val/top1"] <= 1.0
+    assert vr["val/top5"] >= vr["val/top1"]
+    assert 0.0 <= vr["val/legal_move_rate"] <= 1.0
+
+
+def test_train_jax_grad_norm_logged_by_default(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Per-step `grad_norm` is logged on every train record WITHOUT
+    `--emit-grad-norms` (v1 parity — v1 always logged grad_norm). The v2
+    `--emit-grad-norms` gate that suppressed it by default diverged from
+    that contract."""
+    import subprocess
+
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax.py",
+            "--supernet", "tiny", "--total-steps", "4",
+            "--batch-size", "4", "--seq-len", "32", "--k", "2",
+            "--log-interval", "1",
+            "--checkpoint-interval", "4",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+            # NB: NO --emit-grad-norms — grad_norm must still be present.
+        ],
+        capture_output=True, text=True, timeout=600, env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"pretrain failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+    records = _read_jsonl(sorted(logs_dir.glob("*/metrics.jsonl"))[-1])
+    train_records = [r for r in records if r.get("type") == "train"]
+    assert train_records, "no train records"
+    assert all("grad_norm" in r for r in train_records), (
+        "grad_norm missing from a train record despite v1-parity default "
+        f"logging: {[sorted(r) for r in train_records]}"
+    )
+
+
+def test_train_jax_patience_early_stops(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`--patience N` early-stops when the held-out val loss + late-game
+    legality stop improving for N consecutive evals, and records
+    `reason_for_stop=patience` in schedule_health.json. A very low LR keeps
+    the model from improving so patience fires well before total_steps."""
+    import json as _json
+    import subprocess
+
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax.py",
+            "--supernet", "tiny", "--total-steps", "1000",
+            "--batch-size", "4", "--seq-len", "32", "--k", "2",
+            "--val-every", "2", "--val-games", "8", "--patience", "1",
+            "--checkpoint-interval", "2",
+            # LR ~0 so val loss never improves after the first eval → the
+            # patience counter trips on the second eval.
+            "--local-checkpoints", "--lr", "1e-12",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True, text=True, timeout=600, env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"patience run failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+    health = sorted(logs_dir.glob("*/schedule_health.json"))
+    assert health, f"no schedule_health.json under {logs_dir}"
+    h = _json.loads(health[-1].read_text())
+    assert h["reason_for_stop"] == "patience", (
+        f"expected reason_for_stop=patience, got {h['reason_for_stop']}; "
+        f"stdout={result.stdout}"
+    )
+    # Early stop: stopped well before the 1000-step budget.
+    assert h["actual_total_steps"] < 1000
+
+
+def test_train_jax_pause_after_steps_checkpoints_and_stops(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`--pause-after-steps N` checkpoints at the N-step boundary and stops
+    with `reason_for_stop=paused` (v1 pause primitive). The run does NOT
+    reach total_steps."""
+    import json as _json
+    import subprocess
+
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax.py",
+            "--supernet", "tiny", "--total-steps", "1000",
+            "--batch-size", "4", "--seq-len", "32", "--k", "2",
+            "--pause-after-steps", "4",
+            "--checkpoint-interval", "1000",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True, text=True, timeout=600, env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"pause run failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+    health = sorted(logs_dir.glob("*/schedule_health.json"))
+    assert health, f"no schedule_health.json under {logs_dir}"
+    h = _json.loads(health[-1].read_text())
+    assert h["reason_for_stop"] == "paused", (
+        f"expected reason_for_stop=paused, got {h['reason_for_stop']}"
+    )
+    assert h["actual_total_steps"] < 1000
+    # A checkpoint was written at the pause boundary so the run is resumable.
+    assert sorted(logs_dir.glob("*/step_*")), (
+        "pause did not write a resumable checkpoint"
+    )
+
+
+# ---------------------------------------------------------------------------
 # v1 CLI-compat flags reachable only via --config JSON in v2 (config-cli
 # parity workstream). Each routes through the real _parse_args ->
 # _build_config path so the argparse wiring + pydantic migration both run.
@@ -930,43 +1098,89 @@ def test_train_jax_mate_boost_cli_flag_is_honoured_end_to_end(
 @pytest.mark.parametrize(
     "flag,value",
     [
-        ("--patience", "5"),
+        # Still NOT exposed — Lichess-path / unconsumed fields with no
+        # consumer in the random-game pretrain path. `--eval-interval` is the
+        # v1 spelling of the validation cadence; v2 exposes `--val-every`
+        # (parity with the adapter cadence knob) and maps `eval_interval`
+        # → `val_every` only via `--config` JSON, so the bare flag is unknown.
         ("--eval-interval", "200"),
-        ("--pause-after-steps", "999"),
-        ("--val-games", "128"),
-        # Lichess-path / unconsumed fields — see the second group of asserts
-        # in the no-op test below for why these are not honoured by pretrain.
         ("--min-ply", "20"),
         ("--max-corpus-gb", "4.0"),
         ("--cache-dir", "/tmp/pawn-cache"),
     ],
 )
-def test_train_jax_inert_v1_pretrain_knobs_not_exposed_as_cli_flags(
+def test_train_jax_lichess_only_pretrain_knobs_not_exposed_as_cli_flags(
     flag: str, value: str
 ) -> None:
-    """The v2 pretrain loop has NO held-out validation pass, NO
-    early-stop/patience break, and NO pause primitive (the pretrain loop in
-    scripts/train_jax.py consumes only `log_interval` + `checkpoint_interval`;
-    docs/V2_PARITY_AUDIT.md §2 lists the missing validation/patience loop as
-    an open major gap, §3 DEFERRALS records the CLI deferral). Additionally,
-    `min_ply` / `cache_dir` are Lichess-path fields (v1 fed them to
+    """`min_ply` / `cache_dir` are Lichess-path fields (v1 fed them to
     `prepare_lichess_cached`, NOT the random-game pretrain corpus), and
     `max_corpus_gb` is a v2-only soft memory cap with no consumer in either
-    path. So none of these knobs must be promoted to argparse flags —
+    path. `--eval-interval` is the v1 cadence spelling that v2 superseded with
+    `--val-every`. So none of these must be promoted to argparse flags —
     re-advertising them would let a user pass `--min-ply 20` and get a silent
-    no-op. argparse rejects the unknown flag (`SystemExit` from `error()`)."""
+    no-op. argparse rejects the unknown flag (`SystemExit` from `error()`).
+
+    NOTE: `--patience`, `--pause-after-steps`, `--val-games`, and `--val-every`
+    ARE now exposed and honoured by the held-out validation loop (see
+    `test_train_jax_validation_and_earlystop_flags_exposed` /
+    `test_train_jax_validation_loop_emits_val_records`)."""
     with pytest.raises(SystemExit):
         _train_jax_cfg([flag, value])
 
 
-def test_train_jax_inert_v1_pretrain_knobs_still_settable_via_config_json(
+def test_train_jax_validation_and_earlystop_flags_exposed() -> None:
+    """`--val-every`, `--val-games`, `--patience`, `--pause-after-steps` are
+    now first-class pretrain flags (the held-out validation loop + early-stop
+    + pause primitive landed), so the CLI path must accept them and land them
+    on the config. This is the inverse of the old deferral: they were
+    previously --config-JSON-only and the loop ignored them."""
+    cfg = _train_jax_cfg([
+        "--val-every", "50",
+        "--val-games", "128",
+        "--patience", "3",
+        "--pause-after-steps", "200",
+    ])
+    assert cfg.val_every == 50
+    assert cfg.val_games == 128
+    assert cfg.patience == 3
+    assert cfg.pause_after_steps == 200
+
+
+def test_train_jax_eval_interval_maps_to_val_every_via_config_json(
     tmp_path: Path,
 ) -> None:
-    """Although NOT exposed as direct CLI flags, the inert pretrain knobs
-    remain valid `PretrainConfig` fields settable through `--config` JSON, so
-    a verbatim v1 run config still loads (the fields are simply not honoured
-    by the v2 loop yet — see the parity audit DEFERRALS entry). This pins
-    that the deferral is CLI-surface-only, not a config-schema regression."""
+    """A verbatim v1 pretrain config spelling the validation cadence
+    `eval_interval` must still drive the held-out eval — the PretrainConfig
+    before-validator maps `eval_interval` → `val_every` when the latter is
+    unset."""
+    tj = _load_train_jax()
+    config_path = tmp_path / "pretrain.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "run_type": "pretrain",
+                "supernet": "tiny",
+                "total_steps": 1,
+                "local_checkpoints": True,
+                "eval_interval": 200,
+            }
+        )
+    )
+    args = tj._parse_args(["--config", str(config_path)])
+    cfg = tj._build_config(args)
+    assert cfg.eval_interval == 200
+    assert cfg.val_every == 200  # mapped from eval_interval
+
+
+def test_train_jax_v1_pretrain_knobs_load_via_config_json(
+    tmp_path: Path,
+) -> None:
+    """A verbatim v1 pretrain run config carrying the validation /
+    early-stop / pause knobs loads cleanly through `--config` JSON and the
+    fields land on the config. These are now HONOURED by the held-out
+    validation loop (no longer the CLI-only deferral); this pins the
+    config-schema surface stays stable for v1 configs. `eval_interval`
+    drives `val_every` (the v1 cadence spelling), which `patience` requires."""
     tj = _load_train_jax()
     config_path = tmp_path / "pretrain.json"
     config_path.write_text(
@@ -987,6 +1201,7 @@ def test_train_jax_inert_v1_pretrain_knobs_still_settable_via_config_json(
     cfg: PretrainConfig = tj._build_config(args)
     assert cfg.patience == 5
     assert cfg.eval_interval == 200
+    assert cfg.val_every == 200  # mapped from eval_interval
     assert cfg.pause_after_steps == 999
     assert cfg.val_games == 128
 

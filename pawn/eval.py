@@ -4,13 +4,23 @@ Argmax is restricted to ``[0, NUM_ACTIONS)`` so PAD and outcome tokens
 can't be sampled (the v1 contract per plan §10 S8). Per-phase
 breakdown bins moves by game phase (opening / midgame / endgame) on a
 ply threshold.
+
+:func:`compute_val_metrics` is the held-out validation pass the
+supernet pretrain loop runs on a freshly-generated val corpus — the v2
+parity of v1's ``CLMTrainer.evaluate`` (``git show
+main:pawn/trainer.py``). It returns the ``val/*`` schema the dashboard
+``pawn`` run type charts (``val/loss``, ``val/top1``, ``val/top5``,
+``val/perplexity``, ``val/legal_move_rate``, ``val/late_legal_move_rate``)
+plus the per-phase breakdown, all computed with one device→host sync.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Bool, Float, Int
@@ -22,8 +32,10 @@ from pawn.model import PAWNModel
 __all__ = [
     "PhaseBoundaries",
     "AccuracyResult",
+    "ValMetrics",
     "compute_move_accuracy",
     "compute_per_phase_accuracy",
+    "compute_val_metrics",
 ]
 
 
@@ -226,4 +238,283 @@ def compute_per_phase_accuracy(
         n_opening=o_sup,
         n_midgame=m_sup,
         n_endgame=e_sup,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Held-out validation pass (pretrain val loop) — v1 CLMTrainer.evaluate parity
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ValMetrics:
+    """Held-out validation metrics for one pass over a val corpus.
+
+    Mirrors the scalar subset v1's ``CLMTrainer.evaluate`` returned
+    (``val/loss`` / ``val/accuracy`` (top-1) / ``val/top5_accuracy`` /
+    ``val/perplexity`` / ``val/legal_move_rate`` /
+    ``val/late_legal_move_rate``) plus the per-phase breakdown. The
+    ``best_*`` patience signal in the pretrain loop keys on ``val_loss``
+    (lower is better) and ``late_legal_move_rate`` (higher is better).
+    """
+
+    val_loss: float
+    top1: float
+    top5: float
+    perplexity: float
+    legal_move_rate: float
+    late_legal_move_rate: float
+    phases: AccuracyResult
+
+    def as_log_kwargs(self) -> dict[str, float]:
+        """Flatten to the bare-name kwargs :meth:`MetricsLogger.log_val`
+        promotes to the ``val/*`` dashboard keys.
+
+        The logger maps ``loss`` → ``val/loss`` (+ derived
+        ``val/perplexity``), ``top1`` → ``val/top1``, ``top5`` →
+        ``val/top5`` (+ ``val/top5_accuracy``), ``accuracy`` →
+        ``val/accuracy``, ``legal_move_rate`` /
+        ``late_legal_move_rate`` / per-phase ``opening`` / ``midgame`` /
+        ``endgame`` to their namespaced keys. Passing ``accuracy=top1``
+        keeps the v1 ``val/accuracy`` chart fed (v1 reported top-1 as
+        ``val/accuracy``).
+        """
+        return {
+            "loss": self.val_loss,
+            "accuracy": self.top1,
+            "top1": self.top1,
+            "top5": self.top5,
+            "perplexity": self.perplexity,
+            "legal_move_rate": self.legal_move_rate,
+            "late_legal_move_rate": self.late_legal_move_rate,
+            "opening": self.phases.opening,
+            "midgame": self.phases.midgame,
+            "endgame": self.phases.endgame,
+        }
+
+
+@eqx.filter_jit
+def _batch_val_counts(
+    model: PAWNModel,
+    tokens: Int[Array, "B T"],
+    targets: Int[Array, "B T"],
+    attn_mask: Bool[Array, "B T"],
+    loss_mask: Bool[Array, "B T"],
+    legal_mask: Bool[Array, "B T A"],
+    late_mask: Bool[Array, "B T"],
+) -> tuple[
+    Float[Array, ""], Int[Array, ""], Int[Array, ""],
+    Int[Array, ""], Int[Array, ""], Int[Array, ""],
+]:
+    """JIT'd inner for the validation pass.
+
+    Returns ``(loss_sum, n_supervised, n_top1_correct, n_top5_correct,
+    n_legal, n_late_legal)`` as device scalars so the Python loop
+    accumulates on-device and syncs one small tuple per chunk.
+
+    ``loss_sum`` is the **sum** of per-supervised-position cross-entropy
+    (not the mean) so the host can divide by the global supervised count
+    after the loop — a per-chunk mean would mis-weight ragged final
+    chunks. ``legal_mask`` is the ``(B, T, A)`` per-position legal
+    move-token set (True where a token is legal at that position);
+    ``n_legal`` counts supervised positions whose argmax prediction is
+    legal, ``n_late_legal`` restricts that to the late-game positions
+    flagged by ``late_mask``.
+    """
+    logits = model(tokens, attn_mask)
+    move_logits = logits[..., :NUM_ACTIONS].astype(jnp.float32)
+    # Sum CE over supervised positions (mean is taken on the host).
+    per_pos = jax.nn.log_softmax(move_logits, axis=-1)
+    tgt = jnp.clip(targets, 0, NUM_ACTIONS - 1)
+    gathered = jnp.take_along_axis(per_pos, tgt[..., None], axis=-1)[..., 0]
+    loss_sum = jnp.where(loss_mask, -gathered, 0.0).sum()
+
+    pred = jnp.argmax(move_logits, axis=-1)  # (B, T)
+    top1_correct = (pred == targets) & loss_mask
+    # Top-5 via the target's rank, NOT ``jax.lax.top_k``: the fused top-k
+    # kernel requests more shared memory than RDNA3 exposes per CU (the
+    # same 64 KB ceiling that OOMs the fused attention path), so it raises
+    # ``hipError 98`` on gfx1100. The target is in the top-5 iff strictly
+    # fewer than 5 move-token logits exceed the target's own logit — a pure
+    # reduction over the vocab axis with no shared-memory kernel.
+    tgt_logit = jnp.take_along_axis(move_logits, tgt[..., None], axis=-1)
+    n_greater = (move_logits > tgt_logit).sum(axis=-1)  # (B, T)
+    in_top5 = (n_greater < 5) & loss_mask
+
+    # Legality: the argmax prediction is legal at that position.
+    pred_legal = jnp.take_along_axis(
+        legal_mask, pred[..., None], axis=-1
+    )[..., 0]
+    legal = pred_legal & loss_mask
+    late_legal = legal & late_mask
+
+    return (
+        loss_sum,
+        loss_mask.sum(),
+        top1_correct.sum(),
+        in_top5.sum(),
+        legal.sum(),
+        late_legal.sum(),
+    )
+
+
+def _legal_token_grid(corpus: Corpus) -> np.ndarray:
+    """Build the ``(N, T, NUM_ACTIONS)`` per-position legal move-token mask.
+
+    The Rust engine replays each game and returns a dense ``(N, max_ply,
+    V)`` bool mask where index ``p`` is the legal set of the board state
+    *before* ply ``p``. The pretrain corpus lays moves out at slots
+    ``[C .. C + game_length)`` with the first move supervised by the last
+    prefix slot ``C - 1`` (``pawn.corpus._pack_clm``), so supervised slot
+    ``t`` predicts ply ``p = t - (C - 1)``. We therefore shift the
+    ply-aligned engine mask right by ``C - 1`` into the sequence frame and
+    truncate to the move-token columns ``[0, NUM_ACTIONS)``.
+
+    Positions outside ``[C-1 .. C-1 + game_length)`` are never supervised
+    (``loss_mask`` is False there), so their legal-mask rows are
+    don't-cares and left all-False.
+    """
+    n = corpus.n_games
+    seq_len = corpus.seq_len
+    grid = np.zeros((n, seq_len, NUM_ACTIONS), dtype=np.bool_)
+    if n == 0:
+        return grid
+    import chess_engine
+
+    # The constant prefix width C (== outcome_offset) and the raw move IDs
+    # (slots [C .. C + game_length)). Engine wants (N, max_ply) int move
+    # tokens + per-game lengths.
+    C = int(corpus.outcome_offset[0])
+    # The engine's PyO3 binding wants int16 move IDs + int16 game lengths
+    # (the engine vocab is the 1980-wide emission space, not the model's
+    # 2000-wide table — only the move-token columns [0, NUM_ACTIONS) are
+    # read back). The engine emits the legal mask of the board state
+    # *before* each move (the set of legal moves to predict at that ply):
+    # for a length-L game it emits masks for plies ``0..L-1`` and reads
+    # ``move_ids[0..L-1]`` to replay. Pass the whole ``[C .. seq_len)`` move
+    # region (PAD past each game's length, which the engine ignores via
+    # ``game_lengths``).
+    move_ids = corpus.tokens[:, C:seq_len].astype(np.int16)
+    n_move_slots = move_ids.shape[1]
+    if n_move_slots == 0:
+        return grid
+    # ``corpus.game_lengths`` is the *untruncated* game length; the corpus
+    # keeps only the first ``n_move_slots`` moves, so clamp the length the
+    # engine replays to the slots actually present (a game longer than the
+    # window contributes legal masks only for its retained, supervised
+    # plies). The engine emits the legal mask of the board state *before*
+    # each move, so a length-L clamp emits masks for plies ``0..L-1`` and
+    # reads ``move_ids[0..L-1]`` — clamp to ``n_move_slots`` (NOT
+    # ``n_move_slots - 1``): the corpus supervises plies ``0..capped-1``
+    # with ``capped = min(game_length, n_move_slots)``, so the max
+    # supervised ply for a full-window game is ``n_move_slots - 1`` and we
+    # must emit its mask. ``gl == n_move_slots`` is a legal engine input
+    # (the PyO3 bound check is ``gl > max_ply``) and the replay reads
+    # ``move_ids[..t]`` only for ``t in 0..gl-1`` (all in range).
+    game_lengths = np.minimum(
+        corpus.game_lengths, n_move_slots
+    ).astype(np.int16)
+    # Dense (N, n_move_slots, 1980) legal mask, ply-aligned (index p =
+    # legal set of the board before ply p).
+    dense = np.asarray(
+        chess_engine.compute_legal_token_masks(move_ids, game_lengths, 1980),
+        dtype=np.bool_,
+    )
+    # Shift ply p into sequence slot t = p + (C - 1) and keep only the
+    # move-token columns.
+    shift = C - 1
+    p_count = min(dense.shape[1], seq_len - shift)
+    grid[:, shift : shift + p_count, :] = dense[:, :p_count, :NUM_ACTIONS]
+    return grid
+
+
+def compute_val_metrics(
+    model: PAWNModel,
+    corpus: Corpus,
+    *,
+    batch_size: int = 32,
+    late_ply: int = 0,
+    compute_legal: bool = True,
+) -> ValMetrics:
+    """Held-out validation pass — v1 ``CLMTrainer.evaluate`` parity.
+
+    Iterates the corpus in ``batch_size`` chunks, accumulating the CE loss
+    sum + top-1 / top-5 / legality counts on-device, then divides once on
+    the host. Returns a :class:`ValMetrics` carrying the ``val/*`` scalar
+    schema plus the per-phase breakdown.
+
+    ``late_ply`` is the legality late-game threshold (v1's
+    ``legality_late_ply`` — positions predicting ply ``>= late_ply`` count
+    toward ``late_legal_move_rate``). ``compute_legal=False`` skips the
+    engine replay (legal rates report 0.0) for callers that only need the
+    loss / accuracy scalars.
+    """
+    n = corpus.n_games
+    seq_len = corpus.seq_len
+    C = int(corpus.outcome_offset[0]) if n > 0 else 1
+
+    # Per-position late-game mask: supervised slot t predicts ply
+    # p = t - (C - 1); flag p >= late_ply for the late-legality metric.
+    positions = np.arange(seq_len, dtype=np.int32)
+    ply = positions - (C - 1)
+    late_pos = jnp.asarray(ply >= late_ply, dtype=jnp.bool_)  # (T,)
+
+    legal_grid = (
+        _legal_token_grid(corpus)
+        if compute_legal
+        else np.zeros((n, seq_len, NUM_ACTIONS), dtype=np.bool_)
+    )
+
+    loss_sum: Array = jnp.zeros((), dtype=jnp.float32)
+    total_sup: Array = jnp.zeros((), dtype=jnp.int32)
+    top1_sum: Array = jnp.zeros((), dtype=jnp.int32)
+    top5_sum: Array = jnp.zeros((), dtype=jnp.int32)
+    legal_sum: Array = jnp.zeros((), dtype=jnp.int32)
+    late_legal_sum: Array = jnp.zeros((), dtype=jnp.int32)
+    late_sup: Array = jnp.zeros((), dtype=jnp.int32)
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        tokens = jnp.asarray(corpus.tokens[start:end])
+        targets = jnp.asarray(corpus.targets[start:end])
+        attn = jnp.asarray(corpus.attn_mask[start:end])
+        loss = jnp.asarray(corpus.loss_mask[start:end])
+        legal = jnp.asarray(legal_grid[start:end])
+        late_b = jnp.broadcast_to(late_pos, loss.shape)
+        ls, s, t1, t5, lg, llg = _batch_val_counts(
+            model, tokens, targets, attn, loss, legal, late_b,
+        )
+        loss_sum = loss_sum + ls
+        total_sup = total_sup + s
+        top1_sum = top1_sum + t1
+        top5_sum = top5_sum + t5
+        legal_sum = legal_sum + lg
+        late_legal_sum = late_legal_sum + llg
+        # Count of supervised late-game positions (denominator for the
+        # late-legality rate).
+        late_sup = late_sup + (loss & late_b).sum()
+
+    n_sup = int(total_sup)
+    n_late = int(late_sup)
+    loss_total = float(loss_sum)
+    if n_sup == 0:
+        return ValMetrics(
+            val_loss=0.0, top1=0.0, top5=0.0, perplexity=1.0,
+            legal_move_rate=0.0, late_legal_move_rate=0.0,
+            phases=compute_per_phase_accuracy(
+                model, corpus, batch_size=batch_size
+            ),
+        )
+    val_loss = loss_total / n_sup
+    phases = compute_per_phase_accuracy(model, corpus, batch_size=batch_size)
+    return ValMetrics(
+        val_loss=val_loss,
+        top1=int(top1_sum) / n_sup,
+        top5=int(top5_sum) / n_sup,
+        perplexity=math.exp(min(val_loss, 20.0)),
+        legal_move_rate=int(legal_sum) / n_sup,
+        late_legal_move_rate=(
+            int(late_legal_sum) / n_late if n_late > 0 else 0.0
+        ),
+        phases=phases,
     )

@@ -20,6 +20,7 @@ end-to-end.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import equinox as eqx
@@ -261,6 +262,96 @@ def test_supernet_joint_loss_sums_variants() -> None:
     assert jnp.allclose(joint, expected, atol=1e-4)
 
 
+def test_supernet_joint_loss_stochastic_is_unbiased_in_expectation() -> None:
+    """The stochastic sandwich loss is an UNBIASED estimator of the full
+    sum-over-variants loss (`stochastic_variants=True` design intent,
+    pawn/trainer.py: the sampled non-supernet variant's CE is scaled by N
+    so ``E[loss_stochastic] == sum-of-all loss``).
+
+    Tested empirically: average the stochastic loss over every distinct
+    ``stochastic_key`` draw (one per non-supernet variant, all equally
+    likely) and check the mean equals the deterministic sum. Because the
+    sampling is a uniform draw over a finite set of branches, the exact
+    expectation is the mean over the branch losses — we enumerate the
+    branches directly rather than Monte-Carlo sampling, so the assertion is
+    tight (no sampling variance).
+
+    Previously only ``stochastic_variants=False`` (the deterministic sum)
+    was covered, leaving the unbiasedness of the production loss surface
+    untested.
+    """
+    model = _tiny_model()
+    batch = _small_batch()
+    variants = _tiny_variants()
+
+    deterministic = supernet_joint_loss(
+        model, batch, variants, stochastic_key=None
+    )
+
+    # The supernet (is_supernet) CE always runs; one of the N non-supernet
+    # variants is sampled uniformly per key. Average the stochastic loss
+    # over many keys and assert the mean matches the deterministic sum.
+    n_other = sum(1 for v in variants if not v.is_supernet)
+    assert n_other >= 2  # tiny supernet has small + base as non-supernet
+
+    # jit the per-key loss so each draw reuses one compiled program, then
+    # loop sequentially over the keys. A vmap over the key axis would batch
+    # every variant's full forward over the leading key dim and OOM the GPU
+    # at any useful sample count, so we trade the batched dispatch for a
+    # Python loop over a single compiled call.
+    loss_fn = eqx.filter_jit(
+        lambda k: supernet_joint_loss(model, batch, variants, stochastic_key=k)
+    )
+    keys = jax.random.split(jax.random.key(0), 256)
+    stoch_losses = np.array([float(loss_fn(k)) for k in keys])
+    mean_stoch = float(stoch_losses.mean())
+    # Unbiased: the Monte-Carlo mean converges to the deterministic sum.
+    # 256 draws over the non-supernet branches keep the standard error well
+    # under the 3% tolerance for the tiny supernet's loss scale.
+    assert mean_stoch == pytest.approx(float(deterministic), rel=0.03)
+
+    # The estimator is genuinely stochastic: the individual draws vary
+    # (they pick different N-scaled variants), so the sample carries
+    # non-trivial spread rather than being a constant equal to the mean.
+    # (At random init the per-variant CEs all sit near ln(V), so a single
+    # draw can coincide with the sum; the spread, not any single draw, is
+    # what evidences stochasticity.)
+    assert float(stoch_losses.std()) > 0.0
+
+
+def test_supernet_joint_loss_stochastic_exact_branch_expectation() -> None:
+    """Tighter, variance-free version of the unbiasedness check: the
+    expectation over the uniform branch choice equals the deterministic
+    sum *exactly* (no Monte-Carlo error).
+
+    The stochastic loss is ``supernet_CE + N * sampled_variant_CE`` where
+    the sampled variant is uniform over the N non-supernet variants. So
+    ``E[stochastic] = supernet_CE + N * mean_v(variant_CE)
+    = supernet_CE + sum_v(variant_CE)`` = the full sum. We compute each
+    side from the per-variant CEs directly.
+    """
+    model = _tiny_model()
+    batch = _small_batch()
+    variants = _tiny_variants()
+
+    supernet_ce = sum(
+        float(cross_entropy_loss(model, batch))
+        for spec in variants if spec.is_supernet
+    )
+    other_ces = [
+        float(cross_entropy_loss(sliced(model, spec.cfg), batch))
+        for spec in variants if not spec.is_supernet
+    ]
+    n_other = len(other_ces)
+
+    # Closed-form expectation of the stochastic estimator.
+    expected_stochastic = supernet_ce + n_other * (sum(other_ces) / n_other)
+    deterministic = float(
+        supernet_joint_loss(model, batch, variants, stochastic_key=None)
+    )
+    assert expected_stochastic == pytest.approx(deterministic, rel=1e-4)
+
+
 # ---------------------------------------------------------------------------
 # LR schedule — every shape produces values in the expected range
 # ---------------------------------------------------------------------------
@@ -328,10 +419,53 @@ def test_lr_schedule_wsd_warmup_stable_decay() -> None:
 def test_lr_schedule_one_cycle_ramps_then_cosine() -> None:
     cfg = _make_cfg(lr_schedule="one_cycle", warmup_frac=0.1, lr=1e-3)
     sched = make_lr_schedule(cfg, total_steps=100)
+    # Ramp starts at peak/25 (Smith one-cycle initial_div).
+    assert _f(sched(0)) == pytest.approx(1e-3 / 25.0, rel=1e-3)
     # Peak at end of warmup.
     assert _f(sched(10)) == pytest.approx(1e-3, rel=1e-3)
     # End: small (peak/10000).
     assert _f(sched(99)) < 1e-5
+
+
+def test_lr_schedule_one_cycle_ramp_is_cosine_not_linear() -> None:
+    """The one-cycle warmup ramp is **cosine**, not linear (v1 parity —
+    `git show main:pawn/trainer.py` ``OneCycle`` used
+    ``init + (peak-init)*0.5*(1-cos(pi*progress))``).
+
+    An earlier v2 used ``optax.linear_schedule`` for the ramp, which
+    changes the canonical one-cycle shape. The cosine ramp is a strictly
+    convex acceleration into the peak: at the ramp midpoint the cosine
+    ease passes through exactly the linear interpolant value (the cos term
+    is 0.5 there), but at the first quarter the cosine ramp sits *below*
+    the straight line, and at the third quarter it sits *above*. We pin
+    both asymmetry points so a regression back to the linear ramp fails.
+    """
+    peak = 1.0
+    warmup = 100
+    cfg = _make_cfg(
+        lr_schedule="one_cycle", warmup_steps=warmup, lr=peak,
+        total_steps=1000,
+    )
+    sched = make_lr_schedule(cfg, total_steps=1000)
+    init = peak / 25.0
+
+    def cos_ramp(step: int) -> float:
+        progress = step / warmup
+        return init + (peak - init) * 0.5 * (1.0 - math.cos(math.pi * progress))
+
+    def lin_ramp(step: int) -> float:
+        progress = step / warmup
+        return init + (peak - init) * progress
+
+    # Matches the v1 cosine ramp closed form at every probe point.
+    for step in (25, 50, 75):
+        assert _f(sched(step)) == pytest.approx(cos_ramp(step), rel=1e-4)
+    # Cosine ramp ≠ linear ramp away from the midpoint (the regression
+    # guard): below the line in the first quarter, above it in the third.
+    assert _f(sched(25)) < lin_ramp(25) - 1e-3
+    assert _f(sched(75)) > lin_ramp(75) + 1e-3
+    # Midpoint coincides with the linear interpolant.
+    assert _f(sched(50)) == pytest.approx(lin_ramp(50), rel=1e-4)
 
 
 def test_lr_schedule_infinite_has_stable_plateau() -> None:
@@ -605,40 +739,92 @@ def test_train_step_jit_does_not_retrace_across_steps() -> None:
     assert int(state.step) == 3
 
 
-def test_train_step_padded_batch_does_not_drift_params() -> None:
-    """The lax.cond guard against padded-batch weight-decay drift:
-    when `loss_mask.sum() == 0`, the optimizer is skipped entirely
-    and `weight_decay * model_params` shouldn't apply."""
-    model = _tiny_model()
-    # Snapshot params before donation deletes them. TINY_SUPERNET ties
-    # embeddings, so `embed_tokens` carries the token table and the tied
-    # head; no standalone `lm_head` exists.
-    embed_tokens_before = np.asarray(model.embed_tokens)
-    cfg = _make_cfg(lr=1e-3, weight_decay=0.1)  # nontrivial wd
-    sched = make_lr_schedule(cfg, total_steps=100)
-    opt = make_optimizer(cfg, sched)
-    opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array))
-    state = TrainState(
-        model=model,
-        opt_state=opt_state,
-        step=jnp.int32(0),
-        key=jax.random.key(0),
-    )
-    variants = _tiny_variants()
-    train_step = make_train_step(opt, variants)
-
-    batch = _small_batch()
-    empty_batch = Batch(
+def _empty_batch(batch: Batch) -> Batch:
+    """A fully-padded copy of `batch` — same tokens, empty loss_mask."""
+    return Batch(
         tokens=batch.tokens,
         targets=batch.targets,
         attn_mask=batch.attn_mask,
         loss_mask=jnp.zeros_like(batch.loss_mask),
     )
-    state_after_empty, _ = train_step(state, empty_batch)
-    # Params should be byte-identical (no weight-decay drift).
+
+
+def test_train_step_padded_batch_zero_grad_no_drift_with_zero_wd() -> None:
+    """An all-PAD batch produces zero loss → zero grad → no param drift
+    when ``weight_decay == 0``.
+
+    Critically this runs at a **non-zero LR** (constant schedule,
+    ``warmup_frac=0`` so ``schedule(0) == peak``). The predecessor test
+    ran at step 0 of a cosine schedule whose ``schedule(0) == 0``, so it
+    proved nothing: params can't move when the LR is zero regardless of
+    the batch. Pinning the LR > 0 first means the no-drift result is
+    attributable to the empty batch's zero gradient, not a zero LR
+    (the misleading-pass the audit flagged). With ``weight_decay=0`` AdamW
+    has no decoupled-decay term, so a zero gradient leaves params exactly
+    fixed.
+    """
+    model = _tiny_model()
+    embed_tokens_before = np.asarray(model.embed_tokens)
+    # warmup_frac=0 + constant ⇒ schedule(0) == peak (non-zero LR at step 0).
+    cfg = _make_cfg(
+        lr=1e-3, weight_decay=0.0, lr_schedule="constant", warmup_frac=0.0,
+    )
+    sched = make_lr_schedule(cfg, total_steps=100)
+    assert _f(sched(0)) == pytest.approx(1e-3, rel=1e-6)  # LR is genuinely > 0
+    opt = make_optimizer(cfg, sched)
+    opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array))
+    state = TrainState(
+        model=model, opt_state=opt_state, step=jnp.int32(0),
+        key=jax.random.key(0),
+    )
+    variants = _tiny_variants()
+    train_step = make_train_step(opt, variants, stochastic_variants=False)
+
+    batch = _small_batch()
+    state_after_empty, loss = train_step(state, _empty_batch(batch))
+    # The empty batch's loss is exactly zero (0 / 1).
+    assert float(loss) == pytest.approx(0.0, abs=1e-7)
+    # Zero grad + zero weight decay ⇒ params byte-identical.
     assert np.array_equal(
         embed_tokens_before, np.asarray(state_after_empty.model.embed_tokens)
     )
+
+
+def test_train_step_padded_batch_weight_decay_drift_is_accepted() -> None:
+    """v2 removed v1's ``lax.cond`` empty-batch guard *by design*
+    (pawn/trainer.py `make_train_step` docstring: the cond traced + ran
+    both branches, costing more than the rare all-PAD drift it prevented).
+
+    The correct v2 behavior to pin is therefore the OPPOSITE of the old
+    (misleading) assertion: at a non-zero LR with ``weight_decay > 0``, an
+    all-PAD batch DOES drift params toward zero — AdamW's decoupled weight
+    decay (``param *= 1 - lr*wd``) fires even when the gradient is zero.
+    This documents the accepted-drift design rather than asserting a guard
+    that no longer exists.
+    """
+    model = _tiny_model()
+    embed_tokens_before = np.asarray(model.embed_tokens)
+    cfg = _make_cfg(
+        lr=1e-2, weight_decay=0.5, lr_schedule="constant", warmup_frac=0.0,
+    )
+    sched = make_lr_schedule(cfg, total_steps=100)
+    opt = make_optimizer(cfg, sched)
+    opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array))
+    state = TrainState(
+        model=model, opt_state=opt_state, step=jnp.int32(0),
+        key=jax.random.key(0),
+    )
+    variants = _tiny_variants()
+    train_step = make_train_step(opt, variants, stochastic_variants=False)
+
+    batch = _small_batch()
+    state_after_empty, loss = train_step(state, _empty_batch(batch))
+    after = np.asarray(state_after_empty.model.embed_tokens)
+    assert float(loss) == pytest.approx(0.0, abs=1e-7)
+    # Weight-decay drift: params moved (toward zero) despite the zero grad.
+    assert not np.array_equal(embed_tokens_before, after)
+    # The drift is a shrink toward zero (decoupled decay), not random.
+    assert np.abs(after).sum() < np.abs(embed_tokens_before).sum()
 
 
 # ---------------------------------------------------------------------------

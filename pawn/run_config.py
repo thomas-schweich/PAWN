@@ -508,6 +508,14 @@ class PretrainConfig(BaseRunConfig):
     # Pretrain-specific
     accumulation_steps: int = 1
     checkpoint_interval: int = 5000
+    # Held-out validation cadence: run the validation pass + emit
+    # ``type=val`` records every ``val_every`` steps. ``None`` (default)
+    # disables the held-out eval (no val records, no patience signal) —
+    # the cheap-loss-curve-only mode. The flag name matches the v1 adapter
+    # cadence knob; v1 pretrain spelled it ``eval_interval`` (still
+    # accepted via ``--config`` JSON and mapped to ``val_every`` when
+    # ``val_every`` is unset).
+    val_every: int | None = None
     # If null at runtime, defaults to seq_len // 2. Late-ply positions
     # past this threshold get a stricter legality check.
     legality_late_ply: int | None = None
@@ -521,6 +529,23 @@ class PretrainConfig(BaseRunConfig):
     # the distillation-canonical ladder (plan §7). Distinct from `variant`
     # above, which only selects the smoke-verification slice.
     variants: tuple[VariantName, ...] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_eval_interval_to_val_every(cls, data: Any) -> Any:
+        """v1 pretrain spelled the validation cadence ``eval_interval``;
+        v2 PretrainConfig spells it ``val_every`` (parity with the adapter
+        cadence knob). Map a verbatim v1 ``eval_interval`` onto
+        ``val_every`` when the latter is unset so old configs still drive
+        the held-out eval. ``eval_interval`` remains a valid BaseRunConfig
+        field, so we copy (not pop) it — both stay readable.
+        """
+        if not isinstance(data, dict):
+            return data
+        if data.get("val_every") is None and data.get("eval_interval") is not None:
+            data = dict(data)
+            data["val_every"] = data["eval_interval"]
+        return data
 
     @model_validator(mode="after")
     def _check_pretrain(self) -> "PretrainConfig":
@@ -541,6 +566,25 @@ class PretrainConfig(BaseRunConfig):
         if self.checkpoint_interval <= 0:
             raise ValueError(
                 f"checkpoint_interval must be positive, got {self.checkpoint_interval}"
+            )
+        if self.val_every is not None and self.val_every <= 0:
+            raise ValueError(
+                f"val_every must be positive when set, got {self.val_every}"
+            )
+        if self.patience is not None and self.patience <= 0:
+            raise ValueError(
+                f"patience must be positive when set, got {self.patience}"
+            )
+        if self.patience is not None and self.val_every is None:
+            raise ValueError(
+                "patience requires val_every (early stopping keys on the "
+                "held-out validation loss, which is only computed when "
+                "val_every is set)"
+            )
+        if self.pause_after_steps is not None and self.pause_after_steps <= 0:
+            raise ValueError(
+                "pause_after_steps must be positive when set, got "
+                f"{self.pause_after_steps}"
             )
         if self.variants is not None:
             if len(self.variants) == 0:

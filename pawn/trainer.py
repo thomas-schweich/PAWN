@@ -42,6 +42,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from jax.typing import ArrayLike
 from jaxtyping import Array, Bool, Float, Int
 
 from pawn.config import ModelConfig, NULL_TOKEN, PAD_TOKEN
@@ -490,6 +491,32 @@ def _warmup_steps(cfg: BaseRunConfig, total_steps: int) -> int:
     return warmup
 
 
+def _cosine_ramp_schedule(
+    init_value: float, peak_value: float, ramp_steps: int
+) -> optax.Schedule:
+    """Cosine ramp-up from ``init_value`` to ``peak_value`` over
+    ``ramp_steps`` (v1 ``OneCycle`` warmup shape).
+
+    v1's one-cycle ramp was
+    ``init + (peak - init) * 0.5 * (1 - cos(pi * progress))`` where
+    ``progress = step / ramp_steps``: a cosine-eased acceleration into the
+    peak rather than a straight line. Optax ships no cosine **ramp-up**
+    builder (``cosine_decay_schedule`` only decays), so this reproduces the
+    v1 curve directly. ``ramp_steps <= 0`` collapses to a constant at the
+    peak (the warmup is zero-width — :func:`optax.join_schedules` clamps
+    the boundary to 0 in that case).
+    """
+    if ramp_steps <= 0:
+        return optax.constant_schedule(peak_value)
+
+    def schedule(count: ArrayLike) -> Array:
+        progress = jnp.clip(jnp.asarray(count) / ramp_steps, 0.0, 1.0)
+        cos_eased = 0.5 * (1.0 - jnp.cos(jnp.pi * progress))
+        return init_value + (peak_value - init_value) * cos_eased
+
+    return schedule
+
+
 def make_lr_schedule(
     cfg: BaseRunConfig, total_steps: int
 ) -> optax.Schedule:
@@ -581,11 +608,18 @@ def make_lr_schedule(
     if cfg.lr_schedule == "one_cycle":
         init = peak / 25.0
         end = peak / 10000.0
-        # Ramp warmup steps init → peak, then cosine for the remainder.
+        # Ramp warmup steps init → peak with a **cosine** shape (Smith
+        # 2018, v1 parity — `git show main:pawn/trainer.py` ``OneCycle``).
+        # v1's ramp was `init + (peak - init) * 0.5 * (1 - cos(pi *
+        # progress))`, NOT a straight line. An earlier v2 used
+        # ``optax.linear_schedule(init, peak, warmup)`` here, changing the
+        # canonical one-cycle ramp shape (linear vs cosine) — restored to
+        # the cosine ramp so the schedule matches v1 step-for-step. Then
+        # cosine-decay from peak to ``end`` over the remainder.
         remaining = total_steps - warmup
         return optax.join_schedules(
             [
-                optax.linear_schedule(init, peak, warmup),
+                _cosine_ramp_schedule(init, peak, warmup),
                 optax.cosine_decay_schedule(peak, remaining, end / peak),
             ],
             [warmup],

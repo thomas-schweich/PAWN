@@ -37,6 +37,7 @@ from pawn.config import (
     TINY_VARIANTS,
 )
 from pawn.corpus import Corpus, generate_corpus
+from pawn.eval import compute_val_metrics
 from pawn.jax_setup import require_accelerator, resolve_device, setup_jax_caching
 from pawn.lifecycle import (
     HFPushTracker,
@@ -164,19 +165,27 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--weight-decay", type=float, default=None)
     ap.add_argument("--max-grad-norm", type=float, default=None,
                     help="global-norm gradient clip threshold (default 1.0).")
-    # NOTE: no `--patience` / `--eval-interval` / `--val-games` /
-    # `--pause-after-steps` flags. The v2 pretrain loop has NO held-out
-    # validation pass, NO early-stop/patience break, and NO pause primitive
-    # (docs/V2_PARITY_AUDIT.md §2: "No backbone-pretrain validation loop …
-    # no early-stopping/patience" is an open major gap, and §3 DEFERRALS
-    # records the CLI deferral). v1's `run_pretrain` wired all three
-    # (`git show main:scripts/train.py:232,267,274`), so re-advertising them
-    # on the pretrain CLI before the loop exists would let `--patience 5`
-    # silently no-op. The fields still parse via `--config` JSON (so a
-    # verbatim v1 config loads), but they are NOT promoted to argparse flags
-    # until the validation/patience loop lands. `--log-interval` and
-    # `--checkpoint-interval` ARE honoured by the loop, so they stay.
-    #
+    # Held-out validation loop + early-stop/pause primitives (v1 parity —
+    # `git show main:pawn/trainer.py` validation/early-stop block). The
+    # pretrain loop now runs a periodic held-out eval (fresh random games)
+    # and emits `type=val` records, so these knobs are honoured.
+    ap.add_argument("--val-every", type=int, default=None,
+                    help="run the held-out validation pass + emit type=val "
+                         "records every N steps. Omit to disable held-out "
+                         "eval (cheap loss-curve-only mode). v1 spelled this "
+                         "--eval-interval in pretrain; that name still loads "
+                         "via --config JSON.")
+    ap.add_argument("--val-games", type=int, default=None,
+                    help="number of freshly-generated random games in the "
+                         "held-out validation corpus (default 512).")
+    ap.add_argument("--patience", type=int, default=None,
+                    help="early-stop after N consecutive validation passes "
+                         "with no improvement in best val loss / late-game "
+                         "legality. Requires --val-every. Records "
+                         "reason_for_stop=patience in schedule_health.json.")
+    ap.add_argument("--pause-after-steps", type=int, default=None,
+                    help="checkpoint and pause training at this step boundary "
+                         "(reason_for_stop=paused). Resume with --resume.")
     # NOTE: no `--min-ply` / `--max-corpus-gb` / `--cache-dir` flags either.
     # `min_ply` and `cache_dir` are Lichess-path fields — in v1 they fed
     # `prepare_lichess_cached` (`git show main:scripts/train.py:396-412`),
@@ -244,9 +253,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                          "per outer prefetch call (default 3 — covers the "
                          "natural bucket distribution).")
     ap.add_argument("--emit-grad-norms", action="store_true",
-                    help="(C.5 spike) log per-step pre-clip grad norm "
-                         "alongside loss. Slight per-step overhead from "
-                         "emitting an extra scalar per body call.")
+                    help="(no-op, retained for back-compat) per-step pre-clip "
+                         "grad_norm is now logged unconditionally (v1 parity), "
+                         "so this flag has no effect.")
     ap.add_argument("--optimizer", choices=("adamw", "lion"), default=None,
                     help="(C.1) optimizer to use. Lion halves opt-state "
                          "memory + ~3-5%% step time but needs LR ~1/3 of "
@@ -284,11 +293,14 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
         ("wsd_decay_shape", args.wsd_decay_shape),
         ("weight_decay", args.weight_decay),
         ("max_grad_norm", args.max_grad_norm),
-        # NOTE: patience / eval_interval / pause_after_steps / val_games and
-        # min_ply / max_corpus_gb / cache_dir are intentionally NOT merged
-        # from CLI flags — none have honouring code in the pretrain loop (see
-        # _parse_args). They remain settable via `--config` JSON for v1-config
-        # compatibility. `mate_boost` IS honoured (fed to generate_corpus).
+        # Validation loop + early-stop/pause knobs — now honoured by the
+        # pretrain loop (held-out eval + patience break + pause boundary).
+        # `min_ply` / `max_corpus_gb` / `cache_dir` remain --config-JSON-only
+        # (no consumer in the random-game pretrain path).
+        ("val_every", args.val_every),
+        ("val_games", args.val_games),
+        ("patience", args.patience),
+        ("pause_after_steps", args.pause_after_steps),
         ("log_interval", args.log_interval),
         ("mate_boost", args.mate_boost),
         ("checkpoint_interval", args.checkpoint_interval),
@@ -531,12 +543,19 @@ def main(argv: list[str] | None = None) -> int:
             compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa, use_flash=use_flash,
         )
 
+    # grad_norm is logged unconditionally — v1 emitted the per-step
+    # grad_norm on every log record (`git show main:pawn/trainer.py`
+    # `log_train(..., grad_norm=grad_norm, ...)`), not behind a flag. The
+    # v2 `--emit-grad-norms` gate that previously suppressed it by default
+    # diverged from that contract, so the scan now always returns the
+    # pre-clip grad norm (one extra (K,) scalar per chunk, no extra host
+    # round trips). `--emit-grad-norms` is kept as an accepted no-op flag
+    # for shell-script / config back-compat.
     scan_step = make_scan_step(
         train_step,
-        emit_grad_norms=args.emit_grad_norms,
+        emit_grad_norms=True,
         accuracy_fn=_supernet_accuracy,
     )
-    emit_grad_norms = args.emit_grad_norms
 
     # H7 / D2 — bit-reproducible data stream. The outer-chunk seeds are a
     # pure function of `(BASE_DATA_SEED, chunk_index)` (see
@@ -804,9 +823,94 @@ def main(argv: list[str] | None = None) -> int:
         if push_tracker:
             push_checkpoint_async(out, push_tracker)
 
+    # --- Held-out validation loop (v1 CLMTrainer.evaluate parity) --------
+    # The pretrain corpus is freshly-generated random self-play, so the
+    # held-out val set is a fixed corpus of `cfg.val_games` games generated
+    # off a dedicated seed (disjoint from the training stream's per-chunk
+    # seeds, which derive from BASE_DATA_SEED=0). Built once up front so the
+    # periodic eval pays only the forward cost, not regeneration. `None`
+    # cfg.val_every disables the held-out pass entirely.
+    VAL_DATA_SEED: int = 2**31 - 7  # disjoint from BASE_DATA_SEED's chunk seeds
+    val_every = cfg.val_every
+    val_corpus: Corpus | None = None
+    if val_every is not None:
+        val_corpus = generate_corpus(
+            n_games=cfg.val_games, max_ply=cfg.seq_len, seq_len=cfg.seq_len,
+            seed=VAL_DATA_SEED, conditioning=cfg.conditioning,
+            mate_boost=cfg.mate_boost, discard_ply_limit=cfg.discard_ply_limit,
+        )
+    # legality late-ply threshold: explicit override, else seq_len // 2 (v1
+    # `legality_late_ply` default).
+    legality_late_ply = (
+        cfg.legality_late_ply if cfg.legality_late_ply is not None
+        else cfg.seq_len // 2
+    )
+    val_acc_model = accuracy_model
+    # Compound early-stop state (v1: best val loss + best late-game
+    # legality drive the patience counter; an improvement in *either*
+    # resets it).
+    best_val_loss = float("inf")
+    best_late_legality = 0.0
+    patience_counter = 0
+    last_val_step = -1  # de-dupe: never eval the same step twice
+
     start = int(state.step)
     t0 = time.time()
     next_step = start
+
+    def _run_validation(at_step: int) -> bool:
+        """Run the held-out validation pass at ``at_step``, log a
+        ``type=val`` record, update the patience state, and return True
+        when the patience budget has been exhausted (caller should stop).
+
+        No-op (returns False) when the held-out eval is disabled or the
+        step was already evaluated.
+        """
+        nonlocal best_val_loss, best_late_legality, patience_counter
+        nonlocal last_val_step
+        if val_corpus is None or at_step == last_val_step:
+            return False
+        last_val_step = at_step
+        vm = compute_val_metrics(
+            val_acc_model(state.model, widest_variant), val_corpus,
+            batch_size=cfg.batch_size, late_ply=legality_late_ply,
+        )
+        extra_log: dict[str, float | int] = {}
+        stop = False
+        if cfg.patience is not None:
+            improved = False
+            if vm.val_loss < best_val_loss:
+                best_val_loss = vm.val_loss
+                improved = True
+            if vm.late_legal_move_rate > best_late_legality:
+                best_late_legality = vm.late_legal_move_rate
+                improved = True
+            patience_counter = 0 if improved else patience_counter + 1
+            extra_log = {
+                "patience_counter": patience_counter,
+                "best_val_loss": best_val_loss,
+                "best_late_legality": best_late_legality,
+            }
+            stop = patience_counter >= cfg.patience
+        val_kwargs = vm.as_log_kwargs()
+        logger.log_val(step=at_step, **val_kwargs, **extra_log)
+        log_metrics(
+            wandb_run,
+            {f"val/{k}": v for k, v in val_kwargs.items()},
+            step=at_step,
+        )
+        print(
+            f"  val @ {at_step}: loss {vm.val_loss:.4f} | "
+            f"top1 {vm.top1:.3f} | top5 {vm.top5:.3f} | "
+            f"legal {vm.legal_move_rate:.3f} | "
+            f"late_legal {vm.late_legal_move_rate:.3f}"
+            + (
+                f" | pat {patience_counter}/{cfg.patience}"
+                if cfg.patience is not None else ""
+            ),
+            flush=True,
+        )
+        return stop
 
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pawn-prefetch")
     producer = BucketedPrefetcher(
@@ -829,14 +933,13 @@ def main(argv: list[str] | None = None) -> int:
             edge, chunk_batches = nxt
             this_chunk_k = int(chunk_batches.tokens.shape[0])
 
-            if emit_grad_norms:
-                state, chunk_losses, chunk_gnorms, chunk_accs = scan_step(
-                    state, chunk_batches
-                )
-                chunk_gnorms_np = np.asarray(chunk_gnorms)
-            else:
-                state, chunk_losses, chunk_accs = scan_step(state, chunk_batches)
-                chunk_gnorms_np = None
+            # grad_norm is always emitted now (v1 parity — see the
+            # `make_scan_step(emit_grad_norms=True, ...)` call site), so the
+            # scan returns the 4-tuple unconditionally.
+            state, chunk_losses, chunk_gnorms, chunk_accs = scan_step(
+                state, chunk_batches
+            )
+            chunk_gnorms_np = np.asarray(chunk_gnorms)
             next_step += this_chunk_k
             bucket_steps[edge] = bucket_steps.get(edge, 0) + this_chunk_k
 
@@ -891,6 +994,42 @@ def main(argv: list[str] | None = None) -> int:
             if crossed_checkpoint or next_step >= total_steps:
                 if cfg.local_checkpoints or cfg.hf_repo:
                     _save_checkpoint(next_step)
+
+            # Held-out validation pass at every val_every boundary crossed
+            # inside this chunk. Division-based crossing (like the
+            # checkpoint test) so cfg.k need not divide val_every; the eval
+            # runs on the post-chunk model at the crossing step. A patience
+            # exhaustion breaks the loop with reason=patience.
+            if val_every is not None:
+                crossed_val = (
+                    next_step // val_every
+                    != (next_step - this_chunk_k) // val_every
+                )
+                if crossed_val or next_step >= total_steps:
+                    if _run_validation(next_step):
+                        _save_checkpoint(next_step)
+                        reason_for_stop = "patience"
+                        print(
+                            f"\nEarly stopping at step {next_step} "
+                            f"(no val improvement for {cfg.patience} evals)",
+                            flush=True,
+                        )
+                        break
+
+            # Checkpoint-and-pause at a step boundary (v1 pause_after_steps).
+            if (
+                cfg.pause_after_steps is not None
+                and next_step >= cfg.pause_after_steps
+            ):
+                _save_checkpoint(next_step)
+                reason_for_stop = "paused"
+                print(
+                    f"\nPaused at step {next_step} "
+                    f"(pause_after_steps={cfg.pause_after_steps}); "
+                    f"resume with --resume",
+                    flush=True,
+                )
+                break
 
             if should_shutdown():
                 _save_checkpoint(next_step)
