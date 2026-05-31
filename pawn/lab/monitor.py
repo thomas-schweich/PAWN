@@ -7,11 +7,29 @@ import logging
 import math
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from pawn.lab.state import Trial
 
 log = logging.getLogger("pawn.lab")
+
+
+class ScheduleHealthAudit(TypedDict):
+    """Typed return of :func:`audit_schedule_health`.
+
+    ``banner`` is the load-bearing H7 invariant: it is a non-``None`` str
+    exactly when ``structural_mismatch`` is True, and ``None`` otherwise.
+    Annotating it as ``str | None`` (rather than letting the dict decay to
+    ``Any``) lets pyright verify the contract at the :func:`check_health`
+    call site — if the ``"banner"`` key were ever dropped, pyright would
+    flag the access instead of the KeyError being silently swallowed by the
+    monitor loop's ``try/except``.
+    """
+
+    present: bool
+    structural_mismatch: bool
+    banner: str | None
+    health: dict[str, Any] | None
 
 
 def is_alive(pid: int) -> tuple[bool, int | None]:
@@ -520,6 +538,73 @@ def read_cotrain_val_summary(trial: Trial) -> dict[str, Any] | None:
     return {"variants": variants_out}
 
 
+def read_schedule_health(run_dir: Path | str) -> dict[str, Any] | None:
+    """Read a run's ``schedule_health.json`` (H7) or ``None`` if absent.
+
+    The trainers write this file at every exit path; the lab reads it to
+    answer "did the LR schedule run to completion?" post-hoc without
+    replaying the run.
+
+    Lives in :mod:`pawn.lab.monitor` (a pure filesystem read with no
+    :class:`~pawn.lab.runner.TrialRunner` dependency) so that
+    :func:`check_health` can call it without a circular import back into
+    :mod:`pawn.lab.runner`. Re-exported from :mod:`pawn.lab.runner` for
+    callers that depend on that path.
+    """
+    path = Path(run_dir) / "schedule_health.json"
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def audit_schedule_health(run_dir: Path | str) -> ScheduleHealthAudit:
+    """Audit a run's schedule health and flag the structural-bug signal.
+
+    Returns ``{"present": bool, "structural_mismatch": bool,
+    "banner": str | None, "health": dict | None}``. The structural-bug
+    signal (plan §8.3 H7) is ``actual_total_steps != planned_total_steps``
+    AND ``reason_for_stop == "completed"``: the loop fell off the end of
+    the schedule without an early-exit, yet the step counts disagree.
+    With cache-first that's unreachable, so a True here is a regression
+    tripwire and gets a banner the lab surfaces to the operator. SIGTERM /
+    patience / pause / resume_no_op are legitimate early exits and do NOT
+    raise the flag.
+    """
+    health = read_schedule_health(run_dir)
+    if health is None:
+        return {
+            "present": False,
+            "structural_mismatch": False,
+            "banner": None,
+            "health": None,
+        }
+    planned = health.get("planned_total_steps")
+    actual = health.get("actual_total_steps")
+    reason = health.get("reason_for_stop")
+    mismatch = (
+        reason == "completed"
+        and isinstance(planned, int)
+        and isinstance(actual, int)
+        and actual != planned
+    )
+    banner: str | None = None
+    if mismatch:
+        banner = (
+            "\033[31m[lab] STRUCTURAL MISMATCH: schedule reported "
+            f"reason_for_stop='completed' but actual_total_steps={actual} "
+            f"!= planned_total_steps={planned}. The training loop fell off "
+            "the end of the LR schedule without an early-exit yet the step "
+            "counts disagree — this is a structural bug, not a normal early "
+            "stop.\033[0m"
+        )
+    return {
+        "present": True,
+        "structural_mismatch": mismatch,
+        "banner": banner,
+        "health": health,
+    }
+
+
 def check_health(trial: Trial) -> str | None:
     """Return a health issue string, or None if healthy.
 
@@ -539,11 +624,9 @@ def check_health(trial: Trial) -> str | None:
         if trial.current_step > threshold:
             return "NaN/Inf loss"
     # H7: surface the schedule-health structural-mismatch banner from the
-    # trial's run dir. Imported lazily to keep the metrics-reading path free
-    # of the runner module.
+    # trial's run dir. ``audit_schedule_health`` lives in this module (a pure
+    # filesystem read), so there's no circular import back into the runner.
     if trial.run_dir is not None:
-        from pawn.lab.runner import audit_schedule_health
-
         audit = audit_schedule_health(trial.run_dir)
         if audit["structural_mismatch"]:
             return audit["banner"]
