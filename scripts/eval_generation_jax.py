@@ -20,15 +20,34 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from pawn.checkpoint import load_model, resolve_checkpoint_source
 from pawn.corpus import conditioning_from_run_block
-from pawn.generation import run_all_diagnostics
+from pawn.generation import build_gen_diag_corpus, run_all_diagnostics
 from pawn.jax_setup import setup_jax_caching
 
 
-def main(argv: list[str] | None = None) -> int:
+def resolve_outcome_gate(
+    explicit: bool | None, run_block: Mapping[str, object] | None
+) -> bool:
+    """Resolve the ``outcome_prefix_trained`` gate (plan §8.1).
+
+    When the operator passed ``--outcome-prefix-trained`` /
+    ``--no-outcome-prefix-trained`` (``explicit`` is not None), that wins.
+    Otherwise auto-detect from the checkpoint's own conditioning: a
+    checkpoint trained with an ``"outcome"`` conditioning slot runs the
+    diagnostics; one without it reports ``_skipped``. The detection reads
+    the persisted run block via :func:`conditioning_from_run_block`, the
+    single owner of the conditioning-list parsing.
+    """
+    if explicit is not None:
+        return explicit
+    return "outcome" in conditioning_from_run_block(run_block)
+
+
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="eval_generation_jax")
     ap.add_argument("--checkpoint", required=True)
     # The gate defaults to auto-detection from the checkpoint's persisted
@@ -59,13 +78,58 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--gen-n-per-outcome", type=int, default=16,
-        help="games per outcome in `outcome_signal_test` (v1's default "
-        "was 1000; we default to 16 because the JAX path doesn't yet "
-        "use a KV-cached decoder — raise as throughput allows)",
+        help="games per outcome in `outcome_signal_test` (v1's default was "
+        "1000; the default here is conservative so the suite stays fast on "
+        "a small backbone — the KV-cached decoder makes large values "
+        "tractable, so raise as throughput allows)",
     )
     ap.add_argument(
         "--gen-max-seq-len", type=int, default=32,
         help="autoregressive decode horizon for the generation suite",
+    )
+    ap.add_argument(
+        "--gen-corpus-games", type=int, default=0,
+        help="if >0, generate this many engine self-play games and run the "
+        "v1 corpus-driven diagnostics (prefix-continuation cross-"
+        "conditioning matrix, the 4 poisoning pairs, and the "
+        "impossible/improbable scenarios with their control arms) instead "
+        "of the cheap synthetic single-prefix probes (default 0: synthetic)",
+    )
+    ap.add_argument(
+        "--gen-corpus-max-ply", type=int, default=256,
+        help="per-game ply cap for the corpus-driven generation games "
+        "(default 256, matching the v1 corpus)",
+    )
+    ap.add_argument(
+        "--gen-corpus-mate-boost", type=float, default=0.0,
+        help="upweight mate-delivering moves when building the diagnostic "
+        "corpus so the checkmate buckets/scenarios are populated at small "
+        "--gen-corpus-games (default 0.0: pure uniform self-play)",
+    )
+    ap.add_argument(
+        "--gen-n-per-bucket", type=int, default=200,
+        help="games per (outcome, prefix-cut) bucket in the corpus-driven "
+        "prefix-continuation test",
+    )
+    ap.add_argument(
+        "--gen-n-per-pair", type=int, default=500,
+        help="games per poisoning pair in the corpus-driven "
+        "poisoned-prefix test",
+    )
+    ap.add_argument(
+        "--gen-n-per-scenario", type=int, default=200,
+        help="games per scenario/control arm in the corpus-driven "
+        "impossible/improbable tests",
+    )
+    ap.add_argument(
+        "--gen-decode-batch-size", type=int, default=64,
+        help="sub-batch chunk size for the corpus-driven decodes (v1 "
+        "parity: v1 always chunked at 64). Each internal autoregressive "
+        "decode is split into chunks of at most this many games so the "
+        "per-forward KV-cache / logits footprint stays bounded — without "
+        "it a --gen-n-per-pair 500 run at --gen-corpus-max-ply 256 decodes "
+        "a 500-game batch in one shot and OOMs a 20 GB GPU. Pass 0 to "
+        "disable chunking (single-shot decode)",
     )
     ap.add_argument(
         "--cache-dtype",
@@ -82,6 +146,11 @@ def main(argv: list[str] | None = None) -> int:
         "precision when --cache-dtype is bf16/fp16)",
     )
     ap.add_argument("--output", type=Path, default=None)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = _build_parser()
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
     # Enable the persistent compilation cache before any decode jit compiles
@@ -108,17 +177,37 @@ def main(argv: list[str] | None = None) -> int:
     # tokens with the matching [BOS][cond…] prefix.
     conditioning = conditioning_from_run_block(run_block)
     # Auto-detect outcome conditioning from the checkpoint's run block when
-    # the operator didn't pass an explicit gate flag.
-    if args.trained is None:
-        outcome_prefix_trained = "outcome" in conditioning
-    else:
-        outcome_prefix_trained = args.trained
+    # the operator didn't pass an explicit gate flag (resolve_outcome_gate
+    # owns the precedence rule: explicit flag > run-block detection).
+    outcome_prefix_trained = resolve_outcome_gate(args.trained, run_block)
 
+    # Optionally build the engine self-play corpus that drives the v1
+    # corpus-driven diagnostics (cross-conditioning matrix, poisoning pairs,
+    # impossible/improbable scenarios + control arms). Skipped when the gate
+    # is off — those diagnostics short-circuit to the `_skipped` sentinel.
+    gen_corpus = None
+    if args.gen_corpus_games > 0 and outcome_prefix_trained:
+        gen_corpus = build_gen_diag_corpus(
+            args.gen_corpus_games,
+            max_ply=args.gen_corpus_max_ply,
+            mate_boost=args.gen_corpus_mate_boost,
+        )
+
+    # 0 -> None disables the sub-batch chunking (single-shot decode); any
+    # positive value caps the per-forward decode batch on the corpus path.
+    decode_batch_size = (
+        args.gen_decode_batch_size if args.gen_decode_batch_size > 0 else None
+    )
     results = run_all_diagnostics(
         model,
         outcome_prefix_trained=outcome_prefix_trained,
         n_per_outcome=args.gen_n_per_outcome,
         max_seq_len=args.gen_max_seq_len,
+        corpus=gen_corpus,
+        n_per_bucket=args.gen_n_per_bucket,
+        n_per_pair=args.gen_n_per_pair,
+        n_per_scenario=args.gen_n_per_scenario,
+        decode_batch_size=decode_batch_size,
         cache_dtype=cache_dtype,
         compute_dtype=compute_dtype,
     )

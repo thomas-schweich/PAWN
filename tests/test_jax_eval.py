@@ -596,6 +596,278 @@ def test_autoregressive_generate_rejects_mismatched_low_precision_pair() -> None
 
 
 # ---------------------------------------------------------------------------
+# Generation diagnostics: corpus-driven scenarios + control arms (v1 parity)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def gen_diag_corpus():  # type: ignore[no-untyped-def]
+    """A small engine self-play corpus with enough decisive games to
+    populate the WHITE/BLACK-checkmate and ply-limit buckets the
+    corpus-driven diagnostics sample from. ``mate_boost`` upweights mate
+    lines so the checkmate buckets are non-empty at this size."""
+    from pawn.generation import build_gen_diag_corpus
+
+    return build_gen_diag_corpus(600, max_ply=120, seed=2, mate_boost=5.0)
+
+
+def test_build_gen_diag_corpus_carries_raw_term_codes() -> None:
+    """The corpus builder keeps the engine's RAW termination codes (not the
+    collapsed outcome token) so `impossible_task_test` can still single out
+    insufficient-material (code 4) from the other draw-by-rule codes."""
+    from pawn.generation import GenDiagCorpus, build_gen_diag_corpus
+
+    corpus = build_gen_diag_corpus(8, max_ply=32, seed=0)
+    assert isinstance(corpus, GenDiagCorpus)
+    assert len(corpus) == 8
+    assert corpus.move_ids.shape[0] == 8
+    assert corpus.game_lengths.shape == (8,)
+    assert corpus.term_codes.shape == (8,)
+    # Raw engine codes live in [-1, 5]; never an outcome-token id (>= 1969).
+    assert corpus.term_codes.max() < 6
+    assert corpus.term_codes.min() >= -1
+
+
+def test_poisoning_pairs_enumerates_the_four_v1_pairs() -> None:
+    """v1 parity: the poisoned-prefix test runs exactly these four
+    actual->poisoned outcome pairs (eval_suite/generation.py:543-548)."""
+    from pawn.generation import POISONING_PAIRS
+
+    assert POISONING_PAIRS == (
+        ("WHITE_CHECKMATES", "BLACK_CHECKMATES"),
+        ("WHITE_CHECKMATES", "DRAW_BY_RULE"),
+        ("DRAW_BY_RULE", "WHITE_CHECKMATES"),
+        ("PLY_LIMIT", "WHITE_CHECKMATES"),
+    )
+
+
+def test_prefix_continuation_corpus_driven_cross_conditions(gen_diag_corpus) -> None:  # type: ignore[no-untyped-def]
+    """v1 §6.4 restored: with a corpus, prefix_continuation_test builds the
+    full cross-conditioning matrix — for every populated outcome bucket and
+    every prefix cut, it AR-decodes under ALL five outcome conditionings."""
+    from pawn.generation import OUTCOME_TOKENS, prefix_continuation_test
+
+    model = init_model(TINY_SUPERNET, key=0)
+    res = prefix_continuation_test(
+        model, outcome_prefix_trained=True, corpus=gen_diag_corpus,
+        seq_len=24, n_per_bucket=8,
+        prefix_pcts=(0.5,), absolute_plies=(),
+    )
+    assert res["corpus_driven"] is True
+    buckets = res["buckets"]
+    # At least the ply-limit bucket is populated at this corpus size.
+    assert "PLY_LIMIT" in buckets
+    pct_block = buckets["PLY_LIMIT"]["pct_50"]
+    # Cross-conditioning: every outcome token was used as a conditioning
+    # input on the SAME prefixes (the off-diagonal cells are the signal).
+    assert set(pct_block.keys()) == set(OUTCOME_TOKENS)
+    for cond_name, metrics in pct_block.items():
+        assert 0.0 <= metrics["outcome_match_rate"] <= 1.0
+
+
+def test_poisoned_prefix_corpus_driven_tracks_original_match(gen_diag_corpus) -> None:  # type: ignore[no-untyped-def]
+    """v1 §6.5 restored: the corpus-driven poisoned test runs the
+    POISONING_PAIRS and reports `original_outcome_match_rate` — the
+    capitulation signal (did the continuation revert to the prefix's TRUE
+    outcome despite the contradicting poison?)."""
+    from pawn.generation import poisoned_prefix_test
+
+    model = init_model(TINY_SUPERNET, key=0)
+    res = poisoned_prefix_test(
+        model, outcome_prefix_trained=True, corpus=gen_diag_corpus,
+        seq_len=24, n_per_pair=8, prefix_pct=0.5,
+    )
+    assert res["corpus_driven"] is True
+    pairs = res["pairs"]
+    # PLY_LIMIT is populated, so the PLY_LIMIT->WHITE_CHECKMATES pair fires.
+    assert "PLY_LIMIT->WHITE_CHECKMATES" in pairs
+    entry = pairs["PLY_LIMIT->WHITE_CHECKMATES"]
+    assert entry["actual_outcome"] == "PLY_LIMIT"
+    assert entry["poisoned_outcome"] == "WHITE_CHECKMATES"
+    assert 0.0 <= entry["original_outcome_match_rate"] <= 1.0
+    # The poisoned-target match rate is still reported alongside.
+    assert 0.0 <= entry["outcome_match_rate"] <= 1.0
+
+
+def test_impossible_task_corpus_driven_has_scenarios_and_control(gen_diag_corpus) -> None:  # type: ignore[no-untyped-def]
+    """v1 §6.6 restored: corpus-driven impossible test runs the
+    zero-remaining-ply scenario AND the matched-prefix `control_ply_limit`
+    baseline (honest outcome on the same prefixes)."""
+    from pawn.generation import impossible_task_test
+
+    model = init_model(TINY_SUPERNET, key=0)
+    res = impossible_task_test(
+        model, outcome_prefix_trained=True, corpus=gen_diag_corpus,
+        seq_len=24, n_per_scenario=8,
+    )
+    assert res["corpus_driven"] is True
+    scen = res["scenarios"]
+    # Ply-limit games drive both the impossible scenario and its control.
+    assert "zero_remaining_ply" in scen
+    assert "control_ply_limit" in scen
+    assert 0.0 <= scen["zero_remaining_ply"]["outcome_match_rate"] <= 1.0
+    # The control conditions on the HONEST outcome (PLY_LIMIT), so its
+    # match rate is the baseline the impossible arm is measured against.
+    assert 0.0 <= scen["control_ply_limit"]["outcome_match_rate"] <= 1.0
+
+
+def test_improbable_task_corpus_driven_has_control_arms(gen_diag_corpus) -> None:  # type: ignore[no-untyped-def]
+    """v1 §6.7 restored: corpus-driven improbable test runs the
+    checkmate-few-ply scenario with its `control_few_ply` arm (the
+    scientific baseline that isolates the improbable-conditioning effect)."""
+    from pawn.generation import improbable_task_test
+
+    model = init_model(TINY_SUPERNET, key=0)
+    res = improbable_task_test(
+        model, outcome_prefix_trained=True, corpus=gen_diag_corpus,
+        seq_len=24, n_per_scenario=8,
+    )
+    assert res["corpus_driven"] is True
+    scen = res["scenarios"]
+    # Long games (>= min_long) drive the few-ply scenario + its control.
+    assert "checkmate_few_ply" in scen
+    assert "control_few_ply" in scen
+    assert 0.0 <= scen["checkmate_few_ply"]["forfeit_rate"] <= 1.0
+    assert 0.0 <= scen["control_few_ply"]["outcome_match_rate"] <= 1.0
+
+
+def test_run_all_diagnostics_corpus_driven_routes_four_tests(gen_diag_corpus) -> None:  # type: ignore[no-untyped-def]
+    """Passing a corpus to run_all_diagnostics switches the four
+    corpus-capable diagnostics into their v1 multi-scenario mode while
+    keeping all five gate-checked entries."""
+    from pawn.generation import DIAGNOSTIC_NAMES, run_all_diagnostics
+
+    model = init_model(TINY_SUPERNET, key=0)
+    results = run_all_diagnostics(
+        model, outcome_prefix_trained=True, corpus=gen_diag_corpus,
+        n_per_outcome=2, max_seq_len=24,
+        n_per_bucket=8, n_per_pair=8, n_per_scenario=8,
+    )
+    assert set(results.keys()) == set(DIAGNOSTIC_NAMES)
+    # The four corpus-capable diagnostics report corpus_driven=True.
+    for name in (
+        "prefix_continuation_test", "poisoned_prefix_test",
+        "impossible_task_test", "improbable_task_test",
+    ):
+        assert results[name]["corpus_driven"] is True
+
+
+def test_run_all_diagnostics_corpus_driven_skips_when_gate_off(gen_diag_corpus) -> None:  # type: ignore[no-untyped-def]
+    """The outcome-prefix gate still dominates: even with a corpus wired
+    in, gate=False returns the `_skipped` sentinel for every diagnostic."""
+    from pawn.generation import DIAGNOSTIC_NAMES, run_all_diagnostics
+
+    model = init_model(TINY_SUPERNET, key=0)
+    results = run_all_diagnostics(
+        model, outcome_prefix_trained=False, corpus=gen_diag_corpus,
+        n_per_outcome=2, max_seq_len=24,
+    )
+    for name in DIAGNOSTIC_NAMES:
+        assert "_skipped" in results[name]
+
+
+def test_autoregressive_generate_sub_batch_chunking() -> None:
+    """v1 parity: `batch_size` chunks a large `n_games` decode into
+    bounded sub-batches and concatenates the per-chunk results, so the
+    output shapes match an unchunked run of the same size."""
+    from pawn.generation import WHITE_CHECKMATES, autoregressive_generate
+
+    model = init_model(TINY_SUPERNET, key=0)
+    gen = autoregressive_generate(
+        model, WHITE_CHECKMATES, n_games=5,
+        mask_illegal=True, max_seq_len=10, seed=0, batch_size=2,
+    )
+    # 5 games in chunks of 2 -> 3 chunks (2+2+1), concatenated to 5 rows.
+    assert gen["sequences"].shape == (5, 10)
+    assert gen["term_codes"].shape == (5,)
+    assert gen["game_lengths"].shape == (5,)
+    assert gen["forfeit_ply"].shape == (5,)
+    # The scalar prefix-width invariant survives concatenation.
+    assert int(gen["conditioning_offset"]) == 2
+    # Every game still carries the C-wide [BOS][outcome] prefix.
+    assert (gen["sequences"][:, 0] == BOS_TOKEN).all()
+    assert (gen["sequences"][:, 1] == WHITE_CHECKMATES).all()
+
+
+def test_corpus_poisoned_prefix_chunked_matches_unchunked_shapes(gen_diag_corpus) -> None:  # type: ignore[no-untyped-def]
+    """The corpus-driven path threads `decode_batch_size` into every
+    internal AR decode (the v1 OOM-avoidance knob). A run whose
+    `n_per_pair` EXCEEDS the chunk size produces the same per-pair result
+    structure as an unchunked (`decode_batch_size=None`) run — proving the
+    chunking is wired on the real corpus path, not just reachable from its
+    unit test."""
+    model = init_model(TINY_SUPERNET, key=0)
+    # n_per_pair=6 with a chunk of 2 -> 3 sub-batches per pair.
+    chunked = poisoned_prefix_test(
+        model,
+        outcome_prefix_trained=True,
+        corpus=gen_diag_corpus,
+        seq_len=24,
+        n_per_pair=6,
+        prefix_pct=0.5,
+        decode_batch_size=2,
+    )
+    unchunked = poisoned_prefix_test(
+        model,
+        outcome_prefix_trained=True,
+        corpus=gen_diag_corpus,
+        seq_len=24,
+        n_per_pair=6,
+        prefix_pct=0.5,
+        decode_batch_size=None,
+    )
+    assert chunked["corpus_driven"] is True
+    # Same set of populated pairs and the same per-pair metric keys/shapes.
+    assert set(chunked["pairs"]) == set(unchunked["pairs"])
+    assert chunked["pairs"], "expected at least one populated poisoning pair"
+    for label, entry in chunked["pairs"].items():
+        ref = unchunked["pairs"][label]
+        assert set(entry) == set(ref)
+        assert entry["n_games"] == ref["n_games"] == 6
+        assert 0.0 <= entry["original_outcome_match_rate"] <= 1.0
+
+
+def test_impossible_control_reuses_scenario1_prefixes(gen_diag_corpus, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Defect fix: the `control_ply_limit` arm must REPLAY the exact
+    Scenario-1 zero-remaining-ply prefixes (only the conditioning outcome
+    differs), not independently re-derive them. We capture the
+    `prefix_moves` / `prefix_lengths` of every AR decode and assert the
+    control's prefixes are byte-identical to Scenario 1's."""
+    import pawn.generation as gen_mod
+
+    model = init_model(TINY_SUPERNET, key=0)
+    captured: list[tuple[int, np.ndarray | None, np.ndarray | None]] = []
+    real = gen_mod.autoregressive_generate
+
+    def spy(model_, outcome_token, n_games, **kw):  # type: ignore[no-untyped-def]
+        pm = kw.get("prefix_moves")
+        pl = kw.get("prefix_lengths")
+        captured.append((
+            int(outcome_token),
+            np.array(pm) if pm is not None else None,
+            np.array(pl) if pl is not None else None,
+        ))
+        return real(model_, outcome_token, n_games, **kw)
+
+    monkeypatch.setattr(gen_mod, "autoregressive_generate", spy)
+    res = gen_mod.impossible_task_test(
+        model, outcome_prefix_trained=True, corpus=gen_diag_corpus,
+        seq_len=24, n_per_scenario=8, decode_batch_size=None,
+    )
+    assert "zero_remaining_ply" in res["scenarios"]
+    assert "control_ply_limit" in res["scenarios"]
+
+    # Scenario 1 conditions on WHITE_CHECKMATES; the control is the decode
+    # conditioned on PLY_LIMIT — its prefixes must be byte-identical.
+    scenario1 = next(c for c in captured if c[0] == gen_mod.WHITE_CHECKMATES)
+    control = next(c for c in captured if c[0] == gen_mod.PLY_LIMIT)
+    assert scenario1[1] is not None
+    assert control[1] is not None
+    np.testing.assert_array_equal(control[1], scenario1[1])
+    np.testing.assert_array_equal(control[2], scenario1[2])
+
+
+# ---------------------------------------------------------------------------
 # Linear probes
 # ---------------------------------------------------------------------------
 

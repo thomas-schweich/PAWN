@@ -2099,3 +2099,46 @@ def test_adapter_bottleneck_n_hidden_cli_flag() -> None:
     )
     cfg = mod._build_config(args)
     assert cfg.bottleneck_n_hidden == 2
+
+
+def test_eval_generation_gate_auto_detects_from_run_block() -> None:
+    """Parity item ``gen-auto-detect``: `eval_generation_jax` auto-detects
+    `outcome_prefix_trained` from the checkpoint's persisted conditioning
+    when no explicit gate flag is passed. A run block with an "outcome"
+    conditioning slot runs the diagnostics; one without it skips."""
+    mod = _load_script("eval_generation_jax")
+    # No explicit flag (None) -> detect from the run block.
+    assert mod.resolve_outcome_gate(None, {"conditioning": ["outcome"]}) is True
+    assert mod.resolve_outcome_gate(None, {"conditioning": []}) is False
+    # A checkpoint that predates the conditioning prefix (no run block /
+    # missing key) detects as not-outcome-trained.
+    assert mod.resolve_outcome_gate(None, None) is False
+    assert mod.resolve_outcome_gate(None, {}) is False
+
+
+def test_eval_generation_accepts_gen_decode_batch_size_flag() -> None:
+    """Parity item ``gen-no-sub-batch-chunking``: the operator escape hatch
+    `--gen-decode-batch-size` is wired through to bound the corpus-driven
+    decode footprint. It defaults to v1's chunk of 64 and parses a custom
+    value (0 = disable chunking, mapped to None at the call site)."""
+    mod = _load_script("eval_generation_jax")
+    ap = mod._build_parser()
+    # Default is v1's hard-coded chunk size.
+    defaults = ap.parse_args(["--checkpoint", "x"])
+    assert defaults.gen_decode_batch_size == 64
+    # Custom value round-trips.
+    custom = ap.parse_args(["--checkpoint", "x", "--gen-decode-batch-size", "16"])
+    assert custom.gen_decode_batch_size == 16
+
+
+def test_eval_generation_gate_explicit_flag_overrides_detection() -> None:
+    """The explicit `--outcome-prefix-trained` / `--no-...` flag wins over
+    auto-detection in both directions, so an operator can force the skip
+    path on an outcome-trained checkpoint (parity check) or force the run
+    path on a checkpoint whose run block is absent."""
+    mod = _load_script("eval_generation_jax")
+    # Explicit False beats an outcome-trained run block.
+    assert mod.resolve_outcome_gate(False, {"conditioning": ["outcome"]}) is False
+    # Explicit True beats an absent / non-outcome run block.
+    assert mod.resolve_outcome_gate(True, None) is True
+    assert mod.resolve_outcome_gate(True, {"conditioning": []}) is True

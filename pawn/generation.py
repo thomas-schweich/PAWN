@@ -40,6 +40,7 @@ KV-cache parity test).
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, cast
 
 import jax
@@ -77,6 +78,9 @@ _OUTCOME_CONDITIONING: Sequence[str] = ("outcome",)
 __all__ = [
     "DIAGNOSTIC_NAMES",
     "OUTCOME_TOKENS",
+    "POISONING_PAIRS",
+    "GenDiagCorpus",
+    "build_gen_diag_corpus",
     "autoregressive_generate",
     "analyze_generated_games",
     "outcome_signal_test",
@@ -95,6 +99,16 @@ DIAGNOSTIC_NAMES = (
     "impossible_task_test",
     "improbable_task_test",
 )
+
+
+# v1 parity: the corpus-driven diagnostics decode their per-bucket /
+# per-pair / per-scenario batches in chunks of this many games (v1's
+# ``autoregressive_generate`` hard-coded ``batch_size=64`` and ALWAYS
+# chunked). Bounding the per-forward batch keeps the live KV-cache /
+# logits footprint inside accelerator memory at production scale
+# (``n_per_pair=500`` at ``max_seq_len=256`` would otherwise decode a
+# 500-game batch in one shot and OOM a 20 GB GPU).
+DEFAULT_DECODE_BATCH_SIZE = 64
 
 
 # v1 parity: the 5 natural-termination outcome tokens used as
@@ -120,6 +134,119 @@ _SKIP_REASON = (
 
 def _skipped(name: str) -> dict[str, Any]:
     return {"_skipped": _SKIP_REASON, "diagnostic": name}
+
+
+# ---------------------------------------------------------------------------
+# Corpus-driven scenario harness (v1 parity)
+# ---------------------------------------------------------------------------
+#
+# v1 (``pawn/eval_suite/generation.py``) drove ``prefix_continuation_test``,
+# ``poisoned_prefix_test``, ``impossible_task_test`` and
+# ``improbable_task_test`` from a real corpus of engine self-play games,
+# sampling per-outcome buckets / poisoning pairs / impossible-task scenarios
+# off the games' ``(move_ids, game_lengths, termination_codes)``. The v2
+# ports collapsed these to a single synthetic ``prefix=[5,10]`` probe, which
+# the parity audit flagged as a scope reduction (V2_PARITY_AUDIT.md rows
+# 55-58, 70). This dataclass + builder restore the corpus the harness
+# samples from — the engine's raw ``(move_ids, game_lengths, term_codes)``,
+# the exact triple v1's ``corpus`` dict carried. We keep the *raw* term
+# codes (not the collapsed outcome token) so the impossible-task scenario
+# can still distinguish ``InsufficientMaterial`` (code 4) from the other
+# draw-by-rule terminations, matching v1.
+
+
+@dataclass(frozen=True, slots=True)
+class GenDiagCorpus:
+    """Engine self-play games for the corpus-driven generation diagnostics.
+
+    Carries the same three arrays v1's ``corpus`` dict did:
+
+        move_ids:     ``(N, max_ply)`` int16 — per-game action tokens, PAD
+                      past ``game_lengths[i]``.
+        game_lengths: ``(N,)`` int32 — real-move count per game.
+        term_codes:   ``(N,)`` int8 — engine termination code (0 checkmate,
+                      1 stalemate, 2 75-move, 3 fivefold, 4 insufficient
+                      material, 5 ply-limit). Kept raw (not collapsed to an
+                      outcome token) so :func:`impossible_task_test` can pick
+                      out insufficient-material games specifically.
+    """
+
+    move_ids: np.ndarray
+    game_lengths: np.ndarray
+    term_codes: np.ndarray
+
+    def __len__(self) -> int:
+        return int(self.move_ids.shape[0])
+
+
+def build_gen_diag_corpus(
+    n_games: int,
+    *,
+    max_ply: int = 256,
+    seed: int = 0,
+    mate_boost: float = 0.0,
+) -> GenDiagCorpus:
+    """Generate ``n_games`` engine self-play games for the corpus-driven
+    diagnostics.
+
+    Thin wrapper over :func:`chess_engine.generate_random_games` that keeps
+    the raw ``(move_ids, game_lengths, term_codes)`` triple the diagnostics
+    sample buckets / pairs / scenarios from. ``mate_boost`` upweights
+    mate-delivering moves (parity with
+    :func:`pawn.corpus.generate_corpus`), which is the practical way to get
+    enough checkmate-terminated games for the WHITE/BLACK-checkmate buckets
+    at small ``n_games``.
+    """
+    if n_games <= 0:
+        raise ValueError(f"n_games must be positive, got {n_games}")
+    move_ids, game_lengths, term_codes = engine.generate_random_games(
+        n_games, max_ply, seed,
+        discard_ply_limit=False, mate_boost=mate_boost,
+    )
+    return GenDiagCorpus(
+        move_ids=np.asarray(move_ids, dtype=np.int16),
+        game_lengths=np.asarray(game_lengths, dtype=np.int32),
+        term_codes=np.asarray(term_codes, dtype=np.int8),
+    )
+
+
+def _outcome_mask(
+    term_codes: np.ndarray, game_lengths: np.ndarray, outcome_name: str
+) -> np.ndarray:
+    """Boolean mask of games whose engine termination matches ``outcome_name``.
+
+    v1 parity (``eval_suite/generation.py:_outcome_mask``): the checkmate
+    side is read off ``game_lengths`` parity (odd ⇒ white delivered the
+    mate, even ⇒ black), the three draw-by-rule codes (2/3/4) collapse to
+    ``DRAW_BY_RULE``, and code 5 is ``PLY_LIMIT``.
+    """
+    term = np.asarray(term_codes)
+    gl = np.asarray(game_lengths)
+    if outcome_name == "WHITE_CHECKMATES":
+        return (term == 0) & (gl % 2 == 1)
+    if outcome_name == "BLACK_CHECKMATES":
+        return (term == 0) & (gl % 2 == 0)
+    if outcome_name == "STALEMATE":
+        return term == 1
+    if outcome_name == "DRAW_BY_RULE":
+        return (term == 2) | (term == 3) | (term == 4)
+    if outcome_name == "PLY_LIMIT":
+        return term == 5
+    return np.zeros(len(term), dtype=bool)
+
+
+# v1 parity (``eval_suite/generation.py:543-548``): the four
+# actual→poisoned outcome pairs the poisoned-prefix test runs. Each pair
+# feeds the model a prefix that *actually* ended in ``actual`` while
+# conditioning on the contradicting ``poisoned`` outcome — the
+# ``original_outcome_match_rate`` then measures whether the model
+# "capitulates" to the poison or holds the prefix's true trajectory.
+POISONING_PAIRS: tuple[tuple[str, str], ...] = (
+    ("WHITE_CHECKMATES", "BLACK_CHECKMATES"),
+    ("WHITE_CHECKMATES", "DRAW_BY_RULE"),
+    ("DRAW_BY_RULE", "WHITE_CHECKMATES"),
+    ("PLY_LIMIT", "WHITE_CHECKMATES"),
+)
 
 
 def _argmax_action(logits: Float[Array, "B T V"]) -> Int[Array, "B T"]:
@@ -200,6 +327,7 @@ def autoregressive_generate(
     max_seq_len: int | None = None,
     temperature: float = 1.0,
     seed: int = 0,
+    batch_size: int | None = None,
     use_kv_cache: bool | None = None,
     cache_dtype: jnp.dtype | None = None,
     compute_dtype: jnp.dtype | None = None,
@@ -258,9 +386,58 @@ def autoregressive_generate(
     ``mask_illegal=True`` forces every sampled token to be a legal move
     in the current position; ``False`` permits the model to sample an
     illegal move (recorded as a forfeit termination, code -3).
+
+    ``batch_size`` (default ``None`` = one shot): when set and smaller than
+    ``n_games``, the decode is split into sub-batches of at most
+    ``batch_size`` games and the per-chunk result dicts are concatenated.
+    This bounds the live KV-cache / logits footprint (parity with v1's
+    ``batch_size=64`` chunking), so production-scale ``n_games`` runs stay
+    inside accelerator memory. Each chunk uses ``seed + chunk_index`` so the
+    chunked run is deterministic; it is *not* bit-identical to the unchunked
+    run (the env / Gumbel RNG streams differ per chunk), which is fine — the
+    chunked path is a memory-management knob, not a correctness one.
     """
     if max_seq_len is None:
         max_seq_len = model.cfg.max_seq_len
+
+    # ---- Sub-batch chunking (v1 parity) -----------------------------------
+    # Split large ``n_games`` runs so the KV cache / logits buffers for any
+    # one forward stay bounded. Each chunk is a full, self-contained decode
+    # (its own env + RNG), and the per-chunk dicts concatenate on the game
+    # axis. ``conditioning_offset`` is a scalar invariant across chunks.
+    if batch_size is not None and 0 < batch_size < n_games:
+        chunks: list[dict[str, np.ndarray]] = []
+        for ci, start in enumerate(range(0, n_games, batch_size)):
+            end = min(start + batch_size, n_games)
+            chunks.append(
+                autoregressive_generate(
+                    model, outcome_token, end - start,
+                    mask_illegal=mask_illegal,
+                    prefix_moves=(
+                        prefix_moves[start:end]
+                        if prefix_moves is not None else None
+                    ),
+                    prefix_lengths=(
+                        prefix_lengths[start:end]
+                        if prefix_lengths is not None else None
+                    ),
+                    max_seq_len=max_seq_len,
+                    temperature=temperature,
+                    seed=seed + ci,
+                    batch_size=None,
+                    use_kv_cache=use_kv_cache,
+                    cache_dtype=cache_dtype,
+                    compute_dtype=compute_dtype,
+                    conditioning=conditioning,
+                )
+            )
+        out: dict[str, np.ndarray] = {}
+        for key in chunks[0]:
+            if key == "conditioning_offset":
+                out[key] = chunks[0][key]
+            else:
+                out[key] = np.concatenate([c[key] for c in chunks], axis=0)
+        return out
 
     # Cache dtype default: track ``compute_dtype`` rather than forcing
     # fp32. Production decode at ``n_per_outcome=1000`` is memory-
@@ -616,28 +793,140 @@ def outcome_signal_test(
     return out
 
 
+def _corpus_prefix_continuation(
+    model: "PAWNModel | EffectiveCallable",
+    corpus: GenDiagCorpus,
+    *,
+    seq_len: int,
+    n_per_bucket: int,
+    prefix_pcts: tuple[float, ...],
+    absolute_plies: tuple[int, ...],
+    decode_batch_size: int | None,
+    cache_dtype: jnp.dtype | None,
+    compute_dtype: jnp.dtype | None,
+) -> dict[str, Any]:
+    """v1 §6.4 corpus-driven prefix continuation with cross-conditioning.
+
+    For every natural outcome bucket (games that actually ended that way),
+    sample ``n_per_bucket`` games, cut prefixes at each ``prefix_pcts``
+    fraction and each ``absolute_plies`` cutoff, and — for each cut —
+    AR-decode continuations under *all five* outcome conditionings (the
+    cross-conditioning matrix). The diagonal (cond == actual outcome) is
+    the in-distribution control; off-diagonal cells measure how strongly the
+    outcome token steers the continuation. Returns
+    ``results[outcome][bucket][cond] = metrics``.
+    """
+    move_ids = corpus.move_ids
+    game_lengths = corpus.game_lengths
+    term_codes = corpus.term_codes
+
+    results: dict[str, Any] = {}
+    for outcome_name in OUTCOME_TOKENS:
+        mask = _outcome_mask(term_codes, game_lengths, outcome_name)
+        indices = np.where(mask)[0]
+        if len(indices) < n_per_bucket:
+            continue
+        rng = np.random.default_rng(42)
+        selected = rng.choice(indices, n_per_bucket, replace=False)
+        bucket_block: dict[str, Any] = {}
+
+        # Percentage-of-game-length prefix buckets.
+        for pct in prefix_pcts:
+            bucket_name = f"pct_{int(pct * 100)}"
+            prefix_lens = np.maximum(
+                (game_lengths[selected] * pct).astype(np.int32), 1
+            )
+            cond_block: dict[str, Any] = {}
+            for cond_name, cond_tok in OUTCOME_TOKENS.items():
+                gen = autoregressive_generate(
+                    model, cond_tok, n_per_bucket,
+                    mask_illegal=True,
+                    prefix_moves=move_ids[selected],
+                    prefix_lengths=prefix_lens,
+                    max_seq_len=seq_len, batch_size=decode_batch_size,
+                    cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+                )
+                cond_block[cond_name] = analyze_generated_games(gen, cond_name)
+            bucket_block[bucket_name] = cond_block
+
+        # Absolute-ply prefix buckets (only games long enough to cut there).
+        for abs_ply in absolute_plies:
+            bucket_name = f"ply_{abs_ply}"
+            long_enough = selected[game_lengths[selected] > abs_ply]
+            if len(long_enough) < 10:
+                continue
+            sub = long_enough[:n_per_bucket]
+            prefix_lens = np.full(len(sub), abs_ply, dtype=np.int32)
+            cond_block = {}
+            for cond_name, cond_tok in OUTCOME_TOKENS.items():
+                gen = autoregressive_generate(
+                    model, cond_tok, len(sub),
+                    mask_illegal=True,
+                    prefix_moves=move_ids[sub],
+                    prefix_lengths=prefix_lens,
+                    max_seq_len=seq_len, batch_size=decode_batch_size,
+                    cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+                )
+                cond_block[cond_name] = analyze_generated_games(gen, cond_name)
+            bucket_block[bucket_name] = cond_block
+
+        results[outcome_name] = bucket_block
+
+    return {
+        "diagnostic": "prefix_continuation_test",
+        "corpus_driven": True,
+        "buckets": results,
+    }
+
+
 def prefix_continuation_test(
     model: "PAWNModel | EffectiveCallable",
-    prefix: Int[Array, "P"] | np.ndarray,
-    outcome_token: int,
+    prefix: Int[Array, "P"] | np.ndarray | None = None,
+    outcome_token: int | None = None,
     *,
     outcome_prefix_trained: bool,
+    corpus: GenDiagCorpus | None = None,
     seq_len: int = 32,
     n_continuations: int = 8,
+    n_per_bucket: int = 200,
+    prefix_pcts: tuple[float, ...] = (0.1, 0.5, 0.9),
+    absolute_plies: tuple[int, ...] = (10, 50, 100, 200),
     ar: bool = True,
+    decode_batch_size: int | None = DEFAULT_DECODE_BATCH_SIZE,
     cache_dtype: jnp.dtype | None = None,
     compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, Any]:
-    """Given an outcome + the first P moves, does the model continue?
+    """Given an outcome + a move prefix, does the model continue plausibly?
 
-    With ``ar=True`` (default) this AR-decodes ``n_continuations`` real
-    games from the prefix and returns the analysis metrics. The old
-    single-shot next-move argmax is kept under ``next_move_argmax`` so
-    callers that just want the first prediction don't pay for AR
-    decode.
+    Two modes:
+
+    - **Corpus-driven (v1 §6.4 parity)** — pass ``corpus``: for every
+      natural-outcome bucket of real games, AR-decode continuations from
+      ``prefix_pcts`` / ``absolute_plies`` cut points under *all five*
+      outcome conditionings (the cross-conditioning matrix). ``prefix`` /
+      ``outcome_token`` are ignored in this mode.
+    - **Synthetic single-prefix (fast probe)** — omit ``corpus``: AR-decode
+      ``n_continuations`` games from the one supplied ``prefix`` +
+      ``outcome_token`` and report the metrics plus the cheap single-shot
+      ``next_move_argmax``. This is the cheap default the bundled
+      :func:`run_all_diagnostics` runs when no corpus is wired in.
     """
     if not outcome_prefix_trained:
         return _skipped("prefix_continuation_test")
+
+    if corpus is not None:
+        return _corpus_prefix_continuation(
+            model, corpus, seq_len=seq_len, n_per_bucket=n_per_bucket,
+            prefix_pcts=prefix_pcts, absolute_plies=absolute_plies,
+            decode_batch_size=decode_batch_size,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+        )
+
+    if prefix is None or outcome_token is None:
+        raise ValueError(
+            "prefix_continuation_test needs either a `corpus` (corpus-driven "
+            "mode) or both `prefix` and `outcome_token` (synthetic mode)"
+        )
     prefix_np = np.asarray(prefix, dtype=np.int32)
     p = int(prefix_np.shape[0])
 
@@ -672,23 +961,118 @@ def prefix_continuation_test(
     return result
 
 
+def _corpus_poisoned_prefix(
+    model: "PAWNModel | EffectiveCallable",
+    corpus: GenDiagCorpus,
+    *,
+    seq_len: int,
+    n_per_pair: int,
+    prefix_pct: float,
+    decode_batch_size: int | None,
+    cache_dtype: jnp.dtype | None,
+    compute_dtype: jnp.dtype | None,
+) -> dict[str, Any]:
+    """v1 §6.5 corpus-driven poisoned-prefix test over all 4 POISONING_PAIRS.
+
+    For each ``(actual, poisoned)`` pair: take real games that ended in
+    ``actual``, cut a ``prefix_pct`` prefix, then AR-decode under the
+    *contradicting* ``poisoned`` outcome. The headline capitulation signal
+    is ``original_outcome_match_rate`` — the fraction of continuations that
+    still landed on the prefix's true ``actual`` outcome despite the poison.
+    """
+    move_ids = corpus.move_ids
+    game_lengths = corpus.game_lengths
+    term_codes = corpus.term_codes
+
+    results: dict[str, Any] = {}
+    for actual_name, poisoned_name in POISONING_PAIRS:
+        label = f"{actual_name}->{poisoned_name}"
+        mask = _outcome_mask(term_codes, game_lengths, actual_name)
+        indices = np.where(mask)[0]
+        if len(indices) < n_per_pair:
+            continue
+        rng = np.random.default_rng(43)
+        selected = rng.choice(indices, n_per_pair, replace=False)
+        prefix_lens = np.maximum(
+            (game_lengths[selected] * prefix_pct).astype(np.int32), 1
+        )
+        poisoned_tok = OUTCOME_TOKENS[poisoned_name]
+        gen = autoregressive_generate(
+            model, poisoned_tok, n_per_pair,
+            mask_illegal=True,
+            prefix_moves=move_ids[selected],
+            prefix_lengths=prefix_lens,
+            max_seq_len=seq_len, batch_size=decode_batch_size,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+        )
+        analysis = analyze_generated_games(gen, poisoned_name)
+        # Capitulation signal: did the continuation revert to the prefix's
+        # ACTUAL outcome despite being poisoned with a different one?
+        original_match = 0
+        for i in range(len(gen["term_codes"])):
+            recovered = _map_term_code_to_outcome_name(
+                int(gen["term_codes"][i]), int(gen["game_lengths"][i])
+            )
+            if recovered == actual_name:
+                original_match += 1
+        analysis["original_outcome_match_rate"] = original_match / max(
+            1, n_per_pair
+        )
+        analysis["actual_outcome"] = actual_name
+        analysis["poisoned_outcome"] = poisoned_name
+        results[label] = analysis
+
+    return {
+        "diagnostic": "poisoned_prefix_test",
+        "corpus_driven": True,
+        "pairs": results,
+    }
+
+
 def poisoned_prefix_test(
     model: "PAWNModel | EffectiveCallable",
-    true_prefix: Int[Array, "P"] | np.ndarray,
-    poisoned_outcome: int,
+    true_prefix: Int[Array, "P"] | np.ndarray | None = None,
+    poisoned_outcome: int | None = None,
     *,
     outcome_prefix_trained: bool,
+    corpus: GenDiagCorpus | None = None,
     seq_len: int = 32,
     n_continuations: int = 8,
+    n_per_pair: int = 500,
+    prefix_pct: float = 0.5,
+    decode_batch_size: int | None = DEFAULT_DECODE_BATCH_SIZE,
     cache_dtype: jnp.dtype | None = None,
     compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, Any]:
-    """Prefix continuation with an outcome token that contradicts the
-    actual game (e.g. white-checkmates moves paired with a
-    black-checkmates outcome). Tests whether the model "capitulates"
-    to the poisoned outcome."""
+    """Prefix continuation with an outcome token that contradicts the game.
+
+    Two modes:
+
+    - **Corpus-driven (v1 §6.5 parity)** — pass ``corpus``: run all four
+      :data:`POISONING_PAIRS`, reporting ``original_outcome_match_rate``
+      (the capitulation signal) per pair. ``true_prefix`` /
+      ``poisoned_outcome`` are ignored in this mode.
+    - **Synthetic single-pair (fast probe)** — omit ``corpus``: poison the
+      supplied ``true_prefix`` with ``poisoned_outcome`` and AR-decode
+      ``n_continuations`` games. This is the cheap default
+      :func:`run_all_diagnostics` runs.
+    """
     if not outcome_prefix_trained:
         return _skipped("poisoned_prefix_test")
+
+    if corpus is not None:
+        return _corpus_poisoned_prefix(
+            model, corpus, seq_len=seq_len, n_per_pair=n_per_pair,
+            prefix_pct=prefix_pct, decode_batch_size=decode_batch_size,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+        )
+
+    if true_prefix is None or poisoned_outcome is None:
+        raise ValueError(
+            "poisoned_prefix_test needs either a `corpus` (corpus-driven "
+            "mode) or both `true_prefix` and `poisoned_outcome` (synthetic "
+            "mode)"
+        )
     inner = prefix_continuation_test(
         model, true_prefix, poisoned_outcome,
         outcome_prefix_trained=True, seq_len=seq_len,
@@ -699,21 +1083,136 @@ def poisoned_prefix_test(
     return inner
 
 
+def _corpus_impossible_task(
+    model: "PAWNModel | EffectiveCallable",
+    corpus: GenDiagCorpus,
+    *,
+    seq_len: int,
+    n_per_scenario: int,
+    decode_batch_size: int | None,
+    cache_dtype: jnp.dtype | None,
+    compute_dtype: jnp.dtype | None,
+) -> dict[str, Any]:
+    """v1 §6.6 corpus-driven impossible-task scenarios + control arm.
+
+    Scenario 1 (``zero_remaining_ply``): take ply-limit games, feed (nearly)
+    the whole game as prefix, then condition on ``WHITE_CHECKMATES`` — there
+    is no room left to deliver mate. Scenario 2 (``insufficient_material``):
+    feed a 90% prefix of insufficient-material draws and condition on
+    checkmate (mate is impossible with the material on the board). The
+    ``control_ply_limit`` arm replays the same zero-remaining-ply prefixes
+    but conditions on the *honest* ``PLY_LIMIT`` outcome — the matched
+    baseline that isolates the impossible-conditioning effect.
+    """
+    move_ids = corpus.move_ids
+    game_lengths = corpus.game_lengths
+    term_codes = corpus.term_codes
+    cap = seq_len - 2  # leave at least one move slot past the prefix
+
+    results: dict[str, Any] = {}
+
+    # Scenario 1: zero remaining ply (prefix = (almost) the full game).
+    # ``selected_s1`` / ``prefix_lens_s1`` are saved so the control arm
+    # below replays the *exact* same prefixes (reuse, not re-derivation —
+    # the control's only job is to swap the conditioning to the honest
+    # PLY_LIMIT outcome).
+    ply_limit_idx = np.where(term_codes == 5)[0]
+    have_scenario1 = len(ply_limit_idx) >= n_per_scenario
+    selected_s1: np.ndarray = np.empty(0, dtype=np.int64)
+    prefix_lens_s1: np.ndarray = np.empty(0, dtype=np.int32)
+    if have_scenario1:
+        rng = np.random.default_rng(44)
+        selected_s1 = rng.choice(ply_limit_idx, n_per_scenario, replace=False)
+        prefix_lens_s1 = np.minimum(
+            game_lengths[selected_s1].astype(np.int32), cap
+        )
+        gen = autoregressive_generate(
+            model, WHITE_CHECKMATES, n_per_scenario,
+            mask_illegal=True,
+            prefix_moves=move_ids[selected_s1], prefix_lengths=prefix_lens_s1,
+            max_seq_len=seq_len, batch_size=decode_batch_size,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+        )
+        results["zero_remaining_ply"] = analyze_generated_games(
+            gen, "WHITE_CHECKMATES"
+        )
+
+    # Scenario 2: insufficient-material draws conditioned on checkmate.
+    insuf_idx = np.where(term_codes == 4)[0]
+    if len(insuf_idx) >= n_per_scenario:
+        rng = np.random.default_rng(45)
+        selected = rng.choice(insuf_idx, n_per_scenario, replace=False)
+        prefix_lens = np.maximum(
+            (game_lengths[selected] * 0.9).astype(np.int32), 1
+        )
+        prefix_lens = np.minimum(prefix_lens, cap)
+        gen = autoregressive_generate(
+            model, WHITE_CHECKMATES, n_per_scenario,
+            mask_illegal=True,
+            prefix_moves=move_ids[selected], prefix_lengths=prefix_lens,
+            max_seq_len=seq_len, batch_size=decode_batch_size,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+        )
+        results["insufficient_material"] = analyze_generated_games(
+            gen, "WHITE_CHECKMATES"
+        )
+
+    # Control: the SAME zero-remaining-ply prefixes (reused from Scenario 1),
+    # honest PLY_LIMIT conditioning. This is the matched baseline — the only
+    # difference from Scenario 1 is the conditioning outcome, so the
+    # match-rate gap isolates the impossible-conditioning effect.
+    if have_scenario1:
+        gen = autoregressive_generate(
+            model, PLY_LIMIT, n_per_scenario,
+            mask_illegal=True,
+            prefix_moves=move_ids[selected_s1], prefix_lengths=prefix_lens_s1,
+            max_seq_len=seq_len, batch_size=decode_batch_size,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+        )
+        results["control_ply_limit"] = analyze_generated_games(gen, "PLY_LIMIT")
+
+    return {
+        "diagnostic": "impossible_task_test",
+        "corpus_driven": True,
+        "scenarios": results,
+    }
+
+
 def impossible_task_test(
     model: "PAWNModel | EffectiveCallable",
     *,
     outcome_prefix_trained: bool,
+    corpus: GenDiagCorpus | None = None,
     seq_len: int = 16,
     n_games: int = 16,
+    n_per_scenario: int = 200,
+    decode_batch_size: int | None = DEFAULT_DECODE_BATCH_SIZE,
     cache_dtype: jnp.dtype | None = None,
     compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, Any]:
-    """Outcome conditioning = 'white checkmates' but no opening move can
-    deliver mate-in-1. Reports the top-1 prob + entropy of the model's
-    first-move distribution AND, when ``n_games > 0``, the
-    autoregressive analysis (forfeit rate is the headline)."""
+    """Outcome conditioning = 'white checkmates' under impossible conditions.
+
+    Two modes:
+
+    - **Corpus-driven (v1 §6.6 parity)** — pass ``corpus``: run the
+      ``zero_remaining_ply`` and ``insufficient_material`` scenarios plus
+      the ``control_ply_limit`` matched-prefix baseline (see
+      :func:`_corpus_impossible_task`).
+    - **Synthetic (fast probe)** — omit ``corpus``: condition on
+      ``WHITE_CHECKMATES`` from the opening (no opening move can deliver
+      mate-in-1), reporting the first-move top-1 prob + entropy and, when
+      ``n_games > 0``, the AR analysis (forfeit rate is the headline).
+    """
     if not outcome_prefix_trained:
         return _skipped("impossible_task_test")
+
+    if corpus is not None:
+        return _corpus_impossible_task(
+            model, corpus, seq_len=seq_len, n_per_scenario=n_per_scenario,
+            decode_batch_size=decode_batch_size,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+        )
+
     # First-move prediction lives at the last prefix slot ``C-1``.
     tokens, attn, C = _single_row_prefixed(WHITE_CHECKMATES, seq_len)  # noqa: N806
     logits = model(tokens, attn, compute_dtype=compute_dtype)
@@ -733,17 +1232,126 @@ def impossible_task_test(
     return result
 
 
+def _corpus_improbable_task(
+    model: "PAWNModel | EffectiveCallable",
+    corpus: GenDiagCorpus,
+    *,
+    seq_len: int,
+    n_per_scenario: int,
+    decode_batch_size: int | None,
+    cache_dtype: jnp.dtype | None,
+    compute_dtype: jnp.dtype | None,
+) -> dict[str, Any]:
+    """v1 §6.7 corpus-driven improbable-task scenarios + control arms.
+
+    Scenario 1 (``checkmate_few_ply``): long games cut a few ply before the
+    end, conditioned on ``WHITE_CHECKMATES`` (mate in the last handful of
+    ply is improbable but not impossible). Its ``control_few_ply`` arm
+    replays the same prefixes under the most-likely ``PLY_LIMIT`` outcome.
+    Scenario 2 (``stalemate_early``): a short (20-ply) prefix conditioned on
+    the rare ``STALEMATE``; its ``control_early`` arm uses ``PLY_LIMIT``.
+    The control arms are the scientific baseline — the gap between scenario
+    and control isolates the improbable-conditioning effect from the
+    prefix's own dynamics.
+
+    ``cut_ply`` / ``min_long`` / ``early_prefix`` scale with ``seq_len`` so
+    the scenarios stay reachable on a short decode horizon (v1's fixed
+    245-ply / 240-ply / 20-ply assumed a 256-ctx model).
+    """
+    move_ids = corpus.move_ids
+    game_lengths = corpus.game_lengths
+
+    # Scale the v1 cut points to the decode horizon: v1 cut at 245/240/20 ply
+    # under a 256-ctx model. Keep at least one move slot after the prefix.
+    cap = seq_len - 2
+    cut_ply = max(1, min(245, cap))
+    min_long = max(2, min(240, seq_len - 1))
+    early_prefix = max(1, min(20, cap))
+    min_early = max(early_prefix + 1, min(40, seq_len - 1))
+
+    results: dict[str, Any] = {}
+
+    # Scenario 1: checkmate a few ply from the end of a long game.
+    long_idx = np.where(game_lengths >= min_long)[0]
+    if len(long_idx) >= n_per_scenario:
+        rng = np.random.default_rng(46)
+        selected = rng.choice(long_idx, n_per_scenario, replace=False)
+        prefix_lens = np.full(n_per_scenario, cut_ply, dtype=np.int32)
+        prefix_lens = np.minimum(
+            prefix_lens, game_lengths[selected].astype(np.int32) - 1
+        )
+        prefix_lens = np.maximum(prefix_lens, 1)
+        gen = autoregressive_generate(
+            model, WHITE_CHECKMATES, n_per_scenario,
+            mask_illegal=True,
+            prefix_moves=move_ids[selected], prefix_lengths=prefix_lens,
+            max_seq_len=seq_len, batch_size=decode_batch_size,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+        )
+        results["checkmate_few_ply"] = analyze_generated_games(
+            gen, "WHITE_CHECKMATES"
+        )
+        gen_ctrl = autoregressive_generate(
+            model, PLY_LIMIT, n_per_scenario,
+            mask_illegal=True,
+            prefix_moves=move_ids[selected], prefix_lengths=prefix_lens,
+            max_seq_len=seq_len, batch_size=decode_batch_size,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+        )
+        results["control_few_ply"] = analyze_generated_games(
+            gen_ctrl, "PLY_LIMIT"
+        )
+
+    # Scenario 2: stalemate from an early-game prefix.
+    early_idx = np.where(game_lengths >= min_early)[0]
+    if len(early_idx) >= n_per_scenario:
+        rng = np.random.default_rng(47)
+        selected = rng.choice(early_idx, n_per_scenario, replace=False)
+        prefix_lens = np.full(n_per_scenario, early_prefix, dtype=np.int32)
+        gen = autoregressive_generate(
+            model, STALEMATE, n_per_scenario,
+            mask_illegal=True,
+            prefix_moves=move_ids[selected], prefix_lengths=prefix_lens,
+            max_seq_len=seq_len, batch_size=decode_batch_size,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+        )
+        results["stalemate_early"] = analyze_generated_games(gen, "STALEMATE")
+        gen_ctrl = autoregressive_generate(
+            model, PLY_LIMIT, n_per_scenario,
+            mask_illegal=True,
+            prefix_moves=move_ids[selected], prefix_lengths=prefix_lens,
+            max_seq_len=seq_len, batch_size=decode_batch_size,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+        )
+        results["control_early"] = analyze_generated_games(gen_ctrl, "PLY_LIMIT")
+
+    return {
+        "diagnostic": "improbable_task_test",
+        "corpus_driven": True,
+        "scenarios": results,
+    }
+
+
 def improbable_task_test(
     model: "PAWNModel | EffectiveCallable",
     *,
     outcome_prefix_trained: bool,
+    corpus: GenDiagCorpus | None = None,
     seq_len: int = 16,
     n_games: int = 16,
+    n_per_scenario: int = 200,
+    decode_batch_size: int | None = DEFAULT_DECODE_BATCH_SIZE,
     cache_dtype: jnp.dtype | None = None,
     compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, Any]:
     """Outcome conditioning = STALEMATE (rare but *producible*). Reports
     top-1 prob + entropy + AR analysis.
+
+    With a ``corpus`` this runs the v1 §6.7 corpus-driven scenarios
+    (``checkmate_few_ply`` / ``stalemate_early``) plus their
+    ``control_few_ply`` / ``control_early`` matched baselines (see
+    :func:`_corpus_improbable_task`). Without one it runs the synthetic
+    STALEMATE-from-opening probe described below.
 
     The conditioning outcome must be one the engine can actually
     terminate on, otherwise ``ar_analysis["outcome_match_rate"]`` is
@@ -760,6 +1368,14 @@ def improbable_task_test(
     """
     if not outcome_prefix_trained:
         return _skipped("improbable_task_test")
+
+    if corpus is not None:
+        return _corpus_improbable_task(
+            model, corpus, seq_len=seq_len, n_per_scenario=n_per_scenario,
+            decode_batch_size=decode_batch_size,
+            cache_dtype=cache_dtype, compute_dtype=compute_dtype,
+        )
+
     # First-move prediction lives at the last prefix slot ``C-1``.
     tokens, attn, C = _single_row_prefixed(STALEMATE, seq_len)  # noqa: N806
     logits = model(tokens, attn, compute_dtype=compute_dtype)
@@ -785,6 +1401,11 @@ def run_all_diagnostics(
     outcome_prefix_trained: bool,
     n_per_outcome: int = 16,
     max_seq_len: int = 32,
+    corpus: GenDiagCorpus | None = None,
+    n_per_bucket: int = 200,
+    n_per_pair: int = 500,
+    n_per_scenario: int = 200,
+    decode_batch_size: int | None = DEFAULT_DECODE_BATCH_SIZE,
     cache_dtype: jnp.dtype | None = None,
     compute_dtype: jnp.dtype | None = None,
 ) -> dict[str, dict[str, Any]]:
@@ -796,6 +1417,26 @@ def run_all_diagnostics(
     autoregressive generation per v1 parity; defaults are conservative
     so the full suite stays under a minute on a small backbone — pass
     larger ``n_per_outcome`` / ``max_seq_len`` for the full v1 numbers.
+
+    ``corpus`` (default None) switches ``prefix_continuation_test`` /
+    ``poisoned_prefix_test`` / ``impossible_task_test`` /
+    ``improbable_task_test`` into their v1 corpus-driven mode: the
+    multi-bucket cross-conditioning matrix, the four POISONING_PAIRS, and
+    the impossible/improbable scenarios with their CONTROL arms. Without a
+    corpus those four run the cheap synthetic single-prefix probes (the
+    ``outcome_signal_test`` is unaffected — it always generates its own
+    games per outcome). ``n_per_bucket`` / ``n_per_pair`` /
+    ``n_per_scenario`` size the corpus-driven sampling.
+
+    ``decode_batch_size`` (default :data:`DEFAULT_DECODE_BATCH_SIZE` = 64,
+    matching v1's hard-coded chunk) bounds the per-forward KV-cache /
+    logits footprint on the corpus-driven path: every internal
+    :func:`autoregressive_generate` chunks its ``n_per_bucket`` /
+    ``n_per_pair`` / ``n_per_scenario`` decode into sub-batches of at most
+    this many games. Without it a production run (``n_per_pair=500`` at the
+    v1 ``max_seq_len=256``) would decode a 500-game batch in one unchunked
+    forward and OOM the local 20 GB GPU. Pass ``None`` to disable chunking
+    (single-shot decode); raise it on a larger accelerator for throughput.
 
     ``cache_dtype`` / ``compute_dtype`` (default None → fp32) are
     threaded to every internal :func:`autoregressive_generate` call so
@@ -813,23 +1454,31 @@ def run_all_diagnostics(
         "prefix_continuation_test": prefix_continuation_test(
             model, prefix, WHITE_CHECKMATES,
             outcome_prefix_trained=outcome_prefix_trained,
-            n_continuations=min(8, n_per_outcome),
+            corpus=corpus, seq_len=max_seq_len,
+            n_continuations=min(8, n_per_outcome), n_per_bucket=n_per_bucket,
+            decode_batch_size=decode_batch_size,
             cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         ),
         "poisoned_prefix_test": poisoned_prefix_test(
             model, prefix, BLACK_CHECKMATES,
             outcome_prefix_trained=outcome_prefix_trained,
-            n_continuations=min(8, n_per_outcome),
+            corpus=corpus, seq_len=max_seq_len,
+            n_continuations=min(8, n_per_outcome), n_per_pair=n_per_pair,
+            decode_batch_size=decode_batch_size,
             cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         ),
         "impossible_task_test": impossible_task_test(
             model, outcome_prefix_trained=outcome_prefix_trained,
-            n_games=min(16, n_per_outcome),
+            corpus=corpus, seq_len=max_seq_len,
+            n_games=min(16, n_per_outcome), n_per_scenario=n_per_scenario,
+            decode_batch_size=decode_batch_size,
             cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         ),
         "improbable_task_test": improbable_task_test(
             model, outcome_prefix_trained=outcome_prefix_trained,
-            n_games=min(16, n_per_outcome),
+            corpus=corpus, seq_len=max_seq_len,
+            n_games=min(16, n_per_outcome), n_per_scenario=n_per_scenario,
+            decode_batch_size=decode_batch_size,
             cache_dtype=cache_dtype, compute_dtype=compute_dtype,
         ),
     }
