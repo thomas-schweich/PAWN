@@ -120,6 +120,7 @@ __all__ = [
     "load_model_config",
     "save_adapter_resume_state",
     "load_adapter_resume_state",
+    "find_best_adapter_step",
 ]
 
 
@@ -628,3 +629,51 @@ def resolve_checkpoint_source(source: str) -> Path:
         ) from e
     local = snapshot_download(repo_id=source, repo_type="model")
     return Path(local)
+
+
+def find_best_adapter_step(
+    metrics_path: Path | str, *, metric: str = "val_loss"
+) -> int | None:
+    """Return the step with the lowest ``metric`` in a run's ``metrics.jsonl``.
+
+    The v2 owner of v1's best-checkpoint selection (``find_best_adapter_step``).
+    Adapter validation writes one ``type=val`` record per eval step carrying
+    ``val_loss`` (plus the richer ``val_top1`` / ``val_top5`` /
+    ``val_illegal_pred_rate``); this scans those records and returns the step
+    that minimises ``metric``.
+
+    Returns ``None`` when the file is absent or carries no ``type=val``
+    record with a finite ``metric`` value (e.g. a run with validation
+    disabled). Ties resolve to the *earliest* step (the first to reach the
+    best loss), matching v1's strict ``<`` best-update.
+    """
+    path = Path(metrics_path)
+    if not path.is_file():
+        return None
+    best_step: int | None = None
+    best_val = float("inf")
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("type") != "val":
+                continue
+            raw = rec.get(metric)
+            step = rec.get("step")
+            if raw is None or step is None:
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(val):
+                continue
+            if val < best_val:
+                best_val = val
+                best_step = int(step)
+    return best_step

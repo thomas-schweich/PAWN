@@ -36,6 +36,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float, Int
 
+from pawn.adapters.placement import layer_placement_mask
 from pawn.config import ModelConfig
 from pawn.model import KVCache, PAWNModel
 
@@ -72,6 +73,13 @@ class BottleneckConfig:
     n_hidden: int = 0
     no_adapt_attn: bool = False
     no_adapt_ffn: bool = False
+    # Restrict the bottleneck to an explicit subset of transformer layers
+    # (the ``--adapter-layers`` consumer, v1 parity); ``None`` (default)
+    # adapts every layer. Folded into the ``down_*`` arrays at init —
+    # non-adapted layers get a zero down-projection, so their residual is
+    # identically zero (``up(gelu(down·h)) = up(gelu(0)) = 0``) and their
+    # params stay at zero under weight decay.
+    layers: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         # Both placement flags off ⇒ the adapter touches nothing and
@@ -162,6 +170,21 @@ def init_bottleneck_adapter(
         d_f, h_f, u_f = None, None, None
     else:
         d_f, h_f, u_f = ffn_branch()
+
+    # Per-layer placement: zero the `down_*` projection at non-adapted
+    # layers so their residual collapses to zero (forward-invisible and
+    # weight-decay-stable). `up_*` is already zero-init; gating `down_*`
+    # is sufficient and keeps the saved sidecar shape unchanged.
+    placement = layer_placement_mask(cfg.layers, n_layers)
+
+    def _place_down(down: jax.Array | None) -> jax.Array | None:
+        if down is None or cfg.layers is None:
+            return down
+        m = placement.reshape((n_layers,) + (1,) * (down.ndim - 1))
+        return jnp.where(m, down, 0.0)
+
+    d_a = _place_down(d_a)
+    d_f = _place_down(d_f)
 
     return BottleneckAdapter(
         down_attn=d_a, hidden_attn=h_a, up_attn=u_a,

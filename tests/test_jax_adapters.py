@@ -4,6 +4,7 @@ dispatch and train at least one chunk per plan §3 criterion 8.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Literal
 
 import equinox as eqx
@@ -1912,3 +1913,507 @@ def test_run_steps_resume_offsets_boundaries_by_start_step() -> None:
     assert rec["logs"] == [20, 30, 40]
     # First chunk shrinks to land on absolute step 15, not 13 + min(k,…).
     assert rec["chunk_ends"][0] == 15
+
+
+# ---------------------------------------------------------------------------
+# adapter-loop workstream: legal-mask loss, illegal_penalty, patience,
+# best-val checkpoint, richer val metrics, per-layer placement.
+# ---------------------------------------------------------------------------
+
+
+def _legal_batch(
+    n_games: int = 4, seq_len: int = 28, seed: int = 5,
+) -> tuple[Batch, Any]:
+    """Build a small random-game Batch with an engine-replayed legal mask."""
+    from pawn.corpus import legal_mask_for_games
+
+    c = generate_corpus(
+        n_games=n_games, max_ply=seq_len - 4, seq_len=seq_len, seed=seed,
+        conditioning=[],
+    )
+    idx = np.arange(n_games)
+    lm = jnp.asarray(legal_mask_for_games(c, idx))
+    batch = Batch(
+        tokens=jnp.asarray(c.tokens[idx]),
+        targets=jnp.asarray(c.targets[idx]),
+        attn_mask=jnp.asarray(c.attn_mask[idx]),
+        loss_mask=jnp.asarray(c.loss_mask[idx]),
+        legal_mask=lm,
+    )
+    return batch, c
+
+
+def test_legal_mask_aligns_targets_are_always_legal() -> None:
+    """Every supervised target token must be flagged legal by the engine-
+    replayed mask — the alignment (engine ply axis shifted by C-1 onto the
+    target slot) is the load-bearing invariant of the legal-mask source."""
+    batch, _ = _legal_batch(n_games=6, seq_len=32, seed=11)
+    assert batch.legal_mask is not None
+    loss_mask = np.asarray(batch.loss_mask)
+    targets = np.asarray(batch.targets)
+    legal = np.asarray(batch.legal_mask)
+    sup = loss_mask.astype(bool)
+    # Gather the legal flag at each target token; every supervised position
+    # must be legal.
+    tgt_legal = np.take_along_axis(legal, targets[..., None], axis=-1)[..., 0]
+    assert bool(tgt_legal[sup].all()), "a supervised target was flagged illegal"
+
+
+def test_legal_mask_lowers_cross_entropy_vs_reserved_only() -> None:
+    """Adapter-loss legality (v1 ``apply_legal_mask`` default-ON): hard-masking
+    illegal columns to -inf shrinks the softmax denominator, so the CE on a
+    fixed model is strictly lower than the reserved-column-only CE."""
+    from pawn.trainer import cross_entropy_loss
+
+    bb = init_model(TINY_SUPERNET, key=0)
+    batch, _ = _legal_batch(seed=7)
+    no_legal = Batch(
+        tokens=batch.tokens, targets=batch.targets,
+        attn_mask=batch.attn_mask, loss_mask=batch.loss_mask,
+    )
+    loss_legal = float(cross_entropy_loss(bb, batch, apply_legal=True))
+    loss_plain = float(cross_entropy_loss(bb, no_legal))
+    assert loss_legal < loss_plain
+
+
+def test_illegal_penalty_raises_loss_only_with_hard_mask_off() -> None:
+    """``illegal_penalty`` adds ``λ·E[P_illegal]`` to the loss when the hard
+    mask is off (v1 ``compute_adapter_loss``). With the hard mask on the
+    illegal mass is analytically zero, so the penalty is a no-op."""
+    from pawn.trainer import cross_entropy_loss
+
+    bb = init_model(TINY_SUPERNET, key=0)
+    batch, _ = _legal_batch(seed=9)
+    base = float(cross_entropy_loss(bb, batch, apply_legal=False))
+    penalised = float(
+        cross_entropy_loss(bb, batch, apply_legal=False, illegal_penalty=2.0)
+    )
+    assert penalised > base
+    # Hard-mask-on: penalty has no effect (mass is zero).
+    hard = float(cross_entropy_loss(bb, batch, apply_legal=True))
+    hard_pen = float(
+        cross_entropy_loss(bb, batch, apply_legal=True, illegal_penalty=2.0)
+    )
+    assert hard == pytest.approx(hard_pen)
+
+
+def test_cross_entropy_legal_is_noop_without_legal_mask() -> None:
+    """The legality terms are inert when the batch carries no legal_mask
+    (pretrain parity): the loss equals the reserved-column-only CE regardless
+    of ``apply_legal`` / ``illegal_penalty``."""
+    from pawn.trainer import cross_entropy_loss
+
+    bb = init_model(TINY_SUPERNET, key=0)
+    c = generate_corpus(
+        n_games=4, max_ply=20, seq_len=24, seed=3, conditioning=[],
+    )
+    batch = slice_batch(c, np.arange(4))
+    assert batch.legal_mask is None
+    base = float(cross_entropy_loss(bb, batch))
+    assert base == pytest.approx(
+        float(cross_entropy_loss(bb, batch, apply_legal=True))
+    )
+    assert base == pytest.approx(
+        float(
+            cross_entropy_loss(bb, batch, apply_legal=False, illegal_penalty=5.0)
+        )
+    )
+
+
+def test_adapter_train_step_legal_mask_changes_gradient() -> None:
+    """An adapter train step under hard legal masking moves the adapter to a
+    *different* point than the un-masked step — the legality is actually
+    consumed in the gradient, not just declared."""
+    cfg = LoRAConfig(rank=2, targets="qkvo")
+    opt = optax.adam(1e-2)
+
+    def _fresh_state() -> AdapterTrainState:
+        # Fresh backbone too: ``make_adapter_train_step`` donates the whole
+        # state (incl. the backbone arrays), so the two regimes can't share a
+        # backbone object without hitting a donated-buffer deletion.
+        bb = init_model(TINY_SUPERNET, key=0)
+        adapter = dispatch_init("lora")(bb, cfg, key=jax.random.key(1))
+        flt = dispatch_filter("lora")(adapter)
+        opt_state = opt.init(eqx.filter(adapter, flt))
+        return AdapterTrainState(
+            backbone=bb, adapter=adapter, opt_state=opt_state,
+            step=jnp.int32(0), key=jax.random.key(0),
+        )
+
+    batch, _ = _legal_batch(seed=13)
+    # ``make_adapter_train_step`` donates its inputs, so each regime gets a
+    # fresh state rather than reusing donated buffers.
+    step_legal = make_adapter_train_step("lora", opt, apply_legal=True)
+    step_plain = make_adapter_train_step("lora", opt, apply_legal=False)
+    s_legal, _ = step_legal(_fresh_state(), batch)
+    s_plain, _ = step_plain(_fresh_state(), batch)
+    # The B_q LoRA matrices diverge between the two regimes.
+    assert not bool(
+        jnp.allclose(s_legal.adapter.B_q, s_plain.adapter.B_q)
+    )
+
+
+def test_adapter_val_metrics_reports_v1_parity_set() -> None:
+    """v1-parity val metrics: loss / top1 / top5 / illegal_pred_rate, with
+    top5 >= top1 and illegal_pred_rate == 0 when the hard mask is on (the
+    argmax is restricted to legal moves)."""
+    from pawn.adapter_trainer import make_adapter_val_metrics
+
+    bb = init_model(TINY_SUPERNET, key=0)
+    cfg = LoRAConfig(rank=2, targets="qkvo")
+    adapter = dispatch_init("lora")(bb, cfg, key=jax.random.key(1))
+    batch, _ = _legal_batch(seed=21)
+    metrics_fn = make_adapter_val_metrics("lora", apply_legal=True)
+    m = metrics_fn(bb, adapter, batch)
+    assert 0.0 <= float(m.top1) <= 1.0
+    assert float(m.top5) >= float(m.top1)
+    assert float(m.loss) > 0.0
+    # illegal_pred_rate is computed on the raw (un-legal-masked) argmax, so it
+    # can be nonzero even when the loss masks legality — but it must be a valid
+    # rate in [0, 1].
+    assert 0.0 <= float(m.illegal_pred_rate) <= 1.0
+
+
+def test_adapter_val_metrics_illegal_rate_zero_without_legal_mask() -> None:
+    """Without a legal_mask there's no legality reference, so the illegal
+    prediction rate is reported as 0 (no spurious diagnostic)."""
+    from pawn.adapter_trainer import make_adapter_val_metrics
+
+    bb = init_model(TINY_SUPERNET, key=0)
+    cfg = LoRAConfig(rank=2, targets="qkvo")
+    adapter = dispatch_init("lora")(bb, cfg, key=jax.random.key(1))
+    c = generate_corpus(n_games=4, max_ply=20, seq_len=24, seed=4, conditioning=[])
+    batch = slice_batch(c, np.arange(4))
+    m = make_adapter_val_metrics("lora")(bb, adapter, batch)
+    assert float(m.illegal_pred_rate) == 0.0
+
+
+def test_adapter_val_metrics_top_k_support_excludes_reserved_columns() -> None:
+    """top1 / top5 / illegal_pred_rate score over ``[0, NUM_ACTIONS)`` only —
+    the same support eval.py enforces via ``logits[..., :NUM_ACTIONS]``.
+
+    PAD (1968), the 11 outcome tokens (1969-1979) and BOS (1980) are *not*
+    moves, and the conditioning/outcome-prefix path explicitly trains the
+    outcome columns. If the val-metrics argmax could land there, an
+    outcome-dominated head would push top1 to ~0 and mark every prediction
+    'illegal' (legal_mask is False at non-move columns) — a diagnostic v1 and
+    eval.py could never produce. We force an outcome column to dominate the
+    head and assert the metrics are unchanged from the un-biased run.
+    """
+    import dataclasses
+
+    from pawn.adapter_trainer import make_adapter_val_metrics
+    from pawn.config import OUTCOME_TOKEN_BASE
+
+    # Untied head so we can spike a single output column without perturbing
+    # the input embedding (tied head reuses embed_tokens for both).
+    cfg = dataclasses.replace(TINY_SUPERNET, tie_embeddings=False)
+    bb = init_model(cfg, key=0)
+    assert bb.lm_head is not None
+    lora_cfg = LoRAConfig(rank=2, targets="qkvo")
+    adapter = dispatch_init("lora")(bb, lora_cfg, key=jax.random.key(1))
+    batch, _ = _legal_batch(seed=21)
+
+    metrics_fn = make_adapter_val_metrics("lora", apply_legal=True)
+    base = metrics_fn(bb, adapter, batch)
+
+    # Spike one outcome column so it is the global argmax over the full vocab.
+    big = jnp.full_like(bb.lm_head[:, OUTCOME_TOKEN_BASE], 1e4)
+    spiked_head = bb.lm_head.at[:, OUTCOME_TOKEN_BASE].set(big)
+    bb_spiked = eqx.tree_at(lambda m: m.lm_head, bb, spiked_head)
+    spiked = metrics_fn(bb_spiked, adapter, batch)
+
+    # If the support leaked, the dominating outcome column would capture every
+    # argmax: top1 -> ~0, illegal_pred_rate -> ~1. Restricting to the move
+    # support makes the spike invisible to all three metrics.
+    assert float(spiked.top1) == pytest.approx(float(base.top1))
+    assert float(spiked.top5) == pytest.approx(float(base.top5))
+    assert float(spiked.illegal_pred_rate) == pytest.approx(
+        float(base.illegal_pred_rate)
+    )
+
+
+# --- per-layer placement ----------------------------------------------------
+
+
+@pytest.mark.parametrize("strategy", ["lora", "sparse", "hybrid"])
+def test_adapter_layers_only_modifies_selected_layers(strategy: str) -> None:
+    """``--adapter-layers`` (consumed as ``cfg.layers``) restricts the adapter
+    to the requested transformer layers: non-adapted layers are bit-identical
+    to the frozen backbone in the effective ``wq`` weights, the adapted layer
+    differs.
+
+    For lora/hybrid this is checked after forcing the zero-init B arrays to a
+    nonzero value (so the correction is observable); sparse zeroes its
+    per-layer carrier at non-adapted layers so the slice is identity
+    regardless. Bottleneck (a wrapper that injects a residual rather than
+    folding into ``wq``) has its own placement test below.
+    """
+    bb = init_model(TINY_SUPERNET, key=0)
+    n_layers = bb.cfg.n_layers
+    picks = (1,)  # adapt only layer 1
+    if strategy == "lora":
+        cfg: Any = LoRAConfig(rank=2, targets="qkvo", layers=picks)
+    elif strategy == "sparse":
+        cfg = SparseConfig(density=0.5, targets="qkvo", layers=picks)
+    else:  # hybrid
+        cfg = HybridConfig(lora=LoRAConfig(rank=2, targets="qkvo", layers=picks))
+    adapter = dispatch_init(strategy)(bb, cfg, key=jax.random.key(2))
+
+    if strategy in ("lora", "hybrid"):
+        # Make the LoRA correction observable by setting B_q nonzero.
+        lora_ad = adapter.lora if strategy == "hybrid" else adapter
+        lora_ad = eqx.tree_at(
+            lambda a: a.B_q, lora_ad, jnp.ones_like(lora_ad.B_q),
+        )
+        if strategy == "hybrid":
+            adapter = eqx.tree_at(lambda a: a.lora, adapter, lora_ad)
+        else:
+            adapter = lora_ad
+    else:  # sparse
+        # Set every delta nonzero; only the masked (placed) positions add.
+        adapter = eqx.tree_at(
+            lambda a: a.delta_q, adapter, jnp.ones_like(adapter.delta_q),
+        )
+
+    effective = dispatch_apply(strategy)(bb, adapter)
+    # lora / sparse fold into a bare PAWNModel; hybrid folds LoRA into the
+    # backbone then wraps it in a FiLMEffective whose `.backbone` carries the
+    # folded weights. Resolve the folded PAWNModel either way.
+    if isinstance(effective, FiLMEffective):
+        folded = effective.backbone
+    else:
+        assert isinstance(effective, PAWNModel)
+        folded = effective
+    bb_wq = bb.layers.wq
+    eff_wq = folded.layers.wq
+    for layer in range(n_layers):
+        same = bool(jnp.allclose(eff_wq[layer], bb_wq[layer]))
+        if layer in picks:
+            assert not same, f"adapted layer {layer} unchanged for {strategy}"
+        else:
+            assert same, f"non-adapted layer {layer} changed for {strategy}"
+
+
+def test_bottleneck_placement_zeros_down_at_nonadapted_layers() -> None:
+    """Bottleneck per-layer placement zeroes the ``down_*`` projection at
+    non-adapted layers, so their Houlsby residual is identically zero."""
+    bb = init_model(TINY_SUPERNET, key=0)
+    n_layers = bb.cfg.n_layers
+    cfg = BottleneckConfig(dim=4, layers=(2,))
+    adapter = dispatch_init("bottleneck")(bb, cfg, key=jax.random.key(3))
+    down = np.asarray(adapter.down_attn)
+    for layer in range(n_layers):
+        if layer == 2:
+            assert np.any(down[layer] != 0.0)
+        else:
+            assert np.all(down[layer] == 0.0)
+
+
+def test_sparse_placement_empties_mask_at_nonadapted_layers() -> None:
+    """Sparse per-layer placement ANDs the binary mask with the layer mask, so
+    non-adapted layers carry no trainable positions."""
+    bb = init_model(TINY_SUPERNET, key=0)
+    n_layers = bb.cfg.n_layers
+    cfg = SparseConfig(density=0.9, targets="qkvo", layers=(0,))
+    adapter = dispatch_init("sparse")(bb, cfg, key=jax.random.key(4))
+    mask = np.asarray(adapter.mask_q)
+    assert mask[0].any()
+    for layer in range(1, n_layers):
+        assert not mask[layer].any()
+
+
+def test_parse_adapter_layers_bounds_and_form() -> None:
+    """The ``--adapter-layers`` parser de-dupes / sorts and rejects malformed
+    or out-of-range picks."""
+    from pawn.adapters.placement import parse_adapter_layers
+
+    assert parse_adapter_layers(None, 10) is None
+    assert parse_adapter_layers("3, 1, 1", 10) == (1, 3)
+    with pytest.raises(ValueError):
+        parse_adapter_layers("3,99", 10)
+    with pytest.raises(ValueError):
+        parse_adapter_layers("a,b", 10)
+    with pytest.raises(ValueError):
+        parse_adapter_layers("", 10)
+
+
+def test_layer_placement_mask_rejects_out_of_range_index() -> None:
+    """``layer_placement_mask`` bound-checks against the *real* n_layers — a
+    JAX out-of-bounds scatter would otherwise silently drop the write and
+    yield an all-False (adapt-nothing) mask."""
+    from pawn.adapters.placement import layer_placement_mask
+
+    # In-range builds the expected mask.
+    mask = np.asarray(layer_placement_mask((1, 3), 4))
+    assert mask.tolist() == [False, True, False, True]
+    # Out-of-range raises rather than silently dropping the index.
+    with pytest.raises(ValueError, match=r"outside \[0, 4\)"):
+        layer_placement_mask((5,), 4)
+
+
+@pytest.mark.parametrize("strategy", ["lora", "sparse", "bottleneck", "rosa"])
+def test_adapter_init_rejects_out_of_range_layers(strategy: str) -> None:
+    """``--adapter-layers`` past the backbone depth is caught in the adapter
+    init (the placement mask is the single chokepoint), not silently dropped.
+
+    ``parse_adapter_layers`` validates syntax against a permissive sentinel at
+    config-build time (the backbone isn't loaded yet), so the real bound check
+    must fire here — otherwise ``--adapter-layers 5`` on a 4-layer model would
+    scatter-drop the write and train a zero-correction adapter.
+    """
+    bb = init_model(TINY_SUPERNET, key=0)  # n_layers = 4
+    bad = (bb.cfg.n_layers,)  # one past the last valid index
+    if strategy == "lora":
+        cfg: Any = LoRAConfig(rank=2, targets="qkvo", layers=bad)
+    elif strategy == "sparse":
+        cfg = SparseConfig(density=0.5, targets="qkvo", layers=bad)
+    elif strategy == "bottleneck":
+        cfg = BottleneckConfig(dim=4, layers=bad)
+    else:  # rosa — delegates to lora/sparse inits, which hit the same check
+        cfg = RoSAConfig(mode="rosa", lora_rank=2, density=0.3, layers=bad)
+    with pytest.raises(ValueError, match=r"outside \[0, 4\)"):
+        dispatch_init(strategy)(bb, cfg, key=jax.random.key(0))
+
+
+def test_rosa_mask_gen_respects_layer_placement() -> None:
+    """RoSA mask generation gates the gradient-derived sparse masks by the
+    per-layer placement: no selected position falls outside the requested
+    layer subset (otherwise the ``--adapter-layers`` restriction would be
+    silently undone when Phase 2 forces all-True masks)."""
+    from pawn.adapter_trainer import generate_rosa_masks
+
+    bb = init_model(TINY_SUPERNET, key=0)
+    cfg = RoSAConfig(mode="rosa", lora_rank=2, density=0.3, layers=(1,))
+    adapter = dispatch_init("rosa")(bb, cfg, key=jax.random.key(5))
+    batch, _ = _legal_batch(seed=15)
+    new_sparse = generate_rosa_masks(bb, adapter, [batch])
+    mask = np.asarray(new_sparse.mask_q)
+    assert mask[1].any()
+    for layer in range(bb.cfg.n_layers):
+        if layer != 1:
+            assert not mask[layer].any(), f"layer {layer} mask leaked"
+
+
+# --- best-val checkpoint selection -----------------------------------------
+
+
+def test_find_best_adapter_step_picks_lowest_val_loss(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """``find_best_adapter_step`` returns the step with the minimum val_loss
+    across a run's ``metrics.jsonl`` (v1 best-checkpoint selection); ties
+    resolve to the earliest step and non-finite values are skipped."""
+    import json
+
+    from pawn.checkpoint import find_best_adapter_step
+
+    p = tmp_path / "metrics.jsonl"
+    rows = [
+        {"type": "config"},
+        {"type": "train", "step": 10, "loss": 1.0},
+        {"type": "val", "step": 10, "val_loss": 2.0},
+        {"type": "val", "step": 20, "val_loss": 1.5},
+        {"type": "val", "step": 30, "val_loss": 1.5},  # tie — earlier wins
+        {"type": "val", "step": 40, "val_loss": 1.7},
+        {"type": "val", "step": 50, "val_loss": None},  # skipped
+    ]
+    p.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    assert find_best_adapter_step(p) == 20
+    assert find_best_adapter_step(tmp_path / "missing.jsonl") is None
+
+
+def test_find_best_adapter_step_none_without_val_records(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A run with validation disabled (no ``type=val`` rows) yields None."""
+    import json
+
+    from pawn.checkpoint import find_best_adapter_step
+
+    p = tmp_path / "metrics.jsonl"
+    p.write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in ({"type": "train", "step": 1, "loss": 3.0},)
+        ),
+        encoding="utf-8",
+    )
+    assert find_best_adapter_step(p) is None
+
+
+# --- patience / early stopping (end-to-end through main()) ------------------
+
+
+def _save_tiny_backbone(target_dir: Path) -> None:
+    """Save a fresh TINY_SUPERNET as a loadable v2 checkpoint (conditioning
+    ``[]`` ⇒ C=1, matching the AdapterConfig default)."""
+    from pawn.checkpoint import save_model
+
+    bb = init_model(TINY_SUPERNET, key=0)
+    save_model(bb, target_dir, run_config={"conditioning": []})
+
+
+def test_adapter_patience_early_stops_and_writes_best_step(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """End-to-end: a run whose held-out val never improves stops early once
+    ``patience`` consecutive evals miss, records ``reason_for_stop=patience``
+    in ``schedule_health.json``, and writes ``best_step.json`` pointing at the
+    best-val checkpoint (v1 patience + best-checkpoint persistence).
+
+    Driven through the real ``main()`` on a TINY_SUPERNET LoRA run with
+    ``--no-pgn`` so it needs no Lichess data. ``patience`` is small and the LR
+    is zero so the model never improves past its first eval — every subsequent
+    eval is a miss and the patience budget trips.
+    """
+    import json
+
+    from pawn.checkpoint import MASK_VERSION  # noqa: F401  (ensures import OK)
+
+    ckpt = tmp_path / "backbone"
+    _save_tiny_backbone(ckpt)
+    main = _load_train_jax_adapter().main
+    logs_dir = tmp_path / "logs"
+    # A near-zero lr keeps the adapter effectively frozen ⇒ val_loss is flat
+    # after the first eval, so every later eval is a "miss". eval cadence runs
+    # every step (val_every=1, steps_per_epoch=1) and patience=2 trips after
+    # 2 consecutive misses. (lr must be > 0 per AdapterConfig.)
+    argv = [
+        "--strategy", "lora", "--lora-rank", "2",
+        "--supernet", "tiny", "--variant", "large",
+        "--checkpoint", str(ckpt),
+        "--no-pgn",
+        "--total-steps", "20",
+        "--batch-size", "4", "--seq-len", "32", "--k", "1",
+        "--lr", "1e-12",
+        "--no-flash",
+        "--local-checkpoints",
+        "--logs-dir", str(logs_dir),
+    ]
+    # Patience / cadence go through the JSON config since there's no CLI flag
+    # for them on this script; merge via --config.
+    cfg_json = tmp_path / "cfg.json"
+    cfg_json.write_text(
+        json.dumps(
+            {
+                "patience": 2,
+                "val_every": 1,
+                "steps_per_epoch": 1,
+                "epochs": 20,
+                "checkpoint_interval": 1,
+                "log_interval": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    argv = ["--config", str(cfg_json), *argv]
+    rc = main(argv)
+    assert rc == 0
+
+    run_dirs = sorted(logs_dir.glob("*"))
+    assert run_dirs, "no run directory produced"
+    run_dir = run_dirs[-1]
+
+    health = json.loads((run_dir / "schedule_health.json").read_text())
+    assert health["reason_for_stop"] == "patience"
+    # Early stop: fewer steps ran than the planned 20-step budget.
+    assert health["actual_total_steps"] < health["planned_total_steps"]
+
+    best = json.loads((run_dir / "best_step.json").read_text())
+    assert best["best_step"] >= 1
+    assert (run_dir / best["checkpoint"]).is_dir()

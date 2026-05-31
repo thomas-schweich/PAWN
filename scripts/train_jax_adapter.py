@@ -29,6 +29,7 @@ from pawn.adapter_trainer import (
     generate_rosa_masks,
     make_adapter_scan_step,
     make_adapter_train_step,
+    make_adapter_val_metrics,
     rosa_phase1_to_phase3,
 )
 from pawn.adapters import (
@@ -43,7 +44,7 @@ from pawn.adapters import (
 )
 from pawn.checkpoint import resolve_checkpoint_source, save_model
 from pawn.config import SUPERNET, TINY_SUPERNET, VARIANTS, TINY_VARIANTS
-from pawn.corpus import generate_corpus
+from pawn.corpus import Corpus, generate_corpus, legal_mask_for_games
 from pawn.jax_setup import require_accelerator, resolve_device, setup_jax_caching
 from pawn.lichess_data import load_lichess_corpus
 from pawn.lifecycle import (
@@ -65,7 +66,7 @@ from pawn.wandb_utils import (
 from pawn.model import PAWNModel, init_model, sliced
 from pawn.run_config import AdapterConfig
 from pawn.trainer import (
-    Batch, cross_entropy_loss, flatten_opt_state, make_lr_schedule,
+    Batch, flatten_opt_state, make_lr_schedule,
     make_optimizer, slice_batch,
 )
 
@@ -382,13 +383,35 @@ def restore_adapter_resume_state(
 
 
 def _strategy_config_from_run(cfg: AdapterConfig) -> object:
-    """Build the adapter's strategy Config from the AdapterConfig fields."""
+    """Build the adapter's strategy Config from the AdapterConfig fields.
+
+    ``--adapter-layers`` (``cfg.adapter_layers``) is parsed once into the
+    validated layer-index tuple and threaded into every placement-aware
+    strategy (lora / bottleneck / sparse / hybrid / rosa). ``None`` (the
+    default) means "every layer". The bound check is deferred to the
+    adapter init (which knows ``n_layers``); here we only parse the syntax.
+    """
+    from pawn.adapters.placement import parse_adapter_layers
+
     s = cfg.strategy
+    # Bound-checking against the real n_layers happens in the adapter init:
+    # every placement-aware init routes ``cfg.layers`` through
+    # ``layer_placement_mask(layers, backbone.cfg.n_layers)``, which raises
+    # ``ValueError`` on any index >= n_layers (a silent out-of-bounds
+    # scatter would otherwise drop the write and adapt nothing). At
+    # config-build time the backbone isn't loaded, so we only validate the
+    # *syntax* here against a permissive sentinel.
+    layers = (
+        parse_adapter_layers(cfg.adapter_layers, n_layers=1 << 30)
+        if cfg.adapter_layers is not None
+        else None
+    )
     if s == "lora":
         return LoRAConfig(
             rank=cfg.lora_rank or 4,
             targets=cfg.lora_targets or "qkvo",
             ffn=cfg.lora_ffn,
+            layers=layers,
         )
     if s == "film":
         return FiLMConfig(use_output_film=cfg.use_output_film)
@@ -398,6 +421,7 @@ def _strategy_config_from_run(cfg: AdapterConfig) -> object:
             n_hidden=cfg.bottleneck_n_hidden,
             no_adapt_attn=cfg.no_adapt_attn,
             no_adapt_ffn=cfg.no_adapt_ffn,
+            layers=layers,
         )
     if s == "hybrid":
         return HybridConfig(
@@ -405,6 +429,7 @@ def _strategy_config_from_run(cfg: AdapterConfig) -> object:
                 rank=cfg.lora_rank or 4,
                 targets=cfg.lora_targets or "qkvo",
                 ffn=cfg.lora_ffn,
+                layers=layers,
             ),
             film=FiLMConfig(use_output_film=cfg.use_output_film),
         )
@@ -413,6 +438,7 @@ def _strategy_config_from_run(cfg: AdapterConfig) -> object:
             density=cfg.density or 0.01,
             targets=cfg.sparse_targets or "qkvo",
             ffn=cfg.sparse_ffn,
+            layers=layers,
         )
     if s in ("rosa", "rosa-retro-sparse", "rosa-retro-bottleneck"):
         # The three RoSA-family strategies share init/apply; the mode is
@@ -442,6 +468,7 @@ def _strategy_config_from_run(cfg: AdapterConfig) -> object:
             lora_ffn=cfg.lora_ffn,
             sparse_targets=cfg.sparse_targets or "qkvo",
             sparse_ffn=cfg.sparse_ffn,
+            layers=layers,
         )
         # `bottleneck_dim` is the Houlsby width used by the `retro-bottleneck`
         # RoSA sub-mode (unused for `rosa` / `retro-sparse`). Thread it through
@@ -504,6 +531,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--no-adapt-attn", action="store_true")
     ap.add_argument("--no-adapt-ffn", action="store_true")
     ap.add_argument("--rosa-mode", default=None)
+    ap.add_argument("--adapter-layers", default=None,
+                    help="restrict the adapter (lora/bottleneck/sparse/"
+                         "hybrid/rosa) to an explicit comma-separated subset "
+                         "of transformer layers, e.g. '5,6,7'. Default: all "
+                         "layers. Mirrors v1 per-layer placement.")
     ap.add_argument("--unfreeze-layers", default=None)
     ap.add_argument("--d-model", type=int, default=None)
     ap.add_argument("--n-layers", type=int, default=None)
@@ -772,22 +804,31 @@ def main(argv: list[str] | None = None) -> int:
     # Pallas flash requires the GPU backend; CPU smoke runs
     # (`PAWN_ALLOW_CPU=1`) auto-fall-back to plain attention.
     use_flash = cfg.use_flash and jax.default_backend() == "gpu"
+    # Adapter-loss legality (v1 ``apply_legal_mask`` default-ON):
+    # ``disable_legal_mask`` flips the hard mask off; ``illegal_penalty``
+    # adds the soft penalty term (only meaningful with the hard mask off,
+    # enforced by AdapterConfig._check_legality_flags). Both need a
+    # per-position legal mask attached to each batch.
+    apply_legal = not cfg.disable_legal_mask
+    illegal_penalty = cfg.illegal_penalty
+    need_legal = apply_legal or illegal_penalty > 0.0
     train_step = make_adapter_train_step(
         cfg.strategy, optimizer,
         compute_dtype=compute_dtype, use_sdpa=cfg.use_sdpa, use_flash=use_flash,
+        apply_legal=apply_legal, illegal_penalty=illegal_penalty,
     )
     # H11 (§8.3): drive the train loop through the K-step ``lax.scan`` so the
     # whole inner chunk is one compiled program (no per-step dispatch). The
     # single-step ``train_step`` is kept only as the scan body; eval uses the
-    # forward-only ``val_step`` below.
+    # forward-only ``val_metrics_fn`` below.
     scan_step = make_adapter_scan_step(train_step)
 
-    apply_fn = STRATEGIES[cfg.strategy].apply
+    # Richer val metrics (v1 parity: loss / top1 / top5 / illegal_pred_rate).
+    val_metrics_fn = make_adapter_val_metrics(
+        cfg.strategy, apply_legal=apply_legal, illegal_penalty=illegal_penalty,
+    )
 
-    @eqx.filter_jit
-    def val_step(backbone, adapter, batch):
-        effective = apply_fn(backbone, adapter)
-        return cross_entropy_loss(effective, batch)
+    apply_fn = STRATEGIES[cfg.strategy].apply
 
     # Data: Lichess corpus or random games. The val_corpus is the held-out
     # `validation` split for PGN (cfg.pgn_val_split, default "validation")
@@ -846,6 +887,15 @@ def main(argv: list[str] | None = None) -> int:
     push_tracker = HFPushTracker(repo_id=cfg.hf_repo) if cfg.hf_repo else None
     should_shutdown = install_sigterm_handler()
 
+    # Steps already persisted this run. A best-val eval (`_on_val`) and the
+    # run-end final-save can both target the same `adapter_step_<final>` path
+    # when the final step improves val_loss and `total_steps <
+    # checkpoint_interval` (the common short-run / smoke case). `save_model`
+    # refuses to overwrite an existing checkpoint, so `_save` is idempotent
+    # per step: a second request for an already-written step is a no-op
+    # rather than a `FileExistsError`.
+    saved_steps: set[int] = set()
+
     def _save(step_int: int) -> None:
         """Save the *effective* model — `apply_fn(backbone, adapter)` —
         not the frozen backbone. The whole point of adapter training is
@@ -873,6 +923,10 @@ def main(argv: list[str] | None = None) -> int:
         Checkpoints land under the MetricsLogger's per-run directory so
         two concurrent runs can't collide on the same path.
         """
+        if step_int in saved_steps:
+            # Already written this run (e.g. a best-val save at the final
+            # step that the run-end final-save would otherwise re-target).
+            return
         effective = apply_fn(state.backbone, state.adapter)
         out = logger.run_dir / f"adapter_step_{step_int:08d}"
         # H7: persist the scheduler identity + the JAX key + both numpy
@@ -898,6 +952,7 @@ def main(argv: list[str] | None = None) -> int:
             run_config=cfg.model_dump(),
             training_state=training_state,
         )
+        saved_steps.add(step_int)
         if push_tracker:
             push_checkpoint_async(out, push_tracker)
 
@@ -941,6 +996,64 @@ def main(argv: list[str] | None = None) -> int:
     # absolute step counter (which would understate it after a resume).
     run_start = resume_step
 
+    # Patience / best-val checkpoint selection (v1 parity). ``best`` holds
+    # the lowest val_loss seen and the step it occurred at; ``counter`` is
+    # the consecutive-no-improvement eval count; ``stop`` is the
+    # early-stopping flag the chunk loop polls. ``patience`` (None ⇒
+    # disabled) is the v1 patience budget. The best-val step is also written
+    # to ``best_step.json`` at run end so downstream consumers can recover
+    # it without re-scanning ``metrics.jsonl``.
+    patience_state: dict[str, Any] = {
+        "best_loss": float("inf"),
+        "best_step": None,
+        "counter": 0,
+        "stop": False,
+    }
+
+    def _on_val(val_loss: float, step: int) -> None:
+        """Update the patience / best-val tracker after an eval.
+
+        A strictly-lower val_loss resets the patience counter, records the
+        new best step, and persists a best-val checkpoint immediately so it
+        survives even if it doesn't land on a ``checkpoint_interval``
+        boundary (v1 best-checkpoint persistence). No improvement increments
+        the counter; reaching ``cfg.patience`` consecutive misses sets the
+        early-stop flag the chunk loop polls.
+        """
+        if np.isfinite(val_loss) and val_loss < patience_state["best_loss"]:
+            patience_state["best_loss"] = val_loss
+            patience_state["best_step"] = step
+            patience_state["counter"] = 0
+            # Persist the best so it's never lost to a non-boundary eval.
+            if step % cfg.checkpoint_interval != 0:
+                _save(step)
+        else:
+            patience_state["counter"] += 1
+            if (
+                cfg.patience is not None
+                and patience_state["counter"] >= cfg.patience
+            ):
+                patience_state["stop"] = True
+                print(
+                    f"[train_jax_adapter] early stopping at step {step} "
+                    f"(patience={cfg.patience}, best val_loss="
+                    f"{patience_state['best_loss']:.4f} @ step "
+                    f"{patience_state['best_step']})",
+                    file=sys.stderr,
+                )
+
+    def _legal_for(src: Corpus, idx: np.ndarray) -> jax.Array | None:
+        """Engine-replayed ``(..., V)`` legal mask for ``idx`` games in
+        ``src``, or ``None`` when legality is disabled and the penalty is
+        off (the random-game / no-legality-knob path). ``idx`` may be
+        ``(B,)`` or ``(n, B)`` — the leading axes are preserved."""
+        if not need_legal:
+            return None
+        flat = np.asarray(idx).reshape(-1)
+        lm = legal_mask_for_games(src, flat)  # (flat, T, V)
+        lm = lm.reshape(idx.shape + lm.shape[1:])
+        return jnp.asarray(lm)
+
     def _gather_chunk(n: int) -> Batch:
         """Pre-gather ``n`` train batches into one ``(n, B, T)`` Batch.
 
@@ -948,13 +1061,16 @@ def main(argv: list[str] | None = None) -> int:
         K-step axis the :func:`make_adapter_scan_step` ``lax.scan`` iterates.
         Sampling ``(n, B)`` game indices in one draw keeps the train stream's
         RNG sequence identical to the single-step loop (``rng`` is consumed
-        in the same order)."""
+        in the same order). When legality is active the engine replays each
+        game to attach the per-position ``legal_mask`` (v1 ``apply_legal_mask``
+        parity)."""
         idx = rng.integers(0, corpus.n_games, size=(n, cfg.batch_size))
         return Batch(
             tokens=jnp.asarray(corpus.tokens[idx]),
             targets=jnp.asarray(corpus.targets[idx]),
             attn_mask=jnp.asarray(corpus.attn_mask[idx]),
             loss_mask=jnp.asarray(corpus.loss_mask[idx]),
+            legal_mask=_legal_for(corpus, idx),
         )
 
     def _run_steps(
@@ -1021,16 +1137,38 @@ def main(argv: list[str] | None = None) -> int:
                 val_idx = val_rng.integers(
                     0, val_corpus.n_games, size=cfg.batch_size
                 )
-                val_batch = slice_batch(val_corpus, val_idx)
-                val_loss = float(val_step(state.backbone, state.adapter, val_batch))
-                logger.log_val(
-                    step=final_step, val_loss=val_loss,
+                val_batch = Batch(
+                    tokens=jnp.asarray(val_corpus.tokens[val_idx]),
+                    targets=jnp.asarray(val_corpus.targets[val_idx]),
+                    attn_mask=jnp.asarray(val_corpus.attn_mask[val_idx]),
+                    loss_mask=jnp.asarray(val_corpus.loss_mask[val_idx]),
+                    legal_mask=_legal_for(val_corpus, val_idx),
+                )
+                metrics = val_metrics_fn(
+                    state.backbone, state.adapter, val_batch
+                )
+                val_loss = float(metrics.loss)
+                # v1-parity richer val metrics (top1 / top5 /
+                # illegal_pred_rate) alongside the bare val_loss.
+                val_record = dict(
+                    val_loss=val_loss,
+                    val_top1=float(metrics.top1),
+                    val_top5=float(metrics.top5),
+                    val_illegal_pred_rate=float(metrics.illegal_pred_rate),
                     val_source=cfg.pgn_val_split if not args.no_pgn else "random",
                 )
-                log_metrics(wandb_run, {"val_loss": val_loss}, step=final_step)
+                logger.log_val(step=final_step, **val_record)
+                log_metrics(wandb_run, val_record, step=final_step)
+                # Patience / best-val checkpoint selection (v1 parity).
+                # ``patience_state`` is the enclosing-scope tracker; a new
+                # best val_loss resets the counter and tags the checkpoint
+                # so ``find_best_adapter_step`` can recover it.
+                _on_val(val_loss, final_step)
             if final_step % cfg.checkpoint_interval == 0:
                 _save(final_step)
             if should_shutdown():
+                return state, final_step
+            if patience_state["stop"]:
                 return state, final_step
         return state, final_step
 
@@ -1056,13 +1194,20 @@ def main(argv: list[str] | None = None) -> int:
                 # |grad|^grad_alpha on each sparse delta to derive the
                 # density-thresholded boolean masks. The deltas are zeroed
                 # before Phase 3 so the sparse contribution starts at zero.
-                mask_batches: list = []
+                mask_batches: list[Batch] = []
                 for _ in range(rosa_cfg.mask_samples):
                     idx = rng.integers(0, corpus.n_games, size=cfg.batch_size)
-                    mask_batches.append(slice_batch(corpus, idx))
+                    mb = slice_batch(corpus, idx)
+                    if need_legal:
+                        mb = eqx.tree_at(
+                            lambda b: b.legal_mask, mb,
+                            _legal_for(corpus, idx),
+                            is_leaf=lambda x: x is None,
+                        )
+                    mask_batches.append(mb)
                 new_sparse = generate_rosa_masks(
                     state.backbone, state.adapter, mask_batches,
-                    compute_dtype=compute_dtype,
+                    compute_dtype=compute_dtype, apply_legal=apply_legal,
                 )
                 # Phase 3: re-init LoRA (kaiming A, zero B), install masks,
                 # flip toggles per mode (rosa keeps LoRA on; retro modes
@@ -1089,6 +1234,7 @@ def main(argv: list[str] | None = None) -> int:
                     cfg.strategy, optimizer,
                     compute_dtype=compute_dtype,
                     use_sdpa=cfg.use_sdpa, use_flash=use_flash,
+                    apply_legal=apply_legal, illegal_penalty=illegal_penalty,
                 )
                 scan_step = make_adapter_scan_step(train_step)
                 phase3_remaining = effective_total_steps - warmup_n
@@ -1113,6 +1259,11 @@ def main(argv: list[str] | None = None) -> int:
             _save(final_step)
         if should_shutdown():
             reason_for_stop = "sigterm"
+        elif patience_state["stop"]:
+            # Early-stopped on the held-out val loss (v1 parity). This is a
+            # clean exit; ``actual != planned`` is expected and is *not* the
+            # structural-bug signal a ``completed`` mismatch would be.
+            reason_for_stop = "patience"
         elif final_step == 0 and resume_step > 0:
             # Resumed at/past the resolved budget — no steps ran. The
             # actual step count is the saved checkpoint's, not 0.
@@ -1135,6 +1286,29 @@ def main(argv: list[str] | None = None) -> int:
             actual_final_lr=actual_final_lr,
             reason_for_stop=reason_for_stop,
         )
+        # Best-val checkpoint selection (v1 parity): record the step that
+        # minimised val_loss so downstream publish / eval can pick it
+        # without re-scanning metrics.jsonl. Fall back to the live
+        # patience tracker when no metrics file is readable.
+        from pawn.checkpoint import find_best_adapter_step
+        best_step = find_best_adapter_step(logger.run_dir / "metrics.jsonl")
+        if best_step is None:
+            best_step = patience_state["best_step"]
+        if best_step is not None:
+            (logger.run_dir / "best_step.json").write_text(
+                json.dumps(
+                    {
+                        "best_step": int(best_step),
+                        "best_val_loss": (
+                            None
+                            if not np.isfinite(patience_state["best_loss"])
+                            else float(patience_state["best_loss"])
+                        ),
+                        "checkpoint": f"adapter_step_{int(best_step):08d}",
+                    }
+                ),
+                encoding="utf-8",
+            )
         # Only an in-loop exception is a failed run; completed / sigterm /
         # resume_no_op are clean exits.
         finish_wandb(wandb_run, exit_code=1 if reason_for_stop == "exception" else 0)

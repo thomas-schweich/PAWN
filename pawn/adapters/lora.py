@@ -21,8 +21,9 @@ from typing import Literal
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float
+from jaxtyping import Array, Bool, Float
 
+from pawn.adapters.placement import apply_layer_mask, layer_placement_mask
 from pawn.model import PAWNModel, TransformerLayer
 
 __all__ = [
@@ -44,13 +45,16 @@ class LoRAConfig:
     ``rank`` is the bottleneck dimension; ``alpha`` is the LoRA scaling
     factor (defaults to ``rank`` if None per Hu et al. convention).
     ``targets`` selects which attention projections get LoRA; ``ffn``
-    toggles LoRA on the SwiGLU gate/up/down.
+    toggles LoRA on the SwiGLU gate/up/down. ``layers`` restricts LoRA to
+    an explicit subset of transformer layers (the ``--adapter-layers``
+    consumer, v1 parity); ``None`` (default) adapts every layer.
     """
 
     rank: int
     alpha: float | None = None
     targets: LoRATargets = "qkvo"
     ffn: bool = False
+    layers: tuple[int, ...] | None = None
 
     @property
     def scaling(self) -> float:
@@ -85,6 +89,9 @@ class LoRAAdapter(eqx.Module):
     B_up: Float[Array, "n_layers r d_ff"] | None
     A_down: Float[Array, "n_layers d_ff r"] | None
     B_down: Float[Array, "n_layers r d"] | None
+    # Per-layer placement mask (True at adapted layers). Bool, so it stays
+    # out of the trainable filter — exactly like the unfreeze `layer_mask`.
+    layer_mask: Bool[Array, "n_layers"]
     # Static config for scaling factor.
     cfg: LoRAConfig = eqx.field(static=True)
 
@@ -149,18 +156,28 @@ def init_lora_adapter(
         A_gate=maybe_A(cfg.ffn, keys[4], d), B_gate=maybe_B(cfg.ffn, d_ff),
         A_up=maybe_A(cfg.ffn, keys[5], d), B_up=maybe_B(cfg.ffn, d_ff),
         A_down=maybe_A(cfg.ffn, keys[6], d_ff), B_down=maybe_B(cfg.ffn, d),
+        layer_mask=layer_placement_mask(cfg.layers, n_layers),
         cfg=cfg,
     )
 
 
 def _add_lora_correction(
-    weight: jax.Array, A: jax.Array | None, B: jax.Array | None, scaling: float
+    weight: jax.Array,
+    A: jax.Array | None,
+    B: jax.Array | None,
+    scaling: float,
+    layer_mask: Bool[Array, "n_layers"],
 ) -> jax.Array:
-    """Return ``weight + (A @ B) * scaling`` (per-layer leading axis)."""
+    """Return ``weight + mask · (A @ B) · scaling`` (per-layer leading axis).
+
+    ``layer_mask`` gates the correction so only the adapted layers
+    receive it; masked-out layers fall back to the frozen ``weight`` and
+    their A/B slices receive zero gradient (``--adapter-layers`` parity).
+    """
     if A is None or B is None:
         return weight
     correction = jnp.einsum("ldr,lre->lde", A, B) * scaling
-    return weight + correction
+    return weight + apply_layer_mask(correction, layer_mask)
 
 
 def apply_lora(backbone: PAWNModel, adapter: LoRAAdapter) -> PAWNModel:
@@ -172,17 +189,18 @@ def apply_lora(backbone: PAWNModel, adapter: LoRAAdapter) -> PAWNModel:
     untouched.
     """
     s = adapter.cfg.scaling
+    m = adapter.layer_mask
     layers = backbone.layers
     new_layers = TransformerLayer(
         attn_norm_w=layers.attn_norm_w,
-        wq=_add_lora_correction(layers.wq, adapter.A_q, adapter.B_q, s),
-        wk=_add_lora_correction(layers.wk, adapter.A_k, adapter.B_k, s),
-        wv=_add_lora_correction(layers.wv, adapter.A_v, adapter.B_v, s),
-        wo=_add_lora_correction(layers.wo, adapter.A_o, adapter.B_o, s),
+        wq=_add_lora_correction(layers.wq, adapter.A_q, adapter.B_q, s, m),
+        wk=_add_lora_correction(layers.wk, adapter.A_k, adapter.B_k, s, m),
+        wv=_add_lora_correction(layers.wv, adapter.A_v, adapter.B_v, s, m),
+        wo=_add_lora_correction(layers.wo, adapter.A_o, adapter.B_o, s, m),
         ffn_norm_w=layers.ffn_norm_w,
-        w_gate=_add_lora_correction(layers.w_gate, adapter.A_gate, adapter.B_gate, s),
-        w_up=_add_lora_correction(layers.w_up, adapter.A_up, adapter.B_up, s),
-        w_down=_add_lora_correction(layers.w_down, adapter.A_down, adapter.B_down, s),
+        w_gate=_add_lora_correction(layers.w_gate, adapter.A_gate, adapter.B_gate, s, m),
+        w_up=_add_lora_correction(layers.w_up, adapter.A_up, adapter.B_up, s, m),
+        w_down=_add_lora_correction(layers.w_down, adapter.A_down, adapter.B_down, s, m),
     )
     # `tree_at` on the single `layers` leaf keeps every other backbone
     # field (embeddings, head, norms, buffers) untouched and decouples

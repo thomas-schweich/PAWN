@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float
 
+from pawn.adapters.placement import layer_placement_mask
 from pawn.model import PAWNModel, TransformerLayer
 
 __all__ = [
@@ -41,6 +42,12 @@ class SparseConfig:
     density: float
     targets: SparseTargets = "qkvo"
     ffn: bool = False
+    # Restrict the sparse mask to an explicit subset of transformer
+    # layers (the ``--adapter-layers`` consumer, v1 parity); ``None``
+    # (default) adapts every layer. Folded directly into the per-layer
+    # binary mask at init — non-adapted layers get an all-False mask, so
+    # their delta multiplies by zero (no correction, no gradient).
+    layers: tuple[int, ...] | None = None
 
 
 class SparseAdapter(eqx.Module):
@@ -101,6 +108,18 @@ def init_sparse_adapter(
     dg, mg = _maybe_init_sparse(cfg.ffn, keys[4], gate_shape, cfg.density)
     du, mu = _maybe_init_sparse(cfg.ffn, keys[5], up_shape, cfg.density)
     dd, md = _maybe_init_sparse(cfg.ffn, keys[6], down_shape, cfg.density)
+    # Per-layer placement: AND the binary mask with the layer-placement
+    # mask so non-adapted layers carry no trainable positions.
+    placement = layer_placement_mask(cfg.layers, n_layers)
+
+    def _place(mask: jax.Array | None) -> jax.Array | None:
+        if mask is None:
+            return None
+        m = placement.reshape((n_layers,) + (1,) * (mask.ndim - 1))
+        return jnp.logical_and(mask, m)
+
+    mq, mk, mv, mo = _place(mq), _place(mk), _place(mv), _place(mo)
+    mg, mu, md = _place(mg), _place(mu), _place(md)
     return SparseAdapter(
         delta_q=dq, mask_q=mq,
         delta_k=dk, mask_k=mk,

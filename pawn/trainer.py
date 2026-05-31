@@ -69,6 +69,8 @@ __all__ = [
     "mask_reserved_columns",
     "distill_column_mask",
     "mask_distill_columns",
+    "apply_legal_mask",
+    "illegal_probability_mass",
 ]
 
 
@@ -99,12 +101,22 @@ class Batch(eqx.Module):
         targets: ``(B, T)`` int32 left-shifted targets.
         attn_mask: ``(B, T)`` bool — True for real tokens.
         loss_mask: ``(B, T)`` bool — True at supervised positions.
+        legal_mask: ``(B, T, V)`` bool — True at the legal move tokens
+            for the position the target predicts. ``None`` (the pretrain
+            default) means "no per-position legality information": the
+            CE softmax then only masks the reserved / NULL / control
+            columns (:func:`mask_reserved_columns`). The adapter loop
+            (:mod:`pawn.adapter_trainer`) attaches this so the move-CE
+            softmax normalises over legal moves only (v1 ``apply_legal_mask``
+            default-ON parity) and the ``illegal_penalty`` term has a legality
+            reference to penalise against.
     """
 
     tokens: Int[Array, "B T"]
     targets: Int[Array, "B T"]
     attn_mask: Bool[Array, "B T"]
     loss_mask: Bool[Array, "B T"]
+    legal_mask: Bool[Array, "B T V"] | None = None
 
 
 def slice_batch(corpus: Corpus, indices: np.ndarray) -> Batch:
@@ -231,6 +243,63 @@ def mask_distill_columns(
 
 
 # ---------------------------------------------------------------------------
+# Legal-move masking (adapter-loss legality, shared with RoSA mask-gen)
+# ---------------------------------------------------------------------------
+
+
+def apply_legal_mask(
+    logits: Float[Array, "... V"],
+    legal_mask: Bool[Array, "... V"],
+) -> Float[Array, "... V"]:
+    """Set the *illegal* move columns of ``logits`` to ``-inf``.
+
+    ``legal_mask`` is True at the tokens that are legal at each position;
+    every False column is forced to ``-inf`` so the softmax never assigns
+    it probability mass and its embedding / ``lm_head`` row receives zero
+    gradient (the constant ``-inf`` substitution detaches the backward
+    graph at those columns). The v2 parity of v1's
+    ``valid_logits.masked_fill(~valid_legal, -inf)`` (``apply_legal_mask``
+    default-ON in the adapter loss; ``git show
+    main:pawn/adapter_training.py:378-380``).
+
+    Reused by the RoSA mask-generation path (:func:`pawn.adapter_trainer.\
+generate_rosa_masks`) so the gradient signal that selects sparse positions
+    is taken under the same legality regime as training.
+    """
+    return jnp.where(legal_mask, logits, -jnp.inf)
+
+
+def illegal_probability_mass(
+    logits: Float[Array, "... V"],
+    legal_mask: Bool[Array, "... V"],
+    *,
+    where: Bool[Array, "..."] | None = None,
+) -> Float[Array, ""]:
+    """Mean softmax mass landing on illegal moves, over supervised positions.
+
+    The v2 parity of v1's ``illegal_probability_mass``
+    (``git show main:pawn/adapter_training.py:513-530``): softmax the
+    *unmasked* logits (over the move-token support — reserved columns are
+    still pushed to ``-inf`` so they never carry mass), zero the legal
+    columns, and sum the remaining (illegal) mass per position. ``where``
+    restricts the mean to supervised (non-PAD) positions; when ``None`` the
+    mean is over every position.
+
+    Only meaningful when the hard legal mask is *off* (``apply_legal_mask``
+    not applied to ``logits``): under hard masking the illegal mass is
+    analytically zero, so the caller short-circuits this term.
+    """
+    logits_f32 = mask_reserved_columns(logits.astype(jnp.float32))
+    probs = jax.nn.softmax(logits_f32, axis=-1)
+    illegal = jnp.where(legal_mask, 0.0, probs).sum(axis=-1)  # (...,)
+    if where is None:
+        return illegal.mean()
+    w = where.astype(jnp.float32)
+    denom = jnp.maximum(w.sum(), 1.0)
+    return (illegal * w).sum() / denom
+
+
+# ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
 
@@ -242,6 +311,8 @@ def cross_entropy_loss(
     compute_dtype: jnp.dtype | None = None,
     use_sdpa: bool = False,
     use_flash: bool = False,
+    apply_legal: bool = True,
+    illegal_penalty: float = 0.0,
 ) -> Float[Array, ""]:
     """Masked cross-entropy on a single variant + batch.
 
@@ -265,6 +336,18 @@ def cross_entropy_loss(
     the trainer falls back to the plain path automatically. See
     :data:`pawn.run_config.BaseRunConfig.use_sdpa` for the operator
     surface.
+
+    **Legality (adapter-loss parity).** When ``batch.legal_mask`` is set
+    *and* ``apply_legal`` is True (v1 ``apply_legal_mask`` default-ON),
+    the illegal move columns are forced to ``-inf`` before the softmax so
+    the move-CE normalises over legal moves only. When ``apply_legal`` is
+    False the raw move logits survive and, if ``illegal_penalty > 0``, the
+    loss gains ``illegal_penalty · E[P_illegal]`` — the mean softmax mass
+    on illegal moves over supervised positions (v1
+    ``compute_adapter_loss``; ``git show
+    main:pawn/adapter_training.py:382-387,548-549``). Both terms are no-ops
+    when ``batch.legal_mask is None`` (the pretrain path), so pretrain CE
+    is bit-identical to before.
     """
     # ``EffectiveCallable`` now mandates the ``use_sdpa`` / ``use_flash``
     # kwargs (Protocol updated alongside the bottleneck wrapper's
@@ -315,12 +398,33 @@ def cross_entropy_loss(
         # does (columns ``[0, NULL_TOKEN)`` are untouched).
         logits_f32 = logits.astype(jnp.float32)
         masked_logits = mask_reserved_columns(logits_f32)
+        # Adapter-loss legality (v1 parity). With a per-position
+        # ``legal_mask`` and hard masking on, push illegal move columns to
+        # -inf so the softmax denominator (and the gradient) only sees legal
+        # moves. ``None`` legal_mask leaves pretrain CE untouched.
+        if batch.legal_mask is not None and apply_legal:
+            masked_logits = apply_legal_mask(masked_logits, batch.legal_mask)
+        loss_mask_bool = batch.loss_mask.astype(jnp.bool_)
         per_pos_loss = optax.softmax_cross_entropy_with_integer_labels(
             masked_logits, batch.targets,
-            where=batch.loss_mask.astype(jnp.bool_)[..., None],
+            where=loss_mask_bool[..., None],
         )  # (B, T), zero at PAD positions thanks to ``where=``
         n_real = jnp.maximum(batch.loss_mask.sum(), 1)
-        return per_pos_loss.sum() / n_real
+        loss = per_pos_loss.sum() / n_real
+        # Illegal-mass penalty (v1 ``compute_adapter_loss``). Only
+        # meaningful with the hard mask off: under hard masking the
+        # illegal mass is analytically zero. We add it on the *un*-legal-
+        # masked logits so the term has a non-trivial gradient.
+        if (
+            batch.legal_mask is not None
+            and not apply_legal
+            and illegal_penalty > 0.0
+        ):
+            penalty = illegal_probability_mass(
+                logits_f32, batch.legal_mask, where=loss_mask_bool,
+            )
+            loss = loss + illegal_penalty * penalty
+        return loss
 
 
 def top1_accuracy(

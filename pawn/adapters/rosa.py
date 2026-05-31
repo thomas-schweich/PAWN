@@ -70,6 +70,11 @@ class RoSAConfig:
     ``bottleneck_dim`` controls the Houlsby bottleneck width when
     ``mode="retro-bottleneck"`` (the bottleneck is unused for the other
     two modes).
+
+    ``layers`` restricts every RoSA sub-adapter (LoRA, sparse, and the
+    retro-bottleneck Houlsby branch) to an explicit subset of transformer
+    layers — the ``--adapter-layers`` consumer, v1 parity. ``None``
+    (default) adapts every layer.
     """
 
     mode: RoSAMode = "rosa"
@@ -83,6 +88,7 @@ class RoSAConfig:
     sparse_targets: Literal["qkvo", "qv", "qkv"] = "qkvo"
     sparse_ffn: bool = False
     bottleneck_dim: int = 8
+    layers: tuple[int, ...] | None = None
 
 
 class RoSAAdapter(eqx.Module):
@@ -124,13 +130,17 @@ def init_rosa_adapter(
     k1, k2, k3 = jax.random.split(key, 3)
     lora_cfg = LoRAConfig(
         rank=cfg.lora_rank, targets=cfg.lora_targets, ffn=cfg.lora_ffn,
+        layers=cfg.layers,
     )
     sparse_cfg = SparseConfig(
         density=cfg.density, targets=cfg.sparse_targets, ffn=cfg.sparse_ffn,
+        layers=cfg.layers,
     )
     bottleneck = (
         init_bottleneck_adapter(
-            backbone, BottleneckConfig(dim=cfg.bottleneck_dim), k3,
+            backbone,
+            BottleneckConfig(dim=cfg.bottleneck_dim, layers=cfg.layers),
+            k3,
         )
         if cfg.mode == "retro-bottleneck"
         else None

@@ -81,6 +81,8 @@ __all__ = [
     "make_adapter_scan_step",
     "make_forward_eval",
     "forward_eval",
+    "AdapterValMetrics",
+    "make_adapter_val_metrics",
     "generate_rosa_masks",
     "rosa_phase1_to_phase3",
 ]
@@ -235,6 +237,8 @@ def make_adapter_train_step(
     compute_dtype: "jnp.dtype | None" = None,
     use_sdpa: bool = False,
     use_flash: bool = False,
+    apply_legal: bool = True,
+    illegal_penalty: float = 0.0,
 ) -> Callable[
     [AdapterTrainState, Batch], tuple[AdapterTrainState, Float[Array, ""]]
 ]:
@@ -253,6 +257,12 @@ def make_adapter_train_step(
     ...); bottleneck-style wrappers silently fall back to plain
     attention because the wrapper's ``__call__`` doesn't take the
     flags. ``use_flash`` wins when both are set.
+
+    ``apply_legal`` (v1 ``apply_legal_mask`` default-ON) hard-masks
+    illegal move columns to ``-inf`` in the CE softmax when the batch
+    carries a ``legal_mask``; ``illegal_penalty`` adds the v1 illegal-mass
+    penalty term (only with the hard mask off). Both are no-ops on a batch
+    without a ``legal_mask`` so they never perturb the random-game path.
     """
 
     apply_fn = dispatch_apply(strategy)
@@ -268,6 +278,7 @@ def make_adapter_train_step(
                 effective, batch,
                 compute_dtype=compute_dtype,
                 use_sdpa=use_sdpa, use_flash=use_flash,
+                apply_legal=apply_legal, illegal_penalty=illegal_penalty,
             )
 
         loss, grads = eqx.filter_value_and_grad(loss_fn)(state.adapter)
@@ -373,6 +384,105 @@ def forward_eval(
     return make_forward_eval(strategy)(backbone, adapter, batch)
 
 
+class AdapterValMetrics(eqx.Module):
+    """v1-parity adapter validation metrics (all 0-d fp32 JAX scalars).
+
+    Mirrors v1 ``evaluate``'s return dict
+    (``git show main:pawn/adapter_training.py:556-665``):
+
+    - ``loss`` — masked move cross-entropy (legality-aware to match the
+      training loss).
+    - ``top1`` / ``top5`` — fraction of supervised positions whose
+      argmax / top-5 prediction (over the move-token support) hits the
+      target.
+    - ``illegal_pred_rate`` — fraction of supervised positions whose
+      argmax prediction is an illegal move. Always computed on the
+      *un*-legal-masked logits (the model's raw preference) so it stays a
+      meaningful diagnostic even when training masks legality.
+    """
+
+    loss: Float[Array, ""]
+    top1: Float[Array, ""]
+    top5: Float[Array, ""]
+    illegal_pred_rate: Float[Array, ""]
+
+
+def make_adapter_val_metrics(
+    strategy: str,
+    *,
+    apply_legal: bool = True,
+    illegal_penalty: float = 0.0,
+) -> Callable[[PAWNModel, Any, Batch], AdapterValMetrics]:
+    """Build a JIT'd val-metrics pass — backbone + adapter + batch → metrics.
+
+    Resolves ``dispatch_apply(strategy)`` outside the JIT closure (same
+    rationale as :func:`make_forward_eval`). The batch's ``legal_mask``
+    (when present) drives the legality-aware loss and the
+    ``illegal_pred_rate`` diagnostic; a ``None`` legal_mask reports a zero
+    illegal rate (no legality reference) and a reserved-column-only loss.
+    """
+    from pawn.config import NUM_ACTIONS
+    from pawn.trainer import cross_entropy_loss
+
+    apply_fn = dispatch_apply(strategy)
+
+    @eqx.filter_jit
+    def val_metrics(
+        backbone: PAWNModel, adapter: Any, batch: Batch
+    ) -> AdapterValMetrics:
+        effective = apply_fn(backbone, adapter)
+        loss = cross_entropy_loss(
+            effective, batch,
+            apply_legal=apply_legal, illegal_penalty=illegal_penalty,
+        )
+        logits = effective(batch.tokens, batch.attn_mask)
+        logits_f32 = logits.astype(jnp.float32)
+        # Argmax / top-k over the move-token support only. The eval contract
+        # restricts the support to ``[0, NUM_ACTIONS)`` (``eval.py``'s
+        # ``_argmax_over_actions`` slices ``logits[..., :NUM_ACTIONS]``), so
+        # PAD (1968), the 11 outcome tokens (1969-1979), BOS (1980), NULL
+        # and the reserved control block are all excluded — none of them is
+        # a move and the conditioning/outcome-prefix path explicitly trains
+        # the outcome columns, so an under-fit adapter could otherwise have
+        # the argmax land there and corrupt top-k / illegal_pred_rate.
+        scored = logits_f32[..., :NUM_ACTIONS]
+        mask = batch.loss_mask.astype(jnp.bool_)
+        n_real = jnp.maximum(mask.sum(), 1).astype(jnp.float32)
+
+        preds = jnp.argmax(scored, axis=-1)  # (B, T)
+        top1_hits = jnp.where(mask, preds == batch.targets, False)
+        top1 = top1_hits.sum().astype(jnp.float32) / n_real
+
+        # top-5 without ``jax.lax.top_k`` (its JAX-on-ROCm kernel OOMs the
+        # GPU shared memory at V=2000 — same constraint the RoSA mask-gen
+        # path documents). The target is in the top-5 iff strictly fewer
+        # than 5 columns out-score its logit.
+        tgt_logit = jnp.take_along_axis(
+            scored, batch.targets[..., None], axis=-1
+        )  # (B, T, 1)
+        rank = (scored > tgt_logit).sum(axis=-1)  # (B, T) — columns ahead
+        in_top5 = rank < 5
+        top5_acc = jnp.where(mask, in_top5, False).sum().astype(jnp.float32) / n_real
+
+        if batch.legal_mask is not None:
+            # ``preds`` is the argmax over the full move support; a
+            # prediction is illegal when its legal-mask column is False.
+            pred_legal = jnp.take_along_axis(
+                batch.legal_mask, preds[..., None], axis=-1
+            )[..., 0]
+            illegal = jnp.where(mask, ~pred_legal, False)
+            illegal_rate = illegal.sum().astype(jnp.float32) / n_real
+        else:
+            illegal_rate = jnp.float32(0.0)
+
+        return AdapterValMetrics(
+            loss=loss, top1=top1, top5=top5_acc,
+            illegal_pred_rate=illegal_rate,
+        )
+
+    return val_metrics
+
+
 # ---------------------------------------------------------------------------
 # RoSA three-phase orchestration (Nikdan et al. 2024, Algorithm 1)
 # ---------------------------------------------------------------------------
@@ -383,6 +493,7 @@ def _mask_gen_loss(
     adapter: RoSAAdapter,
     batch: Batch,
     compute_dtype: "jnp.dtype | None" = None,
+    apply_legal: bool = True,
 ) -> Float[Array, ""]:
     """Forward + cross-entropy with the RoSA composition active.
 
@@ -390,11 +501,14 @@ def _mask_gen_loss(
     while every sparse mask is forced to all-True. The caller
     constructs that adapter before invoking this; here we just run the
     composed forward and return the loss so :func:`jax.grad` can
-    differentiate it.
+    differentiate it. The legal mask is honoured when the batch carries
+    one so the gradient that selects sparse positions is taken under the
+    same legality regime training uses (shared helper in
+    :func:`pawn.trainer.apply_legal_mask`).
     """
     effective = rosa.apply_rosa(backbone, adapter)
     return cross_entropy_loss(
-        effective, batch, compute_dtype=compute_dtype
+        effective, batch, compute_dtype=compute_dtype, apply_legal=apply_legal,
     )
 
 
@@ -404,6 +518,7 @@ def generate_rosa_masks(
     batches: list[Batch],
     *,
     compute_dtype: "jnp.dtype | None" = None,
+    apply_legal: bool = True,
 ) -> SparseAdapter:
     """Run Algorithm 1: accumulate ``|grad|^grad_alpha`` over
     ``mask_samples`` batches; top-k per delta_* by ``density``.
@@ -457,7 +572,8 @@ def generate_rosa_masks(
         def loss_fn(a: RoSAAdapter) -> Float[Array, ""]:
             effective = rosa.apply_rosa(backbone, a)
             return cross_entropy_loss(
-                effective, batch, compute_dtype=compute_dtype
+                effective, batch, compute_dtype=compute_dtype,
+                apply_legal=apply_legal,
             )
         _, grads = eqx.filter_value_and_grad(loss_fn)(adapter_)
         return grads
@@ -547,8 +663,32 @@ def generate_rosa_masks(
         flat_mask[top_idx] = True
         return jnp.asarray(flat_mask).reshape(score.shape)
 
+    # Per-layer placement (``--adapter-layers``): zero the accumulated
+    # score at non-adapted layers so the top-k never selects a position
+    # outside the requested layer subset. ``cfg.layers is None`` (the
+    # default) leaves every layer eligible.
+    from pawn.adapters.placement import layer_placement_mask
+    n_layers = backbone.cfg.n_layers
+    placement = layer_placement_mask(cfg.layers, n_layers)
+
+    def _gate_score(score: jax.Array | None) -> jax.Array | None:
+        if score is None or cfg.layers is None:
+            return score
+        m = placement.reshape((n_layers,) + (1,) * (score.ndim - 1))
+        return jnp.where(m, score, 0.0)
+
+    def _placed_mask(score: jax.Array | None) -> jax.Array | None:
+        mask = topk_mask(_gate_score(score), cfg.density)
+        if mask is None or cfg.layers is None:
+            return mask
+        # Hard-AND with placement: a density larger than the adapted-layer
+        # position count could otherwise let the top-k spill onto the
+        # zeroed (non-adapted) tail.
+        m = placement.reshape((n_layers,) + (1,) * (mask.ndim - 1))
+        return jnp.logical_and(mask, m)
+
     new_masks = tuple(
-        topk_mask(s, cfg.density)
+        _placed_mask(s)
         for s in (
             accum.delta_q, accum.delta_k, accum.delta_v, accum.delta_o,
             accum.delta_gate, accum.delta_up, accum.delta_down,

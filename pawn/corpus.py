@@ -50,9 +50,11 @@ from pawn.config import (
     CONDITIONING_KINDS,
     DRAW_BY_RULE,
     NULL_TOKEN,
+    NUM_ACTIONS,
     PAD_TOKEN,
     PLY_LIMIT,
     STALEMATE,
+    VOCAB_SIZE,
     WHITE_CHECKMATES,
 )
 
@@ -65,6 +67,7 @@ __all__ = [
     "conditioning_to_C",
     "assert_conditioning_C",
     "conditioning_from_run_block",
+    "legal_mask_for_games",
 ]
 
 
@@ -243,6 +246,98 @@ class Corpus:
                 game_lengths=self.game_lengths[sel].copy(),
             )
         return out
+
+    def move_ids(self) -> NDArray[np.int16]:
+        """Recover the per-game move-id matrix the engine replays from.
+
+        Returns ``(N, max_ply)`` int16 where ``max_ply = seq_len -
+        prefix_width`` (the prefix is BOS + conditioning, width
+        ``C = outcome_offset``). Column ``t`` is the engine action token of
+        the game's ``t``-th ply, taken straight off the packed sequence at
+        slot ``C + t``; padding slots are :data:`PAD_TOKEN`. The
+        prefix width is constant across the corpus
+        (:attr:`outcome_offset`), so a single slice recovers every game's
+        moves. Feeds :func:`legal_mask_for_games`.
+        """
+        if self.n_games == 0:
+            return np.zeros((0, 0), dtype=np.int16)
+        c = int(self.outcome_offset[0])
+        return self.tokens[:, c:].astype(np.int16)
+
+
+def legal_mask_for_games(
+    corpus: Corpus, indices: NDArray[np.integer],
+) -> NDArray[np.bool_]:
+    """Dense ``(B, T, V)`` per-position legal-move mask for ``indices``.
+
+    The v2 source for the adapter loss's legality term (parity with v1's
+    :class:`LegalMaskBuilder` + sparse scatter, ``git show
+    main:pawn/adapter_training.py``). For each selected game the Rust
+    engine replays the moves and emits, per ply, the set of legal action
+    tokens; we scatter those into a dense boolean grid aligned to the
+    *target* positions of the packed sequence.
+
+    Alignment: the engine indexes legal sets by game-relative ply ``t``
+    (``0 = first move``). In the packed sequence the slot whose target is
+    ply-``t`` move sits at ``(C-1) + t`` (``C = outcome_offset``): the last
+    prefix slot ``C-1`` predicts ``ply_1``, matching
+    :func:`build_loss_mask`. We therefore shift the engine's ply axis by
+    ``C-1`` when scattering. The engine also marks PAD legal at the
+    end-of-game slot (its ply ``length``), which lands at ``(C-1) +
+    length`` — the predict-PAD position, which the loss mask excludes, so
+    it is harmless.
+
+    Returns a freshly-allocated host array; the caller uploads it via
+    :func:`jax.numpy.asarray` at the batch boundary.
+    """
+    idx = np.asarray(indices).reshape(-1)
+    b = idx.shape[0]
+    t = corpus.seq_len
+    v = VOCAB_SIZE
+    if b == 0:
+        return np.zeros((0, t, v), dtype=np.bool_)
+    c = int(corpus.outcome_offset[0])
+    # Select first, slice second: indexing `corpus.tokens[idx]` materialises
+    # only the B selected games, then the `[:, c:]` slice + cast builds the
+    # move-region copy for those B rows. Calling `corpus.move_ids()` here would
+    # instead cast the move region of ALL N games before selecting `idx` — a
+    # corpus-wide host allocation churned every chunk. `c` is the prefix width,
+    # so the alignment math below is unchanged.
+    move_ids = corpus.tokens[idx][:, c:].astype(np.int16)  # (B, max_ply) int16
+    max_ply = move_ids.shape[1]
+    # Clamp game_lengths to the move-id width: a game whose ply count would
+    # overflow the packed sequence (prefix C + plies > seq_len) is stored
+    # truncated, so only the moves that physically fit can be replayed. The
+    # engine replays exactly `game_lengths` plies, so the clamp keeps it in
+    # bounds and aligned with the tokens actually present.
+    game_lengths = np.minimum(
+        corpus.game_lengths[idx], max_ply
+    ).astype(np.int16)
+    # Engine returns flat indices into a (B, max_ply, V) grid: a legal
+    # token `tok` at game `g`, ply `p` is encoded `g*max_ply*V + p*V + tok`.
+    # We pass `seq_len=max_ply` so the engine's per-game stride matches the
+    # `move_ids` width; the predict-PAD entry it appends at ply `length`
+    # only fires when `length < max_ply` (always true for sub-max games).
+    flat = engine.compute_legal_token_masks_sparse(
+        np.ascontiguousarray(move_ids),
+        np.ascontiguousarray(game_lengths),
+        max_ply,
+        v,
+    )
+    flat = np.asarray(flat, dtype=np.int64)
+    out = np.zeros((b, t, v), dtype=np.bool_)
+    if flat.size == 0:
+        return out
+    g_idx = flat // (max_ply * v)
+    rem = flat % (max_ply * v)
+    p_idx = rem // v
+    tok_idx = rem % v
+    # Shift the engine ply axis by (C-1) to land on the target slot, and
+    # drop entries that fall outside the packed sequence width.
+    seq_pos = p_idx + (c - 1)
+    keep = seq_pos < t
+    out[g_idx[keep], seq_pos[keep], tok_idx[keep]] = True
+    return out
 
 
 def _map_termination_to_outcome(
