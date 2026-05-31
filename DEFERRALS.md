@@ -48,6 +48,56 @@ defined but not gone-by-design:
   `HF_TOKEN`; deferred to release-time live-verify rather than
   included in the CI test sweep.
 
+## Pretrain CLI flags that have no honouring code in the v2 loop
+**Section:** config-cli (workstream revision; uncommitted)
+**Reason:** detrimental — promoting these to direct argparse flags would
+advertise knobs that silently no-op on the pretrain path, which is worse
+than an honest argparse error. They split into two groups:
+
+1. **Validation / patience / pause** — `--patience`, `--eval-interval`,
+   `--val-games`, `--pause-after-steps`. The v2 backbone-pretrain loop
+   (`scripts/train_jax.py` main loop + `pawn.trainer`) has NO held-out
+   validation pass, NO early-stop/patience break, and NO pause primitive.
+   `docs/V2_PARITY_AUDIT.md` §2 lists "No backbone-pretrain validation loop
+   … no early-stopping/patience" as an open **major** gap, separate from the
+   config/CLI workstream. v1's `run_pretrain` wired all three
+   (`git show main:scripts/train.py:232,267,274`). A user passing
+   `--patience 5 --eval-interval 200` would get no val records and no early
+   stop.
+
+2. **Lichess-path / unconsumed fields** — `--min-ply`, `--cache-dir`,
+   `--max-corpus-gb`. `min_ply` and `cache_dir` were Lichess-path knobs in
+   v1: they fed `prepare_lichess_cached`
+   (`git show main:scripts/train.py:396-412`), NOT the random-game pretrain
+   corpus. v2's pretrain corpus comes from `pawn.corpus.generate_corpus`
+   (random self-play via the Rust engine), whose signature has no
+   `min_ply`/`cache_dir` parameter, so `--min-ply 20` would silently no-op
+   (unfiltered games). `max_corpus_gb` is a v2-only soft resident-memory cap
+   that currently has NO consumer in either the pretrain or the Lichess path
+   (no reader in `pawn/trainer.py` or `pawn/corpus.py`), so `--max-corpus-gb 4`
+   would not cap anything (possible OOM with no error).
+
+**What was supposed to happen:** v1 exposed every `BaseRunConfig` field as
+a `--flag value` CLI arg, including all of these pretrain knobs.
+**What I did instead:** none of these seven knobs are exposed as direct
+pretrain CLI flags. They remain valid `PretrainConfig` fields settable via
+`--config` JSON (so a verbatim v1 config still loads — pinned by
+`tests/scripts/test_train_jax_smoke.py::test_train_jax_inert_v1_pretrain_knobs_still_settable_via_config_json`),
+and argparse rejects them as flags (pinned by
+`test_train_jax_inert_v1_pretrain_knobs_not_exposed_as_cli_flags`). The
+pretrain knobs that the loop DOES honour ARE exposed as flags — `--log-interval`,
+`--checkpoint-interval`, the LR-schedule knobs, and `--mate-boost` /
+`--discard-ply-limit` (both fed straight into `generate_corpus`); the
+`--mate-boost` wiring is pinned *behaviourally* (not just "lands on config")
+by `test_train_jax_mate_boost_cli_flag_is_honoured_end_to_end`, which drives
+`main()` and asserts the CLI value reaches the `generate_corpus` call site.
+**To revisit when:** group 1 — the audited "backbone-pretrain validation
+loop + patience/early-stop" gap is implemented in the pretrain path; promote
+those four flags in the same change that adds `log_val` + the patience break
++ the pause primitive. Group 2 — `max_corpus_gb` gets a real consumer (a
+corpus-size cap in the prefetch path); `min_ply`/`cache_dir` are inapplicable
+to random-game pretrain and stay JSON-only for v1-config load compatibility.
+
 ## Resolved follow-ups
 
 The original three items here landed in the parity sweep's follow-up

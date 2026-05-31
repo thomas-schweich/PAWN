@@ -478,8 +478,28 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--min-ply", type=int, default=None)
     ap.add_argument("--lora-rank", type=int, default=None)
     ap.add_argument("--lora-targets", default=None)
+    # v1 CLI-compat: route LoRA into the FFN sublayers too (not just
+    # attention projections). Was reachable only via --config JSON in v2.
+    ap.add_argument("--lora-ffn", action="store_true",
+                    help="apply LoRA to the FFN sublayers in addition to "
+                         "the attention projections (lora_targets).")
     ap.add_argument("--density", type=float, default=None)
+    # v1 CLI-compat: which attention projections the sparse mask targets.
+    ap.add_argument("--sparse-targets", choices=("qkvo", "qv", "qkv"),
+                    default=None,
+                    help="attention projections the sparse adapter masks "
+                         "(default qkvo). Mirrors --lora-targets.")
+    # v1 CLI-compat: extend the sparse mask to the FFN sublayers too.
+    ap.add_argument("--sparse-ffn", action="store_true",
+                    help="apply the sparse mask to the FFN sublayers in "
+                         "addition to the attention projections.")
     ap.add_argument("--bottleneck-dim", type=int, default=None)
+    # v1 CLI-compat: extra hidden Linear+GELU stages inside each Houlsby
+    # adapter MLP (0 = standard two-layer block).
+    ap.add_argument("--bottleneck-n-hidden", type=int, default=None,
+                    help="extra hidden Linear+GELU stages inside each "
+                         "Houlsby bottleneck adapter MLP (0 = standard "
+                         "two-layer block).")
     ap.add_argument("--use-output-film", action="store_true")
     ap.add_argument("--no-adapt-attn", action="store_true")
     ap.add_argument("--no-adapt-ffn", action="store_true")
@@ -536,7 +556,7 @@ def _build_config(args: argparse.Namespace) -> AdapterConfig:
     # wired into *both* entry points), so it joins the opt-in store_true
     # set below rather than being silently dropped.
     _CLI_STORE_TRUE_FLAGS = ("use_sdpa", "use_output_film", "no_adapt_attn",
-                             "no_adapt_ffn", "wandb")
+                             "no_adapt_ffn", "wandb", "lora_ffn", "sparse_ffn")
     for flag, val in vars(args).items():
         if flag in (
             "config", "no_pgn", "local_checkpoints", "logs_dir", "resume",

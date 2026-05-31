@@ -218,6 +218,15 @@ class BaseRunConfig(BaseModel):
     # --- IO ------------------------------------------------------------
     log_dir: str | None = None
     hf_repo: str | None = None
+    # v1 carried an `hf_bucket` autosave target ("the trainer pushes to
+    # both" — files at `<bucket>/logs/<run_slug>/...`). v2's JAX trainer
+    # never wired the bucket-push primitive (there is no `submit_bucket`
+    # equivalent in `pawn/lifecycle.py`), so a bucket-only run would
+    # validate and then save/push nothing — silent total checkpoint loss
+    # on a long run. Until the bucket-push path is built (tracked as a
+    # blocker in docs/V2_PARITY_AUDIT.md), `_check_checkpoint_mode`
+    # rejects any config that names `hf_bucket` rather than letting it
+    # masquerade as a working destination.
     hf_bucket: str | None = None
     local_checkpoints: bool = False
     resume: str | None = None
@@ -268,6 +277,63 @@ class BaseRunConfig(BaseModel):
         data["conditioning"] = ["outcome"] if legacy else []
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_max_seq_len(cls, data: Any) -> Any:
+        """Migrate the v1 ``max_seq_len`` JSON key to v2's ``seq_len``.
+
+        v2 renamed the training-time context-window field from
+        ``max_seq_len`` to ``seq_len`` (``max_seq_len`` is now reserved
+        for the architectural ceiling :data:`pawn.config.MAX_SEQ_LEN`).
+        A verbatim v1 run-config JSON carrying ``max_seq_len`` would
+        otherwise be rejected by ``extra="forbid"`` with an opaque "extra
+        field" error instead of a pointer to the rename. Emit a
+        ``DeprecationWarning`` and fold the value into ``seq_len``.
+        """
+        if not isinstance(data, dict) or "max_seq_len" not in data:
+            return data
+        legacy = data.pop("max_seq_len")
+        if "seq_len" in data:
+            raise ValueError(
+                "pass either the legacy `max_seq_len` key or the new "
+                "`seq_len`, not both"
+            )
+        warnings.warn(
+            "`max_seq_len` is deprecated as a run-config field; use "
+            "`seq_len` instead (max_seq_len now names the architectural "
+            "ceiling pawn.config.MAX_SEQ_LEN).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        data["seq_len"] = legacy
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_amp_dtype_none(cls, data: Any) -> Any:
+        """Migrate the v1 ``amp_dtype: "none"`` value to ``"float32"``.
+
+        v1's ``amp_dtype`` Literal admitted ``"none"`` to mean "no mixed
+        precision — run the forward in fp32". v2 spells that
+        ``"float32"`` (and drops the ``use_amp`` bool that v1 derived from
+        ``amp_dtype != "none"``). A verbatim v1 JSON config with
+        ``"amp_dtype": "none"`` would otherwise fail the v2 Literal with an
+        opaque enum error. Rewrite it to ``"float32"`` with a
+        ``DeprecationWarning`` so old configs still load.
+        """
+        if not isinstance(data, dict) or data.get("amp_dtype") != "none":
+            return data
+        warnings.warn(
+            "`amp_dtype=\"none\"` is deprecated; use `amp_dtype=\"float32\"` "
+            "(v2 has no separate `use_amp` flag — float32 is the no-mixed-"
+            "precision setting).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        data = dict(data)
+        data["amp_dtype"] = "float32"
+        return data
+
     @model_validator(mode="after")
     def _check_conditioning(self) -> "BaseRunConfig":
         """Every conditioning kind must be registered, and no kind may
@@ -312,26 +378,32 @@ class BaseRunConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_checkpoint_mode(self) -> "BaseRunConfig":
-        """At least one of hf_repo / hf_bucket / local_checkpoints; hf_repo
-        and local_checkpoints are mutually exclusive.
+        """Exactly one of hf_repo / local_checkpoints; hf_bucket is not
+        yet wired in v2 and is rejected up front.
 
-        Per v1's documented contract (`hf_bucket` is "Mutually compatible
-        with hf_repo: the trainer pushes to both"), `hf_repo + hf_bucket`
-        is an allowed combination, not an error. The hard mutex is only
-        hf_repo vs local_checkpoints — local is fundamentally an
-        alternative to pushing anywhere.
+        v1 documented `hf_bucket` as a functional autosave target
+        ("Mutually compatible with hf_repo: the trainer pushes to both",
+        files at `<bucket>/logs/<run_slug>/...`). v2's JAX trainer has no
+        bucket-push primitive (see the field comment above and
+        docs/V2_PARITY_AUDIT.md), so accepting `hf_bucket` would let a
+        bucket-only run validate and then save/push nothing — silent
+        total checkpoint loss. Reject it with an actionable error instead
+        of advertising a destination that drops every checkpoint.
         """
         if self.hf_repo and self.local_checkpoints:
             raise ValueError(
                 "hf_repo and local_checkpoints are mutually exclusive"
             )
-        if (
-            not self.hf_repo
-            and not self.local_checkpoints
-            and not self.hf_bucket
-        ):
+        if self.hf_bucket is not None:
             raise ValueError(
-                "one of hf_repo, hf_bucket, or local_checkpoints is required"
+                "hf_bucket autosave is not implemented in v2 (the JAX "
+                "trainer has no bucket-push path). Use --hf-repo for "
+                "durable pushes or --local-checkpoints for local-only "
+                "saves. Tracking: docs/V2_PARITY_AUDIT.md."
+            )
+        if not self.hf_repo and not self.local_checkpoints:
+            raise ValueError(
+                "one of hf_repo or local_checkpoints is required"
             )
         return self
 
@@ -744,6 +816,20 @@ class AdapterConfig(BaseRunConfig):
                 "max_games is deprecated for adapter runs; pass "
                 "steps_per_epoch (int or 'all') directly."
             )
+        # v1 parity: emit the deprecation warning only when the user
+        # *explicitly* set `max_games` (not when it inherits its `None`
+        # default), so re-loading a saved config that already wrote
+        # `steps_per_epoch` stays silent. v1 interpreted `max_games` as
+        # `steps_per_epoch = max_games // batch_size` at the adapter
+        # boundary; the same conversion is the documented migration path.
+        if self.max_games is not None and "max_games" in self.model_fields_set:
+            warnings.warn(
+                "max_games is deprecated for adapter runs; pass "
+                "steps_per_epoch (int or 'all') instead. max_games is "
+                "interpreted as `steps_per_epoch = max_games // batch_size`.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         return self
 
 
@@ -819,6 +905,14 @@ class SpecializedCLMConfig(BaseRunConfig):
         if spe is not None and self.max_games is not None:
             raise ValueError(
                 "steps_per_epoch and max_games are mutually exclusive"
+            )
+        if self.max_games is not None and "max_games" in self.model_fields_set:
+            warnings.warn(
+                "max_games is deprecated; pass steps_per_epoch (int or "
+                "'all') instead. max_games is interpreted as "
+                "`steps_per_epoch = max_games // batch_size`.",
+                DeprecationWarning,
+                stacklevel=2,
             )
         return self
 

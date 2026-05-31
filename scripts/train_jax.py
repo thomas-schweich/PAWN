@@ -116,13 +116,97 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                          "C = 1 + len(conditioning). Default is BOS-only "
                          "(C=1). Persisted to config.json so eval rebuilds "
                          "the corpus at the same C.")
+    # v1 CLI-compat: `--prepend-outcome` is the legacy boolean that
+    # `BaseRunConfig._migrate_prepend_outcome` folds into
+    # `conditioning=["outcome"]`. v1 users typed it on the CLI (not just
+    # in JSON), so expose it here. Mutually exclusive with `--conditioning`
+    # (the pydantic before-validator rejects setting both).
+    ap.add_argument("--prepend-outcome", dest="prepend_outcome",
+                    action="store_true", default=None,
+                    help="(v1-compat) shorthand for `--conditioning outcome`; "
+                         "prepends the outcome control token after BOS. "
+                         "Mutually exclusive with --conditioning.")
+    ap.add_argument("--amp-dtype",
+                    choices=("bfloat16", "float16", "float32", "none"),
+                    default=None,
+                    help="mixed-precision forward compute dtype (master "
+                         "weights + Adam moments stay fp32). Default "
+                         "bfloat16. `none` is the v1 spelling of `float32` "
+                         "(no mixed precision) and is migrated for you.")
+    ap.add_argument("--max-seq-len", type=int, default=None,
+                    help="(v1-compat) alias for --seq-len; the v1 run-config "
+                         "field name. Migrated to seq_len with a deprecation "
+                         "warning.")
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--lr-schedule", default=None)
     ap.add_argument("--warmup-frac", type=float, default=None)
+    # v1 CLI-compat: the remaining LR-schedule knobs + core training
+    # hyperparameters were reachable only via --config JSON in v2 (v1's
+    # generic `--flag value` parser exposed every BaseRunConfig field).
+    # Expose the load-bearing ones as direct flags.
+    ap.add_argument("--warmup-steps", type=int, default=None,
+                    help="explicit warmup length in steps (overrides "
+                         "--warmup-frac when set).")
+    ap.add_argument("--decay-frac", type=float, default=None,
+                    help="fraction of total_steps in the final decay phase "
+                         "(WSD / infinite schedules).")
+    ap.add_argument("--cooldown-frac", type=float, default=None,
+                    help="cooldown-phase fraction for the `infinite` "
+                         "schedule.")
+    ap.add_argument("--stable-lr-ratio", type=float, default=None,
+                    help="stable-plateau LR as a fraction of peak LR "
+                         "(`infinite` schedule only).")
+    ap.add_argument("--wsd-decay-shape", choices=("linear", "cosine"),
+                    default=None,
+                    help="decay-phase curve for WSD / infinite schedules.")
+    ap.add_argument("--weight-decay", type=float, default=None)
+    ap.add_argument("--max-grad-norm", type=float, default=None,
+                    help="global-norm gradient clip threshold (default 1.0).")
+    # NOTE: no `--patience` / `--eval-interval` / `--val-games` /
+    # `--pause-after-steps` flags. The v2 pretrain loop has NO held-out
+    # validation pass, NO early-stop/patience break, and NO pause primitive
+    # (docs/V2_PARITY_AUDIT.md §2: "No backbone-pretrain validation loop …
+    # no early-stopping/patience" is an open major gap, and §3 DEFERRALS
+    # records the CLI deferral). v1's `run_pretrain` wired all three
+    # (`git show main:scripts/train.py:232,267,274`), so re-advertising them
+    # on the pretrain CLI before the loop exists would let `--patience 5`
+    # silently no-op. The fields still parse via `--config` JSON (so a
+    # verbatim v1 config loads), but they are NOT promoted to argparse flags
+    # until the validation/patience loop lands. `--log-interval` and
+    # `--checkpoint-interval` ARE honoured by the loop, so they stay.
+    #
+    # NOTE: no `--min-ply` / `--max-corpus-gb` / `--cache-dir` flags either.
+    # `min_ply` and `cache_dir` are Lichess-path fields — in v1 they fed
+    # `prepare_lichess_cached` (`git show main:scripts/train.py:396-412`),
+    # NOT the random-game pretrain corpus. v2's pretrain corpus comes from
+    # `generate_corpus()` (random self-play via the Rust engine), whose
+    # signature has no `min_ply`/`cache_dir` parameter, so promoting these
+    # to pretrain flags would let `--min-ply 20` silently no-op. `max_corpus_gb`
+    # is a v2-only soft resident-memory cap that currently has NO consumer in
+    # either the pretrain or the Lichess path (no reader in pawn/trainer.py or
+    # pawn/corpus.py), so it is likewise not advertised as a flag. All three
+    # remain settable via `--config` JSON. By contrast `--mate-boost` and
+    # `--discard-ply-limit` below ARE honoured (passed straight into
+    # `generate_corpus`), so they stay as flags.
+    ap.add_argument("--log-interval", type=int, default=None)
+    ap.add_argument("--mate-boost", type=float, default=None,
+                    help="bias the random-game engine toward mating lines "
+                         "(0 = uniform).")
+    ap.add_argument("--discard-ply-limit", action="store_true", default=None,
+                    help="discard games that hit the ply limit instead of "
+                         "truncating them.")
     ap.add_argument("--checkpoint-interval", type=int, default=None)
     # IO
     ap.add_argument("--local-checkpoints", action="store_true")
     ap.add_argument("--hf-repo", default=None)
+    # NOTE: no `--hf-bucket` flag. v1's bucket-autosave target is not
+    # wired in v2's JAX trainer (no bucket-push primitive), so exposing
+    # it would advertise a destination that silently drops every
+    # checkpoint. `BaseRunConfig._check_checkpoint_mode` rejects any
+    # config that names `hf_bucket`. Tracking: docs/V2_PARITY_AUDIT.md.
+    # (No `--cache-dir` flag — Lichess-path-only, unread by pretrain; see
+    # the not-honoured-knobs NOTE above.)
+    ap.add_argument("--wandb-project", default=None)
     ap.add_argument("--resume", type=Path, default=None)
     ap.add_argument("--logs-dir", type=Path, default=Path("logs"))
     ap.add_argument("--wandb", action="store_true")
@@ -191,8 +275,23 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
         ("lr", args.lr),
         ("lr_schedule", args.lr_schedule),
         ("warmup_frac", args.warmup_frac),
+        ("warmup_steps", args.warmup_steps),
+        ("decay_frac", args.decay_frac),
+        ("cooldown_frac", args.cooldown_frac),
+        ("stable_lr_ratio", args.stable_lr_ratio),
+        ("wsd_decay_shape", args.wsd_decay_shape),
+        ("weight_decay", args.weight_decay),
+        ("max_grad_norm", args.max_grad_norm),
+        # NOTE: patience / eval_interval / pause_after_steps / val_games and
+        # min_ply / max_corpus_gb / cache_dir are intentionally NOT merged
+        # from CLI flags — none have honouring code in the pretrain loop (see
+        # _parse_args). They remain settable via `--config` JSON for v1-config
+        # compatibility. `mate_boost` IS honoured (fed to generate_corpus).
+        ("log_interval", args.log_interval),
+        ("mate_boost", args.mate_boost),
         ("checkpoint_interval", args.checkpoint_interval),
         ("hf_repo", args.hf_repo),
+        ("wandb_project", args.wandb_project),
         ("resume", str(args.resume) if args.resume else None),
         # `--conditioning` with nargs="*" yields a list when passed
         # (possibly empty for `--conditioning` with no args) and None
@@ -215,6 +314,21 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
         base["use_sdpa"] = True
     if args.optimizer is not None:
         base["optimizer"] = args.optimizer
+    # `--amp-dtype none` is the v1 spelling of float32; the
+    # `_migrate_amp_dtype_none` before-validator rewrites it, so pass the
+    # raw value straight through.
+    if args.amp_dtype is not None:
+        base["amp_dtype"] = args.amp_dtype
+    # `--prepend-outcome` and `--max-seq-len` are v1-compat aliases; merge
+    # them as the legacy keys so `BaseRunConfig`'s before-validators run
+    # the migration (and reject conflicting `--conditioning` / `--seq-len`
+    # with a clear message).
+    if args.prepend_outcome:
+        base["prepend_outcome"] = True
+    if args.max_seq_len is not None:
+        base["max_seq_len"] = args.max_seq_len
+    if args.discard_ply_limit:
+        base["discard_ply_limit"] = True
     # `stochastic_variants` default in argparse is None — only override
     # the config value when the user explicitly passed --stochastic-variants
     # or --no-stochastic-variants on the CLI.

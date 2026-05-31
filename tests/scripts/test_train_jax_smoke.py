@@ -8,10 +8,15 @@ checks.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from pawn.run_config import AdapterConfig, PretrainConfig
 
 SCRIPTS = (
     "train_jax",
@@ -656,3 +661,334 @@ def test_train_jax_accumulation_steps_runs(tmp_path) -> None:  # type: ignore[no
         f"no checkpoint written under {logs_dir}; "
         f"stdout={result.stdout}\nstderr={result.stderr}"
     )
+
+
+# ---------------------------------------------------------------------------
+# v1 CLI-compat flags reachable only via --config JSON in v2 (config-cli
+# parity workstream). Each routes through the real _parse_args ->
+# _build_config path so the argparse wiring + pydantic migration both run.
+# ---------------------------------------------------------------------------
+
+
+def _train_jax_cfg(extra: list[str]) -> PretrainConfig:
+    tj = _load_train_jax()
+    args = tj._parse_args(
+        ["--supernet", "tiny", "--total-steps", "1",
+         "--local-checkpoints", *extra]
+    )
+    cfg: PretrainConfig = tj._build_config(args)
+    return cfg
+
+
+def test_train_jax_prepend_outcome_cli_flag() -> None:
+    """`--prepend-outcome` is the v1 boolean; the CLI must accept it (v1
+    users got an argparse error in v2) and the before-validator folds it
+    into `conditioning=["outcome"]`."""
+    with pytest.warns(DeprecationWarning, match="prepend_outcome"):
+        cfg = _train_jax_cfg(["--prepend-outcome"])
+    assert cfg.conditioning == ["outcome"]
+    assert cfg.C == 2
+    # Omitting the flag leaves the BOS-only default (C == 1, no warning).
+    cfg = _train_jax_cfg([])
+    assert cfg.conditioning == []
+    assert cfg.C == 1
+
+
+def test_train_jax_prepend_outcome_conflicts_with_conditioning() -> None:
+    """Passing both `--prepend-outcome` and `--conditioning` is the
+    ambiguous case the migration validator rejects."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="not both"):
+        _train_jax_cfg(["--prepend-outcome", "--conditioning", "outcome"])
+
+
+def test_train_jax_amp_dtype_cli_flag() -> None:
+    """`--amp-dtype` is exposed directly (was --config-only in v2). The v1
+    spelling `none` migrates to `float32`."""
+    cfg = _train_jax_cfg(["--amp-dtype", "float16"])
+    assert cfg.amp_dtype == "float16"
+    with pytest.warns(DeprecationWarning, match="amp_dtype"):
+        cfg = _train_jax_cfg(["--amp-dtype", "none"])
+    assert cfg.amp_dtype == "float32"
+
+
+def test_train_jax_max_seq_len_cli_flag_migrates_to_seq_len() -> None:
+    """`--max-seq-len` is the v1 field name; the CLI accepts it and the
+    before-validator folds it into `seq_len`."""
+    with pytest.warns(DeprecationWarning, match="max_seq_len"):
+        cfg = _train_jax_cfg(["--max-seq-len", "64"])
+    assert cfg.seq_len == 64
+
+
+def test_train_jax_seq_len_flag_still_works() -> None:
+    """The native `--seq-len` flag is unaffected by the max_seq_len alias."""
+    cfg = _train_jax_cfg(["--seq-len", "128"])
+    assert cfg.seq_len == 128
+
+
+def test_train_jax_core_v1_knobs_exposed_as_cli_flags() -> None:
+    """v1's generic `--flag value` parser exposed every BaseRunConfig
+    field; v2's explicit argparse must expose the load-bearing pretrain
+    knobs as direct flags (previously --config-only). Route a
+    representative spread through _parse_args -> _build_config and assert
+    each lands on the config."""
+    cfg = _train_jax_cfg([
+        "--weight-decay", "0.01",
+        "--max-grad-norm", "0.5",
+        "--warmup-steps", "50",
+        "--decay-frac", "0.2",
+        "--cooldown-frac", "0.15",
+        "--stable-lr-ratio", "0.2",
+        "--wsd-decay-shape", "cosine",
+        "--log-interval", "25",
+        "--mate-boost", "1.5",
+        "--wandb-project", "pawn-test",
+    ])
+    assert cfg.weight_decay == 0.01
+    assert cfg.max_grad_norm == 0.5
+    assert cfg.warmup_steps == 50
+    assert cfg.decay_frac == 0.2
+    assert cfg.cooldown_frac == 0.15
+    assert cfg.stable_lr_ratio == 0.2
+    assert cfg.wsd_decay_shape == "cosine"
+    assert cfg.log_interval == 25
+    assert cfg.mate_boost == 1.5
+    assert cfg.wandb_project == "pawn-test"
+
+
+class _AbortAfterSpy(Exception):
+    """Sentinel raised by the corpus spy to short-circuit the pretrain loop
+    once the first `generate_corpus` call has been observed."""
+
+
+def test_train_jax_mate_boost_cli_flag_is_honoured_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--mate-boost` stays exposed as a pretrain flag *because the loop
+    honours it* — `cfg.mate_boost` is fed into `generate_corpus` at the
+    corpus-build call site. "Lands on the config" is not enough (that is the
+    exact masking the gate flagged for the dropped no-op knobs), so drive
+    `main()` end-to-end and assert the value the CLI parsed is the value that
+    reaches `generate_corpus`. A spy records the kwarg and raises to abort
+    before the (heavy) training scan; the trainer's `finally` still tears down
+    the prefetch executor cleanly."""
+    import os
+
+    tj = _load_train_jax()
+
+    seen: dict[str, float] = {}
+    real_generate_corpus = tj.generate_corpus
+
+    def _spy(*args: object, **kwargs: object) -> object:
+        # Build a real (tiny) corpus so the call is faithful, capture the
+        # mate_boost the call site passed, then abort the run.
+        mate_boost = kwargs.get("mate_boost")
+        assert isinstance(mate_boost, float)
+        seen["mate_boost"] = mate_boost
+        real_generate_corpus(*args, **kwargs)
+        raise _AbortAfterSpy
+
+    monkeypatch.setattr(tj, "generate_corpus", _spy)
+    monkeypatch.setenv("PAWN_ALLOW_CPU", "1")
+    # JAX picks up the platform from env at first device use; the spy aborts
+    # before any compiled step runs, but require_accelerator() still gates.
+    monkeypatch.setenv("JAX_PLATFORMS", os.environ.get("JAX_PLATFORMS", "cpu"))
+
+    with pytest.raises(_AbortAfterSpy):
+        tj.main([
+            "--supernet", "tiny", "--total-steps", "2",
+            "--batch-size", "2", "--seq-len", "32", "--k", "2",
+            "--mate-boost", "3.5", "--local-checkpoints", "--lr", "1e-3",
+        ])
+
+    assert seen.get("mate_boost") == 3.5, (
+        "the --mate-boost CLI value did not reach generate_corpus — the flag "
+        "lands on the config but is not honoured by the corpus-build path"
+    )
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("--patience", "5"),
+        ("--eval-interval", "200"),
+        ("--pause-after-steps", "999"),
+        ("--val-games", "128"),
+        # Lichess-path / unconsumed fields — see the second group of asserts
+        # in the no-op test below for why these are not honoured by pretrain.
+        ("--min-ply", "20"),
+        ("--max-corpus-gb", "4.0"),
+        ("--cache-dir", "/tmp/pawn-cache"),
+    ],
+)
+def test_train_jax_inert_v1_pretrain_knobs_not_exposed_as_cli_flags(
+    flag: str, value: str
+) -> None:
+    """The v2 pretrain loop has NO held-out validation pass, NO
+    early-stop/patience break, and NO pause primitive (the pretrain loop in
+    scripts/train_jax.py consumes only `log_interval` + `checkpoint_interval`;
+    docs/V2_PARITY_AUDIT.md §2 lists the missing validation/patience loop as
+    an open major gap, §3 DEFERRALS records the CLI deferral). Additionally,
+    `min_ply` / `cache_dir` are Lichess-path fields (v1 fed them to
+    `prepare_lichess_cached`, NOT the random-game pretrain corpus), and
+    `max_corpus_gb` is a v2-only soft memory cap with no consumer in either
+    path. So none of these knobs must be promoted to argparse flags —
+    re-advertising them would let a user pass `--min-ply 20` and get a silent
+    no-op. argparse rejects the unknown flag (`SystemExit` from `error()`)."""
+    with pytest.raises(SystemExit):
+        _train_jax_cfg([flag, value])
+
+
+def test_train_jax_inert_v1_pretrain_knobs_still_settable_via_config_json(
+    tmp_path: Path,
+) -> None:
+    """Although NOT exposed as direct CLI flags, the inert pretrain knobs
+    remain valid `PretrainConfig` fields settable through `--config` JSON, so
+    a verbatim v1 run config still loads (the fields are simply not honoured
+    by the v2 loop yet — see the parity audit DEFERRALS entry). This pins
+    that the deferral is CLI-surface-only, not a config-schema regression."""
+    tj = _load_train_jax()
+    config_path = tmp_path / "pretrain.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "run_type": "pretrain",
+                "supernet": "tiny",
+                "total_steps": 1,
+                "local_checkpoints": True,
+                "patience": 5,
+                "eval_interval": 200,
+                "pause_after_steps": 999,
+                "val_games": 128,
+            }
+        )
+    )
+    args = tj._parse_args(["--config", str(config_path)])
+    cfg: PretrainConfig = tj._build_config(args)
+    assert cfg.patience == 5
+    assert cfg.eval_interval == 200
+    assert cfg.pause_after_steps == 999
+    assert cfg.val_games == 128
+
+
+def test_train_jax_discard_ply_limit_flag() -> None:
+    """`--discard-ply-limit` is a store_true that's off unless passed
+    (so an absent flag never clobbers a JSON `true`)."""
+    assert _train_jax_cfg([]).discard_ply_limit is False
+    assert _train_jax_cfg(["--discard-ply-limit"]).discard_ply_limit is True
+
+
+def test_train_jax_rejects_hf_bucket_only_config() -> None:
+    """A bucket-only config must NOT validate. v2's JAX trainer has no
+    bucket-push primitive, so accepting `hf_bucket` as a sole destination
+    would let a long run train to completion and persist nothing (silent
+    total checkpoint loss). `_check_checkpoint_mode` rejects it up front
+    with an actionable error. There is deliberately no `--hf-bucket` CLI
+    flag, so the only way to set the field is a JSON config; build the
+    config directly to pin the validator."""
+    from pydantic import ValidationError
+
+    from pawn.run_config import PretrainConfig
+
+    with pytest.raises(ValidationError, match="hf_bucket autosave is not"):
+        # `variant="base"` is a named preset, so no arch overrides are
+        # needed — `_check_checkpoint_mode` runs regardless of arch.
+        PretrainConfig(variant="base", total_steps=1, hf_bucket="ns/bkt")
+
+
+def test_train_jax_local_checkpoints_actually_writes_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """The chosen checkpoint mode must actually persist a checkpoint — a
+    config that merely validates is not enough (regression guard for the
+    bucket-mode silent-loss trap). Run a tiny `--local-checkpoints`
+    pretrain end-to-end and assert a `step_*` directory lands on disk."""
+    import subprocess
+
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax.py",
+            "--supernet", "tiny", "--total-steps", "2",
+            "--batch-size", "4", "--seq-len", "32", "--k", "2",
+            "--checkpoint-interval", "2",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"local-checkpoints pretrain failed:\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    ckpts = sorted(logs_dir.glob("*/step_*"))
+    assert ckpts, (
+        f"no checkpoint written under {logs_dir} despite a valid "
+        f"checkpoint mode; stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    # The atomic-save sentinel must be present — the checkpoint is
+    # actually complete, not a half-written `.tmp`.
+    assert (ckpts[-1] / ".complete").exists(), (
+        f"checkpoint {ckpts[-1]} missing its .complete sentinel"
+    )
+
+
+def _adapter_cli_cfg(extra: list[str]) -> AdapterConfig:
+    mod = _load_adapter_module()
+    args = mod._parse_args(
+        ["--strategy", "lora", "--lora-rank", "4",
+         "--supernet", "tiny", "--variant", "small",
+         "--total-steps", "1", "--local-checkpoints", *extra]
+    )
+    cfg: AdapterConfig = mod._build_config(args)
+    return cfg
+
+
+def test_adapter_lora_ffn_cli_flag() -> None:
+    """`--lora-ffn` is exposed directly (was --config-only in v2). Default
+    off; the flag sets the AdapterConfig field True."""
+    assert _adapter_cli_cfg([]).lora_ffn is False
+    assert _adapter_cli_cfg(["--lora-ffn"]).lora_ffn is True
+
+
+def test_adapter_sparse_ffn_cli_flag() -> None:
+    """`--sparse-ffn` is exposed directly. Sparse strategy needs a density;
+    drive it through a sparse-strategy config."""
+    mod = _load_adapter_module()
+    args = mod._parse_args(
+        ["--strategy", "sparse", "--density", "0.01", "--sparse-ffn",
+         "--supernet", "tiny", "--variant", "small",
+         "--total-steps", "1", "--local-checkpoints"]
+    )
+    cfg = mod._build_config(args)
+    assert cfg.sparse_ffn is True
+
+
+def test_adapter_sparse_targets_cli_flag() -> None:
+    """`--sparse-targets` is exposed directly (was --config-only in v2)."""
+    mod = _load_adapter_module()
+    args = mod._parse_args(
+        ["--strategy", "sparse", "--density", "0.01",
+         "--sparse-targets", "qv",
+         "--supernet", "tiny", "--variant", "small",
+         "--total-steps", "1", "--local-checkpoints"]
+    )
+    cfg = mod._build_config(args)
+    assert cfg.sparse_targets == "qv"
+
+
+def test_adapter_bottleneck_n_hidden_cli_flag() -> None:
+    """`--bottleneck-n-hidden` is exposed directly (was --config-only)."""
+    mod = _load_adapter_module()
+    args = mod._parse_args(
+        ["--strategy", "bottleneck", "--bottleneck-dim", "8",
+         "--bottleneck-n-hidden", "2",
+         "--supernet", "tiny", "--variant", "small",
+         "--total-steps", "1", "--local-checkpoints"]
+    )
+    cfg = mod._build_config(args)
+    assert cfg.bottleneck_n_hidden == 2

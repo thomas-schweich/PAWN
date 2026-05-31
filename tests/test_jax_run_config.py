@@ -231,6 +231,21 @@ def test_amp_dtype_field_present_and_defaults_to_bfloat16() -> None:
         )
 
 
+def test_optimizer_field_defaults_to_adamw_and_accepts_lion() -> None:
+    """C.1: `optimizer` is a BaseRunConfig Literal['adamw','lion'] that
+    defaults to AdamW and accepts Lion. Anything outside the pair is
+    rejected by the Literal (Adafactor is not wired in this build)."""
+    cfg = PretrainConfig(**_pretrain_kwargs())
+    assert cfg.optimizer == "adamw"
+    cfg = PretrainConfig(**_pretrain_kwargs(optimizer="lion"))
+    assert cfg.optimizer == "lion"
+    # Round-trips through JSON (the `--config` contract).
+    reloaded = PretrainConfig(**json.loads(json.dumps(cfg.model_dump())))
+    assert reloaded.optimizer == "lion"
+    with pytest.raises(ValueError, match="optimizer"):
+        PretrainConfig(**_pretrain_kwargs(optimizer="adafactor"))
+
+
 def test_use_sdpa_field_defaults_off() -> None:
     """Parity #43 follow-up: ``use_sdpa`` is a bool field that defaults
     to False (keep the bit-stable baseline) and accepts True to opt
@@ -365,12 +380,25 @@ def test_specialized_round_trips_through_json() -> None:
 
 
 def test_checkpoint_mode_requires_one_destination() -> None:
-    with pytest.raises(ValueError, match="hf_repo.*hf_bucket.*local_checkpoints"):
+    with pytest.raises(ValueError, match="hf_repo or local_checkpoints"):
         PretrainConfig(total_steps=100)  # no checkpoint destination
     # Happy path
     PretrainConfig(local_checkpoints=True, total_steps=100)
     PretrainConfig(hf_repo="thomas-schweich/scratch", total_steps=100)
-    PretrainConfig(hf_bucket="ns/bucket", total_steps=100)
+
+
+def test_checkpoint_mode_rejects_hf_bucket() -> None:
+    """v2 has no bucket-push path, so `hf_bucket` is rejected outright
+    (was a silent no-save trap in v1-parity terms — see
+    docs/V2_PARITY_AUDIT.md). It is rejected even when a working
+    destination is also present, since the trainer would push to the
+    bucket nowhere regardless."""
+    with pytest.raises(ValueError, match="hf_bucket autosave is not"):
+        PretrainConfig(hf_bucket="ns/bucket", total_steps=100)
+    with pytest.raises(ValueError, match="hf_bucket autosave is not"):
+        PretrainConfig(
+            hf_bucket="ns/bucket", local_checkpoints=True, total_steps=100
+        )
 
 
 def test_checkpoint_mode_rejects_hf_repo_plus_local() -> None:
@@ -530,6 +558,33 @@ def test_prepend_outcome_and_conditioning_both_set_rejected() -> None:
         PretrainConfig(
             **_pretrain_kwargs(prepend_outcome=True, conditioning=["outcome"])
         )
+
+
+def test_max_seq_len_legacy_key_migrates_to_seq_len_with_warning() -> None:
+    """v1 spelled the training context window `max_seq_len`; v2 renamed it
+    to `seq_len`. A verbatim v1 JSON config carrying `max_seq_len` must
+    still load — the before-validator folds it into `seq_len` and warns,
+    rather than `extra='forbid'` rejecting it."""
+    with pytest.warns(DeprecationWarning, match="max_seq_len"):
+        cfg = PretrainConfig(**_pretrain_kwargs(max_seq_len=64))
+    assert cfg.seq_len == 64
+
+
+def test_max_seq_len_and_seq_len_both_set_rejected() -> None:
+    """Passing both the legacy `max_seq_len` and the new `seq_len` is
+    ambiguous → error (mirrors the prepend_outcome/conditioning mutex)."""
+    with pytest.raises(ValueError, match="not both"):
+        PretrainConfig(**_pretrain_kwargs(max_seq_len=64, seq_len=64))
+
+
+def test_amp_dtype_none_migrates_to_float32_with_warning() -> None:
+    """v1's `amp_dtype` Literal admitted `"none"` (= no mixed precision).
+    v2 spells that `"float32"`. A verbatim v1 JSON config with
+    `amp_dtype="none"` must still load — the before-validator rewrites it
+    and warns, rather than the v2 Literal rejecting it."""
+    with pytest.warns(DeprecationWarning, match="amp_dtype"):
+        cfg = PretrainConfig(**_pretrain_kwargs(amp_dtype="none"))
+    assert cfg.amp_dtype == "float32"
 
 
 def test_seq_len_exceeding_max_seq_len_rejected() -> None:
@@ -817,6 +872,35 @@ def test_steps_per_epoch_other_string_rejected() -> None:
 def test_steps_per_epoch_with_max_games_rejected() -> None:
     with pytest.raises(ValueError, match="mutually exclusive"):
         AdapterConfig(**_adapter_kwargs(steps_per_epoch=1000, max_games=50000))
+
+
+def test_adapter_max_games_emits_deprecation_warning() -> None:
+    """v1 parity: explicitly setting `max_games` on an adapter run (without
+    `steps_per_epoch`) is honoured but emits a DeprecationWarning pointing
+    at `steps_per_epoch`. v1 interpreted it as
+    `steps_per_epoch = max_games // batch_size`."""
+    with pytest.warns(DeprecationWarning, match="max_games is deprecated"):
+        cfg = AdapterConfig(**_adapter_kwargs(max_games=50000))
+    assert cfg.max_games == 50000
+
+
+def test_adapter_default_max_games_does_not_warn(
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    """The warning fires only when the user *explicitly* set `max_games` —
+    re-loading a saved config that wrote `steps_per_epoch` (max_games
+    inheriting its None default) must stay silent."""
+    AdapterConfig(**_adapter_kwargs(steps_per_epoch=1000))
+    assert not [
+        w for w in recwarn.list if issubclass(w.category, DeprecationWarning)
+    ]
+
+
+def test_specialized_max_games_emits_deprecation_warning() -> None:
+    """SpecializedCLMConfig shares the adapter's `max_games` deprecation
+    (both drive the Lichess-cache sizing logic)."""
+    with pytest.warns(DeprecationWarning, match="max_games is deprecated"):
+        SpecializedCLMConfig(**_specialized_kwargs(max_games=50000))
 
 
 # SpecializedCLMConfig validator --------------------------------------------
