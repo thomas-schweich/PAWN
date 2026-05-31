@@ -56,7 +56,9 @@ from pawn.corpus import Corpus, conditioning_to_C, pack_corpus
 
 __all__ = [
     "load_lichess_corpus",
+    "load_lichess_train_val",
     "make_epoch_schedule",
+    "split_has_files",
 ]
 
 
@@ -74,14 +76,75 @@ _CACHE_VERSION = 2
 
 
 def _default_cache_root() -> Path:
-    """Resolve ``$HF_HOME/pawn-lichess-cache``, defaulting to
-    ``~/.cache/huggingface/pawn-lichess-cache`` when ``HF_HOME`` is
-    unset (matches the huggingface-hub default).
+    """Resolve the on-disk Lichess cache root.
+
+    Resolution order (matches the v1 ``PAWN_DATA_CACHE`` escape hatch):
+
+      1. ``$PAWN_DATA_CACHE`` — used verbatim (expanded), no subdir appended.
+         This is the operator override for routing the cache onto a roomy
+         scratch volume independent of ``$HF_HOME``.
+      2. ``$HF_HOME/pawn-lichess-cache``.
+      3. ``~/.cache/huggingface/pawn-lichess-cache`` (the huggingface-hub
+         default) when neither env var is set.
     """
+    env = os.environ.get("PAWN_DATA_CACHE")
+    if env:
+        return Path(env).expanduser()
     hf_home = os.environ.get("HF_HOME")
     if hf_home:
         return Path(hf_home) / "pawn-lichess-cache"
     return Path.home() / ".cache" / "huggingface" / "pawn-lichess-cache"
+
+
+def split_has_files(source: str, split: str) -> bool:
+    """Probe whether ``split`` has parquet shards available under ``source``.
+
+    This is the carve-vs-held-out decision gate. ``load_lichess_train_val``
+    (and the adapter trainer) call it to decide whether a real held-out
+    validation split exists or whether validation must be carved out of the
+    training games instead.
+
+    Three source forms:
+
+    - **Single local ``.parquet`` file** — no split semantics, so only
+      ``split == "train"`` is satisfiable; any other split returns ``False``
+      (and the caller carves from train).
+    - **HF dataset repo ID** (``"user/dataset"``) — list the repo's files
+      once and look for any ``.parquet`` whose path contains ``/<split>-``.
+      A network/listing failure conservatively returns ``False`` rather than
+      letting :func:`_scan_parquet`'s "fall back to all parquet files" branch
+      silently load the *train* shards as validation.
+    - **Local directory / glob** — match ``<split>-*.parquet`` on disk.
+
+    Cheap (one ``list_repo_files`` call for HF); the right guard before
+    attempting to build a validation cache.
+    """
+    s = str(source)
+
+    if s.endswith(".parquet") and Path(s).exists():
+        # A single parquet file has no per-split structure.
+        return split == "train"
+
+    if "/" in s and not Path(s).exists():
+        try:
+            from huggingface_hub import HfApi
+
+            files = HfApi().list_repo_files(s, repo_type="dataset")
+        except Exception:
+            return False
+        marker = f"/{split}-"
+        return any(
+            f.endswith(".parquet") and marker in f"/{f}" for f in files
+        )
+
+    # Local directory or glob pattern.
+    p = Path(s)
+    if p.is_dir():
+        return bool(list(p.glob(f"{split}-*.parquet")))
+    import glob as _glob
+
+    matches = _glob.glob(s)
+    return any(split in Path(m).name for m in matches)
 
 
 def _cache_key(
@@ -137,15 +200,19 @@ def _scan_parquet(source: str, split: str) -> pl.LazyFrame:
       relevant shards via :mod:`huggingface_hub` if the native scan
       fails.
 
-    - Local directory: scan ``<split>-*.parquet`` inside it. If no
-      split-prefixed shards exist, fall back to all ``*.parquet``
-      (single-file datasets where the user passes ``--pgn-val-split ""``
-      for carve-from-train).
+    - Local directory: scan ``<split>-*.parquet`` inside it. When the
+      requested split is ``"train"`` and no ``train-*.parquet`` shards exist,
+      fall back to all ``*.parquet`` (single-file / split-less datasets where
+      the user carves validation out of train). A non-``train`` split with no
+      matching shards raises ``FileNotFoundError`` rather than falling back to
+      the train files — otherwise an explicit ``--pgn-val-split validation``
+      against a split-less directory would silently load the *train* shards as
+      validation (identical train/val leak).
     """
     path = Path(source)
     if path.is_dir():
         candidates = sorted(path.glob(f"{split}-*.parquet"))
-        if not candidates:
+        if not candidates and split == "train":
             candidates = sorted(path.glob("*.parquet"))
         if not candidates:
             raise FileNotFoundError(
@@ -189,7 +256,12 @@ def _scan_parquet(source: str, split: str) -> pl.LazyFrame:
             f for f in files
             if f.endswith(".parquet") and f"/{split}-" in f"/{f}"
         ]
-        if not parquet_files:
+        # Same carve-from-train guard as the local-dir branch: only the
+        # ``train`` split may fall back to "all parquet files" (a split-less
+        # repo where validation is carved out of train). A non-``train`` split
+        # with no matching shards must raise rather than silently serve the
+        # train shards as validation.
+        if not parquet_files and split == "train":
             parquet_files = [f for f in files if f.endswith(".parquet")]
         if not parquet_files:
             raise FileNotFoundError(
@@ -428,6 +500,153 @@ def load_lichess_corpus(
     corpus = _pack_dataframe(df, seq_len=seq_len, conditioning=conditioning)
     _save_to_cache(corpus, final_dir)
     return corpus
+
+
+def _index_corpus(corpus: Corpus, idx: NDArray[np.int64]) -> Corpus:
+    """Return the sub-Corpus selecting rows ``idx`` from every field array.
+
+    ``Corpus`` is a frozen numpy-backed dataclass (not a pytree); every field
+    is an ``(N, …)`` host array sharing the same leading game axis, so a single
+    fancy-index over that axis carves a consistent subset across ``tokens`` /
+    ``targets`` / masks / ``outcome_offset`` / ``game_lengths``.
+    """
+    return Corpus(
+        tokens=np.asarray(corpus.tokens)[idx],
+        targets=np.asarray(corpus.targets)[idx],
+        attn_mask=np.asarray(corpus.attn_mask)[idx],
+        loss_mask=np.asarray(corpus.loss_mask)[idx],
+        outcome_offset=np.asarray(corpus.outcome_offset)[idx],
+        game_lengths=np.asarray(corpus.game_lengths)[idx],
+    )
+
+
+def load_lichess_train_val(
+    source: str,
+    *,
+    val_split: str | None = None,
+    elo_min: int | None = None,
+    elo_max: int | None = None,
+    min_ply: int = 10,
+    seq_len: int = 512,
+    max_games: int | None = None,
+    max_val_games: int | None = None,
+    conditioning: Sequence[str] = (),
+    cache_dir: str | Path | None = None,
+    seed: int = 0,
+) -> tuple[Corpus, Corpus]:
+    """Load train + validation corpora, honouring the v1 carve/held-out gate.
+
+    Validation source selection (mirrors v1 ``scripts/train.py``):
+
+    1. If ``val_split`` names a non-empty split, it is **used directly** — the
+       caller asked for a specific held-out split, so it is loaded via
+       :func:`load_lichess_corpus` and a genuinely absent split raises
+       ``FileNotFoundError`` rather than silently degrading to carve. (The
+       :func:`split_has_files` probe is deliberately *not* consulted here: it
+       returns ``False`` on any transient listing/auth failure or on a dataset
+       whose shards don't match the ``/<split>-`` naming convention, which
+       would turn a deliberate held-out request into a silent carve of
+       validation out of the training set.)
+    2. Else (``val_split`` is ``None`` — the implicit default), when the
+       conventional ``"validation"`` split actually has files
+       (:func:`split_has_files`), that held-out split is used.
+    3. Otherwise — ``val_split`` is ``None`` with no ``validation`` shards, or
+       ``val_split == ""`` (explicit carve-from-train) — a **deterministic,
+       disjoint** slice is carved out of the training games. The carve uses a
+       seeded permutation, so train and val never share a game and the split is
+       reproducible across runs.
+
+    Carve size matches the v1 cap formula (``scripts/train.py:427``):
+    ``n_val = min(max_val_games, n_total // 5)`` — a 20% floor-division carve
+    capped by ``max_val_games`` when given. (v1 took the trailing-window slice
+    ``arange(n_train, n_total)``; v2 instead draws a seeded random permutation
+    so the carve is reproducible without coupling to corpus row order, but the
+    *count* is the same as v1.) A final ``min(n_val, n_total - 1)`` safety clamp
+    keeps at least one training game.
+
+    The carved validation slice and the returned training corpus are
+    guaranteed disjoint, fixing the v1→v2 regression where ``--pgn-val-split
+    ""`` on a single-file source leaked the entire dataset into val (identical
+    train/val) via an ``or`` short-circuit that fell back to the ``train``
+    shards.
+    """
+    train_corpus = load_lichess_corpus(
+        source,
+        split="train",
+        elo_min=elo_min,
+        elo_max=elo_max,
+        min_ply=min_ply,
+        seq_len=seq_len,
+        max_games=max_games,
+        conditioning=conditioning,
+        cache_dir=cache_dir,
+    )
+
+    # Decide between a real held-out split and carve-from-train.
+    #
+    # * ``val_split == ""`` is the explicit carve-from-train request (v1
+    #   ``--pgn-val-split ""``): never load a held-out split, always carve.
+    # * A non-empty ``val_split`` is an explicit held-out-split request: load
+    #   it directly. We do NOT route it through ``split_has_files`` — that probe
+    #   returns ``False`` on a transient HF listing/auth failure or a dataset
+    #   whose shards don't match the ``/<split>-`` convention, which would
+    #   silently degrade a deliberate held-out request into a carve of
+    #   validation out of the training set (the exact silent-contamination
+    #   footgun). ``load_lichess_corpus`` raises ``FileNotFoundError`` when the
+    #   named split genuinely has no shards, so a typo/absent split surfaces
+    #   loudly instead.
+    # * ``val_split is None`` is the implicit default. Here we *probe* the
+    #   conventional "validation" split via ``split_has_files`` and fall through
+    #   to carve on a miss — a single-file or split-less source has no held-out
+    #   shards, so this is where carve-from-train is the right default.
+    if val_split == "":
+        chosen_split: str | None = None
+    elif val_split:
+        # Explicit named split — load directly, let an absent split raise.
+        chosen_split = val_split
+    else:
+        chosen_split = (
+            "validation" if split_has_files(source, "validation") else None
+        )
+
+    if chosen_split is not None:
+        val_corpus = load_lichess_corpus(
+            source,
+            split=chosen_split,
+            elo_min=elo_min,
+            elo_max=elo_max,
+            min_ply=min_ply,
+            seq_len=seq_len,
+            max_games=max_val_games,
+            conditioning=conditioning,
+            cache_dir=cache_dir,
+        )
+        return train_corpus, val_corpus
+
+    # Carve a deterministic, disjoint validation tail out of train.
+    n_total = int(train_corpus.tokens.shape[0])
+    if n_total < 2:
+        raise ValueError(
+            "carve-from-train needs at least 2 games to produce a disjoint "
+            f"train/val split, got {n_total}. Provide a held-out split via "
+            "--pgn-val-split or loosen the Elo / min_ply filters."
+        )
+    # v1 cap formula (scripts/train.py:427): n_val = min(val_games, n_total//5).
+    # The 20% floor-division is the uncapped ceiling; max_val_games (the v2
+    # name for v1's val_games) caps it tighter when supplied.
+    n_val = n_total // 5
+    if max_val_games is not None:
+        n_val = min(n_val, max_val_games)
+    # Keep at least one val game (floor-division yields 0 for n_total < 5) and
+    # never let val consume every game — keep at least one training game.
+    n_val = max(1, min(n_val, n_total - 1))
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n_total)
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+    val_corpus = _index_corpus(train_corpus, val_idx)
+    carved_train = _index_corpus(train_corpus, train_idx)
+    return carved_train, val_corpus
 
 
 # ---------------------------------------------------------------------------

@@ -46,7 +46,10 @@ from pawn.checkpoint import resolve_checkpoint_source, save_model
 from pawn.config import SUPERNET, TINY_SUPERNET, VARIANTS, TINY_VARIANTS
 from pawn.corpus import Corpus, generate_corpus, legal_mask_for_games
 from pawn.jax_setup import require_accelerator, resolve_device, setup_jax_caching
-from pawn.lichess_data import load_lichess_corpus
+from pawn.lichess_data import (
+    load_lichess_train_val,
+    make_epoch_schedule,
+)
 from pawn.lifecycle import (
     HFPushTracker,
     build_training_state,
@@ -850,23 +853,26 @@ def main(argv: list[str] | None = None) -> int:
             conditioning=cfg.conditioning,
         )
     else:
-        corpus = load_lichess_corpus(
+        # `load_lichess_train_val` applies the v1 carve/held-out gate
+        # (`pawn.lichess_data` / v1 `scripts/train.py`): an explicit
+        # `--pgn-val-split <name>` is honoured; otherwise a real
+        # `validation` split is used when it has files (`split_has_files`
+        # probe), and failing that — `--pgn-val-split ""`, or a single-file
+        # source with no held-out split — a deterministic *disjoint* tail is
+        # carved out of the training games. This replaces the prior
+        # `split=cfg.pgn_val_split or "validation"` short-circuit, which made
+        # a single-file source re-load the whole train file as "validation"
+        # (identical train/val leak).
+        corpus, val_corpus = load_lichess_train_val(
             cfg.pgn,
-            split="train",
+            val_split=cfg.pgn_val_split,
             elo_min=cfg.elo_min, elo_max=cfg.elo_max,
             min_ply=cfg.min_ply,
             seq_len=cfg.seq_len,
             max_games=getattr(cfg, "max_games", None),
+            max_val_games=getattr(cfg, "val_games", None),
             conditioning=cfg.conditioning,
-        )
-        val_corpus = load_lichess_corpus(
-            cfg.pgn,
-            split=cfg.pgn_val_split or "validation",
-            elo_min=cfg.elo_min, elo_max=cfg.elo_max,
-            min_ply=cfg.min_ply,
-            seq_len=cfg.seq_len,
-            max_games=getattr(cfg, "val_games", None),
-            conditioning=cfg.conditioning,
+            seed=cfg.data_seed or 0,
         )
 
     logger = MetricsLogger(
@@ -975,6 +981,30 @@ def main(argv: list[str] | None = None) -> int:
     eval_interval = cadence.eval_interval
     rng = np.random.default_rng(cadence.data_seed)
     val_rng = np.random.default_rng(cadence.data_seed + 1)
+    # Without-replacement, epoch-permuted train sampler (v1 parity). The
+    # schedule is the full `effective_total_steps * batch_size` index stream
+    # derived deterministically from `data_seed`; `_gather_chunk` slices the
+    # window for each chunk keyed on the absolute step. It must be sized by the
+    # budget the loop *actually drives* — `cadence.effective_total_steps` (=
+    # `epochs * epoch_steps` on the `--epochs`/`--steps-per-epoch` path, which
+    # CLAUDE.md documents as the canonical adapter cadence), NOT `cfg.total_steps`
+    # (the LR-schedule decay timeline). Sizing by `cfg.total_steps` undersized
+    # the schedule whenever `effective_total_steps > cfg.total_steps`, so once
+    # `_gather_chunk`'s `flat_start` passed `cfg.total_steps * B` the slice came
+    # back short and `.reshape(n, B)` raised mid-run. `max(..., resume_step +
+    # remaining)` also covers a `--resume` that extends past
+    # `effective_total_steps`. The schedule is a pure function of `data_seed` and
+    # the absolute step, so a resumed run re-derives the identical stream — the
+    # train sampler needs no RNG replay, only the val stream does. `val_rng`
+    # keeps its with-replacement eval draw (eval subsampling, not an epoch
+    # contract).
+    schedule_steps = max(
+        effective_total_steps,
+        resume_step + max(0, effective_total_steps - resume_step),
+    )
+    train_schedule = make_epoch_schedule(
+        corpus.n_games, schedule_steps * cfg.batch_size, cadence.data_seed
+    )
     # H7: on resume, restore the persisted data-stream RNG state so the
     # resumed run continues the *same* batch-index sequence rather than
     # replaying from the seed (which would re-train on already-seen batches).
@@ -1059,17 +1089,28 @@ def main(argv: list[str] | None = None) -> int:
         lm = lm.reshape(idx.shape + lm.shape[1:])
         return jnp.asarray(lm)
 
-    def _gather_chunk(n: int) -> Batch:
+    def _gather_chunk(n: int, absolute: int) -> Batch:
         """Pre-gather ``n`` train batches into one ``(n, B, T)`` Batch.
 
         Each scan element is a ``(B, T)`` batch, so the leading axis is the
         K-step axis the :func:`make_adapter_scan_step` ``lax.scan`` iterates.
-        Sampling ``(n, B)`` game indices in one draw keeps the train stream's
-        RNG sequence identical to the single-step loop (``rng`` is consumed
-        in the same order). When legality is active the engine replays each
-        game to attach the per-position ``legal_mask`` (v1 ``apply_legal_mask``
-        parity)."""
-        idx = rng.integers(0, corpus.n_games, size=(n, cfg.batch_size))
+
+        Sampling is **without replacement, epoch-permuted** (v1 parity):
+        ``train_schedule`` (built once via :func:`make_epoch_schedule`) is a
+        deterministic ``(total_steps * batch_size,)`` index stream — each epoch
+        is a fresh permutation of the finite training pool, tiled across the
+        run. This chunk slices the ``[absolute*B : (absolute+n)*B)`` window and
+        reshapes it to ``(n, B)``, so a game is never revisited within an epoch
+        (the prior ``rng.integers`` draw sampled WITH replacement, drifting
+        from the v1 epoch contract). Because the schedule is a pure function of
+        ``data_seed`` and the absolute step, a run resumed at ``start_step``
+        slices the identical window — no train-RNG replay needed. When legality
+        is active the engine replays each game to attach the per-position
+        ``legal_mask`` (v1 ``apply_legal_mask`` parity)."""
+        flat_start = absolute * cfg.batch_size
+        idx = train_schedule[
+            flat_start : flat_start + n * cfg.batch_size
+        ].reshape(n, cfg.batch_size)
         return Batch(
             tokens=jnp.asarray(corpus.tokens[idx]),
             targets=jnp.asarray(corpus.targets[idx]),
@@ -1120,7 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
                 eval_interval,
                 cfg.checkpoint_interval,
             )
-            batches = _gather_chunk(chunk)
+            batches = _gather_chunk(chunk, absolute)
             state, losses = scan_fn(state, batches)  # type: ignore[operator]
             losses_np = np.asarray(losses)
             chunk_start = absolute  # absolute step *before* this chunk

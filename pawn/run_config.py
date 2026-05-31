@@ -638,7 +638,7 @@ class AdapterConfig(BaseRunConfig):
     pgn: str = "thomas-schweich/pawn-lichess-full"
     # Optional: carve val from train (for sources without a held-out
     # split); default uses the dataset's `validation` split.
-    pgn_val_split: str | None = "validation"
+    pgn_val_split: str | None = None
 
     # --- Placement -----------------------------------------------------
     adapter_layers: str | None = None
@@ -897,7 +897,7 @@ class SpecializedCLMConfig(BaseRunConfig):
 
     # Lichess data source — same shape as AdapterConfig.
     pgn: str = "thomas-schweich/pawn-lichess-full"
-    pgn_val_split: str | None = "validation"
+    pgn_val_split: str | None = None
 
     # Cadence
     epochs: int = 50
@@ -1022,7 +1022,7 @@ class DistillConfig(BaseRunConfig):
 
     # --- Data source (same shape as AdapterConfig) ---------------------
     pgn: str = "thomas-schweich/pawn-lichess-full"
-    pgn_val_split: str | None = "validation"
+    pgn_val_split: str | None = None
 
     # --- Cadence -------------------------------------------------------
     checkpoint_interval: int = 5000

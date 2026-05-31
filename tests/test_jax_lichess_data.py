@@ -25,6 +25,7 @@ import pytest
 
 from pawn._sentinel import SENTINEL_NAME, CheckpointIntegrityError, write_sentinel
 from pawn.config import BOS_TOKEN, PAD_TOKEN, DRAW_BY_RULE, WHITE_CHECKMATES
+from pawn.corpus import Corpus
 from pawn.lichess_data import (
     _cache_key,
     _default_cache_root,
@@ -34,7 +35,9 @@ from pawn.lichess_data import (
     _save_to_cache,
     _scan_parquet,
     load_lichess_corpus,
+    load_lichess_train_val,
     make_epoch_schedule,
+    split_has_files,
 )
 
 
@@ -200,15 +203,32 @@ def test_scan_local_dir_matches_split_prefix(tmp_path: Path) -> None:
     assert len(val_df) == 4
 
 
-def test_scan_local_dir_falls_back_to_all_parquet_when_no_split_match(
+def test_scan_local_dir_train_falls_back_to_all_parquet(
     tmp_path: Path,
 ) -> None:
-    """When no `<split>-*.parquet` exists, fall back to all `*.parquet`
-    in the dir (single-file local case the user opts into via
-    `--pgn-val-split ""`)."""
+    """For the `train` split, when no `train-*.parquet` exists, fall back to
+    all `*.parquet` in the dir (single-file local case — the carve path loads
+    `split="train"` then carves validation out of it)."""
     _write_parquet(tmp_path / "data.parquet", _synthetic_rows(3, base_elo=1500))
-    df = _scan_parquet(str(tmp_path), "validation").collect()
+    df = _scan_parquet(str(tmp_path), "train").collect()
     assert len(df) == 3
+
+
+def test_scan_local_dir_nontrain_split_with_no_match_raises(
+    tmp_path: Path,
+) -> None:
+    """A non-`train` split with no matching shards RAISES rather than falling
+    back to all `*.parquet`.
+
+    Replaces the prior `..._falls_back_to_all_parquet_when_no_split_match`
+    test, which pinned the *wrong* behavior: that an explicit
+    `--pgn-val-split validation` against a split-less dir silently loads the
+    `data.parquet` (the train shards) as validation — the exact identical
+    train/val leak CLAUDE.md warns about. Only `train` may fall back; an
+    explicit held-out split that has no shards must surface loudly."""
+    _write_parquet(tmp_path / "data.parquet", _synthetic_rows(3, base_elo=1500))
+    with pytest.raises(FileNotFoundError, match="split='validation'"):
+        _scan_parquet(str(tmp_path), "validation").collect()
 
 
 def test_scan_local_dir_rejects_empty_dir(tmp_path: Path) -> None:
@@ -636,3 +656,297 @@ def test_make_epoch_schedule_n_needed_smaller_than_pool() -> None:
     rng = np.random.default_rng(0)
     expected = rng.permutation(100).astype(np.int64)[:10]
     assert np.array_equal(sched, expected)
+
+
+def test_make_epoch_schedule_no_repeats_within_first_epoch() -> None:
+    """Without-replacement contract: within one epoch the schedule visits
+    each game exactly once.
+
+    The adapter sampler tiles this schedule into per-step batches; this pins
+    that a game is never revisited until the whole pool has been seen — the
+    v1 epoch behaviour the with-replacement ``jax.random.randint`` path
+    regressed from."""
+    n_pool, batch_size, total_steps = 8, 2, 10
+    sched = make_epoch_schedule(n_pool, total_steps * batch_size, seed=3)
+    first_epoch = sched[:n_pool]
+    assert sorted(first_epoch.tolist()) == list(range(n_pool))
+    # Slicing into per-step batches (the adapter sampler's access pattern)
+    # over the first epoch covers every game with no repeats.
+    seen: list[int] = []
+    for b in range(n_pool // batch_size):
+        seen.extend(sched[b * batch_size : (b + 1) * batch_size].tolist())
+    assert sorted(seen) == list(range(n_pool))
+
+
+# ---------------------------------------------------------------------------
+# split_has_files probe (carve-vs-held-out decision gate)
+# ---------------------------------------------------------------------------
+
+
+def test_split_has_files_single_parquet(tmp_path: Path) -> None:
+    """A single .parquet file only satisfies split=='train'."""
+    pq = tmp_path / "games.parquet"
+    pq.write_bytes(b"")  # contents irrelevant; probe checks existence only
+    assert split_has_files(str(pq), "train") is True
+    assert split_has_files(str(pq), "validation") is False
+
+
+def test_split_has_files_local_dir(tmp_path: Path) -> None:
+    """A local dir gains the validation split only once its shards exist."""
+    (tmp_path / "train-0000.parquet").write_bytes(b"")
+    assert split_has_files(str(tmp_path), "train") is True
+    assert split_has_files(str(tmp_path), "validation") is False
+    (tmp_path / "validation-0000.parquet").write_bytes(b"")
+    assert split_has_files(str(tmp_path), "validation") is True
+
+
+def test_split_has_files_missing_path(tmp_path: Path) -> None:
+    """A nonexistent local path probes False for any split."""
+    assert split_has_files(str(tmp_path / "nope"), "train") is False
+    assert split_has_files(str(tmp_path / "nope"), "validation") is False
+
+
+# ---------------------------------------------------------------------------
+# Cache-root resolution: PAWN_DATA_CACHE > HF_HOME > ~/.cache
+# ---------------------------------------------------------------------------
+
+
+def test_default_cache_root_pawn_data_cache_wins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`PAWN_DATA_CACHE` overrides everything and is used verbatim (no
+    subdir appended) — the v1 escape hatch for routing the cache onto a
+    roomy scratch volume independent of `$HF_HOME`."""
+    monkeypatch.setenv("PAWN_DATA_CACHE", str(tmp_path / "explicit"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    assert _default_cache_root() == tmp_path / "explicit"
+
+
+def test_default_cache_root_falls_back_to_hf_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With `PAWN_DATA_CACHE` unset, `$HF_HOME/pawn-lichess-cache` is used."""
+    monkeypatch.delenv("PAWN_DATA_CACHE", raising=False)
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    assert _default_cache_root() == tmp_path / "hf" / "pawn-lichess-cache"
+
+
+# ---------------------------------------------------------------------------
+# carve-from-train: disjoint, deterministic, reproducible split
+# ---------------------------------------------------------------------------
+
+
+def _identity_corpus(n: int) -> Corpus:
+    """An n-row Corpus whose first token column equals the row index.
+
+    The per-row identity column lets a test recover which original games a
+    carved subset contains, so disjointness can be asserted exactly. Corpus
+    is a numpy-backed host container, so the fields are numpy arrays."""
+    ids = np.arange(n, dtype=np.int32)
+    tokens = np.tile(ids[:, None], (1, 4)).astype(np.int32)
+    return Corpus(
+        tokens=tokens,
+        targets=tokens,
+        attn_mask=np.ones((n, 4), dtype=np.bool_),
+        loss_mask=np.ones((n, 4), dtype=np.bool_),
+        outcome_offset=np.zeros((n,), dtype=np.int32),
+        game_lengths=np.full((n,), 4, dtype=np.int32),
+    )
+
+
+def _row_ids(corpus: Corpus) -> set[int]:
+    return {int(r) for r in np.asarray(corpus.tokens[:, 0])}
+
+
+def test_carve_from_train_is_disjoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--pgn-val-split "" carves a DISJOINT validation tail from train.
+
+    Pins the major regression fix: the prior `split=cfg.pgn_val_split or
+    "validation"` short-circuit re-loaded the train shards as val, so a
+    single-file source produced identical train/val. The carve must instead
+    split one loaded train corpus into two non-overlapping subsets whose
+    union is the original pool."""
+    import pawn.lichess_data as ld
+
+    n = 40
+    train_pool = _identity_corpus(n)
+    monkeypatch.setattr(ld, "load_lichess_corpus", lambda *a, **k: train_pool)
+
+    train, val = load_lichess_train_val(
+        "/tmp/games.parquet", val_split="", seed=0
+    )
+    train_ids, val_ids = _row_ids(train), _row_ids(val)
+    assert train_ids.isdisjoint(val_ids)  # disjoint
+    assert train_ids | val_ids == set(range(n))  # no game lost
+    # v1 cap formula (scripts/train.py:427): n_val = min(val_games, n_total//5)
+    # with no val_games cap → the 20% floor-division carve, clamped to keep at
+    # least one training game.
+    assert len(val_ids) == min(n // 5, n - 1)
+    assert len(train_ids) == n - len(val_ids)
+
+
+def test_carve_from_train_is_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same seed → identical carve; different seed → different carve."""
+    import pawn.lichess_data as ld
+
+    train_pool = _identity_corpus(60)
+    monkeypatch.setattr(ld, "load_lichess_corpus", lambda *a, **k: train_pool)
+
+    _, val_a = load_lichess_train_val("/tmp/g.parquet", val_split="", seed=11)
+    _, val_b = load_lichess_train_val("/tmp/g.parquet", val_split="", seed=11)
+    assert _row_ids(val_a) == _row_ids(val_b)
+
+    _, val_c = load_lichess_train_val("/tmp/g.parquet", val_split="", seed=99)
+    assert _row_ids(val_a) != _row_ids(val_c)
+
+
+def test_carve_val_games_cap_binds_below_twenty_percent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`max_val_games` caps the carve below the 20% floor-division ceiling.
+
+    Pins the v1 cap formula (`scripts/train.py:427`):
+    `n_val = min(val_games, n_total // 5)`. With n=100 the uncapped carve is
+    20 (100 // 5); a `max_val_games=5` cap must bind, yielding 5 — not 20 and
+    not a 5%-of-n (=5 here, but for n=100 5% and the cap coincide, so use a
+    cap strictly below 20% to prove the cap is the binding term)."""
+    import pawn.lichess_data as ld
+
+    train_pool = _identity_corpus(100)
+    monkeypatch.setattr(ld, "load_lichess_corpus", lambda *a, **k: train_pool)
+
+    train, val = load_lichess_train_val(
+        "/tmp/g.parquet", val_split="", seed=0, max_val_games=5
+    )
+    train_ids, val_ids = _row_ids(train), _row_ids(val)
+    assert train_ids.isdisjoint(val_ids)
+    assert train_ids | val_ids == set(range(100))
+    # cap (5) < 20% ceiling (20) → cap binds.
+    assert len(val_ids) == 5
+
+
+def test_carve_uncapped_is_twenty_percent_floor_div(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no `max_val_games`, the carve is the 20% floor-division ceiling.
+
+    Distinguishes the v1 formula (`n_total // 5` = 20%) from the prior buggy
+    5% constant: for n=100 the v1 carve is 20, a 5% carve would be 5."""
+    import pawn.lichess_data as ld
+
+    train_pool = _identity_corpus(100)
+    monkeypatch.setattr(ld, "load_lichess_corpus", lambda *a, **k: train_pool)
+
+    _, val = load_lichess_train_val("/tmp/g.parquet", val_split="", seed=0)
+    assert len(_row_ids(val)) == 100 // 5  # 20, not the old 5% (=5)
+
+
+def test_carve_when_default_split_has_no_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The implicit default (`val_split=None`) carves when `validation` is absent.
+
+    This is the single-file regression case: `AdapterConfig.pgn_val_split`
+    now defaults to `None` ("auto-detect"). The gate probes `split_has_files`
+    for the conventional `validation` split and, on a miss, falls through to a
+    disjoint carve rather than re-loading the train file.
+
+    (Previously the config default was the non-empty string "validation" and
+    this test passed it verbatim. Under the silent-contamination fix a
+    non-empty `val_split` is now an *explicit* request that loads directly and
+    raises on a miss — so the auto-detect-carve behavior is exercised via
+    `val_split=None`, matching the new config default.)"""
+    import pawn.lichess_data as ld
+
+    train_pool = _identity_corpus(50)
+    monkeypatch.setattr(ld, "load_lichess_corpus", lambda *a, **k: train_pool)
+    monkeypatch.setattr(ld, "split_has_files", lambda *a, **k: False)
+
+    train, val = load_lichess_train_val(
+        "/tmp/games.parquet", val_split=None, seed=0
+    )
+    assert _row_ids(train).isdisjoint(_row_ids(val))
+    assert _row_ids(train) | _row_ids(val) == set(range(50))
+
+
+def test_explicit_named_split_loaded_directly_not_probed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit non-empty `val_split` is loaded DIRECTLY — `split_has_files`
+    is never consulted.
+
+    Pins the silent-val-contamination fix: routing an explicit held-out
+    request through `split_has_files` meant a transient HF listing/auth
+    failure (the probe's bare `except Exception` → `False`) silently degraded
+    the deliberate held-out split into a carve of validation out of train. The
+    explicit path must bypass the probe entirely."""
+    import pawn.lichess_data as ld
+
+    train_pool = _identity_corpus(30)
+    val_pool = _identity_corpus(9)
+
+    def fake_load(source: str, *, split: str = "train", **k: object) -> Corpus:
+        return val_pool if split == "myval" else train_pool
+
+    monkeypatch.setattr(ld, "load_lichess_corpus", fake_load)
+
+    def _boom(*a: object, **k: object) -> bool:
+        raise AssertionError(
+            "split_has_files must not be probed for an explicit named split"
+        )
+
+    monkeypatch.setattr(ld, "split_has_files", _boom)
+
+    train, val = load_lichess_train_val("user/dataset", val_split="myval")
+    assert _row_ids(val) == set(range(9))  # held-out loaded whole
+    assert _row_ids(train) == set(range(30))  # train untouched (no carve)
+
+
+def test_explicit_named_split_missing_raises_not_carves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit `val_split=<name>` naming an absent split raises rather than
+    silently carving from train.
+
+    The docstring promises the named split is "used directly"; on a genuine
+    miss `load_lichess_corpus` raises `FileNotFoundError`, which must propagate
+    (not be swallowed into a carve)."""
+    import pawn.lichess_data as ld
+
+    train_pool = _identity_corpus(40)
+
+    def fake_load(source: str, *, split: str = "train", **k: object) -> Corpus:
+        if split == "train":
+            return train_pool
+        raise FileNotFoundError(f"no shards for split={split!r}")
+
+    monkeypatch.setattr(ld, "load_lichess_corpus", fake_load)
+    # The probe must NOT be used to demote the miss to a carve.
+    monkeypatch.setattr(ld, "split_has_files", lambda *a, **k: False)
+
+    with pytest.raises(FileNotFoundError, match="split='validation'"):
+        load_lichess_train_val("user/dataset", val_split="validation")
+
+
+def test_held_out_split_used_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a real validation split has files, it is loaded (not carved)."""
+    import pawn.lichess_data as ld
+
+    train_pool = _identity_corpus(30)
+    val_pool = _identity_corpus(7)
+
+    def fake_load(source: str, *, split: str = "train", **k: object) -> Corpus:
+        return val_pool if split == "validation" else train_pool
+
+    monkeypatch.setattr(ld, "load_lichess_corpus", fake_load)
+    monkeypatch.setattr(ld, "split_has_files", lambda *a, **k: True)
+
+    train, val = load_lichess_train_val("user/dataset", val_split=None)
+    assert _row_ids(val) == set(range(7))  # held-out loaded whole
+    assert _row_ids(train) == set(range(30))  # train untouched (no carve)
