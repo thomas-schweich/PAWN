@@ -34,6 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float, Int
 
+from pawn.checkpoint import ADAPTER_SAFETENSORS
 from pawn.config import ModelConfig
 from pawn.model import KVCache, PAWNModel
 
@@ -50,10 +51,9 @@ __all__ = [
 ]
 
 
-# Sidecar filename used by the trainer's save / resume path — shared with
-# the other wrapper-style adapters (bottleneck) so a checkpoint directory
-# holds exactly one ``adapter.safetensors`` regardless of strategy.
-ADAPTER_SAFETENSORS = "adapter.safetensors"
+# ``ADAPTER_SAFETENSORS`` (the sidecar filename used by the trainer's save /
+# resume path) is owned by :mod:`pawn.checkpoint` and re-exported here so the
+# train + load sites share a single literal regardless of strategy.
 
 
 @dataclass(frozen=True)

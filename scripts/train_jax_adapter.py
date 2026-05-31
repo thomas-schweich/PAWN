@@ -1154,12 +1154,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 val_loss = float(metrics.loss)
                 # v1-parity richer val metrics (top1 / top5 /
-                # illegal_pred_rate) alongside the bare val_loss.
+                # illegal_pred_rate) alongside the bare val_loss. Emit the
+                # legal_move_rate (= 1 - illegal_pred_rate) too so the
+                # dashboard's `val/legal_move_rate` key is fed for adapter
+                # runs, not just the pretrain loop (parity item
+                # `elo-legal-move-rate-not-emitted`).
+                illegal_rate = float(metrics.illegal_pred_rate)
                 val_record = dict(
                     val_loss=val_loss,
                     val_top1=float(metrics.top1),
                     val_top5=float(metrics.top5),
-                    val_illegal_pred_rate=float(metrics.illegal_pred_rate),
+                    val_illegal_pred_rate=illegal_rate,
+                    legal_move_rate=1.0 - illegal_rate,
                     val_source=cfg.pgn_val_split if not args.no_pgn else "random",
                 )
                 logger.log_val(step=final_step, **val_record)

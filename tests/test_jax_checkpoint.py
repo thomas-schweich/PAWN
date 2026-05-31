@@ -681,3 +681,346 @@ def test_save_schema_field_count() -> None:
     assert "lm_head" in saved_fields(False)
     assert len(saved_fields(True)) == len(saved_fields(False)) - 1
     assert CHECKPOINT_FORMAT_VERSION == 1
+
+
+# ---------------------------------------------------------------------------
+# load_eval_model — adapter sidecar re-application (parity item
+# `load-model-adapter-reapply`)
+# ---------------------------------------------------------------------------
+
+
+def _eval_tokens() -> "jnp.ndarray":
+    return jnp.arange(32, dtype=jnp.int32).reshape(2, 16)
+
+
+def test_load_eval_model_reapplies_bottleneck_sidecar(tmp_path: Path) -> None:
+    """A bottleneck checkpoint publishes the frozen backbone +
+    ``adapter.safetensors`` sidecar (the Houlsby MLPs are injected at
+    forward time, not folded). ``load_eval_model`` must re-apply the
+    sidecar so the ADAPTED model is evaluated — ``load_model`` alone would
+    return the bare backbone and silently score at the backbone's accuracy
+    (parity item ``load-model-adapter-reapply``)."""
+    import equinox as eqx
+    import jax
+
+    from pawn.adapters.bottleneck import (
+        BottleneckConfig,
+        apply_bottleneck,
+        init_bottleneck_adapter,
+        save_bottleneck_adapter,
+    )
+    from pawn.checkpoint import load_eval_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = BottleneckConfig(dim=4)
+    adapter = init_bottleneck_adapter(backbone, cfg, key=jax.random.key(0))
+    # The adapter is identity at init (``up`` is zero-init), so perturb the
+    # ``up`` projections to a non-trivial value — otherwise the adapted and
+    # bare logits would coincide and the test couldn't distinguish a
+    # re-applied sidecar from a dropped one.
+    # dim=4 enables both attn + ffn placements, so both `up` slabs exist.
+    assert adapter.up_attn is not None and adapter.up_ffn is not None
+    up_attn_shape = adapter.up_attn.shape
+    up_ffn_shape = adapter.up_ffn.shape
+    adapter = eqx.tree_at(
+        lambda a: [a.up_attn, a.up_ffn],
+        adapter,
+        [
+            0.1 * jax.random.normal(jax.random.key(1), up_attn_shape),
+            0.1 * jax.random.normal(jax.random.key(2), up_ffn_shape),
+        ],
+    )
+
+    out_dir = tmp_path / "adapter_step_00000010"
+    # The checkpoint's run block carries the strategy + adapter hyperparams,
+    # exactly as `cfg.model_dump()` writes them in the adapter trainer.
+    save_model(
+        backbone, out_dir,
+        run_config={
+            "strategy": "bottleneck",
+            "bottleneck_dim": 4,
+            "bottleneck_n_hidden": 0,
+            "no_adapt_attn": False,
+            "no_adapt_ffn": False,
+            "adapter_layers": None,
+        },
+    )
+    save_bottleneck_adapter(adapter, out_dir)
+
+    effective, run_block = load_eval_model(out_dir)
+    assert run_block is not None and run_block["strategy"] == "bottleneck"
+
+    tokens = _eval_tokens()
+    adapted_logits = apply_bottleneck(backbone, adapter)(tokens)
+    eval_logits = effective(tokens)
+    bare_logits = backbone(tokens)
+    # The re-applied model reproduces the adapted forward exactly...
+    assert jnp.allclose(eval_logits, adapted_logits, atol=1e-5)
+    # ...and is meaningfully different from the bare backbone (proves the
+    # sidecar was actually applied, not dropped).
+    assert not jnp.allclose(eval_logits, bare_logits, atol=1e-3)
+
+
+def test_load_eval_model_reapplies_pure_film_sidecar(tmp_path: Path) -> None:
+    """A pure-FiLM checkpoint also publishes the frozen backbone + FiLM
+    sidecar; ``load_eval_model`` re-applies the gamma/beta slabs so the
+    adapted model is evaluated."""
+    import equinox as eqx
+    import jax
+
+    from pawn.adapters.film import (
+        FiLMConfig,
+        apply_film,
+        init_film_adapter,
+        save_film_adapter,
+    )
+    from pawn.checkpoint import load_eval_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = FiLMConfig(use_output_film=True)
+    adapter = init_film_adapter(backbone, cfg, key=0)
+    # Identity at init (gamma=1, beta=0); perturb gamma so the adapted
+    # forward differs from the bare backbone.
+    adapter = eqx.tree_at(
+        lambda a: a.gamma,
+        adapter,
+        1.0 + 0.05 * jax.random.normal(jax.random.key(3), adapter.gamma.shape),
+    )
+
+    out_dir = tmp_path / "adapter_step_00000010"
+    save_model(
+        backbone, out_dir,
+        run_config={"strategy": "film", "use_output_film": True},
+    )
+    save_film_adapter(adapter, out_dir)
+
+    effective, run_block = load_eval_model(out_dir)
+    assert run_block is not None and run_block["strategy"] == "film"
+
+    tokens = _eval_tokens()
+    adapted_logits = apply_film(backbone, adapter)(tokens)
+    eval_logits = effective(tokens)
+    bare_logits = backbone(tokens)
+    assert jnp.allclose(eval_logits, adapted_logits, atol=1e-5)
+    assert not jnp.allclose(eval_logits, bare_logits, atol=1e-3)
+
+
+def test_load_eval_model_bare_checkpoint_returns_backbone(tmp_path: Path) -> None:
+    """No run block / no sidecar → ``load_eval_model`` returns the bare
+    backbone unchanged (a published supernet slice or a weight-folded
+    adapter, where ``model.safetensors`` is already the adapted model)."""
+    from pawn.checkpoint import load_eval_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    out_dir = tmp_path / "step_00000010"
+    save_model(backbone, out_dir)
+
+    effective, run_block = load_eval_model(out_dir)
+    assert run_block is None
+    tokens = _eval_tokens()
+    assert jnp.allclose(effective(tokens), backbone(tokens), atol=1e-6)
+
+
+def test_load_eval_model_reapplies_rosa_retro_bottleneck_sidecar(
+    tmp_path: Path,
+) -> None:
+    """A ``rosa-retro-bottleneck`` checkpoint folds only its sparse delta
+    into ``model.safetensors`` and writes the Houlsby MLPs to the
+    ``adapter.safetensors`` sidecar (``apply_rosa`` returns a
+    ``BottleneckEffective`` in retro-bottleneck mode, so
+    ``write_adapter_checkpoint`` takes the bottleneck branch). The persisted
+    strategy is the literal ``"rosa-retro-bottleneck"`` — a string
+    ``load_eval_model``'s dispatch must recognise. Without the re-application
+    branch, eval would score the sparse-folded backbone *without* the
+    bottleneck residual (the ``load-model-adapter-reapply`` parity gap, for
+    an in-scope / tested strategy)."""
+    import equinox as eqx
+    import jax
+
+    from pawn.adapters.rosa import (
+        RoSAAdapter,
+        RoSAConfig,
+        apply_rosa,
+        init_rosa_adapter,
+    )
+    from pawn.adapters.sparse import apply_sparse
+    from pawn.checkpoint import load_eval_model
+
+    # train_jax_adapter is a script, not a package module — load it by path
+    # so the test drives the *exact* production save path.
+    import importlib.util
+
+    script_path = (
+        Path(__file__).resolve().parent.parent
+        / "scripts"
+        / "train_jax_adapter.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_train_jax_adapter_for_test", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    train_jax_adapter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train_jax_adapter)
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = RoSAConfig(
+        mode="retro-bottleneck",
+        lora_rank=2,
+        density=0.05,
+        bottleneck_dim=4,
+        bottleneck_n_hidden=0,
+    )
+    adapter = init_rosa_adapter(backbone, cfg, key=jax.random.key(0))
+    # Phase-3 retro-bottleneck toggles: LoRA dropped, sparse + bottleneck on.
+    # ``lora_active`` / ``sparse_active`` are static eqx fields (out of the
+    # pytree), so rebuild the adapter with the Phase-3 toggles the way the
+    # trainer does rather than mutating leaves via ``tree_at``.
+    adapter = RoSAAdapter(
+        lora=adapter.lora,
+        sparse=adapter.sparse,
+        bottleneck=adapter.bottleneck,
+        cfg=adapter.cfg,
+        lora_active=False,
+        sparse_active=True,
+    )
+
+    # Perturb the sparse delta (one masked target slab) and the bottleneck
+    # up-projections so neither branch is identity-at-init — otherwise a
+    # dropped sidecar would be indistinguishable from a re-applied one.
+    assert adapter.sparse.delta_q is not None and adapter.sparse.mask_q is not None
+    sparse_delta_q = adapter.sparse.delta_q
+    # Only masked positions contribute (``apply_sparse`` multiplies by the
+    # frozen boolean mask), so add the perturbation under the mask.
+    perturbed_delta_q = sparse_delta_q + 0.2 * adapter.sparse.mask_q.astype(
+        sparse_delta_q.dtype
+    ) * jax.random.normal(jax.random.key(1), sparse_delta_q.shape)
+    assert adapter.bottleneck is not None
+    assert (
+        adapter.bottleneck.up_attn is not None
+        and adapter.bottleneck.up_ffn is not None
+    )
+    up_attn_shape = adapter.bottleneck.up_attn.shape
+    up_ffn_shape = adapter.bottleneck.up_ffn.shape
+    adapter = eqx.tree_at(
+        lambda a: (a.sparse.delta_q, a.bottleneck.up_attn, a.bottleneck.up_ffn),
+        adapter,
+        (
+            perturbed_delta_q,
+            0.1 * jax.random.normal(jax.random.key(2), up_attn_shape),
+            0.1 * jax.random.normal(jax.random.key(3), up_ffn_shape),
+        ),
+    )
+
+    effective = apply_rosa(backbone, adapter)
+    out_dir = tmp_path / "adapter_step_00000010"
+    train_jax_adapter.write_adapter_checkpoint(
+        effective=effective,
+        backbone=backbone,
+        adapter=adapter,
+        out=out_dir,
+        optimizer_state={},
+        step=10,
+        run_config={
+            "strategy": "rosa-retro-bottleneck",
+            "rosa_mode": "retro-bottleneck",
+            "bottleneck_dim": 4,
+            "bottleneck_n_hidden": 0,
+            "adapter_layers": None,
+        },
+    )
+
+    eval_model, run_block = load_eval_model(out_dir)
+    assert run_block is not None
+    assert run_block["strategy"] == "rosa-retro-bottleneck"
+
+    tokens = _eval_tokens()
+    eval_logits = eval_model(tokens)
+    # Reference: the full adapted forward (sparse delta + bottleneck), which
+    # is exactly what apply_rosa composes for retro-bottleneck Phase 3.
+    adapted_logits = effective(tokens)
+    # The sparse-folded backbone *without* the bottleneck — what the buggy
+    # fallthrough would have evaluated.
+    sparse_only = apply_sparse(backbone, adapter.sparse)
+    sparse_only_logits = sparse_only(tokens)
+
+    # Re-applied model reproduces the full adapted forward exactly...
+    assert jnp.allclose(eval_logits, adapted_logits, atol=1e-5)
+    # ...and is meaningfully different from the sparse-only backbone, proving
+    # the bottleneck sidecar was re-applied rather than silently dropped.
+    assert not jnp.allclose(eval_logits, sparse_only_logits, atol=1e-3)
+
+
+def test_load_eval_model_reapplies_rosa_mode_retro_bottleneck_sidecar(
+    tmp_path: Path,
+) -> None:
+    """The H9 ``rosa-ratio`` sweep maps onto the ``rosa`` *strategy* in
+    ``retro-bottleneck`` *mode* (run block ``strategy == "rosa"`` +
+    ``rosa_mode == "retro-bottleneck"``). ``load_eval_model`` must recognise
+    that combination as a sidecar-bearing checkpoint too, not just the
+    literal ``rosa-retro-bottleneck`` strategy string."""
+    import equinox as eqx
+    import jax
+
+    from pawn.adapters.bottleneck import (
+        BottleneckConfig,
+        apply_bottleneck,
+        init_bottleneck_adapter,
+        save_bottleneck_adapter,
+    )
+    from pawn.adapters.sparse import (
+        SparseConfig,
+        apply_sparse,
+        init_sparse_adapter,
+    )
+    from pawn.checkpoint import load_eval_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    # Fold a non-trivial sparse delta into the published backbone (mirrors
+    # the retro-bottleneck save: sparse delta folds, bottleneck sidecars).
+    sparse = init_sparse_adapter(
+        backbone, SparseConfig(density=0.05), key=jax.random.key(0)
+    )
+    assert sparse.delta_q is not None and sparse.mask_q is not None
+    perturbed_delta_q = sparse.delta_q + 0.2 * sparse.mask_q.astype(
+        sparse.delta_q.dtype
+    ) * jax.random.normal(jax.random.key(1), sparse.delta_q.shape)
+    sparse = eqx.tree_at(lambda a: a.delta_q, sparse, perturbed_delta_q)
+    folded_backbone = apply_sparse(backbone, sparse)
+
+    b_cfg = BottleneckConfig(dim=4)
+    bottleneck = init_bottleneck_adapter(
+        folded_backbone, b_cfg, key=jax.random.key(2)
+    )
+    assert bottleneck.up_attn is not None and bottleneck.up_ffn is not None
+    bottleneck = eqx.tree_at(
+        lambda a: (a.up_attn, a.up_ffn),
+        bottleneck,
+        (
+            0.1 * jax.random.normal(jax.random.key(3), bottleneck.up_attn.shape),
+            0.1 * jax.random.normal(jax.random.key(4), bottleneck.up_ffn.shape),
+        ),
+    )
+
+    out_dir = tmp_path / "adapter_step_00000010"
+    save_model(
+        folded_backbone, out_dir,
+        run_config={
+            "strategy": "rosa",
+            "rosa_mode": "retro-bottleneck",
+            "bottleneck_dim": 4,
+            "bottleneck_n_hidden": 0,
+            "adapter_layers": None,
+        },
+    )
+    save_bottleneck_adapter(bottleneck, out_dir)
+
+    eval_model, run_block = load_eval_model(out_dir)
+    assert run_block is not None and run_block["rosa_mode"] == "retro-bottleneck"
+
+    tokens = _eval_tokens()
+    eval_logits = eval_model(tokens)
+    adapted_logits = apply_bottleneck(folded_backbone, bottleneck)(tokens)
+    bare_folded_logits = folded_backbone(tokens)
+
+    assert jnp.allclose(eval_logits, adapted_logits, atol=1e-5)
+    assert not jnp.allclose(eval_logits, bare_folded_logits, atol=1e-3)

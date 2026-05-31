@@ -23,6 +23,7 @@ SCRIPTS = (
     "train_jax_adapter",
     "train_jax_distill",
     "eval_jax",
+    "eval_accuracy",
     "eval_parity",
     "eval_probes_jax",
     "eval_generation_jax",
@@ -46,6 +47,253 @@ def test_script_module_imports(script_name: str) -> None:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert hasattr(mod, "main")
+
+
+def _load_script(name: str):  # type: ignore[no-untyped-def]
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        f"scripts_{name}_vsel", Path("scripts") / f"{name}.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_eval_accuracy_wrapper_maps_adapter_checkpoint_to_v2() -> None:
+    """Parity item ``eval-accuracy-wrapper-adapter``: the v1 wrapper must
+    forward to a path that evals the ADAPTED model. v1 separated the
+    backbone (`--checkpoint`) from the trained adapter
+    (`--adapter-checkpoint`); the v2 adapter checkpoint is self-contained,
+    so the wrapper maps the adapter dir onto v2's `--checkpoint` (the dir
+    `load_eval_model` re-applies the sidecar from), drops the v1 backbone
+    arg, and forwards the within-distribution / MAIA flags verbatim."""
+    mod = _load_script("eval_accuracy")
+    out = mod._translate([
+        "--checkpoint", "thomas-schweich/pawn-base-v2",
+        "--adapter-checkpoint", "logs/run_x/adapter_step_00000200",
+        "--pgn", "thomas-schweich/pawn-lichess-full",
+        "--elo-min", "1800", "--elo-max", "1900",
+        "--min-eval-ply", "10", "--per-ply",
+    ])
+    # The adapter dir becomes the v2 --checkpoint (the adapted model)...
+    assert "--checkpoint" in out
+    assert out[out.index("--checkpoint") + 1] == "logs/run_x/adapter_step_00000200"
+    # ...the v1 backbone --checkpoint is not forwarded a second time.
+    assert out.count("--checkpoint") == 1
+    assert "--adapter-checkpoint" not in out
+    # Within-distribution + MAIA flags pass through to the v2 entry point.
+    for flag in ("--pgn", "--elo-min", "--elo-max", "--min-eval-ply", "--per-ply"):
+        assert flag in out
+
+
+def test_eval_accuracy_wrapper_drops_v1_only_flags_and_maps_max_games() -> None:
+    """Real-defect regression (``eval-accuracy-wrapper-adapter``): a verbatim
+    v1 invocation carries flags eval_jax.py's argparse does not know
+    (`--device`, `--amp-dtype`, `--val-start`, `--val-games`,
+    `--prepend-outcome`). Forwarding them verbatim makes eval_jax.py exit 2.
+    The wrapper must consume + drop them, and map v1's `--max-games`
+    game-count knob onto v2's `--n-games`."""
+    mod = _load_script("eval_accuracy")
+    out = mod._translate([
+        "--adapter-checkpoint", "logs/run_x/adapter_step_00000200",
+        "--pgn", "thomas-schweich/pawn-lichess-full",
+        "--device", "cuda", "--amp-dtype", "bfloat16",
+        "--val-start", "10000", "--val-games", "2000",
+        "--prepend-outcome",
+        "--max-games", "50000",
+    ])
+    # The v1-only flags with no v2 analogue are dropped, not forwarded.
+    for flag in (
+        "--device", "--amp-dtype", "--val-start", "--val-games",
+        "--prepend-outcome",
+    ):
+        assert flag not in out, f"{flag} should be dropped, not forwarded"
+    # v1 --max-games is translated to v2 --n-games (the value is preserved).
+    assert "--max-games" not in out
+    assert "--n-games" in out
+    assert out[out.index("--n-games") + 1] == "50000"
+    # The real flags still reach the v2 entry point.
+    assert "--pgn" in out
+    assert out[out.index("--checkpoint") + 1] == "logs/run_x/adapter_step_00000200"
+
+
+def test_eval_accuracy_wrapper_backbone_only_passthrough() -> None:
+    """With no `--adapter-checkpoint`, the wrapper forwards the bare
+    backbone `--checkpoint` (a backbone-only accuracy run)."""
+    mod = _load_script("eval_accuracy")
+    out = mod._translate(["--checkpoint", "ckpt-dir", "--n-games", "16"])
+    assert out[out.index("--checkpoint") + 1] == "ckpt-dir"
+    assert "--n-games" in out
+
+
+def _write_eval_lichess_parquet(
+    path: Path,
+    *,
+    n_games: int,
+    base_elo: int,
+) -> None:
+    """Write a local ``validation-*.parquet`` shard in the canonical Lichess
+    schema (parity with ``tests/test_jax_lichess_data.py::_write_parquet``).
+
+    The move tokens are taken from REAL engine-generated games (via
+    ``generate_corpus``), not a synthetic ``[1, 2, ...]`` sequence — the eval's
+    ``legal_move_rate`` metric replays every game through the Rust engine and
+    panics on an illegal token, so the games must actually be legal.
+
+    Row ``i`` carries ``white_elo == black_elo == base_elo + i`` so an
+    ``--elo-min`` / ``--elo-max`` band selects a deterministic, countable
+    subset — that count is what the elo-filter behavioural test asserts on.
+    """
+    import numpy as np
+    import polars as pl
+
+    from pawn.config import DRAW_BY_RULE
+    from pawn.corpus import generate_corpus
+
+    # Real, legal games. seq_len comfortably exceeds typical random-game length
+    # so games aren't truncated mid-replay.
+    corpus = generate_corpus(
+        n_games=n_games, max_ply=40, seq_len=48, seed=0, conditioning=()
+    )
+    move_ids = corpus.move_ids()  # (N, max_ply) int16, PAD-padded
+    game_lengths = np.asarray(corpus.game_lengths, dtype=np.int32)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {
+            # Only the real moves (drop the PAD tail) — _pack_dataframe
+            # re-derives game_length from the token-list length anyway.
+            "tokens": [int(t) for t in move_ids[i, : int(game_lengths[i])]],
+            "game_length": int(game_lengths[i]),
+            "outcome_token": DRAW_BY_RULE,
+            "white_elo": base_elo + i,
+            "black_elo": base_elo + i,
+        }
+        for i in range(n_games)
+    ]
+    pl.DataFrame(
+        rows, schema_overrides={"tokens": pl.List(pl.Int16)}
+    ).write_parquet(path)
+
+
+def test_eval_jax_pgn_flag_evaluates_local_lichess_corpus(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Parity item ``eval-random-games-only``: ``eval_jax.main()`` must score a
+    real/published Lichess slice via ``--pgn``, not only freshly-generated
+    random self-play.
+
+    Drives ``main()`` in-process against a *local* ``validation-*.parquet``
+    directory (no HF dependency) and a tiny local backbone, then asserts the
+    emitted JSON reports the full v1 metric set computed over THAT corpus
+    (``n_games`` == the games packed from the parquet, plus top-1 / top-5 /
+    loss / perplexity / legal-move-rate). This fails closed if ``--pgn`` is
+    dropped from ``eval_jax.py``: argparse would reject the unknown flag
+    (SystemExit) before any eval ran, and even were it tolerated the eval
+    would silently fall back to random self-play (``--n-games`` games, not the
+    parquet's), so the ``n_games`` assertion would still trip.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    from pawn.checkpoint import save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    ckpt_dir = tmp_path / "backbone"
+    save_model(backbone, ckpt_dir, training_state={"step": 0}, run_config={})
+
+    pgn_dir = tmp_path / "lichess"
+    _write_eval_lichess_parquet(
+        pgn_dir / "validation-0.parquet", n_games=8, base_elo=1500
+    )
+
+    ej = _load_script("eval_jax")
+    out_path = tmp_path / "eval.json"
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = ej.main([
+            "--checkpoint", str(ckpt_dir),
+            "--pgn", str(pgn_dir),
+            "--split", "validation",
+            "--n-games", "64",          # ≥ the 8 packed games (no truncation)
+            "--seq-len", "32",
+            "--batch-size", "4",
+            "--min-eval-ply", "0",      # tiny games — keep every supervised ply
+            "--output", str(out_path),
+        ])
+    assert rc == 0, f"eval_jax.main() failed; stdout={buf.getvalue()!r}"
+
+    payload = json.loads(out_path.read_text())
+    # The eval ran over the PACKED LICHESS games, not a random self-play
+    # corpus. `--n-games 64` is the cap; only 8 games exist in the parquet, so
+    # a random fallback would report 64 here and this assertion would trip.
+    assert payload["n_games"] == 8, (
+        f"expected the 8 packed Lichess games, got {payload['n_games']} — "
+        "eval_jax fell back to random self-play instead of honouring --pgn"
+    )
+    # The full v1 metric surface is present and in range over that corpus.
+    for key in (
+        "overall_accuracy", "top5_accuracy", "loss", "perplexity",
+        "legal_move_rate",
+    ):
+        assert key in payload, f"missing {key} in --pgn eval payload: {sorted(payload)}"
+    assert 0.0 <= payload["overall_accuracy"] <= 1.0
+    assert 0.0 <= payload["top5_accuracy"] <= 1.0
+    assert 0.0 <= payload["legal_move_rate"] <= 1.0
+
+
+def test_eval_jax_elo_filter_restricts_pgn_corpus(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Parity item ``within-dist-elo-filter``: ``eval_jax.main()``'s
+    ``--elo-min`` / ``--elo-max`` flags must restrict the ``--pgn`` slice to
+    the within-distribution band, so an adapter trained on one Elo band is
+    scored on that band.
+
+    Builds a 20-game local parquet spanning Elo 1800..1819 (row ``i`` has both
+    players at ``1800 + i``), then evals with ``--elo-min 1805 --elo-max 1810``.
+    The filter is ``[elo_min, elo_max)`` on BOTH players, so exactly the 5
+    games at Elo 1805..1809 survive. Asserting ``n_games == 5`` fails closed
+    if either flag is removed from ``eval_jax.py``: argparse would reject the
+    unknown flag (SystemExit ≠ 0) before any eval, and were the flags merely
+    left unwired the unfiltered corpus would report all 20 games here.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    from pawn.checkpoint import save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    ckpt_dir = tmp_path / "backbone"
+    save_model(backbone, ckpt_dir, training_state={"step": 0}, run_config={})
+
+    pgn_dir = tmp_path / "lichess"
+    _write_eval_lichess_parquet(
+        pgn_dir / "validation-0.parquet", n_games=20, base_elo=1800
+    )
+
+    ej = _load_script("eval_jax")
+
+    def _eval_n_games(extra: list[str]) -> int:
+        out_path = tmp_path / f"eval_{'_'.join(extra)}.json"
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = ej.main([
+                "--checkpoint", str(ckpt_dir),
+                "--pgn", str(pgn_dir), "--split", "validation",
+                "--n-games", "64", "--seq-len", "32", "--batch-size", "4",
+                "--min-eval-ply", "0", "--output", str(out_path),
+                *extra,
+            ])
+        assert rc == 0, f"eval_jax.main({extra}) failed; stdout={buf.getvalue()!r}"
+        return int(json.loads(out_path.read_text())["n_games"])
+
+    # No band → all 20 games. The within-band [1805, 1810) → exactly the 5
+    # games at Elo 1805..1809 (both players in range, elo_max exclusive).
+    assert _eval_n_games([]) == 20
+    assert _eval_n_games(["--elo-min", "1805", "--elo-max", "1810"]) == 5
 
 
 def _load_train_jax():
@@ -419,6 +667,84 @@ def test_train_jax_adapter_rosa_logs_phase_transitions(tmp_path) -> None:  # typ
     )
     dens = phase3[0]["rosa/mask_density"]
     assert 0.0 < dens <= 1.0, f"mask_density out of range: {dens}"
+
+
+def test_train_jax_adapter_validation_loop_emits_val_records(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Parity items ``elo-legal-move-rate-not-emitted`` /
+    ``elo-top5-accuracy-not-emitted``: the ADAPTER trainer's val pass must
+    emit `val/legal_move_rate` AND `val/top5` to metrics.jsonl, not just
+    the pretrain loop.
+
+    The pretrain-loop coverage
+    (``test_train_jax_validation_loop_emits_val_records``) does not exercise
+    `scripts/train_jax_adapter.py`'s separate val-record emission path; a
+    deletion of `val_top5` / `legal_move_rate` from the adapter trainer's
+    `val_record` would pass undetected without this end-to-end guard. Runs a
+    tiny LoRA adapter against a *local* backbone (no HF dependency) with
+    `eval_interval=2` so a held-out val step fires, then asserts the emitted
+    `type=val` record carries both keys with in-range values.
+    """
+    import subprocess
+
+    from pawn.checkpoint import save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    ckpt_dir = tmp_path / "backbone"
+    save_model(backbone, ckpt_dir, training_state={"step": 0}, run_config={})
+
+    # `eval_interval` has no dedicated CLI flag — set it via `--config` JSON
+    # (steps_per_epoch=None path resolves the val cadence from
+    # `cfg.eval_interval`). `--no-pgn` builds a random val_corpus so the run
+    # is self-contained.
+    cfg_path = tmp_path / "adapter.json"
+    cfg_path.write_text(json.dumps({
+        "run_type": "adapter",
+        "strategy": "lora",
+        "eval_interval": 2,
+    }))
+
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax_adapter.py",
+            "--config", str(cfg_path),
+            "--strategy", "lora",
+            "--supernet", "tiny", "--variant", "small",
+            "--checkpoint", str(ckpt_dir),
+            "--no-pgn", "--total-steps", "4",
+            "--batch-size", "4", "--seq-len", "16", "--k", "2",
+            "--lora-rank", "2",
+            "--log-interval", "1",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True, text=True, timeout=600, env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"adapter run with eval_interval failed:\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    metrics = sorted(logs_dir.glob("*/metrics.jsonl"))
+    assert metrics, f"no metrics.jsonl under {logs_dir}"
+    records = _read_jsonl(metrics[-1])
+    val_records = [r for r in records if r.get("type") == "val"]
+    assert val_records, (
+        "no type=val records emitted despite eval_interval=2 — the adapter "
+        f"held-out validation loop did not run. stdout={result.stdout}"
+    )
+    vr = val_records[0]
+    # Both dashboard keys must be present and live (the gate flagged a
+    # silent-deletion risk on each).
+    assert "val/legal_move_rate" in vr, (
+        f"adapter val record missing val/legal_move_rate: {sorted(vr)}"
+    )
+    assert "val/top5" in vr, (
+        f"adapter val record missing val/top5: {sorted(vr)}"
+    )
+    assert 0.0 <= vr["val/legal_move_rate"] <= 1.0
+    assert 0.0 <= vr["val/top5"] <= 1.0
 
 
 def test_train_jax_adapter_rosa_retro_bottleneck_end_to_end(tmp_path) -> None:  # type: ignore[no-untyped-def]

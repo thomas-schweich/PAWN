@@ -180,6 +180,117 @@ def test_val_legal_move_rate_counts_full_window_predictions() -> None:
     assert 0.0 < metrics.legal_move_rate <= 1.0
 
 
+def test_compute_val_metrics_reports_full_v1_schema() -> None:
+    """Parity item ``eval-jax-no-top5-per-ply-loss`` + ``perplexity-metric``:
+    the val pass returns top-1, top-5, CE loss, perplexity, and the legal
+    move rate together (v1 ``CLMTrainer.evaluate`` / ``eval_accuracy.py``
+    schema), not top-1 alone."""
+    model = init_model(TINY_SUPERNET, key=0)
+    corpus = generate_corpus(n_games=8, max_ply=40, seq_len=48, seed=3)
+    vm = compute_val_metrics(model, corpus, batch_size=4)
+    assert 0.0 <= vm.top1 <= 1.0
+    assert 0.0 <= vm.top5 <= 1.0
+    # top-5 is a superset of top-1, so it can never be lower.
+    assert vm.top5 >= vm.top1 - 1e-6
+    assert vm.val_loss > 0.0
+    # perplexity == exp(loss) for the clamped loss range.
+    assert vm.perplexity == pytest.approx(np.exp(min(vm.val_loss, 20.0)), rel=1e-5)
+    assert 0.0 <= vm.legal_move_rate <= 1.0
+
+
+def test_legal_move_rate_invariant_to_min_eval_ply() -> None:
+    """Regression for the late_legal_move_rate denominator/numerator
+    mismatch: the legality metrics are gated by the plain supervised mask,
+    NOT the MAIA opening-skip (``min_eval_ply``) mask. So both
+    ``legal_move_rate`` and ``late_legal_move_rate`` (with ``late_ply=0``,
+    i.e. every supervised position is "late") must be invariant to
+    ``min_eval_ply`` — only the loss / top-1 / top-5 scalars see the skip.
+
+    The buggy version gated legality by ``eval_mask = loss & (ply >=
+    min_eval_ply)`` for the numerator while leaving the denominator on the
+    plain supervised count, silently deflating the rate when
+    ``min_eval_ply > 0``."""
+    model = init_model(TINY_SUPERNET, key=0)
+    corpus = generate_corpus(n_games=16, max_ply=60, seq_len=72, seed=11)
+    base = compute_val_metrics(
+        model, corpus, batch_size=8, min_eval_ply=0, late_ply=0
+    )
+    skipped = compute_val_metrics(
+        model, corpus, batch_size=8, min_eval_ply=10, late_ply=0
+    )
+    # Legality is gated by the plain supervised mask, so the opening-skip
+    # must not move either legal-rate metric.
+    assert skipped.legal_move_rate == pytest.approx(
+        base.legal_move_rate, abs=1e-6
+    )
+    assert skipped.late_legal_move_rate == pytest.approx(
+        base.late_legal_move_rate, abs=1e-6
+    )
+    # With late_ply=0 every supervised position is "late", so the two
+    # legality rates coincide within a pass.
+    assert base.late_legal_move_rate == pytest.approx(
+        base.legal_move_rate, abs=1e-6
+    )
+    # The loss/top-1 scalars DO change (the skip drops the easy openings),
+    # confirming the skip is still applied where it should be.
+    assert skipped.val_loss != pytest.approx(base.val_loss, abs=1e-6)
+
+
+def test_min_eval_ply_skips_opening_in_overall_not_in_phases() -> None:
+    """Parity item ``eval-jax-no-min-eval-ply``: the MAIA opening-skip drops
+    the first ``min_eval_ply`` plies from the *overall* headline metrics but
+    leaves the per-phase breakdown (which always bins from ply 0) untouched.
+
+    A high min_eval_ply that excludes every opening-phase position must
+    change the overall top-1 (different position set) while the per-phase
+    ``opening`` accuracy stays identical to the unskipped pass."""
+    model = init_model(TINY_SUPERNET, key=0)
+    corpus = generate_corpus(n_games=16, max_ply=60, seq_len=72, seed=11)
+    base = compute_val_metrics(model, corpus, batch_size=8, min_eval_ply=0)
+    skipped = compute_val_metrics(model, corpus, batch_size=8, min_eval_ply=20)
+    # Per-phase opening accuracy is computed from ply 0 regardless of the
+    # opening-skip, so it must be identical across the two passes.
+    assert skipped.phases.opening == pytest.approx(base.phases.opening, abs=1e-6)
+    assert skipped.phases.midgame == pytest.approx(base.phases.midgame, abs=1e-6)
+    # The overall metrics see a strictly smaller (later-ply) position set,
+    # so the supervised count drops.
+    assert skipped.phases.n_total == base.phases.n_total  # phase count unchanged
+
+
+def test_compute_per_ply_accuracy_returns_per_ply_breakdown() -> None:
+    """Parity item ``per-ply-breakdown``: a per-ply top-1 accuracy map keyed
+    by the ply each position predicts (v1 ``--per-ply``)."""
+    from pawn.eval import PerPlyResult, compute_per_ply_accuracy
+
+    model = init_model(TINY_SUPERNET, key=0)
+    corpus = generate_corpus(n_games=8, max_ply=24, seq_len=32, seed=5)
+    res = compute_per_ply_accuracy(model, corpus, batch_size=4)
+    assert isinstance(res, PerPlyResult)
+    assert res.accuracy, "expected at least one supervised ply"
+    # Plies are 0-indexed (first move is ply 0).
+    assert min(res.accuracy) == 0
+    for ply, acc in res.accuracy.items():
+        assert 0.0 <= acc <= 1.0
+        assert res.n[ply] > 0
+
+
+def test_phase_naming_is_v2_midgame_endgame() -> None:
+    """Parity item ``phase-naming-changed``: v2 renamed v1's
+    ``opening/middle/late`` phases to ``opening/midgame/endgame``. Pin the
+    v2 names so the rename is intentional and documented, not a silent
+    drift — :class:`AccuracyResult` exposes ``midgame`` / ``endgame``, not
+    ``middle`` / ``late``."""
+    model = init_model(TINY_SUPERNET, key=0)
+    corpus = generate_corpus(n_games=4, max_ply=64, seq_len=80, seed=0)
+    result = compute_per_phase_accuracy(model, corpus, batch_size=4)
+    fields = set(AccuracyResult.__dataclass_fields__)
+    assert {"opening", "midgame", "endgame"} <= fields
+    assert "middle" not in fields and "late" not in fields
+    # The accessors resolve (the v2 names are the live API).
+    assert isinstance(result.midgame, float)
+    assert isinstance(result.endgame, float)
+
+
 def test_argmax_never_picks_pad_or_outcome_tokens() -> None:
     """The plan-pinned contract: argmax restricted to [0, NUM_ACTIONS).
     Confirm by checking that compute_move_accuracy's argmax output is
@@ -664,6 +775,23 @@ def test_compute_elo_stratified_accuracy_aggregates_bins() -> None:
     for r in results:
         assert 0.0 <= r.accuracy <= 1.0
         assert r.n_games == 2
+
+
+def test_elo_bin_result_carries_full_v1_schema() -> None:
+    """Parity item ``elo-output-schema-gap`` (criterion 13): each Elo bin
+    reports loss / perplexity / top-5 / legal_move_rate alongside top-1, not
+    top-1 alone — the v1 ``eval_suite/lichess.py`` per-bin schema."""
+    model = init_model(TINY_SUPERNET, key=0)
+    c = generate_corpus(n_games=6, max_ply=24, seq_len=32, seed=1)
+    bins = {EloBin(1500, 1600): c}
+    (r,) = compute_elo_stratified_accuracy(model, bins, batch_size=3)
+    assert 0.0 <= r.accuracy <= 1.0
+    assert r.top1 == r.accuracy  # alias
+    assert 0.0 <= r.top5 <= 1.0
+    assert r.top5 >= r.accuracy - 1e-6
+    assert r.loss > 0.0
+    assert r.perplexity == pytest.approx(np.exp(min(r.loss, 20.0)), rel=1e-5)
+    assert 0.0 <= r.legal_move_rate <= 1.0
 
 
 # ---------------------------------------------------------------------------

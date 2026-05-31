@@ -27,14 +27,16 @@ from jaxtyping import Array, Bool, Float, Int
 
 from pawn.config import NUM_ACTIONS
 from pawn.corpus import Corpus
-from pawn.model import PAWNModel
+from pawn.model import EffectiveCallable
 
 __all__ = [
     "PhaseBoundaries",
     "AccuracyResult",
     "ValMetrics",
+    "PerPlyResult",
     "compute_move_accuracy",
     "compute_per_phase_accuracy",
+    "compute_per_ply_accuracy",
     "compute_val_metrics",
 ]
 
@@ -77,7 +79,7 @@ def _argmax_over_actions(
 
 @eqx.filter_jit
 def _batch_correct(
-    model: PAWNModel,
+    model: EffectiveCallable,
     tokens: Int[Array, "B T"],
     targets: Int[Array, "B T"],
     attn_mask: Bool[Array, "B T"],
@@ -93,7 +95,7 @@ def _batch_correct(
 
 @eqx.filter_jit
 def _batch_phase_counts(
-    model: PAWNModel,
+    model: EffectiveCallable,
     tokens: Int[Array, "B T"],
     targets: Int[Array, "B T"],
     attn_mask: Bool[Array, "B T"],
@@ -119,7 +121,7 @@ def _batch_phase_counts(
 
 
 def compute_move_accuracy(
-    model: PAWNModel,
+    model: EffectiveCallable,
     corpus: Corpus,
     *,
     batch_size: int = 32,
@@ -151,7 +153,7 @@ def compute_move_accuracy(
 
 
 def compute_per_phase_accuracy(
-    model: PAWNModel,
+    model: EffectiveCallable,
     corpus: Corpus,
     *,
     batch_size: int = 32,
@@ -295,42 +297,63 @@ class ValMetrics:
 
 @eqx.filter_jit
 def _batch_val_counts(
-    model: PAWNModel,
+    model: EffectiveCallable,
     tokens: Int[Array, "B T"],
     targets: Int[Array, "B T"],
     attn_mask: Bool[Array, "B T"],
+    eval_mask: Bool[Array, "B T"],
     loss_mask: Bool[Array, "B T"],
     legal_mask: Bool[Array, "B T A"],
     late_mask: Bool[Array, "B T"],
 ) -> tuple[
     Float[Array, ""], Int[Array, ""], Int[Array, ""],
-    Int[Array, ""], Int[Array, ""], Int[Array, ""],
+    Int[Array, ""], Int[Array, ""], Int[Array, ""], Int[Array, ""],
 ]:
     """JIT'd inner for the validation pass.
 
-    Returns ``(loss_sum, n_supervised, n_top1_correct, n_top5_correct,
-    n_legal, n_late_legal)`` as device scalars so the Python loop
-    accumulates on-device and syncs one small tuple per chunk.
+    Returns ``(loss_sum, n_eval, n_loss_sup, n_top1_correct,
+    n_top5_correct, n_legal, n_late_legal)`` as device scalars so the
+    Python loop accumulates on-device and syncs one small tuple per
+    chunk. ``n_eval`` is the MAIA-gated count (denominator for
+    loss / top-1 / top-5); ``n_loss_sup`` is the plain supervised count
+    (denominator for ``legal_move_rate``, matching the ``loss_mask``-gated
+    ``n_legal`` numerator).
 
-    ``loss_sum`` is the **sum** of per-supervised-position cross-entropy
-    (not the mean) so the host can divide by the global supervised count
-    after the loop — a per-chunk mean would mis-weight ragged final
-    chunks. ``legal_mask`` is the ``(B, T, A)`` per-position legal
+    ``eval_mask`` is the ``(B, T)`` set of supervised positions that
+    count toward the *MAIA-skipped* loss / top-1 / top-5 stats — i.e.
+    ``loss_mask & (ply >= min_eval_ply)``. The MAIA opening-skip (v1
+    ``min_eval_ply``, default 10) drops the book-ish opening plies from
+    the headline accuracy/loss numbers; the per-phase breakdown is
+    computed separately (always from ply 0) so it still reports the full
+    picture.
+
+    ``loss_mask`` is the **plain** ``(B, T)`` supervised mask (no MAIA
+    gate). Legality (``n_legal`` / ``n_late_legal``) is gated by it — NOT
+    by ``eval_mask`` — so the legal-move-rate numerators match the
+    denominators ``compute_val_metrics`` derives from the same plain
+    supervised mask (``late_sup = (late_pos & loss).sum()``). Gating
+    legality by ``eval_mask`` would silently deflate the late rate by the
+    fraction of supervised late positions with ply ``< min_eval_ply``.
+
+    ``loss_sum`` is the **sum** of per-position cross-entropy over
+    ``eval_mask`` (not the mean) so the host can divide by the global
+    eval count after the loop — a per-chunk mean would mis-weight ragged
+    final chunks. ``legal_mask`` is the ``(B, T, A)`` per-position legal
     move-token set (True where a token is legal at that position);
-    ``n_legal`` counts supervised positions whose argmax prediction is
-    legal, ``n_late_legal`` restricts that to the late-game positions
-    flagged by ``late_mask``.
+    ``n_legal`` counts eval positions whose argmax prediction is legal,
+    ``n_late_legal`` restricts that to the late-game positions flagged by
+    ``late_mask`` (which carries its own supervised + ply gate).
     """
     logits = model(tokens, attn_mask)
     move_logits = logits[..., :NUM_ACTIONS].astype(jnp.float32)
-    # Sum CE over supervised positions (mean is taken on the host).
+    # Sum CE over the eval positions (mean is taken on the host).
     per_pos = jax.nn.log_softmax(move_logits, axis=-1)
     tgt = jnp.clip(targets, 0, NUM_ACTIONS - 1)
     gathered = jnp.take_along_axis(per_pos, tgt[..., None], axis=-1)[..., 0]
-    loss_sum = jnp.where(loss_mask, -gathered, 0.0).sum()
+    loss_sum = jnp.where(eval_mask, -gathered, 0.0).sum()
 
     pred = jnp.argmax(move_logits, axis=-1)  # (B, T)
-    top1_correct = (pred == targets) & loss_mask
+    top1_correct = (pred == targets) & eval_mask
     # Top-5 via the target's rank, NOT ``jax.lax.top_k``: the fused top-k
     # kernel requests more shared memory than RDNA3 exposes per CU (the
     # same 64 KB ceiling that OOMs the fused attention path), so it raises
@@ -339,7 +362,7 @@ def _batch_val_counts(
     # reduction over the vocab axis with no shared-memory kernel.
     tgt_logit = jnp.take_along_axis(move_logits, tgt[..., None], axis=-1)
     n_greater = (move_logits > tgt_logit).sum(axis=-1)  # (B, T)
-    in_top5 = (n_greater < 5) & loss_mask
+    in_top5 = (n_greater < 5) & eval_mask
 
     # Legality: the argmax prediction is legal at that position.
     pred_legal = jnp.take_along_axis(
@@ -350,6 +373,7 @@ def _batch_val_counts(
 
     return (
         loss_sum,
+        eval_mask.sum(),
         loss_mask.sum(),
         top1_correct.sum(),
         in_top5.sum(),
@@ -429,11 +453,12 @@ def _legal_token_grid(corpus: Corpus) -> np.ndarray:
 
 
 def compute_val_metrics(
-    model: PAWNModel,
+    model: EffectiveCallable,
     corpus: Corpus,
     *,
     batch_size: int = 32,
     late_ply: int = 0,
+    min_eval_ply: int = 0,
     compute_legal: bool = True,
 ) -> ValMetrics:
     """Held-out validation pass — v1 ``CLMTrainer.evaluate`` parity.
@@ -445,9 +470,19 @@ def compute_val_metrics(
 
     ``late_ply`` is the legality late-game threshold (v1's
     ``legality_late_ply`` — positions predicting ply ``>= late_ply`` count
-    toward ``late_legal_move_rate``). ``compute_legal=False`` skips the
-    engine replay (legal rates report 0.0) for callers that only need the
-    loss / accuracy scalars.
+    toward ``late_legal_move_rate``).
+
+    ``min_eval_ply`` is the MAIA opening-skip (v1 ``min_eval_ply``,
+    default 0 here for the pretrain val loop; ``scripts/eval_jax.py``
+    defaults it to 10 for the MAIA-style accuracy report). Only supervised
+    positions predicting ply ``>= min_eval_ply`` contribute to the overall
+    loss / top-1 / top-5 / legality numbers — the book-ish opening plies
+    are too easy to be informative. The per-phase breakdown is computed
+    separately and **always** bins from ply 0, so it still reports the
+    opening accuracy for the full picture (v1 ``eval_accuracy.py``:445).
+
+    ``compute_legal=False`` skips the engine replay (legal rates report
+    0.0) for callers that only need the loss / accuracy scalars.
     """
     n = corpus.n_games
     seq_len = corpus.seq_len
@@ -458,6 +493,10 @@ def compute_val_metrics(
     positions = np.arange(seq_len, dtype=np.int32)
     ply = positions - (C - 1)
     late_pos = jnp.asarray(ply >= late_ply, dtype=jnp.bool_)  # (T,)
+    # MAIA opening-skip: positions predicting ply >= min_eval_ply count
+    # toward the overall headline metrics. ply >= 0 always for supervised
+    # slots, so min_eval_ply=0 reduces to "every supervised position".
+    keep_pos = jnp.asarray(ply >= min_eval_ply, dtype=jnp.bool_)  # (T,)
 
     legal_grid = (
         _legal_token_grid(corpus)
@@ -467,6 +506,7 @@ def compute_val_metrics(
 
     loss_sum: Array = jnp.zeros((), dtype=jnp.float32)
     total_sup: Array = jnp.zeros((), dtype=jnp.int32)
+    loss_sup: Array = jnp.zeros((), dtype=jnp.int32)
     top1_sum: Array = jnp.zeros((), dtype=jnp.int32)
     top5_sum: Array = jnp.zeros((), dtype=jnp.int32)
     legal_sum: Array = jnp.zeros((), dtype=jnp.int32)
@@ -480,21 +520,28 @@ def compute_val_metrics(
         attn = jnp.asarray(corpus.attn_mask[start:end])
         loss = jnp.asarray(corpus.loss_mask[start:end])
         legal = jnp.asarray(legal_grid[start:end])
-        late_b = jnp.broadcast_to(late_pos, loss.shape)
-        ls, s, t1, t5, lg, llg = _batch_val_counts(
-            model, tokens, targets, attn, loss, legal, late_b,
+        late_b = jnp.broadcast_to(late_pos, loss.shape) & loss
+        # Overall metrics gate on the MAIA opening-skip; late-legality
+        # gates on its own ply threshold. Both are intersected with the
+        # supervised mask so unpredicted (prefix / PAD) slots never count.
+        eval_b = jnp.broadcast_to(keep_pos, loss.shape) & loss
+        ls, s, lsup, t1, t5, lg, llg = _batch_val_counts(
+            model, tokens, targets, attn, eval_b, loss, legal, late_b,
         )
         loss_sum = loss_sum + ls
         total_sup = total_sup + s
+        loss_sup = loss_sup + lsup
         top1_sum = top1_sum + t1
         top5_sum = top5_sum + t5
         legal_sum = legal_sum + lg
         late_legal_sum = late_legal_sum + llg
         # Count of supervised late-game positions (denominator for the
-        # late-legality rate).
-        late_sup = late_sup + (loss & late_b).sum()
+        # late-legality rate). ``late_b`` already carries the supervised
+        # gate (``& loss`` above).
+        late_sup = late_sup + late_b.sum()
 
     n_sup = int(total_sup)
+    n_loss_sup = int(loss_sup)
     n_late = int(late_sup)
     loss_total = float(loss_sum)
     if n_sup == 0:
@@ -512,9 +559,90 @@ def compute_val_metrics(
         top1=int(top1_sum) / n_sup,
         top5=int(top5_sum) / n_sup,
         perplexity=math.exp(min(val_loss, 20.0)),
-        legal_move_rate=int(legal_sum) / n_sup,
+        # ``legal_sum`` is gated by the plain supervised mask (no MAIA
+        # skip), so its denominator is the plain supervised count — not
+        # the MAIA-gated ``n_sup`` used for loss / top-1 / top-5.
+        legal_move_rate=(
+            int(legal_sum) / n_loss_sup if n_loss_sup > 0 else 0.0
+        ),
         late_legal_move_rate=(
             int(late_legal_sum) / n_late if n_late > 0 else 0.0
         ),
         phases=phases,
     )
+
+
+@eqx.filter_jit
+def _batch_per_position_top1(
+    model: EffectiveCallable,
+    tokens: Int[Array, "B T"],
+    targets: Int[Array, "B T"],
+    attn_mask: Bool[Array, "B T"],
+    loss_mask: Bool[Array, "B T"],
+) -> tuple[Int[Array, "T"], Int[Array, "T"]]:
+    """JIT'd inner for the per-ply breakdown.
+
+    Returns ``(per_pos_correct, per_pos_supervised)`` — two length-``T``
+    vectors summed over the batch axis, so the host accumulates the
+    per-sequence-position counts and re-bins them by ply once at the end.
+    """
+    logits = model(tokens, attn_mask)
+    pred = _argmax_over_actions(logits)
+    correct = (pred == targets) & loss_mask  # (B, T)
+    return correct.sum(axis=0), loss_mask.sum(axis=0)
+
+
+@dataclass(frozen=True)
+class PerPlyResult:
+    """Per-ply top-1 accuracy breakdown (v1 ``--per-ply``).
+
+    ``accuracy[p]`` / ``n[p]`` give the top-1 accuracy and supervised
+    position count at ply ``p``. Plies are 0-indexed (ply 0 is the first
+    move), keyed off the conditioning offset ``C`` so the report tracks
+    the checkpoint's own layout rather than the raw sequence index.
+    """
+
+    accuracy: dict[int, float]
+    n: dict[int, int]
+
+
+def compute_per_ply_accuracy(
+    model: EffectiveCallable,
+    corpus: Corpus,
+    *,
+    batch_size: int = 32,
+) -> PerPlyResult:
+    """Top-1 accuracy broken down by ply (v1 ``eval_accuracy.py`` ``--per-ply``).
+
+    Supervised slot ``t`` predicts ply ``p = t - (C - 1)`` (the first move
+    is supervised by the last conditioning slot ``C - 1``); this bins the
+    per-position top-1 counts by ``p`` and reports the accuracy for every
+    ply with at least one supervised position. Plies with no supervised
+    positions are omitted (matching v1, which only emits seen plies).
+    """
+    n = corpus.n_games
+    seq_len = corpus.seq_len
+    C = int(corpus.outcome_offset[0]) if n > 0 else 1
+    per_pos_correct: Array = jnp.zeros((seq_len,), dtype=jnp.int32)
+    per_pos_sup: Array = jnp.zeros((seq_len,), dtype=jnp.int32)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        tokens = jnp.asarray(corpus.tokens[start:end])
+        targets = jnp.asarray(corpus.targets[start:end])
+        attn = jnp.asarray(corpus.attn_mask[start:end])
+        loss = jnp.asarray(corpus.loss_mask[start:end])
+        c, s = _batch_per_position_top1(model, tokens, targets, attn, loss)
+        per_pos_correct = per_pos_correct + c
+        per_pos_sup = per_pos_sup + s
+    correct_host = np.asarray(per_pos_correct)
+    sup_host = np.asarray(per_pos_sup)
+    accuracy: dict[int, float] = {}
+    counts: dict[int, int] = {}
+    for t in range(seq_len):
+        s = int(sup_host[t])
+        if s == 0:
+            continue
+        ply = t - (C - 1)
+        accuracy[ply] = int(correct_host[t]) / s
+        counts[ply] = s
+    return PerPlyResult(accuracy=accuracy, n=counts)

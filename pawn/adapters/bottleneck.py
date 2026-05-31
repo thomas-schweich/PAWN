@@ -37,6 +37,7 @@ import numpy as np
 from jaxtyping import Array, Float, Int
 
 from pawn.adapters.placement import layer_placement_mask
+from pawn.checkpoint import ADAPTER_SAFETENSORS
 from pawn.config import ModelConfig
 from pawn.model import KVCache, PAWNModel
 
@@ -53,9 +54,9 @@ __all__ = [
 ]
 
 
-# Sidecar filename used by the trainer's save / resume path. Held as a
-# module constant so the train + load sites can't drift apart.
-ADAPTER_SAFETENSORS = "adapter.safetensors"
+# ``ADAPTER_SAFETENSORS`` (the sidecar filename used by the trainer's save /
+# resume path) is owned by :mod:`pawn.checkpoint` and re-exported here so the
+# train + load sites can't drift apart.
 
 
 @dataclass(frozen=True)

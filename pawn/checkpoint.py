@@ -92,6 +92,7 @@ from pawn._sentinel import (
 )
 from pawn.config import MASK_VERSION, ModelConfig
 from pawn.model import (
+    EffectiveCallable,
     PAWNModel,
     TransformerLayer,
     _build_decomp_table,
@@ -113,10 +114,12 @@ __all__ = [
     "OPTIMIZER_FILE",
     "TRAINING_STATE_FILE",
     "ADAPTER_RESUME_FILE",
+    "ADAPTER_SAFETENSORS",
     "CheckpointIntegrityError",
     "IncompleteCheckpointError",
     "save_model",
     "load_model",
+    "load_eval_model",
     "load_model_config",
     "save_adapter_resume_state",
     "load_adapter_resume_state",
@@ -145,6 +148,13 @@ TRAINING_STATE_FILE: Final[str] = "training_state.json"
 # re-derive the exact (backbone, adapter) split the warm Adam moments were
 # trained against. See :func:`save_adapter_resume_state`.
 ADAPTER_RESUME_FILE: Final[str] = "adapter_resume_state.eqx"
+# Typed-adapter sidecar (bottleneck / pure-FiLM / hybrid's FiLM half). The
+# published ``model.safetensors`` carries the frozen backbone (LoRA-folded
+# for hybrid); this safetensors sidecar carries the injected adapter slabs
+# so :func:`load_eval_model` can re-apply them at eval time. Mirrors the
+# filename the adapter modules write (``pawn.adapters.bottleneck`` /
+# ``pawn.adapters.film`` both export ``ADAPTER_SAFETENSORS``).
+ADAPTER_SAFETENSORS: Final[str] = "adapter.safetensors"
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +551,140 @@ def load_model(
     tensors = st_load(str(directory / MODEL_FILE))
     model = _tensor_dict_to_model(tensors, cfg)
     return model, run_block
+
+
+def load_eval_model(
+    target_dir: Path | str,
+) -> tuple["EffectiveCallable", dict[str, Any] | None]:
+    """Load a checkpoint as the *adapted* effective model for eval.
+
+    :func:`load_model` returns the bare :class:`PAWNModel` from
+    ``model.safetensors``. For weight-folding adapters (lora / sparse /
+    unfreeze / specialized_clm) that's already the adapted model — the
+    fold is baked into the published tensors. But **bottleneck** and
+    **pure-FiLM** adapters publish the *frozen backbone* plus a typed
+    ``adapter.safetensors`` sidecar (the residual MLPs / FiLM slabs are
+    injected at forward time, not folded), and a **hybrid** checkpoint
+    folds only its LoRA half and keeps the FiLM half in the sidecar.
+    Loading those with :func:`load_model` alone evaluates the bare
+    backbone and silently drops the adapter — exactly the
+    ``load-model-adapter-reapply`` parity gap (a bottleneck adapter
+    eval'd as a bare backbone scores at the backbone's accuracy, not the
+    adapted model's).
+
+    This re-applies the sidecar so the returned callable runs the
+    adapted model. It reads the checkpoint's ``run`` block to recover the
+    ``strategy`` + adapter hyperparameters (the same ``cfg`` the sidecar
+    was saved against), rebuilds the typed adapter config, restores the
+    adapter from the sidecar, and wraps it back into the effective model.
+
+    Returns ``(effective_model, run_block)`` where ``effective_model``
+    satisfies :class:`pawn.model.EffectiveCallable` — a bare
+    :class:`PAWNModel` for the no-sidecar case, or a
+    ``BottleneckEffective`` / ``FiLMEffective`` wrapper for the
+    sidecar-bearing adapters. Callers that specifically need the raw
+    ``PAWNModel`` should call :func:`load_model` instead.
+    """
+    directory = Path(target_dir)
+    model, run_block = load_model(directory)
+    strategy = run_block.get("strategy") if isinstance(run_block, dict) else None
+    sidecar = directory / ADAPTER_SAFETENSORS
+    # Only the sidecar-bearing adapters need re-application. Everything
+    # else (no run block, no strategy, or a weight-folding strategy) is
+    # already the adapted model on disk.
+    if strategy is None or not sidecar.is_file():
+        return model, run_block
+    assert isinstance(run_block, dict)
+
+    if strategy == "bottleneck":
+        from pawn.adapters.bottleneck import (
+            BottleneckConfig,
+            apply_bottleneck,
+            load_bottleneck_adapter,
+        )
+
+        b_cfg = BottleneckConfig(
+            dim=int(run_block.get("bottleneck_dim") or 8),
+            n_hidden=int(run_block.get("bottleneck_n_hidden") or 0),
+            no_adapt_attn=bool(run_block.get("no_adapt_attn", False)),
+            no_adapt_ffn=bool(run_block.get("no_adapt_ffn", False)),
+            layers=_adapter_layers(run_block.get("adapter_layers")),
+        )
+        adapter = load_bottleneck_adapter(directory, b_cfg)
+        return apply_bottleneck(model, adapter), run_block
+
+    if strategy in ("film", "hybrid"):
+        # Pure FiLM publishes the frozen backbone + FiLM sidecar; hybrid
+        # publishes the LoRA-folded backbone + FiLM sidecar. In both cases
+        # ``model`` is the correct backbone to wrap — re-apply the FiLM
+        # slabs onto whatever ``load_model`` returned.
+        from pawn.adapters.film import (
+            FiLMConfig,
+            apply_film,
+            load_film_adapter,
+        )
+
+        f_cfg = FiLMConfig(use_output_film=bool(run_block.get("use_output_film", True)))
+        adapter = load_film_adapter(directory, f_cfg)
+        return apply_film(model, adapter), run_block
+
+    # RoSA in ``retro-bottleneck`` mode is the third sidecar-bearing
+    # strategy. ``apply_rosa`` returns a ``BottleneckEffective`` in that
+    # mode (rosa.py: backbone + sparse delta + Houlsby bottleneck), so
+    # ``write_adapter_checkpoint`` folds the sparse delta into
+    # ``model.safetensors`` and writes the Houlsby MLPs to the
+    # ``adapter.safetensors`` sidecar. Both the literal
+    # ``rosa-retro-bottleneck`` strategy and the ``rosa`` strategy with
+    # ``rosa_mode == "retro-bottleneck"`` (the H9 ``rosa-ratio`` sweep maps
+    # onto the latter) land here. Without re-applying the sidecar, eval
+    # would score the sparse-folded backbone *without* the bottleneck
+    # residual — the exact ``load-model-adapter-reapply`` gap.
+    rosa_mode = run_block.get("rosa_mode")
+    is_retro_bottleneck = strategy == "rosa-retro-bottleneck" or (
+        strategy == "rosa" and rosa_mode == "retro-bottleneck"
+    )
+    if is_retro_bottleneck:
+        from pawn.adapters.bottleneck import (
+            BottleneckConfig,
+            apply_bottleneck,
+            load_bottleneck_adapter,
+        )
+
+        # Reconstruct the exact ``BottleneckConfig`` RoSA built in
+        # ``init_rosa_adapter`` (rosa.py): ``dim`` / ``n_hidden`` / ``layers``
+        # only — both attn + ffn placements are on (RoSA never threads
+        # ``no_adapt_*`` into its Houlsby branch). ``bottleneck_dim`` may be
+        # ``None`` in the run block (RoSAConfig's own default of 8 stands).
+        bottleneck_dim = run_block.get("bottleneck_dim")
+        b_cfg = BottleneckConfig(
+            dim=int(bottleneck_dim) if bottleneck_dim is not None else 8,
+            n_hidden=int(run_block.get("bottleneck_n_hidden") or 0),
+            layers=_adapter_layers(run_block.get("adapter_layers")),
+        )
+        adapter = load_bottleneck_adapter(directory, b_cfg)
+        return apply_bottleneck(model, adapter), run_block
+
+    # Any other strategy that happens to have written a sidecar is already
+    # weight-folded into model.safetensors; return the bare backbone.
+    return model, run_block
+
+
+def _adapter_layers(value: object) -> tuple[int, ...] | None:
+    """Parse the persisted ``adapter_layers`` spec to a tuple (or None).
+
+    Accepts the list form written by ``model_dump`` and the
+    comma-separated string form a hand-written ``--config`` JSON might
+    carry. ``None`` means "every layer" (the placement default).
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return tuple(int(x) for x in value)
+    if isinstance(value, str):
+        if value.strip() == "":
+            return None
+        return tuple(int(x) for x in value.split(","))
+    raise TypeError(f"unrecognized adapter_layers spec: {value!r}")
 
 
 def save_adapter_resume_state(

@@ -12,7 +12,7 @@ import json
 import sys
 from pathlib import Path
 
-from pawn.checkpoint import load_model, resolve_checkpoint_source
+from pawn.checkpoint import load_eval_model, resolve_checkpoint_source
 from pawn.corpus import Corpus, conditioning_from_run_block
 from pawn.lichess_data import load_lichess_corpus
 from pawn.lichess_eval import (
@@ -29,12 +29,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--split", default="validation")
     ap.add_argument("--seq-len", type=int, default=128)
     ap.add_argument("--max-games-per-bin", type=int, default=100)
+    ap.add_argument("--min-eval-ply", type=int, default=10,
+                    help="MAIA opening-skip for the per-bin headline "
+                         "metrics (default 10).")
     ap.add_argument("--output", type=Path, default=None)
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
     ckpt = args.checkpoint
     ckpt_path = resolve_checkpoint_source(ckpt)
-    model, run_block = load_model(ckpt_path)
+    # load_eval_model re-applies adapter sidecars so an adapter checkpoint
+    # is scored as the ADAPTED model across every Elo bin.
+    model, run_block = load_eval_model(ckpt_path)
     # Build every Elo-bin corpus with the checkpoint's own conditioning so
     # the move positions match the layout the model was trained under
     # (plan §8.1) — a hardcoded default would shift the absolute RoPE
@@ -54,11 +59,21 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, FileNotFoundError):
             continue
         bins_corpora[b] = c
-    results = compute_elo_stratified_accuracy(model, bins_corpora)
+    results = compute_elo_stratified_accuracy(
+        model, bins_corpora, min_eval_ply=args.min_eval_ply,
+    )
     payload = {
         "checkpoint": ckpt,
         "results": [
-            {"elo_bin": r.bin.label, "accuracy": r.accuracy, "n_games": r.n_games}
+            {
+                "elo_bin": r.bin.label,
+                "n_games": r.n_games,
+                "loss": r.loss,
+                "perplexity": r.perplexity,
+                "top1_accuracy": r.accuracy,
+                "top5_accuracy": r.top5,
+                "legal_move_rate": r.legal_move_rate,
+            }
             for r in results
         ],
     }
