@@ -445,6 +445,66 @@ def test_bottleneck_no_adapt_attn_disables_attn_branch() -> None:
     assert adapter.down_ffn is not None  # FFN still active
 
 
+def test_bottleneck_no_adapt_ffn_disables_ffn_branch() -> None:
+    """``no_adapt_ffn=True`` drops the FFN-side weights and the FFN hook:
+    init leaves the FFN fields None while keeping the attention branch,
+    and the effective forward injects nothing after the FFN sublayer."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("bottleneck")(
+        backbone, BottleneckConfig(dim=4, no_adapt_ffn=True),
+        key=jax.random.key(0),
+    )
+    # FFN-side fields are dropped; attention-side stays populated.
+    assert adapter.down_ffn is None
+    assert adapter.hidden_ffn is None
+    assert adapter.up_ffn is None
+    assert adapter.down_attn is not None  # attn still active
+    # Behavioural: the effective forward must NOT thread an ffn_hook. Patch
+    # the backbone's __call__ to capture which hooks the wrapper passes, so
+    # this pins the FFN-disable path rather than just the init-time fields.
+    effective = dispatch_apply("bottleneck")(backbone, adapter)
+    captured: dict[str, Any] = {}
+    orig_call = type(backbone).__call__
+
+    def _spy_call(self: PAWNModel, *a: Any, **kw: Any) -> Any:
+        captured["attn_hook"] = kw.get("attn_hook")
+        captured["ffn_hook"] = kw.get("ffn_hook")
+        return orig_call(self, *a, **kw)
+
+    tokens = jnp.zeros((2, 16), dtype=jnp.int32)
+    import unittest.mock as _mock
+    with _mock.patch.object(type(backbone), "__call__", _spy_call):
+        _ = effective(tokens)
+    assert captured["ffn_hook"] is None, "ffn_hook must be disabled"
+    assert captured["attn_hook"] is not None, "attn_hook should still fire"
+
+
+def test_bottleneck_no_adapt_ffn_perturbed_up_changes_only_via_attn() -> None:
+    """With ``no_adapt_ffn=True``, perturbing the (absent) FFN up-projection
+    is impossible — the field is None — while perturbing the attention
+    up-projection moves the logits. Confirms the FFN sublayer carries no
+    bottleneck residual at runtime (the disabled-site forward path)."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    adapter = dispatch_init("bottleneck")(
+        backbone, BottleneckConfig(dim=4, no_adapt_ffn=True),
+        key=jax.random.key(0),
+    )
+    assert adapter.up_ffn is None  # no FFN slab to perturb
+    tokens = jnp.zeros((2, 16), dtype=jnp.int32)
+    base = dispatch_apply("bottleneck")(backbone, adapter)(tokens)
+    # Perturbing the attention up-projection must move the logits (proving
+    # the single active site is the attention one, not the FFN one).
+    assert adapter.up_attn is not None
+    perturbed = eqx.tree_at(
+        lambda a: a.up_attn, adapter,
+        adapter.up_attn + jax.random.normal(
+            jax.random.key(3), adapter.up_attn.shape
+        ) * 0.1,
+    )
+    moved = dispatch_apply("bottleneck")(backbone, perturbed)(tokens)
+    assert not jnp.allclose(base, moved, atol=1e-5)
+
+
 def test_bottleneck_identity_at_init_matches_backbone_logits() -> None:
     """The Houlsby up-projection starts at zero ⇒ the residual is
     identity at step 0 ⇒ bottleneck-effective forward equals the bare
@@ -668,6 +728,79 @@ def test_rosa_generate_masks_yields_density_targeted_topk() -> None:
         assert float(jnp.abs(d).max()) == 0.0
 
 
+def test_rosa_mask_gen_illegal_penalty_changes_selected_positions() -> None:
+    """``illegal_penalty`` perturbs the mask-gen objective (v1
+    ``generate_gradient_masks``): with the hard legal mask OFF, adding the
+    illegal-mass term changes the per-delta gradient magnitudes and so the
+    top-k position selection. Confirms the penalty actually conditions the
+    mask, not just the loss scalar."""
+    from pawn.adapter_trainer import generate_rosa_masks
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = RoSAConfig(mode="rosa", lora_rank=2, density=0.1, mask_samples=2)
+    adapter = dispatch_init("rosa")(backbone, cfg, key=jax.random.key(0))
+    # Legal-mask-carrying batches so the penalty term is live.
+    b0, _ = _legal_batch(n_games=4, seq_len=28, seed=21)
+    b1, _ = _legal_batch(n_games=4, seq_len=28, seed=22)
+    batches = [b0, b1]
+
+    # Hard mask OFF so illegal_penalty is the only legality term in play.
+    base = generate_rosa_masks(
+        backbone, adapter, batches, compute_dtype=None,
+        apply_legal=False, illegal_penalty=0.0,
+    )
+    penalised = generate_rosa_masks(
+        backbone, adapter, batches, compute_dtype=None,
+        apply_legal=False, illegal_penalty=5.0,
+    )
+    # At least one projection's selected position set must differ — the
+    # penalty reweights the gradient magnitudes that drive the top-k.
+    differs = any(
+        not bool(
+            jnp.array_equal(getattr(base, name), getattr(penalised, name))
+        )
+        for name in ("mask_q", "mask_k", "mask_v", "mask_o")
+        if getattr(base, name) is not None
+    )
+    assert differs, (
+        "illegal_penalty did not change any mask — the mask-gen objective "
+        "is ignoring the penalty term"
+    )
+
+
+def test_rosa_mask_gen_honours_hard_legal_mask() -> None:
+    """The hard ``apply_legal`` path also conditions mask generation: with
+    the legal mask ON, the masked (``-inf``) illegal columns change the CE
+    gradient relative to the no-legality baseline, so the selected sparse
+    positions can differ. Pins that ``apply_legal`` is plumbed through
+    mask-gen (v1 ``generate_gradient_masks(apply_legal_mask=...)``)."""
+    from pawn.adapter_trainer import generate_rosa_masks
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = RoSAConfig(mode="rosa", lora_rank=2, density=0.1, mask_samples=2)
+    adapter = dispatch_init("rosa")(backbone, cfg, key=jax.random.key(0))
+    b0, _ = _legal_batch(n_games=4, seq_len=28, seed=31)
+    b1, _ = _legal_batch(n_games=4, seq_len=28, seed=32)
+    batches = [b0, b1]
+
+    masked = generate_rosa_masks(
+        backbone, adapter, batches, compute_dtype=None,
+        apply_legal=True, illegal_penalty=0.0,
+    )
+    plain = generate_rosa_masks(
+        backbone, adapter, batches, compute_dtype=None,
+        apply_legal=False, illegal_penalty=0.0,
+    )
+    differs = any(
+        not bool(
+            jnp.array_equal(getattr(masked, name), getattr(plain, name))
+        )
+        for name in ("mask_q", "mask_k", "mask_v", "mask_o")
+        if getattr(masked, name) is not None
+    )
+    assert differs, "apply_legal had no effect on the generated masks"
+
+
 def test_rosa_phase1_to_phase3_flips_toggles_per_mode() -> None:
     """rosa_phase1_to_phase3 sets `sparse_active=True` for every mode
     and `lora_active=(mode == "rosa")` — retro modes drop the LoRA
@@ -686,6 +819,61 @@ def test_rosa_phase1_to_phase3_flips_toggles_per_mode() -> None:
         new = rosa_phase1_to_phase3(ad, ad.sparse, key=jax.random.key(2))
         assert new.sparse_active is True
         assert new.lora_active is expect_lora
+
+
+def test_rosa_phase3_retro_bottleneck_returns_bottleneck_effective() -> None:
+    """After the Phase 2→3 flip, ``retro-bottleneck`` composes to a
+    ``BottleneckEffective`` (sparse + Houlsby) while ``retro-sparse``
+    composes to a bare ``PAWNModel`` (sparse-only). This pins the
+    mode-dependent Phase-3 wrapper type — the bottleneck branch only
+    contributes once ``sparse_active`` flips True, so the two retro modes
+    must diverge in composition class exactly at the Phase-3 boundary."""
+    from pawn.adapter_trainer import rosa_phase1_to_phase3
+    from pawn.adapters.rosa import apply_rosa
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+
+    # retro-bottleneck: Phase 3 must include the Houlsby branch ⇒
+    # BottleneckEffective wrapper.
+    cfg_b = RoSAConfig(
+        mode="retro-bottleneck", lora_rank=2, density=0.1, bottleneck_dim=4,
+    )
+    ad_b = dispatch_init("rosa")(backbone, cfg_b, key=jax.random.key(0))
+    # Pre-flip (Phase 1): sparse inactive ⇒ NOT yet a BottleneckEffective.
+    assert isinstance(apply_rosa(backbone, ad_b), PAWNModel)
+    p3_b = rosa_phase1_to_phase3(ad_b, ad_b.sparse, key=jax.random.key(1))
+    eff_b = apply_rosa(backbone, p3_b)
+    assert isinstance(eff_b, BottleneckEffective), (
+        "retro-bottleneck Phase 3 should compose to BottleneckEffective"
+    )
+
+    # retro-sparse: Phase 3 is sparse-only ⇒ a bare PAWNModel (sparse delta
+    # is folded into the weights, no wrapper).
+    cfg_s = RoSAConfig(mode="retro-sparse", lora_rank=2, density=0.1)
+    ad_s = dispatch_init("rosa")(backbone, cfg_s, key=jax.random.key(0))
+    p3_s = rosa_phase1_to_phase3(ad_s, ad_s.sparse, key=jax.random.key(1))
+    eff_s = apply_rosa(backbone, p3_s)
+    assert isinstance(eff_s, PAWNModel)
+    assert not isinstance(eff_s, BottleneckEffective), (
+        "retro-sparse Phase 3 must NOT wrap in BottleneckEffective"
+    )
+
+
+def test_rosa_retro_bottleneck_threads_n_hidden() -> None:
+    """``bottleneck_n_hidden`` flows from RoSAConfig into the Houlsby
+    branch (the prior code locked it to 0): the bottleneck adapter's
+    ``hidden_attn`` slab carries the requested extra-stage count."""
+    backbone = init_model(TINY_SUPERNET, key=0)
+    cfg = RoSAConfig(
+        mode="retro-bottleneck", lora_rank=2, density=0.1,
+        bottleneck_dim=4, bottleneck_n_hidden=2,
+    )
+    adapter = dispatch_init("rosa")(backbone, cfg, key=jax.random.key(0))
+    assert adapter.bottleneck is not None
+    assert adapter.bottleneck.hidden_attn is not None
+    assert adapter.bottleneck.hidden_attn.shape == (
+        TINY_SUPERNET.n_layers, 2, 4, 4,
+    ), f"got {adapter.bottleneck.hidden_attn.shape}"
 
 
 def test_rosa_retro_modes_init_skip_bottleneck() -> None:

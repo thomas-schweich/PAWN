@@ -478,6 +478,11 @@ def _strategy_config_from_run(cfg: AdapterConfig) -> object:
         # into this field, so it must be consumed here rather than dropped.
         if cfg.bottleneck_dim is not None:
             rosa_kwargs["bottleneck_dim"] = cfg.bottleneck_dim
+        # `bottleneck_n_hidden` is the v1 `RetroBottleneckCLM(n_hidden=...)`
+        # depth knob; forward it whenever non-default so the `retro-bottleneck`
+        # sub-mode can stack extra GELU stages (the prior code locked it to 0).
+        if cfg.bottleneck_n_hidden:
+            rosa_kwargs["bottleneck_n_hidden"] = cfg.bottleneck_n_hidden
         return RoSAConfig(**rosa_kwargs)
     if s == "unfreeze":
         return UnfreezeConfig(layers=cfg.unfreeze_layers or "5,6,7")
@@ -1178,6 +1183,21 @@ def main(argv: list[str] | None = None) -> int:
     # planned budget is the resolved `effective_total_steps`; `final_step`
     # is what actually ran (their disagreement on a `completed` stop is
     # the structural-bug signal the lab runner flags).
+    def _log_rosa_phase(
+        step: int, phase: int, *, mask_density: float | None = None
+    ) -> None:
+        """Emit a ``type=train`` boundary record marking the RoSA phase
+        transition (and, at the Phase-2→3 boundary, the realised mask
+        density). v1 left the three-phase schedule unobservable; the v2
+        superset surfaces ``rosa/phase`` + ``rosa/mask_density`` to
+        ``metrics.jsonl`` and the wandb mirror so the dashboard can mark
+        where warmup ended and the sparse mask was frozen."""
+        rec: dict[str, Any] = {"rosa/phase": phase}
+        if mask_density is not None:
+            rec["rosa/mask_density"] = mask_density
+        logger.log_train(step=step, **rec)
+        log_metrics(wandb_run, rec, step=step)
+
     reason_for_stop = "completed"
     try:
         if is_rosa:
@@ -1186,6 +1206,8 @@ def main(argv: list[str] | None = None) -> int:
             # silenced via apply_rosa's sparse_active gate).
             rosa_cfg = state.adapter.cfg
             warmup_n = min(rosa_cfg.rosa_warmup_steps, effective_total_steps)
+            # Phase 1 boundary: LoRA warmup begins at step 0.
+            _log_rosa_phase(0, phase=1)
             # `--resume + RoSA` is rejected upstream (where args.resume is
             # parsed) so resume_step is guaranteed to be 0 here.
             state, last = _run_steps(scan_step, warmup_n, start_step=0)
@@ -1205,9 +1227,29 @@ def main(argv: list[str] | None = None) -> int:
                             is_leaf=lambda x: x is None,
                         )
                     mask_batches.append(mb)
+                # Phase 2 boundary: mask generation runs at the end of warmup.
+                _log_rosa_phase(warmup_n, phase=2)
                 new_sparse = generate_rosa_masks(
                     state.backbone, state.adapter, mask_batches,
                     compute_dtype=compute_dtype, apply_legal=apply_legal,
+                    illegal_penalty=illegal_penalty,
+                )
+                # Realised mask density = True positions / total maskable
+                # positions across every populated delta_* leaf. Per-leaf
+                # top-k rounds to `max(1, int(density·numel))`, so the
+                # aggregate can drift slightly from `cfg.density` on tiny
+                # tensors — log the actual value rather than the request.
+                mask_on, mask_total = 0, 0
+                for _mname in (
+                    "mask_q", "mask_k", "mask_v", "mask_o",
+                    "mask_gate", "mask_up", "mask_down",
+                ):
+                    _m = getattr(new_sparse, _mname)
+                    if _m is not None:
+                        mask_on += int(np.asarray(_m).sum())
+                        mask_total += int(_m.size)
+                realised_density = (
+                    mask_on / mask_total if mask_total > 0 else 0.0
                 )
                 # Phase 3: re-init LoRA (kaiming A, zero B), install masks,
                 # flip toggles per mode (rosa keeps LoRA on; retro modes
@@ -1237,6 +1279,12 @@ def main(argv: list[str] | None = None) -> int:
                     apply_legal=apply_legal, illegal_penalty=illegal_penalty,
                 )
                 scan_step = make_adapter_scan_step(train_step)
+                # Phase 3 boundary: joint sparse(+LoRA/+bottleneck) training
+                # begins under the frozen mask. Carry the realised density so
+                # the dashboard can correlate the transition with the mask.
+                _log_rosa_phase(
+                    warmup_n, phase=3, mask_density=realised_density
+                )
                 phase3_remaining = effective_total_steps - warmup_n
                 state, _ = _run_steps(
                     scan_step, phase3_remaining, start_step=warmup_n,

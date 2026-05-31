@@ -488,30 +488,6 @@ def make_adapter_val_metrics(
 # ---------------------------------------------------------------------------
 
 
-def _mask_gen_loss(
-    backbone: PAWNModel,
-    adapter: RoSAAdapter,
-    batch: Batch,
-    compute_dtype: "jnp.dtype | None" = None,
-    apply_legal: bool = True,
-) -> Float[Array, ""]:
-    """Forward + cross-entropy with the RoSA composition active.
-
-    The mask-gen phase wants gradients on the sparse ``delta_*`` arrays
-    while every sparse mask is forced to all-True. The caller
-    constructs that adapter before invoking this; here we just run the
-    composed forward and return the loss so :func:`jax.grad` can
-    differentiate it. The legal mask is honoured when the batch carries
-    one so the gradient that selects sparse positions is taken under the
-    same legality regime training uses (shared helper in
-    :func:`pawn.trainer.apply_legal_mask`).
-    """
-    effective = rosa.apply_rosa(backbone, adapter)
-    return cross_entropy_loss(
-        effective, batch, compute_dtype=compute_dtype, apply_legal=apply_legal,
-    )
-
-
 def generate_rosa_masks(
     backbone: PAWNModel,
     adapter: RoSAAdapter,
@@ -519,6 +495,7 @@ def generate_rosa_masks(
     *,
     compute_dtype: "jnp.dtype | None" = None,
     apply_legal: bool = True,
+    illegal_penalty: float = 0.0,
 ) -> SparseAdapter:
     """Run Algorithm 1: accumulate ``|grad|^grad_alpha`` over
     ``mask_samples`` batches; top-k per delta_* by ``density``.
@@ -527,6 +504,13 @@ def generate_rosa_masks(
     fresh masks installed and deltas zeroed. The caller should slot
     this into the ``adapter.sparse`` field via :func:`eqx.tree_at`
     before entering Phase 3.
+
+    ``apply_legal`` / ``illegal_penalty`` condition the mask-gen
+    objective on the same legality regime Phase 3 trains under (v1
+    ``generate_gradient_masks``): the hard mask sends illegal columns to
+    ``-inf`` before the softmax, and ``illegal_penalty`` adds the
+    illegal-probability-mass term (only meaningful with the hard mask
+    off). Both are inert on batches without a ``legal_mask``.
     """
     if not batches:
         raise ValueError(
@@ -573,7 +557,7 @@ def generate_rosa_masks(
             effective = rosa.apply_rosa(backbone, a)
             return cross_entropy_loss(
                 effective, batch, compute_dtype=compute_dtype,
-                apply_legal=apply_legal,
+                apply_legal=apply_legal, illegal_penalty=illegal_penalty,
             )
         _, grads = eqx.filter_value_and_grad(loss_fn)(adapter_)
         return grads

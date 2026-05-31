@@ -25,6 +25,7 @@ from pawn.sweep import (
     params_to_config_json,
     suggest_lora,
     suggest_rosa,
+    suggest_rosa_retro_bottleneck,
 )
 from pawn.wandb_utils import (
     finish_wandb,
@@ -72,6 +73,26 @@ def test_suggest_rosa_includes_v1_hyperparams() -> None:
     assert "mask_samples" in params
     assert "grad_alpha" in params
     assert params["grad_alpha"] in (1, 2)
+    # `lora_targets` is part of the v1 RoSA search space — the LoRA warmup
+    # must be free to adapt a non-default projection subset.
+    assert "lora_targets" in params
+    assert params["lora_targets"] in ("qkvo", "qv", "qkv")
+
+
+def test_suggest_rosa_retro_bottleneck_sweeps_bottleneck_axes() -> None:
+    """v1 ``suggest_retro_bottleneck`` extends the shared RoSA space with the
+    Houlsby width *and* the extra-stage depth; the prior v2 code locked both
+    to their RoSAConfig defaults. Both must now appear in the search space."""
+    study = optuna.create_study()
+    params = suggest_rosa_retro_bottleneck(study.ask())
+    assert params["rosa_mode"] == "retro-bottleneck"
+    assert "bottleneck_dim" in params
+    assert params["bottleneck_dim"] in (4, 8, 16)
+    assert "bottleneck_n_hidden" in params
+    assert params["bottleneck_n_hidden"] in (0, 1, 2)
+    # The shared RoSA axes are still present (it builds on suggest_rosa).
+    assert "lora_targets" in params
+    assert "density" in params
 
 
 def test_params_to_config_json_preserves_native_types() -> None:

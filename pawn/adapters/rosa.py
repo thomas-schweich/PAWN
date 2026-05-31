@@ -67,9 +67,13 @@ class RoSAConfig:
     a user can RoSA-adapt a non-default projection set (e.g.
     ``targets="qv"`` per v1 ATTN_PRESETS) or include FFN projections.
 
-    ``bottleneck_dim`` controls the Houlsby bottleneck width when
-    ``mode="retro-bottleneck"`` (the bottleneck is unused for the other
-    two modes).
+    ``bottleneck_dim`` controls the Houlsby bottleneck width and
+    ``bottleneck_n_hidden`` the number of extra ``Linear+GELU`` stages
+    between the down and up projections when ``mode="retro-bottleneck"``
+    (both are unused for the other two modes). ``bottleneck_n_hidden``
+    forwards the v1 ``RetroBottleneckCLM(..., n_hidden=...)`` knob
+    (v1 ``adapter_training.py`` ``rosa_build_phase3``); the prior v2 code
+    locked it to 0.
 
     ``layers`` restricts every RoSA sub-adapter (LoRA, sparse, and the
     retro-bottleneck Houlsby branch) to an explicit subset of transformer
@@ -88,6 +92,7 @@ class RoSAConfig:
     sparse_targets: Literal["qkvo", "qv", "qkv"] = "qkvo"
     sparse_ffn: bool = False
     bottleneck_dim: int = 8
+    bottleneck_n_hidden: int = 0
     layers: tuple[int, ...] | None = None
 
 
@@ -139,7 +144,11 @@ def init_rosa_adapter(
     bottleneck = (
         init_bottleneck_adapter(
             backbone,
-            BottleneckConfig(dim=cfg.bottleneck_dim, layers=cfg.layers),
+            BottleneckConfig(
+                dim=cfg.bottleneck_dim,
+                n_hidden=cfg.bottleneck_n_hidden,
+                layers=cfg.layers,
+            ),
             k3,
         )
         if cfg.mode == "retro-bottleneck"

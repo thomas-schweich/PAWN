@@ -353,6 +353,144 @@ def test_train_jax_adapter_rejects_conditioning_mismatch(tmp_path) -> None:  # t
     assert result.returncode != 0, "conditioning mismatch should fail"
 
 
+def test_train_jax_adapter_rosa_logs_phase_transitions(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A RoSA run emits `rosa/phase` boundary records (1 → 2 → 3) and the
+    realised `rosa/mask_density` at the Phase-3 boundary to metrics.jsonl.
+
+    The v1 three-phase schedule was unobservable; the v2 superset surfaces
+    the phase transitions so the dashboard can mark where warmup ended and
+    the sparse mask was frozen. The config keeps `rosa_warmup_steps` below
+    `total_steps` so Phases 2 + 3 actually fire (otherwise warmup consumes
+    the whole budget and only the Phase-1 record is written).
+    """
+    import subprocess
+
+    from pawn.checkpoint import save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    ckpt_dir = tmp_path / "backbone"
+    save_model(backbone, ckpt_dir, training_state={"step": 0}, run_config={})
+
+    # `rosa_warmup_steps` has no CLI flag — set it (and the small mask-gen
+    # batch count) via a `--config` JSON so warmup < total_steps.
+    cfg_path = tmp_path / "rosa.json"
+    cfg_path.write_text(json.dumps({
+        "run_type": "adapter",
+        "strategy": "rosa",
+        "rosa_mode": "rosa",
+        "rosa_warmup_steps": 2,
+        "mask_samples": 2,
+    }))
+
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax_adapter.py",
+            "--config", str(cfg_path),
+            "--strategy", "rosa",
+            "--supernet", "tiny", "--variant", "small",
+            "--checkpoint", str(ckpt_dir),
+            "--no-pgn", "--total-steps", "4",
+            "--batch-size", "4", "--seq-len", "16", "--k", "2",
+            "--lora-rank", "2", "--density", "0.1",
+            "--log-interval", "1",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True, text=True, timeout=600, env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"RoSA run failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+    records = _read_jsonl(sorted(logs_dir.glob("*/metrics.jsonl"))[-1])
+    phases = [
+        r["rosa/phase"] for r in records if "rosa/phase" in r
+    ]
+    assert phases == [1, 2, 3], (
+        f"expected phase records [1, 2, 3] in order, got {phases}. "
+        f"stdout={result.stdout}"
+    )
+    # The Phase-3 boundary record carries the realised mask density.
+    phase3 = [r for r in records if r.get("rosa/phase") == 3]
+    assert phase3 and "rosa/mask_density" in phase3[0], (
+        "Phase-3 record missing rosa/mask_density"
+    )
+    dens = phase3[0]["rosa/mask_density"]
+    assert 0.0 < dens <= 1.0, f"mask_density out of range: {dens}"
+
+
+def test_train_jax_adapter_rosa_retro_bottleneck_end_to_end(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The `retro-bottleneck` RoSA sub-mode runs the full 3-phase schedule
+    end-to-end against a *local* backbone (no HF dependency) and writes a
+    sentinel-verified adapter checkpoint.
+
+    This pins the retro-bottleneck path as a committed, self-contained
+    smoke — the prior verification leaned on a manual command that defaulted
+    `cfg.checkpoint` to an unpublished HF repo and aborted before reaching
+    any RoSA code. Threading `bottleneck_n_hidden` through `--config` also
+    exercises the Phase-3 Houlsby stack-depth knob the prior code locked to
+    0 (`RoSAConfig.bottleneck_n_hidden`).
+    """
+    import subprocess
+
+    from pawn._sentinel import verify_sentinel
+    from pawn.checkpoint import save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    ckpt_dir = tmp_path / "backbone"
+    save_model(backbone, ckpt_dir, training_state={"step": 0}, run_config={})
+
+    # `checkpoint_interval` matches `total_steps` so the run-end save lands
+    # an `adapter_step_<final>` directory in the local-checkpoints path.
+    cfg_path = tmp_path / "rosa_rb.json"
+    cfg_path.write_text(json.dumps({
+        "run_type": "adapter",
+        "strategy": "rosa",
+        "rosa_mode": "retro-bottleneck",
+        "rosa_warmup_steps": 2,
+        "mask_samples": 2,
+        "bottleneck_dim": 4,
+        "bottleneck_n_hidden": 1,
+        "checkpoint_interval": 4,
+    }))
+
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax_adapter.py",
+            "--config", str(cfg_path),
+            "--strategy", "rosa",
+            "--supernet", "tiny", "--variant", "small",
+            "--checkpoint", str(ckpt_dir),
+            "--no-pgn", "--total-steps", "4",
+            "--batch-size", "4", "--seq-len", "16", "--k", "2",
+            "--lora-rank", "2", "--density", "0.1",
+            "--log-interval", "1",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True, text=True, timeout=600, env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"retro-bottleneck run failed:\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    # The full 1→2→3 schedule fired (not just warmup).
+    records = _read_jsonl(sorted(logs_dir.glob("*/metrics.jsonl"))[-1])
+    phases = [r["rosa/phase"] for r in records if "rosa/phase" in r]
+    assert phases == [1, 2, 3], (
+        f"expected phases [1, 2, 3], got {phases}\nstdout={result.stdout}"
+    )
+    # A sentinel-verified adapter checkpoint was written (under the run dir).
+    written = sorted(logs_dir.glob("*/adapter_step_*"))
+    assert written, f"no adapter checkpoint written; stdout={result.stdout}"
+    verify_sentinel(written[-1])  # raises on missing/mismatched sentinel
+
+
 def test_train_jax_conditioning_threaded_into_corpus(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """A `--conditioning outcome` pretrain must TRAIN under C=2, not just
     record C=2 in config.json.

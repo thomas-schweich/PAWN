@@ -45,6 +45,11 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+# RoSA retro-bottleneck extra-(Linear+GELU)-stage depth choices — matches
+# the v1 ``BOTTLENECK_N_HIDDEN_CHOICES`` search-space constant.
+BOTTLENECK_N_HIDDEN_CHOICES: tuple[int, ...] = (0, 1, 2)
+
+
 def suggest_lora(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     return {
         "lora_rank": trial.suggest_int("lora_rank", 1, 16),
@@ -97,6 +102,13 @@ def suggest_rosa(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
     return {
         "rosa_mode": "rosa",
         "lora_rank": trial.suggest_int("lora_rank", 1, 8),
+        # `lora_targets` is part of the v1 RoSA search space
+        # (``_suggest_rosa_common``): RoSA's LoRA warmup can adapt the
+        # ``qv`` / ``qkv`` projection subsets, not just the default
+        # ``qkvo``, so the sweep must be free to pick the preset.
+        "lora_targets": trial.suggest_categorical(
+            "lora_targets", ["qkvo", "qv", "qkv"]
+        ),
         "density": trial.suggest_float("density", 0.001, 0.1, log=True),
         "rosa_warmup_steps": trial.suggest_int("rosa_warmup_steps", 32, 512),
         "mask_samples": trial.suggest_int("mask_samples", 8, 64),
@@ -110,7 +122,18 @@ def suggest_rosa_retro_sparse(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]
 
 
 def suggest_rosa_retro_bottleneck(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
-    return {**suggest_rosa(trial), "rosa_mode": "retro-bottleneck"}
+    # The retro-bottleneck mode instantiates a Houlsby bottleneck in
+    # Phase 3, so (per v1 ``suggest_retro_bottleneck``) the sweep extends
+    # the shared RoSA space with the bottleneck width *and* the extra-stage
+    # depth — the prior v2 code locked both to their RoSAConfig defaults.
+    return {
+        **suggest_rosa(trial),
+        "rosa_mode": "retro-bottleneck",
+        "bottleneck_dim": trial.suggest_categorical("bottleneck_dim", [4, 8, 16]),
+        "bottleneck_n_hidden": trial.suggest_categorical(
+            "bottleneck_n_hidden", list(BOTTLENECK_N_HIDDEN_CHOICES)
+        ),
+    }
 
 
 def suggest_rosa_ratio(trial: optuna.Trial, **_kw: Any) -> dict[str, Any]:
