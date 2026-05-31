@@ -95,3 +95,6 @@ bench/results/**/*.safetensors
 /bench/results/
 /checkpoints/
 *.db
+
+# LR-sweep throwaway artifacts (metrics + per-trial final checkpoints)
+logs/lr_sweep/
