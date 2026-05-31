@@ -756,6 +756,547 @@ def test_extract_probe_dataset_labels_match_engine_board() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Probe regression path (MSE / R² / MAE) + best-accuracy tracking
+# ---------------------------------------------------------------------------
+
+
+def test_fit_probe_mse_reports_r2_and_mae_on_linear_target() -> None:
+    """The MSE-regression probe path (probes-regression-mse-r2-mae): a probe
+    fit on a noise-free linear target must recover it — held-out R² ≈ 1 and
+    MAE ≈ 0 — and the result must carry both. A cross-entropy head can't
+    produce these, so this pins the regression objective + scoring."""
+    rng = np.random.default_rng(0)
+    n, d = 400, 16
+    x = rng.normal(size=(n, d)).astype("float32")
+    w_true = rng.normal(size=(d, 1)).astype("float32")
+    # Single-output regression target — perfectly linear in the features.
+    y = (x @ w_true).astype("float32")  # (n, 1)
+    cfg = ProbeConfig(
+        n_classes=1, lr=5e-2, n_epochs=200, batch_size=64,
+        val_frac=0.25, loss_type="mse",
+    )
+    result = fit_probe(jnp.asarray(x), jnp.asarray(y), cfg, key=0)
+    assert result.n_val > 0
+    # `accuracy` is the held-out R² for mse probes; a recovered linear map
+    # drives it to ≈ 1.0.
+    assert result.accuracy > 0.95, f"R² too low: {result.accuracy}"
+    # MAE must be populated for regression probes and be small.
+    assert result.mae is not None
+    assert result.mae < 0.2
+    # The loss is the held-out MSE — small for a recovered target.
+    assert result.loss < 0.1
+
+
+def test_fit_probe_multi_output_mse_target() -> None:
+    """Regression probes support multi-output targets (e.g. material_count's
+    10 outputs): `n_classes` is the head width and labels are (N, n_classes)
+    floats."""
+    rng = np.random.default_rng(1)
+    n, d, k = 300, 12, 4
+    x = rng.normal(size=(n, d)).astype("float32")
+    w_true = rng.normal(size=(d, k)).astype("float32")
+    y = (x @ w_true).astype("float32")  # (n, k)
+    cfg = ProbeConfig(
+        n_classes=k, lr=5e-2, n_epochs=200, batch_size=64,
+        val_frac=0.25, loss_type="mse",
+    )
+    result = fit_probe(jnp.asarray(x), jnp.asarray(y), cfg, key=0)
+    assert result.weight.shape == (d, k)
+    assert result.accuracy > 0.9  # multi-output R²
+    assert result.mae is not None
+
+
+def test_fit_probe_tracks_best_accuracy_across_epochs() -> None:
+    """best_accuracy is the across-epoch best, not just the final epoch
+    (probes-no-best-accuracy-tracking). It must be defined, ≥ the final-epoch
+    accuracy on separable data, and within [0, 1]."""
+    rng = np.random.default_rng(0)
+    n_per_class, d, n_classes = 64, 32, 3
+    means = rng.normal(size=(n_classes, d)) * 2.0
+    hidden, labels = [], []
+    for c in range(n_classes):
+        hidden.append(means[c] + rng.normal(size=(n_per_class, d)) * 0.3)
+        labels.extend([c] * n_per_class)
+    x = jnp.asarray(np.concatenate(hidden, axis=0), dtype=jnp.float32)
+    y = jnp.asarray(labels, dtype=jnp.int32)
+    cfg = ProbeConfig(n_classes=n_classes, lr=1e-2, n_epochs=12, batch_size=32,
+                      val_frac=0.25)
+    result = fit_probe(x, y, cfg, key=0)
+    # best_accuracy must be a real number (not the 0.0 default), bounded in
+    # [0, 1], and at least as good as the final-epoch held-out accuracy.
+    assert 0.0 <= result.best_accuracy <= 1.0
+    assert result.best_accuracy >= result.accuracy - 1e-6
+
+
+def test_fit_probe_explicit_val_pool_scores_on_separate_data() -> None:
+    """The --n-val-games path: when an explicit val pool is supplied,
+    fit_probe trains on the whole `hidden_states` pool and scores on the
+    independent val pool (probes-cli-flags)."""
+    rng = np.random.default_rng(0)
+    n_per_class, d, n_classes = 48, 24, 2
+    means = rng.normal(size=(n_classes, d)) * 2.0
+
+    def _make(n: int) -> tuple[Array, Array]:
+        h, lab = [], []
+        for c in range(n_classes):
+            h.append(means[c] + rng.normal(size=(n, d)) * 0.3)
+            lab.extend([c] * n)
+        return (
+            jnp.asarray(np.concatenate(h, axis=0), dtype=jnp.float32),
+            jnp.asarray(lab, dtype=jnp.int32),
+        )
+
+    x_tr, y_tr = _make(n_per_class)
+    x_val, y_val = _make(16)
+    cfg = ProbeConfig(n_classes=n_classes, lr=1e-2, n_epochs=15, batch_size=32)
+    result = fit_probe(
+        x_tr, y_tr, cfg, key=0,
+        val_hidden_states=x_val, val_labels=y_val,
+    )
+    # n_val is the SEPARATE pool size, and the whole train pool was used for
+    # training (no within-pool carve).
+    assert result.n_val == int(x_val.shape[0])
+    assert result.n_train == int(x_tr.shape[0])
+    assert result.accuracy > 0.9
+
+
+def test_fit_probe_requires_val_pool_args_together() -> None:
+    """fit_probe rejects a half-supplied explicit val pool: passing
+    val_hidden_states without val_labels (or vice versa) raises rather than
+    crashing later inside jnp.asarray(None)."""
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.normal(size=(32, 8)), dtype=jnp.float32)
+    y = jnp.asarray(rng.integers(0, 2, size=32), dtype=jnp.int32)
+    x_val = jnp.asarray(rng.normal(size=(8, 8)), dtype=jnp.float32)
+    cfg = ProbeConfig(n_classes=2, lr=1e-2, n_epochs=2, batch_size=16)
+    with pytest.raises(ValueError, match="supplied together"):
+        fit_probe(x, y, cfg, key=0, val_hidden_states=x_val)
+    with pytest.raises(ValueError, match="supplied together"):
+        fit_probe(x, y, cfg, key=0, val_labels=y)
+
+
+def test_run_layer_probes_requires_val_pool_args_together() -> None:
+    """run_layer_probes mirrors fit_probe's guard: a half-supplied explicit
+    val game pool (val_move_ids without val_game_lengths, or vice versa) must
+    raise rather than silently falling back to within-pool splitting and
+    reporting a misleading n_val. The guard fires before any backbone forward,
+    so no engine games or extraction are needed for either branch."""
+    from pawn.probes import run_layer_probes, side_to_move_labeler
+
+    model = init_model(TINY_SUPERNET, key=0)
+    import chess_engine as engine
+
+    move_ids, game_lengths, _ = engine.generate_random_games(8, 20, 11)
+    with pytest.raises(ValueError, match="supplied together"):
+        run_layer_probes(
+            model, move_ids, game_lengths,
+            n_classes=2, labeler=side_to_move_labeler,
+            n_epochs=1, val_move_ids=move_ids, key=0,
+        )
+    with pytest.raises(ValueError, match="supplied together"):
+        run_layer_probes(
+            model, move_ids, game_lengths,
+            n_classes=2, labeler=side_to_move_labeler,
+            n_epochs=1, val_game_lengths=game_lengths, key=0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Probe-feature coverage (the restored v1 suite)
+# ---------------------------------------------------------------------------
+
+
+def test_probe_features_registry_covers_v1_suite() -> None:
+    """PROBE_FEATURES must restore every v1 probe type
+    (probes-probe-feature-coverage): the carried-over classification probes
+    plus the three MSE-regression probes, with the right loss types."""
+    from pawn.probes import PROBE_FEATURES
+
+    expected_loss = {
+        "side_to_move": "ce",
+        "occupancy": "ce",
+        "piece_type": "ce",
+        "piece_type_all": "ce_per_square",
+        "is_check": "ce",
+        "castling_rights": "ce",
+        "ep_square": "ce",
+        "game_phase": "ce",
+        "material_count": "mse",
+        "legal_move_count": "mse",
+        "halfmove_clock": "mse",
+    }
+    assert set(PROBE_FEATURES) == set(expected_loss)
+    for name, loss in expected_loss.items():
+        assert PROBE_FEATURES[name].loss_type == loss
+    # Exactly the legal_move_count probe reads the appended legal-count array.
+    assert PROBE_FEATURES["legal_move_count"].needs_legal_counts is True
+    assert all(
+        not PROBE_FEATURES[n].needs_legal_counts
+        for n in PROBE_FEATURES if n != "legal_move_count"
+    )
+
+
+def test_new_labelers_match_engine_board_states() -> None:
+    """Each restored labeler must read the engine's ground-truth board state
+    arrays at the right index and shape (probes-probe-feature-coverage)."""
+    import chess_engine as engine
+
+    from pawn.probes import (
+        castling_rights_labeler,
+        ep_square_labeler,
+        game_phase_labeler,
+        halfmove_clock_labeler,
+        is_check_labeler,
+        material_count_labeler,
+        piece_type_all_squares_labeler,
+    )
+
+    move_ids, game_lengths, _ = engine.generate_random_games(12, 24, 3)
+    states = engine.extract_board_states(
+        np.ascontiguousarray(move_ids, dtype=np.int16),
+        np.asarray(game_lengths, dtype=np.int16),
+    )
+    # Supervise every (game, ply) with t+1 < game_length, mirroring the
+    # dataset's index construction.
+    gl = np.asarray(game_lengths, dtype=np.int64)
+    g_list, p_list = [], []
+    for g in range(len(gl)):
+        usable = int(gl[g]) - 1
+        if usable <= 0:
+            continue
+        t = np.arange(usable, dtype=np.int64)
+        g_list.append(np.full(usable, g, dtype=np.int64))
+        p_list.append(t + 1)
+    g_idx = np.concatenate(g_list)
+    p_idx = np.concatenate(p_list)
+    m = g_idx.shape[0]
+
+    # is_check — 2-class, drawn from states[4].
+    chk, n_chk = is_check_labeler(states, g_idx, p_idx)
+    assert n_chk == 2 and chk.shape == (m,)
+    np.testing.assert_array_equal(
+        chk, np.asarray(states[4])[g_idx, p_idx].astype(np.int64)
+    )
+
+    # castling_rights — 16-class joint bitmask from states[2].
+    cas, n_cas = castling_rights_labeler(states, g_idx, p_idx)
+    assert n_cas == 16
+    assert cas.min() >= 0 and cas.max() <= 15
+    np.testing.assert_array_equal(
+        cas, (np.asarray(states[2])[g_idx, p_idx] & 0xF).astype(np.int64)
+    )
+
+    # ep_square — 65 classes, none mapped to 64 (states[3], <0 = none).
+    ep, n_ep = ep_square_labeler(states, g_idx, p_idx)
+    assert n_ep == 65 and ep.min() >= 0 and ep.max() <= 64
+    raw_ep = np.asarray(states[3])[g_idx, p_idx]
+    np.testing.assert_array_equal(ep, np.where(raw_ep < 0, 64, raw_ep))
+
+    # halfmove_clock — float regression target (states[5]).
+    hmc, n_hmc = halfmove_clock_labeler(states, g_idx, p_idx)
+    assert n_hmc == 1 and hmc.shape == (m, 1)
+    assert np.issubdtype(hmc.dtype, np.floating)
+
+    # material_count — 10 float outputs counting per-type per-colour pieces.
+    mat, n_mat = material_count_labeler(states, g_idx, p_idx)
+    assert n_mat == 10 and mat.shape == (m, 10)
+    # White-pawn count (index 0) recomputed independently from the boards.
+    boards = np.asarray(states[0])
+    flat = boards[g_idx, p_idx].reshape(m, 64)
+    np.testing.assert_array_equal(
+        mat[:, 0], (flat == 1).sum(axis=1).astype(np.float32)
+    )
+
+    # game_phase — 3 classes (opening/middle/endgame).
+    phase, n_phase = game_phase_labeler(states, g_idx, p_idx)
+    assert n_phase == 3 and set(np.unique(phase).tolist()) <= {0, 1, 2}
+
+    # piece_type_all — (m, 64) of 13-class codes; head width 13*64.
+    pta, n_pta = piece_type_all_squares_labeler(states, g_idx, p_idx)
+    assert n_pta == 13 * 64 and pta.shape == (m, 64)
+    assert pta.min() >= 0 and pta.max() <= 12
+    np.testing.assert_array_equal(pta, flat.astype(np.int64))
+
+
+def test_count_legal_moves_per_ply_positive_for_real_positions() -> None:
+    """count_legal_moves_per_ply (legal_move_count probe support) must return
+    one count per (game, ply) and be strictly positive for the opening (every
+    legal random game starts with 20 legal moves)."""
+    import chess_engine as engine
+
+    from pawn.probes import count_legal_moves_per_ply
+
+    move_ids, game_lengths, _ = engine.generate_random_games(6, 20, 0)
+    counts = count_legal_moves_per_ply(move_ids, game_lengths)
+    assert counts.shape == np.asarray(move_ids).shape
+    # The opening position (ply 0) has exactly 20 legal moves in standard
+    # chess — a tight pin on the counting contract.
+    assert int(counts[0, 0]) == 20
+    # Every in-game ply has at least one legal move (the game continued).
+    gl = np.asarray(game_lengths)
+    for g in range(len(gl)):
+        for p in range(int(gl[g])):
+            assert int(counts[g, p]) >= 1
+
+
+def test_run_layer_probes_material_count_regression_end_to_end() -> None:
+    """End-to-end MSE-regression probe: forward the frozen model, label
+    material_count, and fit a per-layer regression probe. R² must be defined
+    and the result must carry MAE (probes-regression-mse-r2-mae)."""
+    from pawn.probes import material_count_labeler, run_layer_probes
+
+    model = init_model(TINY_SUPERNET, key=0)
+    import chess_engine as engine
+
+    move_ids, game_lengths, _ = engine.generate_random_games(64, 30, 7)
+    results = run_layer_probes(
+        model, move_ids, game_lengths,
+        n_classes=10, labeler=material_count_labeler, loss_type="mse",
+        n_epochs=12, val_frac=0.25, key=0,
+    )
+    assert set(results.keys()) == set(range(TINY_SUPERNET.n_layers + 1))
+    for r in results.values():
+        assert r.n_val > 0
+        assert r.mae is not None  # regression → MAE populated
+        # R² is bounded above by 1.0 (it can be negative for a bad fit).
+        assert r.accuracy <= 1.0 + 1e-6
+
+
+def test_run_layer_probes_legal_move_count_needs_legal_counts() -> None:
+    """The legal_move_count regression probe runs end-to-end only when
+    needs_legal_counts threads the engine legal-count array into the labeler
+    (states[6]); without it the labeler would IndexError."""
+    from pawn.probes import legal_move_count_labeler, run_layer_probes
+
+    model = init_model(TINY_SUPERNET, key=0)
+    import chess_engine as engine
+
+    move_ids, game_lengths, _ = engine.generate_random_games(48, 30, 9)
+    results = run_layer_probes(
+        model, move_ids, game_lengths,
+        n_classes=1, labeler=legal_move_count_labeler, loss_type="mse",
+        n_epochs=8, val_frac=0.25, needs_legal_counts=True, key=0,
+    )
+    assert len(results) == TINY_SUPERNET.n_layers + 1
+    for r in results.values():
+        assert r.n_val > 0
+        assert r.mae is not None
+
+
+def test_extract_probe_dataset_empty_pool_matches_labeler_shape() -> None:
+    """Degenerate pool guard: when every game is too short to supervise any
+    position (game_length <= 1, so no t+1 successor board exists), the
+    extractor must still return empty labels whose shape/dtype match the
+    labeler's real output — (0, k) float32 for an mse probe, not a (0,) int
+    fallback. The previous hard-coded `(0,)` int tensor broadcast to a `nan`
+    val_loss inside fit_probe for regression probes."""
+    from pawn.probes import (
+        _extract_all_layers_probe_dataset,
+        material_count_labeler,
+    )
+
+    import chess_engine as engine
+
+    model = init_model(TINY_SUPERNET, key=0)
+    # Real games (so engine replay sees legal moves), but every length forced
+    # to 1 → usable = gl - 1 = 0 → no supervised positions.
+    move_ids, _gl, _ = engine.generate_random_games(4, 6, 0)
+    game_lengths = np.ones((4,), dtype=np.int16)
+    feats, labels = _extract_all_layers_probe_dataset(
+        model, move_ids, game_lengths, labeler=material_count_labeler,
+    )
+    n_layers_plus = TINY_SUPERNET.n_layers + 1
+    assert feats.shape == (n_layers_plus, 0, TINY_SUPERNET.d_model)
+    # material_count is a 10-output regression probe: the empty labels must be
+    # (0, 10) float32, the shape fit_probe's mse loss/score expect.
+    assert labels.shape == (0, 10)
+    assert jnp.issubdtype(labels.dtype, jnp.floating)
+
+
+def test_run_layer_probes_empty_pool_reports_finite_loss() -> None:
+    """End-to-end nan guard (gate fix): a regression probe over a pool whose
+    games are all too short to supervise must report a finite (non-nan) loss
+    and a zeroed score, not nan. This exercises the empty-batch guard in
+    `_probe_loss` together with the labeler-shaped empty labels."""
+    import math
+
+    import chess_engine as engine
+
+    from pawn.probes import legal_move_count_labeler, run_layer_probes
+
+    model = init_model(TINY_SUPERNET, key=0)
+    move_ids, _gl, _ = engine.generate_random_games(4, 6, 0)
+    game_lengths = np.ones((4,), dtype=np.int16)
+    results = run_layer_probes(
+        model, move_ids, game_lengths,
+        n_classes=1, labeler=legal_move_count_labeler, loss_type="mse",
+        n_epochs=3, val_frac=0.25, needs_legal_counts=True, key=0,
+    )
+    assert results  # one ProbeResult per layer
+    for r in results.values():
+        assert r.n_train == 0 and r.n_val == 0
+        assert not math.isnan(r.loss), "empty-pool mse probe leaked a nan loss"
+        assert r.loss == 0.0
+        assert not math.isnan(r.accuracy)
+        assert r.mae is not None and not math.isnan(r.mae)
+
+
+# ---------------------------------------------------------------------------
+# eval_probes_jax.py script — end-to-end JSON output schema
+# ---------------------------------------------------------------------------
+
+
+def _load_eval_probes_jax():  # type: ignore[no-untyped-def]
+    """Load scripts/eval_probes_jax.py as a module (no package __init__)."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "scripts_eval_probes_jax", Path("scripts") / "eval_probes_jax.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_eval_probes_jax_main_output_schema(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """End-to-end schema test for the probe CLI (probes-output-schema-diverged,
+    probes-script-output-schema-test-gap): run main() on a freshly-saved
+    checkpoint and assert the v1-parity top-level keys + per-layer schema."""
+    import json
+
+    from pawn.checkpoint import save_model
+
+    ep = _load_eval_probes_jax()
+
+    model = init_model(TINY_SUPERNET, key=0)
+    ckpt_dir = tmp_path / "step_00000001"
+    save_model(model, ckpt_dir, run_config={"conditioning": [], "step": 1})
+
+    out = tmp_path / "probes.json"
+    rc = ep.main([
+        "--checkpoint", str(ckpt_dir),
+        "--feature", "side_to_move",
+        "--n-games", "24", "--max-ply", "20",
+        "--n-epochs", "3", "--output", str(out),
+    ])
+    assert rc == 0
+    payload = json.loads(out.read_text())
+    # v1-parity top-level keys.
+    for key in ("run", "checkpoint", "step", "variant", "model_config",
+                "probes", "probe_accuracy"):
+        assert key in payload, f"missing top-level key {key!r}"
+    assert payload["model_config"]["d_model"] == TINY_SUPERNET.d_model
+    # Per-feature → per-layer schema.
+    assert "side_to_move" in payload["probes"]
+    feat = payload["probes"]["side_to_move"]
+    assert feat["loss_type"] == "ce"
+    layers = feat["layers"]
+    assert layers  # at least one layer reported
+    # v1-parity layer key names: `embed` then `layer_0`..`layer_{n_layers-1}`
+    # (NOT v2's internal `layer_1`..`layer_{n_layers}`). TINY_SUPERNET has
+    # 4 layers, so the full set must be embed + layer_0..layer_3 — any drift
+    # to 1-based names would break downstream parsers keyed on v1 names.
+    expected_layer_names = {"embed"} | {
+        f"layer_{i}" for i in range(TINY_SUPERNET.n_layers)
+    }
+    assert set(layers.keys()) == expected_layer_names, (
+        f"layer names {sorted(layers.keys())} != v1-parity "
+        f"{sorted(expected_layer_names)}"
+    )
+    # `best_layer` must also be a v1-parity name, not an int index.
+    assert feat["best_layer"] in expected_layer_names
+    for lname, metrics in layers.items():
+        for mk in ("val_accuracy", "accuracy", "best_accuracy", "loss",
+                   "n_train", "n_val"):
+            assert mk in metrics, f"layer {lname} missing {mk!r}"
+
+
+def test_eval_probes_jax_main_all_features_includes_regression(
+    tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """--all-features runs the whole suite, and regression features emit a
+    `loss_type: mse` block with an `mae` per layer (probes-output-schema /
+    probes-run-evals-backbone-single-feature)."""
+    import json
+
+    from pawn.checkpoint import save_model
+
+    ep = _load_eval_probes_jax()
+
+    model = init_model(TINY_SUPERNET, key=0)
+    ckpt_dir = tmp_path / "step_00000001"
+    save_model(model, ckpt_dir, run_config={"conditioning": []})
+
+    out = tmp_path / "probes.json"
+    rc = ep.main([
+        "--checkpoint", str(ckpt_dir), "--all-features",
+        "--n-games", "24", "--max-ply", "20",
+        "--n-epochs", "3", "--output", str(out),
+    ])
+    assert rc == 0
+    payload = json.loads(out.read_text())
+    probes = payload["probes"]
+    # The full v1 suite is present.
+    assert {"side_to_move", "material_count", "legal_move_count",
+            "halfmove_clock", "is_check", "castling_rights",
+            "ep_square", "game_phase"} <= set(probes)
+    # Regression probe carries mse loss_type + per-layer MAE.
+    mat = probes["material_count"]
+    assert mat["loss_type"] == "mse"
+    for metrics in mat["layers"].values():
+        assert "mae" in metrics
+
+
+def _load_eval_probes_wrapper():  # type: ignore[no-untyped-def]
+    """Load scripts/eval_probes.py (the v1 compat wrapper) as a module."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "scripts_eval_probes_wrapper", Path("scripts") / "eval_probes.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_eval_probes_wrapper_log_dir_scan(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The v1 compat wrapper's --log-dir scan (probes-compat-wrapper-breaks-
+    log-dir-mode): it must discover the latest checkpoint per run dir, run the
+    v2 probe script, and write a v1-schema probe_results.json (with the scan's
+    run/step fields stamped) into each run dir."""
+    import json
+
+    from pawn.checkpoint import save_model
+
+    wrapper = _load_eval_probes_wrapper()
+
+    log_dir = tmp_path / "logs"
+    run_dir = log_dir / "run_demo"
+    run_dir.mkdir(parents=True)
+    model = init_model(TINY_SUPERNET, key=0)
+    # Two checkpoints — the scan must select the latest (highest step).
+    save_model(model, run_dir / "step_00000005", run_config={"conditioning": []})
+    save_model(model, run_dir / "step_00000010", run_config={"conditioning": []})
+
+    rc = wrapper.main([
+        "--log-dir", str(log_dir),
+        "--n-games", "16", "--max-ply", "16", "--n-epochs", "2",
+    ])
+    assert rc == 0
+    out = run_dir / "probe_results.json"
+    assert out.is_file(), "scan did not write probe_results.json"
+    payload = json.loads(out.read_text())
+    # The scan stamps the v1-schema run/step fields it owns.
+    assert payload["run"] == "run_demo"
+    assert payload["step"] == 10  # latest checkpoint selected
+    assert "probes" in payload and "side_to_move" in payload["probes"]
+
+
+# ---------------------------------------------------------------------------
 # Elo-stratified accuracy
 # ---------------------------------------------------------------------------
 

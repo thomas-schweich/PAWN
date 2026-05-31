@@ -18,19 +18,33 @@ from pathlib import Path
 
 def _is_real_probe_payload(payload: object) -> bool:
     """True when a probes.json carries genuine per-layer held-out probe
-    output (H6) — a ``layers`` map with at least one entry that reports a
-    held-out split (``n_val > 0``). Guards against emitting a placeholder
-    or partial probe result into the aggregated eval bundle.
+    output (H6) — at least one feature's ``layers`` map has an entry that
+    reports a held-out split (``n_val > 0``). Guards against emitting a
+    placeholder or partial probe result into the aggregated eval bundle.
+
+    The v2 probe payload nests per-layer metrics under
+    ``probes[feature]["layers"]`` (a suite of features), so we scan every
+    feature's layer map.
     """
     if not isinstance(payload, dict):
         return False
-    layers = payload.get("layers")
-    if not isinstance(layers, dict) or not layers:
+    probes = payload.get("probes")
+    if not isinstance(probes, dict) or not probes:
         return False
-    return any(
-        isinstance(v, dict) and isinstance(v.get("n_val"), int) and v["n_val"] > 0
-        for v in layers.values()
-    )
+    for feat in probes.values():
+        if not isinstance(feat, dict):
+            continue
+        layers = feat.get("layers")
+        if not isinstance(layers, dict):
+            continue
+        if any(
+            isinstance(v, dict)
+            and isinstance(v.get("n_val"), int)
+            and v["n_val"] > 0
+            for v in layers.values()
+        ):
+            return True
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -63,9 +77,12 @@ def main(argv: list[str] | None = None) -> int:
         # file (subprocess failure) leaves the key absent rather than
         # emitting placeholder noise.
         prob_path = cdir / "probes.json"
+        # Probe the full feature suite (side_to_move, occupancy, piece_type,
+        # is_check, castling_rights, ep_square, game_phase + the MSE
+        # regression probes), not just side_to_move — v1 parity.
         subprocess.run(
             [sys.executable, "scripts/eval_probes_jax.py",
-             "--checkpoint", ckpt, "--output", str(prob_path)],
+             "--checkpoint", ckpt, "--all-features", "--output", str(prob_path)],
             check=False,
         )
         if prob_path.exists():
