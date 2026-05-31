@@ -1026,6 +1026,13 @@ class DistillConfig(BaseRunConfig):
 
     # --- Cadence -------------------------------------------------------
     checkpoint_interval: int = 5000
+    # (B2) micro-batches accumulated per optimizer step. >1 emits
+    # ``(K, N, B, T)`` chunks so the distill trainer's accumulation scan
+    # sums N micro-grads before each update — effective batch N×B at B's
+    # per-step memory cost. Mirrors PretrainConfig.accumulation_steps so the
+    # distill trainer reaches the same effective-batch knob the other
+    # trainers expose. Default 1 (no accumulation).
+    accumulation_steps: int = 1
 
     @model_validator(mode="after")
     def _check_distill(self) -> "DistillConfig":
@@ -1033,6 +1040,11 @@ class DistillConfig(BaseRunConfig):
             raise ValueError(
                 "DistillConfig requires total_steps; pass --total-steps N "
                 "or set it in the JSON config"
+            )
+        if self.accumulation_steps <= 0:
+            raise ValueError(
+                f"accumulation_steps must be positive, got "
+                f"{self.accumulation_steps}"
             )
         if self.objective in ("kl", "mix") and self.temperature <= 0:
             raise ValueError(

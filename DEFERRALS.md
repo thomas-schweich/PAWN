@@ -23,6 +23,38 @@ These v1 surfaces are intentionally absent from v2 and will not return:
   replaces multi-variant cotraining; pretrain the supernet, then
   slice the three variants at publish time. Plan §6 documents the
   removal.
+
+  ### Cotrain per-model (per-variant) early stopping
+  **Section:** distill (T2-core-training workstream; uncommitted)
+  **Reason:** nonsensical — v1 cotrain ran N independent `ModelSlot`s,
+  each with its own optimizer + val loop + patience counter, so a
+  variant whose val loss plateaued could be frozen while its siblings
+  kept training (`git show main:pawn/cotrain.py` per-slot
+  `patience_counter` / `evaluate`). v2 has no `ModelSlot`: the supernet
+  is **one** weight tensor and `pawn.trainer.supernet_joint_loss` sums
+  every selected variant's cross-entropy into a single scalar that one
+  optimizer minimises (gradients accumulate into the shared tensor).
+  There is no per-variant parameter set to freeze independently — the
+  small/base/large slices are nested `[:d_V, :d_V]` views of the same
+  array, so "stop training base but keep training large" is not
+  expressible (freezing the inner slice would freeze the corresponding
+  region of large too). Per-variant patience is therefore not a feature
+  that has a v2 home; it died with the slot abstraction it was built on.
+  **What was supposed to happen:** v1's cotrain loop early-stopped each
+  model slot independently on its own held-out val loss.
+  **What I did instead:** the v2 pretrain loop early-stops the **whole**
+  supernet on a single compound patience signal (best val loss + best
+  late-game legality across the trained variants), which is the only
+  early-stop semantics the shared-tensor design admits
+  (`scripts/train_jax.py::_run_validation`, pinned by
+  `tests/scripts/test_train_jax_smoke.py::test_train_jax_patience_early_stops`).
+  Distillation (the net-new v2 trainer this workstream touches) trains a
+  single standalone student, so per-variant patience is doubly
+  inapplicable there.
+  **To revisit when:** never under the supernet design. If a future v2
+  direction reintroduces genuinely-independent multi-model training (not
+  nested slices of one tensor), per-model patience would be reconsidered
+  alongside that — but that would be a new feature, not a parity port.
 - **Torch-specific GPU init** (`tests/core/test_gpu.py`). JAX
   manages its own device detection via `jax.default_backend()`;
   `pawn.logging._query_jax_memory_stats` (parity #7) is the v2

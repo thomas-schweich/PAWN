@@ -750,6 +750,315 @@ def test_train_jax_distill_rejects_conditioning_mismatch(tmp_path) -> None:  # t
     assert result.returncode != 0, "conditioning mismatch should fail"
 
 
+def _make_tiny_teacher(tmp_path: Path) -> Path:
+    """Save a tiny loadable v2 teacher checkpoint (C=1) under ``tmp_path``."""
+    from pawn.checkpoint import save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    teacher = init_model(TINY_SUPERNET, key=0)
+    teacher_dir = tmp_path / "teacher"
+    save_model(teacher, teacher_dir, training_state={"step": 0}, run_config={})
+    return teacher_dir
+
+
+def test_train_jax_distill_resume_continues_run(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """distill-missing-resume: `--resume <distill_step_N>` continues the run
+    rather than discarding progress.
+
+    Runs a 2-step distillation, then resumes from its checkpoint to
+    total_steps=4 and asserts: (a) rc == 0, (b) the resumed run's
+    `training_state.json` carries step 4 (the loop began at 2 and ran 2 more,
+    i.e. it did NOT restart from 0), and (c) the resumed checkpoint
+    round-trips through `load_model`. Without the resume wiring the run
+    silently restarted from step 0 despite the saved resumable artifacts.
+    """
+    import json as _json
+    import subprocess
+
+    from pawn.checkpoint import load_model
+
+    teacher_dir = _make_tiny_teacher(tmp_path)
+    logs1 = tmp_path / "logs1"
+    cmd = [
+        sys.executable, "scripts/train_jax_distill.py",
+        "--distill-from", str(teacher_dir),
+        "--student-supernet", "tiny",
+        "--no-pgn", "--objective", "mix",
+        "--batch-size", "4", "--seq-len", "32", "--k", "1",
+        "--checkpoint-interval", "2", "--log-interval", "1",
+        "--local-checkpoints", "--lr", "1e-3",
+    ]
+    r1 = subprocess.run(
+        [*cmd, "--total-steps", "2", "--logs-dir", str(logs1)],
+        capture_output=True, text=True, timeout=300, env=_subprocess_env(),
+    )
+    assert r1.returncode == 0, (
+        f"initial distill run failed:\nstdout={r1.stdout}\nstderr={r1.stderr}"
+    )
+    ckpts1 = sorted(logs1.glob("*/distill_step_*"))
+    assert ckpts1, f"no step-2 checkpoint under {logs1}"
+    resume_from = ckpts1[-1]
+    # The first run's checkpoint carries step 2.
+    ts1 = _json.loads(
+        (resume_from / "training_state.json").read_text()
+    )
+    assert int(ts1["step"]) == 2, f"expected step 2, got {ts1['step']}"
+
+    logs2 = tmp_path / "logs2"
+    r2 = subprocess.run(
+        [
+            *cmd, "--total-steps", "4", "--logs-dir", str(logs2),
+            "--resume", str(resume_from),
+        ],
+        capture_output=True, text=True, timeout=300, env=_subprocess_env(),
+    )
+    assert r2.returncode == 0, (
+        f"resumed distill run failed:\nstdout={r2.stdout}\nstderr={r2.stderr}"
+    )
+    ckpts2 = sorted(logs2.glob("*/distill_step_*"))
+    assert ckpts2, (
+        f"no checkpoint under the resumed run dir {logs2}; "
+        f"stdout={r2.stdout}\nstderr={r2.stderr}"
+    )
+    # The resumed run reached step 4 (began at 2, ran 2 more — did NOT
+    # restart from 0, which would have stopped at step 2).
+    final_ckpt = ckpts2[-1]
+    assert final_ckpt.name == "distill_step_00000004", (
+        f"resumed run did not reach step 4; checkpoints: "
+        f"{[c.name for c in ckpts2]}"
+    )
+    ts2 = _json.loads((final_ckpt / "training_state.json").read_text())
+    assert int(ts2["step"]) == 4, f"expected resumed step 4, got {ts2['step']}"
+    _student, run_block = load_model(final_ckpt)
+    assert run_block is not None
+    assert run_block.get("run_type") == "distill"
+
+
+def test_train_jax_distill_rejects_resume_without_training_state(  # type: ignore[no-untyped-def]
+    tmp_path,
+) -> None:
+    """distill-missing-resume guard: `--resume` against a dir missing
+    `training_state.json` fails loudly (the sidecar carries the step counter
+    and is load-bearing for the resume contract). Parity with the adapter
+    resume guard."""
+    import subprocess
+
+    teacher_dir = _make_tiny_teacher(tmp_path)
+    fake_ckpt = tmp_path / "no_training_state"
+    fake_ckpt.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax_distill.py",
+            "--distill-from", str(teacher_dir),
+            "--student-supernet", "tiny", "--no-pgn",
+            "--total-steps", "2", "--batch-size", "4", "--seq-len", "32",
+            "--k", "1", "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(tmp_path / "logs"),
+            "--resume", str(fake_ckpt),
+        ],
+        capture_output=True, text=True, timeout=300, env=_subprocess_env(),
+    )
+    combined = result.stdout + result.stderr
+    assert "--resume requires" in combined and "training_state.json" in combined, (
+        f"expected the resume training-state guard; got "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.returncode != 0, "resume without training_state should fail"
+
+
+def test_train_jax_distill_writes_schedule_health(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """distill-missing-schedule-health: the distill trainer writes
+    `schedule_health.json` at exit, recording the planned-vs-actual step
+    counts + `reason_for_stop` (parity with train_jax / train_jax_adapter).
+    """
+    import json as _json
+    import subprocess
+
+    teacher_dir = _make_tiny_teacher(tmp_path)
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax_distill.py",
+            "--distill-from", str(teacher_dir),
+            "--student-supernet", "tiny", "--no-pgn", "--objective", "mix",
+            "--total-steps", "4", "--batch-size", "4", "--seq-len", "32",
+            "--k", "2", "--checkpoint-interval", "2", "--log-interval", "1",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True, text=True, timeout=300, env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"distill run failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+    health = sorted(logs_dir.glob("*/schedule_health.json"))
+    assert health, (
+        f"no schedule_health.json under {logs_dir}; "
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    payload = _json.loads(health[-1].read_text())
+    assert payload["planned_total_steps"] == 4
+    assert payload["actual_total_steps"] == 4
+    assert payload["reason_for_stop"] == "completed"
+
+
+def test_train_jax_distill_wandb_flag_wires_mirror(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """distill-missing-wandb: `--wandb` reaches the init/finish mirror path
+    without crashing (run under PAWN_WANDB_MODE=disabled so no real W&B run is
+    created). Parity with the train_jax / adapter `--wandb` wiring — the
+    distill entry point previously had no W&B flag at all.
+    """
+    import subprocess
+
+    teacher_dir = _make_tiny_teacher(tmp_path)
+    logs_dir = tmp_path / "logs"
+    env = _subprocess_env()
+    env["PAWN_WANDB_MODE"] = "disabled"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax_distill.py",
+            "--distill-from", str(teacher_dir),
+            "--student-supernet", "tiny", "--no-pgn", "--objective", "mix",
+            "--total-steps", "2", "--batch-size", "4", "--seq-len", "32",
+            "--k", "1", "--checkpoint-interval", "2", "--log-interval", "1",
+            "--local-checkpoints", "--lr", "1e-3", "--wandb",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True, text=True, timeout=300, env=env,
+    )
+    assert result.returncode == 0, (
+        f"distill --wandb run failed:\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    # The run still produced its student checkpoint — the wandb wiring didn't
+    # short-circuit training.
+    assert sorted(logs_dir.glob("*/distill_step_*")), (
+        f"no checkpoint under {logs_dir}; --wandb wiring may have crashed. "
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+
+
+def test_train_jax_distill_accumulation_steps_runs(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """distill-grad-accum: `--accumulation-steps 2` runs end-to-end (the
+    chunk producer emits `(K, N, B, T)` batches that the distill
+    accumulation kernel consumes) and writes a student checkpoint. Parity
+    with `test_train_jax_accumulation_steps_runs` for the pretrain path."""
+    import subprocess
+
+    teacher_dir = _make_tiny_teacher(tmp_path)
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax_distill.py",
+            "--distill-from", str(teacher_dir),
+            "--student-supernet", "tiny", "--no-pgn", "--objective", "mix",
+            "--total-steps", "4", "--accumulation-steps", "2",
+            "--batch-size", "4", "--seq-len", "32", "--k", "2",
+            "--checkpoint-interval", "2", "--log-interval", "1",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True, text=True, timeout=300, env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"distill --accumulation-steps 2 failed:\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert sorted(logs_dir.glob("*/distill_step_*")), (
+        f"no checkpoint under {logs_dir}; "
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+
+
+def _load_distill_module():  # type: ignore[no-untyped-def]
+    """Import `scripts/train_jax_distill.py` as a module so a test can drive
+    its `main()` in-process and monkeypatch its `install_sigterm_handler`
+    binding."""
+    import importlib.util
+
+    script_path = Path("scripts") / "train_jax_distill.py"
+    spec = importlib.util.spec_from_file_location(
+        "scripts_train_jax_distill_sigterm", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_train_jax_distill_sigterm_at_non_boundary_exits_zero(
+    tmp_path,  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SIGTERM at a step that is NOT a multiple of `checkpoint_interval` must
+    exit 0, not crash with `FileExistsError`.
+
+    The in-loop SIGTERM handler saves `distill_step_<final>` and breaks; the
+    post-loop final-save block then re-evaluates and — because `final` is not a
+    checkpoint-interval multiple — would target the *same* path a second time.
+    `save_model` raises `FileExistsError` on an existing target, so without the
+    `saved_steps` idempotency guard in `_save` the process dies with an
+    unhandled exception instead of the graceful exit-0 the CLAUDE.md contract
+    promises. This drives `main()` in-process with `install_sigterm_handler`
+    monkeypatched so `should_shutdown()` flips True after the first chunk lands
+    (k=2 → step 2, with checkpoint_interval=5 so step 2 is a non-boundary),
+    and asserts: rc == 0, exactly one `distill_step_00000002` directory, and a
+    `schedule_health.json` recording `reason_for_stop == "sigterm"`.
+    """
+    import json as _json
+
+    dm = _load_distill_module()
+    teacher_dir = _make_tiny_teacher(tmp_path)
+    logs_dir = tmp_path / "logs"
+
+    # Trip the shutdown flag after the FIRST poll so the loop saves + breaks at
+    # step 2 (the first chunk's end), which is not a multiple of
+    # checkpoint_interval=5. The real handler is replaced wholesale so no
+    # actual signal is needed and the test is timing-independent.
+    poll_count = {"n": 0}
+
+    def _fake_install(on_shutdown=None):  # type: ignore[no-untyped-def]
+        del on_shutdown
+
+        def _should_shutdown() -> bool:
+            poll_count["n"] += 1
+            return poll_count["n"] >= 1
+
+        return _should_shutdown
+
+    monkeypatch.setattr(dm, "install_sigterm_handler", _fake_install)
+
+    rc = dm.main([
+        "--distill-from", str(teacher_dir),
+        "--student-supernet", "tiny", "--no-pgn", "--objective", "mix",
+        "--total-steps", "8", "--batch-size", "4", "--seq-len", "32",
+        "--k", "2", "--checkpoint-interval", "5", "--log-interval", "1",
+        "--local-checkpoints", "--lr", "1e-3",
+        "--logs-dir", str(logs_dir),
+    ])
+    assert rc == 0, "SIGTERM at a non-checkpoint-boundary step must exit 0"
+
+    # Exactly one checkpoint at the interrupted step — the in-loop save and the
+    # post-loop final-save collapsed to a single write via the idempotency
+    # guard rather than crashing on the second `save_model`.
+    step2 = sorted(logs_dir.glob("*/distill_step_00000002"))
+    assert len(step2) == 1, (
+        f"expected exactly one distill_step_00000002 dir, got {step2}"
+    )
+    # No checkpoint beyond the interrupted step (the loop broke at step 2).
+    later = sorted(logs_dir.glob("*/distill_step_000000[3-9]*"))
+    assert not later, f"loop ran past the SIGTERM break: {later}"
+
+    health = sorted(logs_dir.glob("*/schedule_health.json"))
+    assert health, "schedule_health.json not written on the SIGTERM exit path"
+    payload = _json.loads(health[-1].read_text())
+    assert payload["reason_for_stop"] == "sigterm", (
+        f"expected reason_for_stop=sigterm, got {payload['reason_for_stop']!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # B2 — inert-knob parity: mate_boost / accumulation_steps / adapter cadence
 # ---------------------------------------------------------------------------

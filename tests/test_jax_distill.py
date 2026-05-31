@@ -419,3 +419,115 @@ def test_loss_decreases_over_a_few_steps() -> None:
         losses.append(float(loss))
     assert all(np.isfinite(losses))
     assert losses[-1] < losses[0]
+
+
+# ---------------------------------------------------------------------------
+# (g) gradient accumulation — distill-grad-accum (parity with make_train_step)
+# ---------------------------------------------------------------------------
+
+
+def test_distill_accumulation_steps_eq_one_matches_baseline() -> None:
+    """``accumulation_steps=1`` must be a no-op vs the default single-pass
+    path — same student update on the same ``(B, T)`` batch."""
+    cfg = _distill_cfg(objective="mix")
+    schedule = make_lr_schedule(cfg, cfg.total_steps or 4)
+    optimizer = make_optimizer(cfg, schedule)
+
+    def _state() -> DistillTrainState:
+        # Fresh student AND teacher each call — the train step donates its
+        # whole input state (student + teacher), so the two compared
+        # invocations need independent (but bit-identical) starting states.
+        s = init_model(_STUDENT_CFG, key=1)
+        t = init_model(_TEACHER_CFG, key=0)
+        return DistillTrainState(
+            student=s, teacher=t,
+            opt_state=optimizer.init(eqx.filter(s, eqx.is_inexact_array)),
+            step=jnp.int32(0), key=jax.random.key(0),
+        )
+
+    default_step = make_distill_train_step(
+        optimizer, objective=cfg.objective,
+        temperature=cfg.temperature, alpha=cfg.alpha,
+    )
+    accum1_step = make_distill_train_step(
+        optimizer, objective=cfg.objective,
+        temperature=cfg.temperature, alpha=cfg.alpha,
+        accumulation_steps=1,
+    )
+    # Each donated call gets its own (identical) batch — the same fixed seed
+    # in `_batch` makes them bit-identical.
+    s_default, l_default = default_step(_state(), _batch(seq_len=24, n_games=4))
+    s_accum1, l_accum1 = accum1_step(_state(), _batch(seq_len=24, n_games=4))
+    assert float(l_default) == pytest.approx(float(l_accum1), rel=1e-6, abs=1e-6)
+    for a, b in zip(
+        jax.tree_util.tree_leaves(
+            eqx.filter(s_default.student, eqx.is_inexact_array)
+        ),
+        jax.tree_util.tree_leaves(
+            eqx.filter(s_accum1.student, eqx.is_inexact_array)
+        ),
+    ):
+        np.testing.assert_allclose(
+            np.asarray(a), np.asarray(b), rtol=1e-6, atol=1e-6
+        )
+
+
+def test_distill_accumulation_grad_equals_mean_of_micros() -> None:
+    """The accumulation kernel's student update equals SGD(lr=1) on the MEAN
+    of the per-micro distillation gradients (within fp32 noise).
+
+    Drives ``make_distill_train_step(accumulation_steps=2)`` with a plain
+    SGD(lr=1.0) optimizer (clip disabled) so the student delta equals exactly
+    ``-mean_grad``; compares against the mean of the two single-micro
+    gradients computed directly from ``distill_loss``. Confirms the scan body
+    sums then divides by N rather than e.g. summing without the 1/N.
+    """
+    teacher = init_model(_TEACHER_CFG, key=0)
+    student = init_model(_STUDENT_CFG, key=1)
+    teacher_fn = frozen_teacher(teacher)
+    micro1 = _batch(seq_len=24, n_games=4)
+    micro2 = _batch(seq_len=24, n_games=4)
+
+    def _loss(s: PAWNModel, batch: Batch) -> jax.Array:
+        return distill_loss(
+            s, teacher_fn, batch, objective="mix", temperature=2.0, alpha=0.5,
+        )
+
+    _, g1 = eqx.filter_value_and_grad(lambda m: _loss(m, micro1))(student)
+    _, g2 = eqx.filter_value_and_grad(lambda m: _loss(m, micro2))(student)
+    mean_grad_embed = (
+        np.asarray(g1.embed_tokens) + np.asarray(g2.embed_tokens)
+    ) / 2.0
+
+    opt = optax.chain(
+        optax.clip_by_global_norm(1e9), optax.sgd(learning_rate=1.0)
+    )
+    state = DistillTrainState(
+        student=student, teacher=teacher,
+        opt_state=opt.init(eqx.filter(student, eqx.is_inexact_array)),
+        step=jnp.int32(0), key=jax.random.key(0),
+    )
+    accum_step = make_distill_train_step(
+        opt, objective="mix", temperature=2.0, alpha=0.5,
+        accumulation_steps=2,
+    )
+    stacked = Batch(
+        tokens=jnp.stack([micro1.tokens, micro2.tokens], axis=0),
+        targets=jnp.stack([micro1.targets, micro2.targets], axis=0),
+        attn_mask=jnp.stack([micro1.attn_mask, micro2.attn_mask], axis=0),
+        loss_mask=jnp.stack([micro1.loss_mask, micro2.loss_mask], axis=0),
+    )
+    embed_before = np.asarray(state.student.embed_tokens)
+    new_state, _ = accum_step(state, stacked)
+    embed_after = np.asarray(new_state.student.embed_tokens)
+    kernel_mean_grad = -(embed_after - embed_before)
+    np.testing.assert_allclose(
+        kernel_mean_grad, mean_grad_embed, rtol=0, atol=1e-5
+    )
+
+
+def test_distill_accumulation_steps_rejects_zero() -> None:
+    """``accumulation_steps`` must be ≥ 1; reject zero / negative."""
+    optimizer = optax.sgd(learning_rate=1.0)
+    with pytest.raises(ValueError, match="accumulation_steps"):
+        make_distill_train_step(optimizer, accumulation_steps=0)

@@ -306,6 +306,7 @@ def make_distill_train_step(
     compute_dtype: jnp.dtype | None = None,
     use_sdpa: bool = False,
     use_flash: bool = False,
+    accumulation_steps: int = 1,
 ) -> Callable[
     [DistillTrainState, Batch], tuple[DistillTrainState, Float[Array, ""]]
 ]:
@@ -319,10 +320,35 @@ def make_distill_train_step(
     in :func:`jax.lax.stop_gradient` by :func:`frozen_teacher`, so XLA
     dead-code-eliminates every teacher weight-gradient.
 
+    With ``accumulation_steps > 1`` the input ``batch`` gains a leading
+    microbatch axis: each leaf's first dim becomes ``accumulation_steps``
+    (so ``tokens`` is ``(N, B_micro, T)``). The step scans that axis,
+    sums the per-micro grads + losses, and issues a single
+    ``optimizer.update`` — equivalent to one forward+backward on a batch
+    of ``N * B_micro`` games but at ``B_micro`` per-pass memory cost
+    (mirrors :func:`pawn.trainer.make_train_step`'s accumulation path so
+    the distill trainer reaches the same effective-batch knob the other
+    trainers expose). ``N == 1`` keeps the legacy single-pass ``(B, T)``
+    shape — no extra axis, the accumulation-free body unchanged.
+
     The optimizer update is unconditional (same rationale as the adapter /
     pretrain trainers — the ``lax.cond`` empty-batch guard cost more than
     the hypothetical all-PAD drift it prevented).
     """
+    if accumulation_steps < 1:
+        raise ValueError(
+            f"accumulation_steps must be ≥ 1, got {accumulation_steps}"
+        )
+
+    def _loss_for(
+        student: PAWNModel, teacher_fn: TeacherFn, micro_batch: Batch
+    ) -> Float[Array, ""]:
+        return distill_loss(
+            student, teacher_fn, micro_batch,
+            objective=objective, temperature=temperature, alpha=alpha,
+            compute_dtype=compute_dtype,
+            use_sdpa=use_sdpa, use_flash=use_flash,
+        )
 
     @eqx.filter_jit(donate="all")
     def step(
@@ -333,20 +359,42 @@ def make_distill_train_step(
             compute_dtype=compute_dtype,
             use_sdpa=use_sdpa, use_flash=use_flash,
         )
+        if accumulation_steps == 1:
+            loss, grads = eqx.filter_value_and_grad(
+                lambda student: _loss_for(student, teacher_fn, batch)
+            )(state.student)
+        else:
+            # Accumulate grads + loss over the leading microbatch axis via
+            # lax.scan. The body computes one micro's value+grad and adds it
+            # into the carry — only one student-grad tree resident at a time
+            # (NOT the per-micro stack a vmap would build). Mirrors
+            # :func:`pawn.trainer.make_train_step`.
+            params = eqx.filter(state.student, eqx.is_inexact_array)
+            zero_grads = jax.tree_util.tree_map(jnp.zeros_like, params)
+            zero_loss = jnp.float32(0.0)
 
-        def loss_fn(student: PAWNModel) -> Float[Array, ""]:
-            return distill_loss(
-                student, teacher_fn, batch,
-                objective=objective, temperature=temperature, alpha=alpha,
-                compute_dtype=compute_dtype,
-                use_sdpa=use_sdpa, use_flash=use_flash,
+            def _acc_body(
+                carry: tuple[Any, Float[Array, ""]], micro_batch: Batch
+            ) -> tuple[tuple[Any, Float[Array, ""]], None]:
+                accum_grads, accum_loss = carry
+                micro_loss, micro_grads = eqx.filter_value_and_grad(
+                    lambda student: _loss_for(student, teacher_fn, micro_batch)
+                )(state.student)
+                new_grads = jax.tree_util.tree_map(
+                    lambda a, g: a + g, accum_grads, micro_grads
+                )
+                return (new_grads, accum_loss + micro_loss), None
+
+            (acc_grads, acc_loss), _ = jax.lax.scan(
+                _acc_body, (zero_grads, zero_loss), batch
             )
+            scale = jnp.float32(1.0 / accumulation_steps)
+            grads = jax.tree_util.tree_map(lambda g: g * scale, acc_grads)
+            loss = acc_loss * scale
 
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(state.student)
-
-        params: Any = state.student
+        params_any: Any = state.student
         updates, new_opt_state = optimizer.update(
-            grads, state.opt_state, params
+            grads, state.opt_state, params_any
         )
         new_student = eqx.apply_updates(state.student, updates)
 

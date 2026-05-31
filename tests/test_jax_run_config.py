@@ -157,6 +157,20 @@ def test_distill_round_trips_through_json() -> None:
     assert reloaded.model_dump() == cfg.model_dump()
 
 
+def test_distill_accumulation_steps_default_and_valid() -> None:
+    """distill-grad-accum: DistillConfig exposes accumulation_steps (default
+    1, parity with PretrainConfig) and accepts a positive override."""
+    cfg = DistillConfig(**_distill_kwargs())
+    assert cfg.accumulation_steps == 1
+    cfg2 = DistillConfig(**_distill_kwargs(accumulation_steps=4))
+    assert cfg2.accumulation_steps == 4
+
+
+def test_distill_rejects_nonpositive_accumulation_steps() -> None:
+    with pytest.raises(ValueError, match="accumulation_steps must be positive"):
+        DistillConfig(**_distill_kwargs(accumulation_steps=0))
+
+
 def test_distill_rejects_unknown_field() -> None:
     with pytest.raises(ValueError):
         DistillConfig(**_distill_kwargs(distil_temp=2.0))
