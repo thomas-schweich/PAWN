@@ -30,6 +30,14 @@ SCRIPTS = (
     "eval_vs_stockfish",
     "sweep",
     "run_evals_backbone",
+    # v1 backwards-compat wrappers — import-clean + behaviourally tested
+    # below (train.py --variant translation, eval_accuracy.py --translate
+    # forwarding, export_hf_repo.py packaging); eval_probes.py's --log-dir
+    # scan is covered in tests/test_jax_eval.py. (eval_accuracy is already
+    # in the import-clean list above.)
+    "train",
+    "export_hf_repo",
+    "eval_probes",
 )
 
 
@@ -2349,3 +2357,512 @@ def test_eval_generation_gate_explicit_flag_overrides_detection() -> None:
     # Explicit True beats an absent / non-outcome run block.
     assert mod.resolve_outcome_gate(True, None) is True
     assert mod.resolve_outcome_gate(True, {"conditioning": []}) is True
+
+
+# ---------------------------------------------------------------------------
+# scripts/train.py — v1 compat wrapper (--run-type dispatch + --variant
+# translation onto the v2 --supernet / --variants surface)
+# ---------------------------------------------------------------------------
+
+
+def test_train_wrapper_variant_base_translates_to_supernet_variants() -> None:
+    """Parity item ``train-py-wrapper-variant-flag-breaks``: a verbatim v1
+    pretrain invocation (`--run-type pretrain --variant base`) must be
+    translated, not forwarded — v2 ``train_jax.py`` has no ``--variant`` flag
+    (it uses ``--supernet`` + ``--variants``), so forwarding it verbatim trips
+    argparse with exit 2.
+
+    `base`/`small`/`large` → the production supernet narrowed to that single
+    nested slice (the v1 "pretrain just this variant" intent)."""
+    mod = _load_script("train")
+    for variant in ("small", "base", "large"):
+        target, rest = mod.resolve_target([
+            "--run-type", "pretrain", "--variant", variant,
+            "--local-checkpoints", "--total-steps", "1",
+        ])
+        assert target == "train_jax.py"
+        # --variant is gone; --supernet production + --variants <name> appear.
+        assert "--variant" not in rest
+        assert rest[rest.index("--supernet") + 1] == "production"
+        assert rest[rest.index("--variants") + 1] == variant
+        # The other v1 flags pass straight through.
+        assert "--local-checkpoints" in rest
+        assert rest[rest.index("--total-steps") + 1] == "1"
+
+
+def test_train_wrapper_variant_toy_translates_to_tiny_supernet() -> None:
+    """`--variant toy` → the tiny supernet smoke shape (`--supernet tiny`),
+    which trains all three nested variants — so no ``--variants`` narrowing is
+    synthesised (the toy run is the small-scale verification supernet)."""
+    mod = _load_script("train")
+    target, rest = mod.resolve_target([
+        "--run-type", "pretrain", "--variant", "toy", "--local-checkpoints",
+    ])
+    assert target == "train_jax.py"
+    assert rest[rest.index("--supernet") + 1] == "tiny"
+    assert "--variants" not in rest
+    assert "--variant" not in rest
+
+
+def test_train_wrapper_variant_equals_form_is_translated() -> None:
+    """The ``--variant=base`` (single-token) spelling is handled identically
+    to the space-separated form."""
+    mod = _load_script("train")
+    target, rest = mod.resolve_target([
+        "--run-type=pretrain", "--variant=small", "--local-checkpoints",
+    ])
+    assert target == "train_jax.py"
+    assert rest[rest.index("--supernet") + 1] == "production"
+    assert rest[rest.index("--variants") + 1] == "small"
+
+
+def test_train_wrapper_variant_custom_rejected_with_pointer() -> None:
+    """`--variant custom` has no v2 supernet-pretrain home (the supernet is
+    fixed-shape); the wrapper exits 2 and points at the specialized_clm path
+    rather than silently dropping the custom arch."""
+    import pytest
+
+    mod = _load_script("train")
+    with pytest.raises(SystemExit) as ei:
+        mod.resolve_target([
+            "--run-type", "pretrain", "--variant", "custom",
+            "--d-model", "64", "--n-layers", "2", "--n-heads", "4",
+            "--d-ff", "256", "--local-checkpoints",
+        ])
+    assert ei.value.code == 2
+
+
+def test_train_wrapper_variant_conflicts_with_v2_supernet_flag() -> None:
+    """Mixing the v1 ``--variant`` surface with the v2-native ``--supernet`` /
+    ``--variants`` flags is ambiguous — the wrapper rejects it loudly instead
+    of silently picking one."""
+    import pytest
+
+    mod = _load_script("train")
+    with pytest.raises(SystemExit) as ei:
+        mod.resolve_target([
+            "--run-type", "pretrain", "--variant", "base",
+            "--supernet", "production", "--local-checkpoints",
+        ])
+    assert ei.value.code == 2
+
+
+def test_train_wrapper_v2_native_supernet_passes_through_untouched() -> None:
+    """A v2-native pretrain invocation (no ``--variant``) forwards verbatim —
+    the wrapper only translates when the legacy ``--variant`` flag is present,
+    so a fresh ``--supernet tiny`` call reaches ``train_jax.py`` unchanged."""
+    mod = _load_script("train")
+    target, rest = mod.resolve_target([
+        "--run-type", "pretrain", "--supernet", "tiny",
+        "--variants", "large", "--local-checkpoints",
+    ])
+    assert target == "train_jax.py"
+    assert rest[rest.index("--supernet") + 1] == "tiny"
+    assert rest[rest.index("--variants") + 1] == "large"
+
+
+def test_train_wrapper_adapter_run_type_drops_variant_keeps_strategy() -> None:
+    """On a non-pretrain run, ``--variant`` (a v1 shared-config field that the
+    adapter path ignored — it derives arch from the backbone checkpoint) is
+    dropped, and the adapter target + strategy survive."""
+    mod = _load_script("train")
+    target, rest = mod.resolve_target([
+        "--run-type", "adapter", "--strategy", "lora", "--variant", "base",
+        "--checkpoint", "ckpt-dir", "--local-checkpoints",
+    ])
+    assert target == "train_jax_adapter.py"
+    assert "--variant" not in rest
+    assert rest[rest.index("--strategy") + 1] == "lora"
+    assert rest[rest.index("--checkpoint") + 1] == "ckpt-dir"
+
+
+def test_train_wrapper_specialized_clm_injects_strategy() -> None:
+    """`--run-type specialized_clm` dispatches to the adapter entry and
+    synthesises ``--strategy specialized_clm`` when absent (parity with the v1
+    run-type → strategy mapping)."""
+    mod = _load_script("train")
+    target, rest = mod.resolve_target([
+        "--run-type", "specialized_clm", "--d-model", "64",
+        "--local-checkpoints",
+    ])
+    assert target == "train_jax_adapter.py"
+    assert rest[rest.index("--strategy") + 1] == "specialized_clm"
+
+
+def test_train_wrapper_cotrain_rejected_gone_by_design() -> None:
+    """`--run-type cotrain` is GONE BY DESIGN (plan §6) — the wrapper exits 2
+    with the supernet-joint-loss pointer rather than dispatching."""
+    import pytest
+
+    mod = _load_script("train")
+    with pytest.raises(SystemExit) as ei:
+        mod.resolve_target(["--run-type", "cotrain", "--local-checkpoints"])
+    assert ei.value.code == 2
+
+
+def test_train_wrapper_run_type_inferred_from_config_json(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """v1 also allowed ``run_type`` to live inside a ``--config`` JSON. The
+    wrapper peeks it when no CLI ``--run-type`` is given, so a config-driven
+    pretrain invocation still resolves the right v2 target."""
+    import json
+
+    mod = _load_script("train")
+    cfg = tmp_path / "run.json"
+    cfg.write_text(json.dumps({"run_type": "pretrain", "supernet": "tiny"}))
+    target, rest = mod.resolve_target(["--config", str(cfg)])
+    assert target == "train_jax.py"
+    assert rest[rest.index("--config") + 1] == str(cfg)
+
+
+def test_train_wrapper_run_type_config_guards_non_string(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Guard regression (gate defect: ``_run_type_from_config`` leaked ``Any``
+    from ``json.loads``): a JSON config whose ``run_type`` is non-string, or
+    whose root is not an object, must resolve to ``None`` (the wrapper then
+    errors out asking for an explicit run type) rather than propagate a
+    non-``str`` value past the ``-> str | None`` contract."""
+    import json
+
+    import pytest
+
+    mod = _load_script("train")
+    # run_type present but not a string -> treated as absent -> _die (exit 2).
+    bad_type = tmp_path / "bad_type.json"
+    bad_type.write_text(json.dumps({"run_type": 42}))
+    assert mod._run_type_from_config(["--config", str(bad_type)]) is None
+    with pytest.raises(SystemExit) as ei:
+        mod.resolve_target(["--config", str(bad_type)])
+    assert ei.value.code == 2
+    # Non-object JSON root (a bare list) -> None, not a crash.
+    non_obj = tmp_path / "non_obj.json"
+    non_obj.write_text(json.dumps(["pretrain"]))
+    assert mod._run_type_from_config(["--config", str(non_obj)]) is None
+    # The =form is guarded identically.
+    assert mod._run_type_from_config([f"--config={bad_type}"]) is None
+
+
+# ---------------------------------------------------------------------------
+# scripts/export_hf_repo.py — v1 post-hoc HF packager, ported to the v2
+# safetensors checkpoint format
+# ---------------------------------------------------------------------------
+
+
+def test_export_hf_repo_packages_v2_run_into_hf_layout(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Parity item ``export-hf-repo-undocumented-deferral``: the wrapper must
+    package a finished ``--local-checkpoints`` run into HF-repo layout, not
+    exit 2.
+
+    Builds a tiny run dir with two real v2 checkpoints + a v2-schema
+    ``metrics.jsonl`` (the lower ``val/loss`` is the non-final step, so the
+    "best" selection is non-trivial), runs the exporter, and asserts:
+    best checkpoint at root (loadable — sentinel re-verified), the other
+    checkpoint under ``checkpoints/``, a rendered README carrying the
+    checkpoint's real architecture, and a truncated metrics log."""
+    import json
+
+    from pawn.checkpoint import load_model, save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    export_mod = _load_script("export_hf_repo")
+
+    run_dir = tmp_path / "pretrain_run"
+    run_dir.mkdir()
+    model = init_model(TINY_SUPERNET, key=0)
+    run_block = {"conditioning": [], "total_steps": 20, "lr": 1e-3}
+    save_model(model, run_dir / "step_00000010",
+               run_config={**run_block, "step": 10})
+    save_model(model, run_dir / "step_00000020",
+               run_config={**run_block, "step": 20})
+
+    # v2 metric schema: type=val records carry val/loss + val/accuracy. The
+    # best (lowest) loss is at step 10, NOT the final step — exercises the
+    # selection logic rather than "pick the last checkpoint".
+    metrics = run_dir / "metrics.jsonl"
+    metrics.write_text(
+        json.dumps({"type": "config", "run_type": "pretrain"}) + "\n"
+        + json.dumps({"type": "val", "step": 10,
+                      "val/loss": 1.5, "val/accuracy": 0.30}) + "\n"
+        + json.dumps({"type": "train", "step": 15, "train/loss": 1.4}) + "\n"
+        + json.dumps({"type": "val", "step": 20,
+                      "val/loss": 2.0, "val/accuracy": 0.25}) + "\n",
+        encoding="utf-8",
+    )
+
+    out_dir = tmp_path / "export" / "pawn-tiny-v2"
+    rc = export_mod.main([
+        "--run-dir", str(run_dir),
+        "--output-dir", str(out_dir),
+        "--repo-name", "pawn-tiny-v2",
+    ])
+    assert rc == 0
+
+    # Best checkpoint (step 10 — the lowest val/loss) is at the repo root and
+    # loads cleanly (fresh sentinel re-verified by load_model).
+    assert (out_dir / "config.json").is_file()
+    assert (out_dir / "model.safetensors").is_file()
+    loaded, _ = load_model(out_dir)
+    assert loaded.cfg.d_model == TINY_SUPERNET.d_model
+
+    # The other checkpoint (step 20) is packaged under checkpoints/.
+    assert (out_dir / "checkpoints" / "step_00000020" / "config.json").is_file()
+    assert not (out_dir / "checkpoints" / "step_00000010").exists()
+
+    # README carries the checkpoint's real architecture, auto-detected from
+    # the saved config (not hardcoded).
+    readme = (out_dir / "README.md").read_text()
+    assert "PAWN-TINY-V2" in readme
+    assert f"| **d_model** | {TINY_SUPERNET.d_model} |" in readme
+    # Best step (10) + its val loss surfaced in the card.
+    assert "step 10" in readme
+
+    # Root metrics truncated to the best step — the step-20 records are gone.
+    root_metrics = (out_dir / "metrics.jsonl").read_text().splitlines()
+    steps = [json.loads(line).get("step") for line in root_metrics if line]
+    assert 20 not in steps
+    assert 10 in steps
+
+
+def test_export_hf_repo_best_only_skips_other_checkpoints(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`--best-only` packages just the root (best) checkpoint — no
+    ``checkpoints/`` subtree."""
+    import json
+
+    from pawn.checkpoint import save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    export_mod = _load_script("export_hf_repo")
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model = init_model(TINY_SUPERNET, key=0)
+    save_model(model, run_dir / "step_00000010", run_config={"conditioning": []})
+    save_model(model, run_dir / "step_00000020", run_config={"conditioning": []})
+    (run_dir / "metrics.jsonl").write_text(
+        json.dumps({"type": "val", "step": 10, "val/loss": 1.0}) + "\n"
+        + json.dumps({"type": "val", "step": 20, "val/loss": 2.0}) + "\n",
+        encoding="utf-8",
+    )
+
+    out_dir = tmp_path / "export"
+    rc = export_mod.main([
+        "--run-dir", str(run_dir), "--output-dir", str(out_dir),
+        "--repo-name", "r", "--best-only",
+    ])
+    assert rc == 0
+    assert (out_dir / "model.safetensors").is_file()
+    assert not (out_dir / "checkpoints").exists()
+
+
+def test_export_hf_repo_no_val_records_returns_error(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """No val record (so no best-checkpoint signal) → a clear nonzero exit,
+    not a silent empty export."""
+    import json
+
+    export_mod = _load_script("export_hf_repo")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "metrics.jsonl").write_text(
+        json.dumps({"type": "train", "step": 1, "train/loss": 1.0}) + "\n",
+        encoding="utf-8",
+    )
+    rc = export_mod.main([
+        "--run-dir", str(run_dir), "--output-dir", str(tmp_path / "out"),
+        "--repo-name", "r",
+    ])
+    assert rc == 1
+
+
+def test_export_hf_repo_packages_adapter_step_run(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Adapter local-checkpoint runs name their checkpoints
+    ``adapter_step_NNNNNNNN`` (train_jax_adapter.py), not ``step_*``. The
+    exporter must discover that prefix and package the run, not abort with
+    'no checkpoint dirs found'."""
+    import json
+
+    from pawn.checkpoint import load_model, save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    export_mod = _load_script("export_hf_repo")
+
+    run_dir = tmp_path / "adapter_run"
+    run_dir.mkdir()
+    model = init_model(TINY_SUPERNET, key=0)
+    run_block = {"conditioning": [], "total_steps": 20}
+    save_model(model, run_dir / "adapter_step_00000010",
+               run_config={**run_block, "step": 10})
+    save_model(model, run_dir / "adapter_step_00000020",
+               run_config={**run_block, "step": 20})
+    (run_dir / "metrics.jsonl").write_text(
+        json.dumps({"type": "val", "step": 10, "val/loss": 1.0,
+                    "val/accuracy": 0.4}) + "\n"
+        + json.dumps({"type": "val", "step": 20, "val/loss": 2.0,
+                      "val/accuracy": 0.3}) + "\n",
+        encoding="utf-8",
+    )
+
+    out_dir = tmp_path / "export" / "pawn-adapter-v2"
+    rc = export_mod.main([
+        "--run-dir", str(run_dir),
+        "--output-dir", str(out_dir),
+        "--repo-name", "pawn-adapter-v2",
+    ])
+    assert rc == 0
+
+    # Best (step 10) at root, loadable; the other adapter checkpoint preserved
+    # under checkpoints/ with its real adapter_step_ name.
+    loaded, _ = load_model(out_dir)
+    assert loaded.cfg.d_model == TINY_SUPERNET.d_model
+    assert (out_dir / "checkpoints" / "adapter_step_00000020"
+            / "config.json").is_file()
+    assert not (out_dir / "checkpoints" / "adapter_step_00000010").exists()
+
+
+def test_export_hf_repo_best_val_step_has_no_exact_checkpoint(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Validation runs on a different cadence than checkpointing, so the
+    best-val step usually has no exactly-matching checkpoint dir. The exporter
+    must pick the *nearest* checkpoint (v1 parity), not abort on exact-match
+    failure.
+
+    Here the best val step is 15 (lowest val/loss) but checkpoints exist only
+    at steps 10 and 20. Step 20 is nearest (|20-15|=5 < |10-15|=5 is a tie, so
+    `min` keeps the first-seen on tie — step 10). To make the assertion
+    unambiguous we place the best val at 18 so step 20 is strictly nearest."""
+    import json
+
+    from pawn.checkpoint import load_model, save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    export_mod = _load_script("export_hf_repo")
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model = init_model(TINY_SUPERNET, key=0)
+    run_block = {"conditioning": []}
+    # Checkpoints only at 10 and 20 (the checkpoint_interval cadence).
+    save_model(model, run_dir / "step_00000010",
+               run_config={**run_block, "step": 10})
+    save_model(model, run_dir / "step_00000020",
+               run_config={**run_block, "step": 20})
+    # Best val (lowest loss) at step 18 — no exact checkpoint dir for it.
+    (run_dir / "metrics.jsonl").write_text(
+        json.dumps({"type": "val", "step": 12, "val/loss": 2.0,
+                    "val/accuracy": 0.3}) + "\n"
+        + json.dumps({"type": "val", "step": 18, "val/loss": 1.0,
+                      "val/accuracy": 0.5}) + "\n",
+        encoding="utf-8",
+    )
+
+    out_dir = tmp_path / "export"
+    rc = export_mod.main([
+        "--run-dir", str(run_dir),
+        "--output-dir", str(out_dir),
+        "--repo-name", "r",
+    ])
+    # Exact-match would abort here; nearest-match (step 20) succeeds.
+    assert rc == 0
+
+    # Root checkpoint loads cleanly (nearest = step 20).
+    loaded, _ = load_model(out_dir)
+    assert loaded.cfg.d_model == TINY_SUPERNET.d_model
+    # The non-exported checkpoint (step 10) is preserved under checkpoints/.
+    assert (out_dir / "checkpoints" / "step_00000010" / "config.json").is_file()
+    assert not (out_dir / "checkpoints" / "step_00000020").exists()
+
+    # README cites the best-val step (18) and its val loss, even though the
+    # root checkpoint is the nearest dir (step 20).
+    readme = (out_dir / "README.md").read_text()
+    assert "step 18" in readme
+
+    # Root metrics retain the best-val record (truncation extends to the
+    # best-val step even though the exported checkpoint is at step 20).
+    steps = [
+        json.loads(line).get("step")
+        for line in (out_dir / "metrics.jsonl").read_text().splitlines()
+        if line
+    ]
+    assert 18 in steps
+
+
+def test_export_hf_repo_tolerates_truncated_final_metrics_line(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A crashed ``--local-checkpoints`` run is *exactly* what this packager
+    exists to recover, and a crash can leave ``metrics.jsonl`` ending in a
+    partially-flushed (malformed-JSON) line. The exporter must skip that line
+    across every metrics scan (best-step selection, best-val lookup, and the
+    truncated-log copy), not raise ``json.JSONDecodeError`` and abort.
+
+    Regression for the gate defect: the three local ``json.loads`` calls were
+    unguarded, so a single bad row failed the whole export. The fix routes
+    truncation through ``pawn.lifecycle.truncate_metrics_jsonl`` (which guards)
+    and guards the selection/lookup scans inline."""
+    import json
+
+    from pawn.checkpoint import load_model, save_model
+    from pawn.config import TINY_SUPERNET
+    from pawn.model import init_model
+
+    export_mod = _load_script("export_hf_repo")
+
+    run_dir = tmp_path / "crashed_run"
+    run_dir.mkdir()
+    model = init_model(TINY_SUPERNET, key=0)
+    run_block = {"conditioning": []}
+    save_model(model, run_dir / "step_00000010",
+               run_config={**run_block, "step": 10})
+    save_model(model, run_dir / "step_00000020",
+               run_config={**run_block, "step": 20})
+
+    # Well-formed val records (step 10 is the best), then a truncated final
+    # line — a partially-flushed write from a crash mid-record.
+    metrics = run_dir / "metrics.jsonl"
+    metrics.write_text(
+        json.dumps({"type": "val", "step": 10, "val/loss": 1.0,
+                    "val/accuracy": 0.5}) + "\n"
+        + json.dumps({"type": "val", "step": 20, "val/loss": 2.0,
+                      "val/accuracy": 0.3}) + "\n"
+        + '{"type": "train", "step": 21, "train/lo',  # truncated, no newline
+        encoding="utf-8",
+    )
+
+    out_dir = tmp_path / "export"
+    # Unguarded json.loads would raise JSONDecodeError here; the guarded scans
+    # skip the bad row and export cleanly.
+    rc = export_mod.main([
+        "--run-dir", str(run_dir),
+        "--output-dir", str(out_dir),
+        "--repo-name", "r",
+    ])
+    assert rc == 0
+
+    # Best val (step 10) selected + loadable despite the trailing bad line.
+    loaded, _ = load_model(out_dir)
+    assert loaded.cfg.d_model == TINY_SUPERNET.d_model
+    readme = (out_dir / "README.md").read_text()
+    assert "step 10" in readme
+
+
+def test_export_hf_repo_truncate_metrics_skips_malformed_line(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Unit-level guard regression: ``truncate_metrics`` itself must pass a
+    malformed line through verbatim rather than raise — it delegates to the
+    battle-tested ``pawn.lifecycle.truncate_metrics_jsonl``."""
+    import json
+
+    export_mod = _load_script("export_hf_repo")
+
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        json.dumps({"type": "val", "step": 5, "val/loss": 1.0}) + "\n"
+        + "{not valid json at all\n"
+        + json.dumps({"type": "val", "step": 8, "val/loss": 0.5}) + "\n"
+        + json.dumps({"type": "val", "step": 99, "val/loss": 0.1}) + "\n",
+        encoding="utf-8",
+    )
+    out = export_mod.truncate_metrics(metrics, 8)
+    assert isinstance(out, str)
+    # Malformed line passed through verbatim (not gating the boundary, not
+    # raising); the step-99 record is truncated away.
+    assert "{not valid json at all" in out
+    assert '"step": 99' not in out
+    assert '"step": 8' in out
