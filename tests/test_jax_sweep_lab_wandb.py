@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import unittest.mock as mock
 from pathlib import Path
 
@@ -20,12 +22,19 @@ from pawn.lab.runner import (
 from pawn.sweep import (
     STRATEGY_SUGGESTERS,
     AdapterObjective,
+    InProcessRoSAObjective,
     _read_best_val_loss,
+    _scan_val_records,
     adapter_strategy_for,
+    make_pruner,
     params_to_config_json,
+    suggest_bottleneck,
+    suggest_common,
     suggest_lora,
     suggest_rosa,
     suggest_rosa_retro_bottleneck,
+    suggest_sparse,
+    suggest_unfreeze,
 )
 from pawn.wandb_utils import (
     finish_wandb,
@@ -176,10 +185,13 @@ def test_suggested_params_accepted_by_adapter_argparse_and_pydantic(
         "--logs-dir", str(tmp_path / "logs"),
         # base_args the sweep CLI supplies (scripts/sweep.py); these don't
         # collide with the suggested params and satisfy the required
-        # total_steps / checkpoint-mode pydantic gates.
+        # total_steps / checkpoint-mode pydantic gates. `--batch-size` is
+        # NOT supplied here: `batch_size` is now a swept axis (suggest_common),
+        # so a CLI override would clobber the per-trial suggested value in the
+        # config merge — exactly what scripts/sweep.py base_args also avoids.
         "--supernet", "tiny", "--variant", "base",
         "--total-steps", "10", "--log-interval", "2",
-        "--no-pgn", "--batch-size", "8", "--seq-len", "32", "--k", "5",
+        "--no-pgn", "--seq-len", "32", "--k", "5",
         "--local-checkpoints",
     ]
     # Must not raise SystemExit (argparse) or ValidationError (pydantic).
@@ -215,6 +227,376 @@ def test_read_best_val_loss_finds_minimum(tmp_path: Path) -> None:
 
 def test_read_best_val_loss_returns_inf_on_no_records(tmp_path: Path) -> None:
     assert _read_best_val_loss(tmp_path) == float("inf")
+
+
+# ---------------------------------------------------------------------------
+# Sweep — restored search-space axes (common hparams + FFN)
+# ---------------------------------------------------------------------------
+
+
+def test_suggest_common_has_v1_training_axes() -> None:
+    """v1 ``suggest_common`` (``git show main:pawn/sweep.py:48-56``) swept
+    ``batch_size`` / ``weight_decay`` / ``warmup_frac`` / ``patience`` on top
+    of ``lr``; the prior v2 suggesters dropped all four. Re-add them — every
+    key is an ``AdapterConfig`` field so it round-trips through ``--config``."""
+    study = optuna.create_study()
+    params = suggest_common(study.ask())
+    assert set(params) == {
+        "lr", "batch_size", "weight_decay", "warmup_frac", "patience",
+    }
+    assert params["batch_size"] in (32, 64, 128, 256)
+    assert 0.0 <= params["weight_decay"] <= 0.1
+    assert 0.0 <= params["warmup_frac"] <= 0.15
+    assert 5 <= params["patience"] <= 20
+
+
+def test_every_strategy_sweeps_common_training_axes() -> None:
+    """Each strategy's space (except ``rosa-ratio``, which v1 deliberately
+    fixes its nuisances) carries the shared ``suggest_common`` axes, not just
+    ``lr`` plus the adapter-specific knobs."""
+    common = {"batch_size", "weight_decay", "warmup_frac", "patience"}
+    for name, suggester in STRATEGY_SUGGESTERS.items():
+        if name == "rosa-ratio":
+            continue  # v1 fixes weight_decay/warmup_frac/patience/batch_size
+        study = optuna.create_study()
+        params = suggester(study.ask(), n_layers=4)
+        assert common <= set(params), f"{name} dropped {common - set(params)}"
+
+
+def test_suggest_lora_sweeps_ffn_axis() -> None:
+    """v1 ``suggest_lora`` swept ``lora_ffn`` (whether LoRA also targets the
+    FFN projections); the field exists on ``AdapterConfig`` but the prior v2
+    suggester never set it."""
+    study = optuna.create_study()
+    params = suggest_lora(study.ask())
+    assert "lora_ffn" in params
+    assert isinstance(params["lora_ffn"], bool)
+
+
+def test_suggest_sparse_sweeps_ffn_axis() -> None:
+    """v1 ``suggest_sparse`` swept ``sparse_ffn``."""
+    study = optuna.create_study()
+    params = suggest_sparse(study.ask())
+    assert "sparse_ffn" in params
+    assert isinstance(params["sparse_ffn"], bool)
+
+
+def test_suggest_bottleneck_sweeps_both_placement_toggles() -> None:
+    """v1 ``suggest_bottleneck`` swept both ``no_adapt_attn`` *and*
+    ``no_adapt_ffn`` as independent booleans; the prior v2 suggester only
+    swept the attn toggle.
+
+    v2's ``BottleneckConfig`` rejects the both-disabled combination
+    (no_adapt_attn=True AND no_adapt_ffn=True) — the bottleneck would touch
+    nothing — whereas v1 tolerated it as a no-op. So the v2 suggester must
+    still emit *both* placement booleans (parity: the placement axis is
+    swept, not just attn) **without** ever producing the invalid
+    both-disabled pair. It samples a single 3-way placement choice; assert
+    both keys are present bools and that at least one site is always adapted
+    across a generous batch of draws (every draw must be a config the v2
+    ``BottleneckConfig`` accepts)."""
+    study = optuna.create_study()
+    seen: set[tuple[bool, bool]] = set()
+    for _ in range(64):
+        params = suggest_bottleneck(study.ask())
+        assert "no_adapt_attn" in params
+        assert "no_adapt_ffn" in params
+        assert isinstance(params["no_adapt_attn"], bool)
+        assert isinstance(params["no_adapt_ffn"], bool)
+        # The v2 invariant the bottleneck guard enforces: never both-disabled.
+        assert not (params["no_adapt_attn"] and params["no_adapt_ffn"])
+        seen.add((params["no_adapt_attn"], params["no_adapt_ffn"]))
+    # Both placement axes are genuinely explored (not a hardcoded constant):
+    # over 64 draws we expect to see the attn-only and ffn-only placements
+    # (which flip each toggle on independently) alongside the both-on default.
+    assert (True, False) in seen  # ffn-only: attn site skipped
+    assert (False, True) in seen  # attn-only: ffn site skipped
+
+
+def test_suggest_unfreeze_registers_single_lr_axis() -> None:
+    """``suggest_unfreeze`` wants a narrower LR band than the common adapter
+    range, but must register exactly ONE Optuna ``lr`` parameter — not the
+    common ``lr`` axis *and* a stray ``unfreeze_lr``.
+
+    The prior code called ``suggest_common`` (registering ``"lr"`` over
+    1e-5..1e-2) and then overwrote ``params["lr"]`` with a second
+    ``trial.suggest_float("unfreeze_lr", ...)``. That left two effects: the
+    common ``"lr"`` axis was sampled-but-discarded (a wasted search dimension
+    feeding the surrogate misleading data), and ``trial.params`` /
+    ``study.best_params`` carried a stray ``"unfreeze_lr"`` key that
+    ``AdapterConfig`` (``extra="forbid"``) later rejects — so the best trial
+    is not reproducible. Assert the Optuna parameter namespace, not just the
+    returned dict (the returned ``params`` dict was correct even with the
+    bug)."""
+    study = optuna.create_study()
+    trial = study.ask()
+    params = suggest_unfreeze(trial, n_layers=4)
+    # The OPTUNA parameter namespace must carry a single `lr` axis and no
+    # stray `unfreeze_lr` — this is what `study.best_params` is built from.
+    assert "lr" in trial.params
+    assert "unfreeze_lr" not in trial.params
+    # And the narrower unfreeze LR band is what got registered under `lr`.
+    assert 1e-6 <= trial.params["lr"] <= 1e-3
+    # The returned dict's `lr` is the same single value (no discarded axis).
+    assert params["lr"] == trial.params["lr"]
+    # All common axes survive under their canonical names.
+    assert {"batch_size", "weight_decay", "warmup_frac", "patience"} <= set(
+        trial.params
+    )
+
+
+def test_unfreeze_suggested_params_reproducible_through_adapter_config() -> None:
+    """The exact dict ``suggest_unfreeze`` returns must round-trip through
+    ``params_to_config_json`` → ``AdapterConfig`` so the best trial can be
+    re-run from its suggested params. A stray ``"unfreeze_lr"`` key — which
+    the previous code leaked into ``trial.params`` and would carry into a
+    reproduction body — makes ``AdapterConfig(extra="forbid")`` reject the
+    config. Build the body exactly as ``AdapterObjective`` does and assert it
+    validates with the narrower unfreeze LR intact."""
+    from pawn.run_config import AdapterConfig
+
+    study = optuna.create_study(direction="minimize")
+    params = suggest_unfreeze(study.ask(), n_layers=4)
+    # `params` is what `AdapterObjective` serialises to the `--config` body.
+    body = params_to_config_json("unfreeze", params)
+    body.update({"local_checkpoints": True, "total_steps": 10})
+    cfg = AdapterConfig(**body)  # extra="forbid" — no stray `unfreeze_lr`
+    assert cfg.strategy == "unfreeze"
+    assert cfg.unfreeze_layers == params["unfreeze_layers"]
+    assert 1e-6 <= cfg.lr <= 1e-3
+
+
+# ---------------------------------------------------------------------------
+# Sweep — pruner factory + streaming val-record reader
+# ---------------------------------------------------------------------------
+
+
+def test_make_pruner_builds_named_pruners() -> None:
+    """``make_pruner`` mirrors v1's pruner switch — median / hyperband /
+    none — so a study can opt into mid-trial pruning (plan §10 S9)."""
+    assert isinstance(make_pruner("median"), optuna.pruners.MedianPruner)
+    assert isinstance(make_pruner("hyperband"), optuna.pruners.HyperbandPruner)
+    assert isinstance(make_pruner("none"), optuna.pruners.NopPruner)
+    with pytest.raises(ValueError, match="unknown pruner"):
+        make_pruner("bogus")
+
+
+def test_scan_val_records_streams_incrementally(tmp_path: Path) -> None:
+    """``_scan_val_records`` tails a growing metrics.jsonl: it returns only
+    the new ``type=val`` ``(step, val_loss)`` rows since the carried byte
+    offset, leaving a trailing partial line for the next poll. This is the
+    primitive that feeds ``AdapterObjective``'s mid-trial ``trial.report``."""
+    jsonl = tmp_path / "metrics.jsonl"
+    jsonl.write_text("\n".join([
+        json.dumps({"type": "config", "slug": "x"}),
+        json.dumps({"type": "train", "step": 1, "loss": 5.0}),
+        json.dumps({"type": "val", "step": 2, "val_loss": 3.0}),
+    ]) + "\n")
+    records, offset = _scan_val_records(jsonl, 0)
+    assert records == [(2, 3.0)]
+    # A second poll with no new data yields nothing and keeps the offset.
+    again, offset2 = _scan_val_records(jsonl, offset)
+    assert again == []
+    assert offset2 == offset
+    # Append a complete record + a trailing *partial* line; only the
+    # complete one is returned and the partial is left for the next poll.
+    with jsonl.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "val", "step": 4, "val_loss": 2.0}) + "\n")
+        fh.write('{"type": "val", "step": 6, "val_loss"')  # no newline
+    records3, offset3 = _scan_val_records(jsonl, offset)
+    assert records3 == [(4, 2.0)]
+    # Finish the partial line; the next poll picks it up exactly once.
+    with jsonl.open("a", encoding="utf-8") as fh:
+        fh.write(": 1.0}\n")
+    records4, _ = _scan_val_records(jsonl, offset3)
+    assert records4 == [(6, 1.0)]
+
+
+def test_scan_val_records_zero_val_loss_not_misread(tmp_path: Path) -> None:
+    """A legitimate ``val_loss=0.0`` must be reported, not dropped as falsy
+    (the same `or`-fallback bug ``_read_best_val_loss`` guards against)."""
+    jsonl = tmp_path / "metrics.jsonl"
+    jsonl.write_text(
+        json.dumps({"type": "val", "step": 1, "val_loss": 0.0, "loss": 9.0})
+        + "\n"
+    )
+    records, _ = _scan_val_records(jsonl, 0)
+    assert records == [(1, 0.0)]
+
+
+# ---------------------------------------------------------------------------
+# Sweep — AdapterObjective mid-trial pruning (no GPU; subprocess stubbed)
+# ---------------------------------------------------------------------------
+
+
+class _StubProc:
+    """Minimal `subprocess.Popen`-shaped stub: it 'runs' by appending val
+    records to the trial's metrics.jsonl across `wait()` polls, so the
+    objective's streaming pruner has data to report without launching a
+    real training subprocess."""
+
+    def __init__(self, jsonl: Path, val_losses: list[float]) -> None:
+        self._jsonl = jsonl
+        self._remaining = list(enumerate(val_losses))
+        self.returncode: int | None = None
+        self.stdout = None
+        self.stderr = None
+        self._jsonl.parent.mkdir(parents=True, exist_ok=True)
+
+    def wait(self, timeout: float | None = None) -> int:
+        # Each poll emits one more val row, then exits when drained.
+        if self._remaining:
+            step, vl = self._remaining.pop(0)
+            with self._jsonl.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps({"type": "val", "step": step, "val_loss": vl})
+                    + "\n"
+                )
+            raise subprocess.TimeoutExpired(cmd="stub", timeout=timeout or 0)
+        self.returncode = 0
+        return 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self._remaining = []  # stop streaming; the next wait() exits cleanly
+        self.returncode = 0
+
+    def kill(self) -> None:
+        self._remaining = []
+        self.returncode = 0
+
+
+def test_adapter_objective_prunes_mid_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E (S9): ``AdapterObjective`` reports each held-out ``val_loss`` to
+    ``trial.report`` *while the subprocess runs* and aborts the subprocess
+    when the study's pruner says ``should_prune()`` — true mid-trial pruning,
+    not a post-hoc parse. A trial whose reported losses are far worse than a
+    completed baseline is pruned before its subprocess finishes.
+
+    No GPU: the training subprocess is stubbed by `_StubProc`, which streams
+    val rows into the trial's metrics.jsonl across poll cycles.
+    """
+    import subprocess as _sp
+
+    logs = tmp_path / "sweep"
+    # Median pruner with no warmup/startup grace so the first bad report can
+    # prune (default MedianPruner needs ≥1 prior completed trial + warmup).
+    study = optuna.create_study(
+        direction="minimize",
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=1, n_warmup_steps=0, interval_steps=1
+        ),
+    )
+
+    metrics_path = logs / "trial_00000" / "run" / "metrics.jsonl"
+
+    def fake_popen(cmd: list[str], **kw: object) -> _StubProc:
+        # The trial's metrics dir is derived from trial.number; trial 0's
+        # logs land under trial_00000/. The first (baseline) trial reports a
+        # good curve; the second reports a bad one and must be pruned.
+        nonlocal metrics_path
+        return _StubProc(metrics_path, fake_popen.curve)  # type: ignore[attr-defined]
+
+    fake_popen.curve = [1.0, 0.9, 0.8, 0.7]  # type: ignore[attr-defined]
+    monkeypatch.setattr(_sp, "Popen", fake_popen)
+
+    obj = AdapterObjective(
+        strategy="lora", base_args=[], logs_dir=logs, poll_interval=0.0,
+    )
+    # Override the suggester so we don't need a real backbone / argparse.
+    monkeypatch.setattr(
+        "pawn.sweep.STRATEGY_SUGGESTERS",
+        {"lora": lambda trial, **_kw: {"lr": trial.suggest_float(
+            "lr", 1e-5, 1e-2, log=True)}},
+    )
+
+    # Trial 0: baseline good curve → completes, value 0.7.
+    trial0 = study.ask()
+    v0 = obj(trial0)
+    study.tell(trial0, v0)
+    assert v0 == pytest.approx(0.7)
+
+    # Trial 1: a strictly-worse curve. Point the stub at trial 1's dir and
+    # feed losses well above the baseline median so the pruner fires.
+    metrics_path = logs / "trial_00001" / "run" / "metrics.jsonl"
+    fake_popen.curve = [9.0, 9.0, 9.0, 9.0]  # type: ignore[attr-defined]
+    trial1 = study.ask()
+    with pytest.raises(optuna.TrialPruned):
+        obj(trial1)
+
+
+def test_adapter_objective_does_not_deadlock_on_chatty_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: ``AdapterObjective`` must drive a real subprocess that
+    writes FAR more than one OS pipe buffer (~64 KB) of stdout/stderr without
+    dead-locking.
+
+    A previous revision launched the trial with ``stdout=PIPE/stderr=PIPE``
+    and never read either stream during the poll loop (it only read stderr
+    *after* the loop). Once the trainer's XLA/JAX log chatter filled the pipe
+    buffer the child blocked on ``write()``, stopped flushing val records, and
+    the trial hung forever (default ``timeout=None`` gave no deadline either).
+    This test runs a real Python subprocess that prints ~512 KB to stdout +
+    stderr *and then* writes a val record — far past the buffer limit — so a
+    PIPE-without-drain implementation would hang here. The fix redirects the
+    child's output to a per-trial file, which never blocks the writer.
+
+    No GPU / training involved: the 'trainer' is a tiny inline Python script.
+    """
+    logs = tmp_path / "sweep"
+    trial_logs = logs / "trial_00000"
+    trial_logs.mkdir(parents=True, exist_ok=True)  # `__call__` makes this in prod
+    metrics = trial_logs / "run" / "metrics.jsonl"
+    # A standalone trainer stand-in: spew >64 KB to stdout and stderr, then
+    # write a single val record to the metrics path the objective tails.
+    script = tmp_path / "chatty_trainer.py"
+    script.write_text(
+        "import sys, json, pathlib\n"
+        f"p = pathlib.Path({str(metrics)!r})\n"
+        "p.parent.mkdir(parents=True, exist_ok=True)\n"
+        # ~512 KB each — well past the ~64 KB pipe buffer.
+        "blob = 'x' * 1024\n"
+        "for _ in range(512):\n"
+        "    sys.stdout.write(blob + '\\n'); sys.stderr.write(blob + '\\n')\n"
+        "sys.stdout.flush(); sys.stderr.flush()\n"
+        "p.write_text(json.dumps({'type': 'val', 'step': 1, "
+        "'val_loss': 0.5}) + '\\n')\n"
+    )
+
+    obj = AdapterObjective(
+        strategy="lora",
+        base_args=[],
+        logs_dir=logs,
+        poll_interval=0.05,
+        timeout=120.0,  # finite ceiling — a wedged child can't hang the study
+    )
+    # Drive `_run_with_pruning` directly against our chatty script (no real
+    # backbone / argparse): override `__call__` to invoke the script and tail
+    # the trial's metrics.jsonl exactly as the real objective would.
+    monkeypatch.setattr(
+        AdapterObjective,
+        "__call__",
+        lambda self, trial: self._run_with_pruning(
+            trial, [sys.executable, str(script)], trial_logs
+        ),
+    )
+
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    # If the implementation PIPE-deadlocks, this call never returns and the
+    # test times out at the suite level; on the file-redirect path it returns
+    # the val_loss the chatty script emitted.
+    value = obj(trial)
+    assert value == pytest.approx(0.5)
+    # The captured chatter landed in the per-trial log file (proving it was
+    # redirected to a file, not silently dropped or piped).
+    log_text = (trial_logs / "subprocess.log").read_text()
+    assert len(log_text) > 64 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +639,10 @@ def _run_tiny_sweep(strategy: str, logs_dir: Path, n_trials: int = 2) -> float:
         "--supernet", "tiny", "--variant", "small",
         "--checkpoint", str(ckpt),
         "--total-steps", "10", "--log-interval", "2",
-        "--no-pgn", "--batch-size", "8", "--seq-len", "32", "--k", "5",
+        # `--batch-size` is swept (suggest_common), so it is supplied via the
+        # per-trial config, not hardcoded here (a CLI override would clobber
+        # the swept value).
+        "--no-pgn", "--seq-len", "32", "--k", "5",
         "--local-checkpoints",
     ]
     obj = AdapterObjective(
@@ -283,6 +668,153 @@ def test_tiny_sweep_yields_finite_best_value(
     import math
 
     assert math.isfinite(best), f"{strategy}: best_value not finite: {best}"
+
+
+# ---------------------------------------------------------------------------
+# Sweep — InProcessRoSAObjective (real 3-phase in-process trainer; GPU-only)
+# ---------------------------------------------------------------------------
+
+
+def _tiny_rosa_objective(strategy: str) -> "InProcessRoSAObjective":
+    """Build an `InProcessRoSAObjective` over a TINY_SUPERNET backbone + small
+    random-game train/val corpora — the in-process variant that loads the
+    backbone + data once and runs RoSA's 3 phases per trial."""
+    from pawn.config import TINY_SUPERNET
+    from pawn.corpus import generate_corpus
+    from pawn.model import init_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    seq = 64
+    train = generate_corpus(64, max_ply=seq, seq_len=seq, seed=1)
+    val = generate_corpus(32, max_ply=seq, seq_len=seq, seed=2)
+    return InProcessRoSAObjective(
+        strategy, backbone, train, val,
+        epochs=2, steps_per_epoch=4, val_batches=2,
+    )
+
+
+def test_inprocess_rosa_rejects_non_rosa_strategy() -> None:
+    """The in-process objective only drives the RoSA strategy family
+    (v1 ``_supported``); a non-RoSA strategy is a constructor error."""
+    from typing import cast
+
+    from pawn.corpus import Corpus
+    from pawn.model import PAWNModel
+
+    # The strategy guard raises before any backbone/corpus field is read, so
+    # placeholder objects suffice; `cast` keeps the call type-correct without
+    # paying to build a real backbone + corpora for a pure-validation test.
+    dummy = object()
+    with pytest.raises(ValueError, match="does not support strategy"):
+        InProcessRoSAObjective(
+            "lora",
+            cast(PAWNModel, dummy),
+            cast(Corpus, dummy),
+            cast(Corpus, dummy),
+        )
+
+
+@pytest.mark.parametrize("strategy", ["rosa", "rosa-retro-bottleneck"])
+def test_inprocess_rosa_yields_finite_best_value(
+    strategy: str, tmp_path: Path
+) -> None:
+    """Behavioral: a 2-trial in-process RoSA sweep runs the full Phase
+    1→2→3 schedule per trial and returns a finite `best_value` (the backbone
+    + corpora are loaded once and shared). Proves the objective is a real
+    trainer, not a dispatch shim."""
+    _gpu_only()
+    import math
+
+    obj = _tiny_rosa_objective(strategy)
+    study = optuna.create_study(
+        direction="minimize", pruner=optuna.pruners.NopPruner()
+    )
+    study.optimize(obj, n_trials=2)
+    assert math.isfinite(study.best_value), study.best_value
+
+
+def test_inprocess_rosa_reports_and_prunes_mid_trial() -> None:
+    """Behavioral: the in-process objective feeds each Phase-3 epoch's
+    held-out `val_loss` to `trial.report` and aborts the trial on
+    `should_prune()` (plan §10 S9; v1 parity). A pruner that always prunes
+    raises `TrialPruned`, and the pruner's `prune` hook is observed to have
+    been consulted with a recorded intermediate value — distinguishing real
+    mid-trial pruning from a post-hoc result parse."""
+    _gpu_only()
+
+    class _AlwaysPrune(optuna.pruners.BasePruner):
+        consulted_intermediates: list[dict[int, float]] = []
+
+        def prune(self, study: optuna.Study, trial: object) -> bool:
+            # `trial` here is a FrozenTrial carrying the intermediate values
+            # reported so far; record them so the test can assert the
+            # objective reported a val_loss before pruning fired.
+            values = getattr(trial, "intermediate_values", {})
+            _AlwaysPrune.consulted_intermediates.append(dict(values))
+            return True
+
+    obj = _tiny_rosa_objective("rosa")
+    study = optuna.create_study(direction="minimize", pruner=_AlwaysPrune())
+    with pytest.raises(optuna.TrialPruned):
+        obj(study.ask())
+    # `prune` is only reachable via `trial.should_prune()`, which the
+    # objective calls right after `trial.report(val_loss, epoch)` — so a
+    # recorded epoch-0 intermediate proves the report→should_prune path ran.
+    assert _AlwaysPrune.consulted_intermediates, "pruner never consulted"
+    assert 0 in _AlwaysPrune.consulted_intermediates[0]
+
+
+def test_inprocess_rosa_forwards_max_grad_norm_to_optimizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behavioral: the constructor's `max_grad_norm` reaches the optimizer.
+
+    `_train_phases` builds `make_optimizer(sched_cfg, schedule)` and the
+    clip threshold is `sched_cfg.max_grad_norm` (`make_optimizer` reads
+    `cfg.max_grad_norm`). A non-default `max_grad_norm` passed to the
+    objective must therefore appear on the `BaseRunConfig` handed to
+    `make_optimizer` — the earlier code stored the arg but built the cfg
+    without it, so every in-process RoSA trial silently clipped at the
+    `BaseRunConfig` default (1.0) regardless of the caller's value.
+    """
+    _gpu_only()
+    import optax
+
+    import pawn.trainer as trainer_mod
+    from pawn.run_config import BaseRunConfig
+
+    captured: list[float] = []
+    real_make_optimizer = trainer_mod.make_optimizer
+
+    def spy_make_optimizer(
+        cfg: BaseRunConfig, schedule: optax.Schedule
+    ) -> optax.GradientTransformation:
+        captured.append(cfg.max_grad_norm)
+        return real_make_optimizer(cfg, schedule)
+
+    monkeypatch.setattr(trainer_mod, "make_optimizer", spy_make_optimizer)
+
+    from pawn.config import TINY_SUPERNET
+    from pawn.corpus import generate_corpus
+    from pawn.model import init_model
+
+    backbone = init_model(TINY_SUPERNET, key=0)
+    seq = 64
+    train = generate_corpus(64, max_ply=seq, seq_len=seq, seed=1)
+    val = generate_corpus(32, max_ply=seq, seq_len=seq, seed=2)
+    obj = InProcessRoSAObjective(
+        "rosa", backbone, train, val,
+        epochs=1, steps_per_epoch=4, val_batches=2,
+        max_grad_norm=0.5,
+    )
+    study = optuna.create_study(
+        direction="minimize", pruner=optuna.pruners.NopPruner()
+    )
+    study.optimize(obj, n_trials=1)
+    assert captured, "make_optimizer was never called"
+    # Every cfg `make_optimizer` saw must carry the custom threshold, not
+    # the BaseRunConfig default (1.0).
+    assert all(v == 0.5 for v in captured), captured
 
 
 # ---------------------------------------------------------------------------

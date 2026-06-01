@@ -68,6 +68,39 @@ These v1 surfaces are intentionally absent from v2 and will not return:
   (parity #3) routes the old name through to a clear ImportError so
   stale imports fail loudly rather than picking up a near-namesake.
 
+  ### Multi-GPU sweep trial pinning (`n_gpus` / `CUDA_VISIBLE_DEVICES`)
+  **Section:** sweeps (workstream revision; uncommitted)
+  **Reason:** nonsensical under the v2 execution model. v1's
+  `AdapterObjective` took an `n_gpus` constructor param and, when
+  `n_gpus > 1`, pinned each trial's training subprocess to a distinct
+  device by setting `env["CUDA_VISIBLE_DEVICES"] = str(trial.number %
+  n_gpus)` before `subprocess.run` (`git show
+  main:pawn/sweep.py:392-396`). That round-robin presupposes (a) a
+  multi-GPU host and (b) NVIDIA/CUDA device selection via
+  `CUDA_VISIBLE_DEVICES`. v2 is a single-device JAX/Equinox stack on a
+  ROCm (AMD) box: there is exactly one `RocmDevice(id=0)` to assign, so a
+  `trial.number % n_gpus` partition collapses to a single device and the
+  env var is the wrong knob anyway (ROCm honours
+  `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES`, not
+  `CUDA_VISIBLE_DEVICES`). Pinning N trials to N devices is a
+  parallelism feature, not a behavioral-parity one — and there is no
+  second device to parallelise across. The `InProcessRoSAObjective`
+  path is doubly inapplicable: it runs every trial in **one** process
+  sharing a single backbone on a single device, so per-trial device
+  affinity is meaningless there.
+  **What was supposed to happen:** v1 spread subprocess trials across a
+  multi-GPU host by env-var device pinning.
+  **What I did instead:** `AdapterObjective` runs trials sequentially on
+  the single resolved JAX device; it carries no `n_gpus` field and sets
+  no `*_VISIBLE_DEVICES` env var. Trials still isolate cleanly via
+  separate processes + per-trial log dirs; they just don't fan out
+  across devices that don't exist.
+  **To revisit when:** v2 is deployed on a genuine multi-accelerator
+  host AND a parallel-trial sweep is wanted. The reinstated knob would
+  set `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` (or
+  `jax.distributed` device assignment), not `CUDA_VISIBLE_DEVICES` — a
+  new device-fan-out feature, not a verbatim v1 port.
+
 ## Explicit follow-ups (tracked, time-bounded)
 
 These are intentional follow-ups — outside the parity scope as
