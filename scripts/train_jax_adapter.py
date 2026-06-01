@@ -51,11 +51,14 @@ from pawn.lichess_data import (
     make_epoch_schedule,
 )
 from pawn.lifecycle import (
+    HFBucketTracker,
     HFPushTracker,
     build_training_state,
+    drain_bucket_queue,
     drain_push_queue,
     install_sigterm_handler,
     push_checkpoint_async,
+    push_to_bucket_async,
     read_resume_rng_blocks,
     write_schedule_health,
 )
@@ -558,6 +561,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                     help="use random-game corpus instead of Lichess parquet")
     ap.add_argument("--local-checkpoints", action="store_true")
     ap.add_argument("--hf-repo", default=None)
+    # v1-faithful bucket autosave (wired through
+    # `pawn.lifecycle.HFBucketTracker`); mutually compatible with
+    # `--hf-repo` / `--local-checkpoints`. Syncs to
+    # `<bucket>/logs/<run_slug>/...` via `hf sync`.
+    ap.add_argument("--hf-bucket", default=None,
+                    help="HF bucket autosave target (namespace/bucket or "
+                         "hf://buckets/... URL)")
     ap.add_argument("--resume", type=Path, default=None,
                     help="resume from an adapter_step_<N> checkpoint dir. "
                          "Bottleneck and FiLM adapters automatically detect "
@@ -895,7 +905,19 @@ def main(argv: list[str] | None = None) -> int:
             run_dir_name=logger.run_dir.name,
         )
 
-    push_tracker = HFPushTracker(repo_id=cfg.hf_repo) if cfg.hf_repo else None
+    # Pushes land on the per-run isolation branch `run/<slug>` (CLAUDE.md
+    # squash-merge workflow), not the default `main`.
+    push_tracker = (
+        HFPushTracker(repo_id=cfg.hf_repo, branch=f"run/{logger.slug}")
+        if cfg.hf_repo
+        else None
+    )
+    # v1-faithful bucket autosave (mutually compatible with `push_tracker`).
+    bucket_tracker = (
+        HFBucketTracker(bucket=cfg.hf_bucket, run_slug=logger.slug)
+        if cfg.hf_bucket
+        else None
+    )
     should_shutdown = install_sigterm_handler()
 
     # Steps already persisted this run. A best-val eval (`_on_val`) and the
@@ -965,7 +987,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         saved_steps.add(step_int)
         if push_tracker:
-            push_checkpoint_async(out, push_tracker)
+            push_checkpoint_async(
+                out, push_tracker,
+                metrics_path=logger.metrics_path, step=step_int,
+            )
+        if bucket_tracker:
+            push_to_bucket_async(
+                out, bucket_tracker,
+                metrics_path=logger.metrics_path, step=step_int,
+            )
 
     # B2 / plan §8.3: consume the previously-inert cadence/sampling knobs
     # (``epochs`` / ``steps_per_epoch`` / ``data_seed`` / ``val_every``) via
@@ -1413,6 +1443,9 @@ def main(argv: list[str] | None = None) -> int:
         # failure that doesn't need the abandon-thread path.
         timeouts, _errors = drain_push_queue(push_tracker, timeout=300.0)
         push_tracker.shutdown(drain_succeeded=(timeouts == 0))
+    if bucket_tracker:
+        b_timeouts, _b_errors = drain_bucket_queue(bucket_tracker, timeout=300.0)
+        bucket_tracker.shutdown(drain_succeeded=(b_timeouts == 0))
     logger.close()
     return 0
 

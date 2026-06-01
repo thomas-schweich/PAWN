@@ -20,20 +20,26 @@ import pytest
 from pawn.checkpoint import save_model
 from pawn.config import TINY_SUPERNET
 from pawn.lifecycle import (
+    HFBucketTracker,
     HFPushTracker,
     SCHEDULES_THAT_REACH_ZERO,
     _reset_shutdown_state_for_tests,
     build_training_state,
     deserialize_jax_key,
     deserialize_numpy_rng,
+    drain_bucket_queue,
     drain_push_queue,
+    find_best_step,
     install_sigterm_handler,
     load_resume_state,
     push_checkpoint_async,
+    push_to_bucket_async,
+    read_resume_best_checkpoint,
     read_resume_data_anchor,
     read_resume_rng_blocks,
     serialize_jax_key,
     serialize_numpy_rng,
+    truncate_metrics_jsonl,
     write_schedule_health,
 )
 from pawn.model import init_model
@@ -74,9 +80,356 @@ def test_push_checkpoint_async_enqueues_upload(tmp_path: Path) -> None:
         call = _FakeHfApi.calls[0]
         assert call["repo_id"] == "ns/test"
         assert call["revision"] == "run/test"
-        assert call["path_in_repo"] == "step_00000010"
+        # The checkpoint lands under `checkpoints/<step>` on the per-run
+        # branch (v1 `push_checkpoint_to_hf` layout — the published metrics
+        # view sits at the branch root, the checkpoints in a subtree).
+        assert call["path_in_repo"] == "checkpoints/step_00000010"
     finally:
         tracker.shutdown()
+
+
+class _RecordingHfApi:
+    """Test double recording both `upload_folder` and `upload_file` plus
+    `create_branch` — for the metrics-co-upload + branch-creation paths."""
+
+    def __init__(self) -> None:
+        # Class-level call logs so the helper can be passed as the
+        # `upload_cls` (which `push_checkpoint_async` instantiates).
+        pass
+
+    folder_calls: list[dict] = []
+    file_calls: list[dict] = []
+    branch_calls: list[dict] = []
+
+    def create_branch(self, **kwargs: Any) -> None:
+        _RecordingHfApi.branch_calls.append(kwargs)
+
+    def upload_folder(self, **kwargs: Any) -> None:
+        _RecordingHfApi.folder_calls.append(kwargs)
+
+    def upload_file(self, **kwargs: Any) -> None:
+        # Record the *content* of the uploaded metrics file so the test
+        # can assert truncation, not just that an upload happened.
+        rec = dict(kwargs)
+        path = kwargs.get("path_or_fileobj")
+        if isinstance(path, str) and Path(path).exists():
+            rec["_content"] = Path(path).read_text(encoding="utf-8")
+        _RecordingHfApi.file_calls.append(rec)
+
+
+def test_push_checkpoint_async_creates_branch_and_couploads_metrics(
+    tmp_path: Path,
+) -> None:
+    """The HF push creates the per-run branch (exist_ok) and co-uploads a
+    `metrics.jsonl` truncated to the checkpoint's step, to the branch root.
+
+    Pins ckpt-hf-branch-regression (per-run branch + create_branch) and
+    ckpt-hf-metrics-not-pushed (metrics co-upload) together.
+    """
+    _RecordingHfApi.folder_calls = []
+    _RecordingHfApi.file_calls = []
+    _RecordingHfApi.branch_calls = []
+    ckpt = tmp_path / "step_00000100"
+    ckpt.mkdir()
+    (ckpt / "model.safetensors").write_bytes(b"x")
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        '{"type": "train", "step": 50, "loss": 1.0}\n'
+        '{"type": "val", "step": 100, "val/loss": 0.9}\n'
+        '{"type": "train", "step": 150, "loss": 0.8}\n',  # beyond step 100
+        encoding="utf-8",
+    )
+    tracker = HFPushTracker(repo_id="ns/test", branch="run/slug-1")
+    try:
+        push_checkpoint_async(
+            ckpt, tracker,
+            metrics_path=metrics, step=100,
+            upload_cls=_RecordingHfApi,
+        )
+        timeouts, errors = drain_push_queue(tracker, timeout=5.0)
+        assert (timeouts, errors) == (0, 0)
+        # Branch created on the per-run isolation branch.
+        assert len(_RecordingHfApi.branch_calls) == 1
+        assert _RecordingHfApi.branch_calls[0]["branch"] == "run/slug-1"
+        assert _RecordingHfApi.branch_calls[0]["exist_ok"] is True
+        # Checkpoint uploaded under checkpoints/<step> on that branch.
+        assert len(_RecordingHfApi.folder_calls) == 1
+        fc = _RecordingHfApi.folder_calls[0]
+        assert fc["revision"] == "run/slug-1"
+        assert fc["path_in_repo"] == "checkpoints/step_00000100"
+        # metrics.jsonl co-uploaded to the branch root, truncated at step 100
+        # (the step-150 train record is dropped).
+        assert len(_RecordingHfApi.file_calls) == 1
+        mc = _RecordingHfApi.file_calls[0]
+        assert mc["path_in_repo"] == "metrics.jsonl"
+        assert mc["revision"] == "run/slug-1"
+        content = mc["_content"]
+        assert '"step": 50' in content
+        assert '"step": 100' in content
+        assert '"step": 150' not in content
+    finally:
+        tracker.shutdown()
+
+
+def test_push_checkpoint_async_step_defaults_to_dir_name(
+    tmp_path: Path,
+) -> None:
+    """When `step` is omitted, it's parsed from the `step_NNNN` dir name so
+    the metrics truncation boundary is still correct."""
+    _RecordingHfApi.folder_calls = []
+    _RecordingHfApi.file_calls = []
+    _RecordingHfApi.branch_calls = []
+    ckpt = tmp_path / "adapter_step_00000042"
+    ckpt.mkdir()
+    (ckpt / "model.safetensors").write_bytes(b"x")
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        '{"type": "val", "step": 42, "val_loss": 0.5}\n'
+        '{"type": "val", "step": 99, "val_loss": 0.4}\n',
+        encoding="utf-8",
+    )
+    tracker = HFPushTracker(repo_id="ns/test", branch="run/x")
+    try:
+        push_checkpoint_async(
+            ckpt, tracker, metrics_path=metrics, upload_cls=_RecordingHfApi
+        )
+        drain_push_queue(tracker, timeout=5.0)
+        assert _RecordingHfApi.folder_calls[0]["path_in_repo"] == (
+            "checkpoints/adapter_step_00000042"
+        )
+        content = _RecordingHfApi.file_calls[0]["_content"]
+        assert '"step": 42' in content
+        assert '"step": 99' not in content  # truncated at the parsed step 42
+    finally:
+        tracker.shutdown()
+
+
+def test_truncate_metrics_jsonl_inclusive_boundary(tmp_path: Path) -> None:
+    """`truncate_metrics_jsonl` keeps train+val pairs at the boundary step
+    and stops before the first record beyond it; malformed / config lines
+    pass through (v1 parity)."""
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        '{"type": "config", "x": 1}\n'
+        '{"type": "train", "step": 100, "loss": 1.0}\n'
+        '{"type": "val", "step": 100, "val/loss": 0.9}\n'
+        'not json\n'
+        '{"type": "train", "step": 200, "loss": 0.5}\n',
+        encoding="utf-8",
+    )
+    out = truncate_metrics_jsonl(metrics, 100)
+    assert '"type": "config"' in out
+    assert '"step": 100' in out
+    # Malformed lines pass through verbatim (they don't gate the boundary);
+    # the `not json` line sits before the first record beyond step 100, so
+    # it's retained, while the step-200 record stops the scan.
+    assert "not json" in out
+    assert '"step": 200' not in out
+
+
+# ---------------------------------------------------------------------------
+# HFBucketTracker
+# ---------------------------------------------------------------------------
+
+
+def test_push_to_bucket_async_syncs_with_run_slug_layout(
+    tmp_path: Path,
+) -> None:
+    """The bucket push enqueues a sync carrying the bucket, run_slug, the
+    checkpoint dir, the metrics path, and the parsed step. This is the
+    blocker fix: a bucket-targeted run actually pushes something.
+    """
+    calls: list[dict] = []
+
+    def _fake_sync(
+        ckpt_dir: Path, bucket: str, *, run_slug: str,
+        metrics_path: Path | None, step: int,
+    ) -> None:
+        calls.append({
+            "ckpt_dir": ckpt_dir, "bucket": bucket, "run_slug": run_slug,
+            "metrics_path": metrics_path, "step": step,
+        })
+
+    ckpt = tmp_path / "step_00000010"
+    ckpt.mkdir()
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text("{}\n", encoding="utf-8")
+    tracker = HFBucketTracker(bucket="ns/bkt", run_slug="my-slug")
+    try:
+        push_to_bucket_async(
+            ckpt, tracker, metrics_path=metrics, sync_fn=_fake_sync
+        )
+        timeouts, errors = drain_bucket_queue(tracker, timeout=5.0)
+        assert (timeouts, errors) == (0, 0)
+        assert len(calls) == 1
+        assert calls[0]["bucket"] == "ns/bkt"
+        assert calls[0]["run_slug"] == "my-slug"
+        assert calls[0]["step"] == 10  # parsed from step_00000010
+        assert calls[0]["metrics_path"] == metrics
+    finally:
+        tracker.shutdown()
+
+
+def test_push_to_bucket_async_failures_dont_raise(tmp_path: Path) -> None:
+    """A failing bucket sync is counted as an error, not raised — training
+    keeps going (same posture as the HF-repo path)."""
+
+    def _failing_sync(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("hf sync exploded")
+
+    ckpt = tmp_path / "step_00000010"
+    ckpt.mkdir()
+    tracker = HFBucketTracker(bucket="ns/bkt", run_slug="s")
+    try:
+        push_to_bucket_async(ckpt, tracker, sync_fn=_failing_sync)
+        timeouts, errors = drain_bucket_queue(tracker, timeout=5.0)
+        assert (timeouts, errors) == (0, 1)
+    finally:
+        tracker.shutdown()
+
+
+def test_push_checkpoint_to_bucket_builds_url_and_runs_hf_sync(
+    tmp_path: Path,
+) -> None:
+    """`push_checkpoint_to_bucket` stages the checkpoint + truncated metrics
+    under the run-slug subtree and shells out to `hf sync <staging>
+    <bucket-url>/logs/<run_slug>` (v1 bucket layout)."""
+    ckpt = tmp_path / "step_00000005"
+    ckpt.mkdir()
+    (ckpt / "model.safetensors").write_bytes(b"x")
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        '{"type": "val", "step": 5, "val_loss": 1.0}\n'
+        '{"type": "val", "step": 9, "val_loss": 0.5}\n',
+        encoding="utf-8",
+    )
+    captured: dict[str, Any] = {}
+
+    class _Result:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def _fake_run(cmd: list[str], **_kw: Any) -> "_Result":
+        captured["cmd"] = cmd
+        # Inspect the staged tree the CLI would sync.
+        staging = Path(cmd[2])
+        ckpt_dst = staging / "checkpoints" / "step_00000005"
+        captured["ckpt_staged"] = ckpt_dst.exists()
+        captured["metrics_content"] = (
+            (staging / "metrics.jsonl").read_text(encoding="utf-8")
+        )
+        return _Result()
+
+    from pawn.lifecycle import push_checkpoint_to_bucket
+
+    with mock.patch("subprocess.run", _fake_run):
+        push_checkpoint_to_bucket(
+            ckpt, "ns/bkt", run_slug="my-slug", metrics_path=metrics, step=5
+        )
+    cmd = captured["cmd"]
+    assert cmd[0:2] == ["hf", "sync"]
+    assert cmd[3] == "hf://buckets/ns/bkt/logs/my-slug"
+    assert captured["ckpt_staged"] is True
+    # Metrics truncated at step 5 — the step-9 record is dropped.
+    assert '"step": 5' in captured["metrics_content"]
+    assert '"step": 9' not in captured["metrics_content"]
+
+
+def test_push_checkpoint_to_bucket_raises_on_nonzero_exit() -> None:
+    """A non-zero `hf sync` exit surfaces as a RuntimeError so the tracker
+    counts it as a failed push."""
+
+    class _Result:
+        returncode = 1
+        stdout = ""
+        stderr = "permission denied"
+
+    def _fake_run(cmd: list[str], **_kw: Any) -> "_Result":
+        return _Result()
+
+    from pawn.lifecycle import push_checkpoint_to_bucket
+
+    with mock.patch("subprocess.run", _fake_run):
+        with pytest.raises(RuntimeError, match="hf sync exited 1"):
+            push_checkpoint_to_bucket(
+                Path("/nonexistent"), "ns/bkt", run_slug="s"
+            )
+
+
+def test_push_checkpoint_to_bucket_raises_on_auth_signal_despite_exit_0() -> (
+    None
+):
+    """`hf sync` exits 0 even on per-blob 403/401/429 — the wrapper
+    re-greps the output and raises so the failure isn't silent (v1 parity)."""
+
+    class _Result:
+        returncode = 0
+        stdout = "uploading...\nblob foo: 403 Forbidden\n"
+        stderr = ""
+
+    def _fake_run(cmd: list[str], **_kw: Any) -> "_Result":
+        return _Result()
+
+    from pawn.lifecycle import push_checkpoint_to_bucket
+
+    with mock.patch("subprocess.run", _fake_run):
+        with pytest.raises(RuntimeError, match="auth / quota / rate-limit"):
+            push_checkpoint_to_bucket(
+                Path("/nonexistent"), "ns/bkt", run_slug="s"
+            )
+
+
+# ---------------------------------------------------------------------------
+# find_best_step (best-checkpoint selection)
+# ---------------------------------------------------------------------------
+
+
+def test_find_best_step_pretrain_schema(tmp_path: Path) -> None:
+    """Pretrain val records carry `val/loss`; `find_best_step` returns the
+    step with the lowest one (ties to the earliest)."""
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        '{"type": "train", "step": 100, "loss": 5.0}\n'
+        '{"type": "val", "step": 100, "val/loss": 2.0}\n'
+        '{"type": "val", "step": 200, "val/loss": 1.0}\n'
+        '{"type": "val", "step": 300, "val/loss": 1.5}\n',
+        encoding="utf-8",
+    )
+    assert find_best_step(metrics) == 200
+
+
+def test_find_best_step_adapter_schema(tmp_path: Path) -> None:
+    """Adapter val records carry `val_loss`; `find_best_step` reads it too."""
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        '{"type": "val", "step": 10, "val_loss": 0.9}\n'
+        '{"type": "val", "step": 20, "val_loss": 0.3}\n'
+        '{"type": "val", "step": 30, "val_loss": 0.3}\n',  # tie — earlier wins
+        encoding="utf-8",
+    )
+    assert find_best_step(metrics) == 20
+
+
+def test_find_best_step_none_when_no_val_records(tmp_path: Path) -> None:
+    """No `type=val` record (validation disabled) → None."""
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        '{"type": "train", "step": 1, "loss": 1.0}\n', encoding="utf-8"
+    )
+    assert find_best_step(metrics) is None
+    assert find_best_step(tmp_path / "missing.jsonl") is None
+
+
+def test_find_best_step_skips_non_finite(tmp_path: Path) -> None:
+    """A NaN-sanitised (null) loss is skipped, not treated as -inf."""
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        '{"type": "val", "step": 10, "val/loss": null}\n'
+        '{"type": "val", "step": 20, "val/loss": 0.7}\n',
+        encoding="utf-8",
+    )
+    assert find_best_step(metrics) == 20
 
 
 def test_push_checkpoint_async_failures_dont_raise(tmp_path: Path) -> None:
@@ -449,6 +802,15 @@ def test_install_sigterm_handler_is_idempotent() -> None:
     assert count["n"] == 1
 
 
+# Note: the end-to-end subprocess SIGTERM test (kill a real
+# `scripts/train_jax.py` mid-run, assert exit 0 + a `.complete` checkpoint)
+# lives in `tests/scripts/test_train_jax_smoke.py::
+# test_train_jax_sigterm_saves_final_checkpoint` — it drives the actual
+# training loop's graceful save/push/exit dance, which is the faithful
+# realization of the `ckpt-sigterm-no-subprocess-test` item. The tests above
+# pin the handler's in-process contract (flag flip + idempotent callback).
+
+
 # ---------------------------------------------------------------------------
 # load_resume_state
 # ---------------------------------------------------------------------------
@@ -807,3 +1169,92 @@ def test_load_resume_state_restores_persisted_jax_key(tmp_path: Path) -> None:
     assert bool(
         (jax.random.key_data(state.key) == jax.random.key_data(saved_key)).all()
     )
+
+
+# ---------------------------------------------------------------------------
+# Best-checkpoint / early-stop anchor resume round-trip
+# (v1 CLMTrainer.load_state parity — patience must survive --resume)
+# ---------------------------------------------------------------------------
+
+
+def test_read_resume_best_checkpoint_round_trips(tmp_path: Path) -> None:
+    """The `best_checkpoint` block `_save_checkpoint` persists (best val
+    loss, the step that achieved it, the best late-game legality, and the
+    running patience counter) is recovered intact by
+    `read_resume_best_checkpoint`.
+
+    This is the v1 `CLMTrainer.load_state` parity guard: a `--patience N`
+    run SIGTERM-paused near convergence and resumed must keep its
+    no-improvement budget instead of resetting it to 0, which would defeat
+    early stopping indefinitely across chunked / preemptible-pod runs.
+
+    `best_late_legality` is the *second* compound early-stop leg
+    (main:pawn/trainer.py:1319/1345-1346). It must survive the round trip:
+    if it reset to 0.0, the first post-resume val (essentially always
+    carrying a positive late legality) would spuriously beat the reset best,
+    register as an improvement, and clobber the restored patience_counter
+    back to 0 — defeating the loss-leg restoration via the legality leg.
+    """
+    # The block shape mirrors `scripts/train_jax.py:_save_checkpoint`.
+    state = build_training_state(
+        step=500,
+        extra={
+            "best_checkpoint": {
+                "best_val_loss": 1.2345,
+                "best_val_step": 300,
+                "best_late_legality": 0.9876,
+                "patience_counter": 2,
+            }
+        },
+    )
+    out_dir = tmp_path / "step_00000500"
+    save_model(init_model(TINY_SUPERNET, key=0), out_dir, training_state=state)
+    best_val_loss, best_val_step, best_late_legality, patience_counter = (
+        read_resume_best_checkpoint(out_dir)
+    )
+    assert best_val_loss == pytest.approx(1.2345)
+    assert best_val_step == 300
+    assert best_late_legality == pytest.approx(0.9876)
+    assert patience_counter == 2
+
+
+def test_read_resume_best_checkpoint_null_best_maps_to_sentinels(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint saved before any val record (null persisted best) maps
+    back to the trainer's inf / -1 / 0.0 init sentinels so a fresh resume is
+    indistinguishable from a cold start — but a non-zero patience counter
+    still survives."""
+    state = build_training_state(
+        step=10,
+        extra={
+            "best_checkpoint": {
+                "best_val_loss": None,
+                "best_val_step": None,
+                "best_late_legality": None,
+                "patience_counter": 0,
+            }
+        },
+    )
+    out_dir = tmp_path / "step_00000010"
+    save_model(init_model(TINY_SUPERNET, key=0), out_dir, training_state=state)
+    best_val_loss, best_val_step, best_late_legality, patience_counter = (
+        read_resume_best_checkpoint(out_dir)
+    )
+    assert best_val_loss == float("inf")
+    assert best_val_step == -1
+    assert best_late_legality == 0.0
+    assert patience_counter == 0
+
+
+def test_read_resume_best_checkpoint_falls_back_when_absent(
+    tmp_path: Path,
+) -> None:
+    """Older checkpoints written before the `best_checkpoint` anchor existed
+    yield (inf, -1, 0.0, 0) so the patience clock starts from scratch — the
+    safe, documented fallback rather than a crash."""
+    out_dir = tmp_path / "step_00000010"
+    save_model(
+        init_model(TINY_SUPERNET, key=0), out_dir, training_state={"step": 10},
+    )
+    assert read_resume_best_checkpoint(out_dir) == (float("inf"), -1, 0.0, 0)

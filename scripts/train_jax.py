@@ -40,12 +40,16 @@ from pawn.corpus import Corpus, generate_corpus
 from pawn.eval import compute_val_metrics
 from pawn.jax_setup import require_accelerator, resolve_device, setup_jax_caching
 from pawn.lifecycle import (
+    HFBucketTracker,
     HFPushTracker,
     build_training_state,
+    drain_bucket_queue,
     drain_push_queue,
     install_sigterm_handler,
     load_resume_state,
     push_checkpoint_async,
+    push_to_bucket_async,
+    read_resume_best_checkpoint,
     read_resume_data_anchor,
     write_schedule_health,
 )
@@ -210,11 +214,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     # IO
     ap.add_argument("--local-checkpoints", action="store_true")
     ap.add_argument("--hf-repo", default=None)
-    # NOTE: no `--hf-bucket` flag. v1's bucket-autosave target is not
-    # wired in v2's JAX trainer (no bucket-push primitive), so exposing
-    # it would advertise a destination that silently drops every
-    # checkpoint. `BaseRunConfig._check_checkpoint_mode` rejects any
-    # config that names `hf_bucket`. Tracking: docs/V2_PARITY_AUDIT.md.
+    # v1-faithful bucket autosave (now wired through
+    # `pawn.lifecycle.HFBucketTracker`). Accepts `<namespace>/<bucket>` or
+    # a full `hf://buckets/...` URL; the trainer `hf sync`s each checkpoint
+    # to `<bucket>/logs/<run_slug>/checkpoints/step_NNNN/`. Mutually
+    # compatible with `--hf-repo` / `--local-checkpoints`.
+    ap.add_argument("--hf-bucket", default=None,
+                    help="HF bucket autosave target (namespace/bucket or "
+                         "hf://buckets/... URL); pushes to "
+                         "<bucket>/logs/<run_slug>/...")
     # (No `--cache-dir` flag — Lichess-path-only, unread by pretrain; see
     # the not-honoured-knobs NOTE above.)
     ap.add_argument("--wandb-project", default=None)
@@ -305,6 +313,7 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
         ("mate_boost", args.mate_boost),
         ("checkpoint_interval", args.checkpoint_interval),
         ("hf_repo", args.hf_repo),
+        ("hf_bucket", args.hf_bucket),
         ("wandb_project", args.wandb_project),
         ("resume", str(args.resume) if args.resume else None),
         # `--conditioning` with nargs="*" yields a list when passed
@@ -493,8 +502,23 @@ def main(argv: list[str] | None = None) -> int:
             run_dir_name=logger.run_dir.name,
         )
 
-    # HF push tracker (optional).
-    push_tracker = HFPushTracker(repo_id=cfg.hf_repo) if cfg.hf_repo else None
+    # HF push tracker (optional). Pushes land on a per-run isolation
+    # branch `run/<slug>` (CLAUDE.md: "HF mode creates a run/{run_id}
+    # branch. Squash-merge into main when satisfied") rather than the
+    # default `main`, so concurrent runs never race on the branch head.
+    push_tracker = (
+        HFPushTracker(repo_id=cfg.hf_repo, branch=f"run/{logger.slug}")
+        if cfg.hf_repo
+        else None
+    )
+    # HF bucket autosave tracker (optional, v1-faithful) — mutually
+    # compatible with `push_tracker`; syncs each checkpoint to
+    # `<bucket>/logs/<run_slug>/...` via `hf sync`.
+    bucket_tracker = (
+        HFBucketTracker(bucket=cfg.hf_bucket, run_slug=logger.slug)
+        if cfg.hf_bucket
+        else None
+    )
 
     # SIGTERM handler — flips a flag the loop polls between chunks.
     should_shutdown = install_sigterm_handler()
@@ -788,6 +812,35 @@ def main(argv: list[str] | None = None) -> int:
             "batch_offset": batch_offset,
         }
 
+    # Compound early-stop / best-checkpoint state (v1: best val loss +
+    # best late-game legality drive the patience counter; an improvement
+    # in *either* resets it). `best_val_step` is the step that achieved
+    # `best_val_loss` — persisted into every checkpoint's training_state so
+    # a post-hoc reader can identify the best checkpoint without rescanning
+    # `metrics.jsonl` (v1 `best_val_loss` parity; cross-checks against
+    # `pawn.lifecycle.find_best_step`).
+    best_val_loss = float("inf")
+    best_late_legality = 0.0
+    best_val_step = -1
+    patience_counter = 0
+    if cfg.resume:
+        # Restore the early-stop / best-checkpoint anchor so a SIGTERM-paused
+        # run resumed near convergence keeps its no-improvement budget intact
+        # (v1 `CLMTrainer.load_state` parity). Without this, every resume
+        # resets `patience_counter` to 0 and `best_val_loss` to inf, so a
+        # `--patience N` run can have early stopping defeated indefinitely on
+        # a chunked / preemptible pod. A null persisted best maps back to the
+        # inf / -1 / 0.0 sentinels (see `read_resume_best_checkpoint`).
+        # `best_late_legality` is the *second* compound early-stop leg — it
+        # must be restored too, else the first post-resume val (any positive
+        # late legality > 0.0) spuriously resets the restored patience_counter.
+        (
+            best_val_loss,
+            best_val_step,
+            best_late_legality,
+            patience_counter,
+        ) = read_resume_best_checkpoint(Path(cfg.resume))
+
     def _save_checkpoint(step_int: int) -> None:
         out = logger.run_dir / f"step_{step_int:08d}"
         if out.exists():
@@ -799,6 +852,23 @@ def main(argv: list[str] | None = None) -> int:
         # what keeps Adam's first/second moment estimates + the clip
         # counter across the resume boundary.
         opt_tensors = flatten_opt_state(state.opt_state)
+        # Best-checkpoint anchor: persist the running best-val loss + the
+        # step that achieved it so the best checkpoint is recoverable from
+        # the checkpoint sidecars alone (v1 `best_val_loss` parity).
+        best_block: dict[str, float | int | None] = {
+            "best_val_loss": (
+                None if best_val_loss == float("inf") else float(best_val_loss)
+            ),
+            "best_val_step": None if best_val_step < 0 else int(best_val_step),
+            # Compound early-stop has two legs: val_loss AND late-game
+            # legality. Persist the legality leg too (v1 save_state —
+            # main:pawn/trainer.py:1319), else on resume it reset to 0.0 and
+            # the first post-resume val (any positive legality > 0.0) spuriously
+            # registered as an improvement, clobbering the restored
+            # patience_counter back to 0 and defeating this very restoration.
+            "best_late_legality": float(best_late_legality),
+            "patience_counter": int(patience_counter),
+        }
         save_model(
             state.model, out,
             run_config=cfg.model_dump(),
@@ -817,11 +887,22 @@ def main(argv: list[str] | None = None) -> int:
                 # resume; H7 / D2). This replaces the old look-ahead-polluted
                 # `numpy_rngs={"data": rng}`, which skipped the in-flight
                 # (submitted-but-untrained) chunk on resume.
-                extra={"data_anchor": _data_anchor_block(producer)},
+                extra={
+                    "data_anchor": _data_anchor_block(producer),
+                    "best_checkpoint": best_block,
+                },
             ),
         )
         if push_tracker:
-            push_checkpoint_async(out, push_tracker)
+            push_checkpoint_async(
+                out, push_tracker,
+                metrics_path=logger.metrics_path, step=step_int,
+            )
+        if bucket_tracker:
+            push_to_bucket_async(
+                out, bucket_tracker,
+                metrics_path=logger.metrics_path, step=step_int,
+            )
 
     # --- Held-out validation loop (v1 CLMTrainer.evaluate parity) --------
     # The pretrain corpus is freshly-generated random self-play, so the
@@ -846,12 +927,9 @@ def main(argv: list[str] | None = None) -> int:
         else cfg.seq_len // 2
     )
     val_acc_model = accuracy_model
-    # Compound early-stop state (v1: best val loss + best late-game
-    # legality drive the patience counter; an improvement in *either*
-    # resets it).
-    best_val_loss = float("inf")
-    best_late_legality = 0.0
-    patience_counter = 0
+    # Compound early-stop / best-checkpoint state is declared above
+    # `_save_checkpoint` so the save path can persist the running best
+    # into each checkpoint's training_state.
     last_val_step = -1  # de-dupe: never eval the same step twice
 
     start = int(state.step)
@@ -866,8 +944,8 @@ def main(argv: list[str] | None = None) -> int:
         No-op (returns False) when the held-out eval is disabled or the
         step was already evaluated.
         """
-        nonlocal best_val_loss, best_late_legality, patience_counter
-        nonlocal last_val_step
+        nonlocal best_val_loss, best_late_legality, best_val_step
+        nonlocal patience_counter, last_val_step
         if val_corpus is None or at_step == last_val_step:
             return False
         last_val_step = at_step
@@ -877,11 +955,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         extra_log: dict[str, float | int] = {}
         stop = False
+        # Best-checkpoint anchor: track the lowest val_loss + the step that
+        # achieved it independently of the patience knob, so the best
+        # checkpoint is recoverable even when early-stopping is disabled
+        # (v1 `best_val_loss` parity; strict `<` ties to the earliest step).
+        if vm.val_loss < best_val_loss:
+            best_val_loss = vm.val_loss
+            best_val_step = at_step
         if cfg.patience is not None:
-            improved = False
-            if vm.val_loss < best_val_loss:
-                best_val_loss = vm.val_loss
-                improved = True
+            # Patience resets on an improvement in *either* val_loss or
+            # late-game legality (compound early-stop, v1 parity). The
+            # val_loss improvement was already folded into best_val_loss
+            # above; re-derive whether *this* eval improved it.
+            improved = best_val_step == at_step
             if vm.late_legal_move_rate > best_late_legality:
                 best_late_legality = vm.late_legal_move_rate
                 improved = True
@@ -992,7 +1078,11 @@ def main(argv: list[str] | None = None) -> int:
                 != (next_step - this_chunk_k) // cfg.checkpoint_interval
             )
             if crossed_checkpoint or next_step >= total_steps:
-                if cfg.local_checkpoints or cfg.hf_repo:
+                # Save on any durable target: local disk, an HF repo branch,
+                # *or* an HF bucket. Omitting `cfg.hf_bucket` here is the
+                # `ckpt-hf-bucket-not-wired` blocker — a `--hf-bucket`-only
+                # run would accept the flag but never save or sync anything.
+                if cfg.local_checkpoints or cfg.hf_repo or cfg.hf_bucket:
                     _save_checkpoint(next_step)
 
             # Held-out validation pass at every val_every boundary crossed
@@ -1099,6 +1189,11 @@ def main(argv: list[str] | None = None) -> int:
         # `wait=True` path that's still semantically correct.
         timeouts, _errors = drain_push_queue(push_tracker, timeout=300.0)
         push_tracker.shutdown(drain_succeeded=(timeouts == 0))
+    if bucket_tracker:
+        # Same drain contract as the HF-repo tracker — flush in-flight
+        # `hf sync` jobs before exit so the last checkpoint lands.
+        b_timeouts, _b_errors = drain_bucket_queue(bucket_tracker, timeout=300.0)
+        bucket_tracker.shutdown(drain_succeeded=(b_timeouts == 0))
     logger.close()
     return 0
 

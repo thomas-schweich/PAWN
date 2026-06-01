@@ -394,25 +394,46 @@ def test_specialized_round_trips_through_json() -> None:
 
 
 def test_checkpoint_mode_requires_one_destination() -> None:
-    with pytest.raises(ValueError, match="hf_repo or local_checkpoints"):
+    with pytest.raises(
+        ValueError, match="hf_repo, local_checkpoints, or hf_bucket"
+    ):
         PretrainConfig(total_steps=100)  # no checkpoint destination
     # Happy path
     PretrainConfig(local_checkpoints=True, total_steps=100)
     PretrainConfig(hf_repo="thomas-schweich/scratch", total_steps=100)
 
 
-def test_checkpoint_mode_rejects_hf_bucket() -> None:
-    """v2 has no bucket-push path, so `hf_bucket` is rejected outright
-    (was a silent no-save trap in v1-parity terms — see
-    docs/V2_PARITY_AUDIT.md). It is rejected even when a working
-    destination is also present, since the trainer would push to the
-    bucket nowhere regardless."""
-    with pytest.raises(ValueError, match="hf_bucket autosave is not"):
-        PretrainConfig(hf_bucket="ns/bucket", total_steps=100)
-    with pytest.raises(ValueError, match="hf_bucket autosave is not"):
-        PretrainConfig(
-            hf_bucket="ns/bucket", local_checkpoints=True, total_steps=100
-        )
+def test_checkpoint_mode_accepts_hf_bucket() -> None:
+    """`hf_bucket` is now a v1-faithful autosave target (wired through
+    `pawn.lifecycle.HFBucketTracker` / `push_checkpoint_to_bucket`), so
+    it validates — both as the sole destination and combined with a
+    model-repo / local destination ("the trainer pushes to both", v1
+    docs). This pins the resolution of the `hf_bucket`-not-wired blocker.
+    """
+    # Sole destination — a bucket-only run is now valid (it persists to
+    # `<bucket>/logs/<run_slug>/...`).
+    cfg = PretrainConfig(hf_bucket="ns/bucket", total_steps=100)
+    assert cfg.hf_bucket == "ns/bucket"
+    # Combined with local checkpoints (v1: mutually compatible).
+    cfg2 = PretrainConfig(
+        hf_bucket="ns/bucket", local_checkpoints=True, total_steps=100
+    )
+    assert cfg2.hf_bucket == "ns/bucket" and cfg2.local_checkpoints is True
+    # Combined with an hf_repo (the v1 "push to both" path).
+    cfg3 = PretrainConfig(
+        hf_bucket="ns/bucket", hf_repo="thomas-schweich/scratch",
+        total_steps=100,
+    )
+    assert cfg3.hf_bucket == "ns/bucket" and cfg3.hf_repo
+
+
+def test_checkpoint_mode_rejects_no_destination() -> None:
+    """A run with no destination at all (no hf_repo, no local_checkpoints,
+    no hf_bucket) saves/pushes nothing and is rejected up front."""
+    with pytest.raises(
+        ValueError, match="one of hf_repo, local_checkpoints, or hf_bucket"
+    ):
+        PretrainConfig(total_steps=100)
 
 
 def test_checkpoint_mode_rejects_hf_repo_plus_local() -> None:

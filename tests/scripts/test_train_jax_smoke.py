@@ -1723,6 +1723,88 @@ def test_train_jax_pause_after_steps_checkpoints_and_stops(tmp_path) -> None:  #
     )
 
 
+def test_train_jax_resume_restores_patience_counter(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """`--resume` must restore the early-stop / best-checkpoint anchor
+    (best_val_loss, best_val_step, patience_counter) so a paused-then-resumed
+    run keeps its no-improvement budget instead of resetting it to 0.
+
+    v1 parity (`CLMTrainer.load_state` restores best_val_loss +
+    patience_counter). Concrete failure this guards: a `--patience N` run
+    SIGTERM/pause-paused near convergence and resumed would otherwise reset
+    its patience counter every resume, defeating early stopping indefinitely
+    on a chunked / preemptible pod.
+
+    Construction: LR ≈ 0 so the held-out val loss never improves, so the
+    patience counter increments at every eval. The first run pauses with a
+    *non-zero* patience counter persisted in its checkpoint's
+    `best_checkpoint` block. The resumed run's first checkpoint must carry a
+    patience counter >= the paused value (it continued from the seeded value,
+    not from 0).
+    """
+    import json as _json
+    import subprocess
+
+    common = [
+        "--supernet", "tiny", "--batch-size", "4", "--seq-len", "32", "--k", "2",
+        "--val-every", "2", "--val-games", "8", "--patience", "1000",
+        "--checkpoint-interval", "2",
+        # LR ~0 so val loss never improves → patience counter only ever climbs.
+        "--local-checkpoints", "--lr", "1e-12",
+    ]
+
+    logs1 = tmp_path / "logs1"
+    r1 = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax.py", *common,
+            "--total-steps", "1000", "--pause-after-steps", "8",
+            "--logs-dir", str(logs1),
+        ],
+        capture_output=True, text=True, timeout=600, env=_subprocess_env(),
+    )
+    assert r1.returncode == 0, (
+        f"first (pause) run failed:\nstdout={r1.stdout}\nstderr={r1.stderr}"
+    )
+    ckpts1 = sorted(logs1.glob("*/step_*"))
+    assert ckpts1, f"pause run wrote no checkpoint under {logs1}"
+    paused_ckpt = ckpts1[-1]
+    ts1 = _json.loads((paused_ckpt / "training_state.json").read_text())
+    paused_best = ts1["best_checkpoint"]
+    paused_patience = int(paused_best["patience_counter"])
+    # With LR ~0 and an eval every 2 steps through step 8, several evals ran
+    # without improvement, so the counter must be non-zero — otherwise the
+    # test can't distinguish "restored" from "reset".
+    assert paused_patience > 0, (
+        f"expected a non-zero paused patience counter to make the resume "
+        f"assertion meaningful; got {paused_best}"
+    )
+
+    logs2 = tmp_path / "logs2"
+    r2 = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax.py", *common,
+            "--total-steps", "1000", "--pause-after-steps", "12",
+            "--resume", str(paused_ckpt),
+            "--logs-dir", str(logs2),
+        ],
+        capture_output=True, text=True, timeout=600, env=_subprocess_env(),
+    )
+    assert r2.returncode == 0, (
+        f"resumed run failed:\nstdout={r2.stdout}\nstderr={r2.stderr}"
+    )
+    ckpts2 = sorted(logs2.glob("*/step_*"))
+    assert ckpts2, f"resumed run wrote no checkpoint under {logs2}"
+    ts2 = _json.loads((ckpts2[-1] / "training_state.json").read_text())
+    resumed_patience = int(ts2["best_checkpoint"]["patience_counter"])
+    # The resumed run continued the no-improvement budget from the seeded
+    # value (LR ~0 → it only ever climbs). A reset-to-0 regression would make
+    # this strictly less than the paused value over the same span of evals.
+    assert resumed_patience >= paused_patience, (
+        f"resume reset the patience counter: paused={paused_patience}, "
+        f"resumed={resumed_patience} (early stopping would be defeated across "
+        f"resumes). stdout={r2.stdout}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # v1 CLI-compat flags reachable only via --config JSON in v2 (config-cli
 # parity workstream). Each routes through the real _parse_args ->
@@ -1986,22 +2068,65 @@ def test_train_jax_discard_ply_limit_flag() -> None:
     assert _train_jax_cfg(["--discard-ply-limit"]).discard_ply_limit is True
 
 
-def test_train_jax_rejects_hf_bucket_only_config() -> None:
-    """A bucket-only config must NOT validate. v2's JAX trainer has no
-    bucket-push primitive, so accepting `hf_bucket` as a sole destination
-    would let a long run train to completion and persist nothing (silent
-    total checkpoint loss). `_check_checkpoint_mode` rejects it up front
-    with an actionable error. There is deliberately no `--hf-bucket` CLI
-    flag, so the only way to set the field is a JSON config; build the
-    config directly to pin the validator."""
-    from pydantic import ValidationError
+def test_train_jax_accepts_hf_bucket_via_cli() -> None:
+    """`--hf-bucket` is the v1-faithful bucket autosave flag (now wired
+    through `pawn.lifecycle.HFBucketTracker`). The flag reaches the config
+    so the trainer syncs to `<bucket>/logs/<run_slug>/...`, and a bucket
+    can combine with another destination (v1: "the trainer pushes to
+    both"). This pins the resolution of the `hf_bucket`-not-wired blocker
+    at the CLI surface. (`_train_jax_cfg` always passes
+    `--local-checkpoints`; bucket-only validation is pinned directly in
+    `tests/test_jax_run_config.py::test_checkpoint_mode_accepts_hf_bucket`.)
+    """
+    cfg = _train_jax_cfg(["--hf-bucket", "ns/bkt"])
+    assert cfg.hf_bucket == "ns/bkt"
+    assert cfg.local_checkpoints is True  # the two coexist
 
-    from pawn.run_config import PretrainConfig
 
-    with pytest.raises(ValidationError, match="hf_bucket autosave is not"):
-        # `variant="base"` is a named preset, so no arch overrides are
-        # needed — `_check_checkpoint_mode` runs regardless of arch.
-        PretrainConfig(variant="base", total_steps=1, hf_bucket="ns/bkt")
+def test_train_jax_hf_bucket_only_actually_saves_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """A `--hf-bucket`-only run (no `--local-checkpoints`, no `--hf-repo`)
+    must actually reach the save path — the resolution of the
+    `ckpt-hf-bucket-not-wired` blocker.
+
+    The blocker was that the periodic-checkpoint save was gated on
+    `cfg.local_checkpoints or cfg.hf_repo`, omitting `cfg.hf_bucket`, so a
+    bucket-only run accepted the flag but never saved or synced anything.
+    `_save_checkpoint` always materialises the `step_*` directory locally
+    before handing it to the async bucket sync, so a local `step_*` dir
+    appearing proves the gate now fires for bucket-only mode. (The async
+    `hf sync` itself best-effort-fails without bucket credentials and is
+    swallowed — the run still exits 0, which we also assert.)
+    """
+    import subprocess
+
+    logs_dir = tmp_path / "logs"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/train_jax.py",
+            "--supernet", "tiny", "--total-steps", "2",
+            "--batch-size", "4", "--seq-len", "32", "--k", "2",
+            "--checkpoint-interval", "2",
+            # Bucket-only: no --local-checkpoints, no --hf-repo.
+            "--hf-bucket", "pawn-test-nonexistent/bkt", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        capture_output=True, text=True, timeout=300, env=_subprocess_env(),
+    )
+    assert result.returncode == 0, (
+        f"bucket-only pretrain failed:\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    ckpts = sorted(logs_dir.glob("*/step_*"))
+    assert ckpts, (
+        f"bucket-only mode wrote no checkpoint under {logs_dir} — the "
+        f"hf_bucket save gate did not fire (the not-wired blocker); "
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert (ckpts[-1] / ".complete").exists(), (
+        f"bucket-only checkpoint {ckpts[-1]} missing its .complete sentinel"
+    )
 
 
 def test_train_jax_local_checkpoints_actually_writes_checkpoint(
@@ -2042,6 +2167,88 @@ def test_train_jax_local_checkpoints_actually_writes_checkpoint(
     assert (ckpts[-1] / ".complete").exists(), (
         f"checkpoint {ckpts[-1]} missing its .complete sentinel"
     )
+
+
+def test_train_jax_sigterm_saves_final_checkpoint(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """SIGTERM mid-run must finish the current chunk and save a final
+    `.complete` checkpoint, then exit 0 (CLAUDE.md operational guarantee +
+    plan crit 17). This is the subprocess kill-and-check test the parity
+    audit called for (ckpt-sigterm-no-subprocess-test).
+
+    The run is sized so that SIGTERM lands *between* checkpoint-interval
+    boundaries: `--total-steps 10000` keeps it running, while
+    `--checkpoint-interval 100000` (> total) means no periodic checkpoint
+    fires before the signal. Any `step_*/.complete` therefore proves the
+    SIGTERM save path ran — not a periodic boundary save.
+    """
+    import signal
+    import subprocess
+    import time
+
+    logs_dir = tmp_path / "logs"
+    proc = subprocess.Popen(
+        [
+            sys.executable, "scripts/train_jax.py",
+            "--supernet", "tiny", "--total-steps", "10000",
+            "--batch-size", "4", "--seq-len", "32", "--k", "2",
+            # Interval far beyond total_steps: no periodic checkpoint fires.
+            "--checkpoint-interval", "100000",
+            "--local-checkpoints", "--lr", "1e-3",
+            "--logs-dir", str(logs_dir),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_subprocess_env(),
+    )
+    try:
+        # Wait until the run has clearly entered the training loop (a
+        # `metrics.jsonl` with at least one record appears) before signalling,
+        # so the SIGTERM lands mid-run rather than during import/compile.
+        deadline = time.monotonic() + 180.0
+        started = False
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break  # process exited on its own (unexpected) — handled below
+            jsonls = list(logs_dir.glob("*/metrics.jsonl"))
+            if jsonls and jsonls[0].stat().st_size > 0:
+                started = True
+                break
+            time.sleep(0.5)
+        assert started, "training subprocess never reached the train loop"
+        # Give it a moment to advance a few steps, then SIGTERM.
+        time.sleep(2.0)
+        proc.send_signal(signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=180)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    combined = stdout + stderr
+    # Graceful shutdown exits 0 (CLAUDE.md: "finishes the current chunk,
+    # saves a checkpoint, pushes to HF, and exits 0").
+    assert proc.returncode == 0, (
+        f"SIGTERM should exit 0 after a graceful save; got "
+        f"returncode={proc.returncode}\nstdout={stdout}\nstderr={stderr}"
+    )
+    assert "SIGTERM received" in combined, (
+        f"expected the SIGTERM handler banner; stderr={stderr}"
+    )
+    # A final, complete checkpoint was written by the SIGTERM path (no
+    # periodic checkpoint could have fired — interval > total_steps).
+    ckpts = sorted(logs_dir.glob("*/step_*"))
+    assert ckpts, (
+        f"SIGTERM did not save a final checkpoint under {logs_dir}; "
+        f"stdout={stdout}\nstderr={stderr}"
+    )
+    final = ckpts[-1]
+    assert (final / ".complete").exists(), (
+        f"SIGTERM checkpoint {final} missing its .complete sentinel — the "
+        f"save was not atomic/complete"
+    )
+    # The saved step is past 0 (the run actually trained before SIGTERM).
+    saved_step = int(final.name[len("step_"):])
+    assert saved_step > 0, f"expected a non-zero SIGTERM checkpoint step, got {final.name}"
 
 
 def _adapter_cli_cfg(extra: list[str]) -> AdapterConfig:

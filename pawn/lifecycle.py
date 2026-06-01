@@ -52,10 +52,16 @@ from pawn.trainer import TrainState
 
 __all__ = [
     "HFPushTracker",
+    "HFBucketTracker",
     "push_checkpoint_async",
+    "push_to_bucket_async",
+    "push_checkpoint_to_bucket",
+    "truncate_metrics_jsonl",
     "install_sigterm_handler",
     "drain_push_queue",
+    "drain_bucket_queue",
     "load_resume_state",
+    "find_best_step",
     "write_schedule_health",
     "SCHEDULES_THAT_REACH_ZERO",
     "SCHEDULE_HEALTH_FILE",
@@ -66,6 +72,7 @@ __all__ = [
     "build_training_state",
     "read_resume_rng_blocks",
     "read_resume_data_anchor",
+    "read_resume_best_checkpoint",
 ]
 
 
@@ -143,6 +150,118 @@ class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
             cast(Any, _cf_thread._threads_queues)[t] = self._work_queue
 
 
+def _drain_futures(
+    futures_field: list[Future[None]],
+    lock: threading.Lock,
+    *,
+    timeout: float | None,
+) -> tuple[int, int]:
+    """Wait for all pending futures. Returns ``(timeouts, errors)``.
+
+    Shared body of :meth:`HFPushTracker.join` and
+    :meth:`HFBucketTracker.join` — both trackers run a 1-worker daemon pool
+    with the same drain semantics, so the (previously duplicated) drain logic
+    lives here once. Keeping it shared guarantees the ``CancelledError``
+    handling below stays consistent across both trackers.
+
+    ``timeouts`` counts futures we couldn't wait for before ``timeout``
+    elapsed — those represent threads still running. ``errors`` counts
+    uploads / syncs that raised inside the worker (and therefore released the
+    thread normally).
+
+    The two are reported separately because they have different SIGTERM
+    consequences:
+    - ``timeouts > 0`` means a worker is still alive; the trainer must take
+      the abandon-thread path at ``shutdown`` time (``drain_succeeded=False``)
+      so the daemon worker is killed at interpreter exit instead of joining
+      indefinitely.
+    - ``errors > 0`` means the work failed but threads exited; the trainer can
+      ``shutdown(drain_succeeded=True)`` safely.
+
+    Failures don't raise — training already finished, the goal is best-effort
+    cleanup before exit.
+    """
+    deadline = (time.monotonic() + timeout) if timeout is not None else None
+    with lock:
+        futures = list(futures_field)
+        futures_field.clear()
+    timeouts = 0
+    errors = 0
+    for fut in futures:
+        try:
+            remaining = (
+                deadline - time.monotonic() if deadline is not None else None
+            )
+            if remaining is not None and remaining < 0:
+                fut.cancel()
+                timeouts += 1
+                continue
+            fut.result(timeout=remaining)
+        except FutureTimeoutError:
+            # `fut.result(timeout=...)` raises this if the worker didn't
+            # finish in `remaining`. A still-running thread. Import
+            # explicitly from `concurrent.futures` rather than relying on
+            # the 3.11+ alias with builtin `TimeoutError` (round-3
+            # bug-detector Important).
+            timeouts += 1
+        except CancelledError:
+            # Future was cancelled before the worker started — not a stuck
+            # thread, not a failed upload. Treat as neither timeout nor
+            # error (round-3 bug-detector Important: a `cancel_futures=True`
+            # shutdown between `submit()` and `result()` would have
+            # triggered this, and conflating it with `errors` would surface
+            # a spurious checkpoint-failure to the operator).
+            continue
+        except Exception:
+            # The work raised — thread exited, just a failed checkpoint.
+            # No abandon-thread needed.
+            errors += 1
+    return timeouts, errors
+
+
+def _shutdown_executor(
+    executor: ThreadPoolExecutor, *, drain_succeeded: bool
+) -> None:
+    """Drain ``executor`` under the two-state SIGTERM contract.
+
+    Shared body of :meth:`HFPushTracker.shutdown` /
+    :meth:`HFBucketTracker.shutdown`.
+
+    - ``drain_succeeded=True`` (caller verified every prior job completed
+      within budget): ``wait=True`` so running jobs finish cleanly.
+      ``cancel_futures=True`` drops queued-but-not-started jobs so we don't
+      block on a backlog.
+
+    - ``drain_succeeded=False`` (the prior drain timed out — a future is
+      stuck mid-job and ``cancel()`` is a no-op on a running thread):
+      ``wait=False`` so the trainer can exit promptly. We also **remove the
+      worker thread from ``concurrent.futures.thread._threads_queues``** so
+      cpython's ``_python_exit`` atexit hook doesn't ``Thread.join()`` it
+      unconditionally (round-3 codex P1 + bug-detector Critical: the daemon
+      flag alone doesn't help — ``_python_exit`` runs before
+      daemon-thread-kill, and a ``join()`` on a stuck worker blocks on the
+      GIL-internal ``_tstate_lock``).
+
+    Without this gating, a stuck job makes the trainer hang forever past the
+    bounded SIGTERM budget.
+    """
+    if drain_succeeded:
+        executor.shutdown(wait=True, cancel_futures=True)
+        return
+
+    # Abandon path: pop our workers from cpython's atexit join list, *then*
+    # shut down the executor. After this returns, the daemon worker is left
+    # running but the interpreter will exit normally — `_python_exit` no
+    # longer sees the worker.
+    import concurrent.futures.thread as _cf_thread
+    from typing import cast as _cast
+
+    threads_queues = _cast(Any, _cf_thread._threads_queues)
+    for t in list(executor._threads):
+        threads_queues.pop(t, None)
+    executor.shutdown(wait=False, cancel_futures=True)
+
+
 @dataclass
 class HFPushTracker:
     """Tracks the in-flight HuggingFace upload futures.
@@ -172,100 +291,15 @@ class HFPushTracker:
     def join(self, *, timeout: float | None = None) -> tuple[int, int]:
         """Wait for all pending uploads. Returns ``(timeouts, errors)``.
 
-        ``timeouts`` counts futures we couldn't wait for before
-        ``timeout`` elapsed — those represent threads still running.
-        ``errors`` counts uploads that raised inside the worker (and
-        therefore released the thread normally).
-
-        The two are reported separately because they have different
-        SIGTERM consequences:
-        - ``timeouts > 0`` means a worker is still alive; the trainer
-          must take the abandon-thread path at ``shutdown`` time
-          (``drain_succeeded=False``) so the daemon worker is killed
-          at interpreter exit instead of joining indefinitely.
-        - ``errors > 0`` means uploads failed but threads exited; the
-          trainer can ``shutdown(drain_succeeded=True)`` safely.
-
-        Failures don't raise — training already finished, the goal is
-        best-effort cleanup before exit.
+        Delegates to the shared :func:`_drain_futures` — see its docstring
+        for the timeouts-vs-errors SIGTERM contract.
         """
-        deadline = (time.monotonic() + timeout) if timeout is not None else None
-        with self._lock:
-            futures = list(self._futures)
-            self._futures.clear()
-        timeouts = 0
-        errors = 0
-        for fut in futures:
-            try:
-                remaining = (
-                    deadline - time.monotonic() if deadline is not None else None
-                )
-                if remaining is not None and remaining < 0:
-                    fut.cancel()
-                    timeouts += 1
-                    continue
-                fut.result(timeout=remaining)
-            except FutureTimeoutError:
-                # `fut.result(timeout=...)` raises this if the worker
-                # didn't finish in `remaining`. A still-running thread.
-                # Import explicitly from `concurrent.futures` rather
-                # than relying on the 3.11+ alias with builtin
-                # `TimeoutError` (round-3 bug-detector Important).
-                timeouts += 1
-            except CancelledError:
-                # Future was cancelled before the worker started —
-                # not a stuck thread, not a failed upload. Treat as
-                # neither timeout nor error (round-3 bug-detector
-                # Important: a `cancel_futures=True` shutdown between
-                # `submit()` and `result()` would have triggered
-                # this, and conflating it with `errors` would surface
-                # a spurious checkpoint-failure to the operator).
-                continue
-            except Exception:
-                # The upload raised — thread exited, just a failed
-                # checkpoint. No abandon-thread needed.
-                errors += 1
-        return timeouts, errors
+        return _drain_futures(self._futures, self._lock, timeout=timeout)
 
     def shutdown(self, *, drain_succeeded: bool = True) -> None:
-        """Drain the executor.
-
-        Two-state contract:
-
-        - ``drain_succeeded=True`` (caller verified every prior upload
-          completed within budget): ``wait=True`` so running uploads
-          finish cleanly. ``cancel_futures=True`` drops queued-but-not-
-          started uploads so we don't block on a backlog.
-
-        - ``drain_succeeded=False`` (the prior ``drain_push_queue``
-          timed out — a future is stuck mid-upload and ``cancel()`` is
-          a no-op on a running thread): ``wait=False`` so the trainer
-          can exit promptly. We also **remove the worker thread from
-          ``concurrent.futures.thread._threads_queues``** so cpython's
-          ``_python_exit`` atexit hook doesn't ``Thread.join()`` it
-          unconditionally (round-3 codex P1 + bug-detector Critical:
-          the daemon flag alone doesn't help — ``_python_exit`` runs
-          before daemon-thread-kill, and a ``join()`` on a stuck
-          worker blocks on the GIL-internal ``_tstate_lock``).
-
-        Without this gating, a stuck upload makes the trainer hang
-        forever past the bounded SIGTERM budget.
-        """
-        if drain_succeeded:
-            self._executor.shutdown(wait=True, cancel_futures=True)
-            return
-
-        # Abandon path: pop our workers from cpython's atexit join
-        # list, *then* shut down the executor. After this returns,
-        # the daemon worker is left running but the interpreter will
-        # exit normally — `_python_exit` no longer sees the worker.
-        import concurrent.futures.thread as _cf_thread
-        from typing import cast as _cast
-
-        threads_queues = _cast(Any, _cf_thread._threads_queues)
-        for t in list(self._executor._threads):
-            threads_queues.pop(t, None)
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        """Drain the executor — see :func:`_shutdown_executor` for the
+        two-state ``drain_succeeded`` contract."""
+        _shutdown_executor(self._executor, drain_succeeded=drain_succeeded)
 
 
 def push_checkpoint_async(
@@ -273,9 +307,26 @@ def push_checkpoint_async(
     tracker: HFPushTracker,
     *,
     revision: str | None = None,
+    metrics_path: Path | str | None = None,
+    step: int | None = None,
     upload_cls: Any | None = None,
 ) -> None:
     """Enqueue an async upload of ``ckpt_dir`` to ``tracker.repo_id``.
+
+    The checkpoint directory lands at ``checkpoints/<ckpt_dir.name>`` on
+    ``tracker.branch`` (the per-run ``run/<slug>`` isolation branch the
+    trainer passes in — CLAUDE.md "HF mode creates a ``run/{run_id}``
+    branch. Squash-merge into main when satisfied"). The branch is
+    created (``exist_ok=True``) before the first upload so a fresh repo
+    doesn't 404 on the push, matching v1's ``push_checkpoint_to_hf``.
+
+    When ``metrics_path`` is supplied, the run's ``metrics.jsonl`` is
+    co-uploaded to the branch root, truncated to records ``<= step`` via
+    :func:`truncate_metrics_jsonl` so the published metrics never get
+    ahead of the checkpoint they sit beside (v1 parity — the dashboard
+    reads ``metrics.jsonl`` from the branch). ``step`` defaults to the
+    integer suffix of ``ckpt_dir.name`` (``step_NNNN`` / ``adapter_step_
+    NNNN``) when omitted.
 
     ``upload_cls`` is a test seam — defaults to the real
     :class:`huggingface_hub.HfApi` upload path. Tests can pass a
@@ -293,19 +344,113 @@ def push_checkpoint_async(
             ) from e
 
     target_branch = revision if revision is not None else tracker.branch
+    target_step = step if step is not None else _step_from_dir_name(ckpt_dir.name)
+    mpath = Path(metrics_path) if metrics_path is not None else None
 
     def _do_upload() -> None:
         # The actual upload — runs in the executor thread.
         api = upload_cls()
+        # Ensure the per-run branch exists before the first commit. A
+        # fresh repo otherwise 404s on the push; `exist_ok=True` makes
+        # the call idempotent across the run's many checkpoints. Tests'
+        # fake APIs that don't implement `create_branch` are tolerated.
+        create_branch = getattr(api, "create_branch", None)
+        if create_branch is not None:
+            try:
+                create_branch(
+                    repo_id=tracker.repo_id,
+                    repo_type="model",
+                    branch=target_branch,
+                    exist_ok=True,
+                )
+            except Exception:
+                # Branch may already exist (older hub versions don't take
+                # `exist_ok`) — the upload below surfaces a real failure.
+                pass
         api.upload_folder(
             repo_id=tracker.repo_id,
             folder_path=str(ckpt_dir),
-            path_in_repo=ckpt_dir.name,
+            path_in_repo=f"checkpoints/{ckpt_dir.name}",
             revision=target_branch,
             commit_message=f"Checkpoint {ckpt_dir.name}",
         )
+        # Co-upload the truncated metrics.jsonl so the published branch
+        # carries a metrics view that never gets ahead of this checkpoint.
+        if mpath is not None and mpath.exists():
+            import tempfile
+
+            truncated = truncate_metrics_jsonl(mpath, target_step)
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+            ) as tmp:
+                tmp.write(truncated)
+                tmp_path = tmp.name
+            try:
+                api.upload_file(
+                    path_or_fileobj=tmp_path,
+                    path_in_repo="metrics.jsonl",
+                    repo_id=tracker.repo_id,
+                    repo_type="model",
+                    revision=target_branch,
+                    commit_message=f"Metrics through step {target_step}",
+                )
+            finally:
+                os.unlink(tmp_path)
 
     tracker.submit(_do_upload)
+
+
+def _step_from_dir_name(name: str) -> int:
+    """Parse the integer step from a ``step_NNNN`` / ``adapter_step_NNNN`` dir.
+
+    Returns ``0`` when the name carries no trailing integer (the
+    documented fallback — the metrics truncation then keeps the whole
+    file rather than dropping records).
+    """
+    tail = name.rsplit("_", 1)[-1]
+    try:
+        return int(tail)
+    except ValueError:
+        return 0
+
+
+def truncate_metrics_jsonl(metrics_path: Path | str, step: int) -> str:
+    """Return the prefix of ``metrics_path`` covering steps ``<= step``.
+
+    The boundary is inclusive on the target step: every ``train`` / ``val``
+    record at exactly ``step`` is kept, and the scan stops on the first
+    ``train`` / ``val`` record whose ``step > step``. Keeping train+val
+    pairs at the boundary together matters because a val record often
+    follows a train record at the same global step. Records without a
+    ``type in {"train", "val"}`` field (config rows, custom debug rows)
+    and malformed JSON lines pass through verbatim — they don't gate the
+    boundary check.
+
+    Ported verbatim from v1 ``pawn.checkpoint.truncate_metrics_jsonl`` so
+    the co-uploaded ``metrics.jsonl`` on the per-run branch never gets
+    ahead of the checkpoint it sits beside.
+    """
+    out: list[str] = []
+    target = int(step)
+    with open(metrics_path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # Pass malformed lines through; don't let one bad row
+                # truncate the whole file.
+                out.append(line)
+                continue
+            if (
+                record.get("type") in ("train", "val")
+                and int(record.get("step", 0)) > target
+            ):
+                # First record beyond the target — stop *before* it so
+                # multiple records at the target step (e.g. a train then
+                # a val record at the same step) all make it in.
+                break
+            out.append(line)
+    return "".join(out)
 
 
 def drain_push_queue(
@@ -316,6 +461,185 @@ def drain_push_queue(
     Returns ``(timeouts, errors)`` per :meth:`HFPushTracker.join`.
     """
     return tracker.join(timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# HF bucket push — async `hf sync` to an `hf://buckets/...` URL
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HFBucketTracker:
+    """Tracks in-flight HuggingFace-bucket sync jobs for one run.
+
+    Mirrors :class:`HFPushTracker` but targets an HF *bucket* (object
+    store) instead of a model repo. v1 documented ``hf_bucket`` as a
+    first-class autosave target — "Mutually compatible with ``hf_repo``:
+    the trainer pushes to both", files landing at
+    ``<bucket>/logs/<run_slug>/...``. v2 wires the same semantics here.
+
+    Bucket I/O goes through the ``hf sync`` CLI rather than
+    ``HfApi.upload_folder(repo_type="bucket")`` because (as of the v1
+    note, 2026-04) the ``upload_folder`` path rejects ``repo_type=
+    "bucket"`` and silently exits 0 — the only working bucket I/O is the
+    ``hf://buckets/...`` URL via ``hf sync`` (see
+    :func:`push_checkpoint_to_bucket`).
+
+    ``_executor`` is a 1-worker daemon pool — sync jobs serialise so a
+    slow network doesn't queue up gigabytes of pending payloads, and the
+    daemon worker is killed at interpreter exit if a sync is abandoned
+    past the SIGTERM budget (same contract as :class:`HFPushTracker`).
+    """
+
+    bucket: str
+    run_slug: str
+    _executor: ThreadPoolExecutor = field(
+        default_factory=lambda: _DaemonThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hf-bucket"
+        )
+    )
+    _futures: list[Future[None]] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def submit(self, fn: Callable[[], None]) -> None:
+        with self._lock:
+            self._futures.append(self._executor.submit(fn))
+
+    def join(self, *, timeout: float | None = None) -> tuple[int, int]:
+        """Wait for all pending bucket syncs. Returns ``(timeouts, errors)``.
+
+        Delegates to the shared :func:`_drain_futures` — same
+        timeouts-vs-errors SIGTERM contract as :meth:`HFPushTracker.join`.
+        """
+        return _drain_futures(self._futures, self._lock, timeout=timeout)
+
+    def shutdown(self, *, drain_succeeded: bool = True) -> None:
+        """Drain the executor — see :func:`_shutdown_executor` for the
+        two-state ``drain_succeeded`` contract."""
+        _shutdown_executor(self._executor, drain_succeeded=drain_succeeded)
+
+
+def push_to_bucket_async(
+    ckpt_dir: Path,
+    tracker: HFBucketTracker,
+    *,
+    metrics_path: Path | str | None = None,
+    step: int | None = None,
+    sync_fn: "Callable[..., None] | None" = None,
+) -> None:
+    """Enqueue an async ``hf sync`` of ``ckpt_dir`` to ``tracker.bucket``.
+
+    The checkpoint lands at
+    ``<bucket>/logs/<run_slug>/checkpoints/<ckpt_dir.name>/`` and, when
+    ``metrics_path`` is supplied, the truncated ``metrics.jsonl`` lands at
+    ``<bucket>/logs/<run_slug>/metrics.jsonl`` (v1 bucket layout). ``step``
+    defaults to the integer suffix of ``ckpt_dir.name`` when omitted.
+
+    ``sync_fn`` is a test seam — defaults to
+    :func:`push_checkpoint_to_bucket` (the real ``hf sync`` path). Tests
+    pass a recorder that captures the call without shelling out.
+    """
+    target_step = step if step is not None else _step_from_dir_name(ckpt_dir.name)
+    mpath = Path(metrics_path) if metrics_path is not None else None
+    do_sync = sync_fn if sync_fn is not None else push_checkpoint_to_bucket
+
+    def _do_sync() -> None:
+        do_sync(
+            ckpt_dir,
+            tracker.bucket,
+            run_slug=tracker.run_slug,
+            metrics_path=mpath,
+            step=target_step,
+        )
+
+    tracker.submit(_do_sync)
+
+
+def drain_bucket_queue(
+    tracker: HFBucketTracker, *, timeout: float = 300.0
+) -> tuple[int, int]:
+    """Wait for all in-flight bucket syncs (called from the SIGTERM handler).
+
+    Returns ``(timeouts, errors)`` per :meth:`HFBucketTracker.join`.
+    """
+    return tracker.join(timeout=timeout)
+
+
+def push_checkpoint_to_bucket(
+    checkpoint_path: Path | str,
+    bucket: str,
+    *,
+    run_slug: str,
+    metrics_path: Path | str | None = None,
+    step: int = 0,
+) -> None:
+    """Push a checkpoint to an HF bucket path via the ``hf sync`` CLI.
+
+    ``bucket`` accepts either ``<namespace>/<bucket-name>`` or a full
+    ``hf://buckets/<namespace>/<bucket-name>[/<subpath>]`` URL. Files land
+    at ``<bucket-url>/logs/<run_slug>/checkpoints/<step_dir>/`` plus
+    ``<bucket-url>/logs/<run_slug>/metrics.jsonl`` (when ``metrics_path``
+    is given, truncated to ``step``).
+
+    Why ``hf sync`` (and not ``HfApi.upload_folder(repo_type="bucket")``):
+    as of v1's 2026-04 note, the ``hf upload`` / ``upload_folder`` paths
+    reject ``repo_type="bucket"`` and silently exit 0 — the only working
+    bucket I/O is the ``hf://buckets/...`` URL via ``hf sync``. Ported
+    from v1 ``pawn.checkpoint.push_checkpoint_to_bucket``.
+    """
+    import re
+    import shutil
+    import subprocess
+    import tempfile
+
+    checkpoint_path = Path(checkpoint_path)
+    bucket_url = (
+        bucket
+        if bucket.startswith("hf://buckets/")
+        else f"hf://buckets/{bucket.lstrip('/')}"
+    )
+    base = bucket_url.rstrip("/")
+    run_root = f"{base}/logs/{run_slug}"
+
+    # Stage the checkpoint directory under a temp tree shaped like the
+    # target. `hf sync` operates on a local tree -> remote URL pair, so
+    # mirror the on-bucket layout locally first (symlink when the FS
+    # supports it, otherwise copy).
+    with tempfile.TemporaryDirectory() as staging:
+        staging_path = Path(staging)
+        ckpt_target = staging_path / "checkpoints" / checkpoint_path.name
+        ckpt_target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(checkpoint_path.resolve(), ckpt_target)
+        except OSError:
+            shutil.copytree(checkpoint_path, ckpt_target)
+
+        if metrics_path is not None and Path(metrics_path).exists():
+            # Match push_checkpoint_async's "truncate at the current step"
+            # behavior so the bucket copy never gets ahead of the
+            # checkpoint it sits beside.
+            (staging_path / "metrics.jsonl").write_text(
+                truncate_metrics_jsonl(metrics_path, step), encoding="utf-8"
+            )
+
+        result = subprocess.run(
+            ["hf", "sync", str(staging_path), run_root],
+            capture_output=True, text=True,
+        )
+        combined = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"hf sync exited {result.returncode}; "
+                f"output:\n{combined.strip()}"
+            )
+        # `hf sync` exits 0 even on per-blob 403/401/429 — re-grep the
+        # combined output for those signals so the trainer's wrapper
+        # catches them as failures instead of silence (v1 parity).
+        if re.search(r"\b(403|401|429)\b|Forbidden|Unauthorized|RateLimit", combined):
+            raise RuntimeError(
+                "hf sync reported auth / quota / rate-limit signals "
+                f"despite exit 0:\n{combined.strip()}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -722,6 +1046,60 @@ def read_resume_rng_blocks(
     return jax_key, numpy_rngs
 
 
+def read_resume_best_checkpoint(
+    ckpt_dir: Path | str,
+) -> tuple[float, int, float, int]:
+    """Read the early-stop / best-checkpoint anchor from a checkpoint.
+
+    Returns ``(best_val_loss, best_val_step, best_late_legality,
+    patience_counter)`` from the ``best_checkpoint`` block
+    ``_save_checkpoint`` writes into every ``training_state.json``
+    (``scripts/train_jax.py``). Seeding these back at resume time is v1 parity
+    (``CLMTrainer.load_state`` restores ``best_val_loss`` +
+    ``best_late_legality`` + ``patience_counter`` —
+    main:pawn/trainer.py:1343-1347). Without it, a ``--patience N`` run that is
+    SIGTERM-paused near convergence and resumed resets its patience counter to
+    0 and best loss to inf, restarting the no-improvement budget from scratch
+    and defeating early stopping indefinitely across chunked / preemptible-pod
+    runs.
+
+    The compound early-stop counter has two legs: ``best_val_loss`` AND
+    ``best_late_legality`` (an improvement in *either* resets patience).
+    Restoring only the loss leg is insufficient — the legality leg would reset
+    to ``0.0`` and the first post-resume val (essentially always carrying a
+    positive ``late_legal_move_rate``) would spuriously register as an
+    improvement, clobbering the restored ``patience_counter`` back to 0. So
+    both legs are persisted and restored here.
+
+    A ``null`` persisted ``best_val_loss`` (no val record had been seen yet)
+    maps to ``float("inf")`` and a ``null`` / negative ``best_val_step`` maps
+    to ``-1`` — the same sentinels the trainer initialises with — so a fresh
+    resume is indistinguishable from a cold start. A missing / ``null``
+    ``best_late_legality`` maps to ``0.0`` (the trainer's initial sentinel).
+    Missing block (older checkpoints written before this anchor existed)
+    yields ``(inf, -1, 0.0, 0)`` so the caller starts the patience clock from
+    scratch — the safe, documented fallback.
+    """
+    ckpt_dir = Path(ckpt_dir)
+    ts_path = ckpt_dir / "training_state.json"
+    if not ts_path.is_file():
+        return float("inf"), -1, 0.0, 0
+    ts = json.loads(ts_path.read_text(encoding="utf-8"))
+    block = ts.get("best_checkpoint")
+    if not isinstance(block, Mapping):
+        return float("inf"), -1, 0.0, 0
+    raw_loss = block.get("best_val_loss")
+    best_val_loss = float("inf") if raw_loss is None else float(raw_loss)
+    raw_step = block.get("best_val_step")
+    best_val_step = -1 if raw_step is None else int(raw_step)
+    if best_val_step < 0:
+        best_val_step = -1
+    raw_legality = block.get("best_late_legality")
+    best_late_legality = 0.0 if raw_legality is None else float(raw_legality)
+    patience_counter = int(block.get("patience_counter", 0))
+    return best_val_loss, best_val_step, best_late_legality, patience_counter
+
+
 def read_resume_data_anchor(ckpt_dir: Path | str) -> tuple[int, int]:
     """Read the pretrain data-stream consume anchor from a checkpoint.
 
@@ -748,3 +1126,68 @@ def read_resume_data_anchor(ckpt_dir: Path | str) -> tuple[int, int]:
     chunk_index = int(block.get("chunk_index", 0))
     batch_offset = int(block.get("batch_offset", 0))
     return chunk_index, batch_offset
+
+
+# ---------------------------------------------------------------------------
+# Best-checkpoint selection (v1 trainer.find_best / best_val_loss parity)
+# ---------------------------------------------------------------------------
+
+# Validation-loss spellings, in priority order. Pretrain val records carry
+# the namespaced `val/loss` (+ bare `loss`) the dashboard reads; the adapter
+# / distill validation loops pass `val_loss` to `log_val`. Scanning all three
+# lets `find_best_step` work across both entry points' `metrics.jsonl`.
+_VAL_LOSS_KEYS: tuple[str, ...] = ("val/loss", "val_loss", "loss")
+
+
+def find_best_step(
+    metrics_path: Path | str, *, metric: str | None = None
+) -> int | None:
+    """Return the step with the lowest validation loss in ``metrics.jsonl``.
+
+    The v2 owner of v1's best-checkpoint selection
+    (``pawn.trainer.find_best`` + the persisted ``best_val_loss``). Scans
+    every ``type=val`` record and returns the step that minimises the
+    validation loss, reading the first present of ``val/loss`` /
+    ``val_loss`` / ``loss`` (or the explicit ``metric`` when supplied) so
+    it works for both the pretrain and adapter ``metrics.jsonl`` schemas.
+
+    Returns ``None`` when the file is absent or carries no ``type=val``
+    record with a finite loss (e.g. a run with validation disabled). Ties
+    resolve to the *earliest* step (the first to reach the best loss),
+    matching v1's strict ``<`` best-update.
+    """
+    path = Path(metrics_path)
+    if not path.is_file():
+        return None
+    keys = (metric,) if metric is not None else _VAL_LOSS_KEYS
+    best_step: int | None = None
+    best_val = float("inf")
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("type") != "val":
+                continue
+            raw: Any = None
+            for key in keys:
+                if key in rec and rec[key] is not None:
+                    raw = rec[key]
+                    break
+            step = rec.get("step")
+            if raw is None or step is None:
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(val):
+                continue
+            if val < best_val:
+                best_val = val
+                best_step = int(step)
+    return best_step

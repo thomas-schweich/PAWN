@@ -218,15 +218,15 @@ class BaseRunConfig(BaseModel):
     # --- IO ------------------------------------------------------------
     log_dir: str | None = None
     hf_repo: str | None = None
-    # v1 carried an `hf_bucket` autosave target ("the trainer pushes to
-    # both" — files at `<bucket>/logs/<run_slug>/...`). v2's JAX trainer
-    # never wired the bucket-push primitive (there is no `submit_bucket`
-    # equivalent in `pawn/lifecycle.py`), so a bucket-only run would
-    # validate and then save/push nothing — silent total checkpoint loss
-    # on a long run. Until the bucket-push path is built (tracked as a
-    # blocker in docs/V2_PARITY_AUDIT.md), `_check_checkpoint_mode`
-    # rejects any config that names `hf_bucket` rather than letting it
-    # masquerade as a working destination.
+    # v1-faithful `hf_bucket` autosave target ("the trainer pushes to
+    # both" — files at `<bucket>/logs/<run_slug>/...`). Accepts either
+    # `<namespace>/<bucket-name>` or a full `hf://buckets/...` URL.
+    # Wired through `pawn.lifecycle.HFBucketTracker` /
+    # `push_checkpoint_to_bucket` (an `hf sync` to the bucket URL — the
+    # only working bucket I/O path); the trainer syncs each checkpoint to
+    # `<bucket>/logs/<run_slug>/checkpoints/step_NNNN/` plus a truncated
+    # `metrics.jsonl`. Mutually compatible with `hf_repo` and
+    # `local_checkpoints` (see `_check_checkpoint_mode`).
     hf_bucket: str | None = None
     local_checkpoints: bool = False
     resume: str | None = None
@@ -378,32 +378,32 @@ class BaseRunConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_checkpoint_mode(self) -> "BaseRunConfig":
-        """Exactly one of hf_repo / local_checkpoints; hf_bucket is not
-        yet wired in v2 and is rejected up front.
+        """At least one durable checkpoint destination must be selected.
 
-        v1 documented `hf_bucket` as a functional autosave target
-        ("Mutually compatible with hf_repo: the trainer pushes to both",
-        files at `<bucket>/logs/<run_slug>/...`). v2's JAX trainer has no
-        bucket-push primitive (see the field comment above and
-        docs/V2_PARITY_AUDIT.md), so accepting `hf_bucket` would let a
-        bucket-only run validate and then save/push nothing — silent
-        total checkpoint loss. Reject it with an actionable error instead
-        of advertising a destination that drops every checkpoint.
+        `hf_repo` and `local_checkpoints` are mutually exclusive (one
+        local-only path, one push-to-model-repo path). `hf_bucket` is a
+        v1-faithful autosave target — "Mutually compatible with hf_repo:
+        the trainer pushes to both", files landing at
+        `<bucket>/logs/<run_slug>/...` (see :func:`pawn.lifecycle.
+        push_checkpoint_to_bucket`). It can therefore be combined with
+        either of the other two, *or* stand alone as the sole
+        destination.
+
+        The one thing that's still rejected is a run with **no**
+        destination at all (no hf_repo, no local_checkpoints, no
+        hf_bucket) — that would save/push nothing.
         """
         if self.hf_repo and self.local_checkpoints:
             raise ValueError(
                 "hf_repo and local_checkpoints are mutually exclusive"
             )
-        if self.hf_bucket is not None:
+        if (
+            not self.hf_repo
+            and not self.local_checkpoints
+            and not self.hf_bucket
+        ):
             raise ValueError(
-                "hf_bucket autosave is not implemented in v2 (the JAX "
-                "trainer has no bucket-push path). Use --hf-repo for "
-                "durable pushes or --local-checkpoints for local-only "
-                "saves. Tracking: docs/V2_PARITY_AUDIT.md."
-            )
-        if not self.hf_repo and not self.local_checkpoints:
-            raise ValueError(
-                "one of hf_repo or local_checkpoints is required"
+                "one of hf_repo, local_checkpoints, or hf_bucket is required"
             )
         return self
 
