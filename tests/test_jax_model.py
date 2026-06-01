@@ -626,6 +626,32 @@ def test_use_flash_matches_plain_attention_within_fp32_noise() -> None:
     assert jnp.allclose(plain, flash, atol=1e-3, rtol=1e-3)
 
 
+def test_compute_dtype_bfloat16_returns_bf16_logits() -> None:
+    """``compute_dtype=jnp.bfloat16`` runs the forward activations in
+    bf16 and returns logits in bf16 (the plan §5 AMP recipe: master
+    params stay fp32, compute is bf16, the trailing fp32 upcast only
+    happens for ``compute_dtype is None`` callers).
+
+    fp32 (``compute_dtype=None``) must keep returning fp32 logits — the
+    default the parity test / eval / probes depend on.
+    """
+    model = init_model(TINY_SUPERNET, key=0)
+    tokens = jnp.arange(2 * 16, dtype=jnp.int32).reshape(2, 16) % 100
+
+    fp32_logits = model(tokens)
+    assert fp32_logits.dtype == jnp.float32
+
+    bf16_logits = model(tokens, compute_dtype=jnp.bfloat16)
+    assert bf16_logits.dtype == jnp.bfloat16
+    assert bf16_logits.shape == fp32_logits.shape
+    assert jnp.all(jnp.isfinite(bf16_logits))
+    # bf16 has ~3 decimal digits of mantissa; the bf16 forward should
+    # still track the fp32 forward within the dtype's coarse tolerance.
+    assert jnp.allclose(
+        bf16_logits.astype(jnp.float32), fp32_logits, atol=2e-1, rtol=2e-1
+    )
+
+
 # ---------------------------------------------------------------------------
 # KV-cached generation
 # ---------------------------------------------------------------------------

@@ -219,7 +219,7 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
     print("=" * 72)
     print(f"  n_games={n_games}  max_ply={max_ply}  n_iter={n_iter}")
 
-    print("\n  [1/5] generate_random_games (baseline) ...")
+    print("\n  [1/7] generate_random_games (baseline) ...")
     times = time_cpu(
         lambda: engine.generate_random_games(n_games, max_ply, seed),
         n_warmup=n_warmup, n_iter=n_iter,
@@ -229,7 +229,7 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
         throughput_count=n_games, throughput_unit="games/s",
     ))
 
-    print("  [2/5] generate_random_games (mate_boost=1.0) ...")
+    print("  [2/7] generate_random_games (mate_boost=1.0) ...")
     times = time_cpu(
         lambda: engine.generate_random_games(
             n_games, max_ply, seed, mate_boost=1.0),
@@ -240,7 +240,7 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
         throughput_count=n_games, throughput_unit="games/s",
     ))
 
-    print("  [3/5] generate_random_games (discard_ply_limit) ...")
+    print("  [3/7] generate_random_games (discard_ply_limit) ...")
     times = time_cpu(
         lambda: engine.generate_random_games(
             n_games, max_ply, seed, discard_ply_limit=True),
@@ -251,11 +251,25 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
         throughput_count=n_games, throughput_unit="games/s",
     ))
 
+    # Full CLM batch generation (games + tokenisation/packing). This is
+    # the single Rust entry point the v2 corpus pipeline drives every
+    # training step (`pawn.corpus.generate_corpus` → `generate_clm_batch`),
+    # so its cost is the real per-step data-generation floor.
+    print("  [4/7] generate_clm_batch ...")
+    times = time_cpu(
+        lambda: engine.generate_clm_batch(n_games, max_ply, seed),
+        n_warmup=n_warmup, n_iter=n_iter,
+    )
+    results.append(make_result(
+        "engine/generate_clm_batch", times,
+        throughput_count=n_games, throughput_unit="games/s",
+    ))
+
     # Pre-generate games for downstream benchmarks
     move_ids, game_lengths, _tc = engine.generate_random_games(
         n_games, max_ply, seed)
 
-    print("  [4/5] validate_games ...")
+    print("  [5/7] validate_games ...")
     times = time_cpu(
         lambda: engine.validate_games(move_ids, game_lengths),
         n_warmup=n_warmup, n_iter=n_iter,
@@ -265,7 +279,19 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
         throughput_count=n_games, throughput_unit="games/s",
     ))
 
-    print("  [5/5] extract_board_states ...")
+    # Per-game edge-case stat bits (validation + in_check / double_check /
+    # pin / ep / castle bits) — drives `pawn.eval_suite` edge-case coverage.
+    print("  [6/7] compute_edge_stats_per_game (stat bits) ...")
+    times = time_cpu(
+        lambda: engine.compute_edge_stats_per_game(move_ids, game_lengths),
+        n_warmup=n_warmup, n_iter=n_iter,
+    )
+    results.append(make_result(
+        "engine/compute_edge_stats_per_game", times,
+        throughput_count=n_games, throughput_unit="games/s",
+    ))
+
+    print("  [7/7] extract_board_states ...")
     times = time_cpu(
         lambda: engine.extract_board_states(move_ids, game_lengths),
         n_warmup=n_warmup, n_iter=n_iter,
@@ -342,7 +368,8 @@ def _build_train_state(cfg, lr: float = 3e-4, key: int = 42):
 
 
 def _make_backbone_step(
-    state, optimizer, batch, jit: bool, compute_dtype=None
+    state, optimizer, batch, jit: bool, compute_dtype=None,
+    use_sdpa: bool = False, use_flash: bool = False,
 ):
     """Return a `() -> new_state` closure timing one backbone training step.
 
@@ -355,6 +382,10 @@ def _make_backbone_step(
     so the perf benchmarks exercise the same precision settings the
     real training scripts use (otherwise this script silently runs
     fp32 even when the user asks for bf16).
+
+    `use_sdpa` / `use_flash` select the attention backend (plain
+    materialised QK^T / XLA `dot_product_attention` / Pallas-flash) so
+    `--attn-backend` is honoured end to end.
     """
     import jax
     import equinox as eqx
@@ -367,13 +398,15 @@ def _make_backbone_step(
 
     if jit:
         train_step = make_train_step(
-            optimizer, variants, compute_dtype=compute_dtype
+            optimizer, variants, compute_dtype=compute_dtype,
+            use_sdpa=use_sdpa, use_flash=use_flash,
         )
     else:
         def _eager_train_step(s, b):
             def loss_fn(model):
                 return cross_entropy_loss(
-                    model, b, compute_dtype=compute_dtype
+                    model, b, compute_dtype=compute_dtype,
+                    use_sdpa=use_sdpa, use_flash=use_flash,
                 )
             loss, grads = eqx.filter_value_and_grad(loss_fn)(s.model)
             updates, new_opt = optimizer.update(grads, s.opt_state, s.model)
@@ -403,6 +436,8 @@ def bench_backbone(
     n_iter: int,
     n_warmup: int,
     compute_dtype=None,
+    use_sdpa: bool = False,
+    use_flash: bool = False,
 ) -> list[TimingResult]:
     """Benchmark backbone training steps."""
     import jax
@@ -416,12 +451,16 @@ def bench_backbone(
         if compute_dtype is not None and hasattr(compute_dtype, "dtype")
         else (str(compute_dtype) if compute_dtype is not None else "float32")
     )
+    attn_label = "flash (Pallas)" if use_flash else (
+        "sdpa (XLA dot_product_attention)" if use_sdpa
+        else "plain (materialised QK^T)"
+    )
     print("\n" + "=" * 72)
     print(" BACKBONE TRAINING BENCHMARKS (GPU)")
     print("=" * 72)
     print(f"  batch_size={batch_size}  device={jax.devices()[0]}  n_iter={n_iter}")
     print(
-        f"  framework: JAX/Equinox/Optax  attention: plain (materialised QK^T)  "
+        f"  framework: JAX/Equinox/Optax  attention: {attn_label}  "
         f"compute_dtype: {dtype_label}"
     )
 
@@ -456,6 +495,7 @@ def bench_backbone(
             step_fn, _cell = _make_backbone_step(
                 state, optimizer, batch, jit=use_jit,
                 compute_dtype=compute_dtype,
+                use_sdpa=use_sdpa, use_flash=use_flash,
             )
 
             try:
@@ -925,8 +965,19 @@ def bench_adapters(
     do_eager: bool,
     n_iter: int,
     n_warmup: int,
+    compute_dtype=None,
+    use_sdpa: bool = False,
+    use_flash: bool = False,
 ) -> list[TimingResult]:
-    """Benchmark adapter training steps on a frozen `base` backbone."""
+    """Benchmark adapter training steps on a frozen `base` backbone.
+
+    `compute_dtype` (None / jnp.bfloat16 / jnp.float16) selects the AMP
+    forward dtype and is threaded into both the jitted
+    `make_adapter_train_step` and the eager `cross_entropy_loss` clone,
+    so this section honours `--amp-dtype` instead of silently running
+    fp32 (parity with the backbone section). `use_sdpa` / `use_flash`
+    select the attention backend.
+    """
     import jax
 
     from pawn.config import VARIANTS
@@ -935,10 +986,16 @@ def bench_adapters(
 
     results: list[TimingResult] = []
 
+    dtype_label = (
+        compute_dtype.dtype.name
+        if compute_dtype is not None and hasattr(compute_dtype, "dtype")
+        else (str(compute_dtype) if compute_dtype is not None else "float32")
+    )
     print("\n" + "=" * 72)
     print(" ADAPTER TRAINING BENCHMARKS (GPU)")
     print("=" * 72)
     print(f"  backbone=base  batch_size={batch_size}  device={jax.devices()[0]}  n_iter={n_iter}")
+    print(f"  compute_dtype: {dtype_label}")
 
     batch = _make_corpus_batch(batch_size)
 
@@ -964,15 +1021,25 @@ def bench_adapters(
             print(f"    adapter params: {n_adapter:,} / {n_total:,} total")
 
             if use_jit:
-                train_step = make_adapter_train_step(adapter_name, optimizer)
+                train_step = make_adapter_train_step(
+                    adapter_name, optimizer,
+                    compute_dtype=compute_dtype,
+                    use_sdpa=use_sdpa, use_flash=use_flash,
+                )
             else:
                 apply_fn = dispatch_apply(adapter_name)
 
-                def _eager_adapter_step(s, b, _apply=apply_fn, _opt=optimizer):
+                def _eager_adapter_step(
+                    s, b, _apply=apply_fn, _opt=optimizer,
+                    _cd=compute_dtype, _sdpa=use_sdpa, _flash=use_flash,
+                ):
                     import equinox as eqx
                     def loss_fn(adapter):
                         effective = _apply(s.backbone, adapter)
-                        return cross_entropy_loss(effective, b)
+                        return cross_entropy_loss(
+                            effective, b, compute_dtype=_cd,
+                            use_sdpa=_sdpa, use_flash=_flash,
+                        )
                     loss, grads = eqx.filter_value_and_grad(loss_fn)(s.adapter)
                     updates, new_opt = _opt.update(grads, s.opt_state, s.adapter)
                     new_adapter = eqx.apply_updates(s.adapter, updates)
@@ -1152,6 +1219,111 @@ def _collect_system_info() -> dict:
     return info
 
 
+def _collect_gpu_info_amdsmi(info: dict) -> None:
+    """Collect AMD GPU clocks and VRAM bandwidth via the amdsmi Python library.
+
+    Available on ROCm 6+. Native Python API — no subprocess needed. Ported
+    from v1 (`git show main:scripts/benchmark.py`); the metadata is
+    framework-independent so it survives the JAX swap unchanged.
+
+    `amdsmi` ships with the ROCm system install rather than via pip and has
+    no type stubs, so it's loaded with `importlib.import_module` (typed as
+    `ModuleType`) inside the best-effort guard rather than a bare `import`
+    pyright would flag as unresolved.
+    """
+    import importlib
+
+    try:
+        amdsmi = importlib.import_module("amdsmi")
+        amdsmi.amdsmi_init()
+    except Exception:
+        return
+
+    try:
+        handles = amdsmi.amdsmi_get_processor_handles()
+        if not handles:
+            return
+        gpu = handles[0]
+
+        # Max clocks: SYS (graphics) and MEM
+        for clk_type, key in [
+            (amdsmi.AmdSmiClkType.SYS, "gpu_clock_mhz"),
+            (amdsmi.AmdSmiClkType.MEM, "gpu_mem_clock_mhz"),
+        ]:
+            try:
+                clk = amdsmi.amdsmi_get_clock_info(gpu, clk_type)
+                max_clk = clk.get("max_clk") or clk.get("max")
+                if max_clk:
+                    info[key] = int(max_clk)
+            except Exception:
+                pass
+
+        # VRAM info (type, bus width)
+        try:
+            vram = amdsmi.amdsmi_get_gpu_vram_info(gpu)
+            vram_type = vram.get("vram_type") or vram.get("type")
+            if vram_type:
+                info["vram_type"] = str(vram_type)
+            vram_width = vram.get("vram_bit_width") or vram.get("bit_width")
+            if vram_width:
+                info["vram_bus_width"] = int(vram_width)
+        except Exception:
+            pass
+
+        # PCIe info
+        try:
+            pcie = amdsmi.amdsmi_get_pcie_info(gpu)
+            pcie_info = pcie.get("pcie_static", pcie)
+            gen = pcie_info.get("max_pcie_speed") or pcie_info.get("pcie_generation")
+            width = pcie_info.get("max_pcie_width") or pcie_info.get("pcie_width")
+            if gen and width:
+                info["pcie"] = f"Gen{gen} x{width}"
+        except Exception:
+            pass
+    finally:
+        try:
+            amdsmi.amdsmi_shut_down()
+        except Exception:
+            pass
+
+
+def _collect_gpu_info_nvidia_smi(info: dict) -> None:
+    """Collect NVIDIA GPU clocks + PCIe link via nvidia-smi (ported from v1)."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=clocks.max.graphics,clocks.max.mem,pcie.link.gen.max,pcie.link.width.max",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            parts = [p.strip() for p in out.stdout.strip().split(",")]
+            if len(parts) >= 2:
+                info["gpu_clock_mhz"] = int(parts[0])
+                info["gpu_mem_clock_mhz"] = int(parts[1])
+            if len(parts) >= 4:
+                info["pcie"] = f"Gen{parts[2]} x{parts[3]}"
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+
+
+def _is_rocm() -> bool:
+    """True when the active JAX backend is ROCm.
+
+    v1 used `pawn.gpu.is_rocm()` (a torch probe). v2 has no torch on the
+    training path, so detect from the JAX device's platform string — the
+    RocmDevice repr / `device_kind` carries the AMD signature.
+    """
+    try:
+        import jax
+        dev0 = jax.devices()[0]
+        sig = f"{dev0!r} {getattr(dev0, 'device_kind', '')}".lower()
+        return "rocm" in sig or "amd" in sig or "radeon" in sig or "gfx" in sig
+    except Exception:
+        return False
+
+
 def _collect_jax_info() -> dict:
     import jax
 
@@ -1161,6 +1333,7 @@ def _collect_jax_info() -> dict:
         "jax": jax.__version__,
         "jax_platform": jax.default_backend(),
         "jax_device": str(dev0),
+        "jax_device_kind": getattr(dev0, "device_kind", ""),
         "jax_device_count": len(devs),
     }
     stats = None
@@ -1172,6 +1345,15 @@ def _collect_jax_info() -> dict:
         limit = stats.get("bytes_limit") or stats.get("bytes_reservable_limit")
         if limit:
             info["vram_gb"] = round(limit / (1024**3), 1)
+
+    # Detailed hardware metadata (clocks, VRAM type/width, PCIe) via the
+    # platform-native tool. Best-effort; absent on minimal containers.
+    if _is_rocm():
+        info["platform"] = "ROCm"
+        _collect_gpu_info_amdsmi(info)
+    else:
+        info["platform"] = "CUDA"
+        _collect_gpu_info_nvidia_smi(info)
     return info
 
 
@@ -1192,11 +1374,40 @@ def _print_system_info(info: dict) -> None:
             print(f"Cache: {', '.join(parts)}")
 
 
-def _print_jax_info(info: dict) -> None:
-    print(f"JAX: {info['jax']}  backend: {info['jax_platform']}"
-          f"  device: {info['jax_device']}"
-          f"  count: {info['jax_device_count']}")
+def _print_jax_info(info: dict, attn_backend: str = "plain") -> None:
+    dev_kind = info.get("jax_device_kind", "")
+    gpu_line = f"GPU: {info['jax_device']}"
+    if dev_kind and dev_kind not in info["jax_device"]:
+        gpu_line += f" ({dev_kind})"
+    plat = info.get("platform", "")
+    detail_parts = []
+    if plat:
+        detail_parts.append(plat)
     if "vram_gb" in info:
+        vram_str = f"{info['vram_gb']:.1f} GB"
+        if info.get("vram_type"):
+            vram_str += f" {info['vram_type']}"
+        detail_parts.append(f"{vram_str} VRAM")
+    if info.get("gpu_clock_mhz"):
+        detail_parts.append(f"{info['gpu_clock_mhz']} MHz")
+    if info.get("gpu_mem_clock_mhz"):
+        detail_parts.append(f"mem {info['gpu_mem_clock_mhz']} MHz")
+    if detail_parts:
+        gpu_line += f" ({', '.join(detail_parts)})"
+    print(gpu_line)
+
+    extras = []
+    if info.get("vram_bus_width"):
+        extras.append(f"{info['vram_bus_width']}-bit bus")
+    if info.get("pcie"):
+        extras.append(f"PCIe {info['pcie']}")
+    if extras:
+        print(f"      {', '.join(extras)}")
+
+    print(f"JAX: {info['jax']}  backend: {info['jax_platform']}"
+          f"  count: {info['jax_device_count']}")
+    print(f"Attention backend: {attn_backend}")
+    if "vram_gb" in info and not detail_parts:
         print(f"VRAM: {info['vram_gb']:.1f} GB")
 
 
@@ -1264,6 +1475,22 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--attn-backend",
+        choices=["plain", "sdpa", "flash"],
+        default="plain",
+        help=(
+            "Attention backend for the GPU (backbone + adapter) sections "
+            "(default: plain materialised QK^T, matching pawn/model.py's "
+            "default and the v2 bit-stable baseline). `sdpa` selects "
+            "jax.nn.dot_product_attention (XLA); `flash` selects the Pallas "
+            "Triton fused kernel. This is the v2 successor to v1's "
+            "--sdpa-backend / automatic MATH-vs-flash selection — the "
+            "framework swap replaced torch SDPBackend with the model's "
+            "use_sdpa / use_flash knobs."
+        ),
+    )
+
     parser.add_argument("--json", type=str, default=None,
                         help="Save results to JSON file")
 
@@ -1278,6 +1505,11 @@ def main():
     do_jit = not args.no_jit
     do_eager = not args.jit_only
 
+    # Resolve attention backend → model knobs (v2 successor to v1's
+    # torch SDPBackend selection).
+    use_sdpa = args.attn_backend == "sdpa"
+    use_flash = args.attn_backend == "flash"
+
     info = _collect_system_info()
     _print_system_info(info)
 
@@ -1285,7 +1517,7 @@ def main():
         try:
             jax_info = _collect_jax_info()
             info.update(jax_info)
-            _print_jax_info(info)
+            _print_jax_info(info, attn_backend=args.attn_backend)
         except Exception as exc:
             if do_engine:
                 print(f"JAX unavailable ({exc!r}) — running engine benchmarks only.")
@@ -1319,6 +1551,7 @@ def main():
             args.variants, args.batch_size,
             do_jit, do_eager, args.n_iter, args.n_warmup,
             compute_dtype=compute_dtype,
+            use_sdpa=use_sdpa, use_flash=use_flash,
         )
     if do_data_pipeline:
         data_pipeline_results = bench_data_pipeline(
@@ -1333,6 +1566,8 @@ def main():
         adapter_results = bench_adapters(
             args.adapters, args.batch_size,
             do_jit, do_eager, args.n_iter, args.n_warmup,
+            compute_dtype=compute_dtype,
+            use_sdpa=use_sdpa, use_flash=use_flash,
         )
 
     print_summary(engine_results, backbone_results, data_pipeline_results,

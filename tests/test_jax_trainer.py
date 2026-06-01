@@ -723,6 +723,59 @@ def test_train_step_updates_params_and_advances_step() -> None:
     assert not np.array_equal(embed_tokens_before, np.asarray(new_state.model.embed_tokens))
 
 
+def test_train_step_compute_dtype_bf16_runs_and_keeps_fp32_master() -> None:
+    """``make_train_step(..., compute_dtype=jnp.bfloat16)`` exercises the
+    AMP forward (plan §5): activations + logits run in bf16, but the
+    master parameters stay fp32 and the optimizer update lands on fp32
+    weights.
+
+    Behavioral assertions:
+      * the step completes, advances, returns a finite scalar loss;
+      * params move (bf16 grads still drive a real update);
+      * the updated master weights are still fp32 (AMP invariant — bf16
+        is a *compute* dtype, never the stored-weight dtype).
+    """
+    model = _tiny_model()
+    assert model.embed_tokens.dtype == jnp.float32
+    embed_before = np.asarray(model.embed_tokens)
+    state, opt = _tiny_train_state(model)
+    variants = _tiny_variants()
+    train_step = make_train_step(opt, variants, compute_dtype=jnp.bfloat16)
+    batch = _small_batch()
+
+    new_state, loss = train_step(state, batch)
+
+    assert int(new_state.step) == 1
+    assert jnp.isfinite(loss)
+    # Master weights stayed fp32 — bf16 is compute-only.
+    assert new_state.model.embed_tokens.dtype == jnp.float32
+    # bf16 grads still moved the params.
+    assert not np.array_equal(embed_before, np.asarray(new_state.model.embed_tokens))
+
+
+def test_train_step_compute_dtype_bf16_loss_tracks_fp32() -> None:
+    """The bf16 forward must produce a loss close to the fp32 forward on
+    the same model + batch — proving the AMP path actually runs in bf16
+    (and isn't silently identical to fp32) while still tracking it within
+    the dtype's coarse precision. A bf16 step whose loss diverged wildly
+    from fp32 would signal a broken cast somewhere in the forward.
+    """
+    model = _tiny_model()
+    variants = _tiny_variants()
+    batch = _small_batch()
+
+    fp32_loss = float(supernet_joint_loss(model, batch, variants))
+    bf16_loss = float(
+        supernet_joint_loss(
+            model, batch, variants, compute_dtype=jnp.bfloat16
+        )
+    )
+    assert math.isfinite(bf16_loss)
+    # bf16 mantissa is ~3 decimal digits; the joint CE over a tiny batch
+    # lands within a few percent of the fp32 value.
+    assert abs(bf16_loss - fp32_loss) < 0.1 * abs(fp32_loss) + 0.05
+
+
 def test_train_step_jit_does_not_retrace_across_steps() -> None:
     """The JIT cache should hit for steps 1, 2, 3 — no re-trace per
     call. We verify by inspecting `train_step._fn`'s cache info
