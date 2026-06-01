@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate HuggingFace model cards for PAWN variants.
+"""Generate HuggingFace model cards for PAWN v2 variants.
 
 Fetches eval_results.json and metrics.jsonl from each HuggingFace model repo,
 renders the Jinja2 template, and optionally uploads the result.
@@ -8,6 +8,29 @@ This script intentionally fails loudly if any metrics are missing to ensure bad 
 wind up getting posted due to e.g. a connection error. Do not add fallback values or default to
 zero. Just use direct subscripting, division, etc. so that an exception is thrown if anything is
 suspect. Better not to update the model card in such cases.
+
+Everything user-visible is **auto-detected from the published checkpoint**:
+the architecture comes from ``config.json``'s ``model`` block, the training
+hyperparameters from its ``run`` block, and the variant identity (small /
+base / large) is inferred by matching ``model.d_model`` against
+:data:`pawn.config.VARIANTS`. Nothing about a variant is hardcoded per-repo
+beyond the repo IDs themselves, so the same template renders correctly for
+any backbone regardless of how it was trained.
+
+The v2 ``config.json`` layout (written by :func:`pawn.checkpoint.save_model`)
+differs from v1:
+
+- ``model`` block (was ``model_config``) — :class:`pawn.config.ModelConfig`
+  fields: ``d_model`` / ``n_layers`` / ``n_heads`` / ``d_ff`` / ``head_dim``
+  / ``vocab_size`` / ``max_seq_len`` / ``tie_embeddings``.
+- ``run`` block (was ``training_config``) — the run's
+  :class:`pawn.run_config.BaseRunConfig` dump: ``total_steps`` /
+  ``batch_size`` / ``lr`` / ``weight_decay`` / ``warmup_steps`` /
+  ``warmup_frac`` / ``conditioning`` (the v1 ``prepend_outcome`` bool was
+  replaced by the ``conditioning`` list — ``["outcome"]`` ⇒ outcome
+  conditioning enabled).
+
+``training_state.json`` carries ``step`` (was ``global_step``).
 
 Usage:
     # Preview locally
@@ -20,28 +43,36 @@ Usage:
     python scripts/generate_model_cards.py --variants base --push
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import jinja2
 
+from pawn.config import VARIANTS
 
-VARIANTS = {
+
+# Published v2 repos. The architecture / training surface is auto-detected
+# from each repo's config.json (see `build_context`); only the repo IDs and
+# the human-facing labels live here.
+VARIANT_REPOS: dict[str, dict[str, str]] = {
     "small": {
-        "repo": "thomas-schweich/pawn-small",
+        "repo": "thomas-schweich/pawn-small-v2",
         "variant_name": "Small",
         "variant_label": "small",
         "variant_factory": "small",
     },
     "base": {
-        "repo": "thomas-schweich/pawn-base",
+        "repo": "thomas-schweich/pawn-base-v2",
         "variant_name": "Base",
         "variant_label": "base (default)",
         "variant_factory": "base",
     },
     "large": {
-        "repo": "thomas-schweich/pawn-large",
+        "repo": "thomas-schweich/pawn-large-v2",
         "variant_name": "Large",
         "variant_label": "large",
         "variant_factory": "large",
@@ -49,7 +80,30 @@ VARIANTS = {
 }
 
 
-def fetch_config(repo: str, revision: str | None = None) -> dict:
+def detect_variant(model_block: dict[str, Any]) -> str:
+    """Infer the variant key (small / base / large) from a config's model block.
+
+    The variant identity is **never** assumed from the repo it came from —
+    it is derived structurally by matching the checkpoint's ``d_model`` /
+    ``n_heads`` against :data:`pawn.config.VARIANTS`. This keeps the card
+    honest if a repo is ever republished at a different size, and surfaces a
+    mismatch as a loud error rather than a silently wrong card.
+    """
+    d_model = model_block["d_model"]
+    n_heads = model_block["n_heads"]
+    for key, cfg in VARIANTS.items():
+        if cfg.d_model == d_model and cfg.n_heads == n_heads:
+            return key
+    raise ValueError(
+        f"config.json model block (d_model={d_model}, n_heads={n_heads}) "
+        f"does not match any known variant in pawn.config.VARIANTS "
+        f"({ {k: (v.d_model, v.n_heads) for k, v in VARIANTS.items()} }). "
+        f"The card generator only knows the production supernet variants; "
+        f"a custom-size checkpoint needs its own card template."
+    )
+
+
+def fetch_config(repo: str, revision: str | None = None) -> dict[str, Any]:
     """Download config.json from a HuggingFace model repo."""
     from huggingface_hub import hf_hub_download
     path = hf_hub_download(repo, "config.json", revision=revision)
@@ -73,22 +127,22 @@ def count_params_from_weights(repo: str, revision: str | None = None) -> int:
 
     path = hf_hub_download(repo, "model.safetensors", revision=revision)
     total = 0
-    with safe_open(path, framework="pt") as f:
+    with safe_open(path, framework="numpy") as f:
         for key in f.keys():
-            total += f.get_tensor(key).numel()
+            total += int(f.get_tensor(key).size)
     return total
 
 CEILING_PATH = Path("cards/theoretical_ceiling.json")
 
 
-def load_ceilings() -> dict:
+def load_ceilings() -> dict[str, Any]:
     """Load the unconditional ceiling from the canonical JSON artifact.
 
-    The v1.0.0 backbones do not use outcome conditioning, so the only
-    relevant ceiling is the unconditional E[1/N_legal] over positions
-    sampled from random games of up to max_ply plies. See
-    scripts/compute_theoretical_ceiling.py for how the artifact is
-    produced and docs/ACCURACY_CEILING.md for the methodology.
+    PAWN's random-game backbones evaluate against the unconditional
+    ceiling — the only relevant ceiling without outcome conditioning is
+    E[1/N_legal] over positions sampled from random games of up to max_ply
+    plies. See scripts/compute_theoretical_ceiling.py for how the artifact
+    is produced and docs/ACCURACY_CEILING.md for the methodology.
     """
     if not CEILING_PATH.exists():
         raise FileNotFoundError(
@@ -148,7 +202,7 @@ DIAGNOSTIC_NAMES = {
 }
 
 
-def fetch_eval_results(repo: str, revision: str | None = None) -> dict:
+def fetch_eval_results(repo: str, revision: str | None = None) -> dict[str, Any]:
     """Download eval_results.json from a HuggingFace model repo."""
     from huggingface_hub import hf_hub_download
     path = hf_hub_download(repo, "eval_results.json", revision=revision)
@@ -157,7 +211,7 @@ def fetch_eval_results(repo: str, revision: str | None = None) -> dict:
 
 
 def fetch_published_step(repo: str, revision: str | None = None) -> int:
-    """Read the global_step that the published model.safetensors was saved at.
+    """Read the ``step`` that the published model.safetensors was saved at.
 
     The trainer keeps val every `eval_interval` steps but only saves
     checkpoints every `checkpoint_interval` steps (typically 1K vs 5K).
@@ -165,32 +219,32 @@ def fetch_published_step(repo: str, revision: str | None = None) -> int:
     best 5K-cadence checkpoint by val loss, *not* the lowest-loss val
     record across every val step. The two diverge whenever val noise
     around the eventual best happens to dip lower at an in-between
-    step, which is the common case. Reading `global_step` from the
-    co-published `training_state.json` is the only authoritative
-    source for which step the weights came from.
+    step, which is the common case. Reading ``step`` from the
+    co-published ``training_state.json`` is the only authoritative
+    source for which step the weights came from. (v2 renamed v1's
+    ``global_step`` to ``step`` — see pawn.lifecycle.build_training_state.)
     """
     from huggingface_hub import hf_hub_download
     path = hf_hub_download(repo, "training_state.json", revision=revision)
     with open(path) as f:
         ts = json.load(f)
-    step = ts.get("global_step")
+    step = ts.get("step")
     if step is None:
         raise ValueError(
-            f"training_state.json from {repo} has no global_step field; "
+            f"training_state.json from {repo} has no step field; "
             f"cannot determine which step the published model.safetensors "
             f"was saved at."
         )
     return int(step)
 
 
-def fetch_metrics_at_step(repo: str, step: int, revision: str | None = None) -> dict:
+def fetch_metrics_at_step(repo: str, step: int, revision: str | None = None) -> dict[str, Any]:
     """Download metrics.jsonl and return the val record at the given step.
 
     Used to pull the val metrics for the exact checkpoint the published
     `model.safetensors` was saved at — see `fetch_published_step` for
-    the why. The trainer writes a complete val record on every eval
-    (including the extended compound-legality fields), so a single
-    record is enough — no need to merge anything across records.
+    the why. The trainer writes a complete val record on every eval, so a
+    single record is enough — no need to merge anything across records.
     """
     from huggingface_hub import hf_hub_download
     path = hf_hub_download(repo, "metrics.jsonl", revision=revision)
@@ -206,7 +260,7 @@ def fetch_metrics_at_step(repo: str, step: int, revision: str | None = None) -> 
     )
 
 
-def format_probe(eval_results: dict, probe_name: str) -> str:
+def format_probe(eval_results: dict[str, Any], probe_name: str) -> str:
     """Format a probe result.
 
     Picks the best layer by ``best_accuracy`` and formats classification
@@ -235,7 +289,7 @@ def format_probe(eval_results: dict, probe_name: str) -> str:
     return f"{acc:.1%}"
 
 
-def format_diagnostic(eval_results: dict, diag_name: str) -> tuple[str, str]:
+def format_diagnostic(eval_results: dict[str, Any], diag_name: str) -> tuple[str, str]:
     """Format a diagnostic result as (n_positions, value)."""
     diag = eval_results["diagnostics"][diag_name]
     n = diag["n_positions"]
@@ -246,39 +300,55 @@ def format_diagnostic(eval_results: dict, diag_name: str) -> tuple[str, str]:
     return str(n), f"{val:.1%}"
 
 
-def build_context(variant_key: str, variant: dict, revision: str | None = None) -> dict:
+def build_context(variant_meta: dict[str, str], revision: str | None = None) -> dict[str, Any]:
     """Build the full Jinja template context for a variant."""
-    repo = variant["repo"]
+    repo = variant_meta["repo"]
     rev_label = f" @ {revision}" if revision else ""
     print(f"  Fetching config and metrics from {repo}{rev_label}...")
 
-    ctx = dict(variant)
-    ctx["variant_key"] = variant_key
+    ctx: dict[str, Any] = dict(variant_meta)
 
     # Fetch model architecture and training config from config.json. Every
     # field below is auto-detected from the published checkpoint — no
     # hardcoded values, so the same template renders correctly for any
-    # backbone regardless of how it was trained.
+    # backbone regardless of how it was trained. The v2 config layout uses
+    # `model` / `run` blocks (v1 used `model_config` / `training_config`).
     config = fetch_config(repo, revision=revision)
-    mc = config["model_config"]
+    mc = config["model"]
+    # The variant identity is derived structurally from the checkpoint, not
+    # assumed from the repo it lives in.
+    ctx["variant_key"] = detect_variant(mc)
     ctx["d_model"] = mc["d_model"]
     ctx["n_layers"] = mc["n_layers"]
     ctx["n_heads"] = mc["n_heads"]
     ctx["d_ff"] = mc["d_ff"]
     ctx["vocab_size"] = mc["vocab_size"]
     ctx["max_seq_len"] = mc["max_seq_len"]
-    ctx["head_dim"] = ctx["d_model"] // ctx["n_heads"]
+    # head_dim is an explicit ModelConfig field in v2 (fixed at 64 across
+    # nested variants); fall back to the derived value only if a checkpoint
+    # predates the field.
+    ctx["head_dim"] = mc.get("head_dim", ctx["d_model"] // ctx["n_heads"])
     ctx["params_num"] = count_params_from_weights(repo, revision=revision)
     ctx["params"] = params_str(ctx["params_num"])
 
-    tc = config["training_config"]
-    ctx["total_steps"] = tc["total_steps"]
-    ctx["batch_size"] = tc["batch_size"]
-    ctx["warmup_steps"] = tc["warmup_steps"]
-    ctx["lr"] = tc["lr"]
-    ctx["weight_decay"] = tc["weight_decay"]
-    ctx["max_ply"] = tc["max_ply"]
-    ctx["prepend_outcome"] = tc.get("prepend_outcome", False)
+    rc = config["run"]
+    ctx["total_steps"] = rc["total_steps"]
+    ctx["batch_size"] = rc["batch_size"]
+    # v2 splits warmup into an explicit `warmup_steps` override (int | None)
+    # and a `warmup_frac` (default). When the run used the fractional form,
+    # resolve the effective step count from `warmup_frac * total_steps` so
+    # the card always shows a concrete number (no None leaking into the
+    # template's `{:,}` format).
+    warmup_steps = rc["warmup_steps"]
+    if warmup_steps is None:
+        warmup_steps = round(rc["warmup_frac"] * rc["total_steps"])
+    ctx["warmup_steps"] = warmup_steps
+    ctx["lr"] = rc["lr"]
+    ctx["weight_decay"] = rc["weight_decay"]
+    # v2 replaced the v1 `prepend_outcome: bool` with a `conditioning` list;
+    # outcome conditioning is on iff "outcome" is in the list.
+    ctx["conditioning"] = rc["conditioning"]
+    ctx["prepend_outcome"] = "outcome" in rc["conditioning"]
     ctx["sequences_seen"] = ctx["total_steps"] * ctx["batch_size"]
 
     # Fetch training metrics for the EXACT step the published
@@ -288,26 +358,16 @@ def build_context(variant_key: str, variant: dict, revision: str | None = None) 
     ctx["published_step"] = published_step
     ctx["published_sequences"] = published_step * ctx["batch_size"]
     val = fetch_metrics_at_step(repo, published_step, revision=revision)
+    # v2 val record keys (pawn.logging.MetricsLogger.log_val): the scalar
+    # surface emitted by pawn.eval.EvalResult.as_log_kwargs.
     ctx["top1"] = val["val/accuracy"] * 100
     ctx["top5"] = val["val/top5_accuracy"] * 100
     ctx["val_loss"] = val["val/loss"]
     ctx["perplexity"] = val["val/perplexity"]
     ctx["legal_rate"] = val["val/legal_move_rate"] * 100
     ctx["late_legal_rate"] = val["val/late_legal_move_rate"] * 100
-    # Compound legality: did the model predict every move along one side's
-    # plies legally for an entire game? See docs/ARCHITECTURE.md for the
-    # definition. These fields were added in the v1.0.0 training runs;
-    # if they're missing the trainer used by this checkpoint pre-dates
-    # them, which means the card needs to be regenerated against a
-    # newer run before being uploaded.
-    ctx["completion_rate"] = val["val/game_completion_rate"] * 100
-    ctx["avg_pct_completion"] = val["val/avg_pct_completion"] * 100
-    ctx["avg_plies_completed"] = val["val/avg_plies_completed"]
-    ctx["median_forfeit_ply"] = val["val/median_forfeit_ply"]
 
-    # Accuracy ratio against the unconditional ceiling. The v1.0.0
-    # backbones don't use outcome conditioning, so this is the only
-    # relevant ceiling — see docs/ACCURACY_CEILING.md.
+    # Accuracy ratio against the unconditional ceiling.
     ceil = load_ceilings()
     ctx["uncond_ceiling"] = ceil["uncond"]
     ctx["uncond_ceiling_ci_low"] = ceil["uncond_ci_low"]
@@ -340,12 +400,12 @@ def build_context(variant_key: str, variant: dict, revision: str | None = None) 
     return ctx
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Generate HuggingFace model cards")
     parser.add_argument("--push", action="store_true", help="Upload cards to HuggingFace")
     parser.add_argument("--template", type=Path, default=Path("cards/hf_model_card.md.j2"))
     parser.add_argument("--output-dir", type=Path, default=Path("cards/model"))
-    parser.add_argument("--variants", nargs="*", default=list(VARIANTS.keys()))
+    parser.add_argument("--variants", nargs="*", default=list(VARIANT_REPOS.keys()))
     parser.add_argument(
         "--revision",
         default=None,
@@ -371,12 +431,12 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     for variant_key in args.variants:
-        if variant_key not in VARIANTS:
+        if variant_key not in VARIANT_REPOS:
             print(f"Unknown variant: {variant_key}")
             continue
 
-        print(f"\n=== {VARIANTS[variant_key]['variant_name']} ===")
-        ctx = build_context(variant_key, VARIANTS[variant_key], revision=args.revision)
+        print(f"\n=== {VARIANT_REPOS[variant_key]['variant_name']} ===")
+        ctx = build_context(VARIANT_REPOS[variant_key], revision=args.revision)
         card = template.render(**ctx)
 
         output_path = args.output_dir / f"pawn-{variant_key}.md"

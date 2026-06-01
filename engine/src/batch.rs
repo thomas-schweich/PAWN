@@ -42,7 +42,9 @@ pub fn generate_training_batch(batch_size: usize, max_ply: usize, seed: u64) -> 
 
     // Pack bulk arrays in parallel — each game writes to a non-overlapping region
     let total_ply = batch_size * max_ply;
-    let mut move_ids = vec![0i16; total_ply];
+    // PAD-init: positions past `game_length` are never written, and the vocab
+    // assigns 0 to a legal move, so a 0-init tail would read as real moves.
+    let mut move_ids = vec![vocab::PAD_TOKEN as i16; total_ply];
     let mut legal_move_grid = vec![0u64; total_ply * 64];
     let mut legal_promo_mask = vec![false; total_ply * 44 * 4];
 
@@ -96,7 +98,9 @@ pub fn generate_random_games(
 ) -> GameBatch {
     let pack = |results: &[(Vec<u16>, u16, Termination)]| -> GameBatch {
         let n = results.len();
-        let mut move_ids = vec![0i16; n * max_ply];
+        // PAD-init: tail past each game's length is never written; vocab
+        // token 0 is a legal move, so a 0-init tail would read as moves.
+        let mut move_ids = vec![vocab::PAD_TOKEN as i16; n * max_ply];
         let mut game_lengths = Vec::with_capacity(n);
         let mut termination_codes = Vec::with_capacity(n);
         for (b, (moves, length, term)) in results.iter().enumerate() {
@@ -161,7 +165,9 @@ pub fn generate_checkmate_training_batch(
     let (examples, total_generated) = generate_checkmate_examples(seed, max_ply, n_games);
     let n = examples.len();
 
-    let mut move_ids = vec![0i16; n * max_ply];
+    // PAD-init: tail past each game's length is never written; vocab token 0
+    // is a legal move, so a 0-init tail would read as moves.
+    let mut move_ids = vec![vocab::PAD_TOKEN as i16; n * max_ply];
     let mut game_lengths = Vec::with_capacity(n);
     let mut checkmate_targets = vec![0u64; n * 64];
     let mut legal_grids = vec![0u64; n * 64];
@@ -234,7 +240,9 @@ pub fn generate_checkmate_games(
 
     // Pack into GameBatch
     let n_games = collected_white.len() + collected_black.len();
-    let mut move_ids = vec![0i16; n_games * max_ply];
+    // PAD-init: tail past each game's length is never written; vocab token 0
+    // is a legal move, so a 0-init tail would read as moves.
+    let mut move_ids = vec![vocab::PAD_TOKEN as i16; n_games * max_ply];
     let mut game_lengths = Vec::with_capacity(n_games);
     let mut termination_codes = Vec::with_capacity(n_games);
 
@@ -385,22 +393,19 @@ mod tests {
 
     #[test]
     fn test_pad_after_game_end() {
+        let pad = vocab::PAD_TOKEN as i16;
         let batch = generate_training_batch(2, 256, 42);
         for b in 0..2 {
             let len = batch.game_lengths[b] as usize;
-            if len < 256 {
-                assert_eq!(
-                    batch.move_ids[b * 256 + len],
-                    vocab::PAD_TOKEN as i16,
-                    "Position game_length should be PAD (0)"
-                );
-            }
-            // All positions after game_length should also be PAD
+            // Every position from game_length onward is the PAD token
+            // (1968), never 0 — the vocab assigns 0 to a legal move, so a
+            // 0-init tail would be indistinguishable from a real move.
             for t in len..256 {
                 assert_eq!(
                     batch.move_ids[b * 256 + t],
-                    0,
-                    "Position {} (after game_length={}) should be PAD", t, len
+                    pad,
+                    "Position {} (>= game_length={}) should be PAD ({}), got {}",
+                    t, len, pad, batch.move_ids[b * 256 + t]
                 );
             }
         }
@@ -649,12 +654,14 @@ mod tests {
 
     #[test]
     fn test_random_games_pad_after_length() {
+        let pad = vocab::PAD_TOKEN as i16;
         let batch = generate_random_games(4, 128, 42, 0.0, false);
         for b in 0..4 {
             let gl = batch.game_lengths[b] as usize;
             for t in gl..128 {
-                assert_eq!(batch.move_ids[b * 128 + t], 0,
-                    "Position {} after gl={} should be PAD", t, gl);
+                assert_eq!(batch.move_ids[b * 128 + t], pad,
+                    "Position {} after gl={} should be PAD ({}), got {}",
+                    t, gl, pad, batch.move_ids[b * 128 + t]);
             }
         }
     }
@@ -763,11 +770,27 @@ mod tests {
     #[test]
     fn test_checkmate_games_termination_all_checkmate() {
         // Every game returned from generate_checkmate_games is a checkmate
-        let (batch, total) = generate_checkmate_games(2, 2, 256, 42);
+        let max_ply = 256;
+        let (batch, total) = generate_checkmate_games(2, 2, max_ply, 42);
         assert!(total >= 4);
         for &code in &batch.termination_codes {
             assert_eq!(code, Termination::Checkmate.as_u8(),
                 "generate_checkmate_games should return only checkmates");
+        }
+        // The post-game tail must be PAD-initialised, never 0 — the vocab
+        // assigns token 0 to a legal move, so a 0-init tail would feed real
+        // moves into the corpus past each game's length.
+        let pad = vocab::PAD_TOKEN as i16;
+        for b in 0..batch.n_games {
+            let len = batch.game_lengths[b] as usize;
+            for t in len..max_ply {
+                assert_eq!(
+                    batch.move_ids[b * max_ply + t], pad,
+                    "generate_checkmate_games: tail position {} of game {} \
+                     (len={}) must be PAD ({}), got {}",
+                    t, b, len, pad, batch.move_ids[b * max_ply + t]
+                );
+            }
         }
     }
 
@@ -789,13 +812,29 @@ mod tests {
 
     #[test]
     fn test_checkmate_training_batch_targets_nonempty() {
-        let batch = generate_checkmate_training_batch(3, 256, 42);
+        let max_ply = 256;
+        let batch = generate_checkmate_training_batch(3, max_ply, 42);
         assert_eq!(batch.n_games, 3);
         for b in 0..3 {
             let grid = &batch.checkmate_targets[b * 64..(b + 1) * 64];
             // At least one mating move exists
             let any_bits: u32 = grid.iter().map(|&g| g.count_ones()).sum();
             assert!(any_bits > 0, "Checkmate target grid for game {} is empty", b);
+        }
+        // The post-game tail must be PAD-initialised, never 0 — the vocab
+        // assigns token 0 to a legal move, so a 0-init tail would read as a
+        // real move past each game's length.
+        let pad = vocab::PAD_TOKEN as i16;
+        for b in 0..batch.n_games {
+            let len = batch.game_lengths[b] as usize;
+            for t in len..max_ply {
+                assert_eq!(
+                    batch.move_ids[b * max_ply + t], pad,
+                    "generate_checkmate_training_batch: tail position {} of \
+                     game {} (len={}) must be PAD ({}), got {}",
+                    t, b, len, pad, batch.move_ids[b * max_ply + t]
+                );
+            }
         }
     }
 

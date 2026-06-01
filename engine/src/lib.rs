@@ -1740,27 +1740,71 @@ mod tests {
         assert_eq!(vocab::PROMO_PIECES, ["q", "r", "b", "n"]);
     }
 
-    /// Plan §10 S11: every PGN-to-tokens path's token buffer is
-    /// PAD-initialised so positions past `game_length` aren't read as
-    /// a legal move (the vocab assigns 0 to a legal move). Spot-check
-    /// the contract by calling `uci_to_tokens` style flow at the
-    /// vec-init level: a zero `n * max_ply` vec PAD-init'd has all
-    /// entries equal to `PAD_TOKEN as i16`.
+    /// Plan §10 S11: every game-to-tokens path PAD-initialises its token
+    /// buffer so positions past `game_length` aren't read as a legal move
+    /// (the vocab assigns 0 to a legal move). This drives the *actual*
+    /// generation functions and asserts the post-game tail is `PAD_TOKEN`,
+    /// not 0 — a 0-init regression at any pack site fails this test.
     #[test]
     fn test_token_buffer_pad_init_contract() {
-        let n = 3;
-        let max_ply = 8;
-        let buf = vec![vocab::PAD_TOKEN as i16; n * max_ply];
-        for v in &buf {
-            assert_eq!(
-                *v, vocab::PAD_TOKEN as i16,
-                "token buffer must be PAD-initialised, not 0"
-            );
-        }
-        // PAD_TOKEN is 1968 — a value the vocab does NOT decompose as
-        // a real move (it returns None). Without PAD-init the trailing
-        // tail would read as token 0, which IS a legal move.
+        let pad = vocab::PAD_TOKEN as i16;
+        let max_ply = 256;
+
+        // PAD_TOKEN (1968) does NOT decompose as a real move; token 0 does.
+        // This is what makes a 0-init tail dangerous — it reads as a move.
         assert!(vocab::decompose_token(vocab::PAD_TOKEN).is_none());
         assert!(vocab::decompose_token(0).is_some());
+
+        // 1. Random-game packing (`generate_random_games`).
+        let games = batch::generate_random_games(16, max_ply, 7, 0.0, false);
+        let mut saw_short_game = false;
+        for b in 0..games.n_games {
+            let len = games.game_lengths[b] as usize;
+            if len < max_ply {
+                saw_short_game = true;
+            }
+            for t in len..max_ply {
+                assert_eq!(
+                    games.move_ids[b * max_ply + t], pad,
+                    "generate_random_games: tail position {} of game {} \
+                     (len={}) must be PAD, got {}",
+                    t, b, len, games.move_ids[b * max_ply + t]
+                );
+            }
+        }
+        // The contract is only meaningful if at least one game ended before
+        // max_ply (so there is a real tail to PAD); random games almost
+        // always do, but assert it so the test can't pass vacuously.
+        assert!(saw_short_game, "expected at least one game shorter than max_ply");
+
+        // 2. Training-batch packing (`generate_training_batch`).
+        let batch = batch::generate_training_batch(8, max_ply, 11);
+        for b in 0..8 {
+            let len = batch.game_lengths[b] as usize;
+            for t in len..max_ply {
+                assert_eq!(
+                    batch.move_ids[b * max_ply + t], pad,
+                    "generate_training_batch: tail position {} of game {} \
+                     (len={}) must be PAD, got {}",
+                    t, b, len, batch.move_ids[b * max_ply + t]
+                );
+            }
+        }
+
+        // 3. SAN-to-tokens packing (`batch_san_to_tokens`) — a 7-ply game
+        //    padded out to max_ply; everything past ply 7 must be PAD.
+        let san: Vec<Vec<&str>> = vec![
+            vec!["e4", "e5", "Qh5", "Nc6", "Bc4", "Nf6", "Qxf7#"],
+        ];
+        let (flat, lengths) = pgn::batch_san_to_tokens(&san, max_ply);
+        let len = lengths[0] as usize;
+        assert_eq!(len, 7, "expected 7 valid tokens");
+        for t in len..max_ply {
+            assert_eq!(
+                flat[t], pad,
+                "batch_san_to_tokens: tail position {} (len={}) must be PAD, got {}",
+                t, len, flat[t]
+            );
+        }
     }
 }
