@@ -3,8 +3,10 @@
 > **v1 metrics disclaimer.** All metrics and benchmarks attached to
 > the published `pawn-{small, base, large}` HF repos are v1 PyTorch
 > numbers. v2 republishes to new HF repos
-> (`pawn-{small, base, large}-v2` or similar). The bridge that lets
-> v2 code load the v1 repos is `pawn.legacy.convert_legacy_checkpoint`.
+> (`pawn-{small, base, large}-v2` or similar). The v1 repos are **not
+> loadable in v2** (the Phase-A `V=2000` un-factored-embedding redesign is
+> architecturally incompatible and the legacy converter was removed in the
+> H.2 commit); use the `v1.0.0` git tag for the v1 artifacts.
 
 
 ## Prerequisites

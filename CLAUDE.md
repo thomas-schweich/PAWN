@@ -24,7 +24,7 @@ pawn/
 ├── pawn/                    # Core Python package
 │   ├── _sentinel.py         # stdlib-only SHA-256 .complete sentinel helpers
 │   ├── config.py            # ModelConfig, SUPERNET, VARIANTS, TINY_*, validate_nested
-│   ├── model.py             # Equinox PAWNModel (RMSNorm + RoPE + SwiGLU + factored embeddings)
+│   ├── model.py             # Equinox PAWNModel (RMSNorm + RoPE + SwiGLU + uniform tied embeddings)
 │   ├── run_config.py        # pydantic configs: BaseRunConfig / PretrainConfig / AdapterConfig / SpecializedCLMConfig
 │   ├── logging.py           # MetricsLogger (JSONL, type-discriminated, NaN-sanitised)
 │   ├── checkpoint.py        # Atomic safetensors save/load + async HF push
@@ -99,20 +99,28 @@ extraction happen in Rust. No Python chess libraries.
   `compute_legal_token_masks_sparse()`, `extract_board_states()`,
   `export_move_vocabulary()`, `compute_accuracy_ceiling()`, `edge_case_bits()`
 - `export_move_vocabulary()` returns the 1,968-entry searchless_chess action
-  table used by the factored embeddings.
+  table — action IDs 0–1967 within the uniform `VOCAB_SIZE = 2000` vocab.
 
 ## Model
 
 ### Architecture
 
-- Decoder-only transformer, next-token prediction over 1,968 move tokens
-  (1,980 total vocab).
-- Token vocabulary: 1,968 searchless_chess actions (0–1967) + 1 PAD (1968) +
-  11 outcomes (1969–1979) = 1,980 total.
-- Factored embeddings: `src_embed[s] + dst_embed[d] + promo_embed[p]`.
-- Sequence format: `[ply_1] ... [ply_N] [PAD] ... [PAD]` (512 tokens) —
-  outcome prefix is optional via the `prepend_outcome` field in
-  `BaseRunConfig`.
+- Decoder-only transformer, next-token prediction over a uniform
+  `VOCAB_SIZE = 2000` vocabulary (1,968 move actions are the only sampleable
+  tokens; argmax is restricted to `[0, NUM_ACTIONS)`).
+- Token vocabulary (`pawn/config.py`): 1,968 searchless_chess actions
+  (0–1967) + 1 PAD (1968) + 11 outcomes (1969–1979) + BOS + NULL + 18
+  reserved control slots = 2,000 total. (The engine's emission space is a
+  narrower 1,980; the model's uniform input/output vocab is 2,000.)
+- Uniform token embeddings: a single `embed_tokens[V, d]` table over the
+  whole `VOCAB_SIZE = 2000` vocab, tied to the output head by default
+  (`tie_embeddings`; logits are `x @ embed_tokens.T`, no separate `lm_head`).
+  The Phase-A redesign replaced the old factored `src+dst+promo`
+  decomposition with this un-factored table.
+- Sequence format: a fixed-width `[BOS][cond...]` conditioning prefix (width
+  `C`, NULL-filled) followed by `[ply_1] ... [ply_N] [PAD] ... [PAD]` —
+  the conditioning kind is set by the `conditioning` field in
+  `BaseRunConfig` (the old `prepend_outcome` flag is one such kind).
 - Equinox `PAWNModel` is a single module covering the supernet, every sliced
   variant, and any standalone (converted-legacy) model. Stacked layers are
   applied with `jax.lax.scan` over a leading `n_layers` axis. Attention
@@ -442,15 +450,17 @@ entrypoint.
 - **The held-out validation split is the default.** Carving val out of train
   silently leaks; only opt back into carve-from-train for single-file local
   sources without split structure.
-- **One framework.** JAX/Equinox/Optax everywhere. The only torch touchpoints
-  are `pawn/legacy.py` (the v1 converter) and `pawn/_torch_legacy_fixture.py`
-  (the converter's parity-test reference architecture).
+- **One framework.** JAX/Equinox/Optax everywhere. No torch anywhere in v2 —
+  the legacy v1→JAX converter (`pawn/legacy.py`) and its parity fixture were
+  removed in the H.2 housekeeping commit (see [Legacy converter] below); v1
+  PyTorch artifacts are reachable only via the `v1.0.0` git tag.
 - **PAD-token init in the engine.** Every PGN-token-init site initialises
   with `vocab::PAD_TOKEN`, not `0` — the vocab assigns `0` to a legal move,
   so a 0-initialised tail looks like real moves downstream.
-- **Factored embeddings.** Each move token decomposes into
-  `src_embed[s] + dst_embed[d] + promo_embed[p]`, shrinking the
-  move-embedding table from `1968 × d_model` to `(64 + 64 + 5) × d_model`.
+- **Un-factored tied embeddings.** A single `embed_tokens[V=2000, d_model]`
+  table covers the whole vocab; the output head reuses it transposed when
+  `tie_embeddings` (the default). The Phase-A redesign retired the earlier
+  factored `src+dst+promo` decomposition — don't reintroduce it in prose.
 - **WSL2 + ROCm.** JAX-on-ROCm works on WSL2 but emits a benign
   "sysfs nodes path does not exist" warning at import time; ignore it. The
   RocmDevice still resolves and jit'd kernels run normally.

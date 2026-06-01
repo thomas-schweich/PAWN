@@ -21,11 +21,12 @@ The model comes in three sizes, all trained from scratch on random chess games g
 
 *Metrics measured on a 2,048-game validation set of random games. **Game completion** is the ability to choose a legal move in every position throughout a random game. It is the primary signal that separates capacity between sizes. The number given above is non-autoregressive. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate).*
 
-All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), factored move embeddings, and a vocabulary covering:
+All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), a uniform output-tied token embedding table, and a `VOCAB_SIZE = 2000` vocabulary covering:
 
 - 1,968 move actions (the `searchless_chess` vocabulary, one entry per legally-reachable (src, dst[, promotion]) tuple),
 - 11 game-outcome tokens (pretraining outcomes: `WHITE_CHECKMATES`, `BLACK_CHECKMATES`, `STALEMATE`, `DRAW_BY_RULE`, `PLY_LIMIT`; Lichess-specific outcomes: `WHITE_RESIGNS`, `BLACK_RESIGNS`, `DRAW_BY_AGREEMENT`, `WHITE_WINS_ON_TIME`, `BLACK_WINS_ON_TIME`, `DRAW_BY_TIME`),
-- and a single PAD token — 1,980 tokens total.
+- a single PAD token,
+- and the Phase-A control tokens (BOS, NULL, + reserved conditioning slots) — 2,000 tokens total.
 
 Tokens are coordinate pairs (UCI notation) with no piece type or side-to-move information — `e2e4` means the same token whether it's a pawn double-push or a rook move. The model learns to track piece placement, movement rules, and game state entirely from observation, which can be isolated via [linear probes](https://arxiv.org/abs/1610.01644).
 
@@ -55,9 +56,12 @@ uv run --extra rocm python scripts/train_jax_adapter.py \
 ```
 
 The published `pawn-{small,base,large}` HF checkpoints are v1 PyTorch
-artifacts — they're loaded through `pawn.legacy.convert_legacy_checkpoint`
-which transposes weights into the v2 JAX layout. v2 republishes
-under new HF repos (`pawn-{small,base,large}-v2` or similar).
+artifacts. They are **not loadable in v2** — the Phase-A format redesign
+(uniform `V=2000` vocab + un-factored tied embeddings) makes the v1 weight
+layout architecturally incompatible, and the legacy converter was removed in
+the H.2 housekeeping commit. To use the v1 artifacts, check out the `v1.0.0`
+git tag. v2 trains and republishes under new HF repos
+(`pawn-{small,base,large}-v2` or similar); the v1 repos are not modified.
 
 ### Pretrain the supernet
 
@@ -97,7 +101,7 @@ uv run --extra dashboard python -m pawn.dashboard --log-dir logs
 
 <sub>More info: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)</sub>
 
-Standard decoder-only [transformer](https://arxiv.org/abs/1706.03762) with next-token prediction. Each training example is a move sequence padded to 512 tokens. Factored embeddings decompose each move into source square + destination square + promotion piece. Predictions are not masked to legal moves — the model must infer legality from the move history alone. There is no board representation like [AlphaZero](https://arxiv.org/abs/1712.01815)'s 8x8xN planes; all state tracking is learned internally.
+Standard decoder-only [transformer](https://arxiv.org/abs/1706.03762) with next-token prediction. Each training example is a move sequence padded to 512 tokens (optionally preceded by a fixed-width conditioning prefix). Token embeddings come from a single uniform table tied to the output head. Predictions are not masked to legal moves — the model must infer legality from the move history alone. There is no board representation like [AlphaZero](https://arxiv.org/abs/1712.01815)'s 8x8xN planes; all state tracking is learned internally.
 
 ## What the Model Learns
 

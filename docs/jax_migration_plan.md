@@ -43,6 +43,19 @@ Keep `origin/main` reachable for the entire migration. Don't delete it. Don't me
 
 ## 3. Acceptance criteria
 
+> **Post-hoc amendment (after the Phase-A redesign).** Criteria **4, 5, and
+> 20** below — the legacy v1→JAX checkpoint conversion / logit-parity
+> workflow — are **superseded and gone-by-design.** The converter was built
+> and verified working, then made nonsensical by the Phase-A format redesign
+> (`VOCAB_SIZE` 1980→2000 + un-factored output-tied embeddings), which leaves
+> v1 PyTorch weights with no shape-compatible v2 image. v1 artifacts are
+> reachable via the `v1.0.0` git tag; v2 publishes fresh
+> `pawn-{small,base,large}-v2` checkpoints. See `DEFERRALS.md` →
+> *Gone-by-design* → "Legacy v1→JAX checkpoint converter" for the full
+> rationale, and `docs/V2_PARITY_AUDIT.md` for the as-built audit. The rows
+> below are kept verbatim for historical fidelity; every *other* criterion
+> still holds.
+
 These are the workflows the framework-swap PR has to preserve. Each one has a verification command you can run locally on a GPU machine. **Every section close re-grades the relevant subset.** No criterion is optional.
 
 | # | Workflow | Verification |
@@ -87,7 +100,7 @@ Estimated improvement: ~3× throughput on B200 from JAX + fused loop + resident 
 
 **Framework.** JAX/Equinox + Optax. PyTorch is removed from the training and eval surface. Two narrow torch touchpoints survive: a thin loader for external non-JAX consumers (§5.6) and a frozen reference architecture used by the legacy-converter parity tests.
 
-**Model.** A single `PAWNModel` Equinox module shapes the supernet, every sliced variant, and any standalone (converted-legacy) model. Stacked transformer layers applied with `jax.lax.scan` over a leading `n_layers` axis. Plain attention (materialised `QK^T` scores) — at seq 512 attention is ~12% of step FLOPs and plain attention sidesteps fused-kernel maturity under JAX-on-ROCm. RMSNorm + RoPE + SwiGLU + factored input embeddings (`src_embed[s] + dst_embed[d] + promo_embed[p]`).
+**Model.** A single `PAWNModel` Equinox module shapes the supernet, every sliced variant, and any standalone (converted-legacy) model. Stacked transformer layers applied with `jax.lax.scan` over a leading `n_layers` axis. Plain attention (materialised `QK^T` scores) — at seq 512 attention is ~12% of step FLOPs and plain attention sidesteps fused-kernel maturity under JAX-on-ROCm. RMSNorm + RoPE + SwiGLU + factored input embeddings (`src_embed[s] + dst_embed[d] + promo_embed[p]`). *(Superseded by the Phase-A redesign: the factored move embeddings were replaced by a single un-factored, output-tied `embed_tokens[2000, d]` table — see `docs/ARCHITECTURE.md` → Token Embeddings.)*
 
 **Supernet + variants.** The supernet is large's dimensions (d=640, 10 layers, 10 heads, head_dim=64). small (d=256, 4 heads) and base (d=512, 8 heads) are nested slices of it — the inner `[:d_V, :d_V]` of every weight matrix. Joint training sums per-variant cross-entropies on the same batch; gradients accumulate into the one shared weight tensor. The supernet is sliced into three standalone safetensors checkpoints at publish time; downstream consumers see ordinary independent checkpoints. `head_dim = 64` is fixed so width slices align to whole heads and RoPE is variant-invariant.
 

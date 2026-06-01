@@ -326,8 +326,8 @@ def cross_entropy_loss(
     for).
 
     ``compute_dtype`` is the AMP forward dtype (plan §5). ``None`` (the
-    default) runs the model in fp32 — the legacy converter's parity
-    test and any consumer that needs bit-stable logits pass ``None``.
+    default) runs the model in fp32 — the fp32 parity tests and any
+    consumer that needs bit-stable logits pass ``None``.
 
     ``use_sdpa`` opts the attention block into
     :func:`jax.nn.dot_product_attention` (parity #43). Bare

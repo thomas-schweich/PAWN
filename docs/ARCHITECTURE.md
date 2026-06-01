@@ -3,8 +3,10 @@
 > **v1 metrics disclaimer.** All metrics and benchmarks attached to
 > the published `pawn-{small, base, large}` HF repos are v1 PyTorch
 > numbers. v2 republishes to new HF repos
-> (`pawn-{small, base, large}-v2` or similar). The bridge that lets
-> v2 code load the v1 repos is `pawn.legacy.convert_legacy_checkpoint`.
+> (`pawn-{small, base, large}-v2` or similar). The v1 repos are **not
+> loadable in v2** (the Phase-A `V=2000` un-factored-embedding redesign is
+> architecturally incompatible and the legacy converter was removed in the
+> H.2 commit); use the `v1.0.0` git tag for the v1 artifacts.
 
 
 PAWN (Playstyle-Agnostic World-model Network for Chess) is a causal transformer trained on random chess games via next-token prediction. It learns chess rules, legal moves, and board state representations purely from move sequences, with no hand-crafted features or external game databases.
@@ -28,13 +30,14 @@ An optional outcome-conditioning mode — enabled via the `prepend_outcome` trai
 
 ## Token Vocabulary
 
-The vocabulary contains 1,980 tokens, borrowed from Google DeepMind's [searchless_chess](https://github.com/google-deepmind/searchless_chess) project:
+The model's uniform input/output vocabulary is `VOCAB_SIZE = 2000`. The first 1,968 entries are the move actions borrowed from Google DeepMind's [searchless_chess](https://github.com/google-deepmind/searchless_chess) project; the remainder are PAD, outcomes, and the Phase-A control tokens:
 
 | Range | Count | Description |
 |-------|-------|-------------|
 | 0--1967 | 1,968 | Move actions (one entry per legally-reachable (src, dst[, promotion]) tuple) |
 | 1968 | 1 | PAD token |
 | 1969--1979 | 11 | Outcome tokens |
+| 1980--1999 | 20 | Phase-A control tokens (BOS, NULL, + reserved conditioning slots) |
 
 The outcome tokens are:
 
@@ -56,25 +59,36 @@ Tokens 1969-1973 are used during pretraining on random games. Tokens 1974-1979 a
 
 Move tokenization is handled entirely by the Rust chess engine, which maps UCI move strings (e.g., `e2e4`, `a7a8q`) to token indices.
 
-## Factored Input Embeddings
+## Token Embeddings
 
-Instead of a single embedding table of size 1,980, PAWN uses **factored embeddings** that decompose each move token into its structural components. This exploits the fact that chess moves have compositional structure: a source square, a destination square, and an optional promotion piece.
+> **Historical note.** v1 (and early v2) used *factored* move embeddings that
+> decomposed each move token into `src_embed[source] + dst_embed[destination]
+> + promo_embed[promotion]`. The Phase-A redesign replaced that with the
+> uniform table described below; the factored decomposition no longer exists
+> in the code.
 
-For each move token, a static decomposition table maps it to a (source, destination, promotion) triple. The embedding is computed as:
+PAWN uses a single uniform embedding table `embed_tokens` of shape
+`[VOCAB_SIZE, d_model]` over the whole `VOCAB_SIZE = 2000` vocabulary — the
+1,968 move actions, PAD, the 11 outcome tokens, and the reserved
+`BOS` / `NULL` / control slots all index the same table:
 
 ```
-embed(move) = src_embed[source] + dst_embed[destination] + promo_embed[promotion]
+embed(token) = embed_tokens[token]
 ```
 
-The embedding tables are:
+**Tied output head.** By default (`tie_embeddings = True` on `ModelConfig`)
+the model has no separate `lm_head` array — output logits reuse the input
+table transposed:
 
-- `src_embed`: 64 entries (one per square), each of dimension d_model
-- `dst_embed`: 64 entries (one per square), each of dimension d_model
-- `promo_embed`: 5 entries (none, queen, rook, bishop, knight), each of dimension d_model
+```
+logits = x @ embed_tokens.T          # shape [..., VOCAB_SIZE]
+```
 
-This reduces the embedding parameter count from 1,980 x d_model to 133 x d_model -- a roughly 15x reduction. It also provides structural inductive bias: moves that share a source or destination square share embedding components.
-
-PAD and outcome tokens are not decomposed. PAD uses a standalone learned parameter vector. The 11 outcome tokens use a separate small embedding table.
+Argmax callers restrict the result to `[0, NUM_ACTIONS)` so PAD, outcome,
+`BOS`/`NULL`, and reserved tokens can never be sampled as a move. An untied
+config keeps a standalone `lm_head[d_model, VOCAB_SIZE]` instead; the
+checkpoint schema drops the `lm_head` field in the tied case (see
+`pawn.model.saved_fields`).
 
 ## Transformer Architecture
 
@@ -101,7 +115,7 @@ FFN(x) = W_down(SiLU(W_gate(x)) * W_up(x))
 
 This uses three weight matrices per block instead of the standard two, with no bias terms. The intermediate dimension d_ff is 4x the model dimension.
 
-**Output head.** A single linear projection from d_model to vocab_size (1,980), producing logits over the full token vocabulary. No weight tying with the input embeddings.
+**Output head.** Logits over the full `VOCAB_SIZE = 2000` vocabulary. By default (`tie_embeddings`) the output head is the input `embed_tokens` table transposed — `logits = x @ embed_tokens.T`, no separate `lm_head` parameter (see *Token Embeddings* above). An untied config keeps a standalone `lm_head[d_model, VOCAB_SIZE]` linear projection instead. *(v1 used an untied `d_model → 1,980` projection.)*
 
 **Weight initialization.** All parameters with more than one dimension are initialized from N(0, 0.02).
 
@@ -125,7 +139,7 @@ This uses three weight matrices per block instead of the standard two, with no b
 
 The v2 stack pins `head_dim = 64` so width slices align to whole heads and RoPE is variant-invariant; all variants share the supernet's depth (10 layers) so the inner `[:d_V, :d_V]` of every weight matrix gives a valid sub-model. A `TINY_SUPERNET` (d=192, 4 layers, 3 heads) exists for verification runs that don't need production scale.
 
-The v1.0.0 parameter counts are slightly lower than the legacy `-legacy` repos with the same `d_model`/`n_layers`/`n_heads`, because the new 1,980-token vocabulary has roughly half the entries of the old 4,278-token vocab. The output projection (`lm_head`: `d_model → vocab_size`) is the only place vocab size enters the parameter count — factored input embeddings keep the input side compact regardless.
+The v1.0.0 parameter counts are slightly lower than the legacy `-legacy` repos with the same `d_model`/`n_layers`/`n_heads`, because the move vocabulary has roughly half the entries of the old 4,278-token vocab. In v2 the uniform `embed_tokens[VOCAB_SIZE, d_model]` table is where vocab size enters the parameter count; with the default `tie_embeddings` the output head reuses that same table (transposed), so the vocab contributes a single `VOCAB_SIZE × d_model` block rather than separate input and output tables.
 
 ## Forward Pass Variants
 

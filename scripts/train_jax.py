@@ -458,8 +458,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Resolve cfg.amp_dtype → jnp dtype. None ⇒ fp32 forward (back-
     # compat with existing tests that synthesise opt_state in fp32 and
-    # parity-test the legacy converter bit-exact). The default is
-    # bf16 per plan §5 + v1 parity.
+    # need bit-exact fp32 logits). The default is bf16 per plan §5 +
+    # v1 parity.
     _DTYPE_MAP = {
         "bfloat16": jnp.bfloat16,
         "float16": jnp.float16,

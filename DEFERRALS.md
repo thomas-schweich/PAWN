@@ -17,6 +17,31 @@ either gone-by-design or explicitly carried as follow-ups.
 
 These v1 surfaces are intentionally absent from v2 and will not return:
 
+- **Legacy v1→JAX checkpoint converter** (`pawn/legacy.py`,
+  `pawn.legacy.convert_legacy_checkpoint`,
+  `scripts/convert_published_checkpoints.py`,
+  `pawn/_torch_legacy_fixture.py`, `tests/test_jax_legacy.py`) — and with
+  it the plan's **acceptance criteria 4, 5, and 20**.
+  **Removed in:** the H.2 housekeeping commit.
+  **Reason:** actively detrimental + (post-redesign) nonsensical. The
+  converter *was* built and verified working (it hit the criterion-4 logit
+  tolerance on the real published `pawn-small`: mean Δ ≈ 5.9e-6, argmax
+  100%). But the **Phase-A format redesign that landed afterward**
+  changed the model's vocabulary and embedding structure — `VOCAB_SIZE`
+  went 1980→2000 and the factored `src+dst+promo` move embeddings were
+  replaced by a single un-factored, output-tied `embed_tokens[2000, d]`
+  table (`pawn/model.py`, `pawn/config.py`). A v1 PyTorch checkpoint's
+  weights have **no shape-compatible image** in the v2 architecture, so a
+  weight-transposing converter can no longer produce a loadable v2 model;
+  keeping a converter that cannot round-trip would be a maintenance trap
+  and a correctness footgun. Criteria 4/5/20 were written (plan §3, §6:143,
+  §7:177) before that redesign was contemplated and are **superseded**: v1
+  artifacts stay reachable via the `v1.0.0` git tag (CLAUDE.md), and v2
+  trains + publishes fresh `pawn-{small,base,large}-v2` checkpoints rather
+  than converting the v1 weights. This is the one place where v2 is **not**
+  a superset of the *original plan*; it is a deliberate, documented design
+  decision taken after the plan was written, not an unfinished migration.
+
 - **Cotrain config + entry point** (`pawn.run_config.CotrainConfig`,
   `scripts/train_cotrain.py`, `tests/training/test_cotrain_*`). The
   supernet's joint loss (`pawn.trainer.supernet_joint_loss`)
@@ -203,10 +228,18 @@ push (commits on `jax_migration` after `3a0f8e2`):
 
 ## Acceptance-criteria status
 
-Every §3 acceptance-criterion gap from
-`docs/JAX_PARITY_SHORTFALLS.md` §2 has been re-verified with real
-runs in `final_smoke.md` (parity #4). The one criterion that's
-operator-discretion rather than automated is §18 (live HF push) —
-unit tests cover the wiring; the live push itself needs a scratch
-repo + token. See `final_smoke.md` §18 for the explicit honest
-write-up.
+The §3 acceptance criteria were re-audited in `docs/V2_PARITY_AUDIT.md`
+(the gated multi-agent audit that superseded the earlier, now-deleted
+`docs/JAX_PARITY_SHORTFALLS.md`). Every parity/correctness gap that audit
+confirmed has since been implemented and verified (the `fix(v2-parity/*)`
+commit series); see that document for the per-item evidence.
+
+Two criteria are **not** automated green checks:
+
+- **§4 / §5 / §20 (legacy-checkpoint conversion)** — superseded and
+  gone-by-design; see the "Legacy v1→JAX checkpoint converter" entry under
+  *Gone-by-design* above. These are the only §3 criteria with no v2
+  implementation, by deliberate post-redesign decision.
+- **§18 (live HF push)** — operator-discretion rather than automated: unit
+  tests cover the wiring and the per-run `run/{slug}` branch logic; the live
+  push itself needs a scratch repo + token.

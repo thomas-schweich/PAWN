@@ -1,5 +1,18 @@
 # final_smoke.md — jax_migration §3 acceptance criteria
 
+> **Stale-section banner (criteria 4 / 5 / 20).** The sections below that
+> exercise `pawn.legacy.convert_legacy_checkpoint` / the live converter run
+> predate the Phase-A format redesign and the H.2 removal of the converter.
+> Criteria 4/5/20 are now **superseded and gone-by-design** (the v1 weight
+> layout has no shape-compatible v2 image after the `V=2000` un-factored-tied
+> embedding redesign). The converter no longer exists; those commands no
+> longer run. See `DEFERRALS.md` → *Gone-by-design* → "Legacy v1→JAX
+> checkpoint converter", the §3 post-hoc amendment in
+> `docs/jax_migration_plan.md`, and the as-built `docs/V2_PARITY_AUDIT.md`.
+> Every other criterion's write-up below remains valid. (Note also: the
+> earlier "DEFERRALS.md is empty" remark in this file is obsolete — see the
+> current `DEFERRALS.md`.)
+
 This artifact records the verification commands + actual output excerpts
 for each of the 20 §3 acceptance criteria pinned by
 `docs/jax_migration_plan.md`. Captured on branch `jax_migration` at
@@ -37,7 +50,8 @@ Exits 0; tail of the installed-packages listing:
 `maturin develop --release` was run once during environment setup per
 the project's `Building` instructions. The module is importable in the
 active env, and `export_move_vocabulary()` yields the canonical 1968-
-action table the factored embeddings key on:
+action table (action IDs 0–1967 within the uniform `VOCAB_SIZE = 2000`
+vocab; the post-Phase-A model embeds them in a single un-factored table):
 
 ```bash
 $ uv run --extra rocm python -c "import chess_engine; print('actions:',

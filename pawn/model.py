@@ -24,9 +24,8 @@ Architectural choices:
     * ``use_sdpa=True`` — :func:`jax.nn.dot_product_attention` (XLA
       impl). Legacy fast path; superseded by Pallas on GPU.
     * Neither — plain materialised ``QK^T``. Bit-stable baseline used
-      by the legacy converter's fp32 parity test and by CPU smoke
-      runs (scripts auto-fall-back when ``jax.default_backend() !=
-      "gpu"``).
+      by the fp32 parity tests and by CPU smoke runs (scripts
+      auto-fall-back when ``jax.default_backend() != "gpu"``).
   At seq=512, attention is roughly 12% of step FLOPs on plain — and
   the cliff that ate v2's win against v1 PyTorch before Pallas
   landed.
@@ -34,9 +33,9 @@ Architectural choices:
   by the weight in fp32, downcast at the very end. The v1 PyTorch
   layout downcast *between* the norm and the weight multiply. The two
   paths are bit-identical in fp32 (the difference vanishes when the
-  intermediate dtype is already float32), so the legacy converter's
-  fp32 parity test agrees on both; the v2 layout is one fewer cast and
-  is the form the plan §5 calls out. See :func:`_rmsnorm` for details.
+  intermediate dtype is already float32), so the fp32 parity tests
+  agree on both; the v2 layout is one fewer cast and is the form the
+  plan §5 calls out. See :func:`_rmsnorm` for details.
 - **RoPE applied in the compute dtype.** The cos/sin tables are built in
   fp32 (:func:`_build_rope`) but downcast to ``x.dtype`` at the point of
   application (:func:`_apply_rope`), so the rotation runs in bf16/fp16
@@ -229,9 +228,9 @@ def _rmsnorm(
     x.dtype) * self.weight`` — downcasting *between* the norm and the
     weight multiply. The two orders are bit-identical in fp32 (a
     no-op ``.to(float32)`` between) and diverge only in bf16/fp16
-    activations. The legacy converter's parity test runs in fp32, so
-    both orders agree on its tolerance; this v2 layout is the one the
-    plan asks for and is one fewer cast.
+    activations. The fp32 parity tests run in fp32, so both orders
+    agree on their tolerance; this v2 layout is the one the plan asks
+    for and is one fewer cast.
     """
     x_f = x.astype(jnp.float32)
     w_f = weight.astype(jnp.float32)
@@ -285,9 +284,9 @@ def _apply_rope(
     slice the full ``max_seq_len`` tables down to the active window
     before calling. See :meth:`PAWNModel.forward_with_cache`.
 
-    fp32-mode callers (the legacy converter's parity test, eval, the
-    KV-cached generation path when ``compute_dtype`` is ``None``)
-    still pay no precision cost — ``x.dtype`` is fp32 there, so the
+    fp32-mode callers (the fp32 parity tests, eval, the KV-cached
+    generation path when ``compute_dtype`` is ``None``) still pay no
+    precision cost — ``x.dtype`` is fp32 there, so the
     cast on the rope tables is a no-op and the rotation stays fp32
     end-to-end.
     """
