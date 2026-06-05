@@ -2,8 +2,8 @@
 
 Coverage:
 - Round-trip: save a fresh model, load it, every saved field
-  byte-identical, forward pass matches. Both tied (default) and untied
-  (``tie_embeddings=False``) configs.
+  byte-identical, forward pass matches. Both untied (default) and tied
+  (``tie_embeddings=True``) configs.
 - Atomic write: a crashed save leaves either no final dir or a complete
   one; an orphan ``.tmp`` from a prior save is cleaned up on next save.
 - Sentinel verification: a corrupted file is rejected at load.
@@ -111,7 +111,9 @@ def _assert_fields_byte_identical(orig: object, loaded: object, fields: tuple[st
 def test_save_load_round_trip(tmp_path: Path) -> None:
     """Saving and loading a fresh (tied) model yields a model with
     byte-identical saved fields and an identical forward pass."""
-    orig = init_model(TINY_SUPERNET, key=0)
+    # Explicitly tied — untied is the v2 default, so build a tied config to
+    # keep the tied-schema round-trip (no lm_head on disk) under test.
+    orig = init_model(dataclasses.replace(TINY_SUPERNET, tie_embeddings=True), key=0)
     out_dir = tmp_path / "step_00000010"
     final_dir = save_model(orig, out_dir)
     assert final_dir == out_dir
@@ -265,7 +267,9 @@ def test_config_persists_format_and_layout_metadata(tmp_path: Path) -> None:
     raw = json.loads((out_dir / CONFIG_FILE).read_text(encoding="utf-8"))
     assert raw["version"] == CHECKPOINT_FORMAT_VERSION
     assert raw["mask_version"] == MASK_VERSION
-    assert raw["model"]["tie_embeddings"] is True
+    # TINY_SUPERNET is untied by default → persisted as False (matches model.cfg).
+    assert raw["model"]["tie_embeddings"] is False
+    assert raw["model"]["tie_embeddings"] == model.cfg.tie_embeddings
     assert raw["model"]["vocab_size"] == model.cfg.vocab_size
 
 
@@ -311,7 +315,8 @@ def test_cross_load_untied_checkpoint_into_tied_config_rejected(tmp_path: Path) 
 def test_cross_load_tied_checkpoint_into_untied_config_rejected(tmp_path: Path) -> None:
     """A checkpoint saved tied (no `lm_head`) cannot be loaded when
     config.json claims `tie_embeddings=False`."""
-    model = init_model(TINY_SUPERNET, key=0)
+    # Build a genuinely tied checkpoint (untied is the default now).
+    model = init_model(dataclasses.replace(TINY_SUPERNET, tie_embeddings=True), key=0)
     out_dir = tmp_path / "tied_ckpt"
     save_model(model, out_dir)
 

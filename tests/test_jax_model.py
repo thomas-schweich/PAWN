@@ -121,10 +121,11 @@ def test_init_model_tiny_supernet_runs() -> None:
     assert model.layers.wq.shape == (L, d, d)
     assert model.layers.w_gate.shape == (L, d, d_ff)
     assert model.layers.w_down.shape == (L, d_ff, d)
-    # Final norm. Tied by default → no standalone lm_head.
+    # Final norm + untied output head (untied is the v2 default).
     assert model.final_norm_w.shape == (d,)
-    assert TINY_SUPERNET.tie_embeddings is True
-    assert model.lm_head is None
+    assert TINY_SUPERNET.tie_embeddings is False
+    assert model.lm_head is not None
+    assert model.lm_head.shape == (d, TINY_SUPERNET.vocab_size)
 
 
 def test_init_model_untied_has_standalone_lm_head() -> None:
@@ -358,8 +359,9 @@ def test_sliced_small_variant_runs() -> None:
     assert variant_model.layers.w_gate.shape == (L, d, d_ff)
     assert variant_model.layers.w_down.shape == (L, d_ff, d)
     assert variant_model.final_norm_w.shape == (d,)
-    # Tied by default → no standalone lm_head; logits reuse embed_tokens.T.
-    assert variant_model.lm_head is None
+    # Untied by default → lm_head narrowed along d to [:d_V, :], full vocab cols.
+    assert variant_model.lm_head is not None
+    assert variant_model.lm_head.shape == (d, small_cfg.vocab_size)
 
     # Forward pass still works at the new shape
     tokens = jnp.zeros((2, 16), dtype=jnp.int32)
@@ -420,14 +422,14 @@ def test_sliced_preserves_weights() -> None:
     assert jnp.array_equal(var_l.w_gate, sup_l.w_gate[:, :dv, :dv_ff])
     assert jnp.array_equal(var_l.w_up, sup_l.w_up[:, :dv, :dv_ff])
     assert jnp.array_equal(var_l.w_down, sup_l.w_down[:, :dv_ff, :dv])
-    # Final norm + output head. TINY_SUPERNET is tied, so both the
-    # supernet and the slice carry lm_head=None (logits reuse
-    # embed_tokens.T, which is already width-sliced above).
+    # Final norm + output head. TINY_SUPERNET is untied (v2 default), so
+    # lm_head[d, V] is narrowed along d ([:dv, :]) with the full vocab
+    # columns kept — the same inner-block slicing as every other tensor.
     assert jnp.array_equal(
         variant_model.final_norm_w, supernet_model.final_norm_w[:dv]
     )
-    assert supernet_model.lm_head is None
-    assert variant_model.lm_head is None
+    assert supernet_model.lm_head is not None
+    assert jnp.array_equal(variant_model.lm_head, supernet_model.lm_head[:dv, :])
 
 
 def test_sliced_untied_slices_lm_head() -> None:
@@ -515,8 +517,9 @@ def test_init_model_production_supernet_builds() -> None:
     # Uniform token table [V, d] = [2000, 640]; input vocab == output vocab.
     assert model.embed_tokens.shape == (VOCAB_SIZE, 640)
     assert model.layers.wq.shape == (10, 640, 640)
-    # SUPERNET is tied by default → logits reuse embed_tokens.T, no head.
-    assert model.lm_head is None
+    # SUPERNET is untied by default → standalone lm_head[d, V].
+    assert model.lm_head is not None
+    assert model.lm_head.shape == (640, VOCAB_SIZE)
 
 
 def test_forward_pass_rejects_sequence_too_long() -> None:
@@ -626,14 +629,12 @@ def test_use_flash_matches_plain_attention_within_fp32_noise() -> None:
     assert jnp.allclose(plain, flash, atol=1e-3, rtol=1e-3)
 
 
-def test_compute_dtype_bfloat16_returns_bf16_logits() -> None:
-    """``compute_dtype=jnp.bfloat16`` runs the forward activations in
-    bf16 and returns logits in bf16 (the plan §5 AMP recipe: master
-    params stay fp32, compute is bf16, the trailing fp32 upcast only
-    happens for ``compute_dtype is None`` callers).
-
-    fp32 (``compute_dtype=None``) must keep returning fp32 logits — the
-    default the parity test / eval / probes depend on.
+def test_logits_always_fp32_even_under_bf16_amp() -> None:
+    """Output logits are ALWAYS returned in fp32, even when the forward
+    runs in bf16 (``compute_dtype=jnp.bfloat16``). The head matmul is
+    upcast to fp32 so a bf16 logit column can't overflow to ``inf`` (→
+    softmax NaN → one optimizer step poisoning the output projection).
+    Stability hardening; an earlier version returned bf16 logits under AMP.
     """
     model = init_model(TINY_SUPERNET, key=0)
     tokens = jnp.arange(2 * 16, dtype=jnp.int32).reshape(2, 16) % 100
@@ -641,15 +642,13 @@ def test_compute_dtype_bfloat16_returns_bf16_logits() -> None:
     fp32_logits = model(tokens)
     assert fp32_logits.dtype == jnp.float32
 
-    bf16_logits = model(tokens, compute_dtype=jnp.bfloat16)
-    assert bf16_logits.dtype == jnp.bfloat16
-    assert bf16_logits.shape == fp32_logits.shape
-    assert jnp.all(jnp.isfinite(bf16_logits))
-    # bf16 has ~3 decimal digits of mantissa; the bf16 forward should
-    # still track the fp32 forward within the dtype's coarse tolerance.
-    assert jnp.allclose(
-        bf16_logits.astype(jnp.float32), fp32_logits, atol=2e-1, rtol=2e-1
-    )
+    bf16_amp_logits = model(tokens, compute_dtype=jnp.bfloat16)
+    # bf16 activations through the stack, but logits upcast to fp32 in the head.
+    assert bf16_amp_logits.dtype == jnp.float32
+    assert bf16_amp_logits.shape == fp32_logits.shape
+    assert jnp.all(jnp.isfinite(bf16_amp_logits))
+    # The bf16 forward still tracks the fp32 forward within bf16's coarse tol.
+    assert jnp.allclose(bf16_amp_logits, fp32_logits, atol=2e-1, rtol=2e-1)
 
 
 # ---------------------------------------------------------------------------

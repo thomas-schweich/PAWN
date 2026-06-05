@@ -50,10 +50,12 @@ Architectural choices:
   move embedding into ``src + dst + promo`` lookups with PAD/outcome
   overrides; that aliased the Python-side control tokens onto the last
   outcome row, so v2 un-factors to one gather.)
-- **Output head:** when ``cfg.tie_embeddings`` (the default) the model
-  has **no** separate ``lm_head`` array — logits are
-  ``x @ embed_tokens.T`` over the full vocabulary. Untied configs keep
-  a standalone ``lm_head[d, V]``. Either way, argmax callers restrict to
+- **Output head:** untied by default — a standalone ``lm_head[d, V]``
+  projects the final hidden state to logits. When ``cfg.tie_embeddings``
+  the model omits ``lm_head`` and logits are ``x @ embed_tokens.T`` over
+  the full vocabulary; that tied head collapses the output to uniform in
+  one step without a logit scale + z-loss, so untied is canonical (see
+  :class:`pawn.config.ModelConfig`). Either way, argmax callers restrict to
   ``[0, NUM_ACTIONS)`` so PAD and outcome tokens can't be sampled — that
   restriction lives in :mod:`pawn.eval`, not here.
 
@@ -614,21 +616,19 @@ class PAWNModel(eqx.Module):
             )
         with jax.named_scope("final_norm"):
             x = _rmsnorm(x, self.final_norm_w)
-        # `_rmsnorm` returns in `x.dtype` (compute dtype if set). Cast the
-        # head to match. The trailing fp32 cast on `logits` was a
-        # ~520 MB/step HBM bandwidth tax in the bf16 training path
-        # (materialised a full ``(B, T, V)`` fp32 tensor, then
-        # ``log_softmax`` materialised another). The training loss
-        # (``pawn.trainer.cross_entropy_loss``) handles the fp32 cast
-        # inside the fused ``optax.softmax_cross_entropy_with_integer_labels``
-        # call, so we only upcast here for fp32-mode callers (legacy
-        # parity test, eval, probes) — i.e. when ``compute_dtype is
-        # None``, the einsum result is already fp32 and the cast is a
-        # no-op.
+        # Output logits are ALWAYS computed in fp32, even under bf16 AMP. The
+        # head is ~1% of step FLOPs, but a bf16 head matmul can accumulate a
+        # surviving logit column to ``inf`` (→ ``softmax`` NaN → one AdamW step
+        # permanently poisons the output projection). Upcasting ``x`` and the
+        # head weight to fp32 makes the matmul accumulate in fp32 and keeps the
+        # returned logits finite-stable; the trainer's own ``.astype(float32)``
+        # before the fused cross-entropy is then a no-op. This reinstates a
+        # ``(B,T,V)`` fp32 materialisation (a small HBM-bandwidth cost) that an
+        # earlier optimisation had removed — stability wins over that ~1%.
         with jax.named_scope("lm_head"):
-            logits = jnp.einsum("btd,dv->btv", x, self._head_weight(compute_dtype))
-        if compute_dtype is None:
-            return logits.astype(jnp.float32)
+            logits = jnp.einsum(
+                "btd,dv->btv", x.astype(jnp.float32), self._head_weight(None)
+            )
         return logits
 
     def hidden_states(

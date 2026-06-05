@@ -233,7 +233,7 @@ def test_each_strategy_keeps_backbone_embed_and_head_frozen(
     (tied) head reused from it.
     """
     backbone = init_model(TINY_SUPERNET, key=0)
-    assert backbone.lm_head is None  # TINY_SUPERNET ties by default
+    assert backbone.lm_head is not None  # untied by default (v2)
     cfg = _strategy_config(strategy)
     init = dispatch_init(strategy)
     adapter_filter = dispatch_filter(strategy)
@@ -241,6 +241,7 @@ def test_each_strategy_keeps_backbone_embed_and_head_frozen(
 
     embed_pre = np.asarray(backbone.embed_tokens)
     final_norm_pre = np.asarray(backbone.final_norm_w)
+    lm_head_pre = np.asarray(backbone.lm_head)
 
     trainable = eqx.filter(adapter, adapter_filter(adapter))
     opt = optax.chain(
@@ -260,7 +261,10 @@ def test_each_strategy_keeps_backbone_embed_and_head_frozen(
 
     # The backbone is held in state.backbone and never updated by the
     # optimizer; its embedding table / head / final-norm must not move.
-    assert new_state.backbone.lm_head is None
+    assert new_state.backbone.lm_head is not None
+    assert np.array_equal(
+        np.asarray(new_state.backbone.lm_head), lm_head_pre
+    ), f"{strategy}: backbone lm_head drifted"
     assert np.array_equal(
         np.asarray(new_state.backbone.embed_tokens), embed_pre
     ), f"{strategy}: backbone embed_tokens drifted"

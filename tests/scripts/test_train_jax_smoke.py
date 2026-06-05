@@ -456,7 +456,6 @@ def test_accuracy_model_is_invariant_to_untrained_outer_dims() -> None:
     batch = slice_batch(corpus, np.arange(8))
 
     base_sliced = float(top1_accuracy(tj.accuracy_model(model, widest), batch))
-    base_full = float(top1_accuracy(model, batch))
 
     # Perturb ONLY the untrained outer block `[d_trained:, d_trained:]` of
     # every layer's wq stack. The trained inner slice `[:d_trained, :d_trained]`
@@ -473,13 +472,14 @@ def test_accuracy_model_is_invariant_to_untrained_outer_dims() -> None:
     perturbed = _perturb_outer(model)
 
     pert_sliced = float(top1_accuracy(tj.accuracy_model(perturbed, widest), batch))
-    pert_full = float(top1_accuracy(perturbed, batch))
 
     # Sliced accuracy (the fix): invariant to the untrained outer dims.
     assert pert_sliced == base_sliced
-    # Full-model accuracy (the old bug): contaminated by the outer dims, so a
-    # large perturbation out there moves the reported value.
-    assert pert_full != base_full
+    # Full-model forward (the old bug): genuinely consumes the untrained outer
+    # dims, so a large perturbation there changes its logits. Compare raw
+    # logits, not the scalar accuracy — a tiny untrained model can score 0 both
+    # before and after, which wouldn't demonstrate the contamination.
+    assert not jax.numpy.allclose(model(batch.tokens), perturbed(batch.tokens))
 
 
 @pytest.mark.parametrize("script_name", SCRIPTS)

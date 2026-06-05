@@ -883,21 +883,22 @@ def make_optimizer(
         inner = optax.adamw(
             learning_rate=lr_schedule,
             weight_decay=cfg.weight_decay,
-            # First moment (``mu``) in bf16 — saves ~half the optimizer
-            # state's HBM footprint (~70 MB at BASE / ~140 MB at LARGE)
-            # and the matching read/write bandwidth on every step. The
-            # second moment (``nu``) stays fp32 because Adam's ``rsqrt``
-            # is sensitive to denominator precision near zero. Standard
-            # practice in optax / Maxtext / Mesh-Transformer-JAX.
-            mu_dtype=jnp.bfloat16,
+            # First moment (``mu``) in fp32. A bf16 ``mu`` (~8-bit mantissa)
+            # rounds the small surviving gradient components to zero on the
+            # step *after* a gradient spike — while the fp32 second moment
+            # (``nu``) still carries the spike's large magnitude — biasing the
+            # (clipped, unit-norm) update toward a degenerate direction right
+            # when the model is most fragile. The ~140 MB HBM saving at LARGE
+            # is not worth that pretraining-stability risk.
+            mu_dtype=jnp.float32,
         )
     elif name == "lion":
         inner = optax.lion(
             learning_rate=lr_schedule,
             weight_decay=cfg.weight_decay,
-            # Lion stores only one moment (the interpolated direction);
-            # keep it bf16 for the same bandwidth win as AdamW.mu.
-            mu_dtype=jnp.bfloat16,
+            # Lion's single moment in fp32 for the same post-spike
+            # direction-stability reason as AdamW.mu above.
+            mu_dtype=jnp.float32,
         )
     else:
         raise ValueError(f"unknown optimizer {name!r}; expected adamw/lion")

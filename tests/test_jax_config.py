@@ -106,7 +106,7 @@ def test_model_config_valid_construction() -> None:
     assert cfg.head_dim == HEAD_DIM
     assert cfg.vocab_size == VOCAB_SIZE
     assert cfg.max_seq_len == MAX_SEQ_LEN
-    assert cfg.tie_embeddings is True  # tied by default
+    assert cfg.tie_embeddings is False  # untied by default (tied collapses; see ModelConfig)
 
 
 def test_model_config_is_frozen() -> None:
@@ -324,11 +324,11 @@ def test_validate_nested_rejects_tie_embeddings_mismatch() -> None:
     """A tied variant can't nest under an untied supernet (or vice-versa):
     the tied model has no standalone lm_head, so the field sets differ and
     weights can't be shared by the inner slice."""
-    untied = ModelConfig(
-        d_model=256, n_layers=10, n_heads=4, d_ff=1024, tie_embeddings=False
+    tied = ModelConfig(
+        d_model=256, n_layers=10, n_heads=4, d_ff=1024, tie_embeddings=True
     )
     with pytest.raises(NestingError, match="tie_embeddings"):
-        validate_nested(untied, SUPERNET)  # SUPERNET ties by default
+        validate_nested(tied, SUPERNET)  # SUPERNET unties by default
 
 
 def test_validate_nested_accepts_matching_untied() -> None:

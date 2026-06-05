@@ -210,7 +210,20 @@ class ModelConfig:
     max_seq_len: int = MAX_SEQ_LEN
     rope_base: float = ROPE_BASE
     n_outcomes: int = N_TOTAL_OUTCOMES
-    tie_embeddings: bool = True
+    # Untied by default. A tied output head (one ``embed_tokens[V,d]`` used as
+    # both the input lookup and, transposed, the output projection) with NO
+    # logit regularisation collapses the output distribution to uniform in a
+    # single gradient step during pretraining: the cross-entropy gradient
+    # ``(softmax − onehot)·x`` has a column-common component that drives all V
+    # rows of ``embed_tokens`` toward collinearity → ``embed_tokens.T`` goes
+    # near-rank-1 → constant logits → ``loss = ln(V)`` dead fixed point. Global
+    # grad-norm clipping bounds the magnitude but not the *direction* of that
+    # step, so it does not prevent it. v1 was stable because input embeddings
+    # and the output projection (``lm_head``) were separate tensors with
+    # independent gradients. Untied is therefore the canonical v2 default; set
+    # ``tie_embeddings=True`` only with a logit scale + z-loss (GPT-2/PaLM
+    # recipe), which this code does not yet add.
+    tie_embeddings: bool = False
 
     def __post_init__(self) -> None:
         if self.d_model <= 0:
