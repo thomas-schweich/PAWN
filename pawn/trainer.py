@@ -934,9 +934,21 @@ def _skip_on_grad_spike(
     applied and — combined with the (separately-fixed) b2=0.999 regression —
     drove the run into a uniform-output collapse.
 
-    Branchless (``jnp.where`` select over both branches' outputs), matching
-    the trainer's no-``lax.cond`` convention — XLA computes the inner update
-    regardless, so a select is the cheap way to discard it.
+    Implemented with a single ``jax.lax.cond`` on the scalar ``bad``
+    predicate. Unlike the per-element branchless ``jnp.where`` selects the
+    trainer uses inside differentiated/vmapped code, this is a whole-step
+    gate: ``lax.cond`` runs exactly one branch, so the common (good) step
+    returns the AdamW result directly — no select and no extra read/write of
+    the full optimizer state. Only a genuine spike pays the revert. (The
+    earlier branchless form materialised a ``jnp.where`` over the entire
+    opt-state — mu+nu, now fp32 — on every step; XLA cannot DCE it because
+    ``bad`` is data-dependent via the non-finite check even at
+    ``threshold=inf``.)
+
+    The skip predicate reuses the raw pre-clip global grad norm that the clip
+    transform (the first link of ``inner``) already computed and stashed in
+    its ``_ClipState`` — read back via :func:`get_grad_norm` — rather than a
+    second full-tree square-sum reduction over every gradient leaf.
     """
 
     def init_fn(params: optax.Params) -> optax.OptState:
@@ -947,22 +959,26 @@ def _skip_on_grad_spike(
         state: optax.OptState,
         params: optax.Params | None = None,
     ) -> tuple[optax.Updates, optax.OptState]:
-        sq = sum(
-            jnp.sum(jnp.square(leaf))
-            for leaf in jax.tree_util.tree_leaves(updates)
-        )
-        g_norm = jnp.sqrt(sq)
+        new_updates, new_state = inner.update(updates, state, params)
+        # Reuse the raw pre-clip global grad norm the clip transform (the
+        # first link of ``inner``) already computed and stored in its
+        # ``_ClipState`` — one full-tree reduction per step, not two.
+        g_norm = get_grad_norm(new_state)
         bad = jnp.logical_or(
             jnp.logical_not(jnp.isfinite(g_norm)), g_norm > threshold
         )
-        new_updates, new_state = inner.update(updates, state, params)
-        safe_updates = jax.tree_util.tree_map(
-            lambda u: jnp.where(bad, jnp.zeros_like(u), u), new_updates
-        )
-        safe_state = jax.tree_util.tree_map(
-            lambda n, o: jnp.where(bad, o, n), new_state, state
-        )
-        return safe_updates, safe_state
+
+        def _apply() -> tuple[optax.Updates, optax.OptState]:
+            return new_updates, new_state
+
+        def _revert() -> tuple[optax.Updates, optax.OptState]:
+            # True skip: zero the step and roll the optimizer state back to
+            # ``state`` so Adam's moments never absorb the spike (and the
+            # step counter does not advance).
+            zeros = jax.tree_util.tree_map(jnp.zeros_like, new_updates)
+            return zeros, state
+
+        return jax.lax.cond(bad, _revert, _apply)
 
     return optax.GradientTransformation(init_fn, update_fn)
 

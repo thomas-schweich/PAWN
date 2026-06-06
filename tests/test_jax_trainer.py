@@ -697,6 +697,90 @@ def _branchless_clip_for_test(max_norm: float) -> optax.GradientTransformation:
     return optax.clip_by_global_norm(max_norm)
 
 
+def _tree_all_zero(tree: Any) -> bool:
+    return bool(
+        jax.tree_util.tree_all(
+            jax.tree_util.tree_map(lambda x: jnp.all(x == 0), tree)
+        )
+    )
+
+
+def _trees_equal(a: Any, b: Any) -> bool:
+    return bool(
+        jax.tree_util.tree_all(
+            jax.tree_util.tree_map(lambda x, y: jnp.all(x == y), a, b)
+        )
+    )
+
+
+def test_make_optimizer_skips_step_on_nonfinite_grad() -> None:
+    """Default `grad_skip_threshold=inf` ⇒ non-finite-only skip (v1
+    GradScaler parity). A NaN/Inf gradient must produce a *true* skip:
+    zero updates AND a fully reverted optimizer state (Adam moments and the
+    step count unchanged), so the spike never reaches the moments."""
+    cfg = _make_cfg(
+        lr=1.0, optimizer="adamw", warmup_frac=0.0, lr_schedule="constant"
+    )
+    opt = make_optimizer(cfg, make_lr_schedule(cfg, total_steps=100))
+    params = {"w": jnp.ones((4,))}
+    state0 = opt.init(params)
+
+    # One finite step first so the reverted-to state is non-trivial
+    # (Adam count advanced, moments populated).
+    finite = {"w": jnp.full((4,), 0.1)}
+    upd1, state1 = opt.update(finite, state0, params)
+    assert not _tree_all_zero(upd1)
+
+    # NaN gradient → skipped: zero update, state identical to state1.
+    nan_grads = {"w": jnp.array([jnp.nan, 0.0, 0.0, 0.0])}
+    upd2, state2 = opt.update(nan_grads, state1, params)
+    assert _tree_all_zero(upd2)
+    assert _trees_equal(state2, state1)
+
+
+def test_make_optimizer_applies_finite_step_at_inf_threshold() -> None:
+    """A finite gradient below the (infinite) skip threshold must NOT be
+    skipped — the update is applied and the state advances."""
+    cfg = _make_cfg(
+        lr=1.0, optimizer="adamw", warmup_frac=0.0, lr_schedule="constant"
+    )
+    opt = make_optimizer(cfg, make_lr_schedule(cfg, total_steps=100))
+    params = {"w": jnp.ones((4,))}
+    state0 = opt.init(params)
+    upd, state1 = opt.update({"w": jnp.full((4,), 0.1)}, state0, params)
+    assert not _tree_all_zero(upd)
+    assert not _trees_equal(state1, state0)
+
+
+def test_make_optimizer_skips_step_above_finite_threshold() -> None:
+    """A finite `grad_skip_threshold` rejects finite spikes above it and
+    applies steps below it (the skip uses the clip's pre-clip norm)."""
+    cfg = _make_cfg(
+        lr=1.0,
+        optimizer="adamw",
+        grad_skip_threshold=0.5,
+        warmup_frac=0.0,
+        lr_schedule="constant",
+    )
+    opt = make_optimizer(cfg, make_lr_schedule(cfg, total_steps=100))
+    params = {"w": jnp.ones((4,))}
+    state0 = opt.init(params)
+
+    # global norm = sqrt(4 * 0.4^2) = 0.8 > 0.5 → skipped.
+    above = {"w": jnp.full((4,), 0.4)}
+    assert _f(optax.tree.norm(above)) > 0.5
+    upd_hi, state_hi = opt.update(above, state0, params)
+    assert _tree_all_zero(upd_hi)
+    assert _trees_equal(state_hi, state0)
+
+    # global norm = sqrt(4 * 0.1^2) = 0.2 < 0.5 → applied.
+    below = {"w": jnp.full((4,), 0.1)}
+    assert _f(optax.tree.norm(below)) < 0.5
+    upd_lo, state_lo = opt.update(below, state0, params)
+    assert not _tree_all_zero(upd_lo)
+    assert not _trees_equal(state_lo, state0)
+
+
 # ---------------------------------------------------------------------------
 # Train step + JIT contract
 # ---------------------------------------------------------------------------
