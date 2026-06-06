@@ -286,20 +286,24 @@ def _apply_rope(
     slice the full ``max_seq_len`` tables down to the active window
     before calling. See :meth:`PAWNModel.forward_with_cache`.
 
-    fp32-mode callers (the fp32 parity tests, eval, the KV-cached
-    generation path when ``compute_dtype`` is ``None``) still pay no
-    precision cost — ``x.dtype`` is fp32 there, so the
-    cast on the rope tables is a no-op and the rotation stays fp32
-    end-to-end.
+    The rotation is computed in **fp32** even under bf16 AMP (``x`` is
+    upcast at entry, the result downcast to ``x.dtype`` at exit) — this
+    matches v1's ``_apply_rope`` (``x.float()`` → rotate → ``.to(x.dtype)``).
+    An earlier v2 version did the rotation in compute-dtype to save a
+    ``(B,H,T,d_head)`` fp32 materialisation, but bf16 RoPE was a gradient-
+    spike source that destabilised pretraining (the rotation feeds Q/K
+    directly into the attention-score matmul, where a small per-element
+    bf16 error is amplified). The fp32 cost (~one extra Q/K-sized fp32
+    tensor per layer) is worth the stability.
     """
-    cos = rope_cos.astype(x.dtype)
-    sin = rope_sin.astype(x.dtype)
-    pairs = x.reshape(*x.shape[:-1], -1, 2)
+    x_f = x.astype(jnp.float32)
+    pairs = x_f.reshape(*x_f.shape[:-1], -1, 2)
     x0 = pairs[..., 0]
     x1 = pairs[..., 1]
-    out0 = x0 * cos - x1 * sin
-    out1 = x0 * sin + x1 * cos
-    return jnp.stack([out0, out1], axis=-1).reshape(x.shape)
+    out0 = x0 * rope_cos - x1 * rope_sin
+    out1 = x0 * rope_sin + x1 * rope_cos
+    out = jnp.stack([out0, out1], axis=-1).reshape(x.shape)
+    return out.astype(x.dtype)
 
 
 def _pallas_attn(

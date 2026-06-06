@@ -882,29 +882,89 @@ def make_optimizer(
     if name == "adamw":
         inner = optax.adamw(
             learning_rate=lr_schedule,
+            # b2=0.95 (v1 value) NOT optax's 0.999 default — see
+            # ``BaseRunConfig.adam_b2``: 0.999's ~700-step second-moment memory
+            # fails to damp a gradient spike on the next step, which is the v2
+            # collapse-to-uniform root cause. Passed explicitly so it can never
+            # silently regress to the optax default again.
+            b1=cfg.adam_b1,
+            b2=cfg.adam_b2,
             weight_decay=cfg.weight_decay,
-            # First moment (``mu``) in fp32. A bf16 ``mu`` (~8-bit mantissa)
-            # rounds the small surviving gradient components to zero on the
-            # step *after* a gradient spike — while the fp32 second moment
-            # (``nu``) still carries the spike's large magnitude — biasing the
-            # (clipped, unit-norm) update toward a degenerate direction right
-            # when the model is most fragile. The ~140 MB HBM saving at LARGE
-            # is not worth that pretraining-stability risk.
+            # First moment (``mu``) in fp32 (optax defaults bf16). fp32 keeps
+            # the small surviving gradient components from rounding to zero on
+            # the step after a spike.
             mu_dtype=jnp.float32,
         )
     elif name == "lion":
         inner = optax.lion(
             learning_rate=lr_schedule,
             weight_decay=cfg.weight_decay,
-            # Lion's single moment in fp32 for the same post-spike
-            # direction-stability reason as AdamW.mu above.
+            # Lion keeps its own b1/b2 defaults (different semantics from Adam's;
+            # the b2=0.95 fix is adamw-specific). Single moment in fp32.
             mu_dtype=jnp.float32,
         )
     else:
         raise ValueError(f"unknown optimizer {name!r}; expected adamw/lion")
-    return optax.chain(
+    chain = optax.chain(
         _branchless_clip_by_global_norm(cfg.max_grad_norm), inner
     )
+    # Always wrap so the non-finite backstop (true GradScaler parity) is on
+    # even at an infinite threshold. ``grad_skip_threshold = inf`` ⇒
+    # non-finite-only skip; a finite threshold ALSO rejects finite spikes
+    # above it — but note (see BaseRunConfig) a finite threshold near the
+    # spike scale deadlocks/degrades, so the source of the spikes should be
+    # removed (fp32 RoPE, fp32 softmax via use_flash=False) rather than
+    # relying on a finite skip.
+    threshold = getattr(cfg, "grad_skip_threshold", float("inf"))
+    return _skip_on_grad_spike(chain, threshold)
+
+
+def _skip_on_grad_spike(
+    inner: optax.GradientTransformation, threshold: float
+) -> optax.GradientTransformation:
+    """Skip the optimizer step when the raw global grad norm is non-finite
+    or exceeds ``threshold`` — a JAX/optax equivalent of v1's
+    ``torch.amp.GradScaler`` step-skip on gradient overflow.
+
+    On a skipped step the param updates are zeroed **and** the inner
+    optimizer state is reverted, so a pathological batch's gradient spike is
+    never applied and Adam's moments never absorb it (a *true* skip, not a
+    damped one). v1 was stable in part because GradScaler rejected such
+    steps; the JAX rewrite dropped that guard, so a bf16 gradient spike got
+    applied and — combined with the (separately-fixed) b2=0.999 regression —
+    drove the run into a uniform-output collapse.
+
+    Branchless (``jnp.where`` select over both branches' outputs), matching
+    the trainer's no-``lax.cond`` convention — XLA computes the inner update
+    regardless, so a select is the cheap way to discard it.
+    """
+
+    def init_fn(params: optax.Params) -> optax.OptState:
+        return inner.init(params)
+
+    def update_fn(
+        updates: optax.Updates,
+        state: optax.OptState,
+        params: optax.Params | None = None,
+    ) -> tuple[optax.Updates, optax.OptState]:
+        sq = sum(
+            jnp.sum(jnp.square(leaf))
+            for leaf in jax.tree_util.tree_leaves(updates)
+        )
+        g_norm = jnp.sqrt(sq)
+        bad = jnp.logical_or(
+            jnp.logical_not(jnp.isfinite(g_norm)), g_norm > threshold
+        )
+        new_updates, new_state = inner.update(updates, state, params)
+        safe_updates = jax.tree_util.tree_map(
+            lambda u: jnp.where(bad, jnp.zeros_like(u), u), new_updates
+        )
+        safe_state = jax.tree_util.tree_map(
+            lambda n, o: jnp.where(bad, o, n), new_state, state
+        )
+        return safe_updates, safe_state
+
+    return optax.GradientTransformation(init_fn, update_fn)
 
 
 # ---------------------------------------------------------------------------

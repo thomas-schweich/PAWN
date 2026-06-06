@@ -99,6 +99,17 @@ class BaseRunConfig(BaseModel):
     batch_size: int = 256
     lr: float = 3e-4
     weight_decay: float = 0.0
+    # Adam(W) moment-decay rates. ``adam_b2`` is the SECOND-moment decay and
+    # is load-bearing for stability: v1 used ``betas=(0.9, 0.95)`` and was
+    # stable; the JAX rewrite originally passed no betas and silently inherited
+    # optax's ``b2=0.999`` default, which has a ~700-step second-moment memory
+    # that fails to damp a gradient spike on the *next* step — the spiked
+    # coordinate then takes a near-full-magnitude (clip-surviving) step in a
+    # bad direction and the model collapses to a uniform-output dead fixed
+    # point. 0.95 (the v1 value; also GPT-3/PaLM/Chinchilla range) self-damps
+    # spikes within ~20 steps. Restored as the default + made configurable.
+    adam_b1: float = 0.9
+    adam_b2: float = 0.95
     # C.1: optimizer choice — "adamw" (default), "lion", or "adafactor".
     # See `OptimizerName` for the tradeoff summary. Switching requires
     # an LR retune (Lion typically wants LR/3 of AdamW's value).
@@ -120,6 +131,24 @@ class BaseRunConfig(BaseModel):
     stable_lr_ratio: float = 0.1
 
     max_grad_norm: float = 1.0
+    # GradScaler-equivalent spike rejection (v1 parity): SKIP the optimizer
+    # step entirely when the raw global grad norm is non-finite or exceeds
+    # this threshold, so a pathological batch's bf16 spike is never applied and
+    # Adam's moments never absorb it. v1's torch AMP GradScaler skipped steps
+    # on gradient overflow; the JAX rewrite dropped that, which (with bf16
+    # spike sources like the pre-fix bf16 RoPE) let the spikes accumulate into
+    # a uniform-output collapse.
+    #
+    # Default ``inf`` ⇒ NON-FINITE-only skip (catch inf/nan overflow, exactly
+    # v1's GradScaler). A FINITE threshold additionally rejects finite spikes
+    # above it, but empirically that DOESN'T work for the bf16-spike collapse:
+    # any finite threshold is a boundary trap — a spike just below it is
+    # applied and degrades the model, then the degraded model's gradients sit
+    # above it and every step is skipped (freeze). Tried 20 (froze), 50
+    # (froze), 1000 (applied spikes → diverged). The fix is to remove the
+    # spike SOURCE (fp32 RoPE; fp32 softmax via ``use_flash=False``), not to
+    # skip finite spikes. Leave at inf unless you have a specific overflow.
+    grad_skip_threshold: float = float("inf")
     patience: int | None = None
     eval_interval: int | None = None
     log_interval: int = 100
@@ -177,6 +206,17 @@ class BaseRunConfig(BaseModel):
     # tests) auto-fall-back to the plain path at script startup so the
     # config default doesn't need to be flipped. `use_flash` wins over
     # `use_sdpa` when both are set.
+    #
+    # ⚠ PRETRAIN STABILITY: the Pallas `mha` kernel does its softmax in the
+    # bf16 compute dtype (no fp32 score upcast), which under bf16 AMP produces
+    # gradient spikes (gn ~50-170) that destabilise from-scratch supernet
+    # pretraining into a uniform-output collapse — even with b2=0.95 + fp32
+    # RoPE + clipping (the spikes can't be cleanly skipped: applying them
+    # diverges, skipping them freezes). The fix is fp32 softmax, which the
+    # plain path provides (`use_flash=False`, scores upcast at model.py:~824).
+    # So PRETRAINING runs must pass `--no-flash` (the validated large-teacher
+    # config does); flash stays fine for the lower-gradient adapter path and
+    # for inference/eval. Proper long-term fix: an fp32-softmax flash kernel.
     use_flash: bool = True
 
     # --- Supernet variant sampling -------------------------------------

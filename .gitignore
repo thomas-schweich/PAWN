@@ -102,3 +102,5 @@ logs/lr_sweep/
 # workflow scratch artifacts
 .wf_*.mjs
 .wf_audit_structured.json
+logs/fp32_probe/
+logs/untie_smoke/
