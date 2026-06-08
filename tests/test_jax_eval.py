@@ -20,6 +20,7 @@ from pawn.corpus import generate_corpus, pack_corpus
 from pawn.eval import (
     AccuracyResult,
     _legal_token_grid,
+    compute_compound_legality,
     compute_move_accuracy,
     compute_per_phase_accuracy,
     compute_val_metrics,
@@ -179,6 +180,28 @@ def test_val_legal_move_rate_counts_full_window_predictions() -> None:
     # depressed it by forcing the last supervised ply of every full-window
     # game to count as illegal.
     assert 0.0 < metrics.legal_move_rate <= 1.0
+
+
+def test_compound_legality_cross_checks_per_move_legal_rate() -> None:
+    """Teacher-forced game-completion (compound legality, v1's "game
+    completion rate"): a game completes iff every supervised ply's argmax
+    prediction is legal. Its ``per_move_legal_rate`` must match
+    :func:`compute_val_metrics`'s ``legal_move_rate`` exactly (identical
+    legality logic + supervised positions at ``min_eval_ply=0``); the
+    game-completion rate is a valid fraction. (No completion<=per_move bound
+    is asserted — a single long all-illegal game can drag per-move below the
+    completion rate, so it is not an invariant.)
+    """
+    model = init_model(TINY_SUPERNET, key=0)
+    corpus = generate_corpus(n_games=24, max_ply=40, seq_len=48, seed=5)
+    res = compute_compound_legality(model, corpus, batch_size=8, min_eval_ply=0)
+    vm = compute_val_metrics(
+        model, corpus, batch_size=8, min_eval_ply=0, compute_legal=True
+    )
+    assert res.n_games == 24
+    assert 0.0 <= res.game_completion_rate <= 1.0
+    assert 0.0 <= res.per_move_legal_rate <= 1.0
+    assert res.per_move_legal_rate == pytest.approx(vm.legal_move_rate, abs=1e-6)
 
 
 def test_compute_val_metrics_reports_full_v1_schema() -> None:

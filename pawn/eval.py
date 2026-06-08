@@ -33,7 +33,9 @@ __all__ = [
     "PhaseBoundaries",
     "AccuracyResult",
     "ValMetrics",
+    "CompoundLegalityResult",
     "PerPlyResult",
+    "compute_compound_legality",
     "compute_move_accuracy",
     "compute_per_phase_accuracy",
     "compute_per_ply_accuracy",
@@ -569,6 +571,102 @@ def compute_val_metrics(
             int(late_legal_sum) / n_late if n_late > 0 else 0.0
         ),
         phases=phases,
+    )
+
+
+@dataclass(frozen=True)
+class CompoundLegalityResult:
+    """Teacher-forced compound (game-completion) legality.
+
+    The v1 "game completion rate" (``docs/LEGACY.md`` / ``ARCHITECTURE.md``):
+    a game *completes* iff EVERY supervised ply's argmax move prediction is
+    legal — i.e. the model would play the whole game without a single illegal
+    move, given the ground-truth history at each ply (non-autoregressive /
+    teacher-forced). Compounds per-move legality the way real generation
+    would, so it depends far more strongly on model capacity than per-move
+    accuracy does.
+    """
+
+    game_completion_rate: float
+    per_move_legal_rate: float
+    n_games: int
+
+
+@eqx.filter_jit
+def _batch_game_legal(
+    model: EffectiveCallable,
+    tokens: Int[Array, "B T"],
+    attn_mask: Bool[Array, "B T"],
+    sup_mask: Bool[Array, "B T"],
+    legal_grid: Bool[Array, "B T A"],
+) -> tuple[Bool[Array, "B"], Int[Array, ""], Int[Array, ""]]:
+    """Per-game "all predicted moves legal" + per-move legal counts.
+
+    Returns ``(game_all_legal, legal_move_count, supervised_count)``. A game
+    is all-legal iff none of its supervised positions has an illegal argmax
+    prediction.
+    """
+    logits = model(tokens, attn_mask)
+    pred = _argmax_over_actions(logits)  # (B, T)
+    # Is the argmax action legal at each position? ``legal_grid`` is
+    # (B, T, NUM_ACTIONS) bool; gather the predicted action's column.
+    pred_legal = jnp.take_along_axis(
+        legal_grid, pred[..., None], axis=-1
+    )[..., 0]  # (B, T)
+    illegal_sup = sup_mask & (~pred_legal)
+    game_all_legal = ~illegal_sup.any(axis=-1)  # (B,)
+    legal_sup = (pred_legal & sup_mask).sum()
+    return game_all_legal, legal_sup, sup_mask.sum()
+
+
+def compute_compound_legality(
+    model: EffectiveCallable,
+    corpus: Corpus,
+    *,
+    batch_size: int = 32,
+    min_eval_ply: int = 0,
+) -> CompoundLegalityResult:
+    """Teacher-forced game-completion rate (v1 "game completion rate").
+
+    For each game the model predicts the move at every supervised ply given
+    the ground-truth history; the game *completes* iff EVERY such argmax
+    prediction is legal. ``game_completion_rate`` is the fraction of games
+    that complete. Also returns ``per_move_legal_rate`` (the per-position
+    legal rate over the same supervised positions) as a cross-check against
+    :func:`compute_val_metrics`'s ``legal_move_rate``.
+
+    ``min_eval_ply`` skips opening plies ``< min_eval_ply`` (parity with the
+    overall-accuracy MAIA skip); ``0`` counts every supervised ply.
+    """
+    n = corpus.n_games
+    if n == 0:
+        return CompoundLegalityResult(0.0, 0.0, 0)
+    seq_len = corpus.seq_len
+    C = int(corpus.outcome_offset[0])
+    ply = np.arange(seq_len, dtype=np.int32) - (C - 1)
+    keep_pos = jnp.asarray(ply >= min_eval_ply, dtype=jnp.bool_)  # (T,)
+    legal_grid = _legal_token_grid(corpus)
+
+    games_complete = 0
+    legal_moves = 0
+    total_moves = 0
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        tokens = jnp.asarray(corpus.tokens[start:end])
+        attn = jnp.asarray(corpus.attn_mask[start:end])
+        loss = jnp.asarray(corpus.loss_mask[start:end])
+        legal = jnp.asarray(legal_grid[start:end])
+        sup = loss & jnp.broadcast_to(keep_pos, loss.shape)
+        game_all_legal, legal_sup, sup_count = _batch_game_legal(
+            model, tokens, attn, sup, legal
+        )
+        games_complete += int(game_all_legal.sum())
+        legal_moves += int(legal_sup)
+        total_moves += int(sup_count)
+    return CompoundLegalityResult(
+        game_completion_rate=games_complete / n,
+        per_move_legal_rate=legal_moves / total_moves if total_moves else 0.0,
+        n_games=n,
     )
 
 

@@ -27,7 +27,11 @@ from pawn.corpus import (
     conditioning_from_run_block,
     generate_corpus,
 )
-from pawn.eval import compute_per_ply_accuracy, compute_val_metrics
+from pawn.eval import (
+    compute_compound_legality,
+    compute_per_ply_accuracy,
+    compute_val_metrics,
+)
 from pawn.jax_setup import setup_jax_caching
 
 
@@ -64,6 +68,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="skip the first N ply for the overall metrics "
                          "(MAIA methodology, default 10). Per-phase "
                          "accuracy is unaffected (always from ply 0).")
+    ap.add_argument("--compound-legality", action="store_true",
+                    help="also report the teacher-forced game-completion rate "
+                         "(v1's 'game completion rate' = fraction of games "
+                         "whose every argmax move prediction is legal).")
     ap.add_argument("--per-ply", action="store_true",
                     help="also report a per-ply top-1 accuracy breakdown.")
     ap.add_argument("--output", type=Path, default=None)
@@ -117,11 +125,19 @@ def main(argv: list[str] | None = None) -> int:
         "loss": vm.val_loss,
         "perplexity": vm.perplexity,
         "legal_move_rate": vm.legal_move_rate,
+        "late_legal_move_rate": vm.late_legal_move_rate,
         "opening_accuracy": vm.phases.opening,
         "midgame_accuracy": vm.phases.midgame,
         "endgame_accuracy": vm.phases.endgame,
         "n_supervised": vm.phases.n_total,
     }
+    if args.compound_legality:
+        cl = compute_compound_legality(
+            model, corpus,
+            batch_size=args.batch_size, min_eval_ply=args.min_eval_ply,
+        )
+        payload["game_completion_rate"] = cl.game_completion_rate
+        payload["compound_per_move_legal_rate"] = cl.per_move_legal_rate
     if args.per_ply:
         per_ply = compute_per_ply_accuracy(
             model, corpus, batch_size=args.batch_size,
