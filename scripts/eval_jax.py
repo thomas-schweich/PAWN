@@ -132,9 +132,14 @@ def main(argv: list[str] | None = None) -> int:
         "n_supervised": vm.phases.n_total,
     }
     if args.compound_legality:
+        # Game-completion is a no-opening-skip metric — v1 defined it over
+        # EVERY supervised ply. Always pass min_eval_ply=0 (NOT
+        # args.min_eval_ply, whose default 10 is the MAIA accuracy skip): an
+        # opening skip would let an illegal opening move still "complete" the
+        # game and would count games shorter than the skip as vacuously legal,
+        # inflating the v1-comparable rate.
         cl = compute_compound_legality(
-            model, corpus,
-            batch_size=args.batch_size, min_eval_ply=args.min_eval_ply,
+            model, corpus, batch_size=args.batch_size, min_eval_ply=0,
         )
         payload["game_completion_rate"] = cl.game_completion_rate
         payload["compound_per_move_legal_rate"] = cl.per_move_legal_rate

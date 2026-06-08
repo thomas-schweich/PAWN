@@ -204,6 +204,72 @@ def test_compound_legality_cross_checks_per_move_legal_rate() -> None:
     assert res.per_move_legal_rate == pytest.approx(vm.legal_move_rate, abs=1e-6)
 
 
+def test_compound_legality_detects_per_game(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prove the per-game AND actually detects (the range-only check above is
+    vacuous — the tiny model scores 0.0 game-completion, so a function that
+    unconditionally returned 0 would pass it). Monkeypatch the legality grid:
+    an all-legal grid means every game completes (1.0); zeroing ONE game's
+    legality drops only that game, giving (n-1)/n.
+    """
+    import numpy as np
+
+    import pawn.eval as ev
+    from pawn.config import NUM_ACTIONS
+
+    model = init_model(TINY_SUPERNET, key=0)
+    corpus = generate_corpus(n_games=4, max_ply=10, seq_len=16, seed=1)
+    n, t = corpus.n_games, corpus.seq_len
+
+    # Every action legal everywhere -> every game completes.
+    monkeypatch.setattr(
+        ev, "_legal_token_grid",
+        lambda c: np.ones((n, t, NUM_ACTIONS), dtype=bool),
+    )
+    res = ev.compute_compound_legality(model, corpus, batch_size=2, min_eval_ply=0)
+    assert res.game_completion_rate == 1.0
+    assert res.per_move_legal_rate == 1.0
+    assert res.n_games == 4
+
+    # Game 0 has NO legal action anywhere -> every prediction illegal -> only
+    # game 0 fails; games 1-3 still all-legal -> 3/4 complete.
+    grid = np.ones((n, t, NUM_ACTIONS), dtype=bool)
+    grid[0] = False
+    monkeypatch.setattr(ev, "_legal_token_grid", lambda c: grid)
+    res2 = ev.compute_compound_legality(model, corpus, batch_size=2, min_eval_ply=0)
+    assert res2.game_completion_rate == pytest.approx(3 / 4)
+    assert res2.n_games == 4
+
+
+def test_compound_legality_excludes_zero_supervised_games(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A game with no supervised ply after the ``min_eval_ply`` gate must be
+    EXCLUDED from both numerator and denominator — never counted as vacuously
+    'complete' (``~illegal_sup.any()`` is True for an all-False row). With a
+    skip beyond every game's length, zero games are evaluated and the rate is
+    0.0. Regression guard for the game-completion inflation bug.
+    """
+    import numpy as np
+
+    import pawn.eval as ev
+    from pawn.config import NUM_ACTIONS
+
+    model = init_model(TINY_SUPERNET, key=0)
+    corpus = generate_corpus(n_games=6, max_ply=12, seq_len=20, seed=2)
+    n, t = corpus.n_games, corpus.seq_len
+    monkeypatch.setattr(
+        ev, "_legal_token_grid",
+        lambda c: np.ones((n, t, NUM_ACTIONS), dtype=bool),
+    )
+    res = ev.compute_compound_legality(
+        model, corpus, batch_size=4, min_eval_ply=10_000
+    )
+    assert res.n_games == 0
+    assert res.game_completion_rate == 0.0
+
+
 def test_compute_val_metrics_reports_full_v1_schema() -> None:
     """Parity item ``eval-jax-no-top5-per-ply-loss`` + ``perplexity-metric``:
     the val pass returns top-1, top-5, CE loss, perplexity, and the legal

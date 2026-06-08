@@ -585,6 +585,11 @@ class CompoundLegalityResult:
     teacher-forced). Compounds per-move legality the way real generation
     would, so it depends far more strongly on model capacity than per-move
     accuracy does.
+
+    ``n_games`` is the number of *evaluated* games (those with >=1 supervised
+    ply) — the denominator of ``game_completion_rate``. It equals the corpus
+    size at ``min_eval_ply=0``; with a larger skip, games shorter than the
+    skip are excluded.
     """
 
     game_completion_rate: float
@@ -599,12 +604,16 @@ def _batch_game_legal(
     attn_mask: Bool[Array, "B T"],
     sup_mask: Bool[Array, "B T"],
     legal_grid: Bool[Array, "B T A"],
-) -> tuple[Bool[Array, "B"], Int[Array, ""], Int[Array, ""]]:
-    """Per-game "all predicted moves legal" + per-move legal counts.
+) -> tuple[Int[Array, ""], Int[Array, ""], Int[Array, ""], Int[Array, ""]]:
+    """Per-batch game-completion + per-move legality counts.
 
-    Returns ``(game_all_legal, legal_move_count, supervised_count)``. A game
-    is all-legal iff none of its supervised positions has an illegal argmax
-    prediction.
+    Returns ``(complete_games, evaluated_games, legal_moves, supervised_moves)``.
+    A game is *evaluated* iff it has at least one supervised position; it
+    *completes* iff it is evaluated AND none of its supervised positions has an
+    illegal argmax prediction. Games with zero supervised positions (e.g.
+    shorter than ``min_eval_ply``) are excluded from BOTH the completed and the
+    evaluated counts, so they cannot inflate the rate by vacuous truth
+    (``~illegal_sup.any()`` is ``True`` for an all-False ``sup_mask`` row).
     """
     logits = model(tokens, attn_mask)
     pred = _argmax_over_actions(logits)  # (B, T)
@@ -614,9 +623,12 @@ def _batch_game_legal(
         legal_grid, pred[..., None], axis=-1
     )[..., 0]  # (B, T)
     illegal_sup = sup_mask & (~pred_legal)
+    has_sup = sup_mask.any(axis=-1)  # (B,) — game has >=1 evaluated ply
     game_all_legal = ~illegal_sup.any(axis=-1)  # (B,)
-    legal_sup = (pred_legal & sup_mask).sum()
-    return game_all_legal, legal_sup, sup_mask.sum()
+    complete = (game_all_legal & has_sup).sum()
+    evaluated = has_sup.sum()
+    legal_moves = (pred_legal & sup_mask).sum()
+    return complete, evaluated, legal_moves, sup_mask.sum()
 
 
 def compute_compound_legality(
@@ -630,13 +642,20 @@ def compute_compound_legality(
 
     For each game the model predicts the move at every supervised ply given
     the ground-truth history; the game *completes* iff EVERY such argmax
-    prediction is legal. ``game_completion_rate`` is the fraction of games
-    that complete. Also returns ``per_move_legal_rate`` (the per-position
-    legal rate over the same supervised positions) as a cross-check against
-    :func:`compute_val_metrics`'s ``legal_move_rate``.
+    prediction is legal. ``game_completion_rate`` is the fraction of
+    *evaluated* games (those with >=1 supervised ply) that complete. Also
+    returns ``per_move_legal_rate`` (the per-position legal rate over the same
+    supervised positions).
 
-    ``min_eval_ply`` skips opening plies ``< min_eval_ply`` (parity with the
-    overall-accuracy MAIA skip); ``0`` counts every supervised ply.
+    ``min_eval_ply`` skips opening plies ``< min_eval_ply``; ``0`` counts every
+    supervised ply. Game-completion is conventionally a no-opening-skip metric
+    (v1 measured it over every supervised ply — ``eval_jax.py`` always calls
+    this with ``min_eval_ply=0``), so prefer ``0``. Two notes for
+    ``min_eval_ply > 0``: (1) games with no surviving supervised ply are
+    excluded from both the numerator and denominator (no vacuous completions);
+    (2) ``per_move_legal_rate`` then equals :func:`compute_val_metrics`'s
+    ``legal_move_rate`` ONLY at ``min_eval_ply=0`` — ``legal_move_rate`` is
+    computed over the plain (un-skipped) supervised mask.
     """
     n = corpus.n_games
     if n == 0:
@@ -648,6 +667,7 @@ def compute_compound_legality(
     legal_grid = _legal_token_grid(corpus)
 
     games_complete = 0
+    games_evaluated = 0
     legal_moves = 0
     total_moves = 0
     for start in range(0, n, batch_size):
@@ -657,16 +677,19 @@ def compute_compound_legality(
         loss = jnp.asarray(corpus.loss_mask[start:end])
         legal = jnp.asarray(legal_grid[start:end])
         sup = loss & jnp.broadcast_to(keep_pos, loss.shape)
-        game_all_legal, legal_sup, sup_count = _batch_game_legal(
+        complete, evaluated, legal_sup, sup_count = _batch_game_legal(
             model, tokens, attn, sup, legal
         )
-        games_complete += int(game_all_legal.sum())
+        games_complete += int(complete)
+        games_evaluated += int(evaluated)
         legal_moves += int(legal_sup)
         total_moves += int(sup_count)
     return CompoundLegalityResult(
-        game_completion_rate=games_complete / n,
+        game_completion_rate=(
+            games_complete / games_evaluated if games_evaluated else 0.0
+        ),
         per_move_legal_rate=legal_moves / total_moves if total_moves else 0.0,
-        n_games=n,
+        n_games=games_evaluated,
     )
 
 
