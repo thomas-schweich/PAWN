@@ -935,6 +935,11 @@ def main(argv: list[str] | None = None) -> int:
     start = int(state.step)
     t0 = time.time()
     next_step = start
+    # End-of-chunk wall-clock of the *previous* chunk, used to derive the
+    # instantaneous per-step time (this chunk's wall time / steps-in-chunk).
+    # ``None`` until the first chunk completes so the JIT-compile-dominated
+    # first chunk doesn't emit a misleading spike.
+    prev_chunk_end: float | None = None
 
     def _run_validation(at_step: int) -> bool:
         """Run the held-out validation pass at ``at_step``, log a
@@ -1022,6 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
             # grad_norm is always emitted now (v1 parity — see the
             # `make_scan_step(emit_grad_norms=True, ...)` call site), so the
             # scan returns the 4-tuple unconditionally.
+            chunk_t0 = time.time()
             state, chunk_losses, chunk_gnorms, chunk_accs = scan_step(
                 state, chunk_batches
             )
@@ -1032,6 +1038,25 @@ def main(argv: list[str] | None = None) -> int:
             # One D→H per chunk, not per step.
             chunk_losses_np = np.asarray(chunk_losses)
             chunk_accs_np = np.asarray(chunk_accs)
+
+            # Instantaneous per-step time: this chunk's wall-clock over its
+            # step count. The D→H syncs above block until the chunk's compute
+            # lands, so ``now`` marks chunk completion and ``now - chunk_t0``
+            # (``chunk_t0`` captured right before this chunk's ``scan_step``)
+            # is the wall time of *this* chunk alone (dispatch + compute +
+            # sync) — unlike the run-cumulative ``step_time`` mean. Measuring
+            # from ``chunk_t0`` rather than the previous chunk's end excludes
+            # any inter-chunk validation/checkpoint wall-time, which would
+            # otherwise log a bogus per-step spike at every val/checkpoint
+            # boundary. ``prev_chunk_end`` serves only as the first-chunk
+            # sentinel (its wall time is JIT-dominated → ``None``).
+            now = time.time()
+            inst_step_time = (
+                (now - chunk_t0) / max(1, this_chunk_k)
+                if prev_chunk_end is not None
+                else None
+            )
+            prev_chunk_end = now
 
             # Log every step that crossed a log_interval boundary inside
             # the chunk — replays the within-chunk loss curve without
@@ -1063,6 +1088,7 @@ def main(argv: list[str] | None = None) -> int:
                         },
                         lr=lr_now,
                         step_time=(time.time() - t0) / max(1, step - start),
+                        step_time_inst=inst_step_time,
                         bucket=edge,
                         **extra,
                     )

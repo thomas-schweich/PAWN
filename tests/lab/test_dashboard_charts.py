@@ -204,6 +204,95 @@ class TestTimeChart:
         layout = fig.to_dict()["layout"]
         assert "Epoch Time" in layout["title"]["text"]
 
+    def test_pawn_shows_instantaneous_and_mean(self, charts):
+        # When the run logs both keys, the Step Time chart carries both the
+        # instantaneous (per-chunk) line and the cumulative-mean line.
+        records = [
+            {"step": 100, "step_time": 0.12, "step_time_inst": 0.15},
+            {"step": 200, "step_time": 0.11, "step_time_inst": 0.09},
+        ]
+        fig = charts.time_chart(records, "step", "pawn")
+        names = {t.name for t in fig.data}
+        assert "Instantaneous" in names
+        assert "Mean (cumulative)" in names
+
+    def test_pawn_backfills_instantaneous_from_elapsed(self, charts):
+        # Older logs carry the cumulative mean + the logger's `elapsed` wall
+        # clock, but no measured `step_time_inst`. The chart reconstructs an
+        # instantaneous line from the wall-clock deltas.
+        records = [
+            {"step": 100, "step_time": 0.02, "elapsed": 2.0},
+            {"step": 200, "step_time": 0.02, "elapsed": 4.0},
+            {"step": 300, "step_time": 0.02, "elapsed": 6.0},
+        ]
+        fig = charts.time_chart(records, "step", "pawn")
+        names = {t.name for t in fig.data}
+        assert "Instantaneous" in names
+
+
+class TestInstantaneousBackfill:
+    def test_consecutive_deltas_when_logging_is_sparse(self, charts):
+        # One log row per (multi-step) interval with a real wall advance each
+        # time → plain consecutive delta; first row has no predecessor.
+        records = [
+            {"step": 100, "step_time": 0.02, "elapsed": 2.0},
+            {"step": 200, "step_time": 0.02, "elapsed": 4.5},  # 2.5s / 100
+            {"step": 300, "step_time": 0.02, "elapsed": 6.5},  # 2.0s / 100
+        ]
+        out = charts._backfill_instantaneous_step_time(records)
+        assert "step_time_inst" not in out[0]
+        assert out[1]["step_time_inst"] == pytest.approx(0.025)
+        assert out[2]["step_time_inst"] == pytest.approx(0.020)
+
+    def test_intra_chunk_rows_deferred_and_attributed(self, charts):
+        # Two log rows land inside each chunk and share its post-sync
+        # timestamp. The flat intra-chunk rows are deferred; the chunk's rate
+        # is attributed back across them when the next boundary lands.
+        records = [
+            {"step": 100, "step_time": 0.025, "elapsed": 5.0},  # chunk 1
+            {"step": 200, "step_time": 0.025, "elapsed": 5.0},  # chunk 1 (flat)
+            {"step": 300, "step_time": 0.025, "elapsed": 10.0},  # chunk 2
+            {"step": 400, "step_time": 0.025, "elapsed": 10.0},  # chunk 2 (flat)
+        ]
+        out = charts._backfill_instantaneous_step_time(records)
+        # step 100 anchors (no value); 200 deferred then filled at the 300
+        # boundary; 400 is a trailing not-yet-closed chunk → dropped.
+        assert "step_time_inst" not in out[0]
+        assert out[1]["step_time_inst"] == pytest.approx(0.025)  # 5.0 / 200
+        assert out[2]["step_time_inst"] == pytest.approx(0.025)
+        assert "step_time_inst" not in out[3]
+
+    def test_measured_values_are_not_overwritten(self, charts):
+        records = [
+            {"step": 100, "step_time": 0.02, "elapsed": 2.0, "step_time_inst": 0.5},
+            {"step": 200, "step_time": 0.02, "elapsed": 4.0},
+        ]
+        out = charts._backfill_instantaneous_step_time(records)
+        assert out[0]["step_time_inst"] == 0.5  # untouched
+        assert out[1]["step_time_inst"] == pytest.approx(0.02)  # 2.0 / 100
+
+    def test_falls_back_to_mean_times_step_without_elapsed(self, charts):
+        # No `elapsed` → reconstruct cumulative wall as step_time * step.
+        # W(100)=0.02*100=2.0, W(200)=0.02*200=4.0 → (4-2)/100 = 0.02.
+        records = [
+            {"step": 100, "step_time": 0.02},
+            {"step": 200, "step_time": 0.02},
+        ]
+        out = charts._backfill_instantaneous_step_time(records)
+        assert "step_time_inst" not in out[0]
+        assert out[1]["step_time_inst"] == pytest.approx(0.02)
+
+    def test_does_not_mutate_input_records(self, charts):
+        records = [
+            {"step": 100, "step_time": 0.02, "elapsed": 2.0},
+            {"step": 200, "step_time": 0.02, "elapsed": 4.0},
+        ]
+        charts._backfill_instantaneous_step_time(records)
+        assert "step_time_inst" not in records[1]
+
+    def test_empty_records(self, charts):
+        assert charts._backfill_instantaneous_step_time([]) == []
+
 
 class TestFilmCharts:
     def test_film_weight_empty(self, charts):

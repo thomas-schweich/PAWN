@@ -70,6 +70,7 @@ safetensors payload.
 
 from __future__ import annotations
 
+import functools
 import os
 from collections.abc import Callable
 from typing import Any, Final, Protocol, runtime_checkable
@@ -306,6 +307,109 @@ def _apply_rope(
     return out.astype(x.dtype)
 
 
+def _pallas_mha_forward(
+    q_bthd: jax.Array,
+    k_bthd: jax.Array,
+    v_bthd: jax.Array,
+    inv_scale: float,
+) -> jax.Array:
+    """Raw fused Pallas ``mha`` forward (no custom VJP, no transpose).
+
+    Inputs/outputs are in ``(B, T, H, d_head)`` layout. ``segment_ids``
+    is intentionally ``None`` (see :func:`_pallas_attn` for the
+    right-padding contract that makes a PAD mask redundant).
+    """
+    from jax.experimental.pallas.ops.gpu.attention import mha as _pl_mha
+
+    out_bthd: jax.Array = _pl_mha(
+        q_bthd, k_bthd, v_bthd,
+        segment_ids=None,
+        sm_scale=float(inv_scale),
+        causal=True,
+    )
+    return out_bthd
+
+
+def _materialised_attn_fp32(
+    q_bthd: jax.Array,
+    k_bthd: jax.Array,
+    v_bthd: jax.Array,
+    inv_scale: float,
+) -> jax.Array:
+    """Causal attention with an fp32 softmax (the ``use_flash=False`` math).
+
+    Scores and softmax are computed in float32; the result is cast back
+    to the input dtype. Causal-only masking matches the Pallas forward
+    (the strictly-right-padded contract makes an explicit PAD mask
+    redundant — see :func:`_pallas_attn`). Used only as the fp32
+    backward of :func:`_flash_attn`.
+    """
+    qf = q_bthd.astype(jnp.float32)
+    kf = k_bthd.astype(jnp.float32)
+    vf = v_bthd.astype(jnp.float32)
+    scores = jnp.einsum("bthd,bshd->bhts", qf, kf) * jnp.float32(inv_scale)
+    seq = scores.shape[-1]
+    causal = jnp.tril(jnp.ones((seq, seq), dtype=jnp.bool_))
+    scores = jnp.where(causal, scores, jnp.finfo(jnp.float32).min)
+    attn = jax.nn.softmax(scores, axis=-1)
+    out = jnp.einsum("bhts,bshd->bthd", attn, vf)
+    return out.astype(q_bthd.dtype)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def _flash_attn(
+    q_bthd: Float[Array, "B T H d"],
+    k_bthd: Float[Array, "B T H d"],
+    v_bthd: Float[Array, "B T H d"],
+    inv_scale: float,
+) -> Float[Array, "B T H d"]:
+    """Pallas flash attention with an fp32 materialised **backward**.
+
+    The forward is the fast fused Pallas ``mha`` kernel. The backward is
+    deliberately NOT the Pallas Triton backward: that kernel downcasts
+    the softmax-gradient intermediates (``p``, ``ds``) and the saved
+    output ``O`` to bf16 before the dQ/dK/dV matmuls, which breaks the
+    score-gradient cancellation for saturated (well-trained) attention
+    and yields spuriously large dQ/dK — the reproduced pretrain grad-norm
+    blow-up at step ~255.5k (forward loss is unchanged; the divergence is
+    purely a backward-precision effect). We override the VJP to recompute
+    the gradient through an fp32-softmax materialised attention equivalent
+    to the ``use_flash=False`` path, so flash gradients match the
+    proven-stable plain path while keeping the fast forward kernel. (It
+    upcasts q/k to fp32 *before* the score matmul, so the backward is in
+    fact marginally more precise than the plain path, which matmuls in
+    bf16 then upcasts — within fp32 noise.)
+    ``inv_scale`` is a static (nondiff) scalar.
+    """
+    return _pallas_mha_forward(q_bthd, k_bthd, v_bthd, inv_scale)
+
+
+def _flash_attn_fwd(
+    q_bthd: jax.Array,
+    k_bthd: jax.Array,
+    v_bthd: jax.Array,
+    inv_scale: float,
+) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
+    out_bthd = _pallas_mha_forward(q_bthd, k_bthd, v_bthd, inv_scale)
+    return out_bthd, (q_bthd, k_bthd, v_bthd)
+
+
+def _flash_attn_bwd(
+    inv_scale: float,
+    res: tuple[jax.Array, jax.Array, jax.Array],
+    g_bthd: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    q_bthd, k_bthd, v_bthd = res
+    _, vjp = jax.vjp(
+        lambda q, k, v: _materialised_attn_fp32(q, k, v, inv_scale),
+        q_bthd, k_bthd, v_bthd,
+    )
+    return vjp(g_bthd)
+
+
+_flash_attn.defvjp(_flash_attn_fwd, _flash_attn_bwd)
+
+
 def _pallas_attn(
     q_bhtd: Float[Array, "B H T d"],
     k_bhtd: Float[Array, "B H T d"],
@@ -313,7 +417,7 @@ def _pallas_attn(
     attention_mask: Int[Array, "B T"] | None,
     inv_scale: float,
 ) -> Float[Array, "B T HD"]:
-    """Pallas flash attention.
+    """Pallas flash attention (fast forward, fp32 backward via :func:`_flash_attn`).
 
     ``q``/``k``/``v`` come in the ``(B, H, T, d_head)`` layout used by
     the rest of the transformer block; this helper transposes to
@@ -337,21 +441,14 @@ def _pallas_attn(
     path.
     """
     del attention_mask  # see docstring — causal+right-pad makes this redundant
-    from jax.experimental.pallas.ops.gpu.attention import mha as _pl_mha
-
     q_bthd = q_bhtd.transpose(0, 2, 1, 3)
     k_bthd = k_bhtd.transpose(0, 2, 1, 3)
     v_bthd = v_bhtd.transpose(0, 2, 1, 3)
-    # `mha` is a `jax.custom_vjp` wrapper, which pyright surfaces as an
-    # opaque `object` — annotate so downstream `.shape` / `.reshape`
-    # type-check. The runtime contract is well-defined: same dtype and
-    # leading dims as the inputs, with the H/D axes preserved.
-    out_bthd: jax.Array = _pl_mha(
-        q_bthd, k_bthd, v_bthd,
-        segment_ids=None,
-        sm_scale=float(inv_scale),
-        causal=True,
-    )
+    # `_flash_attn` is a `jax.custom_vjp` wrapper, which pyright surfaces
+    # as an opaque `object` — annotate so `.shape` / `.reshape`
+    # type-check. The runtime contract is a `jax.Array` with the same
+    # dtype and leading dims as the inputs, H/D axes preserved.
+    out_bthd: jax.Array = _flash_attn(q_bthd, k_bthd, v_bthd, inv_scale)
     B, T, H, D = out_bthd.shape  # noqa: N806
     return out_bthd.reshape(B, T, H * D)
 

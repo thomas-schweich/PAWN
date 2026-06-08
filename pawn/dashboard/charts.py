@@ -412,12 +412,124 @@ def gpu_chart(records: list[dict], x_key: str,
     ], title="GPU Memory", y_title="GB", compare_records=compare_records)
 
 
+# Reconstruction defers a row whose wall-clock barely advanced since the last
+# emitted anchor (an intra-chunk replay row, whose true time landed all at once
+# at the chunk's host sync). A row is a genuine sample when its reconstructed
+# per-step rate is at least this fraction of the cumulative-mean step time —
+# small enough to admit legitimately faster chunks, large enough to reject the
+# ~0 intra-chunk rows. The cumulative mean is the natural physical scale.
+_INST_RECONSTRUCT_MIN_FRAC = 0.1
+
+
+def _backfill_instantaneous_step_time(records: list[dict]) -> list[dict]:
+    """Fill in a derived ``step_time_inst`` for rows that lack a measured one.
+
+    Live pawn / distill runs log ``step_time_inst`` (per-chunk wall time /
+    steps) directly. Older runs logged only the run-cumulative mean
+    ``step_time``; for any row missing the direct value we reconstruct the
+    instantaneous per-step time from the delta of cumulative wall-clock
+    between logged rows::
+
+        inst = (W(i) - W(anchor)) / (step(i) - step(anchor))
+
+    ``W`` is the logger's exact per-run ``elapsed`` seconds when present
+    (resume-safe — each run's logger clock starts fresh), else the cumulative
+    mean re-expanded as ``step_time * step`` (exact only for a from-zero run,
+    the lone case an old log can lack ``elapsed``).
+
+    The wall clock only truly advances at chunk (``lax.scan``) boundaries —
+    the steps inside a chunk are replayed to the log after the fact and share
+    one timestamp. So a row whose reconstructed rate is a negligible fraction
+    of the cumulative mean (``_INST_RECONSTRUCT_MIN_FRAC``) is treated as
+    intra-chunk: it is *deferred*, and once the next real boundary lands its
+    rate is attributed back across every deferred row plus that boundary. With
+    the default cadence (``log_interval`` ≥ ``k``) every row clears the bar and
+    this degenerates to a plain consecutive delta.
+
+    Order-preserving; rows are shallow-copied only where a value is added.
+    Measured ``step_time_inst`` values are never overwritten. The first row of
+    a run (no predecessor) and a trailing not-yet-closed chunk get no derived
+    value — the chart drops them, matching the live path that emits ``None``
+    for the first compile-dominated chunk.
+    """
+    out: list[dict] = []
+    anchor_step: float | None = None
+    anchor_wall: float | None = None
+    pending: list[int] = []  # indices in `out` of deferred intra-chunk rows
+
+    def _wall(rec: dict, step: float | None) -> float | None:
+        w = rec.get("elapsed")
+        if w is not None:
+            return float(w)
+        avg = rec.get("step_time")
+        if avg is not None and step is not None:
+            return float(avg) * float(step)
+        return None
+
+    for rec in records:
+        step = rec.get("step")
+        wall = _wall(rec, step)
+
+        # A measured value wins outright; reset the anchor to here so any later
+        # derived rows reconstruct from a fresh, real timestamp.
+        if rec.get("step_time_inst") is not None:
+            out.append(rec)
+            pending = []
+            if step is not None and wall is not None:
+                anchor_step, anchor_wall = float(step), wall
+            continue
+
+        rec = dict(rec)
+        idx = len(out)
+        out.append(rec)
+        if step is None or wall is None:
+            continue
+        step = float(step)
+        if anchor_step is None or anchor_wall is None:
+            anchor_step, anchor_wall = step, wall
+            continue
+        step_span = step - anchor_step
+        if step_span <= 0:  # duplicate / out-of-order row — ignore for deltas
+            continue
+        rate = (wall - anchor_wall) / step_span
+        avg = rec.get("step_time")
+        threshold = _INST_RECONSTRUCT_MIN_FRAC * float(avg) if avg else 0.0
+        if rate > 0.0 and rate >= threshold:
+            for j in (*pending, idx):
+                out[j]["step_time_inst"] = rate
+            pending = []
+            anchor_step, anchor_wall = step, wall
+        else:
+            pending.append(idx)
+    return out
+
+
 def time_chart(records: list[dict], x_key: str, run_type: str,
                compare_records: list[dict] | None = None):
-    key = "epoch_time_s" if run_type in _ADAPTER_TYPES else ("epoch_time" if run_type == "bc" else "step_time")
-    label = "Epoch Time" if run_type in (_ADAPTER_TYPES | {"bc"}) else "Step Time"
-    return make_chart(records, x_key, [(key, label, COLORS["slate"])],
-                      title=label, y_title="seconds",
+    if run_type in _ADAPTER_TYPES:
+        specs = [("epoch_time_s", "Epoch Time", COLORS["slate"])]
+        title = "Epoch Time"
+    elif run_type == "bc":
+        specs = [("epoch_time", "Epoch Time", COLORS["slate"])]
+        title = "Epoch Time"
+    else:
+        # Step-based runs (pawn / distill) log the run-cumulative mean
+        # (`step_time`) and — on current runs — the per-chunk instantaneous
+        # time (`step_time_inst`). For older runs that logged only the mean,
+        # backfill an instantaneous series from the delta of cumulative
+        # wall-clock so both lines are available. Plot both: the instantaneous
+        # line surfaces the per-chunk stalls / recompiles the smoothed average
+        # hides, while the average carries the trend.
+        records = _backfill_instantaneous_step_time(records)
+        if compare_records is not None:
+            compare_records = _backfill_instantaneous_step_time(compare_records)
+        specs = [
+            ("step_time_inst", "Instantaneous", COLORS["primary"]),
+            ("step_time", "Mean (cumulative)", COLORS["slate"]),
+        ]
+        title = "Step Time"
+    return make_chart(records, x_key, specs,
+                      title=title, y_title="seconds",
                       compare_records=compare_records)
 
 

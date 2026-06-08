@@ -24,6 +24,9 @@ Coverage:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import pytest
@@ -627,6 +630,99 @@ def test_use_flash_matches_plain_attention_within_fp32_noise() -> None:
     # Tolerance: Pallas reorders the softmax/matmul reduction across
     # tiles, so per-position diffs can run a few ulps wider than SDPA's.
     assert jnp.allclose(plain, flash, atol=1e-3, rtol=1e-3)
+
+
+def test_materialised_attn_fp32_matches_reference_value_and_grad() -> None:
+    """The fp32 materialised attention used as ``_flash_attn``'s backward
+    (:func:`pawn.model._materialised_attn_fp32`) is algebraically a causal,
+    fp32-softmax attention. Verify both its value AND its gradient against an
+    independent reference. CPU-runnable (pure JAX, no Pallas) — this locks in
+    the einsum layouts / causal orientation that the flash backward depends
+    on without needing a GPU.
+    """
+    from pawn.model import _materialised_attn_fp32
+
+    b, h, t, d = 2, 3, 16, 8
+    inv = d ** -0.5
+    ks = jax.random.split(jax.random.key(7), 3)
+    # (B, T, H, d) layout — what `_pallas_attn` feeds `_flash_attn`.
+    q = jax.random.normal(ks[0], (b, t, h, d))
+    k = jax.random.normal(ks[1], (b, t, h, d))
+    v = jax.random.normal(ks[2], (b, t, h, d))
+
+    def reference(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
+        scores = jnp.einsum("bthd,bshd->bhts", q, k) * inv
+        causal = jnp.tril(jnp.ones((t, t), dtype=jnp.bool_))
+        scores = jnp.where(causal, scores, -jnp.inf)
+        attn = jax.nn.softmax(scores, axis=-1)
+        return jnp.einsum("bhts,bshd->bthd", attn, v)
+
+    # Value parity.
+    assert jnp.allclose(
+        _materialised_attn_fp32(q, k, v, inv), reference(q, k, v), atol=1e-5
+    )
+
+    # Gradient parity (the whole point of the flash backward fix).
+    def sq_loss(fn: Callable[..., jax.Array]) -> Callable[..., jax.Array]:
+        return lambda q, k, v: (fn(q, k, v) ** 2).sum()
+
+    g_mat = jax.grad(
+        sq_loss(lambda q, k, v: _materialised_attn_fp32(q, k, v, inv)),
+        (0, 1, 2),
+    )(q, k, v)
+    g_ref = jax.grad(sq_loss(reference), (0, 1, 2))(q, k, v)
+    for gm, gr in zip(g_mat, g_ref, strict=True):
+        assert jnp.allclose(gm, gr, atol=1e-4, rtol=1e-4)
+
+
+def test_use_flash_backward_matches_plain_within_tol() -> None:
+    """``use_flash=True`` now routes the BACKWARD through an fp32 materialised
+    attention (custom VJP in :func:`pawn.model._flash_attn`), because the
+    stock Pallas Triton backward downcasts the softmax-gradient intermediates
+    to bf16 and diverged in pretraining at step ~255.5k. Verify the flash
+    gradient matches the plain ``use_flash=False`` gradient — the property the
+    fix exists to guarantee. Both backwards use fp32 softmax, so a tight
+    tolerance holds even under bf16 activations.
+
+    Pallas requires a GPU backend; skip on CPU.
+    """
+    import pytest
+
+    if jax.default_backend() != "gpu":
+        pytest.skip("Pallas flash attention requires a GPU backend")
+
+    model = init_model(TINY_SUPERNET, key=0)
+    tokens = jnp.arange(2 * 16, dtype=jnp.int32).reshape(2, 16) % 100
+
+    # Gradient w.r.t. the embedding table (downstream of every attention
+    # block) is a faithful proxy for backward correctness.
+    def embed_grad(use_flash: bool, dtype: jnp.dtype) -> jax.Array:
+        def f(embed: jax.Array) -> jax.Array:
+            m = eqx.tree_at(lambda mm: mm.embed_tokens, model, embed)
+            logits = m(tokens, use_flash=use_flash, compute_dtype=dtype)
+            return (logits.astype(jnp.float32) ** 2).sum()
+
+        return jax.grad(f)(model.embed_tokens).astype(jnp.float32)
+
+    def rel_norm(a: jax.Array, b: jax.Array) -> jax.Array:
+        return jnp.linalg.norm(a - b) / jnp.linalg.norm(b)
+
+    # In fp32 (no bf16 rounding) the custom-VJP backward must be algebraically
+    # the plain path's gradient — the core correctness claim.
+    g_flash_f32 = embed_grad(True, jnp.float32)
+    g_plain_f32 = embed_grad(False, jnp.float32)
+    assert rel_norm(g_flash_f32, g_plain_f32) < 1e-4
+
+    # Under bf16 (the production config) per-element noise on small-magnitude
+    # entries is unavoidable, so an elementwise tolerance is the wrong test.
+    # The meaningful property is that flash is no farther from the fp32 ground
+    # truth than the plain path — a faithful bf16 replacement, not a
+    # regression. (It is in fact marginally closer: it upcasts q/k to fp32
+    # before the score matmul, whereas the plain path matmuls in bf16.)
+    truth = g_plain_f32
+    d_flash = rel_norm(embed_grad(True, jnp.bfloat16), truth)
+    d_plain = rel_norm(embed_grad(False, jnp.bfloat16), truth)
+    assert d_flash <= d_plain * 1.05
 
 
 def test_logits_always_fp32_even_under_bf16_amp() -> None:

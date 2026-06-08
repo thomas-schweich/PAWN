@@ -444,6 +444,11 @@ def main(argv: list[str] | None = None) -> int:
     eval_interval = cfg.eval_interval or cfg.log_interval
     t0 = time.time()
     final_step = resume_step
+    # End-of-chunk wall-clock of the *previous* chunk, for the instantaneous
+    # per-step time (this chunk's wall time / steps-in-chunk). ``None`` until
+    # the first chunk completes so the JIT-compile-dominated first chunk
+    # doesn't emit a misleading spike.
+    prev_chunk_end: float | None = None
 
     def _chunk_batch(k_inner: int) -> Batch:
         """Sample the games for one `scan_step` chunk and stack them into the
@@ -502,9 +507,26 @@ def main(argv: list[str] | None = None) -> int:
             # `total_steps`.
             this_k = min(cfg.k, total_steps - completed)
             chunk = _chunk_batch(this_k)
+            chunk_t0 = time.time()
             state, chunk_losses = scan_step(state, chunk)
             # One D→H per chunk, not per step.
             chunk_losses_np = np.asarray(chunk_losses)
+            # Instantaneous per-step time — this chunk's wall-clock (``now -
+            # chunk_t0``, the D→H sync above blocks until compute lands) over
+            # its step count, vs the run-cumulative ``step_time`` mean.
+            # Measuring from ``chunk_t0`` (right before ``scan_step``) rather
+            # than the previous chunk's end excludes any inter-chunk
+            # validation/checkpoint wall-time, which would otherwise log a
+            # bogus per-step spike at every val/checkpoint boundary.
+            # ``prev_chunk_end`` serves only as the first-chunk sentinel
+            # (JIT-compilation-dominated, not steady-state → ``None``).
+            now = time.time()
+            inst_step_time = (
+                (now - chunk_t0) / max(1, this_k)
+                if prev_chunk_end is not None
+                else None
+            )
+            prev_chunk_end = now
             chunk_start = completed
             completed += this_k
             final_step = completed
@@ -518,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
                         loss=float(chunk_losses_np[i]),
                         lr=np.asarray(schedule(step)).item(),
                         step_time=(time.time() - t0) / max(1, step - run_start),
+                        step_time_inst=inst_step_time,
                     )
                     logger.log_train(step=step, **train_metrics)
                     log_metrics(wandb_run, train_metrics, step=step)
