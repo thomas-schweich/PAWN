@@ -444,11 +444,24 @@ def _pallas_attn(
     q_bthd = q_bhtd.transpose(0, 2, 1, 3)
     k_bthd = k_bhtd.transpose(0, 2, 1, 3)
     v_bthd = v_bhtd.transpose(0, 2, 1, 3)
-    # `_flash_attn` is a `jax.custom_vjp` wrapper, which pyright surfaces
-    # as an opaque `object` — annotate so `.shape` / `.reshape`
-    # type-check. The runtime contract is a `jax.Array` with the same
-    # dtype and leading dims as the inputs, H/D axes preserved.
-    out_bthd: jax.Array = _flash_attn(q_bthd, k_bthd, v_bthd, inv_scale)
+    # EXPERIMENT (branch exp/flash-kernel-fp32-bwd): PAWN_FLASH_FP32BWD=1 routes
+    # to the vendored Pallas kernel whose FUSED backward keeps the
+    # softmax-gradient terms fp32 — instead of the custom-VJP (materialised fp32
+    # backward) `_flash_attn`. Lets us measure whether the fused fp32 backward is
+    # correct AND faster than no-flash / the custom-VJP end-to-end.
+    out_bthd: jax.Array
+    if os.environ.get("PAWN_FLASH_FP32BWD") == "1":
+        from pawn._vendor.pallas_attention_fp32bwd import mha as _vendored_mha
+        out_bthd = _vendored_mha(
+            q_bthd, k_bthd, v_bthd,
+            segment_ids=None, sm_scale=float(inv_scale), causal=True,
+        )
+    else:
+        # `_flash_attn` is a `jax.custom_vjp` wrapper, which pyright surfaces
+        # as an opaque `object` — annotate so `.shape` / `.reshape`
+        # type-check. The runtime contract is a `jax.Array` with the same
+        # dtype and leading dims as the inputs, H/D axes preserved.
+        out_bthd = _flash_attn(q_bthd, k_bthd, v_bthd, inv_scale)
     B, T, H, D = out_bthd.shape  # noqa: N806
     return out_bthd.reshape(B, T, H * D)
 
