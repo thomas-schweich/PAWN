@@ -1,24 +1,23 @@
-"""v1 PyTorch → v2 JAX checkpoint converter.
+"""v1 PyTorch → in-memory factored JAX model loader.
 
-The **only** v1↔v2 bridge per plan §5: a single function
-:func:`convert_legacy_checkpoint` that reads a v1 torch
+The single v1↔v2 bridge needed for the v1 AR/teacher-forced legality
+measurements: :func:`load_v1_factored_model` reads a v1 torch
 ``.safetensors`` checkpoint (from a HuggingFace repo or a local path),
 transposes linear weights from ``(out, in)`` to JAX's ``(in, out)``
 convention, builds a :class:`pawn.config.ModelConfig` at the v1
-dimensions, and writes a JAX checkpoint under
-``$HF_HOME/pawn-jax-converted/<sha>/``.
+dimensions (native ``head_dim`` / ``vocab_size``), and assembles the
+factored :class:`pawn._legacy.factored_model.PAWNModel` directly in
+memory — no disk round-trip / ``save_model`` (the current un-factored
+``save_model`` can't serialise the factored ``src+dst+promo``
+embedding). The embeddings are **not** un-factored: a v1 model with
+un-factored embeddings would be a different model.
 
-Pre-vocab-transition checkpoints (vocab_size != 1980) are rejected
-loudly. The conversion is cached by source *identifier* (HF repo ID
-or local path string), not by file content — a second call with the
-same source string returns the cached output directly. If the
-upstream HF repo has been re-published with new weights, pass
-``force=True`` to re-convert; the same is true for local paths whose
-contents have changed under the same path.
+Pre-vocab-transition checkpoints (vocab_size outside the post-transition
+1969..2000 range) are rejected loudly.
 
 For each per-layer v1 field (``layers.<i>.attn.wq.weight`` etc.), the
-converter stacks the N independent layer tensors into a single
-``(n_layers, in, out)`` array matching v2's ``TransformerLayer`` field
+loader stacks the N independent layer tensors into a single
+``(n_layers, in, out)`` array matching the ``TransformerLayer`` field
 shape.
 """
 
