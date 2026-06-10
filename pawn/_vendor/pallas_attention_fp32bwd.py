@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import Any
+from typing import Any, cast
 
 import jax
 from jax import lax
@@ -326,12 +326,18 @@ def _mha_forward(
     debug: bool,
     return_residuals: bool,
 ):
-  out, lse = mha(q, k, v, segment_ids=segment_ids, sm_scale=sm_scale,
-                 causal=causal, block_sizes=block_sizes,
-                 backward_pass_impl=backward_pass_impl,
-                 num_warps=num_warps, num_stages=num_stages,
-                 grid=grid, interpret=interpret, debug=debug,
-                 return_residuals=True)
+  # ``mha`` is wrapped in ``jax.custom_vjp`` (via functools.partial), which
+  # erases the callable's return type to ``object`` for the type checker;
+  # with ``return_residuals=True`` it returns the ``(out, lse)`` pair.
+  out, lse = cast(
+      tuple[jax.Array, jax.Array],
+      mha(q, k, v, segment_ids=segment_ids, sm_scale=sm_scale,
+          causal=causal, block_sizes=block_sizes,
+          backward_pass_impl=backward_pass_impl,
+          num_warps=num_warps, num_stages=num_stages,
+          grid=grid, interpret=interpret, debug=debug,
+          return_residuals=True),
+  )
   residuals = (q, k, v, segment_ids, out, lse)
   ret = (out, lse) if return_residuals else out
   return ret, residuals
