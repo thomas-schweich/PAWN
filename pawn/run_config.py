@@ -639,9 +639,12 @@ class PretrainConfig(BaseRunConfig):
                     f"to embed a prefix with (got {self.conditioning!r})"
                 )
             # No supernet slicing exists for the factored arch; it always
-            # trains as the single standalone model. Reject an explicit
-            # variant subset so the flag can't silently no-op.
-            if self.variants is not None and self.variants != ("large",):
+            # trains as the single standalone model. Reject ANY explicit
+            # --variants so the flag can't silently no-op (round-2 review:
+            # an earlier ("large",) carve-out was itself a silent no-op —
+            # VARIANTS["large"] is the uniform supernet, not the factored
+            # config, and build_variants never reads cfg.variants here).
+            if self.variants is not None:
                 raise ValueError(
                     "arch='factored-v1' trains a single standalone model; "
                     "--variants is not applicable (got "

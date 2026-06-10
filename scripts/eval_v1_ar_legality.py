@@ -204,6 +204,27 @@ def _run_batched(
     return {k: np.concatenate([c[k] for c in chunks], axis=0) for k in chunks[0]}
 
 
+def _is_v2_checkpoint_dir(p: Path) -> bool:
+    """True when ``p`` looks like a v2 checkpoint dir (config.json with the
+    v2 ``{"version", "model"}`` schema), complete or not.
+
+    v1 torch checkpoints carry ``{"format_version", "model_config"}``
+    instead, so the two formats are disambiguated by schema rather than by
+    the ``.complete`` sentinel — a partially-saved v2 dir then still routes
+    to the v2 loader, whose sentinel verification raises the precise
+    ``IncompleteCheckpointError`` instead of the v1 loader's confusing
+    key-mismatch failure.
+    """
+    cfg_file = p / "config.json"
+    if not cfg_file.is_file():
+        return False
+    try:
+        raw = json.loads(cfg_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(raw, dict) and "version" in raw and "model" in raw
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkpoint", required=True,
@@ -236,10 +257,14 @@ def main() -> None:
         # number would be quietly wrong (review round-1, type lane).
         model = require_uniform(loaded, "--use-bos (v2 BOS contract)")
         cfg = model.cfg
-    elif (Path(args.checkpoint) / ".complete").is_file():
+    elif _is_v2_checkpoint_dir(Path(args.checkpoint)):
         # A v2-format checkpoint dir (e.g. an `--arch factored-v1` run's
-        # step_NNNN). Loads through the sentinel-verified v2 loader; the
-        # bare-moves contract below requires the factored architecture.
+        # step_NNNN). Routed on the v2 config.json schema, NOT on the
+        # `.complete` sentinel — an incomplete v2 save must hit the v2
+        # loader's precise IncompleteCheckpointError, not fall through to
+        # the v1 torch loader and die on a baffling key mismatch (review
+        # round-2, test-risk). The bare-moves contract below requires the
+        # factored architecture.
         from pawn.checkpoint import load_model
         loaded, _ = load_model(Path(args.checkpoint))
         if not isinstance(loaded, FactoredPAWNModel):

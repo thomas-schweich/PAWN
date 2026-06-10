@@ -176,22 +176,21 @@ class FactoredPAWNModel(eqx.Module):
             if compute_dtype is not None:
                 x = x.astype(compute_dtype)
         rope_cos, rope_sin = _build_rope(self.cfg.head_dim, T, self.cfg.rope_base)
-        mask: Bool[Array, "B 1 T T"] | None
-        if use_flash:
-            mask = None
+        # The flash path was hard-rejected above, so the materialised mask
+        # is built unconditionally (plain + SDPA paths both consume it).
+        causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+        mask: Bool[Array, "B 1 T T"]
+        if attention_mask is None:
+            mask = causal[None, None, :, :]
         else:
-            causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-            if attention_mask is None:
-                mask = causal[None, None, :, :]
-            else:
-                pad = attention_mask.astype(jnp.bool_)[:, None, None, :]
-                mask = causal[None, None, :, :] & pad
+            pad = attention_mask.astype(jnp.bool_)[:, None, None, :]
+            mask = causal[None, None, :, :] & pad
         with jax.named_scope("transformer_layers"):
             x = _run_layers_impl(
                 self.layers, self.cfg, x, rope_cos, rope_sin, mask,
                 attention_mask, compute_dtype,
                 attn_hook=attn_hook, ffn_hook=ffn_hook, hook_data=hook_data,
-                use_sdpa=use_sdpa, use_flash=use_flash,
+                use_sdpa=use_sdpa, use_flash=False,
             )
         with jax.named_scope("final_norm"):
             x = _rmsnorm(x, self.final_norm_w)
@@ -247,8 +246,27 @@ class FactoredPAWNModel(eqx.Module):
 
         Overrides are branchless (:func:`jnp.where`) so the layout is
         fusion-friendly.
+
+        Out-of-vocab ids fail LOUDLY: the v2 pipeline's control tokens
+        (BOS=1980, NULL=1981, reserved ≥1982) sit above this model's
+        ``vocab_size=1980``, and without the guard the
+        ``ids >= OUTCOME_TOKEN_BASE`` override would silently clamp them
+        onto the last outcome row — every caller that forgot
+        :func:`pawn.corpus.to_v1_contract` would get quietly-wrong numbers
+        instead of an error (round-2 review, codex P2: this is the systemic
+        fix for the hazard the per-caller guards address individually).
+        ``eqx.error_if`` raises at runtime under JIT; the elementwise
+        compare over ``(B, T)`` int32 is negligible next to the forward.
         """
         ids = input_ids.astype(jnp.int32)
+        ids = eqx.error_if(
+            ids,
+            (ids < 0) | (ids >= jnp.int32(self.cfg.vocab_size)),
+            f"FactoredPAWNModel received out-of-vocab token id(s) — the "
+            f"factored vocab is [0, {self.cfg.vocab_size}). BOS/NULL/"
+            "reserved v2 control tokens are not embeddable; adapt inputs "
+            "via pawn.corpus.to_v1_contract (bare-moves contract).",
+        )
         # Clamp to a safe range so the decomp table lookup doesn't OOB
         # on PAD / outcome positions; those positions are overwritten below.
         safe_ids = jnp.clip(ids, 0, NUM_ACTIONS - 1)

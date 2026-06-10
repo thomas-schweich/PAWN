@@ -114,12 +114,15 @@ def test_pretrain_config_factored_guards() -> None:
             run_type="pretrain", total_steps=10, arch="factored-v1",
             local_checkpoints=True, conditioning=["outcome"],
         )
-    # explicit variant subsets are not applicable.
-    with pytest.raises(ValueError, match="variants"):
-        PretrainConfig(
-            run_type="pretrain", total_steps=10, arch="factored-v1",
-            local_checkpoints=True, variants=("small",),
-        )
+    # explicit variant selections are not applicable — including
+    # ("large",), which names the UNIFORM supernet, not the factored
+    # config (round-2 review: an earlier carve-out let it no-op silently).
+    for variants in (("small",), ("large",)):
+        with pytest.raises(ValueError, match="variants"):
+            PretrainConfig(
+                run_type="pretrain", total_steps=10, arch="factored-v1",
+                local_checkpoints=True, variants=variants,
+            )
     # stochastic_variants (the v2 default True) is neutralised, not fatal.
     cfg = PretrainConfig(
         run_type="pretrain", total_steps=10, arch="factored-v1",
@@ -396,9 +399,24 @@ def test_factored_train_step_with_accumulation() -> None:
     micro = jax.tree_util.tree_map(
         lambda x: x.reshape(2, 4, *x.shape[1:]), flat
     )
+    # Pre-step reference: the accumulation scan computes both micros at the
+    # PRE-update weights and reports their mean — pin the math so a scan
+    # bug (e.g. last-micro-only, or sum-not-mean) can't pass as "finite"
+    # (round-2 review, test-risk).
+    micro_losses = [
+        float(supernet_joint_loss(
+            state.model,
+            jax.tree_util.tree_map(lambda x, i=i: x[i], micro),
+            _factored_spec(),
+        ))
+        for i in range(2)
+    ]
     state, loss = train_step(state, micro)
     assert bool(jnp.isfinite(loss))
     assert int(state.step) == 1
+    np.testing.assert_allclose(
+        float(loss), float(np.mean(micro_losses)), rtol=1e-5,
+    )
 
 
 def test_factored_rejects_use_flash() -> None:
@@ -479,6 +497,50 @@ def test_converted_v1_model_roundtrips_through_v2_checkpoint(tmp_path) -> None:
     np.testing.assert_array_equal(
         np.asarray(reloaded.lm_head), np.asarray(model.lm_head)
     )
+
+
+def test_factored_embed_rejects_out_of_vocab_ids() -> None:
+    """BOS=1980 (and NULL/reserved above it) are out-of-vocab for the
+    factored model; `_embed` must raise loudly instead of silently
+    clamping them onto the last outcome row (round-2 review, codex P2 —
+    the systemic guard behind all the per-caller contract checks)."""
+    from pawn.config import BOS_TOKEN
+
+    m = _tiny_factored()
+    bad = jnp.full((1, 4), BOS_TOKEN, dtype=jnp.int32)
+    with pytest.raises(Exception, match="out-of-vocab"):
+        jax.block_until_ready(m(bad))
+
+
+def test_factored_probes_bare_moves_contract() -> None:
+    """Probes on a factored model run under the bare-moves contract: the
+    extractor rewrites slot 0 from BOS (out-of-vocab, would silently embed
+    as the last outcome row) to a masked PAD, and rejects conditioning
+    (round-2 review, test-risk: the branch was untested — removing the
+    isinstance guard would corrupt every probe position silently)."""
+    import chess_engine as engine
+
+    from pawn.probes import run_layer_probes, side_to_move_labeler
+
+    model = _tiny_factored()
+    move_ids, game_lengths, _ = engine.generate_random_games(48, 24, 5)
+    results = run_layer_probes(
+        model, move_ids, game_lengths,
+        n_classes=2, labeler=side_to_move_labeler,
+        n_epochs=10, val_frac=0.25, key=0,
+    )
+    assert set(results.keys()) == set(range(TINY_FACTORED.n_layers + 1))
+    best = max(r.accuracy for r in results.values())
+    assert best > 0.6, f"side-to-move probe at chance: best={best}"
+
+    # Conditioning is rejected for factored models (no control vocab rows).
+    with pytest.raises(ValueError, match="bare-moves"):
+        run_layer_probes(
+            model, move_ids, game_lengths,
+            n_classes=2, labeler=side_to_move_labeler,
+            n_epochs=1, val_frac=0.25, key=0,
+            conditioning=("outcome",),
+        )
 
 
 def test_factored_targets_never_out_of_vocab() -> None:

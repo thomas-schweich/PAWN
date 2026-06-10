@@ -7,10 +7,13 @@ transposes linear weights from ``(out, in)`` to JAX's ``(in, out)``
 convention, builds a :class:`pawn.config.ModelConfig` at the v1
 dimensions (native ``head_dim`` / ``vocab_size``), and assembles the
 factored :class:`pawn.factored_model.FactoredPAWNModel` directly in
-memory — no disk round-trip / ``save_model`` (the current un-factored
-``save_model`` can't serialise the factored ``src+dst+promo``
-embedding). The embeddings are **not** un-factored: a v1 model with
-un-factored embeddings would be a different model.
+memory — no disk round-trip: the PyTorch source layout isn't a v2
+checkpoint dir, so conversion happens at load time. (The returned model
+carries ``factored_embeddings=True`` in its cfg, so the v2
+``save_model``/``load_model`` dispatch CAN persist it as an ordinary v2
+factored checkpoint if a caller wants one.) The embeddings are **not**
+un-factored: a v1 model with un-factored embeddings would be a
+different model.
 
 Pre-vocab-transition checkpoints (vocab_size outside the post-transition
 1969..2000 range) are rejected loudly.
@@ -45,30 +48,6 @@ from pawn.model import TransformerLayer, _build_decomp_table
 __all__ = [
     "load_v1_factored_model",
 ]
-
-
-_CONVERTED_CACHE_VERSION = 1
-
-
-def _converted_cache_root() -> Path:
-    hf_home = os.environ.get("HF_HOME")
-    if hf_home:
-        return Path(hf_home) / "pawn-jax-converted"
-    return Path.home() / ".cache" / "huggingface" / "pawn-jax-converted"
-
-
-def _source_id_hash(source: str) -> str:
-    """SHA-256 of the source *identifier* string (HF repo ID or local
-    path), versioned by ``_CONVERTED_CACHE_VERSION``.
-
-    Not a hash of the file content — re-publishing the upstream
-    checkpoint with new weights under the same identifier does NOT
-    invalidate this key. The matching `convert_legacy_checkpoint(...,
-    force=True)` flag is the documented escape hatch.
-    """
-    return hashlib.sha256(
-        f"{_CONVERTED_CACHE_VERSION}|{source}".encode("utf-8")
-    ).hexdigest()[:32]
 
 
 def _download_legacy_checkpoint(source: str) -> Path:
