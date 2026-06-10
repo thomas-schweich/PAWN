@@ -8,7 +8,8 @@ tags:
   - causal-lm
   - next-token-prediction
   - representation-learning
-  - pytorch
+  - jax
+  - equinox
   - rust
 model_name: PAWN-{{ variant_name }}
 pipeline_tag: other
@@ -40,9 +41,6 @@ model-index:
           type: next-token-prediction
           name: Chess Move Prediction (Random Games)
         metrics:
-          - name: Game Completion Rate
-            type: accuracy
-            value: {{ "%.6f"|format(completion_rate / 100) }}
           - name: Legal Move Rate
             type: accuracy
             value: {{ "%.6f"|format(legal_rate / 100) }}
@@ -70,13 +68,13 @@ This is the **{{ variant_label }}** variant ({{ params }} parameters). PAWN is d
 
 ## All Variants
 
-| Variant | Parameters | Link |
-|---------|------------|------|
-| PAWN-Small | ~9M | [thomas-schweich/pawn-small](https://huggingface.co/thomas-schweich/pawn-small) |
-| PAWN (Base) | ~35M | [thomas-schweich/pawn-base](https://huggingface.co/thomas-schweich/pawn-base) |
-| PAWN-Large | ~67M | [thomas-schweich/pawn-large](https://huggingface.co/thomas-schweich/pawn-large) |
+| Variant | Link |
+|---------|------|
+| PAWN-Small | [thomas-schweich/pawn-small-v2](https://huggingface.co/thomas-schweich/pawn-small-v2) |
+| PAWN (Base) | [thomas-schweich/pawn-base-v2](https://huggingface.co/thomas-schweich/pawn-base-v2) |
+| PAWN-Large | [thomas-schweich/pawn-large-v2](https://huggingface.co/thomas-schweich/pawn-large-v2) |
 
-A previous generation of PAWN backbones (`pawn-{small,base,large}-legacy`) used a 4,278-token coordinate vocabulary, a 256-token context window, and outcome conditioning. They are still available on HuggingFace; see [docs/LEGACY.md](https://github.com/thomas-schweich/PAWN/blob/main/docs/LEGACY.md) for the full story.
+The original PyTorch backbones (`pawn-{small,base,large}`) are frozen v1 artifacts and are not loadable with the v2 code. See [docs/LEGACY.md](https://github.com/thomas-schweich/PAWN/blob/main/docs/LEGACY.md) and the `v1.0.0` git tag for the full story.
 
 ## Headline Metrics
 
@@ -84,7 +82,6 @@ These come from the published `model.safetensors` (step {{ "{:,}".format(publish
 
 | Metric | Value |
 |--------|-------|
-| Game completion rate | {{ "%.2f"|format(completion_rate) }}% |
 | Per-move legal rate | {{ "%.4f"|format(legal_rate) }}% |
 | Late-game legal rate | {{ "%.4f"|format(late_legal_rate) }}% |
 | Top-1 accuracy | {{ "%.2f"|format(top1) }}% |
@@ -92,13 +89,7 @@ These come from the published `model.safetensors` (step {{ "{:,}".format(publish
 | Val loss | {{ "%.3f"|format(val_loss) }} |
 | Val perplexity | {{ "%.2f"|format(perplexity) }} |
 
-**Game completion rate** is the share of validation games in which *every* prediction along one side's plies was a legal move. The measurement is **non-autoregressive**: at each ply the model is shown the true ground-truth history and asked for that side's next move, and an illegal prediction at any ply forfeits the game. Errors do not corrupt subsequent positions — each prediction is independent given the true history. Autoregressive game completion has not been measured for these checkpoints and could be higher or lower; see the [game completion section of the architecture doc](https://github.com/thomas-schweich/PAWN/blob/main/docs/ARCHITECTURE.md#game-completion-rate) for the full definition. Game completion rate is a much stricter metric than per-move legal rate, and is the main signal that separates capacity between sizes.
-
-| Compound-legality detail | Value |
-|--------------------------|-------|
-| Average plies completed per game | {{ "%.0f"|format(avg_plies_completed) }} |
-| Average % of game completed | {{ "%.2f"|format(avg_pct_completion) }}% |
-| Median forfeit ply (when forfeit) | {{ "%.0f"|format(median_forfeit_ply) }} |
+**Per-move legal rate** is the share of validation positions at which the model's top-1 prediction was a legal move. **Late-game legal rate** restricts that share to the back half of each game, where legality is harder. The measurement is **non-autoregressive**: at each ply the model is shown the true ground-truth history and asked for that side's next move, so a mistake at one ply does not corrupt subsequent positions. See the [legality section of the architecture doc](https://github.com/thomas-schweich/PAWN/blob/main/docs/ARCHITECTURE.md) for the full definition.
 
 ### Accuracy ceiling
 
@@ -141,63 +132,52 @@ Edge-case diagnostics measure the model's legal move rate in specific tactical s
 | Head dimension | {{ head_dim }} |
 | d_ff | {{ d_ff }} |
 | Parameters | {{ params }} |
-| Vocabulary | {{ "{:,}".format(vocab_size) }} tokens (1,968 searchless_chess actions + 1 PAD + 11 outcome tokens) |
+| Vocabulary | {{ "{:,}".format(vocab_size) }} tokens (1,968 searchless_chess actions + 1 PAD + 11 outcome tokens + BOS/NULL + reserved control columns) |
 | Context length | {{ max_seq_len }} tokens |
 | Normalization | Pre-norm RMSNorm |
-| FFN | SwiGLU (4x expansion) |
+| FFN | SwiGLU |
 | Positional encoding | Rotary (RoPE, base 10000) |
-| Embeddings | Factored (src + dst + promo) |
-| Dropout | 0.0 |
+| Embeddings | Uniform token table (single `embed_tokens[V, d]`) |
 
 ## Training Details
 
 | Parameter | Value |
 |-----------|-------|
 | Training data | On-the-fly uniformly random legal games (no external dataset) |
-| Objective | Next-token cross-entropy (non-padding positions only) |
-| Outcome conditioning | {{ "Enabled (prepend_outcome=True)" if prepend_outcome else "Disabled (prepend_outcome=False) — pure moves, no outcome leakage" }} |
+| Objective | Next-token cross-entropy (supervised positions only) |
+| Conditioning prefix | {{ "[" + ", ".join(conditioning) + "]" if conditioning else "none (BOS-only prefix) — pure moves, no outcome leakage" }} |
 | Total steps | {{ "{:,}".format(total_steps) }} |
 | Batch size | {{ batch_size }} |
 | Total training sequences | {{ "{:,}".format(sequences_seen) }} (= total steps × batch size; the published checkpoint is the best 5K-cadence step by val loss, at step {{ "{:,}".format(published_step) }} ≈ {{ "{:,}".format(published_sequences) }} sequences) |
-| Max ply per example | {{ max_ply }} |
+| Context length | {{ max_seq_len }} tokens |
 | Learning rate | {{ lr }} (cosine decay with {{ "{:,}".format(warmup_steps) }}-step warmup) |
 | Optimizer | AdamW (weight decay {{ weight_decay }}) |
-| Precision | Mixed (AMP) |
 
 ## Usage
 
 ### Loading the model
 
-```python
-import torch
-from safetensors.torch import load_file
-from pawn.config import CLMConfig
-from pawn.model import PAWNCLM
-
-cfg = CLMConfig.{{ variant_factory }}()
-model = PAWNCLM(cfg).cuda().eval()
-weights = load_file("model.safetensors", device="cuda")
-model.load_state_dict(weights)
-```
-
-Or load directly from HuggingFace:
+PAWN v2 is a JAX/Equinox model. Load it directly from HuggingFace — the
+architecture is read from the checkpoint's `config.json`, so you don't
+construct the config by hand:
 
 ```python
-from pawn.checkpoint import load_backbone_weights
-from pawn.config import CLMConfig
-from pawn.model import PAWNCLM
+from pawn.checkpoint import resolve_checkpoint_source, load_model
 
-weights, config = load_backbone_weights("thomas-schweich/pawn-{{ variant_key }}")
-cfg = CLMConfig.{{ variant_factory }}()
-model = PAWNCLM(cfg).eval()
-model.load_state_dict(weights)
+model, run_config = load_model(
+    resolve_checkpoint_source("thomas-schweich/pawn-{{ variant_key }}-v2")
+)
 ```
+
+`resolve_checkpoint_source` accepts either a HuggingFace repo ID or a local
+checkpoint directory; `load_model` verifies the `.complete` integrity
+sentinel before reading the safetensors weights.
 
 ### Finetuning with an adapter
 
 ```bash
-uv run python scripts/train.py --run-type adapter --strategy bottleneck \
-    --checkpoint thomas-schweich/pawn-{{ variant_key }} \
+uv run --extra rocm python scripts/train_jax_adapter.py --strategy bottleneck \
+    --checkpoint thomas-schweich/pawn-{{ variant_key }}-v2 \
     --pgn thomas-schweich/pawn-lichess-full \
     --bottleneck-dim 32 --lr 1e-4 --local-checkpoints
 ```

@@ -1,4 +1,13 @@
-"""Tests for pawn.lab.runner.TrialRunner."""
+"""Tests for pawn.lab.runner.TrialRunner.
+
+Ported from the v1 ``tests/lab/test_runner.py`` (the parity spec). The v2
+runner keeps the same public API — workspace-based ``__init__``, GPU
+discovery via a subprocess emitting ``[{"name", "vram_mb"}]`` JSON,
+async launch/kill/monitor/recover, the monotonic event bus, cost
+tracking, and the completion-invariant audit — so the v1 behavioral
+assertions port unchanged. Cotrain is gone by design in v2, so the few
+cotrain-only assertions are not ported (none lived in test_runner).
+"""
 
 from __future__ import annotations
 
@@ -6,6 +15,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,31 +24,50 @@ from pawn.lab.runner import TrialRunner
 from pawn.lab.state import Trial
 
 
+@pytest.fixture(autouse=True)
+def _no_real_gpu_probe(request: pytest.FixtureRequest) -> Any:  # type: ignore[no-untyped-def]
+    """Neutralise the real out-of-process JAX GPU probe for the whole module.
+
+    ``TrialRunner._discover_gpus`` shells out to ``python -c 'import jax …'``
+    with a 60s subprocess timeout. Importing JAX under a concurrent GPU
+    workload can block well past the pytest-timeout and kill whichever test
+    happens to be running. Only ``TestGpuDiscovery`` exercises discovery (and
+    patches ``subprocess.check_output`` itself), so it opts out of this stub;
+    every other test gets an instant no-op so ``status()`` /
+    ``gpu_utilization()`` report an empty GPU list without spawning JAX.
+    """
+    if request.cls is not None and request.cls.__name__ == "TestGpuDiscovery":
+        yield
+        return
+    with patch.object(TrialRunner, "_discover_gpus", lambda self: None):
+        yield
+
+
 # =====================================================================
 # __init__ and directory setup
 # =====================================================================
 
 
 class TestInit:
-    def test_creates_log_dir(self, tmp_path):
+    def test_creates_log_dir(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         assert runner.log_dir.exists()
         assert runner.log_dir == tmp_path / "logs"
 
-    def test_creates_results_dir(self, tmp_path):
+    def test_creates_results_dir(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         assert runner.results_dir.exists()
         assert runner.results_dir == tmp_path / "sweep_results"
 
-    def test_state_path_under_workspace(self, tmp_path):
+    def test_state_path_under_workspace(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         assert runner.state_path == tmp_path / "lab_state.json"
 
-    def test_events_path_under_workspace(self, tmp_path):
+    def test_events_path_under_workspace(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         assert runner.events_path == tmp_path / "lab_events.jsonl"
 
-    def test_initial_state(self, tmp_path):
+    def test_initial_state(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         assert runner.trials == {}
         assert runner.next_trial_id == 0
@@ -47,7 +76,7 @@ class TestInit:
         assert runner.events == []
         assert runner.cost_per_hour is None
 
-    def test_workspace_from_env(self, tmp_path, monkeypatch):
+    def test_workspace_from_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:  # type: ignore[no-untyped-def]
         monkeypatch.setenv("PAWN_WORKSPACE", str(tmp_path))
         runner = TrialRunner()
         assert runner.workspace == tmp_path
@@ -59,19 +88,21 @@ class TestInit:
 
 
 class TestGpuDiscovery:
-    def test_discover_gpus_parses_json(self, tmp_path):
+    def test_discover_gpus_parses_json(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
-        fake_output = json.dumps([
-            {"name": "NVIDIA A100", "vram_mb": 80000},
-            {"name": "NVIDIA A100", "vram_mb": 80000},
-        ])
+        fake_output = json.dumps(
+            [
+                {"name": "NVIDIA A100", "vram_mb": 80000},
+                {"name": "NVIDIA A100", "vram_mb": 80000},
+            ]
+        )
         with patch("subprocess.check_output", return_value=fake_output):
             runner._discover_gpus()
         assert runner.gpu_count == 2
         assert runner.gpu_names == ["NVIDIA A100", "NVIDIA A100"]
         assert runner.gpu_vram_mb == [80000, 80000]
 
-    def test_discover_gpus_idempotent(self, tmp_path):
+    def test_discover_gpus_idempotent(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         fake_output = json.dumps([{"name": "A100", "vram_mb": 80000}])
         with patch("subprocess.check_output", return_value=fake_output) as mock:
@@ -80,13 +111,13 @@ class TestGpuDiscovery:
         assert mock.call_count == 1
         assert runner.gpu_count == 1
 
-    def test_discover_gpus_on_failure_sets_zero(self, tmp_path):
+    def test_discover_gpus_on_failure_sets_zero(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         with patch("subprocess.check_output", side_effect=Exception("boom")):
             runner._discover_gpus()
         assert runner.gpu_count == 0
 
-    def test_discover_gpus_empty(self, tmp_path):
+    def test_discover_gpus_empty(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         with patch("subprocess.check_output", return_value="[]"):
             runner._discover_gpus()
@@ -100,7 +131,7 @@ class TestGpuDiscovery:
 
 
 class TestGpuAssignment:
-    def _make_runner_with_gpus(self, tmp_path, n: int) -> TrialRunner:
+    def _make_runner_with_gpus(self, tmp_path: Path, n: int) -> TrialRunner:
         runner = TrialRunner(workspace=str(tmp_path))
         runner._gpus_discovered = True
         runner._mps_active = False
@@ -110,37 +141,37 @@ class TestGpuAssignment:
         runner.gpu_assignments = {i: None for i in range(n)}
         return runner
 
-    def test_find_free_gpu_returns_first_free(self, tmp_path):
+    def test_find_free_gpu_returns_first_free(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = self._make_runner_with_gpus(tmp_path, 3)
         assert runner._find_free_gpu() == 0
 
-    def test_find_free_gpu_skips_assigned(self, tmp_path):
+    def test_find_free_gpu_skips_assigned(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = self._make_runner_with_gpus(tmp_path, 3)
         runner.gpu_assignments[0] = 42  # trial 42 on gpu 0
         assert runner._find_free_gpu() == 1
 
-    def test_find_free_gpu_returns_none_when_all_busy(self, tmp_path):
+    def test_find_free_gpu_returns_none_when_all_busy(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = self._make_runner_with_gpus(tmp_path, 2)
         runner.gpu_assignments[0] = 1
         runner.gpu_assignments[1] = 2
         assert runner._find_free_gpu() is None
 
-    def test_find_free_gpu_returns_none_when_no_gpus(self, tmp_path):
+    def test_find_free_gpu_returns_none_when_no_gpus(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = self._make_runner_with_gpus(tmp_path, 0)
         assert runner._find_free_gpu() is None
 
-    def test_assign_gpu_sets_mapping(self, tmp_path):
+    def test_assign_gpu_sets_mapping(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = self._make_runner_with_gpus(tmp_path, 2)
         runner._assign_gpu(5, 1)
         assert runner.gpu_assignments[1] == 5
 
-    def test_release_gpu_clears_mapping(self, tmp_path):
+    def test_release_gpu_clears_mapping(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = self._make_runner_with_gpus(tmp_path, 2)
         runner._assign_gpu(5, 1)
         runner._release_gpu(1)
         assert runner.gpu_assignments[1] is None
 
-    def test_gpu_utilization_shape(self, tmp_path):
+    def test_gpu_utilization_shape(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = self._make_runner_with_gpus(tmp_path, 2)
         runner.gpu_assignments[0] = 7
         util = runner.gpu_utilization()
@@ -157,15 +188,19 @@ class TestGpuAssignment:
 
 
 class TestStatePersistence:
-    def test_save_and_load_roundtrip(self, tmp_path):
+    def test_save_and_load_roundtrip(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.next_trial_id = 5
         runner.event_seq = 12
         runner.cost_per_hour = 3.59
         trial = Trial(
-            trial_id=0, strategy="lora", params={"lr": 1e-3},
-            cli_command=["python", "x.py"], status="running",
-            current_step=100, total_steps=1000,
+            trial_id=0,
+            strategy="lora",
+            params={"lr": 1e-3},
+            cli_command=["python", "x.py"],
+            status="running",
+            current_step=100,
+            total_steps=1000,
         )
         runner.trials[0] = trial
         runner._save_state()
@@ -182,20 +217,20 @@ class TestStatePersistence:
         assert runner2.trials[0].strategy == "lora"
         assert runner2.trials[0].current_step == 100
 
-    def test_load_state_missing_file_is_noop(self, tmp_path):
+    def test_load_state_missing_file_is_noop(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         # no state file yet
         runner._load_state()
         assert runner.trials == {}
 
-    def test_load_state_corrupt_json_logs_and_continues(self, tmp_path):
+    def test_load_state_corrupt_json_logs_and_continues(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.state_path.write_text("{corrupt")
         runner._load_state()
         # Should not crash
         assert runner.trials == {}
 
-    def test_save_state_is_atomic(self, tmp_path):
+    def test_save_state_is_atomic(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner._save_state()
         # No stale .tmp file left
@@ -208,7 +243,7 @@ class TestStatePersistence:
 
 
 class TestEvents:
-    def test_emit_increments_seq(self, tmp_path):
+    def test_emit_increments_seq(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         assert runner.event_seq == 0
         runner._emit("test_event", trial_id=1, data={"x": 1})
@@ -218,7 +253,7 @@ class TestEvents:
         assert runner.event_seq == 2
         assert len(runner.events) == 2
 
-    def test_emit_writes_to_jsonl(self, tmp_path):
+    def test_emit_writes_to_jsonl(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner._emit("test_event", trial_id=1, data={"x": 1})
         assert runner.events_path.exists()
@@ -229,7 +264,7 @@ class TestEvents:
         assert event["trial_id"] == 1
         assert event["data"] == {"x": 1}
 
-    def test_emit_event_has_timestamp_and_seq(self, tmp_path):
+    def test_emit_event_has_timestamp_and_seq(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner._emit("hello")
         ev = runner.events[0]
@@ -237,7 +272,7 @@ class TestEvents:
         assert "timestamp" in ev
         assert ev["seq"] == 1
 
-    def test_events_since_returns_tail(self, tmp_path):
+    def test_events_since_returns_tail(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner._emit("a")
         runner._emit("b")
@@ -248,7 +283,7 @@ class TestEvents:
         assert events[1]["type"] == "c"
         assert latest == 3
 
-    def test_events_since_zero_returns_all(self, tmp_path):
+    def test_events_since_zero_returns_all(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner._emit("a")
         runner._emit("b")
@@ -256,7 +291,7 @@ class TestEvents:
         assert len(events) == 2
         assert latest == 2
 
-    def test_events_since_none_auto_tracks(self, tmp_path):
+    def test_events_since_none_auto_tracks(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner._emit("a")
         runner._emit("b")
@@ -268,7 +303,7 @@ class TestEvents:
         assert len(events) == 1
         assert events[0]["type"] == "c"
 
-    def test_events_since_seq_at_or_above_latest(self, tmp_path):
+    def test_events_since_seq_at_or_above_latest(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner._emit("a")
         events, latest = runner.events_since(10)
@@ -282,7 +317,7 @@ class TestEvents:
 
 
 class TestStatus:
-    def test_empty_status(self, tmp_path):
+    def test_empty_status(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         s = runner.status()
         assert s["total_trials"] == 0
@@ -291,13 +326,21 @@ class TestStatus:
         assert s["failed"] == 0
         assert "elapsed" in s
 
-    def test_status_with_running_trial(self, tmp_path):
+    def test_status_with_running_trial(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.trials[0] = Trial(
-            trial_id=0, strategy="lora", params={"lr": 1e-3, "lora_rank": 4},
-            cli_command=[], status="running", current_step=50, total_steps=100,
-            steps_per_sec=10.0, last_train_loss=1.5, best_val_loss=2.0,
-            pid=1234, gpu_id=0,
+            trial_id=0,
+            strategy="lora",
+            params={"lr": 1e-3, "lora_rank": 4},
+            cli_command=[],
+            status="running",
+            current_step=50,
+            total_steps=100,
+            steps_per_sec=10.0,
+            last_train_loss=1.5,
+            best_val_loss=2.0,
+            pid=1234,
+            gpu_id=0,
         )
         s = runner.status()
         assert s["total_trials"] == 1
@@ -315,18 +358,24 @@ class TestStatus:
         assert r["key_hp"].get("lora_rank") == 4
         assert r["key_hp"].get("lr") == 1e-3
 
-    def test_status_counts(self, tmp_path):
+    def test_status_counts(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
-        runner.trials[0] = Trial(trial_id=0, strategy="a", params={}, cli_command=[], status="completed")
-        runner.trials[1] = Trial(trial_id=1, strategy="b", params={}, cli_command=[], status="failed")
-        runner.trials[2] = Trial(trial_id=2, strategy="c", params={}, cli_command=[], status="running")
+        runner.trials[0] = Trial(
+            trial_id=0, strategy="a", params={}, cli_command=[], status="completed"
+        )
+        runner.trials[1] = Trial(
+            trial_id=1, strategy="b", params={}, cli_command=[], status="failed"
+        )
+        runner.trials[2] = Trial(
+            trial_id=2, strategy="c", params={}, cli_command=[], status="running"
+        )
         s = runner.status()
         assert s["total_trials"] == 3
         assert s["completed"] == 1
         assert s["failed"] == 1
         assert len(s["running"]) == 1
 
-    def test_status_with_cost(self, tmp_path):
+    def test_status_with_cost(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.cost_per_hour = 3.00
         runner.start_time = time.time() - 3600  # 1 hour ago
@@ -335,10 +384,9 @@ class TestStatus:
         assert s["estimated_cost"] is not None
         assert s["estimated_cost"] == pytest.approx(3.0, abs=0.1)
 
-    def test_status_attaches_pretrain_block_for_pretrain_runs(self, tmp_path):
+    def test_status_attaches_pretrain_block_for_pretrain_runs(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         """Running pretrain trials get a `pretrain` block with latest val
         metrics and the power-law forfeit fit."""
-        import json
         runner = TrialRunner(workspace=str(tmp_path))
         run_dir = tmp_path / "run_x"
         run_dir.mkdir()
@@ -348,24 +396,35 @@ class TestStatus:
         records = []
         for i in range(1, 13):
             step = i * 1000
-            forfeit = prefactor * (step ** exponent)
-            records.append({
-                "type": "val", "step": step, "val/loss": 3.0,
-                "val/game_completion_rate": 1.0 - forfeit,
-                "val/avg_plies_completed": 300.0,
-                "val/min_forfeit_ply": 20.0, "val/max_forfeit_ply": 400.0,
-                "val/median_forfeit_ply": 100.0,
-                "val/legal_move_rate": 0.997,
-                "val/late_legal_move_rate": 0.993,
-            })
+            forfeit = prefactor * (step**exponent)
+            records.append(
+                {
+                    "type": "val",
+                    "step": step,
+                    "val/loss": 3.0,
+                    "val/game_completion_rate": 1.0 - forfeit,
+                    "val/avg_plies_completed": 300.0,
+                    "val/min_forfeit_ply": 20.0,
+                    "val/max_forfeit_ply": 400.0,
+                    "val/median_forfeit_ply": 100.0,
+                    "val/legal_move_rate": 0.997,
+                    "val/late_legal_move_rate": 0.993,
+                }
+            )
         with open(run_dir / "metrics.jsonl", "w") as f:
             for r in records:
                 f.write(json.dumps(r) + "\n")
 
         runner.trials[0] = Trial(
-            trial_id=0, strategy="base", params={"run_type": "pretrain"},
-            cli_command=[], status="running", current_step=12_000,
-            total_steps=100_000, pid=1, gpu_id=0,
+            trial_id=0,
+            strategy="base",
+            params={"run_type": "pretrain"},
+            cli_command=[],
+            status="running",
+            current_step=12_000,
+            total_steps=100_000,
+            pid=1,
+            gpu_id=0,
             config={"run_type": "pretrain", "variant": "base"},
             run_dir=str(run_dir),
         )
@@ -378,17 +437,25 @@ class TestStatus:
         assert "latest" in pretrain
         assert pretrain["latest"]["step"] == 12_000
         assert "forfeit_fit" in pretrain
-        assert pretrain["forfeit_fit"]["exponent"] == pytest.approx(exponent, rel=1e-6)
-        assert pretrain["forfeit_fit"]["prefactor"] == pytest.approx(prefactor, rel=1e-6)
+        assert pretrain["forfeit_fit"]["exponent"] == pytest.approx(
+            exponent, rel=1e-6
+        )
+        assert pretrain["forfeit_fit"]["prefactor"] == pytest.approx(
+            prefactor, rel=1e-6
+        )
 
-    def test_status_omits_pretrain_block_for_adapter_runs(self, tmp_path):
+    def test_status_omits_pretrain_block_for_adapter_runs(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         """Adapter runs don't get a pretrain block even if they log val records."""
         runner = TrialRunner(workspace=str(tmp_path))
         runner.trials[0] = Trial(
-            trial_id=0, strategy="lora", params={"run_type": "adapter"},
-            cli_command=[], status="running",
+            trial_id=0,
+            strategy="lora",
+            params={"run_type": "adapter"},
+            cli_command=[],
+            status="running",
             config={"run_type": "adapter", "strategy": "lora"},
-            pid=1, gpu_id=0,
+            pid=1,
+            gpu_id=0,
         )
         s = runner.status()
         assert len(s["running"]) == 1
@@ -401,10 +468,20 @@ class TestStatus:
 
 
 class TestResults:
-    def _make_completed(self, trial_id, params, val_loss, strategy="lora", tags=None):
+    def _make_completed(
+        self,
+        trial_id: int,
+        params: dict,
+        val_loss: float,
+        strategy: str = "lora",
+        tags: list[str] | None = None,
+    ) -> Trial:
         t = Trial(
-            trial_id=trial_id, strategy=strategy, params={},
-            cli_command=[], status="completed",
+            trial_id=trial_id,
+            strategy=strategy,
+            params={},
+            cli_command=[],
+            status="completed",
             config={"lr": 1e-3, **{k: v for k, v in params.items()}},
             best_val_loss=val_loss,
             actual_param_count=params.get("param_count", 10_000),
@@ -412,14 +489,14 @@ class TestResults:
         )
         return t
 
-    def test_empty_results(self, tmp_path):
+    def test_empty_results(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         r = runner.results()
         assert r["trials"] == []
         assert r["pareto_front"] == []
         assert r["suggestions"] == []
 
-    def test_results_sorted_by_trial_id(self, tmp_path):
+    def test_results_sorted_by_trial_id(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.trials[2] = self._make_completed(2, {"lora_rank": 4}, 1.0)
         runner.trials[0] = self._make_completed(0, {"lora_rank": 2}, 1.5)
@@ -428,7 +505,7 @@ class TestResults:
         ids = [row["trial"] for row in r["trials"]]
         assert ids == [0, 1, 2]
 
-    def test_results_tag_filter(self, tmp_path):
+    def test_results_tag_filter(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.trials[0] = self._make_completed(0, {}, 1.0, tags=["p1"])
         runner.trials[1] = self._make_completed(1, {}, 1.2, tags=["p2"])
@@ -437,7 +514,7 @@ class TestResults:
         ids = sorted(row["trial"] for row in r["trials"])
         assert ids == [0, 2]
 
-    def test_results_pareto_front(self, tmp_path):
+    def test_results_pareto_front(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         # trial 0: 1000 params, val_loss 2.0
         runner.trials[0] = self._make_completed(0, {"param_count": 1000}, 2.0)
@@ -447,42 +524,54 @@ class TestResults:
         runner.trials[2] = self._make_completed(2, {"param_count": 2000}, 2.2)
         # trial 3: 500 params, val_loss 3.0 (not dominated: fewest params)
         runner.trials[3] = self._make_completed(3, {"param_count": 500}, 3.0)
-        # trial 4: 3000 params, val_loss 3.0 (dominated by 1: more params, worse loss)
+        # trial 4: 3000 params, val_loss 3.0 (dominated by 1)
         runner.trials[4] = self._make_completed(4, {"param_count": 3000}, 3.0)
         r = runner.results()
-        all_completed = [row for row in r["trials"]
-                         if row["status"] == "completed"
-                         and row["val_loss"] is not None
-                         and row["params"] is not None]
+        all_completed = [
+            row
+            for row in r["trials"]
+            if row["status"] == "completed"
+            and row["val_loss"] is not None
+            and row["params"] is not None
+        ]
         pareto = r["pareto_front"]
         pareto_ids = {row["trial"] for row in pareto}
         non_pareto_ids = {row["trial"] for row in all_completed} - pareto_ids
 
         # Verify non-domination: for every Pareto-optimal trial, no other
-        # completed trial dominates it (both strictly better on at least one axis)
+        # completed trial dominates it.
         for p_row in pareto:
             for other in all_completed:
                 if other["trial"] == p_row["trial"]:
                     continue
-                both_le = (other["params"] <= p_row["params"]
-                           and other["val_loss"] <= p_row["val_loss"])
-                one_strict = (other["params"] < p_row["params"]
-                              or other["val_loss"] < p_row["val_loss"])
+                both_le = (
+                    other["params"] <= p_row["params"]
+                    and other["val_loss"] <= p_row["val_loss"]
+                )
+                one_strict = (
+                    other["params"] < p_row["params"]
+                    or other["val_loss"] < p_row["val_loss"]
+                )
                 assert not (both_le and one_strict), (
-                    f"Pareto trial {p_row['trial']} is dominated by trial {other['trial']}"
+                    f"Pareto trial {p_row['trial']} is dominated by trial "
+                    f"{other['trial']}"
                 )
 
-        # Verify every non-Pareto trial IS dominated by at least one other trial
+        # Verify every non-Pareto trial IS dominated by at least one other.
         for np_id in non_pareto_ids:
             np_row = next(r for r in all_completed if r["trial"] == np_id)
             dominated = False
             for other in all_completed:
                 if other["trial"] == np_id:
                     continue
-                if (other["params"] <= np_row["params"]
-                        and other["val_loss"] <= np_row["val_loss"]
-                        and (other["params"] < np_row["params"]
-                             or other["val_loss"] < np_row["val_loss"])):
+                if (
+                    other["params"] <= np_row["params"]
+                    and other["val_loss"] <= np_row["val_loss"]
+                    and (
+                        other["params"] < np_row["params"]
+                        or other["val_loss"] < np_row["val_loss"]
+                    )
+                ):
                     dominated = True
                     break
             assert dominated, (
@@ -503,26 +592,32 @@ class TestResults:
 
 
 class TestTrialLog:
-    def test_trial_log_missing_trial(self, tmp_path):
+    def test_trial_log_missing_trial(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         r = runner.trial_log(999)
         assert "error" in r
 
-    def test_trial_log_missing_file(self, tmp_path):
+    def test_trial_log_missing_file(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.trials[0] = Trial(
-            trial_id=0, strategy="x", params={}, cli_command=[],
+            trial_id=0,
+            strategy="x",
+            params={},
+            cli_command=[],
             log_path=str(tmp_path / "nonexistent.log"),
         )
         r = runner.trial_log(0)
         assert "error" in r
 
-    def test_trial_log_returns_last_n_lines(self, tmp_path):
+    def test_trial_log_returns_last_n_lines(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         log_path = tmp_path / "log.txt"
         log_path.write_text("\n".join(f"line {i}" for i in range(100)))
         runner.trials[0] = Trial(
-            trial_id=0, strategy="x", params={}, cli_command=[],
+            trial_id=0,
+            strategy="x",
+            params={},
+            cli_command=[],
             log_path=str(log_path),
         )
         r = runner.trial_log(0, lines=5)
@@ -532,14 +627,16 @@ class TestTrialLog:
 
 
 class TestAddNotes:
-    def test_add_notes_updates_trial(self, tmp_path):
+    def test_add_notes_updates_trial(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
-        runner.trials[0] = Trial(trial_id=0, strategy="x", params={}, cli_command=[])
+        runner.trials[0] = Trial(
+            trial_id=0, strategy="x", params={}, cli_command=[]
+        )
         r = runner.add_notes(0, "cool trial")
         assert r["ok"] is True
         assert runner.trials[0].notes == "cool trial"
 
-    def test_add_notes_missing_trial(self, tmp_path):
+    def test_add_notes_missing_trial(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         r = runner.add_notes(999, "foo")
         assert "error" in r
@@ -551,23 +648,31 @@ class TestAddNotes:
 
 
 class TestKill:
-    def test_kill_missing_trial(self, tmp_path):
+    def test_kill_missing_trial(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         r = asyncio.run(runner.kill(999))
         assert "error" in r
 
-    def test_kill_not_running(self, tmp_path):
+    def test_kill_not_running(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.trials[0] = Trial(
-            trial_id=0, strategy="x", params={}, cli_command=[], status="completed",
+            trial_id=0,
+            strategy="x",
+            params={},
+            cli_command=[],
+            status="completed",
         )
         r = asyncio.run(runner.kill(0))
         assert "error" in r
 
-    def test_kill_sends_sigterm(self, tmp_path):
+    def test_kill_sends_sigterm(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.trials[0] = Trial(
-            trial_id=0, strategy="x", params={}, cli_command=[], status="running",
+            trial_id=0,
+            strategy="x",
+            params={},
+            cli_command=[],
+            status="running",
             pid=99999,
         )
         with patch("os.kill") as mock_kill:
@@ -578,12 +683,17 @@ class TestKill:
         mock_kill.assert_called_once()
         # Signal must be SIGTERM
         import signal
+
         assert mock_kill.call_args[0][1] == signal.SIGTERM
 
-    def test_kill_handles_process_already_gone(self, tmp_path):
+    def test_kill_handles_process_already_gone(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.trials[0] = Trial(
-            trial_id=0, strategy="x", params={}, cli_command=[], status="running",
+            trial_id=0,
+            strategy="x",
+            params={},
+            cli_command=[],
+            status="running",
             pid=99999,
         )
         with patch("os.kill", side_effect=ProcessLookupError):
@@ -598,7 +708,7 @@ class TestKill:
 
 
 class TestRenderProgressLog:
-    def test_render_writes_file(self, tmp_path):
+    def test_render_writes_file(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.gpu_count = 2
         runner.gpu_names = ["A100", "A100"]
@@ -607,7 +717,7 @@ class TestRenderProgressLog:
         assert runner.progress_log_path.exists()
         assert "Pod Manager Log" in content
 
-    def test_render_shows_environment(self, tmp_path):
+    def test_render_shows_environment(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.gpu_count = 2
         runner.gpu_names = ["A100", "A100"]
@@ -616,23 +726,36 @@ class TestRenderProgressLog:
         assert "A100" in content
         assert "80000" in content
 
-    def test_render_shows_running_trials(self, tmp_path):
+    def test_render_shows_running_trials(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.trials[0] = Trial(
-            trial_id=0, strategy="lora", params={}, cli_command=[],
-            status="running", current_step=50, total_steps=100,
-            steps_per_sec=5.0, pid=1234, gpu_id=0,
+            trial_id=0,
+            strategy="lora",
+            params={},
+            cli_command=[],
+            status="running",
+            current_step=50,
+            total_steps=100,
+            steps_per_sec=5.0,
+            pid=1234,
+            gpu_id=0,
         )
         content = runner.render_progress_log()
         assert "Active Processes" in content
         assert "lora" in content
 
-    def test_render_shows_completed(self, tmp_path):
+    def test_render_shows_completed(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.trials[0] = Trial(
-            trial_id=0, strategy="lora", params={}, cli_command=[],
-            status="completed", best_val_loss=0.5, best_accuracy=0.9,
-            actual_param_count=100_000, notes="first run",
+            trial_id=0,
+            strategy="lora",
+            params={},
+            cli_command=[],
+            status="completed",
+            best_val_loss=0.5,
+            best_accuracy=0.9,
+            actual_param_count=100_000,
+            notes="first run",
         )
         content = runner.render_progress_log()
         assert "Results" in content
@@ -645,16 +768,20 @@ class TestRenderProgressLog:
 
 
 class TestRecover:
-    def test_recover_empty_state(self, tmp_path):
+    def test_recover_empty_state(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         asyncio.run(runner.recover())
         assert runner.trials == {}
 
-    def test_recover_marks_dead_trial_failed(self, tmp_path):
+    def test_recover_marks_dead_trial_failed(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.trials[0] = Trial(
-            trial_id=0, strategy="x", params={}, cli_command=[],
-            status="running", pid=99999,  # likely dead
+            trial_id=0,
+            strategy="x",
+            params={},
+            cli_command=[],
+            status="running",
+            pid=99999,  # likely dead
             best_val_loss=None,
         )
         runner._save_state()
@@ -664,11 +791,15 @@ class TestRecover:
             asyncio.run(runner2.recover())
         assert runner2.trials[0].status == "failed"
 
-    def test_recover_marks_dead_trial_completed_if_has_val(self, tmp_path):
+    def test_recover_marks_dead_trial_completed_if_has_val(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.trials[0] = Trial(
-            trial_id=0, strategy="x", params={}, cli_command=[],
-            status="running", pid=99999,
+            trial_id=0,
+            strategy="x",
+            params={},
+            cli_command=[],
+            status="running",
+            pid=99999,
             best_val_loss=0.5,
         )
         runner._save_state()
@@ -677,7 +808,7 @@ class TestRecover:
             asyncio.run(runner2.recover())
         assert runner2.trials[0].status == "completed"
 
-    def test_recover_reads_events(self, tmp_path):
+    def test_recover_reads_events(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner._emit("a")
         runner._emit("b")
@@ -694,10 +825,189 @@ class TestRecover:
 
 
 class TestShutdown:
-    def test_shutdown_saves_state(self, tmp_path):
+    def test_shutdown_saves_state(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         runner.shutdown()
         assert runner.state_path.exists()
+
+    def test_shutdown_cancels_monitors(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = TrialRunner(workspace=str(tmp_path))
+
+        async def make_task() -> asyncio.Task[None]:
+            async def dummy() -> None:
+                await asyncio.sleep(100)
+
+            return asyncio.ensure_future(dummy())
+
+        task = asyncio.run(make_task())
+        runner._monitor_tasks[0] = task
+        runner.shutdown()
+        # Monitor tasks are cancelled and cleared; training processes
+        # themselves keep running (detached).
+        assert len(runner._monitor_tasks) == 0
+
+
+# =====================================================================
+# launch() — GPU-aware scheduling + trial_started event + strategy shim
+# =====================================================================
+
+
+def _make_runner_one_free_gpu(tmp_path: Path) -> TrialRunner:
+    runner = TrialRunner(workspace=str(tmp_path))
+    runner._gpus_discovered = True
+    runner._mps_active = False
+    runner.gpu_count = 1
+    runner.gpu_names = ["A100"]
+    runner.gpu_vram_mb = [80000]
+    runner.gpu_assignments = {0: None}
+    return runner
+
+
+_LORA_CFG: dict[str, Any] = {
+    "run_type": "adapter",
+    "strategy": "lora",
+    "lora_rank": 4,
+    "total_steps": 10,
+}
+
+
+class TestLaunch:
+    def test_launch_assigns_gpu_and_spawns(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = _make_runner_one_free_gpu(tmp_path)
+
+        async def fake_spawn(trial: Trial) -> None:
+            trial.pid = 12345
+            trial.status = "running"
+
+        with patch.object(runner, "_spawn", side_effect=fake_spawn):
+            tid = asyncio.run(runner.launch(dict(_LORA_CFG)))
+        assert tid == 0
+        # One trial per free GPU: the GPU is now assigned to this trial.
+        assert runner.gpu_assignments[0] == 0
+        assert 0 in runner.trials
+
+    def test_launch_no_free_gpu_raises(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = _make_runner_one_free_gpu(tmp_path)
+        runner.gpu_assignments = {0: 99}  # busy
+        # Refuse to launch when all GPUs are busy.
+        with pytest.raises(RuntimeError, match="No free GPU"):
+            asyncio.run(runner.launch(dict(_LORA_CFG)))
+
+    def test_launch_with_strategy_shim(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        """Legacy strategy/params shim builds an adapter config."""
+        runner = _make_runner_one_free_gpu(tmp_path)
+
+        async def fake_spawn(trial: Trial) -> None:
+            trial.pid = 555
+            trial.status = "running"
+
+        with patch.object(runner, "_spawn", side_effect=fake_spawn):
+            tid = asyncio.run(
+                runner.launch(
+                    {},
+                    strategy="bottleneck",
+                    params={"bottleneck_dim": 8, "total_steps": 10},
+                )
+            )
+        t = runner.trials[tid]
+        assert t.strategy == "bottleneck"
+        assert (
+            t.params.get("bottleneck_dim") == 8
+            or t.config.get("bottleneck_dim") == 8
+        )
+
+    def test_launch_emits_trial_started_event(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = _make_runner_one_free_gpu(tmp_path)
+
+        async def fake_spawn(trial: Trial) -> None:
+            trial.pid = 1
+            trial.status = "running"
+
+        with patch.object(runner, "_spawn", side_effect=fake_spawn):
+            asyncio.run(runner.launch(dict(_LORA_CFG)))
+        started = [e for e in runner.events if e["type"] == "trial_started"]
+        assert len(started) == 1
+
+
+# =====================================================================
+# set_cost() — cost tracking ($/hr -> cumulative cost)
+# =====================================================================
+
+
+class TestSetCost:
+    def test_set_cost_records_rate(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = TrialRunner(workspace=str(tmp_path))
+        r = runner.set_cost(3.59)
+        assert r["cost_per_hour"] == 3.59
+        assert r["status"] == "set"
+        assert runner.cost_per_hour == 3.59
+
+    def test_set_cost_feeds_status_estimate(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = TrialRunner(workspace=str(tmp_path))
+        runner.start_time = time.time() - 3600  # one hour ago
+        runner.set_cost(2.00)
+        s = runner.status()
+        assert s["cost_per_hour"] == 2.00
+        assert s["estimated_cost"] == pytest.approx(2.0, abs=0.1)
+
+    def test_set_cost_persists_across_restart(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = TrialRunner(workspace=str(tmp_path))
+        runner.set_cost(1.25)
+        runner2 = TrialRunner(workspace=str(tmp_path))
+        runner2._load_state()
+        assert runner2.cost_per_hour == 1.25
+
+
+# =====================================================================
+# Event-bus: gpu_idle emission + reattach-with-monitor on recover
+# =====================================================================
+
+
+class TestEventBus:
+    def test_gpu_idle_event_on_all_complete(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = TrialRunner(workspace=str(tmp_path))
+        runner._gpus_discovered = True
+        runner._mps_active = False
+        runner.gpu_count = 1
+        runner.gpu_names = ["A100"]
+        runner.gpu_vram_mb = [80000]
+        runner.gpu_assignments = {0: 0}  # trial 0 on gpu 0
+        runner.trials[0] = Trial(
+            trial_id=0,
+            strategy="lora",
+            params={},
+            cli_command=[],
+            status="running",
+            gpu_id=0,
+        )
+        runner._complete(0)
+        idle = [e for e in runner.events if e["type"] == "gpu_idle"]
+        assert len(idle) == 1
+
+    def test_recover_reattaches_running_trial_with_monitor(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = TrialRunner(workspace=str(tmp_path))
+        runner.trials[0] = Trial(
+            trial_id=0,
+            strategy="x",
+            params={},
+            cli_command=[],
+            status="running",
+            pid=12345,
+        )
+        runner._save_state()
+        runner2 = TrialRunner(workspace=str(tmp_path))
+
+        async def run_recover() -> None:
+            with (
+                patch("pawn.lab.runner.is_alive", return_value=(True, None)),
+                patch.object(runner2, "_monitor", new_callable=AsyncMock),
+            ):
+                await runner2.recover()
+
+        asyncio.run(run_recover())
+        # Trial still running; a monitor task was created to reattach to it.
+        assert runner2.trials[0].status == "running"
+        assert 0 in runner2._monitor_tasks
 
 
 # =====================================================================
@@ -705,11 +1015,18 @@ class TestShutdown:
 # =====================================================================
 
 
-def _running_trial(runner, trial_id=0, best_val_loss=None) -> Trial:
+def _running_trial(
+    runner: TrialRunner, trial_id: int = 0, best_val_loss: float | None = None
+) -> Trial:
     t = Trial(
-        trial_id=trial_id, strategy="bottleneck", params={}, cli_command=[],
-        status="running", pid=12345,
-        best_val_loss=best_val_loss, gpu_id=None,
+        trial_id=trial_id,
+        strategy="bottleneck",
+        params={},
+        cli_command=[],
+        status="running",
+        pid=12345,
+        best_val_loss=best_val_loss,
+        gpu_id=None,
     )
     runner.trials[trial_id] = t
     return t
@@ -718,50 +1035,50 @@ def _running_trial(runner, trial_id=0, best_val_loss=None) -> Trial:
 class TestMonitorExitCode:
     """The _monitor loop must not mask crashes as completions.
 
-    Regression: before 2026-04, a trial that crashed with a non-zero exit
-    code (OOM, Python traceback) was still classified as ``completed`` if
+    Regression: a trial that crashed with a non-zero exit code (OOM,
+    Python traceback) was still classified as ``completed`` if
     ``best_val_loss`` had been populated by the baseline eval — which
     runs before any training step. That silently hid real failures.
     """
 
-    def test_clean_exit_completes(self, tmp_path):
+    def test_clean_exit_completes(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         t = _running_trial(runner, best_val_loss=None)
-        with patch("pawn.lab.runner.is_alive", side_effect=[(False, 0)]), \
-             patch("pawn.lab.runner.read_metrics"), \
-             patch("pawn.lab.runner.check_health", return_value=None), \
-             patch("asyncio.sleep", new_callable=AsyncMock):
+        with (
+            patch("pawn.lab.runner.is_alive", side_effect=[(False, 0)]),
+            patch("pawn.lab.runner.read_metrics"),
+            patch("pawn.lab.runner.check_health", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
             asyncio.run(runner._monitor(t.trial_id))
         assert runner.trials[t.trial_id].status == "completed"
 
-    def test_nonzero_exit_fails_even_with_baseline_val(self, tmp_path):
+    def test_nonzero_exit_fails_even_with_baseline_val(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         """Baseline eval populates best_val_loss; that must not mask a crash."""
         runner = TrialRunner(workspace=str(tmp_path))
         t = _running_trial(runner, best_val_loss=3.21)  # set by baseline eval
-        with patch("pawn.lab.runner.is_alive", side_effect=[(False, 1)]), \
-             patch("pawn.lab.runner.read_metrics"), \
-             patch("pawn.lab.runner.check_health", return_value=None), \
-             patch("asyncio.sleep", new_callable=AsyncMock):
+        with (
+            patch("pawn.lab.runner.is_alive", side_effect=[(False, 1)]),
+            patch("pawn.lab.runner.read_metrics"),
+            patch("pawn.lab.runner.check_health", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
             asyncio.run(runner._monitor(t.trial_id))
         assert runner.trials[t.trial_id].status == "failed"
-        failed_events = [
-            e for e in runner.events if e["type"] == "trial_failed"
-        ]
+        failed_events = [e for e in runner.events if e["type"] == "trial_failed"]
         assert len(failed_events) == 1
         assert "exit code 1" in failed_events[0]["data"]["reason"]
 
-    def test_missing_exit_code_fails(self, tmp_path):
-        """If we can't retrieve an exit code, treat it as a failure.
-
-        This prevents silently promoting uncertain outcomes to
-        ``completed``.
-        """
+    def test_missing_exit_code_fails(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        """If we can't retrieve an exit code, treat it as a failure."""
         runner = TrialRunner(workspace=str(tmp_path))
         t = _running_trial(runner, best_val_loss=3.21)
-        with patch("pawn.lab.runner.is_alive", side_effect=[(False, None)]), \
-             patch("pawn.lab.runner.read_metrics"), \
-             patch("pawn.lab.runner.check_health", return_value=None), \
-             patch("asyncio.sleep", new_callable=AsyncMock):
+        with (
+            patch("pawn.lab.runner.is_alive", side_effect=[(False, None)]),
+            patch("pawn.lab.runner.read_metrics"),
+            patch("pawn.lab.runner.check_health", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
             asyncio.run(runner._monitor(t.trial_id))
         assert runner.trials[t.trial_id].status == "failed"
 
@@ -782,16 +1099,14 @@ def _make_completed_trial(
     run_dir = runner.log_dir / f"trial_{trial_id:04d}" / "run_x"
     run_dir.mkdir(parents=True, exist_ok=True)
     if schedule_health is not None:
-        (run_dir / "schedule_health.json").write_text(
-            json.dumps(schedule_health)
-        )
+        (run_dir / "schedule_health.json").write_text(json.dumps(schedule_health))
     ckpt_dir = run_dir / "checkpoints" / "step_00001000"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     (ckpt_dir / "model.safetensors").write_bytes(b"")
     if write_complete_sentinel:
         (ckpt_dir / ".complete").write_text("{}")
 
-    config = {"run_type": "adapter", "strategy": "bottleneck"}
+    config: dict[str, Any] = {"run_type": "adapter", "strategy": "bottleneck"}
     if hf_repo:
         config["hf_repo"] = hf_repo
     t = Trial(
@@ -809,7 +1124,7 @@ def _make_completed_trial(
 
 
 class TestAudit:
-    def test_completed_trial_passes_when_health_matches(self, tmp_path):
+    def test_completed_trial_passes_when_health_matches(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         _make_completed_trial(
             runner,
@@ -826,7 +1141,7 @@ class TestAudit:
         assert row["checks"]["schedule_complete"]["pass"] is True
         assert row["checks"]["checkpoint_complete"]["pass"] is True
 
-    def test_step_mismatch_flags_schedule_failure(self, tmp_path):
+    def test_step_mismatch_flags_schedule_failure(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         _make_completed_trial(
             runner,
@@ -844,18 +1159,19 @@ class TestAudit:
         assert sc["actual_total_steps"] == 950
         assert sc["planned_total_steps"] == 1000
 
-    def test_missing_schedule_health_is_null(self, tmp_path):
+    def test_missing_schedule_health_is_null(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         _make_completed_trial(runner, schedule_health=None)
         result = runner.audit()
         assert result["trials"][0]["checks"]["schedule_complete"]["pass"] is None
 
-    def test_missing_complete_sentinel_fails(self, tmp_path):
+    def test_missing_complete_sentinel_fails(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         _make_completed_trial(
             runner,
             schedule_health={
-                "planned_total_steps": 100, "actual_total_steps": 100,
+                "planned_total_steps": 100,
+                "actual_total_steps": 100,
             },
             write_complete_sentinel=False,
         )
@@ -864,12 +1180,13 @@ class TestAudit:
         cc = result["trials"][0]["checks"]["checkpoint_complete"]
         assert cc["pass"] is False
 
-    def test_running_trials_are_skipped(self, tmp_path):
+    def test_running_trials_are_skipped(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         _make_completed_trial(
             runner,
             schedule_health={
-                "planned_total_steps": 100, "actual_total_steps": 100,
+                "planned_total_steps": 100,
+                "actual_total_steps": 100,
             },
         )
         # Mutate to running.
@@ -877,12 +1194,13 @@ class TestAudit:
         result = runner.audit()
         assert result["trials"] == []
 
-    def test_check_hf_off_by_default(self, tmp_path):
+    def test_check_hf_off_by_default(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         _make_completed_trial(
             runner,
             schedule_health={
-                "planned_total_steps": 100, "actual_total_steps": 100,
+                "planned_total_steps": 100,
+                "actual_total_steps": 100,
             },
             hf_repo="someuser/somerepo",
         )
@@ -892,14 +1210,15 @@ class TestAudit:
         assert ch["pass"] is None
         assert "check_hf=True" in ch["reason"]
 
-    def test_check_hf_pass_when_listed(self, tmp_path):
+    def test_check_hf_pass_when_listed(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         """``check_hf=True`` lists the run's branch and passes when the
         latest local checkpoint name appears."""
         runner = TrialRunner(workspace=str(tmp_path))
         _make_completed_trial(
             runner,
             schedule_health={
-                "planned_total_steps": 100, "actual_total_steps": 100,
+                "planned_total_steps": 100,
+                "actual_total_steps": 100,
             },
             hf_repo="user/repo",
         )
@@ -915,12 +1234,13 @@ class TestAudit:
         assert ch["pass"] is True
         assert ch["checkpoint"] == "step_00001000"
 
-    def test_check_hf_fail_when_missing(self, tmp_path):
+    def test_check_hf_fail_when_missing(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         runner = TrialRunner(workspace=str(tmp_path))
         _make_completed_trial(
             runner,
             schedule_health={
-                "planned_total_steps": 100, "actual_total_steps": 100,
+                "planned_total_steps": 100,
+                "actual_total_steps": 100,
             },
             hf_repo="user/repo",
         )
@@ -932,7 +1252,7 @@ class TestAudit:
         ch = result["trials"][0]["checks"]["checkpoint_on_hf"]
         assert ch["pass"] is False
 
-    def test_check_hf_api_error_returns_null(self, tmp_path):
+    def test_check_hf_api_error_returns_null(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
         """API failures should report ``pass=None`` (couldn't verify)
         rather than ``False`` — distinguishes 'missing' from
         'couldn't tell'."""
@@ -940,7 +1260,8 @@ class TestAudit:
         _make_completed_trial(
             runner,
             schedule_health={
-                "planned_total_steps": 100, "actual_total_steps": 100,
+                "planned_total_steps": 100,
+                "actual_total_steps": 100,
             },
             hf_repo="user/repo",
         )
@@ -951,3 +1272,50 @@ class TestAudit:
         ch = result["trials"][0]["checks"]["checkpoint_on_hf"]
         assert ch["pass"] is None
         assert "HF list failed" in ch["reason"]
+
+
+# =====================================================================
+# build_command — v2 entry-point dispatch
+# =====================================================================
+
+
+class TestBuildCommand:
+    def test_pretrain_dispatches_train_jax(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = TrialRunner(workspace=str(tmp_path))
+        cmd = runner._build_command(
+            {"run_type": "pretrain", "log_dir": str(tmp_path / "logs")}, 0
+        )
+        assert any("scripts/train_jax.py" in c for c in cmd)
+        assert "--config" in cmd
+
+    def test_adapter_dispatches_train_jax_adapter(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = TrialRunner(workspace=str(tmp_path))
+        cmd = runner._build_command(
+            {"run_type": "adapter", "strategy": "lora"}, 0
+        )
+        assert any("scripts/train_jax_adapter.py" in c for c in cmd)
+
+    def test_specialized_dispatches_adapter_trainer(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        # v2 routes the specialized_clm run_type through the adapter trainer
+        # (the standalone-CLM entry point), not a separate script.
+        runner = TrialRunner(workspace=str(tmp_path))
+        cmd = runner._build_command({"run_type": "specialized_clm"}, 0)
+        assert any("scripts/train_jax_adapter.py" in c for c in cmd)
+
+    def test_distill_dispatches_train_jax_distill(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = TrialRunner(workspace=str(tmp_path))
+        cmd = runner._build_command({"run_type": "distill"}, 0)
+        assert any("scripts/train_jax_distill.py" in c for c in cmd)
+
+    def test_unknown_run_type_raises(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = TrialRunner(workspace=str(tmp_path))
+        with pytest.raises(ValueError, match="unknown run_type"):
+            runner._build_command({"run_type": "bogus"}, 0)
+
+    def test_writes_config_json(self, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+        runner = TrialRunner(workspace=str(tmp_path))
+        cmd = runner._build_command({"run_type": "pretrain", "total_steps": 100}, 3)
+        config_path = Path(cmd[cmd.index("--config") + 1])
+        assert config_path.exists()
+        written = json.loads(config_path.read_text())
+        assert written["total_steps"] == 100

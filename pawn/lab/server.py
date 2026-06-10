@@ -1,9 +1,20 @@
-"""MCP server for pawn-lab: exposes the trial runner as tools via FastMCP."""
+"""MCP server for pawn-lab: exposes the trial runner as tools via FastMCP.
+
+The server is a thin wrapper around :mod:`pawn.lab.runner`. A single
+:class:`~pawn.lab.runner.TrialRunner` is created per server lifespan and shared
+across tool calls via the FastMCP request context. Run via
+``python -m pawn.lab``.
+
+Every tool's inputs are validated by FastMCP against the JSON Schema it derives
+from the tool signature (unknown fields rejected), and config-bearing tools
+(``lab_launch`` / ``lab_schema``) additionally round-trip through the pydantic
+``RunConfig`` models, which forbid extra fields.
+"""
 
 from __future__ import annotations
 
-import json
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -15,7 +26,7 @@ log = logging.getLogger("pawn.lab")
 
 
 @asynccontextmanager
-async def _lifespan(server: FastMCP):
+async def _lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
     runner = TrialRunner()
     await runner.recover()
     log.info("pawn-lab MCP server starting (workspace=%s)", runner.workspace)
@@ -23,28 +34,42 @@ async def _lifespan(server: FastMCP):
     runner.shutdown()
 
 
-mcp = FastMCP("pawn-lab", lifespan=_lifespan)
+mcp: FastMCP = FastMCP("pawn-lab", lifespan=_lifespan)
 
 
 def _runner(ctx: Context) -> TrialRunner:
-    return ctx.lifespan_context["runner"]
+    runner = ctx.lifespan_context["runner"]
+    assert isinstance(runner, TrialRunner)
+    return runner
 
 
 # -----------------------------------------------------------------------
 # Tools
 # -----------------------------------------------------------------------
 
+
 @mcp.tool
 async def lab_status(ctx: Context) -> dict[str, Any]:
-    """Compact lab status: GPUs, running trials (ID, strategy, key HPs, step/total, ETA, train_loss, train_acc, val_loss, val_acc), counts, elapsed time, cost. Train metrics update every log_interval steps; val metrics update at eval_interval. Use lab_log for real-time stdout.
+    """Compact lab status: running trials, counts, elapsed time, cost.
 
-    For running pretraining trials, each row carries a `pretrain` block with the latest game-completion metrics (game_completion_rate, avg_plies_completed, forfeit_ply min/max/median, legal/late_legal) and a `forfeit_fit` sub-block with a power-law fit ``forfeit = prefactor * step^exponent`` over the most recent half of the forfeit-rate history (exponent, prefactor, n_points, current_forfeit, plus x_ratio_to_halve when exponent < 0 — the multiplicative step ratio needed to halve forfeit). Cotraining trials carry the same information under a `cotrain` block keyed by variant name (e.g. `cotrain.variants.small.forfeit_fit`), one summary per model variant. The fit is the primary late-stage convergence signal — it keeps moving after val_loss plateaus."""
+    Returns total/running/completed/failed trial counts. Running trials list
+    their id, strategy, status, current step, and configured total steps. Use
+    ``lab_log`` for real-time stdout from an individual trial.
+    """
     return _runner(ctx).status()
 
 
 @mcp.tool
-async def lab_launch(config: dict[str, Any], ctx: Context, tags: list[str] | None = None) -> dict[str, Any]:
-    """Launch a trial from a RunConfig dict. Use lab_schema to discover all fields. The config must include run_type ('pretrain', 'adapter', or 'cotrain'). Optionally pass tags for grouping (e.g. ["phase1", "mate-boost"])."""
+async def lab_launch(
+    config: dict[str, Any], ctx: Context, tags: list[str] | None = None
+) -> dict[str, Any]:
+    """Launch a trial from a RunConfig dict.
+
+    Use ``lab_schema`` to discover all fields. The config must include
+    ``run_type`` (``"pretrain"``, ``"adapter"``, ``"specialized_clm"``, or
+    ``"distill"``). Unknown fields are rejected. Optionally pass ``tags`` for
+    grouping (e.g. ``["phase1", "mate-boost"]``).
+    """
     try:
         tid = await _runner(ctx).launch(config, tags=tags)
         return _runner(ctx).trials[tid].to_dict()
@@ -54,29 +79,52 @@ async def lab_launch(config: dict[str, Any], ctx: Context, tags: list[str] | Non
 
 @mcp.tool
 async def lab_kill(trial_id: int, ctx: Context) -> dict[str, Any]:
-    """Kill a running trial by ID (sends SIGTERM for graceful shutdown)."""
+    """Kill a running trial by id (sends SIGTERM for graceful shutdown)."""
     return await _runner(ctx).kill(trial_id)
 
 
 @mcp.tool
-async def lab_resume(trial_id: int, ctx: Context, total_steps: int | None = None, pause_after_steps: int | None = None) -> dict[str, Any]:
-    """Resume a completed/paused trial from its best checkpoint. Creates a new trial with the same config plus --resume. Override total_steps or pause_after_steps for iterative narrowing."""
+async def lab_resume(
+    trial_id: int,
+    ctx: Context,
+    total_steps: int | None = None,
+    pause_after_steps: int | None = None,
+) -> dict[str, Any]:
+    """Resume a completed/paused trial from its best checkpoint.
+
+    Creates a new trial with the same config plus ``--resume``. Override
+    ``total_steps`` or ``pause_after_steps`` for iterative narrowing.
+    """
     try:
-        new_id = await _runner(ctx).resume_trial(trial_id, total_steps=total_steps, pause_after_steps=pause_after_steps)
+        new_id = await _runner(ctx).resume_trial(
+            trial_id,
+            total_steps=total_steps,
+            pause_after_steps=pause_after_steps,
+        )
         return _runner(ctx).trials[new_id].to_dict()
     except RuntimeError as e:
         return {"error": str(e)}
 
 
 @mcp.tool
-async def lab_results(ctx: Context, strategy: str | None = None, tag: str | None = None) -> dict[str, Any]:
-    """All trials with val_loss, accuracy, param count, wall time, key HPs, status, notes, tags. Includes Pareto front and Optuna suggestions. Filter by strategy and/or tag (e.g. tag="phase2")."""
+async def lab_results(
+    ctx: Context, strategy: str | None = None, tag: str | None = None
+) -> dict[str, Any]:
+    """All trials with val_loss, params, status, notes, tags.
+
+    Includes a Pareto front and Optuna suggestions. Filter by ``strategy``
+    and/or ``tag`` (e.g. ``tag="phase2"``).
+    """
     return _runner(ctx).results(strategy, tag=tag)
 
 
 @mcp.tool
 async def lab_events(ctx: Context, since: int | None = None) -> dict[str, Any]:
-    """Events since a sequence number. Types: trial_started, trial_completed, trial_failed, trial_killed, gpu_idle, health_warning. Omit 'since' to get events since last call (auto-tracked). Pass since=0 for all events."""
+    """Events since a sequence number.
+
+    Omit ``since`` to get events since the last call (auto-tracked). Pass
+    ``since=0`` for all events.
+    """
     runner = _runner(ctx)
     events, latest_seq = runner.events_since(since)
     return {"events": events, "latest_seq": latest_seq}
@@ -84,35 +132,39 @@ async def lab_events(ctx: Context, since: int | None = None) -> dict[str, Any]:
 
 @mcp.tool
 async def lab_log(trial_id: int, ctx: Context, lines: int = 50) -> dict[str, Any]:
-    """Last N lines of a trial's stdout/stderr log. Use to debug failures or check training output."""
+    """Last N lines of a trial's stdout/stderr log.
+
+    Use to debug failures or check training output.
+    """
     return _runner(ctx).trial_log(trial_id, lines)
 
 
 @mcp.tool
 async def lab_notes(trial_id: int, notes: str, ctx: Context) -> dict[str, Any]:
-    """Add notes to a trial. Notes appear in results table and progress log."""
+    """Add notes to a trial. Notes appear in the results table."""
     return _runner(ctx).add_notes(trial_id, notes)
 
 
 @mcp.tool
 async def lab_set_cost(cost_per_hour: float, ctx: Context) -> dict[str, Any]:
-    """Set $/hr rate for cost tracking (e.g. 3.59 for H200 SXM on RunPod)."""
-    runner = _runner(ctx)
-    runner.cost_per_hour = cost_per_hour
-    runner._save_state()
-    return {"cost_per_hour": runner.cost_per_hour}
+    """Set the $/hr rate for cost tracking (e.g. 3.59 for an H200 SXM on RunPod)."""
+    return _runner(ctx).set_cost(cost_per_hour)
 
 
 @mcp.tool
 async def lab_schema(ctx: Context) -> dict[str, Any]:
-    """Return the JSON Schema for RunConfig (PretrainConfig, AdapterConfig, CotrainConfig). Use this to discover all available parameters before calling lab_launch."""
-    from pawn.run_config import AdapterConfig, CotrainConfig, PretrainConfig
+    """Return the JSON Schema for every supported run_type.
 
-    return {
-        "pretrain": PretrainConfig.model_json_schema(),
-        "adapter": AdapterConfig.model_json_schema(),
-        "cotrain": CotrainConfig.model_json_schema(),
-    }
+    Keys: ``pretrain`` (:class:`PretrainConfig`), ``adapter``
+    (:class:`AdapterConfig`), ``specialized_clm``
+    (:class:`SpecializedCLMConfig`), and ``distill`` (:class:`DistillConfig`).
+    Use this to discover all available parameters before calling ``lab_launch``.
+    Delegates to :func:`pawn.lab.runner.lab_schema` so the schema surface stays
+    the single source of truth shared with the in-process helper.
+    """
+    from pawn.lab.runner import lab_schema as _lab_schema
+
+    return _lab_schema()
 
 
 @mcp.tool
@@ -123,12 +175,22 @@ async def lab_audit(
 ) -> dict[str, Any]:
     """Per-trial pass/fail on completion invariants.
 
-    Without arguments: audits every non-running trial. With ``trial_id``: just that one. Returns ``{trials: [...], any_failure: bool}`` where each trial row carries a ``checks`` dict.
-
-    Invariants checked:
-      - ``schedule_complete``: ``schedule_health.json`` reports ``actual_total_steps == planned_total_steps`` (equality; partial decay fails).
-      - ``checkpoint_complete``: the latest ``step_*`` directory under the run dir has its ``.complete`` SHA-256 sentinel.
-      - ``checkpoint_on_hf`` (only when ``check_hf=True`` and the trial has an ``hf_repo``): the latest local checkpoint directory name is present on the run's branch via ``list_repo_files``. Off by default — the HF API call is the slow path.
-
-    Each check returns ``{pass: true|false|null, ...}`` where ``null`` means "not applicable" or "couldn't verify". Surface non-pass entries to the user immediately."""
+    Without arguments: audits every trial. With ``trial_id``: just that one.
+    Returns ``{trials: [...], any_failure: bool}`` where each row carries a
+    ``checks`` dict covering ``schedule_complete``, ``checkpoint_complete``,
+    and (when ``check_hf=True``) ``checkpoint_on_hf``. Each check is
+    ``{pass: true|false|null, ...}`` where ``null`` means "not applicable" or
+    "couldn't verify".
+    """
     return _runner(ctx).audit(trial_id=trial_id, check_hf=check_hf)
+
+
+def build_server() -> FastMCP:
+    """Return the module-level FastMCP server.
+
+    ``python -m pawn.lab`` (see :mod:`pawn.lab.__main__`) calls this to obtain
+    the configured server. All tools are registered at import time via the
+    ``@mcp.tool`` decorators above, and the lifespan creates / recovers the
+    :class:`~pawn.lab.runner.TrialRunner`.
+    """
+    return mcp

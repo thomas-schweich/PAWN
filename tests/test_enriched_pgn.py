@@ -205,11 +205,17 @@ class TestEnrichedParsing:
             f"Missing evals should be -32768 (i16::MIN), got {list(evals)}"
         )
 
-    def test_padding_is_zero(self):
+    def test_padding_is_pad_token(self):
+        """Plan §10 S11: token buffer past game_length is PAD_TOKEN
+        (1968), NOT 0 — token 0 is a legal move in the v2 vocab and
+        would be misread as real moves downstream. Clocks/evals stay
+        zero-initialised (0 is the correct "no data" sentinel for those).
+        """
         pgn = PGNS["alice_v_bob"]
         r = chess_engine.parse_pgn_enriched(pgn)
         length = r["game_lengths"][0]
-        assert np.all(r["tokens"][0, length:] == 0)
+        from pawn.config import PAD_TOKEN
+        assert np.all(r["tokens"][0, length:] == PAD_TOKEN)
         assert np.all(r["clocks"][0, length:] == 0)
         assert np.all(r["evals"][0, length:] == 0)
 

@@ -1,269 +1,479 @@
-"""Bottleneck adapters for PAWN.
+"""Bottleneck adapters (Houlsby et al. 2019).
 
-Inserts small residual MLP bottlenecks after the attention sublayer and/or
-the FFN sublayer within each transformer block, following `Houlsby et al.,
-2019 <https://arxiv.org/abs/1902.00751>`_
-("Parameter-Efficient Transfer Learning for NLP", ICML 2019):
+A small residual MLP inserted after each transformer sublayer:
 
     x = x + up(gelu(down(x)))
 
-The up-projection is zero-initialized so the model starts identical to
-the frozen backbone. ``bottleneck_dim`` controls the parameter budget.
+(with optional extra ``Linear+GELU`` stages in between when
+``n_hidden > 0``). The up-projection is zero-initialised so the
+adapter starts identical to the frozen backbone.
 
-``n_hidden`` adds extra ``Linear(bn, bn)`` stages with GELU between
-``down`` and ``up`` so the adapter MLP can be deeper than the standard
-two-layer Houlsby block:
+Per the v1 contract (and the migration plan §10 S7 adapter table),
+both placement flags are honoured:
 
-    h = down(x)
-    for i in range(n_hidden):
-        h = hidden[i](gelu(h))
-    x = x + up(gelu(h))
+- ``no_adapt_attn=False`` → inject the residual MLP after the
+  attention sublayer.
+- ``no_adapt_ffn=False`` → inject after the FFN sublayer.
 
-Identity-at-init still holds for any ``n_hidden`` because ``up.weight``
-is zero. Per-adapter param count (no bias anywhere):
-    2 · d_model · bn + n_hidden · bn²
+At least one of the two must remain enabled (an all-off config would
+silently degenerate to "frozen backbone").
 
-Total trainable params (bottleneck_dim=8, n_hidden=0, both positions,
-8 layers): 2 × 8 × 2 × 512 × 8 = 131,072. With n_hidden=2: add
-8 × 2 × 2 × 8² = 2,048 → 133,120.
+The forward injects the residuals via the ``attn_hook`` / ``ffn_hook``
+parameters of :meth:`pawn.model.PAWNModel.__call__`, which the
+:class:`BottleneckEffective` wrapper threads through.
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from __future__ import annotations
 
-from pawn.config import CLMConfig
-from pawn.model import PAWNCLM
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jaxtyping import Array, Float, Int
+
+from pawn.adapters.placement import layer_placement_mask
+from pawn.checkpoint import ADAPTER_SAFETENSORS
+from pawn.config import ModelConfig
+from pawn.model import KVCache, PAWNModel
+
+__all__ = [
+    "BottleneckConfig",
+    "BottleneckAdapter",
+    "BottleneckEffective",
+    "init_bottleneck_adapter",
+    "apply_bottleneck",
+    "bottleneck_filter",
+    "ADAPTER_SAFETENSORS",
+    "save_bottleneck_adapter",
+    "load_bottleneck_adapter",
+]
 
 
-class BottleneckAdapter(nn.Module):
-    """Residual bottleneck: ``x + up(gelu(... hidden(gelu(down(x))) ...))``.
+# ``ADAPTER_SAFETENSORS`` (the sidecar filename used by the trainer's save /
+# resume path) is owned by :mod:`pawn.checkpoint` and re-exported here so the
+# train + load sites can't drift apart.
 
-    ``n_hidden=0`` reproduces the standard two-layer Houlsby adapter.
+
+@dataclass(frozen=True)
+class BottleneckConfig:
+    """Houlsby bottleneck size + placement.
+
+    ``dim`` is the inner bottleneck dimension; ``n_hidden`` is the
+    number of extra ``Linear+GELU`` stages between the down and up
+    projections (0 = the standard two-layer Houlsby block);
+    ``no_adapt_attn`` / ``no_adapt_ffn`` honour the v1 flag names per
+    plan §10 S3.
     """
 
-    def __init__(self, d_model: int, bottleneck_dim: int, n_hidden: int = 0):
-        super().__init__()
-        if n_hidden < 0:
-            raise ValueError(f"n_hidden must be >= 0, got {n_hidden}")
-        self.down = nn.Linear(d_model, bottleneck_dim, bias=False)
-        self.hidden = nn.ModuleList(
-            [nn.Linear(bottleneck_dim, bottleneck_dim, bias=False)
-             for _ in range(n_hidden)]
+    dim: int
+    n_hidden: int = 0
+    no_adapt_attn: bool = False
+    no_adapt_ffn: bool = False
+    # Restrict the bottleneck to an explicit subset of transformer layers
+    # (the ``--adapter-layers`` consumer, v1 parity); ``None`` (default)
+    # adapts every layer. Folded into the ``down_*`` arrays at init —
+    # non-adapted layers get a zero down-projection, so their residual is
+    # identically zero (``up(gelu(down·h)) = up(gelu(0)) = 0``) and their
+    # params stay at zero under weight decay.
+    layers: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        # Both placement flags off ⇒ the adapter touches nothing and
+        # would silently degenerate to "frozen backbone" at runtime.
+        # Surface that as a config error rather than a no-op run.
+        if self.no_adapt_attn and self.no_adapt_ffn:
+            raise ValueError(
+                "BottleneckConfig: no_adapt_attn and no_adapt_ffn are "
+                "both set — the bottleneck would touch nothing. Enable "
+                "at least one site."
+            )
+        if self.n_hidden < 0:
+            raise ValueError(
+                f"BottleneckConfig.n_hidden must be >= 0, got {self.n_hidden}"
+            )
+
+
+class BottleneckAdapter(eqx.Module):
+    """Per-layer down/(hidden)/up bottleneck weights for both placements.
+
+    Attention-side and FFN-side adapters are stored separately so
+    ``no_adapt_attn`` / ``no_adapt_ffn`` can disable one without
+    affecting the other. ``hidden_*`` is shape
+    ``(n_layers, n_hidden, dim, dim)`` (``n_hidden = 0`` ⇒ a 0-length
+    leading axis, which scans degenerate to a no-op).
+
+    All arrays have a leading ``n_layers`` axis so the bottleneck slice
+    threads through the backbone's :func:`jax.lax.scan` cleanly.
+    """
+
+    # Attention-side (None when no_adapt_attn=True).
+    down_attn: Float[Array, "n_layers d dim"] | None
+    hidden_attn: Float[Array, "n_layers n_hidden dim dim"] | None
+    up_attn: Float[Array, "n_layers dim d"] | None
+    # FFN-side (None when no_adapt_ffn=True).
+    down_ffn: Float[Array, "n_layers d dim"] | None
+    hidden_ffn: Float[Array, "n_layers n_hidden dim dim"] | None
+    up_ffn: Float[Array, "n_layers dim d"] | None
+    cfg: BottleneckConfig = eqx.field(static=True)
+
+
+def _kaiming_uniform(
+    key: jax.Array, shape: tuple[int, ...], fan_in: int
+) -> jax.Array:
+    """``kaiming_uniform_(a=sqrt(5))`` from PyTorch — matches v1's init.
+
+    For ``a=sqrt(5)``, ``gain = sqrt(2 / 6) = sqrt(1/3)``, and
+    ``bound = gain * sqrt(3 / fan_in) = sqrt(1/fan_in)``.
+    """
+    bound = math.sqrt(1.0 / fan_in)
+    return jax.random.uniform(key, shape, minval=-bound, maxval=bound)
+
+
+def init_bottleneck_adapter(
+    backbone: PAWNModel, cfg: BottleneckConfig, key: jax.Array | int
+) -> BottleneckAdapter:
+    """Kaiming-uniform `down`/`hidden`; zero `up` (identity at step 0)."""
+    if isinstance(key, int):
+        key = jax.random.key(key)
+    d = backbone.cfg.d_model
+    n_layers = backbone.cfg.n_layers
+    n_hidden = cfg.n_hidden
+    dim = cfg.dim
+
+    keys = jax.random.split(key, 4)
+
+    def attn_branch() -> tuple[jax.Array, jax.Array, jax.Array]:
+        down = _kaiming_uniform(keys[0], (n_layers, d, dim), fan_in=d)
+        hidden = _kaiming_uniform(
+            keys[1], (n_layers, n_hidden, dim, dim), fan_in=dim,
         )
-        self.up = nn.Linear(bottleneck_dim, d_model, bias=False)
-        nn.init.zeros_(self.up.weight)
+        up = jnp.zeros((n_layers, dim, d), dtype=jnp.float32)
+        return down, hidden, up
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.down(x)
-        for layer in self.hidden:
-            h = layer(F.gelu(h))
-        return x + self.up(F.gelu(h))
+    def ffn_branch() -> tuple[jax.Array, jax.Array, jax.Array]:
+        down = _kaiming_uniform(keys[2], (n_layers, d, dim), fan_in=d)
+        hidden = _kaiming_uniform(
+            keys[3], (n_layers, n_hidden, dim, dim), fan_in=dim,
+        )
+        up = jnp.zeros((n_layers, dim, d), dtype=jnp.float32)
+        return down, hidden, up
+
+    if cfg.no_adapt_attn:
+        d_a, h_a, u_a = None, None, None
+    else:
+        d_a, h_a, u_a = attn_branch()
+    if cfg.no_adapt_ffn:
+        d_f, h_f, u_f = None, None, None
+    else:
+        d_f, h_f, u_f = ffn_branch()
+
+    # Per-layer placement: zero the `down_*` projection at non-adapted
+    # layers so their residual collapses to zero (forward-invisible and
+    # weight-decay-stable). `up_*` is already zero-init; gating `down_*`
+    # is sufficient and keeps the saved sidecar shape unchanged.
+    placement = layer_placement_mask(cfg.layers, n_layers)
+
+    def _place_down(down: jax.Array | None) -> jax.Array | None:
+        if down is None or cfg.layers is None:
+            return down
+        m = placement.reshape((n_layers,) + (1,) * (down.ndim - 1))
+        return jnp.where(m, down, 0.0)
+
+    d_a = _place_down(d_a)
+    d_f = _place_down(d_f)
+
+    return BottleneckAdapter(
+        down_attn=d_a, hidden_attn=h_a, up_attn=u_a,
+        down_ffn=d_f, hidden_ffn=h_f, up_ffn=u_f,
+        cfg=cfg,
+    )
 
 
-class BottleneckCLM(nn.Module):
-    """Frozen PAWN backbone with bottleneck adapters.
+def _bottleneck_residual(
+    h: jax.Array,
+    down: jax.Array | None,
+    hidden: jax.Array | None,
+    up: jax.Array | None,
+    compute_dtype: jnp.dtype | None,
+) -> jax.Array:
+    """``h + up(gelu(hidden_stages(gelu(down(h)))))``.
 
-    Adapters are inserted after the attention sublayer and/or FFN sublayer
-    within each transformer block. Only adapter parameters are trainable.
+    Returns ``h`` unchanged when ``down`` is None (placement disabled).
+    All matmuls run in ``compute_dtype`` when set, with the master
+    weights cast just before each einsum (XLA fuses the cast).
+    """
+    if down is None or up is None:
+        return h
+    d_w = down if compute_dtype is None else down.astype(compute_dtype)
+    u_w = up if compute_dtype is None else up.astype(compute_dtype)
+    # "i" = batch, "j" = seq, "d" = d_model, "k"/"l" = bottleneck dim.
+    z = jnp.einsum("ijd,dk->ijk", h, d_w)
+    z = jax.nn.gelu(z)
+    if hidden is not None and hidden.shape[0] > 0:
+        # `hidden` here is the per-layer slice with leading n_hidden axis.
+        def stage(carry: jax.Array, w: jax.Array) -> tuple[jax.Array, None]:
+            w_c = w if compute_dtype is None else w.astype(compute_dtype)
+            out = jnp.einsum("ijk,kl->ijl", carry, w_c)
+            return jax.nn.gelu(out), None
+
+        z, _ = jax.lax.scan(stage, z, hidden)
+    out = jnp.einsum("ijk,kd->ijd", z, u_w)
+    return h + out
+
+
+class BottleneckEffective(eqx.Module):
+    """Wrapper that exposes ``PAWNModel.__call__``'s signature but
+    threads the bottleneck adapter's per-layer weights through the
+    backbone's scan via the ``attn_hook`` / ``ffn_hook`` injection
+    points.
+
+    Looks like a ``PAWNModel`` to the trainer (same call signature,
+    same logits shape); the trainer and eval scripts treat it
+    interchangeably.
     """
 
-    def __init__(
-        self,
-        backbone: PAWNCLM,
-        bottleneck_dim: int = 8,
-        adapt_attn: bool = True,
-        adapt_ffn: bool = True,
-        layers: tuple[int, ...] | None = None,
-        attn_layers: tuple[int, ...] | None = None,
-        ffn_layers: tuple[int, ...] | None = None,
-        n_hidden: int = 0,
-    ):
-        super().__init__()
-        self.backbone = backbone
-        self.bottleneck_dim = bottleneck_dim
-        self.n_hidden = n_hidden
-        self.adapt_attn = adapt_attn
-        self.adapt_ffn = adapt_ffn
-        cfg = backbone.cfg
-        n_layers = len(backbone.layers)
-
-        self.adapted_layers = set(layers if layers is not None else range(n_layers))
-
-        # Per-layer overrides: if attn_layers/ffn_layers are specified,
-        # they take precedence over the global adapt_attn/adapt_ffn flags.
-        if attn_layers is not None:
-            self._attn_set = set(attn_layers)
-        elif adapt_attn:
-            self._attn_set = set(self.adapted_layers)
-        else:
-            self._attn_set = set()
-
-        if ffn_layers is not None:
-            self._ffn_set = set(ffn_layers)
-        elif adapt_ffn:
-            self._ffn_set = set(self.adapted_layers)
-        else:
-            self._ffn_set = set()
-
-        # Freeze the entire backbone
-        for p in backbone.parameters():
-            p.requires_grad = False
-
-        # Create adapter modules (Identity for non-adapted layers)
-        self.attn_adapters = nn.ModuleList()
-        self.ffn_adapters = nn.ModuleList()
-        for i in range(n_layers):
-            if i in self._attn_set:
-                self.attn_adapters.append(
-                    BottleneckAdapter(cfg.d_model, bottleneck_dim, n_hidden=n_hidden)
-                )
-            else:
-                self.attn_adapters.append(nn.Identity())
-            if i in self._ffn_set:
-                self.ffn_adapters.append(
-                    BottleneckAdapter(cfg.d_model, bottleneck_dim, n_hidden=n_hidden)
-                )
-            else:
-                self.ffn_adapters.append(nn.Identity())
+    backbone: PAWNModel
+    adapter: BottleneckAdapter
 
     @property
-    def cfg(self) -> CLMConfig:
+    def cfg(self) -> ModelConfig:
         return self.backbone.cfg
 
-    def forward_hidden(self, input_ids: torch.Tensor,
-                       attention_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """Run backbone sublayers with adapters, return normed hidden states."""
-        bb = self.backbone
-        x = bb.embed(input_ids)
+    @property
+    def decomp_table(self) -> Int[Array, "n_actions 3"]:
+        return self.backbone.decomp_table
 
-        T = input_ids.shape[1]
-        if attention_mask is not None:
-            causal = bb.causal_mask[:T, :T]
-            padding = attention_mask.unsqueeze(1).unsqueeze(2)
-            mask = causal.unsqueeze(0) & padding
-        else:
-            mask = None
+    @property
+    def lm_head(self) -> Float[Array, "d V"] | None:
+        return self.backbone.lm_head
 
-        rope_cos = bb.rope_cos[:, :, :T, :]
-        rope_sin = bb.rope_sin[:, :, :T, :]
+    @property
+    def final_norm_w(self) -> Float[Array, "d"]:
+        return self.backbone.final_norm_w
 
-        for i in range(len(bb.layers)):
-            block = bb.get_block(i)
-            x = x + block.attn(block.attn_norm(x), rope_cos, rope_sin, mask)
-            x = self.attn_adapters[i](x)
-            x = x + block.ffn(block.ffn_norm(x))
-            x = self.ffn_adapters[i](x)
+    @property
+    def layers(self) -> Any:  # TransformerLayer; avoid circular type import
+        return self.backbone.layers
 
-        return bb.final_norm(x)
+    @property
+    def embed_tokens(self) -> Float[Array, "V d"]:
+        return self.backbone.embed_tokens
 
-    def project_head(self, x: torch.Tensor) -> torch.Tensor:
-        """Project hidden states through lm_head."""
-        return self.backbone.lm_head(x)
-
-    def forward(
+    def __call__(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Full forward pass. Returns logits (B, T, V)."""
-        bb = self.backbone
-        x = bb.embed(input_ids)
+        input_ids: Int[Array, "B T"],
+        attention_mask: Int[Array, "B T"] | None = None,
+        *,
+        compute_dtype: jnp.dtype | None = None,
+        use_sdpa: bool = False,
+        use_flash: bool = False,
+    ) -> Float[Array, "B T V"]:
+        adapter = self.adapter
+        # Per-layer hook slices: each leaf of `hook_data` has a leading
+        # n_layers axis; the scan zips it with the backbone's layers.
+        hook_data = adapter
 
-        T = input_ids.shape[1]
-        if attention_mask is not None:
-            causal = bb.causal_mask[:T, :T]
-            padding = attention_mask.unsqueeze(1).unsqueeze(2)
-            mask = causal.unsqueeze(0) & padding
-        else:
-            mask = None
-
-        rope_cos = bb.rope_cos[:, :, :T, :]
-        rope_sin = bb.rope_sin[:, :, :T, :]
-
-        for i in range(len(bb.layers)):
-            block = bb.get_block(i)
-            x = x + block.attn(block.attn_norm(x), rope_cos, rope_sin, mask)
-            x = self.attn_adapters[i](x)
-
-            x = x + block.ffn(block.ffn_norm(x))
-            x = self.ffn_adapters[i](x)
-
-        x = bb.final_norm(x)
-        return self.project_head(x)
-
-    def forward_generate(
-        self,
-        input_ids: torch.Tensor,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-        """Forward with KV-cache for autoregressive generation."""
-        bb = self.backbone
-        x = bb.embed(input_ids)
-
-        T_new = input_ids.shape[1]
-        if kv_cache is not None:
-            T_cached = kv_cache[0][0].shape[2]
-            rope_cos = bb.rope_cos[:, :, T_cached:T_cached + T_new, :]
-            rope_sin = bb.rope_sin[:, :, T_cached:T_cached + T_new, :]
-        else:
-            rope_cos = bb.rope_cos[:, :, :T_new, :]
-            rope_sin = bb.rope_sin[:, :, :T_new, :]
-
-        new_kv_cache = []
-        for i in range(len(bb.layers)):
-            block = bb.get_block(i)
-            # KV-cache forward for attention
-            layer_cache = kv_cache[i] if kv_cache is not None else None
-            attn_out, new_cache = block.attn.forward_kv(
-                block.attn_norm(x), rope_cos, rope_sin, layer_cache,
+        def attn_hook(
+            h: Float[Array, "B T d"], slice_: BottleneckAdapter
+        ) -> Float[Array, "B T d"]:
+            return _bottleneck_residual(
+                h, slice_.down_attn, slice_.hidden_attn, slice_.up_attn,
+                compute_dtype,
             )
-            x = x + attn_out
-            x = self.attn_adapters[i](x)
-            new_kv_cache.append(new_cache)
 
-            x = x + block.ffn(block.ffn_norm(x))
-            x = self.ffn_adapters[i](x)
+        def ffn_hook(
+            h: Float[Array, "B T d"], slice_: BottleneckAdapter
+        ) -> Float[Array, "B T d"]:
+            return _bottleneck_residual(
+                h, slice_.down_ffn, slice_.hidden_ffn, slice_.up_ffn,
+                compute_dtype,
+            )
 
-        x = bb.final_norm(x[:, -1:, :])
-        logits = bb.lm_head(x)
-        return logits, new_kv_cache
+        return self.backbone(
+            input_ids,
+            attention_mask,
+            compute_dtype=compute_dtype,
+            attn_hook=attn_hook if not adapter.cfg.no_adapt_attn else None,
+            ffn_hook=ffn_hook if not adapter.cfg.no_adapt_ffn else None,
+            hook_data=hook_data,
+            use_sdpa=use_sdpa,
+            use_flash=use_flash,
+        )
 
-    # --- Parameter management ---
+    def forward_with_cache(
+        self,
+        input_ids: Int[Array, "B T_new"],
+        cache: KVCache,
+        pos_start: Int[Array, ""] | int,
+        *,
+        compute_dtype: jnp.dtype | None = None,
+    ) -> tuple[Float[Array, "B T_new V"], KVCache]:
+        """Cached forward — delegates to the backbone's KV-cached path
+        and threads the bottleneck residual hooks through unchanged.
 
-    def adapter_parameters(self) -> list[nn.Parameter]:
-        """Return only trainable adapter parameters."""
-        return [p for p in self.parameters() if p.requires_grad]
+        The Houlsby residual MLP is position-local (operates pointwise
+        on the hidden state at each token), so injecting it at the
+        same attn/ffn hook sites in the cached path produces the same
+        logits as the non-cached forward — modulo XLA kernel-ordering
+        noise. Lets adapter-wrapped backbones share the KV-cache
+        speedup with bare :class:`PAWNModel` for generation.
+        """
+        adapter = self.adapter
+        hook_data = adapter
 
-    def adapter_state_dict(self) -> dict[str, torch.Tensor]:
-        """Extract adapter weights for saving."""
-        return {
-            name: param.data.clone()
-            for name, param in self.named_parameters()
-            if param.requires_grad
-        }
+        def attn_hook(
+            h: Float[Array, "B T d"], slice_: BottleneckAdapter
+        ) -> Float[Array, "B T d"]:
+            return _bottleneck_residual(
+                h, slice_.down_attn, slice_.hidden_attn, slice_.up_attn,
+                compute_dtype,
+            )
 
-    def load_adapter_state_dict(self, state: dict[str, torch.Tensor]):
-        """Load adapter weights."""
-        params = dict(self.named_parameters())
-        for k, v in state.items():
-            if k in params:
-                params[k].data.copy_(v)
+        def ffn_hook(
+            h: Float[Array, "B T d"], slice_: BottleneckAdapter
+        ) -> Float[Array, "B T d"]:
+            return _bottleneck_residual(
+                h, slice_.down_ffn, slice_.hidden_ffn, slice_.up_ffn,
+                compute_dtype,
+            )
 
-    def adapter_weight_report(self) -> dict[str, float]:
-        """Per-layer adapter weight norms for monitoring."""
-        report = {}
-        for i in range(len(self.backbone.layers)):
-            for pos, adapters in (("attn", self.attn_adapters),
-                                  ("ffn", self.ffn_adapters)):
-                a = adapters[i]
-                if not isinstance(a, BottleneckAdapter):
-                    continue
-                report[f"adapter/layer{i}.{pos}.down"] = a.down.weight.data.norm().item()
-                for k, layer in enumerate(a.hidden):
-                    assert isinstance(layer, nn.Linear)
-                    report[f"adapter/layer{i}.{pos}.hidden{k}"] = (
-                        layer.weight.data.norm().item()
-                    )
-                report[f"adapter/layer{i}.{pos}.up"] = a.up.weight.data.norm().item()
-        return report
+        return self.backbone.forward_with_cache(
+            input_ids, cache, pos_start,
+            compute_dtype=compute_dtype,
+            attn_hook=attn_hook if not adapter.cfg.no_adapt_attn else None,
+            ffn_hook=ffn_hook if not adapter.cfg.no_adapt_ffn else None,
+            hook_data=hook_data,
+        )
+
+
+def apply_bottleneck(
+    backbone: PAWNModel, adapter: BottleneckAdapter
+) -> BottleneckEffective:
+    """Return a callable that runs the backbone with the bottleneck
+    residual MLPs injected after each enabled sublayer."""
+    return BottleneckEffective(backbone=backbone, adapter=adapter)
+
+
+def bottleneck_filter(adapter: BottleneckAdapter) -> BottleneckAdapter:
+    return jax.tree_util.tree_map(
+        lambda leaf: True if eqx.is_inexact_array(leaf) else False, adapter
+    )
+
+
+# ---------------------------------------------------------------------------
+# Save / load — sidecar safetensors next to the backbone checkpoint
+# ---------------------------------------------------------------------------
+
+
+# Fields persisted to / restored from the sidecar safetensors file.
+# Stored under ``bottleneck.<field>`` keys so future adapter sidecars
+# can coexist in the same directory without colliding.
+_ADAPTER_FIELDS: tuple[str, ...] = (
+    "down_attn", "hidden_attn", "up_attn",
+    "down_ffn", "hidden_ffn", "up_ffn",
+)
+
+
+def save_bottleneck_adapter(
+    adapter: BottleneckAdapter, out_dir: "Path | str",
+) -> None:
+    """Write the bottleneck weights to ``out_dir/adapter.safetensors``.
+
+    Only the populated fields land on disk — the ``no_adapt_attn`` /
+    ``no_adapt_ffn`` placements stay None at load time because the
+    config is replayed alongside the backbone (so the
+    :func:`init_bottleneck_adapter` path takes the same branch as it
+    did at save time).
+
+    The caller is responsible for writing ``out_dir/model.safetensors``
+    (the frozen backbone) and the config block; this just emits the
+    Houlsby sidecar. Keeps the train-time save path's two-file layout
+    in lockstep with the load path below.
+
+    Raises :class:`ValueError` if every adapter field is None (an
+    all-placements-disabled :class:`BottleneckConfig` would already
+    fail at construction, so this branch only fires when an adapter
+    is built directly without the config validation — surfacing it
+    loudly avoids a silent train-then-lose-weights failure flagged
+    by round-1 test-risk review).
+    """
+    from safetensors.numpy import save_file as st_save
+
+    out_path = Path(out_dir)
+    arrays: dict[str, np.ndarray] = {}
+    for name in _ADAPTER_FIELDS:
+        leaf = getattr(adapter, name)
+        if leaf is not None:
+            arrays[f"bottleneck.{name}"] = np.asarray(leaf)
+    if not arrays:
+        raise ValueError(
+            "BottleneckAdapter has no populated fields — refusing to "
+            "write an empty sidecar. Check that BottleneckConfig has "
+            "at least one of no_adapt_attn / no_adapt_ffn set to False."
+        )
+    st_save(arrays, str(out_path / ADAPTER_SAFETENSORS))
+
+
+def load_bottleneck_adapter(
+    ckpt_dir: "Path | str", cfg: BottleneckConfig,
+) -> BottleneckAdapter:
+    """Restore a :class:`BottleneckAdapter` from a checkpoint sidecar.
+
+    Expects ``ckpt_dir/adapter.safetensors`` written by
+    :func:`save_bottleneck_adapter`. ``cfg`` must match the save-time
+    config — the placement flags (``no_adapt_attn`` / ``no_adapt_ffn``)
+    determine which fields are populated, and a mismatch between the
+    sidecar's populated keys and ``cfg``'s placement flags is
+    rejected with :class:`ValueError` rather than silently loading
+    mismatched None / non-None fields (round-1 bug-detector finding:
+    the prior docstring claimed KeyError, but the silent-None branch
+    actually fired, leading to a crash at first forward).
+
+    Raises :class:`FileNotFoundError` if the sidecar isn't present —
+    callers that need a "is this a bottleneck checkpoint" check should
+    test for ``(ckpt_dir / "adapter.safetensors").is_file()`` first.
+    """
+    from safetensors.numpy import load_file as st_load
+
+    path = Path(ckpt_dir) / ADAPTER_SAFETENSORS
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"no {ADAPTER_SAFETENSORS} in {ckpt_dir} — not a bottleneck "
+            "checkpoint, or saved without sidecar"
+        )
+    flat = st_load(str(path))
+
+    # Validate the sidecar's populated keys against cfg's placement
+    # flags so a save / resume config mismatch fails loudly at load.
+    expect_attn = not cfg.no_adapt_attn
+    expect_ffn = not cfg.no_adapt_ffn
+    has_attn = "bottleneck.down_attn" in flat
+    has_ffn = "bottleneck.down_ffn" in flat
+    if expect_attn != has_attn or expect_ffn != has_ffn:
+        raise ValueError(
+            f"BottleneckConfig / sidecar mismatch at {path}: cfg expects "
+            f"(attn={expect_attn}, ffn={expect_ffn}) but sidecar has "
+            f"(attn={has_attn}, ffn={has_ffn}). Was the run resumed "
+            "with different placement flags?"
+        )
+
+    def _maybe(key: str) -> jax.Array | None:
+        full = f"bottleneck.{key}"
+        if full not in flat:
+            return None
+        return jnp.asarray(flat[full])
+
+    return BottleneckAdapter(
+        down_attn=_maybe("down_attn"),
+        hidden_attn=_maybe("hidden_attn"),
+        up_attn=_maybe("up_attn"),
+        down_ffn=_maybe("down_ffn"),
+        hidden_ffn=_maybe("hidden_ffn"),
+        up_ffn=_maybe("up_ffn"),
+        cfg=cfg,
+    )

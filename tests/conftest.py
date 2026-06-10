@@ -44,7 +44,10 @@ def pytest_collection_modifyitems(config, items):
             # valid; only require the reason format when a reason is given.
             reason = marker.kwargs.get("reason", "")
             if not reason or not _BUG_REASON_RE.match(reason):
-                failures.append(f"{item.nodeid}: xfail reason must match 'BUG-N: <summary>' (got {reason!r})")
+                failures.append(
+                    f"{item.nodeid}: xfail reason must match "
+                    f"'BUG-N: <summary>' (got {reason!r})"
+                )
     if failures:
         raise pytest.UsageError(
             "xfail discipline violated — every xfail must cite a BUG-N:\n  "
@@ -53,14 +56,41 @@ def pytest_collection_modifyitems(config, items):
 
 
 # ---------------------------------------------------------------------------
+# JAX persistent compilation cache (session-scoped, autouse)
+# ---------------------------------------------------------------------------
+#
+# Phase C tests compile slow ROCm kernels; without a persistent cache every
+# pytest process re-pays the XLA/ROCm compile cost on first jit. Enabling
+# ``setup_jax_caching()`` keys executables by ``(jaxlib version, GPU
+# platform, HLO hash)`` and writes them to disk, so they're reused across
+# every pytest invocation — and the cache dir is shared with the
+# training/bench scripts that already call it, giving cross-hits on matching
+# TINY configs.
+#
+# This MUST run before any ``jax.jit`` / ``eqx.filter_jit`` compile, hence
+# ``autouse=True`` with session scope: pytest instantiates session-scoped
+# autouse fixtures before the first test body executes. It's correctness-
+# neutral (a stale-cache miss after a jaxlib/driver upgrade just falls back
+# to recompilation) and ``setup_jax_caching`` is idempotent, so the single
+# call here is sufficient for the whole session.
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _jax_compilation_cache() -> None:
+    """Enable JAX's persistent compilation cache for the whole test session.
+
+    Importing :mod:`pawn.jax_setup` is cheap; the function itself imports
+    ``jax`` lazily, so this doesn't drag JAX into tests that never touch it
+    beyond the (already-paid) configuration call.
+    """
+    from pawn.jax_setup import setup_jax_caching
+
+    setup_jax_caching()
+
+
+# ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="session")
-def cpu_device() -> str:
-    """Canonical CPU device string for tests that must pin to CPU."""
-    return "cpu"
 
 
 @pytest.fixture(scope="session")
@@ -77,82 +107,20 @@ def tmp_checkpoint_dir(tmp_path: Path) -> Path:
     return d
 
 
-@pytest.fixture(scope="session")
-def toy_clm_config():
-    """CLMConfig.toy() — d_model=64, n_layers=2. Cheap enough for CPU tests."""
-    from pawn.config import CLMConfig
-
-    return CLMConfig.toy()
-
-
-@pytest.fixture(scope="session")
-def toy_training_config():
-    """TrainingConfig.toy() — short schedule, small batches, no AMP."""
-    from pawn.config import TrainingConfig
-
-    return TrainingConfig.toy()
-
-
 @pytest.fixture
-def toy_model(toy_clm_config, cpu_device):
-    """Fresh PAWNCLM(toy_config) on CPU, eval mode.
-
-    Not session-scoped: tests may mutate weights/gradients.
-    """
-    import torch
-
-    from pawn.model import PAWNCLM
-
-    torch.manual_seed(0)
-    model = PAWNCLM(toy_clm_config).to(cpu_device)
-    model.eval()
-    return model
-
-
-@pytest.fixture(scope="session")
-def sample_clm_batch(rust_seed):
-    """Small deterministic CLM batch from the Rust engine.
-
-    Returns a dict with: input_ids, targets, loss_mask, move_ids,
-    game_lengths, term_codes. Session-scoped because generation is
-    expensive and inputs are read-only.
-    """
-    import chess_engine  # type: ignore[import-not-found]
-
-    input_ids, targets, loss_mask, move_ids, game_lengths, term_codes = (
-        chess_engine.generate_clm_batch(
-            batch_size=4,
-            seq_len=64,
-            seed=rust_seed,
-        )
-    )
-    return {
-        "input_ids": input_ids,
-        "targets": targets,
-        "loss_mask": loss_mask,
-        "move_ids": move_ids,
-        "game_lengths": game_lengths,
-        "term_codes": term_codes,
-    }
-
-
-@pytest.fixture
-def freeze_rng() -> Iterator[None]:
-    """Snapshot and restore torch + numpy + python RNG around a test.
+def freeze_numpy_rng() -> Iterator[None]:
+    """Snapshot and restore numpy + python RNG around a test.
 
     Useful when a test needs to seed globally without contaminating sibling tests.
     """
     import random
 
     import numpy as np
-    import torch
 
     py_state = random.getstate()
     np_state = np.random.get_state()
-    torch_state = torch.random.get_rng_state()
     try:
         yield
     finally:
         random.setstate(py_state)
         np.random.set_state(np_state)
-        torch.random.set_rng_state(torch_state)

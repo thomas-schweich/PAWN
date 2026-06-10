@@ -23,7 +23,7 @@
 # ── Caddy: single static binary for reverse-proxying the dashboard ──
 FROM python:3.12-slim AS caddy
 ARG CADDY_VERSION=2.11.2
-ARG CADDY_SHA256=6d07b9bda92ac46e3b874e90dabc33192eca7e64c4b36ea661f4fd7dd27a5129
+ARG CADDY_SHA256=40ba93598553246178d296d08942a72afee32f3415cd5f5651165b97edd2d5f4
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64&version=v${CADDY_VERSION}" \
        -o /usr/local/bin/caddy \

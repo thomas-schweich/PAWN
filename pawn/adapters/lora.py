@@ -1,245 +1,216 @@
-"""LoRA (Low-Rank Adaptation) for PAWN.
+"""LoRA — Low-Rank Adaptation (Hu et al. 2021).
 
-Implements `Hu et al., 2021 <https://arxiv.org/abs/2106.09685>`_
-("LoRA: Low-Rank Adaptation of Large Language Models", ICLR 2022).
+Injects rank-r adapters into Q, K, V, O attention projections (and
+optionally the SwiGLU FFN gate/up/down) of all transformer layers:
 
-Injects rank-r adapters into Q, K, V, O attention projections (and optionally
-FFN projections) in all transformer layers:
+    effective_weight = frozen_weight + (A @ B) * (alpha / rank)
 
-    output = frozen_linear(x) + (x @ A^T) @ B^T * (alpha / rank)
-
-B is zero-initialized so the model starts identical to the frozen backbone.
-Total trainable params (rank=4, attention-only): 131,072.
+B is zero-initialised so the model starts identical to the frozen
+backbone. The effective weights flow through the standard
+:class:`pawn.model.PAWNModel` forward pass — the trainer never sees
+A/B individually; they live in a separate :class:`LoRAAdapter` PyTree
+that the apply function uses to build the effective model.
 """
 
+from __future__ import annotations
+
 import math
+from dataclasses import dataclass
+from typing import Literal
 
-import torch
-import torch.nn as nn
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float
 
-from pawn.config import CLMConfig
-from pawn.model import PAWNCLM, Attention
+from pawn.adapters.placement import apply_layer_mask, layer_placement_mask
+from pawn.model import PAWNModel, TransformerLayer
+
+__all__ = [
+    "LoRAConfig",
+    "LoRAAdapter",
+    "init_lora_adapter",
+    "apply_lora",
+    "lora_filter",
+]
 
 
-class LoRALinear(nn.Module):
-    """Wraps a frozen nn.Linear with a low-rank adapter.
+LoRATargets = Literal["qkvo", "qv", "qkv"]
 
-    output = frozen_linear(x) + (x @ A^T) @ B^T * (alpha / rank)
+
+@dataclass(frozen=True)
+class LoRAConfig:
+    """LoRA hyperparameters.
+
+    ``rank`` is the bottleneck dimension; ``alpha`` is the LoRA scaling
+    factor (defaults to ``rank`` if None per Hu et al. convention).
+    ``targets`` selects which attention projections get LoRA; ``ffn``
+    toggles LoRA on the SwiGLU gate/up/down. ``layers`` restricts LoRA to
+    an explicit subset of transformer layers (the ``--adapter-layers``
+    consumer, v1 parity); ``None`` (default) adapts every layer.
     """
 
-    def __init__(self, frozen_linear: nn.Linear, rank: int, alpha: float | None = None):
-        super().__init__()
-        self.frozen = frozen_linear
-        self.rank = rank
-        self.alpha = alpha if alpha is not None else float(rank)
-        self.scaling = self.alpha / self.rank
-
-        in_features = frozen_linear.in_features
-        out_features = frozen_linear.out_features
-
-        self.lora_A = nn.Parameter(torch.empty(rank, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
-
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base = self.frozen(x)
-        lora = (x @ self.lora_A.T) @ self.lora_B.T * self.scaling
-        return base + lora
-
-
-ATTN_PRESETS = {
-    "qkvo": ("wq", "wk", "wv", "wo"),
-    "qv": ("wq", "wv"),
-    "qkv": ("wq", "wk", "wv"),
-}
-_FFN_TARGETS = ("w_gate", "w_up", "w_down")
-
-
-class LoRACLM(nn.Module):
-    """Frozen PAWN backbone with LoRA adapters.
-
-    LoRA is injected into attention projections (and optionally FFN) in every
-    transformer layer. Only LoRA parameters are trainable.
-    """
-
-    def __init__(
-        self,
-        backbone: PAWNCLM,
-        rank: int = 4,
-        alpha: float | None = None,
-        attn_targets: str | tuple[str, ...] = "qkvo",
-        adapt_ffn: bool = False,
-        layers: tuple[int, ...] | None = None,
-    ):
-        super().__init__()
-        self.backbone = backbone
-        self.rank = rank
-        self.alpha = alpha if alpha is not None else float(rank)
-        self.adapt_ffn = adapt_ffn
-
-        # Resolve attention targets
-        if isinstance(attn_targets, str):
-            self.attn_targets = ATTN_PRESETS[attn_targets]
-        else:
-            self.attn_targets = tuple(attn_targets)
-
-        # Resolve layer indices (default: all)
-        n_layers = len(backbone.layers)
-        self.adapted_layers = set(layers if layers is not None else range(n_layers))
-
-        # Freeze the entire backbone
-        for p in backbone.parameters():
-            p.requires_grad = False
-
-        # Inject LoRA into selected layers
-        for layer_idx in range(len(backbone.layers)):
-            if layer_idx not in self.adapted_layers:
-                continue
-            block = backbone.get_block(layer_idx)
-
-            attn: Attention = block.attn
-            for proj_name in self.attn_targets:
-                original = getattr(attn, proj_name)
-                setattr(attn, proj_name, LoRALinear(original, rank, self.alpha))
-
-            if adapt_ffn:
-                ffn = block.ffn
-                for proj_name in _FFN_TARGETS:
-                    original = getattr(ffn, proj_name)
-                    setattr(ffn, proj_name, LoRALinear(original, rank, self.alpha))
+    rank: int
+    alpha: float | None = None
+    targets: LoRATargets = "qkvo"
+    ffn: bool = False
+    layers: tuple[int, ...] | None = None
 
     @property
-    def cfg(self) -> CLMConfig:
-        return self.backbone.cfg
+    def scaling(self) -> float:
+        return (self.alpha if self.alpha is not None else float(self.rank)) / self.rank
 
-    def forward_hidden(self, input_ids: torch.Tensor,
-                       attention_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """Run backbone layers (with LoRA), return normed hidden states.
 
-        Returns (B, T, d_model) -- before lm_head projection.
-        """
-        bb = self.backbone
-        x = bb.embed(input_ids)
+class LoRAAdapter(eqx.Module):
+    """LoRA A/B parameter pairs for each targeted projection.
 
-        T = input_ids.shape[1]
-        if attention_mask is not None:
-            causal = bb.causal_mask[:T, :T]
-            padding = attention_mask.unsqueeze(1).unsqueeze(2)
-            mask = causal.unsqueeze(0) & padding
-        else:
-            mask = None
+    Each pair is ``(A[n_layers, d, r], B[n_layers, r, d])`` so the
+    effective ``[n_layers, d, d]`` correction is
+    ``jnp.einsum("ldr,lre->lde", A, B) * scaling``.
 
-        rope_cos = bb.rope_cos[:, :, :T, :]
-        rope_sin = bb.rope_sin[:, :, :T, :]
+    Fields are ``None`` when the corresponding projection isn't
+    LoRA-targeted (e.g. ``targets="qv"`` leaves ``A_k`` / ``A_o`` as
+    ``None``). Equinox treats ``None`` leaves as no-ops in the
+    filter / partition machinery.
+    """
 
-        for layer in bb.layers:
-            x = layer(x, rope_cos, rope_sin, mask)
+    A_q: Float[Array, "n_layers d r"] | None
+    B_q: Float[Array, "n_layers r d"] | None
+    A_k: Float[Array, "n_layers d r"] | None
+    B_k: Float[Array, "n_layers r d"] | None
+    A_v: Float[Array, "n_layers d r"] | None
+    B_v: Float[Array, "n_layers r d"] | None
+    A_o: Float[Array, "n_layers d r"] | None
+    B_o: Float[Array, "n_layers r d"] | None
+    # FFN LoRA (when cfg.ffn=True; None otherwise).
+    A_gate: Float[Array, "n_layers d r"] | None
+    B_gate: Float[Array, "n_layers r d_ff"] | None
+    A_up: Float[Array, "n_layers d r"] | None
+    B_up: Float[Array, "n_layers r d_ff"] | None
+    A_down: Float[Array, "n_layers d_ff r"] | None
+    B_down: Float[Array, "n_layers r d"] | None
+    # Per-layer placement mask (True at adapted layers). Bool, so it stays
+    # out of the trainable filter — exactly like the unfreeze `layer_mask`.
+    layer_mask: Bool[Array, "n_layers"]
+    # Static config for scaling factor.
+    cfg: LoRAConfig = eqx.field(static=True)
 
-        return bb.final_norm(x)
 
-    def project_head(self, x: torch.Tensor) -> torch.Tensor:
-        """Project hidden states through lm_head.
+def _targets_to_flags(targets: LoRATargets) -> dict[str, bool]:
+    return {
+        "q": "q" in targets,
+        "k": "k" in targets,
+        "v": "v" in targets,
+        "o": "o" in targets,
+    }
 
-        x: (*, d_model) -- works for both (B, T, d) and (N_valid, d).
-        """
-        return self.backbone.lm_head(x)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Full forward pass. Returns logits (B, T, V).
+def init_lora_adapter(
+    backbone: PAWNModel, cfg: LoRAConfig, key: jax.Array | int
+) -> LoRAAdapter:
+    """Build a fresh LoRA adapter against ``backbone``.
 
-        When attention_mask is None, uses is_causal=True in SDPA.
-        """
-        bb = self.backbone
-        x = bb.embed(input_ids)
+    A matrices: kaiming-uniform (sqrt(5)) — matches the v1 init.
+    B matrices: zero — model starts identical to the frozen backbone.
+    """
+    if isinstance(key, int):
+        key = jax.random.key(key)
 
-        T = input_ids.shape[1]
-        if attention_mask is not None:
-            causal = bb.causal_mask[:T, :T]
-            padding = attention_mask.unsqueeze(1).unsqueeze(2)
-            mask = causal.unsqueeze(0) & padding
-        else:
-            mask = None
+    d = backbone.cfg.d_model
+    d_ff = backbone.cfg.d_ff
+    n_layers = backbone.cfg.n_layers
+    r = cfg.rank
+    flags = _targets_to_flags(cfg.targets)
 
-        rope_cos = bb.rope_cos[:, :, :T, :]
-        rope_sin = bb.rope_sin[:, :, :T, :]
+    def kaiming(k: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+        # Kaiming-uniform matching PyTorch `kaiming_uniform_(a=sqrt(5))`
+        # — the v1 init this adapter is meant to mirror. For
+        # `a=sqrt(5)`, `gain = sqrt(2 / (1 + 5)) = sqrt(1/3)`, and
+        # `bound = gain * sqrt(3 / fan_in) = sqrt(1/fan_in)`.
+        # An earlier version computed `sqrt(2/fan_in)` (gain=1.0
+        # default), inflating LoRA A-matrices by sqrt(2) relative to
+        # v1; this restored the v1 contract.
+        if len(shape) == 0:
+            raise ValueError("kaiming requires at least a 1-D shape")
+        fan_in = shape[-1] if len(shape) >= 2 else shape[0]
+        bound = math.sqrt(1.0 / fan_in)
+        return jax.random.uniform(k, shape, minval=-bound, maxval=bound)
 
-        for layer in bb.layers:
-            x = layer(x, rope_cos, rope_sin, mask)
+    keys = jax.random.split(key, 16)
 
-        x = bb.final_norm(x)
-        return self.project_head(x)
+    def maybe_A(active: bool, k: jax.Array, fan_in: int) -> jax.Array | None:
+        if not active:
+            return None
+        return kaiming(k, (n_layers, fan_in, r))
 
-    def forward_generate(
-        self,
-        input_ids: torch.Tensor,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-        """Forward with KV-cache for autoregressive generation."""
-        bb = self.backbone
-        x = bb.embed(input_ids)
+    def maybe_B(active: bool, fan_out: int) -> jax.Array | None:
+        if not active:
+            return None
+        return jnp.zeros((n_layers, r, fan_out), dtype=jnp.float32)
 
-        T_new = input_ids.shape[1]
-        if kv_cache is not None:
-            T_cached = kv_cache[0][0].shape[2]
-            rope_cos = bb.rope_cos[:, :, T_cached:T_cached + T_new, :]
-            rope_sin = bb.rope_sin[:, :, T_cached:T_cached + T_new, :]
-        else:
-            rope_cos = bb.rope_cos[:, :, :T_new, :]
-            rope_sin = bb.rope_sin[:, :, :T_new, :]
+    return LoRAAdapter(
+        A_q=maybe_A(flags["q"], keys[0], d), B_q=maybe_B(flags["q"], d),
+        A_k=maybe_A(flags["k"], keys[1], d), B_k=maybe_B(flags["k"], d),
+        A_v=maybe_A(flags["v"], keys[2], d), B_v=maybe_B(flags["v"], d),
+        A_o=maybe_A(flags["o"], keys[3], d), B_o=maybe_B(flags["o"], d),
+        A_gate=maybe_A(cfg.ffn, keys[4], d), B_gate=maybe_B(cfg.ffn, d_ff),
+        A_up=maybe_A(cfg.ffn, keys[5], d), B_up=maybe_B(cfg.ffn, d_ff),
+        A_down=maybe_A(cfg.ffn, keys[6], d_ff), B_down=maybe_B(cfg.ffn, d),
+        layer_mask=layer_placement_mask(cfg.layers, n_layers),
+        cfg=cfg,
+    )
 
-        new_kv_cache = []
-        for i in range(len(bb.layers)):
-            layer_cache = kv_cache[i] if kv_cache is not None else None
-            x, new_cache = bb.get_block(i).forward_kv(x, rope_cos, rope_sin, layer_cache)
-            new_kv_cache.append(new_cache)
 
-        x = bb.final_norm(x[:, -1:, :])
-        logits = bb.lm_head(x)
+def _add_lora_correction(
+    weight: jax.Array,
+    A: jax.Array | None,
+    B: jax.Array | None,
+    scaling: float,
+    layer_mask: Bool[Array, "n_layers"],
+) -> jax.Array:
+    """Return ``weight + mask · (A @ B) · scaling`` (per-layer leading axis).
 
-        return logits, new_kv_cache
+    ``layer_mask`` gates the correction so only the adapted layers
+    receive it; masked-out layers fall back to the frozen ``weight`` and
+    their A/B slices receive zero gradient (``--adapter-layers`` parity).
+    """
+    if A is None or B is None:
+        return weight
+    correction = jnp.einsum("ldr,lre->lde", A, B) * scaling
+    return weight + apply_layer_mask(correction, layer_mask)
 
-    def lora_parameters(self) -> list[nn.Parameter]:
-        """Return only trainable LoRA parameters."""
-        return [p for p in self.parameters() if p.requires_grad]
 
-    def lora_state_dict(self) -> dict[str, torch.Tensor]:
-        """Extract LoRA weights for saving."""
-        return {
-            name: param.data.clone()
-            for name, param in self.named_parameters()
-            if param.requires_grad
-        }
+def apply_lora(backbone: PAWNModel, adapter: LoRAAdapter) -> PAWNModel:
+    """Return a new :class:`PAWNModel` with effective LoRA-corrected weights.
 
-    def load_lora_state_dict(self, state: dict[str, torch.Tensor]):
-        """Load LoRA weights."""
-        own = self.state_dict()
-        for k, v in state.items():
-            if k in own:
-                own[k] = v
-        self.load_state_dict(own, strict=False)
+    Reuses every backbone field except the targeted projection
+    weights, which become ``frozen + LoRA(A, B)``. The autograd graph
+    runs only through the LoRA A/B params — the backbone arrays are
+    untouched.
+    """
+    s = adapter.cfg.scaling
+    m = adapter.layer_mask
+    layers = backbone.layers
+    new_layers = TransformerLayer(
+        attn_norm_w=layers.attn_norm_w,
+        wq=_add_lora_correction(layers.wq, adapter.A_q, adapter.B_q, s, m),
+        wk=_add_lora_correction(layers.wk, adapter.A_k, adapter.B_k, s, m),
+        wv=_add_lora_correction(layers.wv, adapter.A_v, adapter.B_v, s, m),
+        wo=_add_lora_correction(layers.wo, adapter.A_o, adapter.B_o, s, m),
+        ffn_norm_w=layers.ffn_norm_w,
+        w_gate=_add_lora_correction(layers.w_gate, adapter.A_gate, adapter.B_gate, s, m),
+        w_up=_add_lora_correction(layers.w_up, adapter.A_up, adapter.B_up, s, m),
+        w_down=_add_lora_correction(layers.w_down, adapter.A_down, adapter.B_down, s, m),
+    )
+    # `tree_at` on the single `layers` leaf keeps every other backbone
+    # field (embeddings, head, norms, buffers) untouched and decouples
+    # this rebuild from the model's field set.
+    return eqx.tree_at(lambda m: m.layers, backbone, new_layers)
 
-    def lora_weight_report(self) -> dict[str, float]:
-        """Per-layer LoRA weight norms for monitoring."""
-        report = {}
-        for layer_idx in range(len(self.backbone.layers)):
-            attn = self.backbone.get_block(layer_idx).attn
-            for proj_name in self.attn_targets:
-                module = getattr(attn, proj_name)
-                if isinstance(module, LoRALinear):
-                    report[f"layer{layer_idx}.{proj_name}.A"] = module.lora_A.data.norm().item()
-                    report[f"layer{layer_idx}.{proj_name}.B"] = module.lora_B.data.norm().item()
 
-            if self.adapt_ffn:
-                ffn = self.backbone.get_block(layer_idx).ffn
-                for proj_name in _FFN_TARGETS:
-                    module = getattr(ffn, proj_name)
-                    if isinstance(module, LoRALinear):
-                        report[f"layer{layer_idx}.{proj_name}.A"] = module.lora_A.data.norm().item()
-                        report[f"layer{layer_idx}.{proj_name}.B"] = module.lora_B.data.norm().item()
-
-        return report
+def lora_filter(adapter: LoRAAdapter) -> LoRAAdapter:
+    """All inexact-array leaves on LoRAAdapter are trainable; cfg is
+    static. `eqx.partition` keys off this filter."""
+    return jax.tree_util.tree_map(
+        lambda leaf: True if eqx.is_inexact_array(leaf) else False, adapter
+    )

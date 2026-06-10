@@ -176,7 +176,9 @@ pub fn uci_file_to_tokens(
         .collect();
 
     let n = filtered.len();
-    let mut flat = vec![0i16; n * max_ply];
+    // PAD-init: positions past each game's length are never written, and the
+    // vocab assigns 0 to a legal move, so a 0-init tail would read as moves.
+    let mut flat = vec![vocab::PAD_TOKEN as i16; n * max_ply];
     let mut lengths = Vec::with_capacity(n);
 
     for (gi, (tokens, n_valid)) in filtered.iter().enumerate() {
@@ -337,6 +339,22 @@ mod tests {
         assert_eq!(lengths[0], 4);
         assert_eq!(lengths[1], 2);
         assert_eq!(flat.len(), 2 * 256);
+
+        // The post-game tail must be PAD-initialised, never 0 — the vocab
+        // assigns token 0 to a legal move, so a 0-init tail would feed real
+        // moves into the downstream corpus past each game's length.
+        let pad = vocab::PAD_TOKEN as i16;
+        for b in 0..2 {
+            let len = lengths[b] as usize;
+            for t in len..256 {
+                assert_eq!(
+                    flat[b * 256 + t], pad,
+                    "uci_file_to_tokens: tail position {} of game {} (len={}) \
+                     must be PAD ({}), got {}",
+                    t, b, len, pad, flat[b * 256 + t]
+                );
+            }
+        }
 
         std::fs::remove_file(path).ok();
     }

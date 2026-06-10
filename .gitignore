@@ -76,3 +76,31 @@ runs/
 
 # Codex review scratch file (ephemeral, sometimes left behind by `codex review`)
 .codex
+
+# Rust scratch binaries (e.g. `rustc -o rust_out`)
+/rust_out
+
+# Bench results — keep the directory + README but ignore the JSON
+# artifacts (they're large + per-pod ephemeral; commit them only when
+# they anchor a specific perf claim in a PR).
+bench/results/*.json
+
+# Bench-run training checkpoints (throwaway random-game; keep metrics.jsonl + result JSON)
+bench/results/**/step_*/
+bench/results/**/*.safetensors
+
+# v2 migration housekeeping — untrack accidentally-committed artifacts (kept on disk)
+/JAX_MIGRATION_REVIEW.md
+/JAX_MIGRATION_REVIEW_findings.json
+/bench/results/
+/checkpoints/
+*.db
+
+# LR-sweep throwaway artifacts (metrics + per-trial final checkpoints)
+logs/lr_sweep/
+
+# workflow scratch artifacts
+.wf_*.mjs
+.wf_audit_structured.json
+logs/fp32_probe/
+logs/untie_smoke/

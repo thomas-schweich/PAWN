@@ -1,206 +1,327 @@
-"""FiLM conditioning for PAWN.
+"""FiLM — Feature-wise Linear Modulation (Perez et al. 2018).
 
-Implements Feature-wise Linear Modulation following `Perez et al., 2017
-<https://arxiv.org/abs/1709.07871>`_
-("FiLM: Visual Reasoning with a General Conditioning Layer", AAAI 2018).
+Per-channel ``gamma`` / ``beta`` scale + shift applied to the residual
+stream after each transformer layer (``h = gamma * h + beta``) and,
+optionally, to the output logits (``logits = gamma * logits + beta``
+over the uniform ``V``-wide vocabulary). ``gamma`` is one-initialised
+and ``beta`` zero-initialised so the model starts identical to the
+frozen backbone.
 
-Applies learned per-channel affine transforms after each transformer block
-and on the output logits:
+This is *true* FiLM: the affine modulation lives in the residual stream
+(injected via the backbone's post-residual ``ffn_hook``), **not** folded
+into the RMSNorm weights. Folding ``gamma`` into a norm weight would
+couple it to the norm's rescaling and folding ``beta`` into a norm
+weight is impossible (RMSNorm has no additive term), so the earlier
+fold-into-norm implementation was not FiLM at all.
 
-    h_adapted = γ_l ⊙ h_l + β_l        (hidden layers)
-    logits_adapted = γ_out ⊙ logits + β_out  (output)
-
-Identity-initialized (γ=1, β=0) so the wrapped model starts identical to
-the frozen backbone.
+Because the per-layer shift and the output-logit modulation cannot
+collapse into the backbone's weight tensors, :func:`apply_film` returns
+a :class:`FiLMEffective` wrapper (mirroring
+:class:`pawn.adapters.bottleneck.BottleneckEffective`) that threads the
+modulation through the backbone's forward pass rather than a folded
+:class:`PAWNModel`.
 """
 
-import torch
-import torch.nn as nn
-from pawn.config import CLMConfig
-from pawn.model import PAWNCLM
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jaxtyping import Array, Float, Int
+
+from pawn.checkpoint import ADAPTER_SAFETENSORS
+from pawn.config import ModelConfig
+from pawn.model import KVCache, PAWNModel
+
+__all__ = [
+    "FiLMConfig",
+    "FiLMAdapter",
+    "FiLMEffective",
+    "ADAPTER_SAFETENSORS",
+    "init_film_adapter",
+    "apply_film",
+    "film_filter",
+    "save_film_adapter",
+    "load_film_adapter",
+]
 
 
-class FiLMLayer(nn.Module):
-    """Feature-wise Linear Modulation: y = γ * x + β."""
-
-    gamma: nn.Parameter
-    beta: nn.Parameter
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.gamma = nn.Parameter(torch.ones(dim))
-        self.beta = nn.Parameter(torch.zeros(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.gamma * x + self.beta
+# ``ADAPTER_SAFETENSORS`` (the sidecar filename used by the trainer's save /
+# resume path) is owned by :mod:`pawn.checkpoint` and re-exported here so the
+# train + load sites share a single literal regardless of strategy.
 
 
-class FiLMCLM(nn.Module):
-    """Frozen PAWN backbone with FiLM adapters.
+@dataclass(frozen=True)
+class FiLMConfig:
+    """FiLM hyperparameters. ``use_output_film=True`` is the v2 default
+    (plan §10 S3) — adds a FiLM head over the output logits too."""
 
-    FiLM layers are inserted after every transformer block and on the
-    output logits. Only FiLM parameters are trainable.
+    use_output_film: bool = True
+
+
+class FiLMAdapter(eqx.Module):
+    """Per-layer gamma/beta + optional output FiLM.
+
+    ``gamma`` / ``beta`` have shape ``(n_layers, d_model)`` and apply
+    elementwise to each layer's residual-stream output. The optional
+    output FiLM has shape ``(vocab_size,)`` and applies to the output
+    logits (post-Phase-A: the uniform ``V``-wide head, **not**
+    ``d_model``).
     """
 
-    def __init__(self, backbone: PAWNCLM, use_output_film: bool = True):
-        super().__init__()
-        self.backbone = backbone
-        self.use_output_film = use_output_film
-        cfg = backbone.cfg
+    gamma: Float[Array, "n_layers d"]
+    beta: Float[Array, "n_layers d"]
+    output_gamma: Float[Array, "V"] | None
+    output_beta: Float[Array, "V"] | None
+    cfg: FiLMConfig = eqx.field(static=True)
 
-        # Freeze the entire backbone
-        for p in backbone.parameters():
-            p.requires_grad = False
 
-        # Hidden-layer FiLM: one per transformer block
-        self.hidden_films = nn.ModuleList([
-            FiLMLayer(cfg.d_model) for _ in range(cfg.n_layers)
-        ])
+def init_film_adapter(
+    backbone: PAWNModel, cfg: FiLMConfig, key: jax.Array | int
+) -> FiLMAdapter:
+    """gamma=1, beta=0 → identity at step 0.
 
-        # Output FiLM: applied to logits (optional)
-        if use_output_film:
-            self.output_film = FiLMLayer(cfg.vocab_size)
-        else:
-            self.output_film = None
+    The per-layer slabs are sized ``(n_layers, d_model)``; the optional
+    output-FiLM slabs are sized ``(vocab_size,)`` because they modulate
+    the logits, not the ``d_model``-wide final-norm output.
+    """
+    del key  # unused — one/zero init is deterministic
+    n_layers = backbone.cfg.n_layers
+    d = backbone.cfg.d_model
+    v = backbone.cfg.vocab_size
+    out_g = jnp.ones((v,), dtype=jnp.float32) if cfg.use_output_film else None
+    out_b = jnp.zeros((v,), dtype=jnp.float32) if cfg.use_output_film else None
+    return FiLMAdapter(
+        gamma=jnp.ones((n_layers, d), dtype=jnp.float32),
+        beta=jnp.zeros((n_layers, d), dtype=jnp.float32),
+        output_gamma=out_g,
+        output_beta=out_b,
+        cfg=cfg,
+    )
+
+
+class FiLMEffective(eqx.Module):
+    """Wrapper exposing :meth:`PAWNModel.__call__`'s signature while
+    applying true FiLM modulation.
+
+    Per-layer affine ``h = gamma_l * h + beta_l`` is injected after each
+    layer's FFN residual via the backbone's ``ffn_hook``; the optional
+    output FiLM rescales the final ``V``-wide logits. Looks like a
+    :class:`PAWNModel` to the trainer / eval (same call signature, same
+    logits shape), so they treat it interchangeably with the bare
+    backbone and the bottleneck wrapper.
+    """
+
+    backbone: PAWNModel
+    adapter: FiLMAdapter
 
     @property
-    def cfg(self) -> CLMConfig:
+    def cfg(self) -> ModelConfig:
         return self.backbone.cfg
 
-    def forward_hidden(self, input_ids: torch.Tensor,
-                       attention_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """Run backbone layers + FiLM adapters, return normed hidden states.
+    @property
+    def decomp_table(self) -> Int[Array, "n_actions 3"]:
+        return self.backbone.decomp_table
 
-        Returns (B, T, d_model) — before lm_head projection.
-        """
-        bb = self.backbone
-        x = bb.embed(input_ids)
+    @property
+    def lm_head(self) -> Float[Array, "d V"] | None:
+        return self.backbone.lm_head
 
-        T = input_ids.shape[1]
-        if attention_mask is not None:
-            causal = bb.causal_mask[:T, :T]
-            padding = attention_mask.unsqueeze(1).unsqueeze(2)
-            mask = causal.unsqueeze(0) & padding
-        else:
-            mask = None
+    @property
+    def final_norm_w(self) -> Float[Array, "d"]:
+        return self.backbone.final_norm_w
 
-        rope_cos = bb.rope_cos[:, :, :T, :]
-        rope_sin = bb.rope_sin[:, :, :T, :]
+    @property
+    def layers(self) -> Any:  # TransformerLayer; avoid circular type import
+        return self.backbone.layers
 
-        for layer, film in zip(bb.layers, self.hidden_films):
-            x = layer(x, rope_cos, rope_sin, mask)
-            x = film(x)
+    @property
+    def embed_tokens(self) -> Float[Array, "V d"]:
+        return self.backbone.embed_tokens
 
-        return bb.final_norm(x)
-
-    def project_head(self, x: torch.Tensor) -> torch.Tensor:
-        """Project hidden states through lm_head + optional output FiLM.
-
-        x: (*, d_model) — works for both (B, T, d) and (N_valid, d).
-        """
-        logits = self.backbone.lm_head(x)
-        if self.output_film is not None:
-            logits = self.output_film(logits)
-        return logits
-
-    def forward(
+    def _ffn_hook(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Run the backbone with FiLM adapters. Returns logits (B, T, V).
+        h: Float[Array, "B T d"],
+        slice_: tuple[Float[Array, "d"], Float[Array, "d"]],
+    ) -> Float[Array, "B T d"]:
+        """``h = gamma_l * h + beta_l`` in the residual stream.
 
-        When attention_mask is None, uses is_causal=True in SDPA (enables
-        Flash Attention / efficient kernels).  Safe for causal LM training
-        because loss_mask already excludes padding positions.
+        ``slice_`` is the per-layer ``(gamma_l, beta_l)`` pair handed in
+        by the backbone's scan (each ``(d_model,)``). Broadcast over the
+        ``(B, T)`` axes; cast the params to ``h``'s dtype so the AMP
+        forward stays in compute dtype.
         """
-        bb = self.backbone
-        x = bb.embed(input_ids)
+        gamma_l, beta_l = slice_
+        gamma_l = gamma_l.astype(h.dtype)
+        beta_l = beta_l.astype(h.dtype)
+        return gamma_l * h + beta_l
 
-        T = input_ids.shape[1]
-        if attention_mask is not None:
-            causal = bb.causal_mask[:T, :T]
-            padding = attention_mask.unsqueeze(1).unsqueeze(2)
-            mask = causal.unsqueeze(0) & padding
-        else:
-            mask = None
+    def _apply_output_film(
+        self, logits: Float[Array, "B T V"]
+    ) -> Float[Array, "B T V"]:
+        """``logits = output_gamma * logits + output_beta`` over ``V``.
 
-        rope_cos = bb.rope_cos[:, :, :T, :]
-        rope_sin = bb.rope_sin[:, :, :T, :]
+        No-op when output FiLM is disabled. The slabs are ``(vocab_size,)``
+        and broadcast over the ``(B, T)`` axes.
+        """
+        adapter = self.adapter
+        if adapter.output_gamma is None or adapter.output_beta is None:
+            return logits
+        og = adapter.output_gamma.astype(logits.dtype)
+        ob = adapter.output_beta.astype(logits.dtype)
+        return og * logits + ob
 
-        for layer, film in zip(bb.layers, self.hidden_films):
-            x = layer(x, rope_cos, rope_sin, mask)
-            x = film(x)
-
-        x = bb.final_norm(x)
-        return self.project_head(x)
-
-    def forward_generate(
+    def __call__(
         self,
-        input_ids: torch.Tensor,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-        """Forward with KV-cache for autoregressive generation."""
-        bb = self.backbone
-        x = bb.embed(input_ids)
+        input_ids: Int[Array, "B T"],
+        attention_mask: Int[Array, "B T"] | None = None,
+        *,
+        compute_dtype: jnp.dtype | None = None,
+        use_sdpa: bool = False,
+        use_flash: bool = False,
+    ) -> Float[Array, "B T V"]:
+        # `hook_data` leaves must each carry a leading n_layers axis so
+        # the backbone's scan zips them with the per-layer weights. The
+        # gamma/beta slabs are (n_layers, d_model); pass them as a tuple
+        # so the scan hands the ffn_hook a per-layer (gamma_l, beta_l).
+        hook_data = (self.adapter.gamma, self.adapter.beta)
+        logits = self.backbone(
+            input_ids,
+            attention_mask,
+            compute_dtype=compute_dtype,
+            ffn_hook=self._ffn_hook,
+            hook_data=hook_data,
+            use_sdpa=use_sdpa,
+            use_flash=use_flash,
+        )
+        return self._apply_output_film(logits)
 
-        T_new = input_ids.shape[1]
-        if kv_cache is not None:
-            T_cached = kv_cache[0][0].shape[2]
-            rope_cos = bb.rope_cos[:, :, T_cached:T_cached + T_new, :]
-            rope_sin = bb.rope_sin[:, :, T_cached:T_cached + T_new, :]
-        else:
-            rope_cos = bb.rope_cos[:, :, :T_new, :]
-            rope_sin = bb.rope_sin[:, :, :T_new, :]
+    def forward_with_cache(
+        self,
+        input_ids: Int[Array, "B T_new"],
+        cache: KVCache,
+        pos_start: Int[Array, ""] | int,
+        *,
+        compute_dtype: jnp.dtype | None = None,
+    ) -> tuple[Float[Array, "B T_new V"], KVCache]:
+        """Cached forward — threads the per-layer FiLM hook through the
+        backbone's KV-cached path and applies output FiLM to the logits.
 
-        new_kv_cache = []
-        for i in range(len(bb.layers)):
-            block = bb.get_block(i)
-            layer_cache = kv_cache[i] if kv_cache is not None else None
-            x, new_cache = block.forward_kv(x, rope_cos, rope_sin, layer_cache)
-            x = self.hidden_films[i](x)
-            new_kv_cache.append(new_cache)
+        The affine modulation is position-local (operates pointwise on
+        the hidden state / logits at each token), so injecting it at the
+        same ``ffn_hook`` site in the cached path produces the same
+        logits as the full forward — modulo XLA kernel-ordering noise.
+        """
+        hook_data = (self.adapter.gamma, self.adapter.beta)
+        logits, new_cache = self.backbone.forward_with_cache(
+            input_ids, cache, pos_start,
+            compute_dtype=compute_dtype,
+            ffn_hook=self._ffn_hook,
+            hook_data=hook_data,
+        )
+        return self._apply_output_film(logits), new_cache
 
-        x = bb.final_norm(x[:, -1:, :])
-        logits = bb.lm_head(x)
-        if self.output_film is not None:
-            logits = self.output_film(logits)
 
-        return logits, new_kv_cache
+def apply_film(backbone: PAWNModel, adapter: FiLMAdapter) -> FiLMEffective:
+    """Return a :class:`FiLMEffective` that runs ``backbone`` with the
+    FiLM affine modulation injected into the residual stream (and,
+    optionally, the output logits).
 
-    def film_parameters(self) -> list[nn.Parameter]:
-        """Return only trainable FiLM parameters."""
-        params = []
-        for film in self.hidden_films:
-            params.extend(film.parameters())
-        if self.output_film is not None:
-            params.extend(self.output_film.parameters())
-        return params
+    Unlike weight-folding adapters (LoRA, sparse), FiLM's per-layer
+    shift and output-logit modulation can't collapse into the backbone's
+    weight tensors, so this returns a callable wrapper — the trainer and
+    eval treat it interchangeably with a bare :class:`PAWNModel`.
+    """
+    return FiLMEffective(backbone=backbone, adapter=adapter)
 
-    def film_state_dict(self) -> dict[str, torch.Tensor]:
-        """Extract FiLM weights for saving."""
-        state = {}
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                state[name] = param.data.clone()
-        return state
 
-    def load_film_state_dict(self, state: dict[str, torch.Tensor]):
-        """Load FiLM weights."""
-        own = self.state_dict()
-        for k, v in state.items():
-            if k in own:
-                own[k] = v
-        self.load_state_dict(own, strict=False)
+def film_filter(adapter: FiLMAdapter) -> FiLMAdapter:
+    return jax.tree_util.tree_map(
+        lambda leaf: True if eqx.is_inexact_array(leaf) else False, adapter
+    )
 
-    def film_weight_report(self) -> dict[str, float]:
-        """Per-layer FiLM deviation from identity, for monitoring."""
-        report = {}
-        for i, film in enumerate(self.hidden_films):
-            if isinstance(film, FiLMLayer):
-                report[f"hidden_{i}/gamma_dev"] = (film.gamma - 1.0).norm().item()
-                report[f"hidden_{i}/beta_norm"] = film.beta.norm().item()
-        if self.output_film is not None:
-            report["output/gamma_dev"] = (self.output_film.gamma - 1.0).norm().item()
-            report["output/beta_norm"] = self.output_film.beta.norm().item()
-        return report
+
+# ---------------------------------------------------------------------------
+# Save / load — sidecar safetensors next to the (frozen) backbone checkpoint
+# ---------------------------------------------------------------------------
+
+
+# Fields persisted to / restored from the sidecar. ``output_gamma`` /
+# ``output_beta`` are absent when ``use_output_film=False``; the config is
+# replayed at load time so the load path takes the same branch as init.
+_ADAPTER_FIELDS: tuple[str, ...] = (
+    "gamma", "beta", "output_gamma", "output_beta",
+)
+
+
+def save_film_adapter(adapter: FiLMAdapter, out_dir: "Path | str") -> None:
+    """Write the FiLM slabs to ``out_dir/adapter.safetensors``.
+
+    Only the populated fields land on disk — the output-FiLM slabs stay
+    absent when ``use_output_film=False``. The caller writes the frozen
+    backbone (``model.safetensors``) and the config block separately;
+    this just emits the FiLM sidecar, keeping the wrapper-adapter save
+    layout in lockstep with :mod:`pawn.adapters.bottleneck`.
+    """
+    from safetensors.numpy import save_file as st_save
+
+    out_path = Path(out_dir)
+    arrays: dict[str, np.ndarray] = {}
+    for name in _ADAPTER_FIELDS:
+        leaf = getattr(adapter, name)
+        if leaf is not None:
+            arrays[f"film.{name}"] = np.asarray(leaf)
+    st_save(arrays, str(out_path / ADAPTER_SAFETENSORS))
+
+
+def load_film_adapter(
+    ckpt_dir: "Path | str", cfg: FiLMConfig
+) -> FiLMAdapter:
+    """Restore a :class:`FiLMAdapter` from a checkpoint sidecar.
+
+    Expects ``ckpt_dir/adapter.safetensors`` written by
+    :func:`save_film_adapter`. ``cfg`` must match the save-time config —
+    ``use_output_film`` determines whether the output-FiLM slabs are
+    populated, and a mismatch between the sidecar's keys and ``cfg`` is
+    rejected with :class:`ValueError` rather than silently loading a
+    mismatched adapter.
+
+    Raises :class:`FileNotFoundError` if the sidecar isn't present.
+    """
+    from safetensors.numpy import load_file as st_load
+
+    path = Path(ckpt_dir) / ADAPTER_SAFETENSORS
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"no {ADAPTER_SAFETENSORS} in {ckpt_dir} — not a FiLM "
+            "checkpoint, or saved without sidecar"
+        )
+    flat = st_load(str(path))
+
+    has_output = "film.output_gamma" in flat
+    if cfg.use_output_film != has_output:
+        raise ValueError(
+            f"FiLMConfig / sidecar mismatch at {path}: cfg "
+            f"use_output_film={cfg.use_output_film} but sidecar "
+            f"{'has' if has_output else 'lacks'} output-FiLM slabs. Was "
+            "the run resumed with a different --use-output-film flag?"
+        )
+
+    def _maybe(key: str) -> jax.Array | None:
+        full = f"film.{key}"
+        if full not in flat:
+            return None
+        return jnp.asarray(flat[full])
+
+    return FiLMAdapter(
+        gamma=jnp.asarray(flat["film.gamma"]),
+        beta=jnp.asarray(flat["film.beta"]),
+        output_gamma=_maybe("output_gamma"),
+        output_beta=_maybe("output_beta"),
+        cfg=cfg,
+    )

@@ -1,111 +1,227 @@
 #!/usr/bin/env python3
-"""Export a training run to HuggingFace repo format.
+"""Package a finished local training run into HuggingFace-repo layout.
 
-Finds the best checkpoint by val loss and packages files for HF upload:
-  - Root: best checkpoint (model.safetensors, config.json, metrics.jsonl, README.md)
-  - checkpoints/step_NNNN/: other checkpoints with truncated metrics
+The v2 trainer pushes to HF *during* training via ``--hf-repo``; this tool
+is the post-hoc packager for runs done with ``--local-checkpoints`` (no HF
+push wired up) that you later decide to publish. It mirrors the v1
+``export_hf_repo.py`` workflow, ported onto the v2 safetensors checkpoint
+format:
 
-Usage:
-    python scripts/export_hf_repo.py \
-        --run-dir logs/run_20260322_182707 \
-        --output-dir export/pawn-base \
-        --repo-name pawn-base \
+  - Root: the checkpoint *nearest* the best-val step (``model.safetensors`` /
+    ``config.json`` / optional ``optimizer.safetensors`` /
+    ``training_state.json``), a truncated ``metrics.jsonl``, and a
+    rendered ``README.md`` model card. (Validation runs on a different
+    cadence than checkpointing, so the best-val step rarely has an exact
+    checkpoint — nearest-step selection mirrors v1.)
+  - ``checkpoints/<prefix>step_NNNNNNNN/``: every *other* checkpoint, each
+    with a metrics log truncated to its own step. ``<prefix>`` is "",
+    ``adapter_`` or ``distill_`` depending on which trainer produced the run.
+
+Every copied checkpoint gets a freshly-recomputed ``.complete`` SHA-256
+sentinel (the source sentinel's hashes are keyed to the source dir's file
+order, so it's dropped and rewritten) — so the exported tree is loadable
+via every ``pawn.checkpoint`` load path, all of which verify the sentinel.
+
+Usage::
+
+    python scripts/export_hf_repo.py \\
+        --run-dir logs/pretrain_20260322_182707_abc123 \\
+        --output-dir export/pawn-base-v2 \\
+        --repo-name pawn-base-v2 \\
         --github-url https://github.com/thomas-schweich/PAWN
+
+For new runs, prefer pushing to HF during training:
+
+    python scripts/train_jax.py        --hf-repo USER/repo ...
+    python scripts/train_jax_adapter.py --hf-repo USER/repo ...
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
+import sys
 from pathlib import Path
+from typing import Any
 
-from pawn.checkpoint import _write_complete_sentinel
+# A v2 checkpoint directory is ``<prefix>step_NNNNNNNN`` where ``<prefix>`` is
+# one of "" (pretrain, train_jax.py), "adapter_" (train_jax_adapter.py), or
+# "distill_" (train_jax_distill.py). We discover the actual name on disk rather
+# than hardcoding the pretrain spelling so adapter/distill local runs package.
+_CHECKPOINT_RE = re.compile(r"^(?:[A-Za-z]+_)?step_(\d+)$")
+
+from pawn._sentinel import SENTINEL_NAME, write_sentinel
+from pawn.checkpoint import (
+    CONFIG_FILE,
+    MODEL_FILE,
+    OPTIMIZER_FILE,
+    TRAINING_STATE_FILE,
+)
+from pawn.lifecycle import truncate_metrics_jsonl
+
+# Files inside a v2 checkpoint dir that, when present, are part of the
+# integrity-checked payload (passed to ``write_sentinel``). The optional
+# files are only listed when they actually exist in the source dir.
+_REQUIRED_PAYLOAD: tuple[str, ...] = (MODEL_FILE, CONFIG_FILE)
+_OPTIONAL_PAYLOAD: tuple[str, ...] = (OPTIMIZER_FILE, TRAINING_STATE_FILE)
+
+
+def discover_checkpoints(run_dir: Path) -> list[tuple[int, Path]]:
+    """Return ``(step, checkpoint_dir)`` pairs found directly under ``run_dir``.
+
+    Matches any of the three v2 checkpoint spellings —
+    ``step_NNNNNNNN`` (pretrain), ``adapter_step_NNNNNNNN`` (adapter), and
+    ``distill_step_NNNNNNNN`` (distill) — and parses the trailing numeric step
+    out of the directory name. Sorted by step so the caller can rely on order.
+    """
+    found: list[tuple[int, Path]] = []
+    for child in run_dir.iterdir():
+        if not child.is_dir():
+            continue
+        match = _CHECKPOINT_RE.match(child.name)
+        if match is None:
+            continue
+        found.append((int(match.group(1)), child))
+    return sorted(found, key=lambda pair: pair[0])
 
 
 def find_best_step(metrics_path: Path) -> int | None:
-    """Find the step with lowest val loss from metrics.jsonl."""
+    """Find the step with the lowest ``val/loss`` from ``metrics.jsonl``.
+
+    Reads the v2 metric schema (``type == "val"`` records carry the
+    namespaced ``val/loss`` key; see
+    :meth:`pawn.logging.MetricsLogger.log_val`). Returns ``None`` when no
+    val record carries both a finite loss and a step.
+    """
     best_loss = float("inf")
-    best_step = None
-    with open(metrics_path) as f:
+    best_step: int | None = None
+    with open(metrics_path, encoding="utf-8") as f:
         for line in f:
-            record = json.loads(line)
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                record = json.loads(stripped)
+            except json.JSONDecodeError:
+                # A partially-flushed write from a crashed run leaves a
+                # truncated last line; skip it rather than aborting the
+                # whole export (parity with truncate_metrics_jsonl).
+                continue
             if record.get("type") != "val":
                 continue
-            loss = record.get("val/loss", float("inf"))
+            loss = record.get("val/loss")
             step = record.get("step")
-            if loss < best_loss and step is not None:
+            if loss is None or step is None:
+                continue
+            # ``record`` is ``dict[str, Any]`` (json.loads); cast through the
+            # numeric types the annotation promises so no ``Any`` leaks into
+            # ``best_step`` / the nearest-checkpoint ``abs(...)`` arithmetic.
+            loss = float(loss)
+            if loss < best_loss:
                 best_loss = loss
-                best_step = step
+                best_step = int(step)
     return best_step
 
 
-def truncate_metrics(metrics_path: Path, up_to_step: int) -> list[str]:
-    """Return metrics lines up to and including the given step."""
-    lines: list[str] = []
-    with open(metrics_path) as f:
+def best_val_metrics(metrics_path: Path, step: int) -> tuple[float, float]:
+    """Return ``(val_loss, val_accuracy)`` for the val record at ``step``.
+
+    ``val/accuracy`` falls back to ``val/top1`` (the same scalar under the
+    pre-promotion spelling) and finally to ``0.0`` when neither is present.
+    """
+    with open(metrics_path, encoding="utf-8") as f:
         for line in f:
-            record = json.loads(line)
-            if (
-                record.get("type") in ("train", "val")
-                and record.get("step", 0) > up_to_step
-            ):
-                break
-            lines.append(line)
-    return lines
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                record = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            rec_step = record.get("step")
+            if record.get("type") != "val" or rec_step is None:
+                continue
+            if int(rec_step) != step:
+                continue
+            loss = float(record.get("val/loss", float("inf")))
+            acc = record.get("val/accuracy", record.get("val/top1", 0.0))
+            return loss, float(acc if acc is not None else 0.0)
+    return float("inf"), 0.0
+
+
+def truncate_metrics(metrics_path: Path, up_to_step: int) -> str:
+    """Return ``metrics.jsonl`` content up to and including ``up_to_step``.
+
+    Thin alias for :func:`pawn.lifecycle.truncate_metrics_jsonl` (the
+    battle-tested implementation the trainer uses to keep the co-uploaded
+    log from running ahead of the checkpoint it sits beside). Delegating
+    keeps a single truncation implementation, so this packager inherits its
+    JSONDecodeError guard — a partially-flushed last line from a crashed
+    run passes through rather than aborting the export.
+    """
+    return truncate_metrics_jsonl(metrics_path, up_to_step)
 
 
 def copy_checkpoint(src: Path, dst: Path) -> None:
-    """Copy a directory-format checkpoint into the HF export layout.
+    """Copy a v2 directory-format checkpoint into the export layout.
 
-    The source's ``.complete`` sentinel is dropped during copy (its
-    hashes are keyed to the source directory's file order) and a fresh
-    sentinel is written for ``dst`` so the exported checkpoint is
-    loadable via every ``pawn.checkpoint`` load path, including
-    ``load_pretrain_checkpoint`` which insists on a valid sentinel.
+    The source ``.complete`` sentinel is dropped (its hashes are keyed to
+    the source dir's file order) and a fresh sentinel is written for
+    ``dst`` over exactly the payload files present, so the exported
+    checkpoint passes ``pawn.checkpoint`` sentinel verification on load.
     """
     dst.mkdir(parents=True, exist_ok=True)
     for item in src.iterdir():
-        if item.name == ".complete":
+        if item.name == SENTINEL_NAME:
             continue
         target = dst / item.name
         if item.is_dir():
             shutil.copytree(item, target, dirs_exist_ok=True)
         else:
             shutil.copy2(item, target)
-    _write_complete_sentinel(dst)
+    payload = list(_REQUIRED_PAYLOAD) + [
+        name for name in _OPTIONAL_PAYLOAD if (dst / name).is_file()
+    ]
+    write_sentinel(dst, payload)
 
 
 def generate_readme(
-    repo_name: str, model_config: dict, training_config: dict,
-    best_step: int, val_loss: float, val_acc: float,
-    github_url: str, extra_desc: str = "",
+    repo_name: str,
+    model_block: dict[str, Any],
+    run_block: dict[str, Any],
+    best_step: int,
+    val_loss: float,
+    val_acc: float,
+    github_url: str,
+    extra_desc: str = "",
 ) -> str:
-    """Generate a HuggingFace model card README.
+    """Render a HuggingFace model card from the checkpoint's saved config.
 
-    All architecture fields come from the checkpoint's saved
-    ``model_config``, so the card stays correct regardless of whether
-    the checkpoint was trained with a named preset or custom arch.
+    Architecture fields come from ``config.json``'s ``model`` block (the
+    v2 layout written by :func:`pawn.checkpoint.save_model`), so the card
+    stays correct regardless of whether the checkpoint was a named variant
+    slice or a custom arch.
     """
-    d_model = model_config.get("d_model", "?")
-    n_layers = model_config.get("n_layers", "?")
-    n_heads = model_config.get("n_heads", "?")
-    d_ff = model_config.get("d_ff", "?")
-    vocab_size = model_config.get("vocab_size", "?")
-    max_seq_len = model_config.get("max_seq_len", "?")
-
-    # `CLMConfig(**model_config)` reconstructs the exact trained
-    # architecture from the saved dict regardless of whether it matches
-    # a named preset, so the usage snippet below is always correct.
+    d_model = model_block.get("d_model", "?")
+    n_layers = model_block.get("n_layers", "?")
+    n_heads = model_block.get("n_heads", "?")
+    d_ff = model_block.get("d_ff", "?")
+    vocab_size = model_block.get("vocab_size", "?")
+    max_seq_len = model_block.get("max_seq_len", "?")
+    tie_embeddings = model_block.get("tie_embeddings", "?")
+    conditioning = run_block.get("conditioning", [])
 
     return f"""---
 license: apache-2.0
-library_name: pytorch
+library_name: safetensors
 tags:
   - chess
   - transformer
   - causal-lm
   - world-model
+  - jax
 datasets:
   - random-self-play
 model-index:
@@ -138,30 +254,26 @@ A causal transformer trained on random chess games, designed as a testbed for fi
 | **d_ff** | {d_ff} |
 | **Vocabulary size** | {vocab_size} |
 | **Sequence length** | {max_seq_len} |
+| **Tied embeddings** | {tie_embeddings} |
+| **Conditioning** | {conditioning or "none"} |
 | **Best val loss** | {val_loss:.4f} (step {best_step:,}) |
 | **Best val accuracy** | {val_acc:.1%} |
 
 ## Usage
 
 ```python
-import json
-from safetensors.torch import load_file
-from pawn.config import CLMConfig
-from pawn.model import PAWNCLM
+from pawn.checkpoint import load_model, resolve_checkpoint_source
 
-# Reconstruct the exact architecture this checkpoint was trained with
-with open("config.json") as f:
-    model_config = json.load(f)["model_config"]
-cfg = CLMConfig(**model_config)
-
-model = PAWNCLM(cfg)
-model.load_state_dict(load_file("model.safetensors"))
-model.eval()
+# Reconstructs the exact architecture this checkpoint was trained with
+# from config.json's `model` block and verifies the .complete sentinel.
+# `model.cfg` is the ModelConfig; `run_block` is the saved run config.
+model, run_block = load_model(resolve_checkpoint_source("{repo_name}"))
 ```
 
 ## Training
 
-Trained from scratch on random self-play games generated by a Rust chess engine (shakmaty).
+Trained from scratch on random self-play games generated by a Rust chess engine (shakmaty),
+using the v2 JAX / Equinox / Optax stack.
 See the [PAWN repository]({github_url}) for training code, data pipeline, and evaluation suite.
 
 ## License
@@ -170,89 +282,132 @@ Apache 2.0
 """
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Export training run to HF repo format")
+def _read_config_blocks(
+    checkpoint_dir: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the ``(model, run)`` blocks from a checkpoint's ``config.json``.
+
+    The ``run`` block is optional in the v2 layout (a bare ``save_model``
+    without a run config omits it); default it to ``{}`` so the README
+    renderer never KeyErrors.
+    """
+    payload = json.loads(
+        (checkpoint_dir / CONFIG_FILE).read_text(encoding="utf-8")
+    )
+    model_block: dict[str, Any] = payload.get("model", {})
+    run_block: dict[str, Any] = payload.get("run", {})
+    return model_block, run_block
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Package a finished v2 training run into HF-repo layout"
+    )
     parser.add_argument("--run-dir", required=True, help="Training run directory")
-    parser.add_argument("--output-dir", required=True, help="Output directory for HF repo")
-    parser.add_argument("--repo-name", required=True, help="Repository name for README")
-    parser.add_argument("--github-url", default="https://github.com/thomas-schweich/PAWN")
-    parser.add_argument("--best-only", action="store_true", help="Only export best checkpoint")
-    parser.add_argument("--extra-desc", default="", help="Extra description for README")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--output-dir", required=True, help="Output directory for the HF repo"
+    )
+    parser.add_argument(
+        "--repo-name", required=True, help="Repository name for the README"
+    )
+    parser.add_argument(
+        "--github-url", default="https://github.com/thomas-schweich/PAWN"
+    )
+    parser.add_argument(
+        "--best-only", action="store_true", help="Only export the best checkpoint"
+    )
+    parser.add_argument(
+        "--extra-desc", default="", help="Extra description for the README"
+    )
+    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     run_dir = Path(args.run_dir)
     output_dir = Path(args.output_dir)
     metrics_path = run_dir / "metrics.jsonl"
 
     if not metrics_path.exists():
-        print(f"ERROR: {metrics_path} not found")
-        return
+        print(f"ERROR: {metrics_path} not found", file=sys.stderr)
+        return 1
 
-    best_step = find_best_step(metrics_path)
-    if best_step is None:
-        print("ERROR: No val records found in metrics.jsonl")
-        return
-    print(f"Best val step: {best_step}")
+    best_val_step = find_best_step(metrics_path)
+    if best_val_step is None:
+        print(
+            "ERROR: no val records with a val/loss + step found in "
+            "metrics.jsonl",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Best val step: {best_val_step}")
 
-    best_val_loss, best_val_acc = float("inf"), 0.0
-    with open(metrics_path) as f:
-        for line in f:
-            r = json.loads(line)
-            if r.get("type") == "val" and r.get("step") == best_step:
-                best_val_loss = r.get("val/loss", float("inf"))
-                best_val_acc = r.get("val/accuracy", 0.0)
-                break
-
-    ckpt_dir = run_dir / "checkpoints"
-    checkpoints = sorted(d for d in ckpt_dir.glob("step_*") if d.is_dir()) if ckpt_dir.exists() else []
+    # The trainer saves checkpoints on the `checkpoint_interval` cadence, but
+    # validation runs on the independent `val_every` cadence — so the best-val
+    # step usually has no exactly-matching checkpoint dir. Pick the checkpoint
+    # whose step is *nearest* to the best-val step (v1 parity:
+    # `min(..., key=lambda p: abs(step - best_step))`), across whichever
+    # checkpoint prefix the run used (pretrain / adapter / distill).
+    checkpoints = discover_checkpoints(run_dir)
     if not checkpoints:
-        print("ERROR: No checkpoints found")
-        return
-
-    best_ckpt = min(
-        checkpoints,
-        key=lambda p: abs(int(p.name.replace("step_", "")) - best_step),
+        print(
+            f"ERROR: no checkpoint dirs (step_*/adapter_step_*/distill_step_*) "
+            f"found under {run_dir}",
+            file=sys.stderr,
+        )
+        return 1
+    best_step, best_dir = min(
+        checkpoints, key=lambda pair: abs(pair[0] - best_val_step)
     )
-    print(f"Best checkpoint: {best_ckpt}")
+    if best_step != best_val_step:
+        print(
+            f"Best val step {best_val_step} has no exact checkpoint; using "
+            f"nearest checkpoint at step {best_step} ({best_dir.name})"
+        )
 
-    with open(best_ckpt / "config.json") as f:
-        config = json.load(f)
-    model_config = config.get("model_config", {})
-    training_config = config.get("training_config", {})
+    val_loss, val_acc = best_val_metrics(metrics_path, best_val_step)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\nExporting best checkpoint to {output_dir}/")
-    copy_checkpoint(best_ckpt, output_dir)
 
-    shutil.copy2(metrics_path, output_dir / "metrics.jsonl")
-
-    readme = generate_readme(
-        args.repo_name, model_config, training_config,
-        best_step, best_val_loss, best_val_acc,
-        args.github_url, args.extra_desc,
+    # Root = the best checkpoint, plus a truncated metrics log + README. The
+    # log is truncated to whichever is later of the exported checkpoint step
+    # and the best-val step, so the val record the README cites is never cut
+    # when the nearest checkpoint precedes the best-val step.
+    copy_checkpoint(best_dir, output_dir)
+    (output_dir / "metrics.jsonl").write_text(
+        truncate_metrics(metrics_path, max(best_step, best_val_step)),
+        encoding="utf-8",
     )
-    with open(output_dir / "README.md", "w") as f:
-        f.write(readme)
+    model_block, run_block = _read_config_blocks(best_dir)
+    (output_dir / "README.md").write_text(
+        generate_readme(
+            args.repo_name,
+            model_block,
+            run_block,
+            best_val_step,
+            val_loss,
+            val_acc,
+            args.github_url,
+            args.extra_desc,
+        ),
+        encoding="utf-8",
+    )
+    print(f"Exported best checkpoint (step {best_step}) -> {output_dir}")
 
     if not args.best_only:
-        for ckpt in checkpoints:
-            if ckpt == best_ckpt:
-                continue
-            step_name = ckpt.name  # e.g. "step_00005000"
-            step_num = int(step_name.replace("step_", ""))
-            step_dir = output_dir / "checkpoints" / step_name
-            print(f"  Exporting {step_name}...")
-            copy_checkpoint(ckpt, step_dir)
+        other_steps = [
+            (step, ckpt)
+            for step, ckpt in discover_checkpoints(run_dir)
+            if step != best_step
+        ]
+        for step, ckpt in other_steps:
+            dst = output_dir / "checkpoints" / ckpt.name
+            copy_checkpoint(ckpt, dst)
+            (dst / "metrics.jsonl").write_text(
+                truncate_metrics(metrics_path, step), encoding="utf-8"
+            )
+            print(f"Exported checkpoint (step {step}) -> {dst}")
 
-            truncated = truncate_metrics(metrics_path, step_num)
-            with open(step_dir / "metrics.jsonl", "w") as f:
-                f.writelines(truncated)
-
-    print(f"\nExport complete: {output_dir}")
-    print("  Best: model.safetensors, config.json, metrics.jsonl, README.md")
-    if not args.best_only:
-        print(f"  Checkpoints: {len(checkpoints) - 1} in checkpoints/")
+    print(f"\nDone. HF-repo layout written to {output_dir}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

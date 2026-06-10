@@ -507,6 +507,67 @@ class TestCheckHealth:
         assert "NaN" in issue or "Inf" in issue
 
 
+class TestCheckHealthScheduleMismatch:
+    """H7: check_health surfaces the structural-mismatch banner from the
+    trial's run dir (the real lab health hook, not the bare helper)."""
+
+    @staticmethod
+    def _write_health(run_dir: Path, **fields) -> None:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "schedule_health.json").write_text(json.dumps(fields))
+
+    def test_completed_mismatch_surfaces_banner(self, tmp_path):
+        run_dir = tmp_path / "run_foo"
+        self._write_health(
+            run_dir,
+            reason_for_stop="completed",
+            planned_total_steps=1000,
+            actual_total_steps=640,
+        )
+        t = _make_trial()
+        t.run_dir = str(run_dir)
+        issue = check_health(t)
+        assert issue is not None
+        assert "STRUCTURAL MISMATCH" in issue
+        assert "640" in issue and "1000" in issue
+
+    def test_completed_match_is_healthy(self, tmp_path):
+        run_dir = tmp_path / "run_foo"
+        self._write_health(
+            run_dir,
+            reason_for_stop="completed",
+            planned_total_steps=1000,
+            actual_total_steps=1000,
+        )
+        t = _make_trial()
+        t.run_dir = str(run_dir)
+        assert check_health(t) is None
+
+    def test_sigterm_mismatch_is_healthy(self, tmp_path):
+        run_dir = tmp_path / "run_foo"
+        self._write_health(
+            run_dir,
+            reason_for_stop="sigterm",
+            planned_total_steps=1000,
+            actual_total_steps=640,
+        )
+        t = _make_trial()
+        t.run_dir = str(run_dir)
+        assert check_health(t) is None
+
+    def test_no_health_file_is_healthy(self, tmp_path):
+        run_dir = tmp_path / "run_foo"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        t = _make_trial()
+        t.run_dir = str(run_dir)
+        assert check_health(t) is None
+
+    def test_no_run_dir_is_healthy(self):
+        t = _make_trial()
+        t.run_dir = None
+        assert check_health(t) is None
+
+
 # =====================================================================
 # read_pretrain_val_summary
 # =====================================================================

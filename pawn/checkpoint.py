@@ -1,1020 +1,927 @@
-"""Checkpoint save/load using safetensors + JSON.
+"""Atomic safetensors save/load for :class:`pawn.model.PAWNModel` and
+:class:`pawn.factored_model.FactoredPAWNModel`.
 
-Directory-based checkpoints:
-  - model.safetensors / adapter.safetensors — tensor data
-  - optimizer.safetensors — flattened optimizer state tensors
-  - training_state.json — scalars, scheduler, scaler, RNG, optimizer metadata
-  - config.json — model and training configuration
-  - .complete — SHA-256 hashes of all files (integrity sentinel)
+The on-disk layout for one checkpoint directory ``step_<N>/`` is:
 
-Writes are atomic: files are written to a .tmp directory, then renamed.
-Loads always verify the .complete sentinel and SHA-256 hashes.
+- ``model.safetensors`` — the trainable arrays in declaration order. The
+  schema is selected by architecture: for the uniform model,
+  :func:`pawn.model.saved_fields` for the config's ``tie_embeddings`` (a
+  tied model omits ``lm_head``; logits reuse ``embed_tokens.T``); for the
+  factored (v1-architecture) model — ``ModelConfig.factored_embeddings``
+  — :data:`pawn.factored_model.FACTORED_SAVED_FIELDS` (16 tensors:
+  ``embed_src/dst/promo/pad/outcome`` + the shared trunk + an
+  always-present ``lm_head``). Either way the :attr:`decomp_table`
+  buffer is *not* saved — it's rebuilt at load time from the engine
+  vocab. RoPE phase tables aren't stored at all (they're a function of
+  cfg, recomputed inside the forward pass).
+- ``config.json`` — ``{"version": 1, "mask_version": M,
+  "model": {ModelConfig fields}, "run": {optional user-supplied dict}}``.
+  The ``model`` block (which carries ``tie_embeddings`` + ``vocab_size``)
+  is enough to reconstruct a fresh ``PAWNModel`` and align the loaded
+  tensors; the ``run`` block carries the run config (the run's
+  ``conditioning`` + derived ``C``), returned by :func:`load_model` so
+  eval can rebuild the checkpoint's own sequence layout. ``mask_version``
+  is the layout/loss-mask contract tag (Chunk 4 owns its value).
+- ``optimizer.safetensors`` (optional) — flattened Optax state, written
+  by :func:`save_model` when the caller passes an ``optimizer_state``
+  dict. Skipped if absent. (Trainer integration arrives in S6.)
+- ``training_state.json`` (optional) — ``{"step", "scheduler",
+  "rng_key", "numpy_rngs"}`` plus any user-supplied metadata; same opt-in
+  shape as the optimizer. ``scheduler`` records the LR-schedule identity +
+  peak (the schedule is a pure function of cfg, so its name is enough to
+  reconstruct it); ``rng_key`` is the serialised JAX PRNG key and
+  ``numpy_rngs`` the data-stream ``numpy.random.Generator`` states, so a
+  ``--resume`` is bit-reproducible vs an uninterrupted run (H7). The
+  payload is assembled by :func:`pawn.lifecycle.build_training_state`.
+- ``.complete`` — the SHA-256 manifest from :func:`pawn._sentinel.write_sentinel`.
+  Every load verifies it.
+
+Atomic write workflow:
+
+1. Compute ``<target_dir>.tmp`` as the staging path next to the final
+   directory. If a stale ``.tmp`` from a prior crashed save is sitting
+   there, blow it away with ``shutil.rmtree`` first — the docstring on
+   the plan says "the next run sees either a complete `step_<N>` or
+   just the orphaned `.tmp` (which gets cleaned up at the next save's
+   start)".
+2. ``mkdir`` the temp dir, write every payload file into it.
+3. Call :func:`pawn._sentinel.write_sentinel` to compute hashes and
+   drop the ``.complete`` manifest. The sentinel call lives **inside**
+   the temp dir so a process kill mid-rename still leaves a recoverable
+   state (either no final dir or a complete one — never a partial
+   final dir).
+4. ``os.rename(<target_dir>.tmp, <target_dir>)``. This is atomic on
+   POSIX filesystems (same-filesystem rename is one inode-table
+   operation).
+
+Read workflow:
+
+1. :func:`pawn._sentinel.verify_sentinel` re-hashes every payload and
+   confirms the manifest. Raises :class:`IncompleteCheckpointError` if
+   ``.complete`` is missing, :class:`CheckpointIntegrityError` on any
+   mismatch.
+2. Parse ``config.json`` → :class:`ModelConfig` + run block.
+3. Load the per-config tensors from ``model.safetensors`` and rebuild
+   the architecture the config names — :class:`PAWNModel`, or
+   :class:`FactoredPAWNModel` when ``factored_embeddings`` — with them
+   + the recomputed decomp table.
+
+:mod:`pawn.model` asserts ``len(SAVED_FIELDS) == 12`` (the untied
+superset) at its own import, and :func:`pawn.model.saved_fields`
+derives the per-config schema from it. Importing this module triggers
+``pawn.model`` first, so the same drift guard fires before
+``pawn.checkpoint`` is fully loaded; a typo'd or extra field surfaces
+as an ``AssertionError`` at startup, not at save/load time.
 """
 
 from __future__ import annotations
 
-import base64
-import hashlib
+import dataclasses
 import json
 import os
 import shutil
-from collections.abc import Callable
 from pathlib import Path
+from typing import Any, Final
 
-import torch
-import torch.nn as nn
-from safetensors.torch import save_file, load_file
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+from safetensors.numpy import load_file as st_load
+from safetensors.numpy import save_file as st_save
 
-CHECKPOINT_FORMAT_VERSION = 1
+from pawn._sentinel import (
+    CheckpointIntegrityError,
+    IncompleteCheckpointError,
+    verify_sentinel,
+    write_sentinel,
+)
+from pawn.config import MASK_VERSION, ModelConfig
+from pawn.factored_model import FACTORED_SAVED_FIELDS, FactoredPAWNModel
+from pawn.model import (
+    EffectiveCallable,
+    PAWNModel,
+    TransformerLayer,
+    _build_decomp_table,
+    saved_fields,
+)
+
+# pawn.model already asserts the untied superset has 12 fields at import,
+# and `saved_fields(tie_embeddings)` derives the per-config schema from it.
+# Importing checkpoint always imports model first, so that assertion is the
+# canonical guard against schema drift; no need to duplicate it here.
+# The test `test_save_schema_field_count` re-pins the contract at the
+# checkpoint API layer for documentation.
+
+__all__ = [
+    "CHECKPOINT_FORMAT_VERSION",
+    "MASK_VERSION",
+    "MODEL_FILE",
+    "CONFIG_FILE",
+    "OPTIMIZER_FILE",
+    "TRAINING_STATE_FILE",
+    "ADAPTER_RESUME_FILE",
+    "ADAPTER_SAFETENSORS",
+    "CheckpointIntegrityError",
+    "IncompleteCheckpointError",
+    "save_model",
+    "load_model",
+    "load_eval_model",
+    "load_model_config",
+    "require_uniform",
+    "save_adapter_resume_state",
+    "load_adapter_resume_state",
+    "find_best_adapter_step",
+]
+
+
+CHECKPOINT_FORMAT_VERSION: Final[int] = 1
+
+# Layout/mask contract version baked into every ``config.json``. Owned by
+# :data:`pawn.config.MASK_VERSION` (single source of truth shared with the
+# lichess cache key) and re-exported here for the checkpoint API surface.
+# It bumps whenever the prefix-assembly / loss-mask / move-position
+# convention changes; the load-time assert in ``_verify_and_read_config``
+# refuses a checkpoint whose ``mask_version`` doesn't match the builder's.
+# (Already listed in ``__all__`` above; the import above binds the name.)
+
+MODEL_FILE: Final[str] = "model.safetensors"
+CONFIG_FILE: Final[str] = "config.json"
+OPTIMIZER_FILE: Final[str] = "optimizer.safetensors"
+TRAINING_STATE_FILE: Final[str] = "training_state.json"
+# Resume sidecar for weight-folding adapters (lora / sparse / unfreeze /
+# specialized_clm / hybrid). ``model.safetensors`` carries the *folded*
+# effective model for downstream eval / publish; this sidecar carries the
+# *raw* frozen backbone + the trained adapter PyTree so ``--resume`` can
+# re-derive the exact (backbone, adapter) split the warm Adam moments were
+# trained against. See :func:`save_adapter_resume_state`.
+ADAPTER_RESUME_FILE: Final[str] = "adapter_resume_state.eqx"
+# Typed-adapter sidecar (bottleneck / pure-FiLM / hybrid's FiLM half). The
+# published ``model.safetensors`` carries the frozen backbone (LoRA-folded
+# for hybrid); this safetensors sidecar carries the injected adapter slabs
+# so :func:`load_eval_model` can re-apply them at eval time. Mirrors the
+# filename the adapter modules write (``pawn.adapters.bottleneck`` /
+# ``pawn.adapters.film`` both export ``ADAPTER_SAFETENSORS``).
+ADAPTER_SAFETENSORS: Final[str] = "adapter.safetensors"
 
 
 # ---------------------------------------------------------------------------
-# Exceptions
+# Internal helpers
 # ---------------------------------------------------------------------------
 
-class IncompleteCheckpointError(Exception):
-    """Raised when a checkpoint directory is missing its .complete sentinel."""
-    pass
 
+def _model_to_tensor_dict(
+    model: PAWNModel | FactoredPAWNModel,
+) -> dict[str, np.ndarray]:
+    """Flatten a model into a name → numpy-array dict for safetensors.
 
-class CheckpointIntegrityError(Exception):
-    """Raised when a checkpoint file's SHA-256 hash doesn't match .complete."""
-    pass
-
-
-# ---------------------------------------------------------------------------
-# SHA-256 helpers
-# ---------------------------------------------------------------------------
-
-def _sha256_file(path: Path) -> str:
-    """Compute SHA-256 hex digest of a file."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):  # 1MB chunks
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _write_complete_sentinel(directory: Path) -> None:
-    """Write .complete sentinel with SHA-256 hashes of all checkpoint files."""
-    hashes = {}
-    for f in sorted(directory.iterdir()):
-        if f.name == ".complete" or f.is_dir():
-            continue
-        hashes[f.name] = _sha256_file(f)
-
-    sentinel = {"format_version": CHECKPOINT_FORMAT_VERSION, "files": hashes}
-    with open(directory / ".complete", "w") as f:
-        json.dump(sentinel, f, indent=2)
-
-
-def _verify_complete_sentinel(directory: Path) -> None:
-    """Verify .complete sentinel exists and all hashes match.
-
-    Raises IncompleteCheckpointError if sentinel is missing.
-    Raises CheckpointIntegrityError if any hash mismatches.
+    Keys are the dotted paths from :func:`saved_fields` for the model's
+    ``tie_embeddings`` setting (tied models omit ``lm_head``), or
+    :data:`pawn.factored_model.FACTORED_SAVED_FIELDS` for the factored
+    (v1-architecture) model. Arrays are materialised via
+    :func:`numpy.asarray` (block until device transfer completes).
     """
-    sentinel_path = directory / ".complete"
-    if not sentinel_path.exists():
-        raise IncompleteCheckpointError(
-            f"Checkpoint {directory} is missing .complete sentinel — "
-            f"likely a partial write from a crashed or interrupted save."
+    # Class ↔ config consistency: the schema is selected by the runtime
+    # class but config.json records cfg.factored_embeddings, and load_model
+    # dispatches on the latter. A mismatched pair (e.g. a hand-constructed
+    # uniform PAWNModel carrying a factored config) would write an
+    # unloadable checkpoint — refuse at save time (round-4 review, codex
+    # P2; init_model/init_factored_model also guard at construction).
+    is_factored_cls = isinstance(model, FactoredPAWNModel)
+    if is_factored_cls != model.cfg.factored_embeddings:
+        raise CheckpointIntegrityError(
+            f"model class {type(model).__name__} is inconsistent with its "
+            f"config (factored_embeddings={model.cfg.factored_embeddings}); "
+            "refusing to write a checkpoint that load_model cannot read"
+        )
+    field_names = (
+        FACTORED_SAVED_FIELDS
+        if is_factored_cls
+        else saved_fields(model.cfg.tie_embeddings)
+    )
+    tensors: dict[str, np.ndarray] = {}
+    for path in field_names:
+        node: Any = model
+        for piece in path.split("."):
+            node = getattr(node, piece)
+        tensors[path] = np.asarray(node)
+    return tensors
+
+
+def _tensor_dict_to_model(
+    tensors: dict[str, np.ndarray],
+    cfg: ModelConfig,
+) -> PAWNModel | FactoredPAWNModel:
+    """Rebuild a model from its loaded tensors + config.
+
+    Validates that every name in the config's save schema
+    (:func:`saved_fields` for the uniform architecture,
+    :data:`FACTORED_SAVED_FIELDS` when ``cfg.factored_embeddings``) is
+    present in the dict, and that every tensor's shape matches the expected
+    ``cfg``-derived shape (catches a checkpoint produced by a model of a
+    different size before the array is silently broadcast somewhere).
+
+    Tied↔untied cross-load is a hard error: a tied checkpoint omits
+    ``lm_head`` while an untied one includes it, so the missing/extra-tensor
+    guards below already fire on a mismatch — but we raise an explicit,
+    actionable message first so the failure mode is obvious rather than
+    surfacing as a bare "missing lm_head". (Factored models are always
+    untied — ``ModelConfig.__post_init__`` rejects the combination — so the
+    tied guard below can never fire for them.)
+
+    Uniform↔factored cross-load is likewise caught structurally: the two
+    schemas differ in their embedding field names (``embed_tokens`` vs
+    ``embed_src``/...), so a config/payload mismatch surfaces via the
+    missing/extra-tensor errors below.
+    """
+    expected_fields = (
+        FACTORED_SAVED_FIELDS
+        if cfg.factored_embeddings
+        else saved_fields(cfg.tie_embeddings)
+    )
+    saved_set = set(expected_fields)
+    tensor_set = set(tensors.keys())
+
+    # Tied↔untied cross-load: detect via the lone differing field (lm_head)
+    # and raise a targeted error before the generic missing/extra messages.
+    has_lm_head = "lm_head" in tensor_set
+    if cfg.tie_embeddings and has_lm_head:
+        raise CheckpointIntegrityError(
+            "checkpoint carries an `lm_head` tensor but the saved ModelConfig "
+            "has tie_embeddings=True (tied models reuse embed_tokens.T and "
+            "store no lm_head); refusing to load an untied checkpoint into a "
+            "tied config"
+        )
+    if not cfg.tie_embeddings and not has_lm_head:
+        raise CheckpointIntegrityError(
+            "checkpoint has no `lm_head` tensor but the saved ModelConfig has "
+            "tie_embeddings=False (untied models need a standalone lm_head); "
+            "refusing to load a tied checkpoint into an untied config"
         )
 
-    with open(sentinel_path) as f:
-        sentinel = json.load(f)
+    missing = sorted(saved_set - tensor_set)
+    extras = sorted(tensor_set - saved_set)
+    if missing:
+        raise CheckpointIntegrityError(
+            f"checkpoint missing expected tensors: {missing}"
+        )
+    if extras:
+        raise CheckpointIntegrityError(
+            f"checkpoint has unexpected tensors: {extras}"
+        )
 
-    for filename, expected_hash in sentinel["files"].items():
-        filepath = directory / filename
-        if not filepath.exists():
+    expected = _expected_shapes(cfg)
+    for name, want in expected.items():
+        got = tuple(tensors[name].shape)
+        if got != want:
             raise CheckpointIntegrityError(
-                f"File {filename} listed in .complete but missing from {directory}"
-            )
-        actual_hash = _sha256_file(filepath)
-        if actual_hash != expected_hash:
-            raise CheckpointIntegrityError(
-                f"SHA-256 mismatch for {filename} in {directory}: "
-                f"expected {expected_hash[:16]}..., got {actual_hash[:16]}..."
+                f"checkpoint tensor {name!r} has shape {got}, expected {want} "
+                f"for the saved ModelConfig"
             )
 
+    def jnp_at(name: str) -> "jax.Array":
+        return jnp.asarray(tensors[name])
 
-# ---------------------------------------------------------------------------
-# Atomic directory write
-# ---------------------------------------------------------------------------
-
-def _atomic_directory_write(target: Path):
-    """Context manager for atomic directory writes.
-
-    Usage:
-        with _atomic_directory_write(Path("step_00001")) as tmp:
-            save_file(tensors, tmp / "model.safetensors")
-            ...
-        # Directory is now at step_00001/ with .complete sentinel
-    """
-    class _AtomicDir:
-        def __init__(self, target: Path):
-            self.target = target
-            self.tmp = target.parent / f"{target.name}.tmp"
-
-        def __enter__(self) -> Path:
-            # Clean up any leftover .tmp from a previous crash
-            if self.tmp.exists():
-                shutil.rmtree(self.tmp)
-            self.tmp.mkdir(parents=True, exist_ok=True)
-            return self.tmp
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            if exc_type is not None:
-                # Error during write — clean up temp dir
-                if self.tmp.exists():
-                    shutil.rmtree(self.tmp)
-                return False
-
-            # Write .complete sentinel with hashes
-            _write_complete_sentinel(self.tmp)
-
-            # Atomic rename (same filesystem)
-            if self.target.exists():
-                shutil.rmtree(self.target)
-            os.rename(self.tmp, self.target)
-            return False
-
-    return _AtomicDir(target)
-
-
-# ---------------------------------------------------------------------------
-# JSON helpers
-# ---------------------------------------------------------------------------
-
-def _json_default(obj):
-    """JSON serializer for types not natively supported."""
-    if isinstance(obj, torch.Tensor):
-        return obj.item() if obj.numel() == 1 else obj.tolist()
-    if hasattr(obj, "item"):  # numpy scalar
-        return obj.item()
-    if isinstance(obj, Path):
-        return str(obj)
-    return str(obj)
-
-
-# ---------------------------------------------------------------------------
-# RNG state serialization
-# ---------------------------------------------------------------------------
-
-def _rng_to_json(
-    torch_rng: torch.Tensor | None, cuda_rng: torch.Tensor | None
-) -> dict:
-    data = {}
-    if torch_rng is not None:
-        data["torch_rng_state"] = base64.b64encode(
-            torch_rng.numpy().tobytes()
-        ).decode("ascii")
-    if cuda_rng is not None:
-        data["cuda_rng_state"] = base64.b64encode(
-            cuda_rng.numpy().tobytes()
-        ).decode("ascii")
-    return data
-
-
-def _json_to_rng(data: dict) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    torch_rng = None
-    if "torch_rng_state" in data:
-        raw = base64.b64decode(data["torch_rng_state"])
-        torch_rng = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
-    cuda_rng = None
-    if "cuda_rng_state" in data:
-        raw = base64.b64decode(data["cuda_rng_state"])
-        cuda_rng = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
-    return torch_rng, cuda_rng
-
-
-# ---------------------------------------------------------------------------
-# Optimizer state flattening for safetensors
-# ---------------------------------------------------------------------------
-
-def _flatten_optimizer_state(
-    opt_state_dict: dict,
-) -> tuple[dict[str, torch.Tensor], dict]:
-    """Flatten optimizer state into safetensors-compatible tensors + JSON metadata."""
-    tensors: dict[str, torch.Tensor] = {}
-    scalars: dict[str, float | int] = {}
-
-    for param_id, param_state in opt_state_dict["state"].items():
-        for key, val in param_state.items():
-            flat_key = f"state.{param_id}.{key}"
-            if isinstance(val, torch.Tensor):
-                t = val.cpu().contiguous()
-                if t.ndim == 0:
-                    t = t.unsqueeze(0)
-                tensors[flat_key] = t
-            else:
-                scalars[flat_key] = val
-
-    meta = {
-        "param_groups": opt_state_dict["param_groups"],
-        "scalars": scalars if scalars else None,
-    }
-    return tensors, meta
-
-
-def _unflatten_optimizer_state(
-    tensors: dict[str, torch.Tensor],
-    meta: dict,
-    device: str = "cpu",
-) -> dict:
-    """Reconstruct optimizer state_dict from flattened tensors + metadata."""
-    state: dict[int, dict[str, torch.Tensor | float | int]] = {}
-    scalars = meta.get("scalars") or {}
-
-    for flat_key, val in tensors.items():
-        parts = flat_key.split(".", 2)
-        if len(parts) != 3 or parts[0] != "state":
-            continue
-        try:
-            param_id = int(parts[1])
-        except ValueError:
-            continue
-        key = parts[2]
-        if param_id not in state:
-            state[param_id] = {}
-        t = val.to(device)
-        if t.shape == (1,) and key == "step":
-            t = t.squeeze(0)
-        state[param_id][key] = t
-
-    for flat_key, val in scalars.items():
-        parts = flat_key.split(".", 2)
-        if len(parts) != 3:
-            continue
-        try:
-            param_id = int(parts[1])
-        except ValueError:
-            continue
-        key = parts[2]
-        if param_id not in state:
-            state[param_id] = {}
-        state[param_id][key] = val
-
-    return {
-        "state": state,
-        "param_groups": meta["param_groups"],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Peek at checkpoint metadata without loading weights
-# ---------------------------------------------------------------------------
-
-def read_checkpoint_metadata(path: str | Path) -> dict:
-    """Return ``{"model_config": ..., "training_config": ...}`` from a
-    checkpoint without touching model weights or verifying the hash
-    sentinel. Used by resume/eval paths that need to peek at the saved
-    sequence format before building data pipelines.
-
-    Raises ``FileNotFoundError`` if the path or its ``config.json`` is
-    missing.
-    """
-    p = Path(path)
-    cfg_path = p / "config.json"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"No config.json at {cfg_path}")
-    with open(cfg_path) as f:
-        config = json.load(f)
-    return {
-        "model_config": config.get("model_config"),
-        "training_config": config.get("training_config"),
-    }
-
-
-class IncompatibleCheckpointError(Exception):
-    """Raised when a checkpoint's saved model_config is incompatible with
-    the current codebase (e.g. pre-migration vocab/context)."""
-    pass
-
-
-def _check_checkpoint_compatible(model_config: dict | None, path_hint: str | Path) -> None:
-    """Fail loud when loading a checkpoint whose vocab layout doesn't
-    match the current ``CLMConfig`` defaults.
-
-    The repo migrated to a new 1,980-token vocabulary (searchless_chess)
-    and a 512-token context window. Pre-migration checkpoints (4,284
-    vocab / 256 ctx) would silently load with mismatched embeddings — the
-    shapes happen to match for the factored-embedding layers, but the
-    decomposition table is different and every token would be embedded
-    as the wrong move.
-
-    Refuse to load those checkpoints and point the user at the
-    ``pre-vocab-transition`` git tag, the last commit before the vocabulary
-    transition that will load and work with the old checkpoints.
-    """
-    if not model_config:
-        return
-    from pawn.config import CLMConfig
-    expected_vocab = CLMConfig().vocab_size
-    vocab = model_config.get("vocab_size")
-    if vocab is not None and vocab != expected_vocab:
-        raise IncompatibleCheckpointError(
-            f"Checkpoint {path_hint} has vocab_size={vocab}, but this "
-            f"codebase only supports vocab_size={expected_vocab}. "
-            "Pre-migration checkpoints (4284-token vocab / 256-ctx) are "
-            "no longer loadable on `main`; check out the "
-            "`pre-vocab-transition` git tag to work with them."
+    layers = TransformerLayer(
+        attn_norm_w=jnp_at("layers.attn_norm_w"),
+        wq=jnp_at("layers.wq"),
+        wk=jnp_at("layers.wk"),
+        wv=jnp_at("layers.wv"),
+        wo=jnp_at("layers.wo"),
+        ffn_norm_w=jnp_at("layers.ffn_norm_w"),
+        w_gate=jnp_at("layers.w_gate"),
+        w_up=jnp_at("layers.w_up"),
+        w_down=jnp_at("layers.w_down"),
+    )
+    if cfg.factored_embeddings:
+        return FactoredPAWNModel(
+            embed_src=jnp_at("embed_src"),
+            embed_dst=jnp_at("embed_dst"),
+            embed_promo=jnp_at("embed_promo"),
+            embed_pad=jnp_at("embed_pad"),
+            embed_outcome=jnp_at("embed_outcome"),
+            layers=layers,
+            final_norm_w=jnp_at("final_norm_w"),
+            lm_head=jnp_at("lm_head"),
+            decomp_table=_build_decomp_table(),
+            cfg=cfg,
         )
+    lm_head = None if cfg.tie_embeddings else jnp_at("lm_head")
+    return PAWNModel(
+        embed_tokens=jnp_at("embed_tokens"),
+        layers=layers,
+        final_norm_w=jnp_at("final_norm_w"),
+        lm_head=lm_head,
+        decomp_table=_build_decomp_table(),
+        cfg=cfg,
+    )
 
 
-def get_prepend_outcome(training_config: dict | None) -> bool:
-    """Return the saved ``prepend_outcome`` flag for a checkpoint.
+def _expected_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
+    """Map every :func:`saved_fields` name (for ``cfg``'s ``tie_embeddings``)
+    to the shape implied by ``cfg``.
 
-    Reads ``training_config["prepend_outcome"]`` and returns it as a
-    bool. Raises ``ValueError`` when the field is absent — every current
-    checkpoint writes the full ``TrainingConfig.__dict__``, so a missing
-    field means either a partially-written checkpoint or hand-edited
-    config.json; callers must fail closed rather than guess the
-    sequence format.
+    Used at load time to refuse a tensor whose shape doesn't match the
+    ``ModelConfig`` we just parsed from ``config.json``. For the uniform
+    architecture the single ``embed_tokens[V, d]`` table carries every
+    token and ``lm_head`` is only expected for untied configs; for the
+    factored (v1) architecture (``cfg.factored_embeddings``) the schema
+    swaps in the ``src/dst/promo/pad/outcome`` tables and ``lm_head`` is
+    always present.
     """
-    training = training_config or {}
-    if "prepend_outcome" not in training:
-        raise ValueError(
-            "training_config has no 'prepend_outcome' field — cannot "
-            "determine sequence format. Pass prepend_outcome explicitly "
-            "in the run config."
-        )
-    return bool(training["prepend_outcome"])
-
-
-# ---------------------------------------------------------------------------
-# Pretrain checkpoint save/load
-# ---------------------------------------------------------------------------
-
-def save_pretrain_checkpoint(
-    path: str | Path,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    scaler,
-    global_step: int,
-    model_config: dict,
-    training_config: dict,
-    extra: dict | None = None,
-) -> None:
-    """Save a pretraining checkpoint atomically.
-
-    Writes to {path}.tmp/, then renames to {path}/ with .complete sentinel.
-    """
-    path = Path(path)
-
-    with _atomic_directory_write(path) as tmp:
-        # 1. Model weights
-        state_dict = {k: v.cpu().contiguous() for k, v in model.state_dict().items()}
-        save_file(state_dict, tmp / "model.safetensors")
-
-        # 2. Optimizer tensors
-        opt_tensors, opt_meta = _flatten_optimizer_state(optimizer.state_dict())
-        if opt_tensors:
-            save_file(opt_tensors, tmp / "optimizer.safetensors")
-
-        # 3. Training state (JSON)
-        training_state = {
-            "format_version": CHECKPOINT_FORMAT_VERSION,
-            "global_step": global_step,
-            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
-            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
-            "optimizer_meta": opt_meta,
-            **_rng_to_json(
-                torch.get_rng_state(),
-                torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
-            ),
-        }
-        if extra:
-            collisions = extra.keys() & training_state.keys()
-            if collisions:
-                raise ValueError(
-                    f"extra keys collide with training_state: {collisions}"
-                )
-            training_state.update(extra)
-        with open(tmp / "training_state.json", "w") as f:
-            json.dump(training_state, f, indent=2, default=_json_default)
-
-        # 4. Config
-        config = {
-            "format_version": CHECKPOINT_FORMAT_VERSION,
-            "checkpoint_type": "pretrain",
-            "model_config": model_config,
-            "training_config": training_config,
-        }
-        with open(tmp / "config.json", "w") as f:
-            json.dump(config, f, indent=2, default=_json_default)
-
-
-def load_pretrain_checkpoint(
-    path: str | Path,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer | None = None,
-    scheduler=None,
-    scaler=None,
-    device: str = "cpu",
-) -> dict:
-    """Load a pretraining checkpoint with integrity verification.
-
-    Verifies the .complete sentinel and SHA-256 hashes before loading
-    and refuses to load pre-migration checkpoints whose vocab_size
-    doesn't match the current codebase.
-    """
-    path = Path(path)
-
-    _verify_complete_sentinel(path)
-
-    with open(path / "config.json") as f:
-        saved_config = json.load(f)
-    _check_checkpoint_compatible(saved_config.get("model_config"), path)
-
-    weights = load_file(path / "model.safetensors", device=device)
-    model.load_state_dict(weights)
-
-    with open(path / "training_state.json") as f:
-        ts = json.load(f)
-
-    if optimizer and (path / "optimizer.safetensors").exists():
-        opt_tensors = load_file(path / "optimizer.safetensors", device=device)
-        opt_state = _unflatten_optimizer_state(opt_tensors, ts["optimizer_meta"], device)
-        optimizer.load_state_dict(opt_state)
-
-    if scheduler and "scheduler_state_dict" in ts:
-        scheduler.load_state_dict(ts["scheduler_state_dict"])
-
-    if scaler and "scaler_state_dict" in ts:
-        scaler.load_state_dict(ts["scaler_state_dict"])
-
-    torch_rng, cuda_rng = _json_to_rng(ts)
-    if torch_rng is not None:
-        torch.set_rng_state(torch_rng.cpu().byte())
-    if cuda_rng is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state(cuda_rng.cpu().byte())
-
-    with open(path / "config.json") as f:
-        config = json.load(f)
-
-    return {
-        "global_step": ts.get("global_step", 0),
-        "model_config": config.get("model_config"),
-        "training_config": config.get("training_config"),
-        "best_val_loss": ts.get("best_val_loss"),
-        "best_late_legality": ts.get("best_late_legality"),
-        "patience_counter": ts.get("patience_counter"),
+    d = cfg.d_model
+    d_ff = cfg.d_ff
+    L = cfg.n_layers
+    V = cfg.vocab_size
+    shapes: dict[str, tuple[int, ...]] = {
+        "layers.attn_norm_w": (L, d),
+        "layers.wq": (L, d, d),
+        "layers.wk": (L, d, d),
+        "layers.wv": (L, d, d),
+        "layers.wo": (L, d, d),
+        "layers.ffn_norm_w": (L, d),
+        "layers.w_gate": (L, d, d_ff),
+        "layers.w_up": (L, d, d_ff),
+        "layers.w_down": (L, d_ff, d),
+        "final_norm_w": (d,),
     }
+    if cfg.factored_embeddings:
+        shapes["embed_src"] = (64, d)
+        shapes["embed_dst"] = (64, d)
+        shapes["embed_promo"] = (5, d)
+        shapes["embed_pad"] = (d,)
+        shapes["embed_outcome"] = (cfg.n_outcomes, d)
+        shapes["lm_head"] = (d, V)
+        return shapes
+    shapes["embed_tokens"] = (V, d)
+    if not cfg.tie_embeddings:
+        shapes["lm_head"] = (d, V)
+    return shapes
 
 
-# ---------------------------------------------------------------------------
-# Adapter checkpoint save/load
-# ---------------------------------------------------------------------------
-
-def save_adapter_checkpoint(
-    path: str | Path,
-    adapter_state_dict: dict[str, torch.Tensor],
-    config: dict,
-    epoch: int,
-    step: int,
-    val_metrics: dict,
-    optimizer: torch.optim.Optimizer | None = None,
-    scheduler=None,
-    scaler=None,
-    extra: dict | None = None,
-) -> None:
-    """Save an adapter checkpoint atomically."""
-    path = Path(path)
-
-    with _atomic_directory_write(path) as tmp:
-        # 1. Adapter weights
-        tensors = {k: v.cpu().contiguous() for k, v in adapter_state_dict.items()}
-        save_file(tensors, tmp / "adapter.safetensors")
-
-        # 2. Optimizer tensors (if provided)
-        opt_meta = None
-        if optimizer is not None:
-            opt_tensors, opt_meta = _flatten_optimizer_state(optimizer.state_dict())
-            if opt_tensors:
-                save_file(opt_tensors, tmp / "optimizer.safetensors")
-
-        # 3. Training state
-        training_state: dict = {
-            "format_version": CHECKPOINT_FORMAT_VERSION,
-            "epoch": epoch,
-            "step": step,
-            "val_metrics": val_metrics,
-        }
-        if opt_meta is not None:
-            training_state["optimizer_meta"] = opt_meta
-        if scheduler is not None:
-            training_state["scheduler_state_dict"] = scheduler.state_dict()
-        if scaler is not None:
-            training_state["scaler_state_dict"] = scaler.state_dict()
-        if extra:
-            collisions = extra.keys() & training_state.keys()
-            if collisions:
-                raise ValueError(
-                    f"extra keys collide with training_state: {collisions}"
-                )
-            training_state.update(extra)
-
-        with open(tmp / "training_state.json", "w") as f:
-            json.dump(training_state, f, indent=2, default=_json_default)
-
-        # 4. Config
-        with open(tmp / "config.json", "w") as f:
-            json.dump(config, f, indent=2, default=_json_default)
+def _cfg_to_dict(cfg: ModelConfig) -> dict[str, Any]:
+    return dataclasses.asdict(cfg)
 
 
-def load_adapter_checkpoint(
-    path: str | Path,
-    device: str = "cpu",
-) -> dict:
-    """Load an adapter checkpoint with integrity verification."""
-    path = Path(path)
+def _cfg_from_dict(raw: dict[str, Any]) -> ModelConfig:
+    """Rebuild a :class:`ModelConfig` from its JSON-serialised dict.
 
-    _verify_complete_sentinel(path)
-
-    adapter_weights = load_file(path / "adapter.safetensors", device=device)
-
-    with open(path / "config.json") as f:
-        config = json.load(f)
-
-    ts = {}
-    ts_path = path / "training_state.json"
-    if ts_path.exists():
-        with open(ts_path) as f:
-            ts = json.load(f)
-
-    result: dict = {
-        "adapter_state_dict": adapter_weights,
-        "config": config,
-        "epoch": ts.get("epoch", 0),
-        "step": ts.get("step", 0),
-        "val_metrics": ts.get("val_metrics", {}),
-        "best_val_loss": ts.get("best_val_loss"),
-        "patience_counter": ts.get("patience_counter"),
-        # ``steps_per_epoch`` persists the save-time value so resume can
-        # fast-forward exactly, independent of any runtime estimate.
-        # ``None`` for checkpoints written before this field existed.
-        "steps_per_epoch": ts.get("steps_per_epoch"),
-    }
-
-    if (path / "optimizer.safetensors").exists() and "optimizer_meta" in ts:
-        opt_tensors = load_file(path / "optimizer.safetensors", device=device)
-        result["optimizer_state_dict"] = _unflatten_optimizer_state(
-            opt_tensors, ts["optimizer_meta"], device
+    Rejects extra keys (caller likely loaded a future-version manifest
+    we don't understand) and missing required keys with
+    :class:`CheckpointIntegrityError`.
+    """
+    expected_fields = {f.name for f in dataclasses.fields(ModelConfig)}
+    extras = set(raw.keys()) - expected_fields
+    if extras:
+        raise CheckpointIntegrityError(
+            f"config.json `model` block has unexpected keys: {sorted(extras)}"
         )
-
-    if "scheduler_state_dict" in ts:
-        result["scheduler_state_dict"] = ts["scheduler_state_dict"]
-
-    if "scaler_state_dict" in ts:
-        result["scaler_state_dict"] = ts["scaler_state_dict"]
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Backbone-only loading (inference)
-# ---------------------------------------------------------------------------
-
-def load_backbone_weights(
-    path: str | Path,
-    device: str = "cpu",
-) -> tuple[dict[str, torch.Tensor], dict | None]:
-    """Load model weights and config for inference with integrity verification.
-
-    Works with:
-    - HuggingFace repo IDs (e.g. "thomas-schweich/pawn-small") — downloads
-      model.safetensors + config.json via huggingface_hub
-    - Checkpoint directories (reads model.safetensors + config.json, verifies .complete)
-    - Bare model.safetensors files (no .complete check — used for HF downloads)
-
-    Returns (state_dict, model_config_dict_or_None).
-    """
-    path_str = str(path)
-
-    # HuggingFace repo ID: contains "/" and doesn't exist as a local path
-    if "/" in path_str and not Path(path_str).exists():
-        return _load_from_hf_repo(path_str, device)
-
-    path = Path(path)
-
-    # Directory with model.safetensors
-    if path.is_dir():
-        sf_path = path / "model.safetensors"
-        if not sf_path.exists():
-            raise FileNotFoundError(f"No model.safetensors in {path}")
-        # Verify integrity if .complete exists (new format checkpoints)
-        if (path / ".complete").exists():
-            _verify_complete_sentinel(path)
-        config = None
-        config_path = path / "config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                config = json.load(f).get("model_config")
-        _check_checkpoint_compatible(config, path)
-        weights = load_file(sf_path, device=device)
-        return weights, config
-
-    # Bare safetensors file
-    if path.suffix == ".safetensors":
-        config = None
-        config_path = path.parent / "config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                config = json.load(f).get("model_config")
-        _check_checkpoint_compatible(config, path)
-        weights = load_file(path, device=device)
-        return weights, config
-
-    raise ValueError(f"Unrecognized checkpoint format: {path}")
-
-
-def _load_from_hf_repo(
-    repo_id: str,
-    device: str = "cpu",
-) -> tuple[dict[str, torch.Tensor], dict | None]:
-    """Download and load model weights from a HuggingFace model repo.
-
-    Fetches ``config.json`` first so the vocab-compatibility gate runs
-    against real metadata. Network / auth / rate-limit errors on that
-    fetch propagate — previously they were silently swallowed, which
-    let pre-migration checkpoints load with ``config=None`` and bypass
-    ``_check_checkpoint_compatible`` entirely. Only a legitimately
-    missing ``config.json`` in the repo is treated as "no metadata".
-    """
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.utils import EntryNotFoundError
-
-    print(f"Downloading weights from HuggingFace: {repo_id}")
-
-    config: dict | None = None
     try:
-        config_path = hf_hub_download(repo_id, "config.json")
-    except EntryNotFoundError:
-        # Repo has no config.json at all — bare safetensors.
-        pass
-    else:
-        with open(config_path) as f:
-            config = json.load(f).get("model_config")
-    _check_checkpoint_compatible(config, repo_id)
-
-    sf_path = hf_hub_download(repo_id, "model.safetensors")
-    weights = load_file(sf_path, device=device)
-    return weights, config
+        return ModelConfig(**raw)
+    except (TypeError, ValueError) as e:
+        raise CheckpointIntegrityError(
+            f"config.json `model` block is not a valid ModelConfig: {e}"
+        ) from e
 
 
 # ---------------------------------------------------------------------------
-# Best-step discovery
+# Public API
 # ---------------------------------------------------------------------------
 
-def find_best_adapter_step(metrics_path: str | Path) -> int | None:
-    """Find the step with lowest ``val_loss`` in an adapter ``metrics.jsonl``.
 
-    Adapter training writes one record per eval under ``type="train"`` with
-    ``val_loss`` / ``val_top1`` / ... as kwargs (see
-    ``pawn.adapter_training.train``'s eval block and
-    ``pawn.logging.MetricsLogger.log_train``). The pretraining counterpart
-    lives in ``scripts/export_hf_repo.find_best_step`` and looks for
-    ``type="val"`` with ``val/loss``; that function does not apply here.
+def save_model(
+    model: PAWNModel | FactoredPAWNModel,
+    target_dir: Path | str,
+    *,
+    run_config: dict[str, Any] | None = None,
+    optimizer_state: dict[str, np.ndarray] | None = None,
+    training_state: dict[str, Any] | None = None,
+) -> Path:
+    """Atomically write a model checkpoint to ``target_dir``.
 
-    Returns the step of the record with the lowest finite ``val_loss``, or
-    ``None`` if no eval records were found.
+    Accepts either the uniform :class:`PAWNModel` or the factored
+    :class:`FactoredPAWNModel` — the save schema is selected by the model
+    type and the architecture is recorded via
+    ``ModelConfig.factored_embeddings`` inside ``config.json``, so
+    :func:`load_model` rebuilds the right class without a separate tag.
+
+    Returns the final ``target_dir`` :class:`Path`.
+
+    The write is staged in ``<target_dir>.tmp``; an orphan ``.tmp`` from
+    a prior crashed save is cleaned up first. The final rename is the
+    POSIX-atomic step — once it completes, the directory is loadable.
+
+    ``run_config`` / ``optimizer_state`` / ``training_state`` are
+    optional; if any are passed, the corresponding files land alongside
+    ``model.safetensors`` / ``config.json``. The trainer (S6) and the
+    HF-push path (S12) supply them; S2 callers don't have to.
+
+    Raises :class:`FileExistsError` if ``target_dir`` already exists —
+    checkpoints are immutable by design, so an accidental overwrite is
+    surfaced as a bug instead of silent data loss.
     """
-    metrics_path = Path(metrics_path)
-    best_loss = float("inf")
+    final = Path(target_dir)
+    tmp = final.with_name(final.name + ".tmp")
+
+    if final.exists():
+        raise FileExistsError(
+            f"checkpoint already exists at {final}; refusing to overwrite. "
+            f"Save to a new step path or delete the existing dir explicitly."
+        )
+    # Discard any orphan from a prior crashed save. Tolerate a non-directory
+    # at the .tmp path (regular file, symlink) — surface the cleanup as part
+    # of the documented contract.
+    if tmp.is_dir():
+        shutil.rmtree(tmp)
+    elif tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
+    tmp.mkdir(parents=True, exist_ok=False)
+
+    # If any write step below raises, the partially-populated tmp dir
+    # would otherwise linger until the next save to the same target path
+    # cleans it up. Clean it ourselves on any exception and re-raise, so
+    # the failure mode is "no .tmp left behind" regardless of which save
+    # target the caller retries with.
+    try:
+        payload_files: list[str] = [MODEL_FILE, CONFIG_FILE]
+
+        # 1. model.safetensors
+        tensors = _model_to_tensor_dict(model)
+        st_save(tensors, str(tmp / MODEL_FILE))
+
+        # 2. config.json. ``version`` is the checkpoint *format* version;
+        # ``mask_version`` is the layout/prefix/loss-mask contract version
+        # (Chunk 4 owns its value). The run block carries the run's
+        # ``conditioning`` + derived ``C`` (filled by the trainer / adapter
+        # driver) so eval can rebuild the exact sequence layout the
+        # checkpoint was trained under (plan §8.1: eval reads the
+        # checkpoint's own conditioning). ``tie_embeddings`` + ``vocab_size``
+        # are already inside the ``model`` block via ``_cfg_to_dict``.
+        payload: dict[str, Any] = {
+            "version": CHECKPOINT_FORMAT_VERSION,
+            "mask_version": MASK_VERSION,
+            "model": _cfg_to_dict(model.cfg),
+        }
+        if run_config is not None:
+            payload["run"] = run_config
+        (tmp / CONFIG_FILE).write_text(
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        )
+
+        # 3. Optional optimizer.safetensors
+        if optimizer_state is not None:
+            st_save(optimizer_state, str(tmp / OPTIMIZER_FILE))
+            payload_files.append(OPTIMIZER_FILE)
+
+        # 4. Optional training_state.json
+        if training_state is not None:
+            (tmp / TRAINING_STATE_FILE).write_text(
+                json.dumps(training_state, indent=2) + "\n", encoding="utf-8"
+            )
+            payload_files.append(TRAINING_STATE_FILE)
+
+        # 5. .complete sentinel — must be written into tmp BEFORE the rename
+        # so the final dir is never seen in a partial state.
+        write_sentinel(tmp, payload_files)
+
+        # 6. POSIX-atomic rename. After this point the checkpoint is loadable.
+        os.rename(tmp, final)
+    except BaseException:
+        # Includes KeyboardInterrupt / SystemExit; we want to clean up under
+        # all unexpected exits before re-raising to the caller.
+        if tmp.is_dir():
+            shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    return final
+
+
+def require_uniform(
+    model: PAWNModel | FactoredPAWNModel, context: str
+) -> PAWNModel:
+    """Narrow a loaded model to the uniform :class:`PAWNModel`, or raise.
+
+    The supernet-slicing, adapter, distillation, and parity paths only
+    operate on the uniform architecture; a factored (v1-architecture)
+    checkpoint reaching them is a caller error. This helper turns that
+    into a loud, actionable :class:`TypeError` at the load boundary
+    instead of an attribute error deep inside the consumer.
+    """
+    if not isinstance(model, PAWNModel):
+        raise TypeError(
+            f"{context} requires the uniform PAWNModel; got "
+            f"{type(model).__name__} (factored v1-architecture checkpoints "
+            "are not supported on this path)"
+        )
+    return model
+
+
+def _verify_and_read_config(target_dir: Path | str) -> dict[str, Any]:
+    """Verify the sentinel + manifest coverage and return the parsed
+    ``config.json`` dict.
+
+    Re-hashes every file in the manifest and refuses a manifest that
+    doesn't cover both required payloads, then validates the top-level
+    ``version`` / ``mask_version`` tags. The caller pulls the ``model`` /
+    ``run`` blocks out of the returned dict.
+    """
+    directory = Path(target_dir)
+    manifest = verify_sentinel(directory)
+    # Defense in depth: verify_sentinel only re-hashes whatever the
+    # manifest claims. A malformed `.complete` that omits MODEL_FILE
+    # would let `load_model` proceed to read an unverified file. Refuse
+    # to load any checkpoint whose manifest doesn't cover both required
+    # payloads.
+    _require_payloads_in_manifest(manifest, directory)
+
+    cfg_path = directory / CONFIG_FILE
+    raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    version = raw.get("version")
+    if version != CHECKPOINT_FORMAT_VERSION:
+        raise CheckpointIntegrityError(
+            f"config.json version is {version!r}, expected {CHECKPOINT_FORMAT_VERSION}: "
+            f"{cfg_path}"
+        )
+    # ``mask_version`` is optional for forward-compat with older checkpoints
+    # written before the tag existed (they predate the conditioning prefix,
+    # so the layout is the implicit v0 contract). If present it must match.
+    mask_version = raw.get("mask_version", MASK_VERSION)
+    if mask_version != MASK_VERSION:
+        raise CheckpointIntegrityError(
+            f"config.json mask_version is {mask_version!r}, expected "
+            f"{MASK_VERSION}: {cfg_path}"
+        )
+    return raw
+
+
+def load_model_config(target_dir: Path | str) -> ModelConfig:
+    """Verify the sentinel and parse the :class:`ModelConfig` only.
+
+    Skips the safetensors load + JAX device transfer that
+    :func:`load_model` performs, but **does** still re-hash every file
+    in the manifest — the dashboard "show me this run's hyperparameters"
+    use case still pays for the SHA-256 streaming over the (potentially
+    multi-GB) ``model.safetensors``. If a caller knows the directory is
+    fresh-from-disk and wants to skip integrity verification, they
+    should read ``config.json`` themselves.
+    """
+    raw = _verify_and_read_config(target_dir)
+    model_block = raw.get("model")
+    if not isinstance(model_block, dict):
+        raise CheckpointIntegrityError(
+            f"config.json is missing the `model` block: "
+            f"{Path(target_dir) / CONFIG_FILE}"
+        )
+    return _cfg_from_dict(model_block)
+
+
+def _require_payloads_in_manifest(
+    manifest: dict[str, str], directory: Path
+) -> None:
+    """Reject a sentinel manifest that doesn't cover the required payload files.
+
+    The required set is ``{MODEL_FILE, CONFIG_FILE}``. A manifest that
+    omits either would allow :func:`load_model` to read an
+    unverified file — exactly what the SHA-256 contract is supposed to
+    prevent.
+    """
+    required = {MODEL_FILE, CONFIG_FILE}
+    missing_in_manifest = required - set(manifest.keys())
+    if missing_in_manifest:
+        raise CheckpointIntegrityError(
+            f"checkpoint sentinel at {directory} doesn't cover required "
+            f"payloads: {sorted(missing_in_manifest)}"
+        )
+
+
+def load_model(
+    target_dir: Path | str,
+) -> tuple[PAWNModel | FactoredPAWNModel, dict[str, Any] | None]:
+    """Verify the sentinel and load a model from disk.
+
+    The concrete class is selected by the saved config's
+    ``factored_embeddings`` flag — :class:`FactoredPAWNModel` for the
+    v1-architecture experiment checkpoints, :class:`PAWNModel` otherwise.
+
+    Returns ``(model, run_block)`` — ``run_block`` is the persisted run
+    config dict (``config.json``'s ``run`` block) or ``None`` if the
+    checkpoint was written without one. Eval/generation read the run
+    block to rebuild the exact sequence layout (conditioning + derived
+    ``C``) the checkpoint was trained under, rather than assuming a
+    hardcoded default (plan §8.1: eval reads the checkpoint's own
+    conditioning).
+
+    Workflow:
+
+    1. :func:`pawn._sentinel.verify_sentinel` re-hashes every payload
+       file and confirms the manifest. Raises
+       :class:`IncompleteCheckpointError` if ``.complete`` is missing
+       (interrupted save) or :class:`CheckpointIntegrityError` on any
+       SHA-256 mismatch.
+    2. Parse ``config.json`` → :class:`ModelConfig` + run block. The
+       model block's keys must match :class:`ModelConfig`'s fields
+       exactly; the top-level ``version`` / ``mask_version`` tags must
+       match this build.
+    3. Load ``model.safetensors``. Every name in
+       :func:`pawn.model.saved_fields` (for the config's
+       ``tie_embeddings``) must be present, with the shape ``cfg``
+       implies. A tied↔untied mismatch is a hard error.
+    4. Rebuild the :class:`PAWNModel` (decomp table is rebuilt from
+       the engine vocab).
+    """
+    directory = Path(target_dir)
+    raw = _verify_and_read_config(directory)  # verify sentinel + tags
+    model_block = raw.get("model")
+    if not isinstance(model_block, dict):
+        raise CheckpointIntegrityError(
+            f"config.json is missing the `model` block: {directory / CONFIG_FILE}"
+        )
+    cfg = _cfg_from_dict(model_block)
+    run_block = raw.get("run")
+    if run_block is not None and not isinstance(run_block, dict):
+        raise CheckpointIntegrityError(
+            f"config.json `run` block is not a dict: {directory / CONFIG_FILE}"
+        )
+    tensors = st_load(str(directory / MODEL_FILE))
+    model = _tensor_dict_to_model(tensors, cfg)
+    return model, run_block
+
+
+def load_eval_model(
+    target_dir: Path | str,
+) -> tuple["EffectiveCallable", dict[str, Any] | None]:
+    """Load a checkpoint as the *adapted* effective model for eval.
+
+    :func:`load_model` returns the bare :class:`PAWNModel` from
+    ``model.safetensors``. For weight-folding adapters (lora / sparse /
+    unfreeze / specialized_clm) that's already the adapted model — the
+    fold is baked into the published tensors. But **bottleneck** and
+    **pure-FiLM** adapters publish the *frozen backbone* plus a typed
+    ``adapter.safetensors`` sidecar (the residual MLPs / FiLM slabs are
+    injected at forward time, not folded), and a **hybrid** checkpoint
+    folds only its LoRA half and keeps the FiLM half in the sidecar.
+    Loading those with :func:`load_model` alone evaluates the bare
+    backbone and silently drops the adapter — exactly the
+    ``load-model-adapter-reapply`` parity gap (a bottleneck adapter
+    eval'd as a bare backbone scores at the backbone's accuracy, not the
+    adapted model's).
+
+    This re-applies the sidecar so the returned callable runs the
+    adapted model. It reads the checkpoint's ``run`` block to recover the
+    ``strategy`` + adapter hyperparameters (the same ``cfg`` the sidecar
+    was saved against), rebuilds the typed adapter config, restores the
+    adapter from the sidecar, and wraps it back into the effective model.
+
+    Returns ``(effective_model, run_block)`` where ``effective_model``
+    satisfies :class:`pawn.model.EffectiveCallable` — a bare
+    :class:`PAWNModel` for the no-sidecar case, or a
+    ``BottleneckEffective`` / ``FiLMEffective`` wrapper for the
+    sidecar-bearing adapters. Callers that specifically need the raw
+    ``PAWNModel`` should call :func:`load_model` instead.
+    """
+    directory = Path(target_dir)
+    model, run_block = load_model(directory)
+    strategy = run_block.get("strategy") if isinstance(run_block, dict) else None
+    sidecar = directory / ADAPTER_SAFETENSORS
+    # Only the sidecar-bearing adapters need re-application. Everything
+    # else (no run block, no strategy, or a weight-folding strategy) is
+    # already the adapted model on disk.
+    if strategy is None or not sidecar.is_file():
+        return model, run_block
+    assert isinstance(run_block, dict)
+    # Sidecar-bearing adapters (bottleneck / FiLM / retro-bottleneck RoSA)
+    # are only ever trained against the uniform PAWNModel backbone — the
+    # factored (v1-architecture) experiment has no adapter path. A factored
+    # checkpoint with an adapter sidecar is therefore malformed; refuse it
+    # loudly rather than letting the apply_* calls fail on a field mismatch.
+    if isinstance(model, FactoredPAWNModel):
+        raise CheckpointIntegrityError(
+            f"checkpoint at {directory} pairs a factored_embeddings model "
+            f"with an {ADAPTER_SAFETENSORS} sidecar (strategy={strategy!r}); "
+            "adapters are only supported on the uniform PAWNModel backbone"
+        )
+
+    if strategy == "bottleneck":
+        from pawn.adapters.bottleneck import (
+            BottleneckConfig,
+            apply_bottleneck,
+            load_bottleneck_adapter,
+        )
+
+        b_cfg = BottleneckConfig(
+            dim=int(run_block.get("bottleneck_dim") or 8),
+            n_hidden=int(run_block.get("bottleneck_n_hidden") or 0),
+            no_adapt_attn=bool(run_block.get("no_adapt_attn", False)),
+            no_adapt_ffn=bool(run_block.get("no_adapt_ffn", False)),
+            layers=_adapter_layers(run_block.get("adapter_layers")),
+        )
+        adapter = load_bottleneck_adapter(directory, b_cfg)
+        return apply_bottleneck(model, adapter), run_block
+
+    if strategy in ("film", "hybrid"):
+        # Pure FiLM publishes the frozen backbone + FiLM sidecar; hybrid
+        # publishes the LoRA-folded backbone + FiLM sidecar. In both cases
+        # ``model`` is the correct backbone to wrap — re-apply the FiLM
+        # slabs onto whatever ``load_model`` returned.
+        from pawn.adapters.film import (
+            FiLMConfig,
+            apply_film,
+            load_film_adapter,
+        )
+
+        f_cfg = FiLMConfig(use_output_film=bool(run_block.get("use_output_film", True)))
+        adapter = load_film_adapter(directory, f_cfg)
+        return apply_film(model, adapter), run_block
+
+    # RoSA in ``retro-bottleneck`` mode is the third sidecar-bearing
+    # strategy. ``apply_rosa`` returns a ``BottleneckEffective`` in that
+    # mode (rosa.py: backbone + sparse delta + Houlsby bottleneck), so
+    # ``write_adapter_checkpoint`` folds the sparse delta into
+    # ``model.safetensors`` and writes the Houlsby MLPs to the
+    # ``adapter.safetensors`` sidecar. Both the literal
+    # ``rosa-retro-bottleneck`` strategy and the ``rosa`` strategy with
+    # ``rosa_mode == "retro-bottleneck"`` (the H9 ``rosa-ratio`` sweep maps
+    # onto the latter) land here. Without re-applying the sidecar, eval
+    # would score the sparse-folded backbone *without* the bottleneck
+    # residual — the exact ``load-model-adapter-reapply`` gap.
+    rosa_mode = run_block.get("rosa_mode")
+    is_retro_bottleneck = strategy == "rosa-retro-bottleneck" or (
+        strategy == "rosa" and rosa_mode == "retro-bottleneck"
+    )
+    if is_retro_bottleneck:
+        from pawn.adapters.bottleneck import (
+            BottleneckConfig,
+            apply_bottleneck,
+            load_bottleneck_adapter,
+        )
+
+        # Reconstruct the exact ``BottleneckConfig`` RoSA built in
+        # ``init_rosa_adapter`` (rosa.py): ``dim`` / ``n_hidden`` / ``layers``
+        # only — both attn + ffn placements are on (RoSA never threads
+        # ``no_adapt_*`` into its Houlsby branch). ``bottleneck_dim`` may be
+        # ``None`` in the run block (RoSAConfig's own default of 8 stands).
+        bottleneck_dim = run_block.get("bottleneck_dim")
+        b_cfg = BottleneckConfig(
+            dim=int(bottleneck_dim) if bottleneck_dim is not None else 8,
+            n_hidden=int(run_block.get("bottleneck_n_hidden") or 0),
+            layers=_adapter_layers(run_block.get("adapter_layers")),
+        )
+        adapter = load_bottleneck_adapter(directory, b_cfg)
+        return apply_bottleneck(model, adapter), run_block
+
+    # Any other strategy that happens to have written a sidecar is already
+    # weight-folded into model.safetensors; return the bare backbone.
+    return model, run_block
+
+
+def _adapter_layers(value: object) -> tuple[int, ...] | None:
+    """Parse the persisted ``adapter_layers`` spec to a tuple (or None).
+
+    Accepts the list form written by ``model_dump`` and the
+    comma-separated string form a hand-written ``--config`` JSON might
+    carry. ``None`` means "every layer" (the placement default).
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return tuple(int(x) for x in value)
+    if isinstance(value, str):
+        if value.strip() == "":
+            return None
+        return tuple(int(x) for x in value.split(","))
+    raise TypeError(f"unrecognized adapter_layers spec: {value!r}")
+
+
+def save_adapter_resume_state(
+    backbone: PAWNModel, adapter: Any, ckpt_dir: Path | str
+) -> Path:
+    """Serialise the raw ``(backbone, adapter)`` PyTree into a resume sidecar.
+
+    The published ``model.safetensors`` for a weight-folding adapter holds
+    the *folded* effective model (``apply_fn(backbone, adapter)``) so
+    downstream eval treats it as an ordinary checkpoint. That fold is one-way
+    (and, for sparse, the trained mask isn't recoverable from it at all), so a
+    faithful ``--resume`` can't reconstruct the pre-fold split from
+    ``model.safetensors`` alone. This sidecar persists the *raw* frozen
+    backbone and the trained adapter PyTree verbatim via
+    :func:`equinox.tree_serialise_leaves`, so the resume path can restore the
+    identical (backbone, adapter) the warm Adam moments were trained against —
+    no cold-started params under a warm optimiser state (H3).
+
+    The frozen backbone is constant across the run; persisting it per
+    checkpoint trades a little disk for a correctness guarantee that holds
+    even when the original ``--checkpoint`` source is no longer reachable.
+
+    Returns the written sidecar :class:`Path`. Like the typed bottleneck / FiLM
+    sidecars, this lands next to the finalised ``model.safetensors`` *after*
+    :func:`save_model`'s atomic rename, so it is not part of the ``.complete``
+    integrity manifest — the resume path predicates on its presence and falls
+    back to a cold opt-state when it's absent.
+    """
+    out = Path(ckpt_dir) / ADAPTER_RESUME_FILE
+    eqx.tree_serialise_leaves(out, (backbone, adapter))
+    return out
+
+
+def load_adapter_resume_state(
+    backbone_like: PAWNModel, adapter_like: Any, ckpt_dir: Path | str
+) -> tuple[PAWNModel, Any]:
+    """Restore the raw ``(backbone, adapter)`` PyTree from the resume sidecar.
+
+    ``backbone_like`` / ``adapter_like`` are freshly-built templates of the
+    exact same PyTree structure as the saved pair — typically the loaded
+    (folded) backbone and the freshly cold-initialised adapter. They provide
+    the treedef + leaf shapes/dtypes; :func:`equinox.tree_deserialise_leaves`
+    overwrites every array leaf with the saved value, so the returned pair is
+    the raw frozen backbone and the trained adapter (including non-trainable
+    leaves like sparse masks).
+
+    Raises :class:`FileNotFoundError` if the sidecar isn't present — callers
+    that need an "is this a resumable folded-adapter checkpoint" probe should
+    test ``(ckpt_dir / ADAPTER_RESUME_FILE).is_file()`` first.
+    """
+    path = Path(ckpt_dir) / ADAPTER_RESUME_FILE
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"no {ADAPTER_RESUME_FILE} in {ckpt_dir} — this checkpoint was "
+            "written without the weight-folding adapter resume sidecar"
+        )
+    backbone, adapter = eqx.tree_deserialise_leaves(
+        path, (backbone_like, adapter_like)
+    )
+    return backbone, adapter
+
+
+def resolve_checkpoint_source(source: str) -> Path:
+    """Resolve a checkpoint identifier to a local directory.
+
+    Local paths that exist are returned as-is. Anything else is treated
+    as a HuggingFace repo ID and fetched via
+    :func:`huggingface_hub.snapshot_download`. The result is a directory
+    suitable for :func:`load_model` / :func:`load_model_config`.
+
+    v2 checkpoints only. v1 PyTorch artifacts (the original
+    ``thomas-schweich/pawn-{small,base,large}`` repos) are no longer
+    loadable in v2 — the legacy converter was removed in the H.2
+    housekeeping commit. To use v1 checkpoints, check out the
+    ``v1.0.0`` git tag.
+    """
+    p = Path(source)
+    if p.is_dir():
+        return p
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise RuntimeError(
+            f"checkpoint source {source!r} is not a local directory and "
+            f"huggingface_hub is not installed — pip install huggingface_hub"
+        ) from e
+    local = snapshot_download(repo_id=source, repo_type="model")
+    return Path(local)
+
+
+def find_best_adapter_step(
+    metrics_path: Path | str, *, metric: str = "val_loss"
+) -> int | None:
+    """Return the step with the lowest ``metric`` in a run's ``metrics.jsonl``.
+
+    The v2 owner of v1's best-checkpoint selection (``find_best_adapter_step``).
+    Adapter validation writes one ``type=val`` record per eval step carrying
+    ``val_loss`` (plus the richer ``val_top1`` / ``val_top5`` /
+    ``val_illegal_pred_rate``); this scans those records and returns the step
+    that minimises ``metric``.
+
+    Returns ``None`` when the file is absent or carries no ``type=val``
+    record with a finite ``metric`` value (e.g. a run with validation
+    disabled). Ties resolve to the *earliest* step (the first to reach the
+    best loss), matching v1's strict ``<`` best-update.
+    """
+    path = Path(metrics_path)
+    if not path.is_file():
+        return None
     best_step: int | None = None
-    with open(metrics_path) as f:
-        for line in f:
-            # Tolerate malformed lines (truncated writes, partial flushes)
-            # — skip rather than abort the whole scan. Matches the posture
-            # of ``push_checkpoint_to_hf``'s metrics-truncation reader.
+    best_val = float("inf")
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                record = json.loads(line)
+                rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            # Adapter eval records live under type="train" with val_loss.
-            val_loss = record.get("val_loss")
-            if val_loss is None:
+            if rec.get("type") != "val":
                 continue
-            step = record.get("step")
-            if step is None:
+            raw = rec.get(metric)
+            step = rec.get("step")
+            if raw is None or step is None:
                 continue
-            if val_loss < best_loss:
-                best_loss = float(val_loss)
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(val):
+                continue
+            if val < best_val:
+                best_val = val
                 best_step = int(step)
     return best_step
-
-
-# ---------------------------------------------------------------------------
-# HuggingFace push
-# ---------------------------------------------------------------------------
-
-
-class BackgroundCheckpointPusher:
-    """Serialized background HF pushes for a single run.
-
-    A HF branch can't be concurrently updated (``upload_folder`` creates
-    a commit, so two parallel uploads would race on the branch head), so
-    this helper runs pushes on a single-worker pool and blocks the
-    submitter on the previous future before accepting a new push.
-    Failures are logged (``print``) and swallowed, matching the prior
-    inline behavior.
-
-    Usage::
-
-        pusher = BackgroundCheckpointPusher()
-        ...
-        pusher.submit(path, "user/repo", "run/slug", step=1000)
-        ...
-        pusher.wait()   # before exit — ensures the last push lands
-
-    The helper is a no-op when ``hf_repo`` is ``None`` — callers can
-    construct it unconditionally and skip the ``submit`` call.
-    """
-
-    def __init__(self, thread_name_prefix: str = "hf-push") -> None:
-        from concurrent.futures import Future, ThreadPoolExecutor
-
-        self._pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=thread_name_prefix,
-        )
-        self._future: Future[None] | None = None
-
-    def _submit_serialized(
-        self,
-        thunk: "Callable[[], None]",
-        success_msg: str,
-        failure_label: str,
-        log_prefix: str,
-    ) -> None:
-        """Block on the previous future, then queue ``thunk``.
-
-        All push paths share the same shape: wait for the previous
-        upload (so two concurrent uploads don't race on the same branch
-        head or bucket subtree), submit the new one, log success or
-        failure. Centralizing it keeps the submit / submit_bucket
-        bodies focused on what's different — the underlying push call.
-        """
-        if self._future is not None:
-            self._future.result()
-
-        def _push() -> None:
-            try:
-                thunk()
-                print(f"{log_prefix}{success_msg}")
-            except Exception as e:
-                print(f"{log_prefix}WARNING: {failure_label} push failed: {e}")
-
-        self._future = self._pool.submit(_push)
-
-    def submit(
-        self,
-        checkpoint_path: str | Path,
-        repo_id: str,
-        branch: str,
-        *,
-        step: int,
-        metrics_path: str | Path | None = None,
-        log_prefix: str = "",
-    ) -> None:
-        """Queue a push. Blocks on the previous push if one is in flight."""
-        ckpt_path = str(checkpoint_path)
-        mpath = str(metrics_path) if metrics_path is not None else None
-
-        def thunk() -> None:
-            push_checkpoint_to_hf(
-                ckpt_path, repo_id, branch,
-                metrics_path=mpath, step=step,
-            )
-
-        self._submit_serialized(
-            thunk,
-            success_msg=f"Pushed to HF: {repo_id}@{branch}",
-            failure_label="HF",
-            log_prefix=log_prefix,
-        )
-
-    def submit_bucket(
-        self,
-        checkpoint_path: str | Path,
-        bucket: str,
-        *,
-        run_slug: str,
-        step: int,
-        metrics_path: str | Path | None = None,
-        log_prefix: str = "",
-    ) -> None:
-        """Queue a push to an HF bucket path.
-
-        ``bucket`` accepts either ``<namespace>/<bucket-name>`` or the
-        full ``hf://buckets/<namespace>/<bucket-name>[/<subpath>]`` URL.
-        Files land at ``<bucket>/logs/<run_slug>/checkpoints/step_NNNN/``
-        plus ``<bucket>/logs/<run_slug>/metrics.jsonl`` (when supplied).
-        Bucket sync goes through ``hf sync`` because the
-        ``HfApi.upload_folder(repo_type="bucket")`` path is not
-        supported as of the current ``huggingface_hub`` — see the
-        ``manage-pod`` skill's HF Bucket I/O note.
-        """
-        ckpt_path = str(checkpoint_path)
-        mpath = str(metrics_path) if metrics_path is not None else None
-
-        def thunk() -> None:
-            push_checkpoint_to_bucket(
-                ckpt_path, bucket, run_slug=run_slug,
-                metrics_path=mpath, step=step,
-            )
-
-        self._submit_serialized(
-            thunk,
-            success_msg=f"Pushed to bucket: {bucket} (run/{run_slug})",
-            failure_label="bucket",
-            log_prefix=log_prefix,
-        )
-
-    def wait(self) -> None:
-        """Block until all pending pushes finish and release the pool."""
-        if self._future is not None:
-            self._future.result()
-            self._future = None
-        self._pool.shutdown(wait=True)
-
-
-def truncate_metrics_jsonl(metrics_path: str | Path, step: int) -> str:
-    """Return the prefix of ``metrics_path`` covering steps ``<= step``.
-
-    The boundary semantics are inclusive on the target step: every train
-    or val record at exactly ``step`` is kept, and the loop stops on the
-    first train/val record whose ``step > step``. This keeps train+val
-    pairs at the boundary together (val often follows train at the same
-    global_step). Records without a ``type in {"train", "val"}`` field
-    (config rows, custom debug rows) and malformed JSON lines are
-    passed through verbatim — they don't gate the boundary check.
-
-    The full-file scan per push is intentional. At default settings
-    (``log_interval=100``, ``eval_interval=5000``,
-    ``checkpoint_interval=5000``) the metrics file is < 1 MB at every
-    checkpoint and the scan is bounded by sequential disk reads — well
-    inside microseconds. A running-cursor optimization would only matter
-    at very high checkpoint frequency or extremely long runs; if you hit
-    that regime, replace this helper with a stateful reader.
-    """
-    out: list[str] = []
-    target = int(step)
-    with open(metrics_path) as f:
-        for line in f:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                # Pass malformed lines through; don't let one bad row
-                # truncate the whole file.
-                out.append(line)
-                continue
-            if (
-                record.get("type") in ("train", "val")
-                and int(record.get("step", 0)) > target
-            ):
-                # First record beyond the target — stop *before* it so
-                # multiple records at the target step (e.g. a train then
-                # a val record at the same step) all make it in.
-                break
-            out.append(line)
-    return "".join(out)
-
-
-def push_checkpoint_to_hf(
-    checkpoint_path: str | Path,
-    repo_id: str,
-    branch: str,
-    metrics_path: str | Path | None = None,
-    step: int = 0,
-) -> None:
-    """Push a complete checkpoint directory to a HuggingFace repo branch.
-
-    Uploads checkpoint files to checkpoints/step_NNNN/ on the branch.
-    Optionally uploads metrics.jsonl (truncated to current step) to the root.
-
-    Requires HF_TOKEN environment variable or prior `huggingface_hub.login()`.
-    """
-    from huggingface_hub import HfApi
-
-    checkpoint_path = Path(checkpoint_path)
-    api = HfApi()
-
-    # Ensure branch exists
-    try:
-        api.create_branch(repo_id, repo_type="model", branch=branch, exist_ok=True)
-    except Exception:
-        pass  # Branch may already exist
-
-    # Upload checkpoint directory
-    api.upload_folder(
-        folder_path=str(checkpoint_path),
-        path_in_repo=f"checkpoints/{checkpoint_path.name}",
-        repo_id=repo_id,
-        repo_type="model",
-        revision=branch,
-        commit_message=f"Checkpoint step {step}",
-    )
-
-    # Upload truncated metrics.jsonl to repo root
-    if metrics_path is not None:
-        metrics_path = Path(metrics_path)
-        if metrics_path.exists():
-            import tempfile
-
-            truncated_text = truncate_metrics_jsonl(metrics_path, step)
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tmp:
-                tmp.write(truncated_text)
-                tmp_path = tmp.name
-
-            try:
-                api.upload_file(
-                    path_or_fileobj=tmp_path,
-                    path_in_repo="metrics.jsonl",
-                    repo_id=repo_id,
-                    repo_type="model",
-                    revision=branch,
-                    commit_message=f"Metrics through step {step}",
-                )
-            finally:
-                os.unlink(tmp_path)
-
-
-def push_checkpoint_to_bucket(
-    checkpoint_path: str | Path,
-    bucket: str,
-    *,
-    run_slug: str,
-    metrics_path: str | Path | None = None,
-    step: int = 0,
-) -> None:
-    """Push a checkpoint to an HF bucket path via ``hf sync``.
-
-    ``bucket`` accepts either ``<namespace>/<bucket-name>`` or a full
-    ``hf://buckets/<namespace>/<bucket-name>[/<subpath>]`` URL. Files
-    land at ``<bucket-url>/logs/<run_slug>/checkpoints/<step_dir>/``
-    plus ``<bucket-url>/logs/<run_slug>/metrics.jsonl`` (when given).
-
-    Why ``hf sync`` (and not ``HfApi.upload_folder(repo_type="bucket")``):
-    as of 2026-04, the ``hf upload`` / ``upload_folder`` paths reject
-    ``repo_type="bucket"`` and silently exit 0 — the only working
-    bucket I/O is the ``hf://buckets/...`` URL via ``hf sync``.
-    """
-    import shutil
-    import subprocess
-    import tempfile
-
-    checkpoint_path = Path(checkpoint_path)
-    bucket_url = (
-        bucket
-        if bucket.startswith("hf://buckets/")
-        else f"hf://buckets/{bucket.lstrip('/')}"
-    )
-    base = bucket_url.rstrip("/")
-    run_root = f"{base}/logs/{run_slug}"
-
-    # Stage the checkpoint directory under a temp tree shaped like the
-    # target. ``hf sync`` operates on a local tree → remote URL pair, so
-    # we mirror the on-bucket layout locally first. This is cheap (the
-    # checkpoint files are already on disk; we only create symlinks
-    # when the FS supports them, otherwise copy).
-    with tempfile.TemporaryDirectory() as staging:
-        staging_path = Path(staging)
-        ckpt_target = (
-            staging_path / "checkpoints" / checkpoint_path.name
-        )
-        ckpt_target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.symlink(checkpoint_path.resolve(), ckpt_target)
-        except OSError:
-            shutil.copytree(checkpoint_path, ckpt_target)
-
-        if metrics_path is not None and Path(metrics_path).exists():
-            # Match push_checkpoint_to_hf's "truncate at the current
-            # step" behavior so the bucket copy never gets ahead of
-            # the checkpoint it sits beside.
-            (staging_path / "metrics.jsonl").write_text(
-                truncate_metrics_jsonl(metrics_path, step)
-            )
-
-        result = subprocess.run(
-            ["hf", "sync", str(staging_path), run_root],
-            capture_output=True, text=True,
-        )
-        combined = (result.stdout or "") + (result.stderr or "")
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"hf sync exited {result.returncode}; "
-                f"output:\n{combined.strip()}"
-            )
-        # ``hf sync`` exits 0 even on per-blob 403/401/429 — re-grep the
-        # combined output for those signals so the trainer's wrapper
-        # ``_push`` catches them as failures instead of silence.
-        import re
-
-        if re.search(r"\b(403|401|429)\b|Forbidden|Unauthorized|RateLimit", combined):
-            raise RuntimeError(
-                "hf sync reported auth / quota / rate-limit signals "
-                f"despite exit 0:\n{combined.strip()}"
-            )

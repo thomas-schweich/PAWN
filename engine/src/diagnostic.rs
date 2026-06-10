@@ -144,8 +144,10 @@ pub fn generate_diagnostic_sets(
 
     let n_games = accepted_moves.len();
 
-    // Pack move_ids and per-ply stats into flat arrays
-    let mut move_ids_flat = vec![0i16; n_games * max_ply];
+    // Pack move_ids and per-ply stats into flat arrays.
+    // PAD-init: positions past each game's length are never written, and the
+    // vocab assigns 0 to a legal move, so a 0-init tail would read as moves.
+    let mut move_ids_flat = vec![crate::vocab::PAD_TOKEN as i16; n_games * max_ply];
     let mut per_ply_stats = vec![0u64; n_games * max_ply];
     let mut game_lengths_flat = Vec::with_capacity(n_games);
 

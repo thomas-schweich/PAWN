@@ -2,25 +2,25 @@
 
 from __future__ import annotations
 
-from typing import Any
+import optuna.distributions as d
+from optuna.distributions import BaseDistribution
 
 from pawn.sweep import BOTTLENECK_N_HIDDEN_CHOICES
 
 
-def builtin_distributions(strategy: str) -> dict[str, Any]:
+def builtin_distributions(strategy: str) -> dict[str, BaseDistribution]:
     """Return Optuna distributions for a PAWN adapter strategy."""
-    import optuna.distributions as d
     Cat = d.CategoricalDistribution
     Float = d.FloatDistribution
     Int = d.IntDistribution
 
-    common: dict[str, Any] = {
+    common: dict[str, BaseDistribution] = {
         "lr": Float(1e-5, 1e-2, log=True),
         "batch_size": Cat([32, 64, 128, 256]),
         "weight_decay": Float(0.0, 0.1),
         "warmup_frac": Float(0.0, 0.15),
     }
-    spaces: dict[str, dict[str, Any]] = {
+    spaces: dict[str, dict[str, BaseDistribution]] = {
         "lora": {**common,
             "lora_rank": Cat([2, 4, 8, 16, 32]),
             "lora_targets": Cat(["qkvo", "qv", "qkv"]),
@@ -54,7 +54,7 @@ def builtin_distributions(strategy: str) -> dict[str, Any]:
             "unfreeze_layers": Cat(["6,7", "5,6,7", "4,5,6,7"]),
         },
     }
-    rosa_common: dict[str, Any] = {**common,
+    rosa_common: dict[str, BaseDistribution] = {**common,
         "density": Float(0.001, 0.1, log=True),
         "lora_rank": Cat([2, 4, 8, 16]),
         "lora_targets": Cat(["qkvo", "qv", "qkv"]),
@@ -85,15 +85,28 @@ def builtin_distributions(strategy: str) -> dict[str, Any]:
     return spaces[strategy]
 
 
-def parse_distribution(spec: dict[str, Any]) -> Any:
+def parse_distribution(spec: dict[str, object]) -> BaseDistribution:
     """Convert a JSON distribution spec to an Optuna distribution object."""
-    import optuna.distributions as d
-
     t = spec["type"]
     if t == "float":
-        return d.FloatDistribution(spec["low"], spec["high"], log=spec.get("log", False))
+        low = spec["low"]
+        high = spec["high"]
+        if not isinstance(low, (int, float)) or not isinstance(high, (int, float)):
+            raise ValueError("float distribution requires numeric 'low' and 'high'")
+        log = bool(spec.get("log", False))
+        return d.FloatDistribution(float(low), float(high), log=log)
     elif t == "int":
-        return d.IntDistribution(spec["low"], spec["high"], step=spec.get("step", 1))
+        low = spec["low"]
+        high = spec["high"]
+        if not isinstance(low, (int, float)) or not isinstance(high, (int, float)):
+            raise ValueError("int distribution requires numeric 'low' and 'high'")
+        step_raw = spec.get("step", 1)
+        if not isinstance(step_raw, (int, float)):
+            raise ValueError("'step' must be numeric")
+        return d.IntDistribution(int(low), int(high), step=int(step_raw))
     elif t == "categorical":
-        return d.CategoricalDistribution(spec["choices"])
+        choices = spec["choices"]
+        if not isinstance(choices, list):
+            raise ValueError("categorical distribution requires a 'choices' list")
+        return d.CategoricalDistribution(choices)
     raise ValueError(f"Unknown distribution type: {t}")

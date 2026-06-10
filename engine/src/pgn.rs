@@ -609,13 +609,15 @@ pub fn san_moves_to_tokens_full(
 }
 
 /// Batch convert: multiple games, each as a list of SAN moves.
-/// Returns a flat (n_games * max_ply) i16 array (0-padded) + lengths.
+/// Returns a flat (n_games * max_ply) i16 array (PAD-padded) + lengths.
 pub fn batch_san_to_tokens(
     games: &[Vec<&str>],
     max_ply: usize,
 ) -> (Vec<i16>, Vec<i16>) {
     let n = games.len();
-    let mut flat = vec![0i16; n * max_ply];
+    // PAD-init: positions past each game's length are never written, and the
+    // vocab assigns 0 to a legal move, so a 0-init tail would read as moves.
+    let mut flat = vec![vocab::PAD_TOKEN as i16; n * max_ply];
     let mut lengths = Vec::with_capacity(n);
 
     for (gi, san_moves) in games.iter().enumerate() {
@@ -746,7 +748,9 @@ pub fn pgn_file_to_tokens(
         .collect();
 
     let n = filtered.len();
-    let mut flat = vec![0i16; n * max_ply];
+    // PAD-init: positions past each game's length are never written, and the
+    // vocab assigns 0 to a legal move, so a 0-init tail would read as moves.
+    let mut flat = vec![vocab::PAD_TOKEN as i16; n * max_ply];
     let mut lengths = Vec::with_capacity(n);
 
     for (gi, (tokens, n_valid)) in filtered.iter().enumerate() {
@@ -835,6 +839,22 @@ mod tests {
         assert_eq!(lengths[0], 4);
         assert_eq!(lengths[1], 2);
         assert_eq!(flat.len(), 2 * 256);
+
+        // The post-game tail must be PAD-initialised, never 0 — the vocab
+        // assigns token 0 to a legal move, so a 0-init tail would feed real
+        // moves into the downstream corpus past each game's length.
+        let pad = vocab::PAD_TOKEN as i16;
+        for b in 0..2 {
+            let len = lengths[b] as usize;
+            for t in len..256 {
+                assert_eq!(
+                    flat[b * 256 + t], pad,
+                    "pgn_file_to_tokens: tail position {} of game {} (len={}) \
+                     must be PAD ({}), got {}",
+                    t, b, len, pad, flat[b * 256 + t]
+                );
+            }
+        }
 
         fs::remove_file(path).ok();
     }
@@ -1474,10 +1494,13 @@ mod tests {
         let (flat, lengths) = batch_san_to_tokens(&games, 8);
         assert_eq!(flat.len(), 2 * 8);
         assert_eq!(lengths, vec![2, 3]);
-        // Check padding beyond lengths is zero
-        assert_eq!(flat[2], 0); // game 0 ply 2 (padding)
-        assert_eq!(flat[7], 0); // game 0 ply 7 (padding)
-        assert_eq!(flat[8 + 3], 0); // game 1 ply 3 (padding)
+        // Padding beyond each game's length is the PAD token (1968), not 0:
+        // the vocab assigns 0 to a legal move, so a 0-init tail would read
+        // as a real move downstream.
+        let pad = vocab::PAD_TOKEN as i16;
+        assert_eq!(flat[2], pad); // game 0 ply 2 (padding)
+        assert_eq!(flat[7], pad); // game 0 ply 7 (padding)
+        assert_eq!(flat[8 + 3], pad); // game 1 ply 3 (padding)
     }
 
     #[test]

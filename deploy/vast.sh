@@ -40,7 +40,29 @@ mkdir -p "$VAST_DIR"
 # Default instance settings
 DEFAULT_GPU="RTX_A5000"
 DEFAULT_DISK=100                       # vast.ai uses one disk (no separate volume)
-DEFAULT_IMAGE="thomasschweich/pawn:latest"
+# Default image is branch-aware (H.4): on the JAX migration branch we
+# pick the :jax tag so vast.sh-launched pods get the pre-baked JAX image.
+# Override with --image on the CLI when needed.
+DEFAULT_IMAGE_MAIN="thomasschweich/pawn:latest"
+DEFAULT_IMAGE_JAX="thomasschweich/pawn:jax"
+default_image_for_branch() {
+    local branch=""
+    branch=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    case "$branch" in
+        jax_migration|feat/jax-migration/*)
+            echo "$DEFAULT_IMAGE_JAX"
+            ;;
+        *)
+            echo "$DEFAULT_IMAGE_MAIN"
+            ;;
+    esac
+}
+DEFAULT_IMAGE="$(default_image_for_branch)"
+# Pod-affinity tracker: which (gpu, offer_id) combos we've successfully
+# launched and benchmarked. Subsequent launches prefer hosts in this file
+# so the JAX image's layers are likely already cached. Written by
+# vast.sh launch on success.
+KNOWN_GOOD_FILE="$VAST_DIR/known_good.json"
 DEFAULT_MAX_PRICE=""                   # empty = no cap
 
 # --- Helpers ---
@@ -153,9 +175,20 @@ list_local_instances() {
 }
 
 # Fetch raw JSON for a single instance.
+#
+# NOTE: the per-instance `vastai show instance <id> --raw` path throws on
+# some CLI versions (`TypeError: 'NoneType' ... start_date` when the
+# instance has no start_date yet), returning nothing. Derive the same
+# record from the list endpoint instead — `show instances-v1 --raw` is
+# unaffected and carries identical fields (actual_status, public_ipaddr,
+# ssh_host/ssh_port, ports, gpu_name). Falls back to the (deprecated)
+# bare-array `show instances --raw` shape too.
 instance_json() {
     local id="$1"
-    vastai show instance "$id" --raw 2>/dev/null
+    vastai show instances-v1 --raw 2>/dev/null \
+        | jq -c --argjson id "$id" \
+            '(.instances // .) | map(select(.id == $id)) | .[0] // empty' \
+            2>/dev/null
 }
 
 # Pull SSH host/port from instance JSON. Echoes "host port" or empty on miss.
@@ -181,32 +214,54 @@ extract_ssh_endpoint() {
 wait_for_instance_running() {
     local instance_id="$1" name="$2"
     echo -n "Waiting for instance to be ready"
-    for i in $(seq 1 90); do
-        local json status
+    # Readiness is "SSH actually connects on the direct port", not
+    # "actual_status == running". On vast, actual_status frequently stays
+    # null even after cur_state flips to running, and the direct SSH port
+    # (ports["22/tcp"]) only maps once the container's sshd is listening —
+    # so a successful direct-SSH probe is the one signal that's both
+    # necessary and sufficient. We gate the SSH attempt on having an
+    # endpoint rather than on a status string, so a null actual_status
+    # can't wedge the loop.
+    # ~12.5 min: the :jax runtime image is multi-GB, and a cold host needs
+    # to pull + extract it before the container's sshd comes up and the
+    # direct 22/tcp port maps. 7.5 min was routinely too short and produced
+    # false "timeout" reports on instances that were merely still pulling.
+    for i in $(seq 1 150); do
+        local json dhost dport phost pport host port
         json=$(instance_json "$instance_id" || true)
-        status=$(echo "$json" | jq -r '.actual_status // empty' 2>/dev/null)
+        # Direct endpoint (preferred — proxy swallows stdin on non-interactive
+        # launch). Read direct + proxy separately so we never lock onto the
+        # proxy while the direct port is still mapping.
+        read -r dhost dport < <(echo "$json" | jq -r '
+            [(.public_ipaddr // ""),
+             (.ports["22/tcp"][0].HostPort // "")] | @tsv' 2>/dev/null \
+            | tr '\t' ' ')
+        read -r phost pport < <(echo "$json" | jq -r '
+            [(.ssh_host // ""), (.ssh_port // "")] | @tsv' 2>/dev/null \
+            | tr '\t' ' ')
 
-        if [ "$status" = "running" ]; then
-            local endpoint host port
-            endpoint=$(extract_ssh_endpoint "$json")
-            if [ -n "$endpoint" ]; then
-                host="${endpoint% *}"
-                port="${endpoint#* }"
-                if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
-                       -p "$port" "root@$host" "echo ok" &>/dev/null; then
-                    echo " ready!"
-                    local gpu
-                    gpu=$(echo "$json" | jq -r '.gpu_name // "unknown"')
-                    save_instance_config "$name" "$instance_id" "$host" "$port" "$gpu"
-                    return 0
-                fi
+        host=""; port=""
+        if [ -n "$dhost" ] && [[ "$dport" =~ ^[0-9]+$ ]]; then
+            host="$dhost"; port="$dport"          # direct: always preferred
+        elif [ "$i" -ge 60 ] && [ -n "$phost" ] && [[ "$pport" =~ ^[0-9]+$ ]]; then
+            host="$phost"; port="$pport"          # proxy: only after ~5 min
+        fi
+
+        if [ -n "$host" ] && [ -n "$port" ]; then
+            if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+                   -p "$port" "root@$host" "echo ok" &>/dev/null; then
+                echo " ready!"
+                local gpu
+                gpu=$(echo "$json" | jq -r '.gpu_name // "unknown"')
+                save_instance_config "$name" "$instance_id" "$host" "$port" "$gpu"
+                return 0
             fi
         fi
         echo -n "."
         sleep 5
     done
     echo " timeout!"
-    echo "Instance may still be starting. Check: vastai show instance $instance_id"
+    echo "Instance may still be starting. Check: vastai show instances-v1"
     return 1
 }
 
@@ -426,7 +481,13 @@ cmd_create() {
         # deploy. The documented opt-out is to touch
         # ~/.no_auto_tmux on the pod. Belt-and-suspenders: do it for
         # both /root and /home/pawn so the dev image also benefits.
-        --onstart-cmd 'touch /root/.no_auto_tmux 2>/dev/null; touch /home/pawn/.no_auto_tmux 2>/dev/null; chown pawn:pawn /home/pawn/.no_auto_tmux 2>/dev/null; true'
+        # Also strip group/other write from /root + ~/.ssh: some vast hosts
+        # hand the container a group/world-writable /root, which makes sshd
+        # StrictModes reject an otherwise-correct authorized_keys
+        # ("bad ownership or modes ... Permission denied (publickey)"). The
+        # image entrypoint hardens this too; doing it in onstart as well
+        # covers older images and any platform-injected keys.
+        --onstart-cmd 'touch /root/.no_auto_tmux 2>/dev/null; touch /home/pawn/.no_auto_tmux 2>/dev/null; chown pawn:pawn /home/pawn/.no_auto_tmux 2>/dev/null; chmod go-w /root 2>/dev/null; chmod 700 /root/.ssh 2>/dev/null; chmod 600 /root/.ssh/authorized_keys 2>/dev/null; true'
         --env "$env_str"
     )
 
@@ -613,6 +674,61 @@ cmd_deploy() {
     echo "=== Deploy complete ==="
 }
 
+cmd_known_good() {
+    # `vast.sh known_good list` — print the JSON tracker.
+    # `vast.sh known_good record <offer_id> <gpu> <first_step_ms>` — add a row.
+    # Records (offer_id, last_used_utc, gpu, first_step_ms) so subsequent
+    # launches can prefer warm hosts where the :jax image is likely cached.
+    local sub="${1:-list}"
+    shift || true
+    if [ ! -f "$KNOWN_GOOD_FILE" ]; then
+        echo "[]" > "$KNOWN_GOOD_FILE"
+    fi
+    case "$sub" in
+        list)
+            jq . "$KNOWN_GOOD_FILE"
+            ;;
+        record)
+            local offer_id="${1:?Usage: $0 known_good record <offer_id> <gpu> <first_step_ms>}"
+            local gpu="${2:-unknown}"
+            local first_step_ms="${3:-0}"
+            local ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            # jq -n with --arg/--argjson keeps the file as a JSON array,
+            # appending one new entry; drop any prior entry with the same
+            # offer_id so the file doesn't grow unbounded.
+            jq --arg id "$offer_id" \
+               --arg gpu "$gpu" \
+               --arg ts "$ts" \
+               --argjson ms "$first_step_ms" \
+               '[.[] | select(.offer_id != $id)] + [{offer_id: $id, gpu: $gpu, last_used_utc: $ts, first_step_ms: $ms}]' \
+               "$KNOWN_GOOD_FILE" > "$KNOWN_GOOD_FILE.tmp" \
+               && mv "$KNOWN_GOOD_FILE.tmp" "$KNOWN_GOOD_FILE"
+            echo "Recorded offer $offer_id ($gpu, ${first_step_ms}ms)"
+            ;;
+        prefer)
+            # `vast.sh known_good prefer <gpu>` — emit offer IDs (one per
+            # line) that we've previously used for this gpu, sorted by
+            # most-recent first. Caller pipes into vast.sh create --offer-id.
+            local gpu="${1:-}"
+            if [ -z "$gpu" ]; then
+                echo "Usage: $0 known_good prefer <gpu>" >&2
+                exit 1
+            fi
+            jq -r --arg gpu "$gpu" \
+                '[.[] | select(.gpu == $gpu)] | sort_by(.last_used_utc) | reverse | .[].offer_id' \
+                "$KNOWN_GOOD_FILE"
+            ;;
+        clear)
+            echo "[]" > "$KNOWN_GOOD_FILE"
+            echo "Cleared $KNOWN_GOOD_FILE"
+            ;;
+        *)
+            echo "Usage: $0 known_good {list|record|prefer|clear} [args...]" >&2
+            exit 1
+            ;;
+    esac
+}
+
 cmd_launch() {
     local name="${1:?Usage: $0 launch <name> <command...>}"
     shift
@@ -622,8 +738,8 @@ cmd_launch() {
         echo "Usage: $0 launch <name> <command...>"
         echo ""
         echo "Examples:"
-        echo "  $0 launch exp1 scripts/train.py --variant base"
-        echo "  $0 launch exp1 scripts/train.py --run-type adapter --strategy bottleneck \\"
+        echo "  $0 launch exp1 scripts/train_jax.py --supernet base"
+        echo "  $0 launch exp1 scripts/train_jax_adapter.py --strategy bottleneck \\"
         echo "      --checkpoint thomas-schweich/pawn-base --pgn thomas-schweich/pawn-lichess-full \\"
         echo "      --elo-min 1800 --elo-max 1900 --bottleneck-dim 32"
         exit 1
@@ -658,6 +774,7 @@ case "${1:-}" in
     setup)   shift; cmd_setup "$@" ;;
     deploy)  shift; cmd_deploy "$@" ;;
     launch)  shift; cmd_launch "$@" ;;
+    known_good|known-good) shift; cmd_known_good "$@" ;;
     *)
         echo "PAWN vast.ai Instance Manager"
         echo ""
@@ -685,7 +802,7 @@ case "${1:-}" in
         echo "  $0 create exp1 --gpu 4090 --max-price 0.5"
         echo "  $0 create cheap1 --gpu 3090 --interruptible"
         echo "  $0 deploy exp1"
-        echo "  $0 launch exp1 scripts/train.py --variant base"
+        echo "  $0 launch exp1 scripts/train_jax.py --supernet base"
         echo "  $0 stop exp1"
         echo ""
         echo "Setup:"

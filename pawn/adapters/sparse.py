@@ -1,245 +1,164 @@
-"""Sparse adaptation for PAWN.
+"""Sparse adaptation — random sparse perturbation of frozen weights.
 
-Perturbs a random subset of frozen weight elements. Each selected weight
-gets an additive trainable delta (zero-initialized, so the model starts
-identical to the frozen backbone).  Related to sparse fine-tuning ideas
-from the lottery ticket literature (`Frankle & Carbin, 2018
-<https://arxiv.org/abs/1803.03635>`_, ICLR 2019).
+A density-`p` random binary mask selects which weight entries get a
+trainable delta added on top of the frozen value.
 
-    output = linear(x)  where  W = W_frozen + delta * mask
+Targets:
 
-The binary mask is fixed at init. Effective trainable parameters equal
-the number of True entries in the mask, controlled by the density parameter.
+- Attention projections ``wq`` / ``wk`` / ``wv`` / ``wo`` per
+  ``cfg.targets``.
+- FFN projections ``w_gate`` / ``w_up`` / ``w_down`` when
+  ``cfg.ffn`` is set. Per v1 parity (``pawn.adapters.sparse._FFN_TARGETS``
+  is the full ``(w_gate, w_up, w_down)`` triple).
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from __future__ import annotations
 
-from pawn.config import CLMConfig
-from pawn.model import PAWNCLM, Attention
+from dataclasses import dataclass
+from typing import Literal
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float
+
+from pawn.adapters.placement import layer_placement_mask
+from pawn.model import PAWNModel, TransformerLayer
+
+__all__ = [
+    "SparseConfig",
+    "SparseAdapter",
+    "init_sparse_adapter",
+    "apply_sparse",
+    "sparse_filter",
+]
 
 
-class SparseLinear(nn.Module):
-    """Frozen linear with a sparse additive delta.
+SparseTargets = Literal["qkvo", "qv", "qkv"]
 
-    output = F.linear(x, W_frozen + delta * mask, bias)
+
+@dataclass(frozen=True)
+class SparseConfig:
+    density: float
+    targets: SparseTargets = "qkvo"
+    ffn: bool = False
+    # Restrict the sparse mask to an explicit subset of transformer
+    # layers (the ``--adapter-layers`` consumer, v1 parity); ``None``
+    # (default) adapts every layer. Folded directly into the per-layer
+    # binary mask at init — non-adapted layers get an all-False mask, so
+    # their delta multiplies by zero (no correction, no gradient).
+    layers: tuple[int, ...] | None = None
+
+
+class SparseAdapter(eqx.Module):
+    """Per-projection (mask, delta) pairs.
+
+    ``mask`` is a frozen binary tensor (sparse pattern fixed at init);
+    ``delta`` is a trainable dense tensor element-multiplied by the mask
+    before being added to the frozen weight.
     """
 
-    mask: torch.Tensor
-
-    def __init__(self, frozen_linear: nn.Linear, mask: torch.Tensor):
-        super().__init__()
-        self.frozen = frozen_linear
-        self.delta = nn.Parameter(torch.zeros_like(frozen_linear.weight))
-        self.register_buffer("mask", mask)
-
-    @property
-    def n_active(self) -> int:
-        return int(self.mask.sum().item())
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.frozen.weight + self.delta * self.mask
-        return F.linear(x, w, self.frozen.bias)
-
-
-def _random_mask(shape: tuple[int, ...], density: float,
-                 generator: torch.Generator | None = None) -> torch.Tensor:
-    """Create a random binary mask with the given density (fraction of True)."""
-    return torch.rand(shape, generator=generator) < density
+    delta_q: Float[Array, "n_layers d d"] | None
+    mask_q: Bool[Array, "n_layers d d"] | None
+    delta_k: Float[Array, "n_layers d d"] | None
+    mask_k: Bool[Array, "n_layers d d"] | None
+    delta_v: Float[Array, "n_layers d d"] | None
+    mask_v: Bool[Array, "n_layers d d"] | None
+    delta_o: Float[Array, "n_layers d d"] | None
+    mask_o: Bool[Array, "n_layers d d"] | None
+    # FFN sparse projections, populated when cfg.ffn=True. Shapes mirror
+    # the backbone's TransformerLayer (gate/up: d→d_ff; down: d_ff→d).
+    delta_gate: Float[Array, "n_layers d d_ff"] | None
+    mask_gate: Bool[Array, "n_layers d d_ff"] | None
+    delta_up: Float[Array, "n_layers d d_ff"] | None
+    mask_up: Bool[Array, "n_layers d d_ff"] | None
+    delta_down: Float[Array, "n_layers d_ff d"] | None
+    mask_down: Bool[Array, "n_layers d_ff d"] | None
+    cfg: SparseConfig = eqx.field(static=True)
 
 
-_ATTN_TARGETS = ("wq", "wk", "wv", "wo")
-_FFN_TARGETS = ("w_gate", "w_up", "w_down")
+def _maybe_init_sparse(
+    active: bool, k: jax.Array, shape: tuple[int, ...], density: float
+) -> tuple[jax.Array | None, jax.Array | None]:
+    if not active:
+        return None, None
+    bern = jax.random.bernoulli(k, p=density, shape=shape)
+    delta = jnp.zeros(shape, dtype=jnp.float32)
+    return delta, bern
 
 
-class SparseCLM(nn.Module):
-    """Frozen PAWN backbone with sparse weight perturbation.
+def init_sparse_adapter(
+    backbone: PAWNModel, cfg: SparseConfig, key: jax.Array | int
+) -> SparseAdapter:
+    if isinstance(key, int):
+        key = jax.random.key(key)
+    d = backbone.cfg.d_model
+    d_ff = backbone.cfg.d_ff
+    n_layers = backbone.cfg.n_layers
+    keys = jax.random.split(key, 7)
+    attn_shape = (n_layers, d, d)
+    gate_shape = (n_layers, d, d_ff)
+    up_shape = (n_layers, d, d_ff)
+    down_shape = (n_layers, d_ff, d)
+    flags = {c: c in cfg.targets for c in "qkvo"}
+    dq, mq = _maybe_init_sparse(flags["q"], keys[0], attn_shape, cfg.density)
+    dk, mk = _maybe_init_sparse(flags["k"], keys[1], attn_shape, cfg.density)
+    dv, mv = _maybe_init_sparse(flags["v"], keys[2], attn_shape, cfg.density)
+    do, mo = _maybe_init_sparse(flags["o"], keys[3], attn_shape, cfg.density)
+    dg, mg = _maybe_init_sparse(cfg.ffn, keys[4], gate_shape, cfg.density)
+    du, mu = _maybe_init_sparse(cfg.ffn, keys[5], up_shape, cfg.density)
+    dd, md = _maybe_init_sparse(cfg.ffn, keys[6], down_shape, cfg.density)
+    # Per-layer placement: AND the binary mask with the layer-placement
+    # mask so non-adapted layers carry no trainable positions.
+    placement = layer_placement_mask(cfg.layers, n_layers)
 
-    A random subset of weight elements in attention (and optionally FFN)
-    projections are made trainable. Only the masked delta values are
-    effectively learned.
-    """
+    def _place(mask: jax.Array | None) -> jax.Array | None:
+        if mask is None:
+            return None
+        m = placement.reshape((n_layers,) + (1,) * (mask.ndim - 1))
+        return jnp.logical_and(mask, m)
 
-    def __init__(
-        self,
-        backbone: PAWNCLM,
-        density: float = 0.01,
-        attn_targets: tuple[str, ...] = _ATTN_TARGETS,
-        adapt_ffn: bool = False,
-        layers: tuple[int, ...] | None = None,
-        seed: int = 42,
-    ):
-        super().__init__()
-        self.backbone = backbone
-        self.density = density
-        self.adapt_ffn = adapt_ffn
-        self.attn_targets = tuple(attn_targets)
+    mq, mk, mv, mo = _place(mq), _place(mk), _place(mv), _place(mo)
+    mg, mu, md = _place(mg), _place(mu), _place(md)
+    return SparseAdapter(
+        delta_q=dq, mask_q=mq,
+        delta_k=dk, mask_k=mk,
+        delta_v=dv, mask_v=mv,
+        delta_o=do, mask_o=mo,
+        delta_gate=dg, mask_gate=mg,
+        delta_up=du, mask_up=mu,
+        delta_down=dd, mask_down=md,
+        cfg=cfg,
+    )
 
-        n_layers = len(backbone.layers)
-        self.adapted_layers = set(layers if layers is not None else range(n_layers))
 
-        # Freeze the entire backbone
-        for p in backbone.parameters():
-            p.requires_grad = False
+def _add_sparse(
+    weight: jax.Array, delta: jax.Array | None, mask: jax.Array | None
+) -> jax.Array:
+    if delta is None or mask is None:
+        return weight
+    return weight + delta * mask.astype(weight.dtype)
 
-        gen = torch.Generator().manual_seed(seed)
 
-        # Inject sparse adapters
-        for layer_idx in range(len(backbone.layers)):
-            if layer_idx not in self.adapted_layers:
-                continue
-            block = backbone.get_block(layer_idx)
+def apply_sparse(backbone: PAWNModel, adapter: SparseAdapter) -> PAWNModel:
+    layers = backbone.layers
+    new_layers = TransformerLayer(
+        attn_norm_w=layers.attn_norm_w,
+        wq=_add_sparse(layers.wq, adapter.delta_q, adapter.mask_q),
+        wk=_add_sparse(layers.wk, adapter.delta_k, adapter.mask_k),
+        wv=_add_sparse(layers.wv, adapter.delta_v, adapter.mask_v),
+        wo=_add_sparse(layers.wo, adapter.delta_o, adapter.mask_o),
+        ffn_norm_w=layers.ffn_norm_w,
+        w_gate=_add_sparse(layers.w_gate, adapter.delta_gate, adapter.mask_gate),
+        w_up=_add_sparse(layers.w_up, adapter.delta_up, adapter.mask_up),
+        w_down=_add_sparse(layers.w_down, adapter.delta_down, adapter.mask_down),
+    )
+    return eqx.tree_at(lambda m: m.layers, backbone, new_layers)
 
-            attn: Attention = block.attn
-            for proj_name in self.attn_targets:
-                original = getattr(attn, proj_name)
-                mask = _random_mask(original.weight.shape, density, gen)
-                setattr(attn, proj_name, SparseLinear(original, mask))
 
-            if adapt_ffn:
-                ffn = block.ffn
-                for proj_name in _FFN_TARGETS:
-                    original = getattr(ffn, proj_name)
-                    mask = _random_mask(original.weight.shape, density, gen)
-                    setattr(ffn, proj_name, SparseLinear(original, mask))
-
-    @property
-    def cfg(self) -> CLMConfig:
-        return self.backbone.cfg
-
-    def forward_hidden(self, input_ids: torch.Tensor,
-                       attention_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """Run backbone layers (with sparse deltas), return normed hidden states."""
-        bb = self.backbone
-        x = bb.embed(input_ids)
-
-        T = input_ids.shape[1]
-        if attention_mask is not None:
-            causal = bb.causal_mask[:T, :T]
-            padding = attention_mask.unsqueeze(1).unsqueeze(2)
-            mask = causal.unsqueeze(0) & padding
-        else:
-            mask = None
-
-        rope_cos = bb.rope_cos[:, :, :T, :]
-        rope_sin = bb.rope_sin[:, :, :T, :]
-
-        for layer in bb.layers:
-            x = layer(x, rope_cos, rope_sin, mask)
-
-        return bb.final_norm(x)
-
-    def project_head(self, x: torch.Tensor) -> torch.Tensor:
-        """Project hidden states through lm_head."""
-        return self.backbone.lm_head(x)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Full forward pass. Returns logits (B, T, V)."""
-        bb = self.backbone
-        x = bb.embed(input_ids)
-
-        T = input_ids.shape[1]
-        if attention_mask is not None:
-            causal = bb.causal_mask[:T, :T]
-            padding = attention_mask.unsqueeze(1).unsqueeze(2)
-            mask = causal.unsqueeze(0) & padding
-        else:
-            mask = None
-
-        rope_cos = bb.rope_cos[:, :, :T, :]
-        rope_sin = bb.rope_sin[:, :, :T, :]
-
-        for layer in bb.layers:
-            x = layer(x, rope_cos, rope_sin, mask)
-
-        x = bb.final_norm(x)
-        return self.project_head(x)
-
-    def forward_generate(
-        self,
-        input_ids: torch.Tensor,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-        """Forward with KV-cache for autoregressive generation."""
-        bb = self.backbone
-        x = bb.embed(input_ids)
-
-        T_new = input_ids.shape[1]
-        if kv_cache is not None:
-            T_cached = kv_cache[0][0].shape[2]
-            rope_cos = bb.rope_cos[:, :, T_cached:T_cached + T_new, :]
-            rope_sin = bb.rope_sin[:, :, T_cached:T_cached + T_new, :]
-        else:
-            rope_cos = bb.rope_cos[:, :, :T_new, :]
-            rope_sin = bb.rope_sin[:, :, :T_new, :]
-
-        new_kv_cache = []
-        for i in range(len(bb.layers)):
-            layer_cache = kv_cache[i] if kv_cache is not None else None
-            x, new_cache = bb.get_block(i).forward_kv(x, rope_cos, rope_sin, layer_cache)
-            new_kv_cache.append(new_cache)
-
-        x = bb.final_norm(x[:, -1:, :])
-        logits = bb.lm_head(x)
-        return logits, new_kv_cache
-
-    # --- Parameter management ---
-
-    def sparse_parameters(self) -> list[nn.Parameter]:
-        """Return only trainable sparse delta parameters."""
-        return [p for p in self.parameters() if p.requires_grad]
-
-    def n_active_params(self) -> int:
-        """Count of actually active (masked-in) parameters."""
-        total = 0
-        for layer_idx in range(len(self.backbone.layers)):
-            block = self.backbone.get_block(layer_idx)
-            for proj_name in self.attn_targets:
-                module = getattr(block.attn, proj_name)
-                if isinstance(module, SparseLinear):
-                    total += module.n_active
-            if self.adapt_ffn:
-                for proj_name in _FFN_TARGETS:
-                    module = getattr(block.ffn, proj_name)
-                    if isinstance(module, SparseLinear):
-                        total += module.n_active
-        return total
-
-    def sparse_state_dict(self) -> dict[str, torch.Tensor]:
-        """Extract sparse delta weights for saving."""
-        return {
-            name: param.data.clone()
-            for name, param in self.named_parameters()
-            if param.requires_grad
-        }
-
-    def load_sparse_state_dict(self, state: dict[str, torch.Tensor]):
-        """Load sparse delta weights."""
-        own = self.state_dict()
-        for k, v in state.items():
-            if k in own:
-                own[k] = v
-        self.load_state_dict(own, strict=False)
-
-    def sparse_weight_report(self) -> dict[str, float]:
-        """Per-layer sparse delta norms for monitoring."""
-        report = {}
-        for layer_idx in range(len(self.backbone.layers)):
-            block = self.backbone.get_block(layer_idx)
-            for proj_name in self.attn_targets:
-                module = getattr(block.attn, proj_name)
-                if isinstance(module, SparseLinear):
-                    masked_delta = module.delta.data * module.mask
-                    report[f"sparse/layer{layer_idx}.{proj_name}.delta"] = masked_delta.norm().item()
-            if self.adapt_ffn:
-                for proj_name in _FFN_TARGETS:
-                    module = getattr(block.ffn, proj_name)
-                    if isinstance(module, SparseLinear):
-                        masked_delta = module.delta.data * module.mask
-                        report[f"sparse/layer{layer_idx}.{proj_name}.delta"] = masked_delta.norm().item()
-        return report
+def sparse_filter(adapter: SparseAdapter) -> SparseAdapter:
+    """Only the `delta_*` arrays are trainable — `mask_*` are bool
+    (filtered out by `eqx.is_inexact_array`) and treated as frozen."""
+    return jax.tree_util.tree_map(
+        lambda leaf: True if eqx.is_inexact_array(leaf) else False, adapter
+    )

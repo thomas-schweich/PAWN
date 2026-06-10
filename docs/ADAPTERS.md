@@ -1,5 +1,14 @@
 # Adapter Methods
 
+> **v1 metrics disclaimer.** All metrics and benchmarks attached to
+> the published `pawn-{small, base, large}` HF repos are v1 PyTorch
+> numbers. v2 republishes to new HF repos
+> (`pawn-{small, base, large}-v2` or similar). The v1 repos are **not
+> loadable in v2** (the Phase-A `V=2000` un-factored-embedding redesign is
+> architecturally incompatible and the legacy converter was removed in the
+> H.2 commit); use the `v1.0.0` git tag for the v1 artifacts.
+
+
 PAWN is designed as a testbed for parameter-efficient fine-tuning. The frozen ~36M-parameter backbone provides learned chess representations from pretraining on random games; adapters specialize those representations for downstream tasks like predicting human moves at a given Elo level.
 
 All adapter implementations live in `pawn/adapters/`. Each wraps a frozen `PAWNCLM` backbone and exposes a uniform interface: `forward_hidden()`, `project_head()`, `forward()`, and `forward_generate()` (with KV-cache).

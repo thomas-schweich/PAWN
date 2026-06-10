@@ -1,8 +1,8 @@
 [project]
 name = "pawn"
-version = "0.1.0"
+version = "0.2.0"
 description = "PAWN: Playstyle-Agnostic World-model Network for Chess"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.11,<3.13"
 license = "Apache-2.0"
 dependencies = [
     "chess-engine",
@@ -10,26 +10,30 @@ dependencies = [
     "psutil>=5.9.0",
     "safetensors>=0.4.0",
     "tqdm~=4.67.0",
-    "wandb~=0.25.0",
     "huggingface-hub>=0.20.0",
-    # Eval + probes
+    # JAX framework core. `jax` 0.10.0 + `jaxlib` 0.10.0 pinned explicitly
+    # here so a future `uv lock` regeneration without a GPU extra can't float
+    # jaxlib to 0.10.1+ and break the plugin (jax-rocm7-plugin 0.10.0
+    # requires jaxlib 0.10.0; jaxlib 0.10.1 calls a `_triton.registrations()`
+    # symbol the 0.10.0 plugin doesn't expose). The GPU device plugin
+    # (jax-rocm7-plugin / jax-cuda12-plugin) lives in the `rocm` / `cu128`
+    # extras. Bump all three pins in lockstep when 0.10.1+ ships.
+    "jax==0.10.0",
+    "jaxlib==0.10.0",
+    "equinox>=0.13.0",
+    "optax>=0.2.5",
+    # Config + templating + structured logging
+    "pydantic>=2.13.0",
+    "jinja2>=3.1.0",
+    # Eval + probes + Lichess parquet data path (load-bearing per plan §12)
     "seaborn>=0.13.2",
     "matplotlib>=3.10.8",
     "polars>=1.39.0",
     "pyarrow>=23.0.1",
-    "zstandard>=0.22.0",  # Lichess PGN extraction
-    # Dashboard
-    "solara>=1.0.0",
-    "plotly>=5.18.0",
-    "pandas>=2.0.0",
-    "anywidget>=0.9.21",
-    # Sweeps
+    "zstandard>=0.22.0",
+    # Sweeps (Optuna is core; optuna-dashboard is in the `dashboard` extra)
     "optuna>=4.0.0",
-    "optuna-dashboard>=0.17.0",
-    # Lab manager MCP server
-    "fastmcp>=2.0.0",
-    "starlette<1.0.0",  # solara incompatible with starlette 1.0
-    # Dev
+    # Dev tooling
     "pyright>=1.1.0",
     "pytest~=9.0.0",
     "pytest-mock>=3.12.0",
@@ -39,8 +43,40 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-rocm = ["torch~=2.10.0", "triton-rocm>=3.6.0", "triton>=3.6.0"]
-cu128 = ["torch~=2.10.0"]
+# GPU backends — each adds the JAX device plugin. The two GPU extras are
+# mutually exclusive. (Torch is no longer a runtime dep: the v1
+# checkpoint converter was removed in the H.2 housekeeping commit; we
+# keep the wheel available via `dev-torch` for any one-off tooling that
+# still wants it, but training never pulls it in.)
+rocm = [
+    "triton-rocm>=3.6.0",
+    "triton>=3.6.0",
+    # JAX-on-ROCm: system ROCm 7.x runtime + plugin from PyPI. The base
+    # `jaxlib==0.10.0` pin in [project.dependencies] is shared by both
+    # GPU extras; only the platform-specific plugin lives here.
+    "jax-rocm7-plugin==0.10.0",
+]
+cu128 = [
+    "jax-cuda12-plugin[with-cuda]==0.10.0",
+]
+# Solara dashboard for log inspection.
+dashboard = [
+    "solara>=1.0.0",
+    "plotly>=5.18.0",
+    "pandas>=2.0.0",
+    "anywidget>=0.9.21",
+    "starlette<1.0.0",  # solara/fastmcp incompatible with starlette 1.0
+    "optuna-dashboard>=0.17.0",
+]
+# pawn-lab MCP server.
+lab = [
+    "fastmcp>=2.0.0",
+    "starlette<1.0.0",  # solara/fastmcp incompatible with starlette 1.0
+]
+# Optional Weights & Biases metric mirror.
+wandb = [
+    "wandb~=0.25.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -63,33 +99,33 @@ environments = ["sys_platform == 'linux'"]
 
 [tool.uv.sources]
 chess-engine = { workspace = true }
-torch = [
-    { index = "pytorch-rocm", extra = "rocm" },
-    { index = "pytorch-cu128", extra = "cu128" },
-]
 triton-rocm = [
     { index = "pytorch-rocm", extra = "rocm" },
 ]
 
+# pytorch-rocm carries the triton-rocm wheel even though we no longer
+# depend on torch itself; keep the index pinned so triton resolution is
+# stable across uv lockfile refreshes.
 [[tool.uv.index]]
 name = "pytorch-rocm"
 url = "https://download.pytorch.org/whl/rocm7.1"
 explicit = true
 
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
 
 [tool.pyright]
-pythonVersion = "3.10"
+pythonVersion = "3.11"
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false
 reportPrivateImportUsage = false
 reportMissingImports = "error"
-include = ["pawn"]
-exclude = ["pawn/dashboard"]
+include = ["pawn", "scripts", "tests"]
+# Excludes:
+#   - pawn/dashboard: Solara widgets pyright can't follow.
+#   - scripts/vastai_score.py: PEP 723 uv-shebang script — its deps
+#     (requests, beautifulsoup4) are declared in-script via the
+#     `# /// script` block and resolved by uv at execution time;
+#     pyright doesn't see them.
+exclude = ["pawn/dashboard", "scripts/vastai_score.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,8 +1,26 @@
-"""Trial runner: process lifecycle and metrics monitoring.
+"""Lab trial runner — process-lifecycle daemon + pydantic-validated dispatch.
 
-The runner manages GPU-isolated training processes, polls their metrics files,
-and detects failures. State is persisted to JSON so the runner can recover
-after MCP server restarts while training processes continue running.
+Two surfaces live here:
+
+- The thin MCP-facing helpers (:func:`validate_config`, :func:`lab_schema`,
+  :func:`lab_launch`). The lab MCP server (``pawn.lab.server``) wraps these
+  as FastMCP tools. The schedule-health helpers (:func:`read_schedule_health`,
+  :func:`audit_schedule_health`) now live in :mod:`pawn.lab.monitor` — pure
+  filesystem reads with no :class:`TrialRunner` dependency — and are
+  re-exported here for callers that import them from this module.
+  ``pawn.lab.monitor.check_health`` calls :func:`audit_schedule_health`
+  directly (same module) for the H7 structural-mismatch banner, so there is
+  no longer a runner<->monitor import cycle.
+- :class:`TrialRunner` — the async process-lifecycle daemon (GPU discovery
+  + one-trial-per-GPU scheduling, subprocess spawn/monitor/kill, crash
+  recovery via ``lab_state.json``, a monotonic-seq event bus, cost tracking,
+  and a per-trial completion-invariant audit).
+
+The runner is deliberately JAX-free: trials are spawned as subprocesses
+running the v2 entry points (``scripts/train_jax*.py``), so the runner — and
+the MCP server that hosts it — stay light to import. This mirrors the v1
+process-isolation discipline (v1 spawned ``scripts/train.py``; v2 dispatches
+on ``run_type``).
 """
 
 from __future__ import annotations
@@ -14,42 +32,168 @@ import os
 import signal
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from pawn.lab.monitor import (
+    audit_schedule_health,
     check_health,
     is_alive,
-    read_cotrain_val_summary,
     read_metrics,
     read_pretrain_val_summary,
+    read_schedule_health,
 )
 from pawn.lab.state import Trial, _format_duration, _now_iso
+from pawn.run_config import (
+    AdapterConfig,
+    BaseRunConfig,
+    DistillConfig,
+    PretrainConfig,
+    SpecializedCLMConfig,
+)
 
 log = logging.getLogger("pawn.lab")
 
+__all__ = [
+    "TrialRunner",
+    "lab_launch",
+    "lab_schema",
+    "validate_config",
+    "read_schedule_health",
+    "audit_schedule_health",
+]
 
-def _validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Validate a config dict against RunConfig and return the normalized dict.
 
-    Raises ``pydantic.ValidationError`` on bad input.
+# run_type -> v2 entry-point script (relative to the code dir). Cotrain is
+# GONE BY DESIGN in v2 (the supernet joint loss replaced it). ``specialized_clm``
+# as a *run_type* trains a standalone CLM via the dedicated entry point;
+# ``--strategy specialized_clm`` (an *adapter* run) dispatches through the
+# adapter trainer instead.
+_RUN_TYPE_SCRIPTS: dict[str, str] = {
+    "pretrain": "scripts/train_jax.py",
+    "adapter": "scripts/train_jax_adapter.py",
+    "specialized_clm": "scripts/train_jax_adapter.py",
+    "distill": "scripts/train_jax_distill.py",
+}
+
+
+# Config keys surfaced as ``key_hp`` in :meth:`TrialRunner.status` and
+# :meth:`TrialRunner.results`. Single source of truth so the two report
+# surfaces can't silently diverge when a key is added or renamed.
+_KEY_HP_FIELDS: frozenset[str] = frozenset(
+    {
+        "lr",
+        "lora_rank",
+        "bottleneck_dim",
+        "bottleneck_n_hidden",
+        "density",
+        "d_model",
+        "n_layers",
+        "batch_size",
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# Config validation / schema (MCP-facing helpers)
+# ---------------------------------------------------------------------------
+
+
+def lab_schema() -> dict[str, Any]:
+    """Return JSON Schema for every supported run_type.
+
+    The lab client uses this to render trial forms and pre-validate
+    user input. The dict shape is::
+
+        {
+            "pretrain": {<JSON Schema dict>},
+            "adapter": {<JSON Schema dict>},
+            "specialized_clm": {<JSON Schema dict>},
+            "distill": {<JSON Schema dict>},
+        }
     """
-    from pydantic import TypeAdapter
+    return {
+        "pretrain": PretrainConfig.model_json_schema(),
+        "adapter": AdapterConfig.model_json_schema(),
+        "specialized_clm": SpecializedCLMConfig.model_json_schema(),
+        "distill": DistillConfig.model_json_schema(),
+    }
 
-    from pawn.run_config import AdapterConfig, CotrainConfig, PretrainConfig
 
+def validate_config(config: Mapping[str, Any]) -> BaseRunConfig:
+    """Dispatch on ``config["run_type"]`` and validate through pydantic.
+
+    `extra="forbid"` rejects unknown / stale field names at the lab
+    boundary — the v1 contract per plan §10 S9. Returns the validated
+    Config instance (a :class:`BaseRunConfig` subclass — all four concrete
+    configs share ``.model_dump()``).
+    """
     run_type = config.get("run_type")
-    config_cls = {
-        "pretrain": PretrainConfig,
-        "adapter": AdapterConfig,
-        "cotrain": CotrainConfig,
-    }.get(run_type)  # type: ignore[arg-type]
-    if config_cls is None:
-        raise ValueError(
-            f"run_type must be 'pretrain', 'adapter', or 'cotrain', got {run_type!r}"
-        )
-    ta = TypeAdapter(config_cls)
-    return ta.validate_python(config).model_dump()
+    if run_type is None:
+        raise ValueError("missing 'run_type' in trial config")
+    payload = {k: v for k, v in config.items() if k != "run_type"}
+    if run_type == "pretrain":
+        return PretrainConfig(**payload)
+    if run_type == "adapter":
+        return AdapterConfig(**payload)
+    if run_type == "specialized_clm":
+        return SpecializedCLMConfig(**payload)
+    if run_type == "distill":
+        return DistillConfig(**payload)
+    raise ValueError(
+        f"unknown run_type {run_type!r}; valid: pretrain / adapter / "
+        f"specialized_clm / distill"
+    )
+
+
+def lab_launch(
+    config: Mapping[str, Any], *, dry_run: bool = False
+) -> dict[str, Any]:
+    """Validate ``config`` and dispatch to the appropriate trainer script.
+
+    Returns ``{"status": "launched"|"validated", "run_type": str,
+    "config": dict, "pid": int|None}``. ``dry_run=True`` validates the
+    config but doesn't actually spawn the subprocess — useful for the
+    lab's pre-flight smoke check.
+    """
+    validated = validate_config(config)
+    run_type = config["run_type"]
+    if dry_run:
+        return {
+            "status": "validated",
+            "run_type": run_type,
+            "config": validated.model_dump(),
+            "pid": None,
+        }
+
+    script = _RUN_TYPE_SCRIPTS[run_type]
+    # Spawn (the script reads its own --config JSON; we hand it the
+    # validated config as a JSON file). The runner detaches; lab
+    # monitoring picks up metrics via the run dir.
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False
+    ) as f:
+        json.dump(validated.model_dump(), f)
+        cfg_path = f.name
+    proc = subprocess.Popen(
+        ["python", script, "--config", cfg_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return {
+        "status": "launched",
+        "run_type": run_type,
+        "config": validated.model_dump(),
+        "pid": proc.pid,
+    }
+
+
+# ---------------------------------------------------------------------------
+# TrialRunner daemon
+# ---------------------------------------------------------------------------
 
 
 class TrialRunner:
@@ -60,12 +204,14 @@ class TrialRunner:
         workspace: str | None = None,
         code_dir: str | None = None,
         python: str = "python3",
-    ):
+    ) -> None:
         ws = workspace or os.environ.get("PAWN_WORKSPACE")
         if ws is None:
             # On pods: /workspace. Locally: runs/ under the repo root.
-            ws = "/workspace" if Path("/workspace").exists() else str(
-                Path(__file__).resolve().parents[2] / "runs"
+            ws = (
+                "/workspace"
+                if Path("/workspace").exists()
+                else str(Path(__file__).resolve().parents[2] / "runs")
             )
         self.workspace = Path(ws)
         self.code_dir = Path(
@@ -98,10 +244,9 @@ class TrialRunner:
 
         # Async
         self._monitor_tasks: dict[int, asyncio.Task[None]] = {}
-        self._metrics_offsets: dict[int, int] = {}
-        # Rolling (step, elapsed) window per trial (or per cotrain
-        # variant) for stable throughput estimation. See
-        # ``pawn.lab.monitor._update_sps_window``.
+        self._metrics_offsets: dict[Any, int] = {}
+        # Rolling (step, elapsed) window per trial for stable throughput
+        # estimation. See ``pawn.lab.monitor._update_sps_window``.
         self._sps_windows: dict[Any, list[tuple[int, float]]] = {}
 
         self._ensure_dirs()
@@ -117,11 +262,15 @@ class TrialRunner:
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
     def _discover_gpus(self) -> None:
-        """Detect GPUs via a subprocess to avoid loading torch into this process.
+        """Detect GPUs via a subprocess to keep the runner process JAX-free.
 
-        Torch's ROCm/HIP runtime spawns background threads that busy-spin,
-        burning ~30% CPU permanently. Running discovery in a subprocess
-        keeps the MCP server process clean.
+        Importing JAX (or torch) into the long-lived runner process spawns
+        background runtime threads. Running discovery in a short-lived
+        subprocess keeps the MCP-server process clean. We probe with JAX
+        (the v2 framework) and fall back to a zero-GPU result on any error.
+
+        The subprocess prints a JSON list of ``{"name", "vram_mb"}`` dicts —
+        the same schema v1 used (v1 probed torch).
         """
         if self._gpus_discovered:
             return
@@ -129,15 +278,17 @@ class TrialRunner:
         try:
             out = subprocess.check_output(
                 [
-                    self.python.split()[0], "-c",
-                    "import json, torch; "
-                    "gpus = [{"
-                    "'name': torch.cuda.get_device_name(i), "
-                    "'vram_mb': torch.cuda.get_device_properties(i).total_memory // (1024*1024)"
-                    "} for i in range(torch.cuda.device_count())]; "
+                    self.python.split()[0],
+                    "-c",
+                    "import json, jax; "
+                    "devs = [d for d in jax.devices() "
+                    "if d.platform in ('gpu', 'rocm', 'cuda')]; "
+                    "gpus = [{'name': str(getattr(d, 'device_kind', d.platform)), "
+                    "'vram_mb': 0} for d in devs]; "
                     "print(json.dumps(gpus))",
                 ],
-                text=True, timeout=30,
+                text=True,
+                timeout=60,
             )
             gpus = json.loads(out.strip())
             self.gpu_count = len(gpus)
@@ -178,7 +329,7 @@ class TrialRunner:
             self.start_time = state.get("start_time", self.start_time)
             self.cost_per_hour = state.get("cost_per_hour")
             log.info("Loaded state: %d trials", len(self.trials))
-        except Exception as e:
+        except (OSError, ValueError, json.JSONDecodeError) as e:
             log.error("Failed to load state: %s", e)
 
     # =======================================================================
@@ -191,10 +342,11 @@ class TrialRunner:
             try:
                 out = subprocess.check_output(
                     ["pgrep", "-f", "nvidia-cuda-mps"],
-                    text=True, timeout=5,
+                    text=True,
+                    timeout=5,
                 )
                 self._mps_active = bool(out.strip())
-            except Exception:
+            except (OSError, subprocess.SubprocessError):
                 self._mps_active = False
             if self._mps_active:
                 log.info("CUDA MPS detected — GPU isolation disabled")
@@ -218,7 +370,7 @@ class TrialRunner:
             self.gpu_assignments[gpu_id] = None
 
     def gpu_utilization(self) -> list[dict[str, Any]]:
-        """Return GPU info without importing torch into this process."""
+        """Return GPU info without importing JAX into this process."""
         self._discover_gpus()
         return [
             {
@@ -247,10 +399,10 @@ class TrialRunner:
     ) -> int:
         """Launch a single trial. Returns trial_id.
 
-        ``config`` is a dict matching ``RunConfig`` (either
-        ``PretrainConfig`` or ``AdapterConfig``).  It is validated and
-        written to a JSON file, then passed to ``scripts/train.py
-        --config``.
+        ``config`` is a dict matching a v2 RunConfig (``PretrainConfig`` /
+        ``AdapterConfig`` / ``SpecializedCLMConfig`` / ``DistillConfig``).
+        It is validated and written to a JSON file, then passed to the
+        matching ``scripts/train_jax*.py --config``.
         """
         # Legacy shim: build a config dict from strategy/params/base_args
         if strategy is not None:
@@ -272,15 +424,16 @@ class TrialRunner:
         config.setdefault("log_dir", trial_log_dir)
         config.setdefault("local_checkpoints", True)
 
-        # Validate via Pydantic
-        validated = _validate_config(config)
+        # Validate via pydantic. Keep run_type on the stored dict so
+        # ``_build_command`` can dispatch on it.
+        run_type = config.get("run_type")
+        validated = validate_config(config).model_dump()
+        validated["run_type"] = run_type
         cmd = self._build_command(validated, trial_id)
 
-        if validated.get("run_type") == "cotrain":
-            variant_names = [v["name"] for v in validated.get("variants", [])]
-            strategy_display = "cotrain:" + "+".join(variant_names)
-        else:
-            strategy_display = validated.get("strategy") or validated.get("variant", "pretrain")
+        strategy_display = (
+            validated.get("strategy") or validated.get("variant") or "pretrain"
+        )
         trial = Trial(
             trial_id=trial_id,
             strategy=strategy_display,
@@ -296,10 +449,11 @@ class TrialRunner:
         self._assign_gpu(trial_id, gpu_id)
 
         await self._spawn(trial)
-        self._emit("trial_started", trial_id, {
-            "strategy": strategy_display, "gpu": gpu_id,
-            "config": validated,
-        })
+        self._emit(
+            "trial_started",
+            trial_id,
+            {"strategy": strategy_display, "gpu": gpu_id, "config": validated},
+        )
         self._save_state()
         self.render_progress_log()
         return trial_id
@@ -310,11 +464,7 @@ class TrialRunner:
         total_steps: int | None = None,
         pause_after_steps: int | None = None,
     ) -> int:
-        """Resume a completed/failed trial from its best checkpoint.
-
-        For cotrain trials, discovers per-variant checkpoints and sets
-        the resume path on each variant in the new config.
-        """
+        """Resume a completed/failed trial from its latest checkpoint."""
         old = self.trials.get(trial_id)
         if not old:
             raise RuntimeError(f"Trial {trial_id} not found")
@@ -324,11 +474,8 @@ class TrialRunner:
         new_config = dict(old.config)
         new_config.pop("pause_after_steps", None)
 
-        if (old.config or {}).get("run_type") == "cotrain":
-            self._resolve_cotrain_resume(old, new_config)
-        else:
-            ckpt_dir = self._find_latest_checkpoint(Path(old.run_dir))
-            new_config["resume"] = str(ckpt_dir)
+        ckpt_dir = self._find_latest_checkpoint(Path(old.run_dir))
+        new_config["resume"] = str(ckpt_dir)
 
         if total_steps is not None:
             new_config["total_steps"] = total_steps
@@ -343,7 +490,7 @@ class TrialRunner:
 
         Checks for ``best/`` and ``final/`` symlinks first (adapter runs),
         then falls back to the highest-numbered ``step_*`` directory
-        (pretrain/cotrain runs, which don't create best/final symlinks).
+        (pretrain runs, which don't create best/final symlinks).
         """
         ckpt_base = run_dir / "checkpoints"
         ckpt_dir = ckpt_base / "best"
@@ -357,41 +504,16 @@ class TrialRunner:
             raise RuntimeError(f"No checkpoint found under {run_dir}")
         return ckpt_dir
 
-    def _resolve_cotrain_resume(
-        self, old: "Trial", new_config: dict[str, Any],
-    ) -> None:
-        """Set per-variant resume paths for a cotrain trial."""
-        if not old.variants:
-            raise RuntimeError(
-                f"Trial {old.trial_id} is cotrain but has no variant state. "
-                "Cannot determine per-variant checkpoints."
-            )
-
-        # Deep-copy variants list so we can mutate
-        import copy
-        variants = copy.deepcopy(new_config.get("variants", []))
-
-        for v_cfg in variants:
-            name = v_cfg.get("name")
-            if name not in old.variants:
-                raise RuntimeError(
-                    f"Variant '{name}' not found in trial {old.trial_id} state"
-                )
-            vs = old.variants[name]
-            v_run_dir = vs.get("run_dir")
-            if not v_run_dir:
-                raise RuntimeError(
-                    f"Variant '{name}' in trial {old.trial_id} has no run directory"
-                )
-            ckpt_dir = self._find_latest_checkpoint(Path(v_run_dir))
-            v_cfg["resume"] = str(ckpt_dir)
-
-        new_config["variants"] = variants
-
     def _build_command(
-        self, config: dict[str, Any], trial_id: int,
+        self,
+        config: dict[str, Any],
+        trial_id: int,
     ) -> list[str]:
-        script = str(self.code_dir / "scripts" / "train.py")
+        run_type = config.get("run_type") or "pretrain"
+        script_rel = _RUN_TYPE_SCRIPTS.get(run_type)
+        if script_rel is None:
+            raise ValueError(f"unknown run_type: {run_type!r}")
+        script = str(self.code_dir / script_rel)
         config_dir = self.log_dir / f"trial_{trial_id:04d}"
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / "run_config.json"
@@ -404,7 +526,10 @@ class TrialRunner:
         """Start the training process, with GPU isolation unless MPS is active."""
         env = os.environ.copy()
         if trial.gpu_id is not None and not self._is_mps_active():
+            # JAX honours both; ROCm uses HIP_VISIBLE_DEVICES, CUDA uses
+            # CUDA_VISIBLE_DEVICES. Setting both keeps this backend-agnostic.
             env["CUDA_VISIBLE_DEVICES"] = str(trial.gpu_id)
+            env["HIP_VISIBLE_DEVICES"] = str(trial.gpu_id)
 
         Path(trial.log_path).parent.mkdir(parents=True, exist_ok=True)
         log_fd = open(trial.log_path, "w")
@@ -422,8 +547,13 @@ class TrialRunner:
         trial.pid = proc.pid
         trial.status = "running"
         trial.start_time = time.time()
-        log.info("Spawned trial %d (PID %d) on GPU %d: %s",
-                 trial.trial_id, proc.pid, trial.gpu_id, trial.strategy)
+        log.info(
+            "Spawned trial %d (PID %d) on GPU %s: %s",
+            trial.trial_id,
+            proc.pid,
+            trial.gpu_id,
+            trial.strategy,
+        )
 
         self._monitor_tasks[trial.trial_id] = asyncio.create_task(
             self._monitor(trial.trial_id)
@@ -443,14 +573,18 @@ class TrialRunner:
                         exit_code = code
                         break
 
-                read_metrics(trial, self.log_dir, self._metrics_offsets, self._sps_windows)
+                read_metrics(
+                    trial, self.log_dir, self._metrics_offsets, self._sps_windows
+                )
                 issue = check_health(trial)
                 if issue:
                     log.warning("Trial %d health issue: %s", trial_id, issue)
                     self._emit("health_warning", trial_id, {"issue": issue})
 
             # Process exited — final metrics read
-            read_metrics(trial, self.log_dir, self._metrics_offsets, self._sps_windows)
+            read_metrics(
+                trial, self.log_dir, self._metrics_offsets, self._sps_windows
+            )
 
             if trial.status == "killed":
                 # Wait for the process to actually exit before releasing GPU.
@@ -465,17 +599,18 @@ class TrialRunner:
                         await asyncio.sleep(1.0)
                 if trial.gpu_id is not None:
                     self._release_gpu(trial.gpu_id)
-                read_metrics(trial, self.log_dir, self._metrics_offsets, self._sps_windows)
+                read_metrics(
+                    trial, self.log_dir, self._metrics_offsets, self._sps_windows
+                )
                 self._save_state()
             elif exit_code == 0:
                 self._complete(trial_id)
             else:
-                # Any non-zero exit = failure. Previously we fell back to
-                # ``trial.best_val_loss is not None`` as a safety net, but
-                # that misclassified crashed trials as "completed" once the
-                # baseline eval populated ``best_val_loss`` before the real
-                # failure point — e.g. OOMs at step 0 or Python tracebacks
-                # after model load.
+                # Any non-zero exit = failure. We do NOT fall back to
+                # ``best_val_loss is not None``: that misclassified crashed
+                # trials as "completed" once the baseline eval populated
+                # ``best_val_loss`` before the real failure point (OOMs at
+                # step 0, tracebacks after model load).
                 reason = (
                     f"exit code {exit_code}"
                     if exit_code is not None
@@ -495,14 +630,22 @@ class TrialRunner:
         trial.end_time = time.time()
         if trial.gpu_id is not None:
             self._release_gpu(trial.gpu_id)
-        log.info("Trial %d completed: val_loss=%s acc=%s",
-                 trial_id, trial.best_val_loss, trial.best_accuracy)
-        self._emit("trial_completed", trial_id, {
-            "best_val_loss": trial.best_val_loss,
-            "best_accuracy": trial.best_accuracy,
-            "param_count": trial.actual_param_count,
-            "steps": trial.current_step,
-        })
+        log.info(
+            "Trial %d completed: val_loss=%s acc=%s",
+            trial_id,
+            trial.best_val_loss,
+            trial.best_accuracy,
+        )
+        self._emit(
+            "trial_completed",
+            trial_id,
+            {
+                "best_val_loss": trial.best_val_loss,
+                "best_accuracy": trial.best_accuracy,
+                "param_count": trial.actual_param_count,
+                "steps": trial.current_step,
+            },
+        )
         if all(v is None for v in self.gpu_assignments.values()):
             self._emit("gpu_idle", data={"message": "All GPUs are idle"})
         self._save_state()
@@ -538,7 +681,9 @@ class TrialRunner:
             except ProcessLookupError:
                 pass
         # Final metrics read before marking killed
-        read_metrics(trial, self.log_dir, self._metrics_offsets, self._sps_windows)
+        read_metrics(
+            trial, self.log_dir, self._metrics_offsets, self._sps_windows
+        )
         trial.status = "killed"
         trial.end_time = time.time()
         self._emit("trial_killed", trial_id)
@@ -578,7 +723,9 @@ class TrialRunner:
         except OSError as e:
             log.error("Failed to write event: %s", e)
 
-    def events_since(self, seq: int | None = None) -> tuple[list[dict[str, Any]], int]:
+    def events_since(
+        self, seq: int | None = None
+    ) -> tuple[list[dict[str, Any]], int]:
         """Return events since seq and update the cursor.
 
         If seq is None, returns events since the last call (auto-tracking).
@@ -600,17 +747,22 @@ class TrialRunner:
             if t.status == "running":
                 cfg = t.config or t.params
                 row: dict[str, Any] = {
-                    "trial": t.trial_id, "strategy": t.strategy,
-                    "step": t.current_step, "total": t.total_steps,
+                    "trial": t.trial_id,
+                    "strategy": t.strategy,
+                    "step": t.current_step,
+                    "total": t.total_steps,
                     "sps": round(t.steps_per_sec, 2),
                     "eta": _format_duration(t.eta_seconds()),
-                    "train_loss": t.last_train_loss, "train_acc": t.last_train_acc,
-                    "val_loss": t.best_val_loss, "val_acc": t.best_accuracy,
-                    "params": t.actual_param_count, "pid": t.pid, "gpu": t.gpu_id,
-                    "key_hp": {k: v for k, v in cfg.items()
-                               if k in ("lr", "lora_rank", "bottleneck_dim",
-                                        "bottleneck_n_hidden",
-                                        "density", "d_model", "n_layers", "batch_size")},
+                    "train_loss": t.last_train_loss,
+                    "train_acc": t.last_train_acc,
+                    "val_loss": t.best_val_loss,
+                    "val_acc": t.best_accuracy,
+                    "params": t.actual_param_count,
+                    "pid": t.pid,
+                    "gpu": t.gpu_id,
+                    "key_hp": {
+                        k: v for k, v in cfg.items() if k in _KEY_HP_FIELDS
+                    },
                 }
                 # For pretraining runs, surface game-completion metrics and
                 # the power-law forfeit-rate fit (matches the dashboard chart).
@@ -618,11 +770,6 @@ class TrialRunner:
                     pretrain = read_pretrain_val_summary(t)
                     if pretrain:
                         row["pretrain"] = pretrain
-                # Same surface for cotrain, per variant.
-                elif cfg.get("run_type") == "cotrain":
-                    cotrain = read_cotrain_val_summary(t)
-                    if cotrain:
-                        row["cotrain"] = cotrain
                 running.append(row)
         elapsed = time.time() - self.start_time
         cost = (self.cost_per_hour * elapsed / 3600) if self.cost_per_hour else None
@@ -632,47 +779,70 @@ class TrialRunner:
             "gpu_names": self.gpu_names,
             "running": running,
             "total_trials": len(self.trials),
-            "completed": sum(1 for t in self.trials.values() if t.status == "completed"),
+            "completed": sum(
+                1 for t in self.trials.values() if t.status == "completed"
+            ),
             "failed": sum(1 for t in self.trials.values() if t.status == "failed"),
             "elapsed": _format_duration(elapsed),
             "cost_per_hour": self.cost_per_hour,
             "estimated_cost": round(cost, 2) if cost else None,
         }
 
-    def results(self, strategy: str | None = None, tag: str | None = None) -> dict[str, Any]:
+    def results(
+        self, strategy: str | None = None, tag: str | None = None
+    ) -> dict[str, Any]:
         rows = []
         trials = sorted(self.trials.values(), key=lambda t: t.trial_id)
         if tag:
             trials = [t for t in trials if tag in t.tags]
         for t in trials:
-            elapsed = (t.end_time - t.start_time) if t.end_time and t.start_time else None
+            elapsed = (
+                (t.end_time - t.start_time)
+                if t.end_time and t.start_time
+                else None
+            )
             cfg = t.config or t.params
-            rows.append({
-                "trial": t.trial_id, "strategy": t.strategy,
-                "params": t.actual_param_count, "steps": t.current_step,
-                "val_loss": t.best_val_loss, "accuracy": t.best_accuracy,
-                "status": t.status, "notes": t.notes, "tags": t.tags,
-                "wall_time": _format_duration(elapsed),
-                "key_hp": {k: v for k, v in cfg.items()
-                           if k in ("lr", "lora_rank", "bottleneck_dim",
-                                    "bottleneck_n_hidden", "density",
-                                    "d_model", "n_layers", "batch_size")},
-            })
+            rows.append(
+                {
+                    "trial": t.trial_id,
+                    "strategy": t.strategy,
+                    "params": t.actual_param_count,
+                    "steps": t.current_step,
+                    "val_loss": t.best_val_loss,
+                    "accuracy": t.best_accuracy,
+                    "status": t.status,
+                    "notes": t.notes,
+                    "tags": t.tags,
+                    "wall_time": _format_duration(elapsed),
+                    "key_hp": {
+                        k: v for k, v in cfg.items() if k in _KEY_HP_FIELDS
+                    },
+                }
+            )
         # Pareto front: trials not dominated on (param_count, val_loss).
         # A trial is dominated if another trial has both fewer (or equal)
         # params AND lower (or equal) val_loss, with at least one strict.
-        completed = [r for r in rows if r["status"] == "completed"
-                     and r["val_loss"] is not None and r["params"] is not None]
+        completed = [
+            r
+            for r in rows
+            if r["status"] == "completed"
+            and r["val_loss"] is not None
+            and r["params"] is not None
+        ]
         pareto: list[dict[str, Any]] = []
         for r in completed:
             dominated = False
             for other in completed:
                 if other is r:
                     continue
-                if (other["params"] <= r["params"]
-                        and other["val_loss"] <= r["val_loss"]
-                        and (other["params"] < r["params"]
-                             or other["val_loss"] < r["val_loss"])):
+                if (
+                    other["params"] <= r["params"]
+                    and other["val_loss"] <= r["val_loss"]
+                    and (
+                        other["params"] < r["params"]
+                        or other["val_loss"] < r["val_loss"]
+                    )
+                ):
                     dominated = True
                     break
             if not dominated:
@@ -692,37 +862,53 @@ class TrialRunner:
             result["suggestions"] = []
         return result
 
-    def _suggest(self, strategy: str, completed: list[dict[str, Any]], n: int = 3) -> list[dict[str, Any]]:
-        """Create an ephemeral Optuna study, seed it, and return N suggestions."""
+    def _suggest(
+        self, strategy: str, completed: list[dict[str, Any]], n: int = 3
+    ) -> list[dict[str, Any]]:
+        """Create an ephemeral Optuna study and return N HP suggestions.
+
+        v1 seeded ``builtin_distributions`` with completed trials and called
+        ``study.ask``. v2's sweep surface is the per-strategy
+        ``STRATEGY_SUGGESTERS`` table (resolved through
+        ``adapter_strategy_for`` for sweep-only aliases), so we seed the
+        study with the completed trials' observed val_loss and draw N fresh
+        suggestions from the strategy's suggester. Best-effort: any failure
+        (unknown strategy, optuna missing) returns ``[]``.
+        """
         try:
             import optuna
-            from pawn.lab.sweep import builtin_distributions
+
+            from pawn.sweep import STRATEGY_SUGGESTERS, adapter_strategy_for
+
             optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-            dists = builtin_distributions(strategy)
+            suggester = STRATEGY_SUGGESTERS.get(
+                strategy
+            ) or STRATEGY_SUGGESTERS.get(adapter_strategy_for(strategy))
+            if suggester is None:
+                return []
+
             study = optuna.create_study(study_name="suggest", direction="minimize")
 
-            seeded = 0
+            # Seed the sampler with the completed trials: re-run the suggester
+            # against each trial so its parameter space is registered, then
+            # record the observed val_loss. This biases the next ``ask`` toward
+            # the better-performing region of the space (v1 parity).
             for r in completed:
-                hp = r.get("key_hp", {})
-                trial_dists = {k: v for k, v in dists.items() if k in hp}
-                trial_params = {k: v for k, v in hp.items() if k in dists}
-                if not trial_dists:
+                val_loss = r.get("val_loss")
+                if val_loss is None:
                     continue
                 try:
-                    frozen = optuna.trial.create_trial(
-                        params=trial_params, distributions=trial_dists,
-                        values=[r["val_loss"]], state=optuna.trial.TrialState.COMPLETE,
-                    )
-                    study.add_trial(frozen)
-                    seeded += 1
-                except Exception:
+                    trial = study.ask()
+                    suggester(trial)
+                    study.tell(trial, val_loss)
+                except (ValueError, RuntimeError):
                     pass
 
-            suggestions = []
+            suggestions: list[dict[str, Any]] = []
             for _ in range(n):
-                trial = study.ask(dists)
-                suggestions.append(trial.params)
+                trial = study.ask()
+                suggestions.append(suggester(trial))
             return suggestions
         except Exception as e:
             log.debug("Suggestion failed: %s", e)
@@ -746,6 +932,23 @@ class TrialRunner:
         trial.notes = notes
         self._save_state()
         return {"ok": True}
+
+    def set_cost(self, cost_per_hour: float) -> dict[str, Any]:
+        """Set the pod's hourly cost for cumulative cost tracking.
+
+        v1 parity (``runner.set_cost`` behind the ``lab_set_cost`` tool):
+        records the instance ``$/hr`` so :meth:`status` and
+        :meth:`render_progress_log` can report a cumulative
+        ``estimated_cost`` (rate x uptime). The return shape matches v1
+        (``{"cost_per_hour", "status"}``). v2 additionally persists the
+        rate into ``lab_state.json`` so it survives a runner restart
+        (``_save_state`` / ``_load_state`` already round-trip
+        ``cost_per_hour``).
+        """
+        self.cost_per_hour = cost_per_hour
+        self._save_state()
+        self.render_progress_log()
+        return {"cost_per_hour": cost_per_hour, "status": "set"}
 
     # =======================================================================
     # Audit
@@ -787,21 +990,22 @@ class TrialRunner:
             rows.append(row)
 
         any_fail = any(
-            any(c.get("pass") is False for c in r["checks"].values())
-            for r in rows
+            any(c.get("pass") is False for c in r["checks"].values()) for r in rows
         )
         return {"trials": rows, "any_failure": any_fail}
 
     @staticmethod
     def _check(
-        ok: bool | None, *, reason: str | None = None, **details: Any,
+        ok: bool | None,
+        *,
+        reason: str | None = None,
+        **details: Any,
     ) -> dict[str, Any]:
         """Construct a single audit-check entry.
 
-        Centralizes the ``{pass: bool|None, ...}`` shape so callers
-        don't repeat the dict scaffolding. ``reason`` is omitted from
-        the result when ``None`` so passing checks don't carry an
-        empty-reason field.
+        Centralizes the ``{pass: bool|None, ...}`` shape so callers don't
+        repeat the dict scaffolding. ``reason`` is omitted from the result
+        when ``None`` so passing checks don't carry an empty-reason field.
         """
         out: dict[str, Any] = {"pass": ok}
         if reason is not None:
@@ -810,7 +1014,10 @@ class TrialRunner:
         return out
 
     def _audit_trial(
-        self, trial: Trial, *, check_hf: bool,
+        self,
+        trial: Trial,
+        *,
+        check_hf: bool,
     ) -> dict[str, Any]:
         checks: dict[str, dict[str, Any]] = {}
         check = self._check
@@ -832,12 +1039,16 @@ class TrialRunner:
                     )
                 except (OSError, ValueError, json.JSONDecodeError) as e:
                     checks["schedule_complete"] = check(
-                        None, reason=f"schedule_health.json unreadable: {e}",
+                        None,
+                        reason=f"schedule_health.json unreadable: {e}",
                     )
             else:
                 checks["schedule_complete"] = check(
                     None,
-                    reason="schedule_health.json absent (older trainer or pre-init crash)",
+                    reason=(
+                        "schedule_health.json absent "
+                        "(older trainer or pre-init crash)"
+                    ),
                 )
         else:
             checks["schedule_complete"] = check(None, reason="no run_dir")
@@ -852,7 +1063,8 @@ class TrialRunner:
                     latest_ckpt = step_dirs[-1]
         if latest_ckpt is None:
             checks["checkpoint_complete"] = check(
-                None, reason="no step_* checkpoint found",
+                None,
+                reason="no step_* checkpoint found",
             )
         else:
             checks["checkpoint_complete"] = check(
@@ -865,7 +1077,8 @@ class TrialRunner:
         hf_repo = (trial.config or {}).get("hf_repo")
         if not hf_repo:
             checks["checkpoint_on_hf"] = check(
-                None, reason="hf_repo not configured",
+                None,
+                reason="hf_repo not configured",
             )
         elif not check_hf:
             checks["checkpoint_on_hf"] = check(
@@ -874,7 +1087,8 @@ class TrialRunner:
             )
         elif latest_ckpt is None:
             checks["checkpoint_on_hf"] = check(
-                None, reason="no local checkpoint to compare",
+                None,
+                reason="no local checkpoint to compare",
             )
         else:
             checks["checkpoint_on_hf"] = self._audit_hf(
@@ -890,7 +1104,9 @@ class TrialRunner:
 
     @staticmethod
     def _audit_hf(
-        hf_repo: str, run_dir: str | None, ckpt_name: str,
+        hf_repo: str,
+        run_dir: str | None,
+        ckpt_name: str,
     ) -> dict[str, Any]:
         try:
             from huggingface_hub import HfApi
@@ -898,9 +1114,7 @@ class TrialRunner:
             return {"pass": None, "reason": f"huggingface_hub unavailable: {e}"}
         try:
             api = HfApi()
-            branch = (
-                f"run/{Path(run_dir).name}" if run_dir else "main"
-            )
+            branch = f"run/{Path(run_dir).name}" if run_dir else "main"
             files = api.list_repo_files(
                 hf_repo, repo_type="model", revision=branch
             )
@@ -923,8 +1137,11 @@ class TrialRunner:
         lines: list[str] = ["# Pod Manager Log\n"]
 
         lines.append("## Environment")
-        lines.append(f"- GPUs: {self.gpu_count}x {self.gpu_names[0] if self.gpu_names else '?'}, "
-                      f"{self.gpu_vram_mb[0] if self.gpu_vram_mb else '?'} MB each")
+        lines.append(
+            f"- GPUs: {self.gpu_count}x "
+            f"{self.gpu_names[0] if self.gpu_names else '?'}, "
+            f"{self.gpu_vram_mb[0] if self.gpu_vram_mb else '?'} MB each"
+        )
         lines.append(f"- Persistent storage: {self.workspace}")
         lines.append("")
 
@@ -939,8 +1156,12 @@ class TrialRunner:
         running = [t for t in self.trials.values() if t.status == "running"]
         if running:
             lines.append("## Active Processes")
-            lines.append("| PID | GPU | Trial | Strategy | Step | Total | Step/s | ETA |")
-            lines.append("|-----|-----|-------|----------|------|-------|--------|-----|")
+            lines.append(
+                "| PID | GPU | Trial | Strategy | Step | Total | Step/s | ETA |"
+            )
+            lines.append(
+                "|-----|-----|-------|----------|------|-------|--------|-----|"
+            )
             for t in running:
                 eta = _format_duration(t.eta_seconds())
                 lines.append(
@@ -950,16 +1171,25 @@ class TrialRunner:
                 )
             lines.append("")
 
-        completed = [t for t in self.trials.values()
-                     if t.status in ("completed", "failed", "killed")]
+        completed = [
+            t
+            for t in self.trials.values()
+            if t.status in ("completed", "failed", "killed")
+        ]
         if completed:
             lines.append("## Results")
-            lines.append("| Trial | Strategy | Params | val_loss | Acc | Status | Notes |")
-            lines.append("|-------|----------|--------|----------|-----|--------|-------|")
+            lines.append(
+                "| Trial | Strategy | Params | val_loss | Acc | Status | Notes |"
+            )
+            lines.append(
+                "|-------|----------|--------|----------|-----|--------|-------|"
+            )
             for t in sorted(completed, key=lambda t: t.trial_id):
                 vl = f"{t.best_val_loss:.4f}" if t.best_val_loss else "---"
                 acc = f"{t.best_accuracy:.1%}" if t.best_accuracy else "---"
-                pc = f"{t.actual_param_count:,}" if t.actual_param_count else "?"
+                pc = (
+                    f"{t.actual_param_count:,}" if t.actual_param_count else "?"
+                )
                 lines.append(
                     f"| {t.trial_id} | {t.strategy} | {pc} | {vl} "
                     f"| {acc} | {t.status} | {t.notes} |"
@@ -973,7 +1203,9 @@ class TrialRunner:
                 tid = e.get("trial_id")
                 tid_str = f" (trial {tid})" if tid is not None else ""
                 data_str = json.dumps(e.get("data", {}), default=str)
-                lines.append(f"- [{e['timestamp']}] {e['type']}{tid_str} {data_str}")
+                lines.append(
+                    f"- [{e['timestamp']}] {e['type']}{tid_str} {data_str}"
+                )
             lines.append("")
 
         content = "\n".join(lines)
@@ -1016,30 +1248,44 @@ class TrialRunner:
                 if trial.gpu_id is not None:
                     self._assign_gpu(trial_id, trial.gpu_id)
             else:
-                log.warning("Trial %d (PID %d) no longer running", trial_id, trial.pid)
-                read_metrics(trial, self.log_dir, self._metrics_offsets, self._sps_windows)
+                log.warning(
+                    "Trial %d (PID %s) no longer running", trial_id, trial.pid
+                )
+                read_metrics(
+                    trial, self.log_dir, self._metrics_offsets, self._sps_windows
+                )
                 trial.end_time = time.time()
                 if trial.best_val_loss is not None:
                     trial.status = "completed"
-                    self._emit("trial_completed", trial_id, {
-                        "best_val_loss": trial.best_val_loss,
-                        "best_accuracy": trial.best_accuracy,
-                        "param_count": trial.actual_param_count,
-                        "steps": trial.current_step,
-                        "recovered": True,
-                    })
+                    self._emit(
+                        "trial_completed",
+                        trial_id,
+                        {
+                            "best_val_loss": trial.best_val_loss,
+                            "best_accuracy": trial.best_accuracy,
+                            "param_count": trial.actual_param_count,
+                            "steps": trial.current_step,
+                            "recovered": True,
+                        },
+                    )
                 else:
                     trial.status = "failed"
-                    self._emit("trial_failed", trial_id, {
-                        "reason": "process exited during server downtime",
-                        "recovered": True,
-                    })
+                    self._emit(
+                        "trial_failed",
+                        trial_id,
+                        {
+                            "reason": "process exited during server downtime",
+                            "recovered": True,
+                        },
+                    )
 
         self._save_state()
         self.render_progress_log()
-        log.info("Recovery complete: %d trials, %d still running",
-                 len(self.trials),
-                 sum(1 for t in self.trials.values() if t.status == "running"))
+        log.info(
+            "Recovery complete: %d trials, %d still running",
+            len(self.trials),
+            sum(1 for t in self.trials.values() if t.status == "running"),
+        )
 
     def shutdown(self) -> None:
         """Save state on shutdown. Training processes continue independently."""

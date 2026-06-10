@@ -11,7 +11,7 @@ Feel free to use PAWN in your own experiments. PAWN is developed as a personal p
 
 ## Model Variants
 
-The model comes in three sizes, all trained from scratch on random chess games generated on-the-fly by a Rust-based chess backend. The v1.0.0 weights were trained together for 200K steps at batch size 256 on a single GPU — all three variants see the same random-game batches each step, with one forward/backward pass per variant in sequence (see [cotrain config](configs/cotrain_three_variants.json)). The numbers below come from the best 5K-cadence checkpoint by val loss (step 195,000 ≈ 49.9M sequences) for all three variants:
+The model comes in three sizes, all trained from scratch on random chess games generated on-the-fly by a Rust-based chess backend. The v1.0.0 weights were trained together for 200K steps at batch size 256 on a single GPU — all three variants see the same random-game batches each step, with one forward/backward pass per variant in sequence. **The v1 numbers below come from the best 5K-cadence checkpoint by val loss (step 195,000 ≈ 49.9M sequences) for all three variants under the PyTorch stack. The v2 stack (JAX/Equinox/Optax) replaces multi-variant cotraining with the supernet's joint loss; v2 weights publish to new HF repos (`pawn-{small,base,large}-v2`).**
 
 | Variant | d_model | Layers | Heads | Params | Top-1 | Legal rate | Game completion | Download |
 |---------|---------|--------|-------|--------|-------|------------|-----------------|----------|
@@ -21,11 +21,12 @@ The model comes in three sizes, all trained from scratch on random chess games g
 
 *Metrics measured on a 2,048-game validation set of random games. **Game completion** is the ability to choose a legal move in every position throughout a random game. It is the primary signal that separates capacity between sizes. The number given above is non-autoregressive. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#game-completion-rate).*
 
-All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), factored move embeddings, and a vocabulary covering:
+All variants share the same architecture: [RMSNorm](https://arxiv.org/abs/1910.07467), [SwiGLU](https://arxiv.org/abs/2002.05202) FFN, [RoPE](https://arxiv.org/abs/2104.09864), a uniform output-tied token embedding table, and a `VOCAB_SIZE = 2000` vocabulary covering:
 
 - 1,968 move actions (the `searchless_chess` vocabulary, one entry per legally-reachable (src, dst[, promotion]) tuple),
 - 11 game-outcome tokens (pretraining outcomes: `WHITE_CHECKMATES`, `BLACK_CHECKMATES`, `STALEMATE`, `DRAW_BY_RULE`, `PLY_LIMIT`; Lichess-specific outcomes: `WHITE_RESIGNS`, `BLACK_RESIGNS`, `DRAW_BY_AGREEMENT`, `WHITE_WINS_ON_TIME`, `BLACK_WINS_ON_TIME`, `DRAW_BY_TIME`),
-- and a single PAD token — 1,980 tokens total.
+- a single PAD token,
+- and the Phase-A control tokens (BOS, NULL, + reserved conditioning slots) — 2,000 tokens total.
 
 Tokens are coordinate pairs (UCI notation) with no piece type or side-to-move information — `e2e4` means the same token whether it's a pawn double-push or a rook move. The model learns to track piece placement, movement rules, and game state entirely from observation, which can be isolated via [linear probes](https://arxiv.org/abs/1610.01644).
 
@@ -47,35 +48,60 @@ uv sync --extra cu128   # NVIDIA GPU (or --extra rocm for AMD)
 Weights and data can be loaded directly from HuggingFace:
 
 ```bash
-uv run python scripts/train.py --run-type adapter --strategy bottleneck \
+uv run --extra rocm python scripts/train_jax_adapter.py \
+    --strategy bottleneck \
     --checkpoint thomas-schweich/pawn-base \
     --pgn thomas-schweich/pawn-lichess-full \
-    --bottleneck-dim 32 --lr 1e-4 --local-checkpoints
+    --bottleneck-dim 32 --lr 1e-4 --total-steps 200 --local-checkpoints
 ```
 
-### Pretrain from scratch
+The published `pawn-{small,base,large}` HF checkpoints are v1 PyTorch
+artifacts. They are **not loadable in v2** — the Phase-A format redesign
+(uniform `V=2000` vocab + un-factored tied embeddings) makes the v1 weight
+layout architecturally incompatible, and the legacy converter was removed in
+the H.2 housekeeping commit. To use the v1 artifacts, check out the `v1.0.0`
+git tag. v2 trains and republishes under new HF repos
+(`pawn-{small,base,large}-v2` or similar); the v1 repos are not modified.
+
+### Pretrain the supernet
 
 Random games are generated on-the-fly; no dataset required:
 
 ```bash
-uv run python scripts/train.py --variant base --local-checkpoints
-
-# Or train all three variants simultaneously on shared data
-uv run python scripts/train.py --config configs/cotrain_three_variants.json
+uv run --extra rocm python scripts/train_jax.py \
+    --supernet base --total-steps 100000 --batch-size 256 \
+    --local-checkpoints
 ```
+
+The v1 cotrain path is GONE BY DESIGN — the supernet's joint loss
+(`sum` of per-variant cross-entropies on the same batch) replaces it.
 
 ### Run probes and diagnostics
 
 ```bash
-uv run python scripts/eval_probes.py --log-dir logs --device cuda
-uv run python -m pawn.dashboard --log-dir logs  # real-time monitoring
+# Move accuracy + per-phase
+uv run --extra rocm python scripts/eval_jax.py --checkpoint <converted-or-v2-dir>
+
+# Linear probes
+uv run --extra rocm python scripts/eval_probes_jax.py --checkpoint <converted>
+
+# 5 generation diagnostics (all gated on outcome_prefix_trained)
+uv run --extra rocm python scripts/eval_generation_jax.py \
+    --checkpoint <converted> --outcome-prefix-trained --edge-cases
+
+# Elo-stratified Lichess accuracy
+uv run --extra rocm python scripts/eval_vs_stockfish.py \
+    --checkpoint <converted> --pgn thomas-schweich/pawn-lichess-full
+
+# Real-time monitoring
+uv run --extra dashboard python -m pawn.dashboard --log-dir logs
 ```
 
 ## Architecture
 
 <sub>More info: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)</sub>
 
-Standard decoder-only [transformer](https://arxiv.org/abs/1706.03762) with next-token prediction. Each training example is a move sequence padded to 512 tokens. Factored embeddings decompose each move into source square + destination square + promotion piece. Predictions are not masked to legal moves — the model must infer legality from the move history alone. There is no board representation like [AlphaZero](https://arxiv.org/abs/1712.01815)'s 8x8xN planes; all state tracking is learned internally.
+Standard decoder-only [transformer](https://arxiv.org/abs/1706.03762) with next-token prediction. Each training example is a move sequence padded to 512 tokens (optionally preceded by a fixed-width conditioning prefix). Token embeddings come from a single uniform table tied to the output head. Predictions are not masked to legal moves — the model must infer legality from the move history alone. There is no board representation like [AlphaZero](https://arxiv.org/abs/1712.01815)'s 8x8xN planes; all state tracking is learned internally.
 
 ## What the Model Learns
 

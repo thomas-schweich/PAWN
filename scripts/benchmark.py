@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
-"""Standardized performance benchmarks for PAWN.
+"""Standardized performance benchmarks for PAWN (v2: JAX/Equinox/Optax).
 
 Benchmarks three layers:
-  1. Rust engine (CPU): game generation, validation, board extraction, legal masks
-  2. Backbone training steps (GPU): small/base models, compiled vs eager
-  3. Adapter training steps (GPU): LoRA, FiLM, Bottleneck on frozen backbone
+  1. Rust engine (CPU): game generation, validation, board extraction
+  2. Backbone training steps (GPU): tiny/small/base/large models, eager
+     vs jit-compiled
+  3. Adapter training steps (GPU): LoRA, FiLM, Bottleneck on a frozen
+     backbone via :func:`pawn.adapter_trainer.make_adapter_train_step`.
 
 Defaults per platform:
-  AMD/ROCm:    SDPA MATH backend, bf16 AMP
-  NVIDIA/CUDA: flash attention,   bf16 AMP
+  AMD/ROCm:    JAX-on-ROCm, plain attention (matches pawn/model.py)
+  NVIDIA/CUDA: JAX-on-CUDA12, plain attention
 
-Usage:
-    uv run python scripts/benchmark.py
-    uv run python scripts/benchmark.py --engine-only
-    uv run python scripts/benchmark.py --gpu-only
-    uv run python scripts/benchmark.py --variants small base --batch-size 128
-    uv run python scripts/benchmark.py --adapters lora film
-    uv run python scripts/benchmark.py --no-backbone         # skip backbone, run adapters only
-    uv run python scripts/benchmark.py --no-adapters         # skip adapters, run backbone only
-    uv run python scripts/benchmark.py --no-compile          # eager only
-    uv run python scripts/benchmark.py --compile-only        # compiled only
-    uv run python scripts/benchmark.py --json results.json   # machine-readable output
+Usage::
+
+    uv run --extra rocm python scripts/benchmark.py
+    uv run --extra rocm python scripts/benchmark.py --engine-only
+    uv run --extra rocm python scripts/benchmark.py --gpu-only
+    uv run --extra rocm python scripts/benchmark.py --variants tiny small
+    uv run --extra rocm python scripts/benchmark.py --adapters lora film
+    uv run --extra rocm python scripts/benchmark.py --no-backbone
+    uv run --extra rocm python scripts/benchmark.py --no-adapters
+    uv run --extra rocm python scripts/benchmark.py --no-jit
+    uv run --extra rocm python scripts/benchmark.py --jit-only
+    uv run --extra rocm python scripts/benchmark.py --json results.json
 """
 
 from __future__ import annotations
@@ -52,11 +55,11 @@ class TimingResult:
     min_ms: float
     max_ms: float
     stdev_ms: float
-    throughput: float | None = None      # items/sec (games, steps, etc.)
+    throughput: float | None = None
     throughput_unit: str = ""
-    peak_memory_mb: float | None = None  # GPU peak memory
-    warmup_ms: float | None = None       # total warmup time (compilation + first runs)
-    n_warmup: int | None = None          # number of warmup iterations
+    peak_memory_mb: float | None = None
+    warmup_ms: float | None = None
+    n_warmup: int | None = None
 
     def summary_line(self) -> str:
         parts = [
@@ -77,12 +80,12 @@ class TimingResult:
 @dataclass
 class ConcurrencyResult:
     n_models: int
-    step_ms: float              # wall time for one round (all N models stepped)
-    per_model_ms: float         # step_ms / n_models
-    total_throughput: float     # total samples/s across all models
-    per_model_throughput: float # samples/s per model
-    total_vram_mb: float        # sum of peak VRAM across all processes
-    speedup: float              # total_throughput / single_model_throughput
+    step_ms: float
+    per_model_ms: float
+    total_throughput: float
+    per_model_throughput: float
+    total_vram_mb: float
+    speedup: float
 
 
 @dataclass
@@ -91,7 +94,7 @@ class BenchmarkReport:
     platform_info: dict = field(default_factory=dict)
     engine_results: list[dict] = field(default_factory=list)
     backbone_results: list[dict] = field(default_factory=list)
-    dataloader_results: list[dict] = field(default_factory=list)
+    data_pipeline_results: list[dict] = field(default_factory=list)
     concurrency_results: list[dict] = field(default_factory=list)
     adapter_results: list[dict] = field(default_factory=list)
 
@@ -99,7 +102,6 @@ class BenchmarkReport:
 # ── Timing helpers ───────────────────────────────────────────────────────────
 
 def time_cpu(fn, *, n_warmup: int = 2, n_iter: int = 10) -> list[float]:
-    """Time a CPU function, returning wall-clock seconds per call."""
     for _ in range(n_warmup):
         fn()
     times = []
@@ -112,46 +114,68 @@ def time_cpu(fn, *, n_warmup: int = 2, n_iter: int = 10) -> list[float]:
 
 @dataclass
 class GPUTimingResult:
-    """Raw timing data from time_gpu."""
-    times: list[float]         # timed iteration durations (seconds)
-    warmup_secs: float         # total warmup wall time (seconds)
-    n_warmup: int              # number of warmup iterations
+    times: list[float]
+    warmup_secs: float
+    n_warmup: int
 
 
-def time_gpu(fn, *, n_warmup: int = 3, n_iter: int = 10,
-             reset_peak_memory: bool = False) -> GPUTimingResult:
-    """Time a GPU function with CUDA synchronization.
+def _sync():
+    """JAX dispatch is async; block on any in-flight work to get honest
+    wall-clock timings. Wraps `jax.block_until_ready` over a sentinel."""
+    import jax
+    import jax.numpy as jnp
+    jax.block_until_ready(jnp.zeros(()))
 
-    Returns timed iteration durations plus total warmup time (which includes
-    compilation overhead for torch.compile'd functions).
 
-    When reset_peak_memory is True, peak memory stats are reset after warmup
-    so the caller gets steady-state memory usage, not compilation overhead.
+def time_gpu(fn, *, n_warmup: int = 3, n_iter: int = 10) -> GPUTimingResult:
+    """Time a JAX function with explicit sync points.
+
+    Returns timed iteration durations plus total warmup wall time (which
+    includes JIT compilation overhead — the first warmup call traces the
+    function).
     """
-    import torch
-
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    _sync()
     warmup_start = time.perf_counter()
     for _ in range(n_warmup):
-        fn()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+        out = fn()
+        if out is not None:
+            import jax
+            jax.block_until_ready(out)
+    _sync()
     warmup_secs = time.perf_counter() - warmup_start
-
-    if torch.cuda.is_available() and reset_peak_memory:
-        torch.cuda.reset_peak_memory_stats()
 
     times = []
     for _ in range(n_iter):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        _sync()
         t0 = time.perf_counter()
-        fn()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        out = fn()
+        if out is not None:
+            import jax
+            jax.block_until_ready(out)
+        else:
+            _sync()
         times.append(time.perf_counter() - t0)
     return GPUTimingResult(times=times, warmup_secs=warmup_secs, n_warmup=n_warmup)
+
+
+def _peak_memory_mb() -> float | None:
+    """Best-effort GPU peak memory in MB via `jax.devices()[0].memory_stats()`.
+
+    Returns None on platforms where the XLA runtime doesn't expose the
+    `peak_bytes_in_use` field (some ROCm builds).
+    """
+    try:
+        import jax
+        dev = jax.devices()[0]
+        stats = dev.memory_stats()
+        if stats is None:
+            return None
+        peak = stats.get("peak_bytes_in_use")
+        if peak is None:
+            return None
+        return peak / (1024**2)
+    except Exception:
+        return None
 
 
 def make_result(
@@ -195,7 +219,6 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
     print("=" * 72)
     print(f"  n_games={n_games}  max_ply={max_ply}  n_iter={n_iter}")
 
-    # 1. Random game generation (baseline)
     print("\n  [1/7] generate_random_games (baseline) ...")
     times = time_cpu(
         lambda: engine.generate_random_games(n_games, max_ply, seed),
@@ -206,7 +229,6 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
         throughput_count=n_games, throughput_unit="games/s",
     ))
 
-    # 2. Random games with mate_boost=1.0 (always take mate-in-1)
     print("  [2/7] generate_random_games (mate_boost=1.0) ...")
     times = time_cpu(
         lambda: engine.generate_random_games(
@@ -218,9 +240,6 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
         throughput_count=n_games, throughput_unit="games/s",
     ))
 
-    # 3. Random games with discard_ply_limit=True
-    #    Engine discards ply-limit games and retries, so actual returned count
-    #    equals n_games but wall time reflects extra generation work.
     print("  [3/7] generate_random_games (discard_ply_limit) ...")
     times = time_cpu(
         lambda: engine.generate_random_games(
@@ -232,7 +251,10 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
         throughput_count=n_games, throughput_unit="games/s",
     ))
 
-    # 4. Full CLM batch generation (games + packing)
+    # Full CLM batch generation (games + tokenisation/packing). This is
+    # the single Rust entry point the v2 corpus pipeline drives every
+    # training step (`pawn.corpus.generate_corpus` → `generate_clm_batch`),
+    # so its cost is the real per-step data-generation floor.
     print("  [4/7] generate_clm_batch ...")
     times = time_cpu(
         lambda: engine.generate_clm_batch(n_games, max_ply, seed),
@@ -247,7 +269,6 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
     move_ids, game_lengths, _tc = engine.generate_random_games(
         n_games, max_ply, seed)
 
-    # 5. validate_games
     print("  [5/7] validate_games ...")
     times = time_cpu(
         lambda: engine.validate_games(move_ids, game_lengths),
@@ -258,7 +279,8 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
         throughput_count=n_games, throughput_unit="games/s",
     ))
 
-    # 6. compute_edge_stats_per_game (validation + stat bits)
+    # Per-game edge-case stat bits (validation + in_check / double_check /
+    # pin / ep / castle bits) — drives `pawn.eval_suite` edge-case coverage.
     print("  [6/7] compute_edge_stats_per_game (stat bits) ...")
     times = time_cpu(
         lambda: engine.compute_edge_stats_per_game(move_ids, game_lengths),
@@ -269,7 +291,6 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
         throughput_count=n_games, throughput_unit="games/s",
     ))
 
-    # 7. extract_board_states
     print("  [7/7] extract_board_states ...")
     times = time_cpu(
         lambda: engine.extract_board_states(move_ids, game_lengths),
@@ -287,260 +308,308 @@ def bench_engine(n_games: int, n_iter: int, n_warmup: int) -> list[TimingResult]
     return results
 
 
-# ── GPU training step helper ─────────────────────────────────────────────────
-
-def _make_backbone_step(model, optimizer, scaler, batch, device, forward_fn):
-    """Build a closure for one full backbone training step."""
-    import torch
-
-    def step():
-        model.train()
-        with torch.amp.autocast(device, dtype=torch.bfloat16, enabled=True):
-            loss, _metrics = forward_fn(
-                batch["input_ids"], batch["loss_mask"], batch["targets"],
-            )
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-
-    return step
-
-
-def _make_adapter_step(adapter_model, optimizer, scaler, batch, device, forward_fn,
-                       trainable):
-    """Build a closure for one full adapter training step."""
-    import torch
-    from pawn.model import clm_loss
-
-    def step():
-        adapter_model.train()
-        with torch.amp.autocast(device, dtype=torch.bfloat16, enabled=True):
-            logits = forward_fn(batch["input_ids"])
-            loss, _metrics = clm_loss(
-                logits, batch["targets"], batch["loss_mask"],
-            )
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-
-    return step
-
-
-def _make_batch(batch_size: int, device: str):
-    """Generate a CLM batch on the given device."""
-    import torch
-
-    input_ids, targets, loss_mask, _mid, _gl, _tc = \
-        engine.generate_clm_batch(batch_size, 256, seed=42)
-    return {
-        "input_ids": torch.from_numpy(input_ids).long().to(device),
-        "targets": torch.from_numpy(targets).long().to(device),
-        "loss_mask": torch.from_numpy(loss_mask).to(device),
-    }
-
-
 # ── Backbone benchmarks (GPU) ───────────────────────────────────────────────
+
+_VARIANT_MAP = {
+    "tiny": "tiny",   # → TINY_SUPERNET
+    "small": "small",
+    "base": "base",
+    "large": "large",
+}
+
+
+def _make_corpus_batch(batch_size: int, max_ply: int = 256, seq_len: int = 512, seed: int = 42):
+    """Generate one Corpus + slice into a Batch via the v2 trainer surface."""
+    from pawn.corpus import generate_corpus
+    from pawn.trainer import slice_batch
+
+    corpus = generate_corpus(
+        n_games=batch_size, max_ply=max_ply, seq_len=seq_len, seed=seed
+    )
+    indices = np.arange(batch_size, dtype=np.int64)
+    return slice_batch(corpus, indices)
+
+
+def _resolve_supernet(variant: str):
+    """Return the (cfg, label) for a benchmarked backbone size."""
+    from pawn.config import SUPERNET, TINY_SUPERNET, VARIANTS, TINY_VARIANTS
+
+    if variant == "tiny":
+        return TINY_SUPERNET, "tiny-supernet"
+    if variant == "large":
+        return SUPERNET, "large(supernet)"
+    if variant in VARIANTS:
+        return VARIANTS[variant], variant
+    if variant in TINY_VARIANTS:
+        return TINY_VARIANTS[variant], f"tiny-{variant}"
+    raise ValueError(f"unknown variant {variant!r}")
+
+
+def _build_train_state(cfg, lr: float = 3e-4, key: int = 42):
+    """Build a v2 TrainState wrapping a freshly-initialised PAWNModel."""
+    import equinox as eqx
+    import jax
+    import jax.numpy as jnp
+    import optax
+
+    from pawn.model import init_model
+    from pawn.trainer import TrainState
+
+    model = init_model(cfg, jax.random.key(key))
+    optimizer = optax.adamw(lr, b1=0.9, b2=0.95, weight_decay=0.01)
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    state = TrainState(
+        model=model,
+        opt_state=opt_state,
+        step=jnp.int32(0),
+        key=jax.random.key(key),
+    )
+    return state, optimizer, model
+
+
+def _make_backbone_step(
+    state, optimizer, batch, jit: bool, compute_dtype=None,
+    use_sdpa: bool = False, use_flash: bool = False,
+):
+    """Return a `() -> new_state` closure timing one backbone training step.
+
+    `jit=True` returns the jitted train_step from `pawn.trainer.make_train_step`.
+    `jit=False` builds an unjitted clone of the same loss + update path so
+    eager mode measures the cost of running the autograd graph in Python.
+
+    `compute_dtype` (None / jnp.bfloat16 / jnp.float16 / jnp.float32)
+    controls AMP forward dtype. Threaded into both `train_step` paths
+    so the perf benchmarks exercise the same precision settings the
+    real training scripts use (otherwise this script silently runs
+    fp32 even when the user asks for bf16).
+
+    `use_sdpa` / `use_flash` select the attention backend (plain
+    materialised QK^T / XLA `dot_product_attention` / Pallas-flash) so
+    `--attn-backend` is honoured end to end.
+    """
+    import jax
+    import equinox as eqx
+
+    from pawn.trainer import (
+        VariantSpec, make_train_step, cross_entropy_loss,
+    )
+
+    variants = (VariantSpec(name="bench", cfg=state.model.cfg, is_supernet=True),)
+
+    if jit:
+        train_step = make_train_step(
+            optimizer, variants, compute_dtype=compute_dtype,
+            use_sdpa=use_sdpa, use_flash=use_flash,
+        )
+    else:
+        def _eager_train_step(s, b):
+            def loss_fn(model):
+                return cross_entropy_loss(
+                    model, b, compute_dtype=compute_dtype,
+                    use_sdpa=use_sdpa, use_flash=use_flash,
+                )
+            loss, grads = eqx.filter_value_and_grad(loss_fn)(s.model)
+            updates, new_opt = optimizer.update(grads, s.opt_state, s.model)
+            new_model = eqx.apply_updates(s.model, updates)
+            new_state = type(s)(
+                model=new_model, opt_state=new_opt,
+                step=s.step + 1, key=s.key,
+            )
+            return new_state, loss
+        train_step = _eager_train_step
+
+    cell = {"state": state}
+
+    def step():
+        new_state, loss = train_step(cell["state"], batch)
+        cell["state"] = new_state
+        return loss
+
+    return step, cell
+
 
 def bench_backbone(
     variants: list[str],
     batch_size: int,
-    device: str,
-    do_compile: bool,
+    do_jit: bool,
     do_eager: bool,
     n_iter: int,
     n_warmup: int,
-    sdpa_backend,
+    compute_dtype=None,
+    use_sdpa: bool = False,
+    use_flash: bool = False,
 ) -> list[TimingResult]:
     """Benchmark backbone training steps."""
-    import torch
-    import pawn.model as model_module
-    from pawn.config import CLMConfig
-    from pawn.model import PAWNCLM
+    import jax
 
-    results = []
-    variant_map = {
-        "toy": CLMConfig.toy,
-        "small": CLMConfig.small,
-        "base": CLMConfig.base,
-        "large": CLMConfig.large,
-    }
+    from pawn.model import init_model
 
+    results: list[TimingResult] = []
+
+    dtype_label = (
+        compute_dtype.dtype.name
+        if compute_dtype is not None and hasattr(compute_dtype, "dtype")
+        else (str(compute_dtype) if compute_dtype is not None else "float32")
+    )
+    attn_label = "flash (Pallas)" if use_flash else (
+        "sdpa (XLA dot_product_attention)" if use_sdpa
+        else "plain (materialised QK^T)"
+    )
     print("\n" + "=" * 72)
     print(" BACKBONE TRAINING BENCHMARKS (GPU)")
     print("=" * 72)
-    print(f"  batch_size={batch_size}  device={device}  n_iter={n_iter}")
-    print(f"  AMP: bf16  SDPA: {sdpa_backend.name if sdpa_backend else 'default (flash)'}")
+    print(f"  batch_size={batch_size}  device={jax.devices()[0]}  n_iter={n_iter}")
+    print(
+        f"  framework: JAX/Equinox/Optax  attention: {attn_label}  "
+        f"compute_dtype: {dtype_label}"
+    )
 
-    batch = _make_batch(batch_size, device)
+    batch = _make_corpus_batch(batch_size)
 
     modes = []
     if do_eager:
         modes.append(("eager", False))
-    if do_compile:
-        modes.append(("compiled", True))
+    if do_jit:
+        modes.append(("jit", True))
 
     for variant_name in variants:
-        cfg = variant_map[variant_name]()
+        cfg, label = _resolve_supernet(variant_name)
         n_params = None
 
-        for mode_name, use_compile in modes:
-            label = f"backbone/{variant_name} [{mode_name}]"
-            print(f"\n  {label} ...")
+        for mode_name, use_jit in modes:
+            bench_label = f"backbone/{label} [{mode_name}]"
+            print(f"\n  {bench_label} ...")
 
-            # Set SDPA backend before compile
-            model_module.SDPA_BACKEND = sdpa_backend
-
-            model = PAWNCLM(cfg).to(device)
+            state, optimizer, model = _build_train_state(cfg)
             if n_params is None:
-                n_params = sum(p.numel() for p in model.parameters())
+                n_params = int(sum(
+                    x.size for x in jax.tree_util.tree_leaves(
+                        jax.tree_util.tree_map(
+                            lambda v: v if hasattr(v, "size") else None,
+                            model,
+                        )
+                    ) if x is not None
+                ))
                 print(f"    params: {n_params:,}")
 
-            forward_fn = model.forward_train
-            if use_compile:
-                forward_fn = torch.compile(forward_fn)
-
-            optimizer = torch.optim.AdamW(
-                model.parameters(), lr=3e-4, weight_decay=0.01, betas=(0.9, 0.95),
-            )
-            scaler = torch.amp.GradScaler(device, enabled=True)
-
-            step = _make_backbone_step(
-                model, optimizer, scaler, batch, device, forward_fn,
+            step_fn, _cell = _make_backbone_step(
+                state, optimizer, batch, jit=use_jit,
+                compute_dtype=compute_dtype,
+                use_sdpa=use_sdpa, use_flash=use_flash,
             )
 
             try:
-                gpu_timing = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter,
-                                      reset_peak_memory=True)
-            except torch.cuda.OutOfMemoryError:
-                print(f"    OOM — skipping (try smaller --batch-size)")
-                del model, optimizer, scaler
-                torch.cuda.empty_cache()
-                continue
+                gpu_timing = time_gpu(step_fn, n_warmup=n_warmup, n_iter=n_iter)
+            except (RuntimeError, MemoryError) as exc:
+                if "out of memory" in str(exc).lower() or "RESOURCE_EXHAUSTED" in str(exc):
+                    print(f"    OOM — skipping (try smaller --batch-size)")
+                    continue
+                raise
 
-            peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
+            peak_mb = _peak_memory_mb()
 
             r = make_result(
-                label, gpu_timing.times,
+                bench_label, gpu_timing.times,
                 throughput_count=batch_size,
                 throughput_unit="samples/s",
                 peak_memory_mb=peak_mb,
-                warmup_secs=gpu_timing.warmup_secs if use_compile else None,
-                n_warmup=gpu_timing.n_warmup if use_compile else None,
+                warmup_secs=gpu_timing.warmup_secs if use_jit else None,
+                n_warmup=gpu_timing.n_warmup if use_jit else None,
             )
             results.append(r)
             print(f"    {r.summary_line()}")
 
-            # Free before next iteration
-            del model, optimizer, scaler
-            torch.cuda.empty_cache()
-
     return results
 
 
-# ── Dataloader-inclusive benchmarks (GPU) ─────────────────────────────────────
+# ── Data-pipeline-inclusive benchmarks (GPU) ─────────────────────────────────
 
-def bench_dataloader(
+def bench_data_pipeline(
     batch_size: int,
-    device: str,
     n_iter: int,
     n_warmup: int,
-    sdpa_backend,
 ) -> list[TimingResult]:
-    """Benchmark end-to-end training steps with DataLoader data generation.
+    """End-to-end step where the data is freshly generated by the Rust
+    engine on every iteration, versus reusing a pre-staged batch.
 
-    Runs pawn-base in compiled mode with workers=0 and workers=2 to measure
-    the impact of data loading on training throughput.
+    In v2 there is no PyTorch DataLoader / num_workers concept — fresh
+    games come straight from `engine.generate_clm_batch` inside Rust,
+    which is internally parallel via rayon. This bench measures the
+    overhead of the host→device transfer + Rust call per step against a
+    pre-staged batch baseline.
     """
-    import torch
-    import torch.utils.data
-    import pawn.model as model_module
-    from pawn.config import CLMConfig
-    from pawn.data import CLMDataset
-    from pawn.model import PAWNCLM
+    import jax
 
-    results = []
-    cfg = CLMConfig.base()
+    from pawn.config import TINY_SUPERNET
+    from pawn.trainer import VariantSpec, make_train_step, slice_batch
+    from pawn.corpus import generate_corpus
+
+    results: list[TimingResult] = []
+    cfg = TINY_SUPERNET
+    cfg_label = "tiny-supernet"
 
     print("\n" + "=" * 72)
-    print(" DATALOADER-INCLUSIVE BENCHMARKS (GPU)")
+    print(" DATA-PIPELINE-INCLUSIVE BENCHMARKS (GPU)")
     print("=" * 72)
-    print(f"  model=base  batch_size={batch_size}  device={device}  n_iter={n_iter}")
-    print(f"  AMP: bf16  SDPA: {sdpa_backend.name if sdpa_backend else 'default (flash)'}")
+    print(f"  model={cfg_label}  batch_size={batch_size}  device={jax.devices()[0]}")
 
-    for num_workers in [0, 2]:
-        label = f"dataloader/base [compiled, workers={num_workers}]"
-        print(f"\n  {label} ...")
+    indices = np.arange(batch_size, dtype=np.int64)
 
-        model_module.SDPA_BACKEND = sdpa_backend
+    # 1) pre-staged batch (no per-step generation cost)
+    state_a, optimizer, _ = _build_train_state(cfg)
+    variants = (VariantSpec(name="bench", cfg=cfg, is_supernet=True),)
+    train_step = make_train_step(optimizer, variants)
+    pre_batch = _make_corpus_batch(batch_size)
+    pre_cell = {"state": state_a}
 
-        model = PAWNCLM(cfg).to(device)
-        n_params = sum(p.numel() for p in model.parameters())
-        print(f"    params: {n_params:,}")
+    def pre_staged_step():
+        new_state, loss = train_step(pre_cell["state"], pre_batch)
+        pre_cell["state"] = new_state
+        return loss
 
-        forward_fn = torch.compile(model.forward_train)
+    print("\n  [1/2] pre-staged batch (reuse, no per-step generation) ...")
+    timing = time_gpu(pre_staged_step, n_warmup=n_warmup, n_iter=n_iter)
+    results.append(make_result(
+        "data_pipeline/pre-staged",
+        timing.times,
+        throughput_count=batch_size,
+        throughput_unit="samples/s",
+        peak_memory_mb=_peak_memory_mb(),
+        warmup_secs=timing.warmup_secs,
+        n_warmup=timing.n_warmup,
+    ))
+    print(f"    {results[-1].summary_line()}")
 
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=3e-4, weight_decay=0.01, betas=(0.9, 0.95),
+    # 2) fresh corpus per step (Rust engine + host→device on every call).
+    # Build a *separate* TrainState — `train_step` donates the previous
+    # state buffer, so reusing `state_a` after `pre_staged_step` consumed
+    # it would error with "Donation requested for invalid buffer".
+    state_b, _, _ = _build_train_state(cfg, key=43)
+    fresh_cell = {"state": state_b, "seed": 1000}
+
+    def fresh_per_step():
+        corpus = generate_corpus(
+            n_games=batch_size, max_ply=256, seq_len=512,
+            seed=fresh_cell["seed"],
         )
-        scaler = torch.amp.GradScaler(device, enabled=True)
+        fresh_cell["seed"] += 1
+        b = slice_batch(corpus, indices)
+        new_state, loss = train_step(fresh_cell["state"], b)
+        fresh_cell["state"] = new_state
+        return loss
 
-        dataset = CLMDataset(
-            batch_size=batch_size, max_ply=256, base_seed=42,
-        )
-        loader = torch.utils.data.DataLoader(
-            dataset, batch_size=None, num_workers=num_workers,
-            multiprocessing_context="spawn" if num_workers > 0 else None,
-            pin_memory=(num_workers > 0),
-        )
-        batch_iter = iter(loader)
-
-        def step():
-            batch = next(batch_iter)
-            batch = {
-                k: v.to(device, non_blocking=True) for k, v in batch.items()
-            }
-            model.train()
-            with torch.amp.autocast(device, dtype=torch.bfloat16, enabled=True):
-                loss, _metrics = forward_fn(
-                    batch["input_ids"], batch["loss_mask"], batch["targets"],
-                )
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-
-        try:
-            gpu_timing = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter,
-                                  reset_peak_memory=True)
-        except torch.cuda.OutOfMemoryError:
-            print(f"    OOM — skipping (try smaller --batch-size)")
-            del model, optimizer, scaler, loader, batch_iter
-            torch.cuda.empty_cache()
-            continue
-
-        peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
-
-        r = make_result(
-            label, gpu_timing.times,
-            throughput_count=batch_size,
-            throughput_unit="samples/s",
-            peak_memory_mb=peak_mb,
-            warmup_secs=gpu_timing.warmup_secs,
-            n_warmup=gpu_timing.n_warmup,
-        )
-        results.append(r)
-        print(f"    {r.summary_line()}")
-
-        del model, optimizer, scaler, loader, batch_iter
-        torch.cuda.empty_cache()
+    print("\n  [2/2] fresh corpus per step (engine + slice_batch every iter) ...")
+    timing = time_gpu(fresh_per_step, n_warmup=n_warmup, n_iter=n_iter)
+    results.append(make_result(
+        "data_pipeline/fresh-per-step",
+        timing.times,
+        throughput_count=batch_size,
+        throughput_unit="samples/s",
+        peak_memory_mb=_peak_memory_mb(),
+        warmup_secs=timing.warmup_secs,
+        n_warmup=timing.n_warmup,
+    ))
+    print(f"    {results[-1].summary_line()}")
 
     return results
 
@@ -548,149 +617,141 @@ def bench_dataloader(
 # ── Concurrency sweep (GPU) ──────────────────────────────────────────────────
 
 _WORKER_SCRIPT = '''
-"""Worker process for concurrency benchmark. Runs N training steps and
-reports wall time back to the parent via a result file.
+"""JAX worker process for the concurrency benchmark. Runs `n_iter` jit-compiled
+training steps on a (variant, optional-adapter) backbone and reports wall time
+via a result file.
 
-Uses a barrier file protocol to synchronize workers:
-1. Each worker sets up model, compiles, and runs warmup independently
-2. Writes a "ready" sentinel file
-3. Waits until all N ready files exist (barrier)
-4. All workers start timed iterations roughly simultaneously
+Barrier protocol mirrors the v1 PyTorch worker:
+1. Each worker initialises + compiles + warms up independently
+2. Touches a `ready_<id>` sentinel in the barrier dir
+3. Spins until all `n_workers` sentinels exist
+4. Runs `n_iter` timed iterations
+5. Writes a JSON result blob
 """
-import sys, time, json, os, torch
-import torch.nn.functional as F
-import pawn.model as model_module
-from pawn.config import CLMConfig
-from pawn.model import PAWNCLM, clm_loss
-from torch.nn.attention import SDPBackend
-import chess_engine as engine
+import sys, time, json
 from pathlib import Path
+
+import numpy as np
+import jax
+import jax.numpy as jnp
 
 batch_size = int(sys.argv[1])
 n_warmup = int(sys.argv[2])
 n_iter = int(sys.argv[3])
-sdpa_backend_name = sys.argv[4]   # "MATH" or "NONE"
-variant = sys.argv[5]
-adapter_type = sys.argv[6]        # "none", "lora", "film", "bottleneck"
-result_path = sys.argv[7]
-worker_id = int(sys.argv[8])
-n_workers = int(sys.argv[9])
-barrier_dir = sys.argv[10]
+variant = sys.argv[4]
+adapter_kind = sys.argv[5]   # "none", "lora", "film", "bottleneck"
+result_path = sys.argv[6]
+worker_id = int(sys.argv[7])
+n_workers = int(sys.argv[8])
+barrier_dir = sys.argv[9]
 
-device = "cuda"
-cfg = getattr(CLMConfig, variant)()
+from pawn.config import SUPERNET, TINY_SUPERNET, VARIANTS, TINY_VARIANTS
+from pawn.model import init_model
+from pawn.corpus import generate_corpus
+from pawn.trainer import VariantSpec, make_train_step, slice_batch
+import optax
 
-if sdpa_backend_name != "NONE":
-    model_module.SDPA_BACKEND = getattr(SDPBackend, sdpa_backend_name)
-
-backbone = PAWNCLM(cfg).to(device)
-
-# Optionally wrap in an adapter
-if adapter_type == "lora":
-    from pawn.adapters.lora import LoRACLM
-    model = LoRACLM(backbone, rank=4, attn_targets="qkvo").to(device)
-elif adapter_type == "film":
-    from pawn.adapters.film import FiLMCLM
-    model = FiLMCLM(backbone, use_output_film=True).to(device)
-elif adapter_type == "bottleneck":
-    from pawn.adapters.bottleneck import BottleneckCLM
-    model = BottleneckCLM(backbone, bottleneck_dim=8).to(device)
+if variant == "tiny":
+    cfg = TINY_SUPERNET
+elif variant == "large":
+    cfg = SUPERNET
+elif variant in VARIANTS:
+    cfg = VARIANTS[variant]
 else:
-    model = backbone
+    cfg = TINY_VARIANTS[variant]
 
-is_adapter = adapter_type != "none"
+model = init_model(cfg, jax.random.key(42 + worker_id))
 
-if is_adapter:
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    forward_fn = torch.compile(model.forward)
+corpus = generate_corpus(
+    n_games=batch_size, max_ply=256, seq_len=512, seed=42 + worker_id,
+)
+batch = slice_batch(corpus, np.arange(batch_size, dtype=np.int64))
+
+if adapter_kind == "none":
+    from pawn.trainer import TrainState
+    import equinox as eqx
+    optimizer = optax.adamw(3e-4, b1=0.9, b2=0.95, weight_decay=0.01)
+    state = TrainState(
+        model=model,
+        opt_state=optimizer.init(eqx.filter(model, eqx.is_inexact_array)),
+        step=jnp.int32(0), key=jax.random.key(42 + worker_id),
+    )
+    variants = (VariantSpec(name="bench", cfg=cfg, is_supernet=True),)
+    train_step = make_train_step(optimizer, variants)
 else:
-    trainable = list(model.parameters())
-    forward_fn = torch.compile(model.forward_train)
-
-optimizer = torch.optim.AdamW(
-    trainable, lr=3e-4, weight_decay=0.01, betas=(0.9, 0.95))
-scaler = torch.amp.GradScaler(device, enabled=True)
-
-input_ids, targets, loss_mask, *_ = engine.generate_clm_batch(batch_size, 256, seed=42)
-batch = {
-    "input_ids": torch.from_numpy(input_ids).long().to(device),
-    "targets": torch.from_numpy(targets).long().to(device),
-    "loss_mask": torch.from_numpy(loss_mask).to(device),
-}
+    from pawn.adapter_trainer import (
+        AdapterTrainState, dispatch_init, dispatch_filter,
+        make_adapter_train_step,
+    )
+    if adapter_kind == "lora":
+        from pawn.adapters.lora import LoRAConfig
+        adapter_cfg = LoRAConfig(rank=4, targets="qkvo")
+    elif adapter_kind == "film":
+        from pawn.adapters.film import FiLMConfig
+        adapter_cfg = FiLMConfig(use_output_film=True)
+    elif adapter_kind == "bottleneck":
+        from pawn.adapters.bottleneck import BottleneckConfig
+        adapter_cfg = BottleneckConfig(dim=8)
+    else:
+        raise SystemExit(f"unknown adapter {adapter_kind!r}")
+    adapter = dispatch_init(adapter_kind)(model, adapter_cfg, jax.random.key(99))
+    filt = dispatch_filter(adapter_kind)
+    trainable, _ = __import__("equinox").partition(adapter, filt)
+    optimizer = optax.adamw(3e-4, b1=0.9, b2=0.95, weight_decay=0.01)
+    state = AdapterTrainState(
+        backbone=model, adapter=adapter,
+        opt_state=optimizer.init(trainable),
+        step=jnp.int32(0), key=jax.random.key(42 + worker_id),
+    )
+    train_step = make_adapter_train_step(adapter_kind, optimizer)
 
 def step():
-    model.train()
-    with torch.amp.autocast(device, dtype=torch.bfloat16, enabled=True):
-        if is_adapter:
-            logits = forward_fn(batch["input_ids"])
-            loss, _ = clm_loss(logits, batch["targets"], batch["loss_mask"])
-        else:
-            loss, _ = forward_fn(batch["input_ids"], batch["loss_mask"], batch["targets"])
-    scaler.scale(loss).backward()
-    scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-    scaler.step(optimizer)
-    scaler.update()
-    optimizer.zero_grad(set_to_none=True)
+    global state
+    state, loss = train_step(state, batch)
+    return loss
 
-# Warmup (includes compilation) — each worker does this independently
 for _ in range(n_warmup):
-    step()
-torch.cuda.synchronize()
+    jax.block_until_ready(step())
 
-# Signal ready and wait for all workers to finish compilation
 ready_file = Path(barrier_dir) / f"ready_{worker_id}"
 ready_file.touch()
 
-# Spin-wait for all workers (with timeout)
-deadline = time.monotonic() + 300  # 5 min barrier timeout
+deadline = time.monotonic() + 600
 while time.monotonic() < deadline:
-    ready_count = sum(1 for f in Path(barrier_dir).glob("ready_*"))
+    ready_count = sum(1 for _ in Path(barrier_dir).glob("ready_*"))
     if ready_count >= n_workers:
         break
     time.sleep(0.05)
 
-# Timed iterations — all workers start roughly simultaneously
 times = []
 for _ in range(n_iter):
-    torch.cuda.synchronize()
     t0 = time.perf_counter()
-    step()
-    torch.cuda.synchronize()
+    out = step()
+    jax.block_until_ready(out)
     times.append(time.perf_counter() - t0)
 
-peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
+try:
+    stats = jax.devices()[0].memory_stats() or {}
+    peak_mb = (stats.get("peak_bytes_in_use") or 0) / (1024**2)
+except Exception:
+    peak_mb = 0.0
 
-with open(result_path, "w") as f:
-    json.dump({"times": times, "peak_memory_mb": peak_mb}, f)
+Path(result_path).write_text(json.dumps({"times": times, "peak_memory_mb": peak_mb}))
 '''
 
 
 def bench_concurrency(
     batch_size: int,
-    device: str,
     n_iter: int,
     n_warmup: int,
-    sdpa_backend,
-    variant: str = "small",
+    variant: str = "tiny",
     adapter: str = "none",
-    max_n: int = 10,
+    max_n: int = 8,
 ) -> list[ConcurrencyResult]:
-    """Sweep N concurrent training processes to find peak total throughput.
-
-    Spawns N independent Python processes, each running a compiled training
-    loop on the same GPU. Measures aggregate throughput and per-process
-    throughput. Stops when total throughput decreases or OOM is hit.
-
-    Args:
-        variant: backbone model size (toy/small/base/large)
-        adapter: adapter type to wrap the backbone (none/lora/film/bottleneck)
-    """
+    """Sweep N concurrent JAX processes to find peak total throughput."""
     import shutil
     import subprocess
     import tempfile
-
-    sdpa_name = sdpa_backend.name if sdpa_backend else "NONE"
 
     print("\n" + "=" * 72)
     print(" CONCURRENCY SWEEP (GPU)")
@@ -698,26 +759,18 @@ def bench_concurrency(
     config_str = f"  model={variant}"
     if adapter != "none":
         config_str += f"+{adapter}"
-    config_str += f"  batch_size={batch_size}  device={device}"
+    config_str += f"  batch_size={batch_size}"
     print(config_str)
-    print(f"  mode=compiled  {n_warmup} warmup + {n_iter} timed iterations per process")
-    print(f"  AMP: bf16  SDPA: {sdpa_name}")
+    print(f"  mode=jit  {n_warmup} warmup + {n_iter} timed iterations per process")
 
-    # Detect CUDA MPS (changes concurrency dynamics)
-    try:
-        ps = subprocess.run(
-            ["ps", "-eo", "comm"], capture_output=True, text=True, timeout=5)
-        if "nvidia-cuda-mps" in ps.stdout:
-            print("  NOTE: CUDA MPS is active — results reflect MPS scheduling")
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    # Pin all workers to GPU 0 so the sweep measures contention on a single
-    # GPU, even on multi-GPU systems.
     worker_env = os.environ.copy()
+    # JAX honours its own *_VISIBLE_DEVICES env var families; this pins
+    # every worker to physical device 0 so the sweep stays on a single
+    # GPU even on multi-GPU systems.
+    worker_env["JAX_PLATFORMS"] = worker_env.get("JAX_PLATFORMS", "")
     worker_env["CUDA_VISIBLE_DEVICES"] = "0"
+    worker_env["HIP_VISIBLE_DEVICES"] = "0"
 
-    # Write worker script to a temp file
     fd, worker_path = tempfile.mkstemp(suffix=".py", prefix="pawn_bench_worker_")
     os.close(fd)
     worker_file = Path(worker_path)
@@ -725,46 +778,37 @@ def bench_concurrency(
 
     results: list[ConcurrencyResult] = []
     single_throughput: float | None = None
-    baseline_wall_secs: float | None = None  # N=1 total wall time
+    baseline_wall_secs: float | None = None
 
     try:
         for n_procs in range(1, max_n + 1):
             print(f"\n  N={n_procs} ...")
-
-            # Create result files for each worker
-            result_files = []
+            result_files: list[Path] = []
             for i in range(n_procs):
                 fd, rpath = tempfile.mkstemp(suffix=".json", prefix=f"pawn_bench_r{i}_")
                 os.close(fd)
                 result_files.append(Path(rpath))
 
-            # Timeout: for N=1, be generous (10 min for compilation).
-            # For N>1, allow N * baseline * 3 — if it takes longer than that,
-            # the GPU is thrashing and we should stop.
             if baseline_wall_secs is not None:
                 timeout_secs = max(baseline_wall_secs * n_procs * 3, 60)
             else:
-                timeout_secs = 600  # 10 min for N=1 (includes compilation)
+                timeout_secs = 600
 
             sweep_start = time.perf_counter()
-
-            # Create barrier directory for worker synchronization
             barrier_dir = Path(tempfile.mkdtemp(prefix="pawn_bench_barrier_"))
 
-            # Launch all workers, pinned to GPU 0
             procs: list[subprocess.Popen[str]] = []
             for i, rf in enumerate(result_files):
                 p = subprocess.Popen(
                     [sys.executable, str(worker_file),
                      str(batch_size), str(n_warmup), str(n_iter),
-                     sdpa_name, variant, adapter, str(rf),
+                     variant, adapter, str(rf),
                      str(i), str(n_procs), str(barrier_dir)],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                     env=worker_env,
                 )
                 procs.append(p)
 
-            # Wait for all workers with timeout
             oom = False
             failed = False
             timed_out = False
@@ -777,7 +821,7 @@ def bench_concurrency(
                     break
                 if p.returncode != 0:
                     stderr = (p.stderr.read() if p.stderr else "")
-                    if "OutOfMemoryError" in stderr or "out of memory" in stderr.lower():
+                    if "out of memory" in stderr.lower() or "RESOURCE_EXHAUSTED" in stderr:
                         oom = True
                     else:
                         failed = True
@@ -786,7 +830,7 @@ def bench_concurrency(
                             print(f"      {line}")
 
             if timed_out:
-                print(f"    Timeout ({timeout_secs:.0f}s) — GPU thrashing, stopping sweep")
+                print(f"    Timeout ({timeout_secs:.0f}s) — stopping sweep")
                 for p in procs:
                     p.kill()
                     p.wait()
@@ -795,20 +839,14 @@ def bench_concurrency(
                 shutil.rmtree(barrier_dir, ignore_errors=True)
                 break
 
-            if oom:
-                print(f"    OOM with N={n_procs} — stopping sweep")
+            if oom or failed:
                 for rf in result_files:
                     rf.unlink(missing_ok=True)
                 shutil.rmtree(barrier_dir, ignore_errors=True)
+                if oom:
+                    print(f"    OOM with N={n_procs} — stopping sweep")
                 break
 
-            if failed:
-                for rf in result_files:
-                    rf.unlink(missing_ok=True)
-                shutil.rmtree(barrier_dir, ignore_errors=True)
-                break
-
-            # Collect results and clean up
             shutil.rmtree(barrier_dir, ignore_errors=True)
             worker_results = []
             for rf in result_files:
@@ -823,24 +861,19 @@ def bench_concurrency(
                 print(f"    Only {len(worker_results)}/{n_procs} workers reported — stopping")
                 break
 
-            # Each worker ran independently; wall time is the max across workers
-            # (they ran in parallel, so total time = slowest worker)
             all_means = []
             total_vram_mb = 0.0
             for wr in worker_results:
                 times_ms = [t * 1000 for t in wr["times"]]
                 all_means.append(statistics.mean(times_ms))
-                total_vram_mb += wr["peak_memory_mb"]
+                total_vram_mb += wr.get("peak_memory_mb") or 0.0
 
-            # The effective wall time per "round" is the slowest worker
             wall_ms = max(all_means)
-            # Total throughput: all N processes produce batch_size samples in wall_ms
             total_throughput = n_procs * batch_size / wall_ms * 1000
             per_model_throughput = total_throughput / n_procs
 
             if single_throughput is None:
                 single_throughput = per_model_throughput
-                # Record N=1 total wall time for timeout calculation
                 baseline_wall_secs = time.perf_counter() - sweep_start
 
             speedup = total_throughput / single_throughput
@@ -862,7 +895,6 @@ def bench_concurrency(
                   f"  speedup: {speedup:.2f}x"
                   f"  VRAM: {total_vram_mb:.0f} MB")
 
-            # Stop when total throughput decreases (adding a process hurt)
             if len(results) >= 2:
                 prev_total = results[-2].total_throughput
                 if total_throughput <= prev_total:
@@ -887,105 +919,164 @@ def bench_concurrency(
 
 # ── Adapter benchmarks (GPU) ─────────────────────────────────────────────────
 
+def _build_adapter_state(model, adapter_kind: str, key: int = 99):
+    """Build an `AdapterTrainState` + optimizer for the given strategy."""
+    import equinox as eqx
+    import jax
+    import jax.numpy as jnp
+    import optax
+
+    from pawn.adapter_trainer import (
+        AdapterTrainState, dispatch_init, dispatch_filter,
+    )
+
+    if adapter_kind == "lora":
+        from pawn.adapters.lora import LoRAConfig
+        cfg = LoRAConfig(rank=4, targets="qkvo")
+    elif adapter_kind == "film":
+        from pawn.adapters.film import FiLMConfig
+        cfg = FiLMConfig(use_output_film=True)
+    elif adapter_kind == "bottleneck":
+        from pawn.adapters.bottleneck import BottleneckConfig
+        cfg = BottleneckConfig(dim=8)
+    else:
+        raise ValueError(f"unknown adapter {adapter_kind!r}")
+
+    adapter = dispatch_init(adapter_kind)(model, cfg, jax.random.key(key))
+    filt = dispatch_filter(adapter_kind)
+    trainable, _ = eqx.partition(adapter, filt)
+    optimizer = optax.adamw(3e-4, b1=0.9, b2=0.95, weight_decay=0.01)
+    state = AdapterTrainState(
+        backbone=model, adapter=adapter,
+        opt_state=optimizer.init(trainable),
+        step=jnp.int32(0), key=jax.random.key(key),
+    )
+    n_trainable = int(sum(
+        x.size for x in jax.tree_util.tree_leaves(trainable)
+        if hasattr(x, "size")
+    ))
+    return state, optimizer, n_trainable
+
+
 def bench_adapters(
     adapter_types: list[str],
     batch_size: int,
-    device: str,
-    do_compile: bool,
+    do_jit: bool,
     do_eager: bool,
     n_iter: int,
     n_warmup: int,
-    sdpa_backend,
+    compute_dtype=None,
+    use_sdpa: bool = False,
+    use_flash: bool = False,
 ) -> list[TimingResult]:
-    """Benchmark adapter training steps on a frozen base backbone."""
-    import torch
-    import torch.nn as nn
-    import pawn.model as model_module
-    from pawn.config import CLMConfig
-    from pawn.model import PAWNCLM
+    """Benchmark adapter training steps on a frozen `base` backbone.
 
-    results = []
+    `compute_dtype` (None / jnp.bfloat16 / jnp.float16) selects the AMP
+    forward dtype and is threaded into both the jitted
+    `make_adapter_train_step` and the eager `cross_entropy_loss` clone,
+    so this section honours `--amp-dtype` instead of silently running
+    fp32 (parity with the backbone section). `use_sdpa` / `use_flash`
+    select the attention backend.
+    """
+    import jax
 
+    from pawn.config import VARIANTS
+    from pawn.adapter_trainer import make_adapter_train_step, dispatch_apply
+    from pawn.trainer import cross_entropy_loss
+
+    results: list[TimingResult] = []
+
+    dtype_label = (
+        compute_dtype.dtype.name
+        if compute_dtype is not None and hasattr(compute_dtype, "dtype")
+        else (str(compute_dtype) if compute_dtype is not None else "float32")
+    )
     print("\n" + "=" * 72)
     print(" ADAPTER TRAINING BENCHMARKS (GPU)")
     print("=" * 72)
-    print(f"  backbone=base  batch_size={batch_size}  device={device}  n_iter={n_iter}")
-    print(f"  AMP: bf16  SDPA: {sdpa_backend.name if sdpa_backend else 'default (flash)'}")
+    print(f"  backbone=base  batch_size={batch_size}  device={jax.devices()[0]}  n_iter={n_iter}")
+    print(f"  compute_dtype: {dtype_label}")
 
-    batch = _make_batch(batch_size, device)
-
-    def _build_adapter(name: str, backbone: PAWNCLM) -> nn.Module:
-        if name == "lora":
-            from pawn.adapters.lora import LoRACLM
-            return LoRACLM(backbone, rank=4, attn_targets="qkvo")
-        elif name == "film":
-            from pawn.adapters.film import FiLMCLM
-            return FiLMCLM(backbone, use_output_film=True)
-        elif name == "bottleneck":
-            from pawn.adapters.bottleneck import BottleneckCLM
-            return BottleneckCLM(backbone, bottleneck_dim=8)
-        else:
-            raise ValueError(f"Unknown adapter: {name}")
+    batch = _make_corpus_batch(batch_size)
 
     modes = []
     if do_eager:
         modes.append(("eager", False))
-    if do_compile:
-        modes.append(("compiled", True))
+    if do_jit:
+        modes.append(("jit", True))
+
+    base_cfg = VARIANTS["base"]
+    _state, _opt, base_model = _build_train_state(base_cfg)
+    n_total = int(sum(
+        x.size for x in jax.tree_util.tree_leaves(base_model)
+        if hasattr(x, "size")
+    ))
 
     for adapter_name in adapter_types:
-        for mode_name, use_compile in modes:
+        for mode_name, use_jit in modes:
             label = f"adapter/{adapter_name} [{mode_name}]"
             print(f"\n  {label} ...")
 
-            model_module.SDPA_BACKEND = sdpa_backend
+            state, optimizer, n_adapter = _build_adapter_state(base_model, adapter_name)
+            print(f"    adapter params: {n_adapter:,} / {n_total:,} total")
 
-            backbone = PAWNCLM(CLMConfig.base()).to(device)
-            adapter_model = _build_adapter(adapter_name, backbone).to(device)
+            if use_jit:
+                train_step = make_adapter_train_step(
+                    adapter_name, optimizer,
+                    compute_dtype=compute_dtype,
+                    use_sdpa=use_sdpa, use_flash=use_flash,
+                )
+            else:
+                apply_fn = dispatch_apply(adapter_name)
 
-            trainable = [p for p in adapter_model.parameters() if p.requires_grad]
-            n_adapter_params = sum(p.numel() for p in trainable)
-            n_total_params = sum(p.numel() for p in adapter_model.parameters())
-            print(f"    adapter params: {n_adapter_params:,} / {n_total_params:,} total")
+                def _eager_adapter_step(
+                    s, b, _apply=apply_fn, _opt=optimizer,
+                    _cd=compute_dtype, _sdpa=use_sdpa, _flash=use_flash,
+                ):
+                    import equinox as eqx
+                    def loss_fn(adapter):
+                        effective = _apply(s.backbone, adapter)
+                        return cross_entropy_loss(
+                            effective, b, compute_dtype=_cd,
+                            use_sdpa=_sdpa, use_flash=_flash,
+                        )
+                    loss, grads = eqx.filter_value_and_grad(loss_fn)(s.adapter)
+                    updates, new_opt = _opt.update(grads, s.opt_state, s.adapter)
+                    new_adapter = eqx.apply_updates(s.adapter, updates)
+                    new_state = type(s)(
+                        backbone=s.backbone, adapter=new_adapter,
+                        opt_state=new_opt, step=s.step + 1, key=s.key,
+                    )
+                    return new_state, loss
+                train_step = _eager_adapter_step
 
-            forward_fn = adapter_model.forward
-            if use_compile:
-                forward_fn = torch.compile(forward_fn)
+            cell = {"state": state}
 
-            optimizer = torch.optim.AdamW(
-                trainable, lr=3e-4, weight_decay=0.01,
-            )
-            scaler = torch.amp.GradScaler(device, enabled=True)
-
-            step = _make_adapter_step(
-                adapter_model, optimizer, scaler, batch, device, forward_fn,
-                trainable,
-            )
+            def step():
+                new_state, loss = train_step(cell["state"], batch)
+                cell["state"] = new_state
+                return loss
 
             try:
-                gpu_timing = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter,
-                                      reset_peak_memory=True)
-            except torch.cuda.OutOfMemoryError:
-                print(f"    OOM — skipping (try smaller --batch-size)")
-                del adapter_model, backbone, optimizer, scaler
-                torch.cuda.empty_cache()
-                continue
+                gpu_timing = time_gpu(step, n_warmup=n_warmup, n_iter=n_iter)
+            except (RuntimeError, MemoryError) as exc:
+                if "out of memory" in str(exc).lower() or "RESOURCE_EXHAUSTED" in str(exc):
+                    print(f"    OOM — skipping (try smaller --batch-size)")
+                    continue
+                raise
 
-            peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
+            peak_mb = _peak_memory_mb()
 
             r = make_result(
                 label, gpu_timing.times,
                 throughput_count=batch_size,
                 throughput_unit="samples/s",
                 peak_memory_mb=peak_mb,
-                warmup_secs=gpu_timing.warmup_secs if use_compile else None,
-                n_warmup=gpu_timing.n_warmup if use_compile else None,
+                warmup_secs=gpu_timing.warmup_secs if use_jit else None,
+                n_warmup=gpu_timing.n_warmup if use_jit else None,
             )
             results.append(r)
             print(f"    {r.summary_line()}")
-
-            del adapter_model, backbone, optimizer, scaler
-            torch.cuda.empty_cache()
 
     return results
 
@@ -995,7 +1086,7 @@ def bench_adapters(
 def print_summary(
     engine_results: list[TimingResult],
     backbone_results: list[TimingResult],
-    dataloader_results: list[TimingResult],
+    data_pipeline_results: list[TimingResult],
     concurrency_results: list[ConcurrencyResult],
     adapter_results: list[TimingResult],
 ):
@@ -1013,9 +1104,9 @@ def print_summary(
         for r in backbone_results:
             print(f"    {r.summary_line()}")
 
-    if dataloader_results:
-        print("\n  Dataloader-inclusive training (GPU):")
-        for r in dataloader_results:
+    if data_pipeline_results:
+        print("\n  Data-pipeline-inclusive training (GPU):")
+        for r in data_pipeline_results:
             print(f"    {r.summary_line()}")
 
     if concurrency_results:
@@ -1041,7 +1132,7 @@ def save_json(
     path: str,
     engine_results: list[TimingResult],
     backbone_results: list[TimingResult],
-    dataloader_results: list[TimingResult],
+    data_pipeline_results: list[TimingResult],
     concurrency_results: list[ConcurrencyResult],
     adapter_results: list[TimingResult],
     platform_info: dict,
@@ -1051,7 +1142,7 @@ def save_json(
         platform_info=platform_info,
         engine_results=[asdict(r) for r in engine_results],
         backbone_results=[asdict(r) for r in backbone_results],
-        dataloader_results=[asdict(r) for r in dataloader_results],
+        data_pipeline_results=[asdict(r) for r in data_pipeline_results],
         concurrency_results=[asdict(r) for r in concurrency_results],
         adapter_results=[asdict(r) for r in adapter_results],
     )
@@ -1062,12 +1153,10 @@ def save_json(
 # ── System info collection ───────────────────────────────────────────────────
 
 def _collect_cpu_cache() -> dict[str, str]:
-    """Read CPU cache hierarchy from sysfs. Best-effort, Linux only."""
     cache: dict[str, str] = {}
     cache_dir = Path("/sys/devices/system/cpu/cpu0/cache")
     if not cache_dir.exists():
         return cache
-
     for idx_dir in sorted(cache_dir.glob("index*")):
         try:
             level = (idx_dir / "level").read_text().strip()
@@ -1075,151 +1164,45 @@ def _collect_cpu_cache() -> dict[str, str]:
             size = (idx_dir / "size").read_text().strip()
         except OSError:
             continue
-
         if cache_type == "Data":
             cache[f"l{level}d"] = size
         elif cache_type == "Instruction":
             cache[f"l{level}i"] = size
         elif cache_type == "Unified":
-            # Check if L3 is shared across all assigned CPUs
-            if level == "3":
-                try:
-                    shared = (idx_dir / "shared_cpu_list").read_text().strip()
-                    cache["l3_shared_cpus"] = shared
-                except OSError:
-                    pass
             cache[f"l{level}"] = size
-
     return cache
 
 
-def _cgroup_cpu_count() -> int | None:
-    """Return container CPU limit from cgroups, or None if unconstrained."""
-    import math as _math
-    # cgroup v2: cpu.max contains "quota period" (e.g. "200000 100000" = 2 CPUs)
-    try:
-        text = Path("/sys/fs/cgroup/cpu.max").read_text().strip()
-        quota_s, period_s = text.split()
-        if quota_s != "max":
-            return max(1, _math.ceil(int(quota_s) / int(period_s)))
-    except (OSError, ValueError):
-        pass
-
-    # cgroup v1: cpu.cfs_quota_us / cpu.cfs_period_us
-    try:
-        quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text().strip())
-        if quota > 0:
-            period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text().strip())
-            return max(1, _math.ceil(quota / period))
-    except (OSError, ValueError):
-        pass
-
-    # cpuset: count the CPUs in the effective cpuset
-    for p in ("/sys/fs/cgroup/cpuset.cpus.effective",      # v2
-              "/sys/fs/cgroup/cpuset/cpuset.cpus"):         # v1
-        try:
-            text = Path(p).read_text().strip()
-            if text:
-                # Parse ranges like "0-3,8-11" → count individual CPUs
-                count = 0
-                for part in text.split(","):
-                    if "-" in part:
-                        lo, hi = part.split("-", 1)
-                        count += int(hi) - int(lo) + 1
-                    else:
-                        count += 1
-                return count
-        except (OSError, ValueError):
-            pass
-
-    return None
-
-
-def _cgroup_memory_bytes() -> int | None:
-    """Return container memory limit from cgroups, or None if unconstrained."""
-    # cgroup v2
-    try:
-        text = Path("/sys/fs/cgroup/memory.max").read_text().strip()
-        if text != "max":
-            return int(text)
-    except (OSError, ValueError):
-        pass
-
-    # cgroup v1
-    try:
-        limit = int(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-                     .read_text().strip())
-        # Kernel uses a huge sentinel (~2^63) when unconstrained
-        if limit < 2**62:
-            return limit
-    except (OSError, ValueError):
-        pass
-
-    return None
-
-
 def _collect_system_info() -> dict:
-    """Collect CPU, RAM, and cache info.
-
-    In containers (RunPod, Docker), /proc/cpuinfo and /proc/meminfo report
-    host-level resources.  We check cgroup limits first and prefer those
-    when they indicate a constrained environment.
-    """
     import multiprocessing
 
     cpu_name = ""
-    cpu_mhz = 0.0
     if platform.system() == "Linux":
         try:
             with open("/proc/cpuinfo") as f:
                 for line in f:
-                    if line.startswith("model name") and not cpu_name:
+                    if line.startswith("model name"):
                         cpu_name = line.split(":", 1)[1].strip()
-                    elif line.startswith("cpu MHz") and not cpu_mhz:
-                        cpu_mhz = float(line.split(":", 1)[1].strip())
-                    if cpu_name and cpu_mhz:
                         break
         except OSError:
             pass
     if not cpu_name:
         cpu_name = platform.processor() or platform.machine() or "unknown"
 
-    # Max frequency from cpufreq (more reliable than current MHz)
     try:
-        max_khz = int(Path("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
-                       .read_text().strip())
-        cpu_mhz = max_khz / 1000
-    except (OSError, ValueError):
-        pass  # keep /proc/cpuinfo MHz if available
+        cpu_count = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpu_count = multiprocessing.cpu_count() or 0
 
-    # CPU count: prefer cgroup limit over host-visible CPUs
-    cg_cpus = _cgroup_cpu_count()
-    if cg_cpus is not None:
-        cpu_count = cg_cpus
-    else:
-        try:
-            cpu_count = len(os.sched_getaffinity(0))
-        except (AttributeError, OSError):
-            cpu_count = multiprocessing.cpu_count() or 0
-
-    # System RAM: prefer cgroup limit over host total
-    cg_mem = _cgroup_memory_bytes()
-    if cg_mem is not None:
-        ram_gb = cg_mem / (1024**3)
-    else:
-        ram_gb = 0.0
-        try:
-            import psutil
-            ram_gb = psutil.virtual_memory().total / (1024**3)
-        except ImportError:
-            try:
-                with open("/proc/meminfo") as f:
-                    for line in f:
-                        if line.startswith("MemTotal:"):
-                            ram_gb = int(line.split()[1]) / (1024**2)
-                            break
-            except OSError:
-                pass
+    ram_gb = 0.0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    ram_gb = int(line.split()[1]) / (1024**2)
+                    break
+    except OSError:
+        pass
 
     info: dict = {
         "python": sys.version.split()[0],
@@ -1229,25 +1212,31 @@ def _collect_system_info() -> dict:
         "cpu_count": cpu_count,
         "ram_gb": round(ram_gb, 1),
     }
-    if cpu_mhz:
-        info["cpu_mhz"] = round(cpu_mhz)
 
     cache = _collect_cpu_cache()
     if cache:
         info["cache"] = cache
-
     return info
 
 
 def _collect_gpu_info_amdsmi(info: dict) -> None:
     """Collect AMD GPU clocks and VRAM bandwidth via the amdsmi Python library.
 
-    Available on ROCm 6+. Native Python API — no subprocess needed.
+    Available on ROCm 6+. Native Python API — no subprocess needed. Ported
+    from v1 (`git show main:scripts/benchmark.py`); the metadata is
+    framework-independent so it survives the JAX swap unchanged.
+
+    `amdsmi` ships with the ROCm system install rather than via pip and has
+    no type stubs, so it's loaded with `importlib.import_module` (typed as
+    `ModuleType`) inside the best-effort guard rather than a bare `import`
+    pyright would flag as unresolved.
     """
+    import importlib
+
     try:
-        import amdsmi  # type: ignore[import-untyped]
+        amdsmi = importlib.import_module("amdsmi")
         amdsmi.amdsmi_init()
-    except (ImportError, Exception):
+    except Exception:
         return
 
     try:
@@ -1269,7 +1258,7 @@ def _collect_gpu_info_amdsmi(info: dict) -> None:
             except Exception:
                 pass
 
-        # VRAM info (type, bus width, bandwidth)
+        # VRAM info (type, bus width)
         try:
             vram = amdsmi.amdsmi_get_gpu_vram_info(gpu)
             vram_type = vram.get("vram_type") or vram.get("type")
@@ -1299,7 +1288,7 @@ def _collect_gpu_info_amdsmi(info: dict) -> None:
 
 
 def _collect_gpu_info_nvidia_smi(info: dict) -> None:
-    """Collect NVIDIA GPU clocks via nvidia-smi."""
+    """Collect NVIDIA GPU clocks + PCIe link via nvidia-smi (ported from v1)."""
     import subprocess
     try:
         out = subprocess.run(
@@ -1319,56 +1308,59 @@ def _collect_gpu_info_nvidia_smi(info: dict) -> None:
         pass
 
 
-def _collect_gpu_info() -> dict:
-    """Collect GPU info from torch and system tools. Best-effort."""
-    import subprocess
-    import torch
+def _is_rocm() -> bool:
+    """True when the active JAX backend is ROCm.
 
-    n_gpus = torch.cuda.device_count()
-    props = torch.cuda.get_device_properties(0)
-    info: dict = {
-        "torch": torch.__version__,
-        "gpu": props.name,
-        "gpu_count": n_gpus,
-        "vram_gb": round(props.total_memory / (1024**3), 1),
-        "gpu_sm_count": props.multi_processor_count,
-    }
-
-    # L2 cache (exposed by torch on some GPUs)
-    l2 = getattr(props, "L2_cache_size", 0)
-    if l2:
-        info["gpu_l2_mb"] = round(l2 / (1024**2), 1)
-
-    # Detect CUDA MPS
+    v1 used `pawn.gpu.is_rocm()` (a torch probe). v2 has no torch on the
+    training path, so detect from the JAX device's platform string — the
+    RocmDevice repr / `device_kind` carries the AMD signature.
+    """
     try:
-        ps = subprocess.run(
-            ["ps", "-eo", "comm"], capture_output=True, text=True, timeout=5,
-        )
-        if "nvidia-cuda-mps" in ps.stdout:
-            info["cuda_mps"] = True
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+        import jax
+        dev0 = jax.devices()[0]
+        sig = f"{dev0!r} {getattr(dev0, 'device_kind', '')}".lower()
+        return "rocm" in sig or "amd" in sig or "radeon" in sig or "gfx" in sig
+    except Exception:
+        return False
 
-    # Try platform-specific tools for clock speeds and VRAM details
-    from pawn.gpu import is_rocm
-    if is_rocm():
+
+def _collect_jax_info() -> dict:
+    import jax
+
+    devs = jax.devices()
+    dev0 = devs[0]
+    info: dict = {
+        "jax": jax.__version__,
+        "jax_platform": jax.default_backend(),
+        "jax_device": str(dev0),
+        "jax_device_kind": getattr(dev0, "device_kind", ""),
+        "jax_device_count": len(devs),
+    }
+    stats = None
+    try:
+        stats = dev0.memory_stats()
+    except Exception:
+        pass
+    if stats:
+        limit = stats.get("bytes_limit") or stats.get("bytes_reservable_limit")
+        if limit:
+            info["vram_gb"] = round(limit / (1024**3), 1)
+
+    # Detailed hardware metadata (clocks, VRAM type/width, PCIe) via the
+    # platform-native tool. Best-effort; absent on minimal containers.
+    if _is_rocm():
+        info["platform"] = "ROCm"
         _collect_gpu_info_amdsmi(info)
     else:
+        info["platform"] = "CUDA"
         _collect_gpu_info_nvidia_smi(info)
-
     return info
 
 
 def _print_system_info(info: dict) -> None:
-    """Print system info header."""
-    cpu_line = f"CPU: {info['cpu']} ({info['cpu_count']} CPUs)"
-    if info.get("cpu_mhz"):
-        cpu_line += f" @ {info['cpu_mhz']} MHz"
-    print(cpu_line)
-
+    print(f"CPU: {info['cpu']} ({info['cpu_count']} CPUs)")
     if info.get("ram_gb"):
         print(f"RAM: {info['ram_gb']:.1f} GB")
-
     cache = info.get("cache", {})
     if cache:
         parts = []
@@ -1377,125 +1369,128 @@ def _print_system_info(info: dict) -> None:
         if "l2" in cache:
             parts.append(f"L2: {cache['l2']}")
         if "l3" in cache:
-            shared = cache.get("l3_shared_cpus", "")
-            l3_str = f"L3: {cache['l3']}"
-            # If L3 is shared with more CPUs than we're assigned, note it
-            if shared:
-                try:
-                    assigned = len(os.sched_getaffinity(0))
-                    # Parse "0-15" style ranges
-                    shared_count = sum(
-                        int(r.split("-")[1]) - int(r.split("-")[0]) + 1
-                        if "-" in r else 1
-                        for r in shared.split(",")
-                    )
-                    if shared_count > assigned:
-                        l3_str += " (shared)"
-                except (AttributeError, OSError, ValueError):
-                    pass
-            parts.append(l3_str)
+            parts.append(f"L3: {cache['l3']}")
         if parts:
             print(f"Cache: {', '.join(parts)}")
 
 
-def _print_gpu_info(info: dict, sdpa_backend) -> None:
-    """Print GPU info header."""
-    n_gpus = info.get("gpu_count", 1)
-    gpu_count_str = f" x{n_gpus}" if n_gpus > 1 else ""
-    gpu_line = f"GPU: {info['gpu']}{gpu_count_str} ({info['platform']}, {info['vram_gb']:.1f} GB"
-    vram_type = info.get("vram_type", "")
-    if vram_type:
-        gpu_line += f" {vram_type}"
-    gpu_line += " VRAM"
+def _print_jax_info(info: dict, attn_backend: str = "plain") -> None:
+    dev_kind = info.get("jax_device_kind", "")
+    gpu_line = f"GPU: {info['jax_device']}"
+    if dev_kind and dev_kind not in info["jax_device"]:
+        gpu_line += f" ({dev_kind})"
+    plat = info.get("platform", "")
+    detail_parts = []
+    if plat:
+        detail_parts.append(plat)
+    if "vram_gb" in info:
+        vram_str = f"{info['vram_gb']:.1f} GB"
+        if info.get("vram_type"):
+            vram_str += f" {info['vram_type']}"
+        detail_parts.append(f"{vram_str} VRAM")
     if info.get("gpu_clock_mhz"):
-        gpu_line += f", {info['gpu_clock_mhz']} MHz"
+        detail_parts.append(f"{info['gpu_clock_mhz']} MHz")
     if info.get("gpu_mem_clock_mhz"):
-        gpu_line += f", mem {info['gpu_mem_clock_mhz']} MHz"
-    gpu_line += ")"
+        detail_parts.append(f"mem {info['gpu_mem_clock_mhz']} MHz")
+    if detail_parts:
+        gpu_line += f" ({', '.join(detail_parts)})"
     print(gpu_line)
 
     extras = []
-    if info.get("gpu_sm_count"):
-        extras.append(f"{info['gpu_sm_count']} SMs")
-    if info.get("gpu_l2_mb"):
-        extras.append(f"L2: {info['gpu_l2_mb']} MB")
     if info.get("vram_bus_width"):
         extras.append(f"{info['vram_bus_width']}-bit bus")
     if info.get("pcie"):
         extras.append(f"PCIe {info['pcie']}")
-    if info.get("cuda_mps"):
-        extras.append("MPS active")
     if extras:
         print(f"      {', '.join(extras)}")
-    if n_gpus > 1:
-        print(f"      Benchmarking GPU 0 only")
 
-    import torch
-    print(f"PyTorch: {torch.__version__}")
-    print(f"SDPA backend: {sdpa_backend.name if sdpa_backend else 'default (flash)'}")
-    print(f"AMP dtype: bfloat16")
+    print(f"JAX: {info['jax']}  backend: {info['jax_platform']}"
+          f"  count: {info['jax_device_count']}")
+    print(f"Attention backend: {attn_backend}")
+    if "vram_gb" in info and not detail_parts:
+        print(f"VRAM: {info['vram_gb']:.1f} GB")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PAWN performance benchmarks",
+        description="PAWN performance benchmarks (v2: JAX/Equinox/Optax)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # Scope
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument("--engine-only", action="store_true",
                        help="Only run engine (CPU) benchmarks")
     scope.add_argument("--gpu-only", action="store_true",
                        help="Only run GPU benchmarks (backbone + adapters)")
 
-    # Engine options
     parser.add_argument("--engine-games", type=int, default=10_000,
                         help="Number of games for engine benchmarks (default: 10000)")
 
-    # GPU options
-    parser.add_argument("--variants", nargs="+", default=["small", "base"],
-                        choices=["toy", "small", "base", "large"],
-                        help="Backbone variants to benchmark (default: small base)")
+    parser.add_argument("--variants", nargs="+", default=["tiny", "small"],
+                        choices=["tiny", "small", "base", "large"],
+                        help="Backbone variants to benchmark (default: tiny small)")
     parser.add_argument("--adapters", nargs="+", default=["lora", "film", "bottleneck"],
                         choices=["lora", "film", "bottleneck"],
                         help="Adapter types to benchmark (default: lora film bottleneck)")
-    parser.add_argument("--batch-size", type=int, default=256,
-                        help="Batch size for GPU benchmarks (default: 256)")
+    parser.add_argument("--batch-size", type=int, default=64,
+                        help="Batch size for GPU benchmarks (default: 64)")
     parser.add_argument("--no-backbone", action="store_true",
                         help="Skip backbone benchmarks")
-    parser.add_argument("--no-dataloader", action="store_true",
-                        help="Skip dataloader-inclusive benchmarks")
+    parser.add_argument("--no-data-pipeline", action="store_true",
+                        help="Skip data-pipeline-inclusive benchmarks")
     parser.add_argument("--no-adapters", action="store_true",
                         help="Skip adapter benchmarks")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--no-concurrency", action="store_true",
+                        help="Skip concurrency sweep")
 
-    # Concurrency sweep options
-    parser.add_argument("--sweep-variant", type=str, default="small",
-                        choices=["toy", "small", "base", "large"],
-                        help="Backbone variant for concurrency sweep (default: small)")
+    parser.add_argument("--sweep-variant", type=str, default="tiny",
+                        choices=["tiny", "small", "base", "large"],
+                        help="Backbone variant for concurrency sweep (default: tiny)")
     parser.add_argument("--sweep-adapter", type=str, default="none",
                         choices=["none", "lora", "film", "bottleneck"],
                         help="Adapter for concurrency sweep (default: none)")
 
-    # Compile modes
-    compile_group = parser.add_mutually_exclusive_group()
-    compile_group.add_argument("--no-compile", action="store_true",
-                               help="Only run eager mode (skip torch.compile)")
-    compile_group.add_argument("--compile-only", action="store_true",
-                               help="Only run compiled mode (skip eager)")
+    jit_group = parser.add_mutually_exclusive_group()
+    jit_group.add_argument("--no-jit", action="store_true",
+                           help="Only run eager mode (skip JIT)")
+    jit_group.add_argument("--jit-only", action="store_true",
+                           help="Only run JIT mode (skip eager)")
 
-    # Iteration control
     parser.add_argument("--n-iter", type=int, default=10,
                         help="Timed iterations per benchmark (default: 10)")
-    parser.add_argument("--n-warmup", type=int, default=10,
-                        help="Warmup iterations per benchmark (default: 10). "
-                             "torch.compile may need 5-10+ steps to fully optimize; "
-                             "too few warmup steps inflates timed results.")
+    parser.add_argument("--n-warmup", type=int, default=5,
+                        help="Warmup iterations per benchmark (default: 5). "
+                             "JIT compilation happens during warmup.")
 
-    # Output
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["bfloat16", "float16", "float32"],
+        default="bfloat16",
+        help=(
+            "Forward-compute dtype (default: bfloat16). Mirrors the "
+            "BaseRunConfig.amp_dtype field — bf16 is what the v1 PyTorch "
+            "AMP path used and what the v2 training scripts default to."
+        ),
+    )
+
+    parser.add_argument(
+        "--attn-backend",
+        choices=["plain", "sdpa", "flash"],
+        default="plain",
+        help=(
+            "Attention backend for the GPU (backbone + adapter) sections "
+            "(default: plain materialised QK^T, matching pawn/model.py's "
+            "default and the v2 bit-stable baseline). `sdpa` selects "
+            "jax.nn.dot_product_attention (XLA); `flash` selects the Pallas "
+            "Triton fused kernel. This is the v2 successor to v1's "
+            "--sdpa-backend / automatic MATH-vs-flash selection — the "
+            "framework swap replaced torch SDPBackend with the model's "
+            "use_sdpa / use_flash knobs."
+        ),
+    )
+
     parser.add_argument("--json", type=str, default=None,
                         help="Save results to JSON file")
 
@@ -1505,49 +1500,46 @@ def main():
     do_gpu = not args.engine_only
     do_backbone = do_gpu and not args.no_backbone
     do_adapters = do_gpu and not args.no_adapters
-    do_compile = not args.no_compile
-    do_eager = not args.compile_only
+    do_data_pipeline = do_gpu and not args.no_data_pipeline
+    do_concurrency = do_gpu and not args.no_concurrency
+    do_jit = not args.no_jit
+    do_eager = not args.jit_only
 
-    # Platform info
+    # Resolve attention backend → model knobs (v2 successor to v1's
+    # torch SDPBackend selection).
+    use_sdpa = args.attn_backend == "sdpa"
+    use_flash = args.attn_backend == "flash"
+
     info = _collect_system_info()
     _print_system_info(info)
 
-    # Detect GPU platform for SDPA backend selection
-    sdpa_backend = None
-    do_gpu_any = do_backbone or do_adapters or do_gpu
-    if do_gpu_any:
-        import torch
-        from pawn.gpu import is_rocm
-
-        if not torch.cuda.is_available():
+    if do_gpu or do_concurrency:
+        try:
+            jax_info = _collect_jax_info()
+            info.update(jax_info)
+            _print_jax_info(info, attn_backend=args.attn_backend)
+        except Exception as exc:
             if do_engine:
-                print("No GPU available — running engine benchmarks only.")
-                do_backbone = do_adapters = do_gpu = False
+                print(f"JAX unavailable ({exc!r}) — running engine benchmarks only.")
+                do_backbone = do_adapters = do_data_pipeline = do_concurrency = do_gpu = False
             else:
-                print("ERROR: No GPU available.", file=sys.stderr)
+                print(f"ERROR: JAX unavailable: {exc!r}", file=sys.stderr)
                 sys.exit(1)
-        else:
-            gpu_info = _collect_gpu_info()
-            info.update(gpu_info)
-            from torch.nn.attention import SDPBackend
 
-            if is_rocm():
-                info["platform"] = "ROCm"
-                info["hip"] = torch.version.hip
-                sdpa_backend = SDPBackend.MATH
-            else:
-                info["platform"] = "CUDA"
-                info["cuda"] = torch.version.cuda
-                sdpa_backend = None
-
-            _print_gpu_info(info, sdpa_backend)
-
-    # Run benchmarks
     engine_results: list[TimingResult] = []
     backbone_results: list[TimingResult] = []
-    dataloader_results: list[TimingResult] = []
+    data_pipeline_results: list[TimingResult] = []
     concurrency_results: list[ConcurrencyResult] = []
     adapter_results: list[TimingResult] = []
+
+    # Resolve amp_dtype → jnp dtype.
+    import jax.numpy as jnp_local
+    _DTYPE_MAP = {
+        "bfloat16": jnp_local.bfloat16,
+        "float16": jnp_local.float16,
+        "float32": None,
+    }
+    compute_dtype = _DTYPE_MAP[args.amp_dtype]
 
     if do_engine:
         engine_results = bench_engine(
@@ -1556,35 +1548,34 @@ def main():
 
     if do_backbone:
         backbone_results = bench_backbone(
-            args.variants, args.batch_size, args.device,
-            do_compile, do_eager, args.n_iter, args.n_warmup,
-            sdpa_backend,
+            args.variants, args.batch_size,
+            do_jit, do_eager, args.n_iter, args.n_warmup,
+            compute_dtype=compute_dtype,
+            use_sdpa=use_sdpa, use_flash=use_flash,
         )
-    if do_backbone and not args.no_dataloader:
-        dataloader_results = bench_dataloader(
-            args.batch_size, args.device, args.n_iter, args.n_warmup,
-            sdpa_backend,
+    if do_data_pipeline:
+        data_pipeline_results = bench_data_pipeline(
+            args.batch_size, args.n_iter, args.n_warmup,
         )
-    if do_gpu:
+    if do_concurrency:
         concurrency_results = bench_concurrency(
-            args.batch_size, args.device, args.n_iter, args.n_warmup,
-            sdpa_backend, variant=args.sweep_variant,
-            adapter=args.sweep_adapter,
+            args.batch_size, args.n_iter, args.n_warmup,
+            variant=args.sweep_variant, adapter=args.sweep_adapter,
         )
     if do_adapters:
         adapter_results = bench_adapters(
-            args.adapters, args.batch_size, args.device,
-            do_compile, do_eager, args.n_iter, args.n_warmup,
-            sdpa_backend,
+            args.adapters, args.batch_size,
+            do_jit, do_eager, args.n_iter, args.n_warmup,
+            compute_dtype=compute_dtype,
+            use_sdpa=use_sdpa, use_flash=use_flash,
         )
 
-    # Summary
-    print_summary(engine_results, backbone_results, dataloader_results,
+    print_summary(engine_results, backbone_results, data_pipeline_results,
                   concurrency_results, adapter_results)
 
     if args.json:
         save_json(
-            args.json, engine_results, backbone_results, dataloader_results,
+            args.json, engine_results, backbone_results, data_pipeline_results,
             concurrency_results, adapter_results, info,
         )
 
