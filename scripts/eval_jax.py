@@ -26,7 +26,9 @@ from pawn.corpus import (
     Corpus,
     conditioning_from_run_block,
     generate_corpus,
+    to_v1_contract,
 )
+from pawn.factored_model import FactoredPAWNModel
 from pawn.eval import (
     compute_compound_legality,
     compute_per_ply_accuracy,
@@ -110,6 +112,17 @@ def main(argv: list[str] | None = None) -> int:
             n_games=args.n_games, max_ply=args.max_ply, seq_len=args.seq_len,
             seed=0, conditioning=conditioning,
         )
+
+    # Factored (v1-architecture) checkpoints eval under v1's bare-moves
+    # contract: BOS=1980 is out-of-vocab for them — the packed corpus's
+    # slot-0 BOS would trip the factored _embed's loud OOV guard before any
+    # metric is produced (round-3 review, codex P2). Apply the same
+    # validated transform the trainer / probes use. `to_v1_contract`
+    # requires C=1, which is guaranteed here: factored checkpoints can only
+    # be trained with conditioning=[] (PretrainConfig validator), and the
+    # corpus above was built from the checkpoint's own conditioning.
+    if isinstance(model, FactoredPAWNModel):
+        corpus = to_v1_contract(corpus)
 
     vm = compute_val_metrics(
         model, corpus,

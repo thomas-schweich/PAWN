@@ -543,6 +543,51 @@ def test_factored_probes_bare_moves_contract() -> None:
         )
 
 
+def test_eval_jax_scores_factored_checkpoint(tmp_path) -> None:
+    """The standard eval CLI (`scripts/eval_jax.py`) must produce metrics
+    for a factored checkpoint — the packed corpus's slot-0 BOS is adapted
+    via to_v1_contract instead of tripping the factored _embed's OOV guard
+    (round-3 review, codex P2). Pins the documented eval plan §2 path."""
+    import importlib.util
+    import io
+    import json
+    from contextlib import redirect_stdout
+    from pathlib import Path as _P
+
+    spec = importlib.util.spec_from_file_location(
+        "eval_jax_under_test",
+        _P(__file__).resolve().parents[1] / "scripts" / "eval_jax.py",
+    )
+    assert spec is not None and spec.loader is not None
+    ej = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ej)
+
+    ckpt_dir = tmp_path / "factored_ckpt"
+    save_model(
+        _tiny_factored(), ckpt_dir,
+        training_state={"step": 0},
+        run_config={"arch": "factored-v1", "conditioning": []},
+    )
+    out_path = tmp_path / "eval.json"
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = ej.main([
+            "--checkpoint", str(ckpt_dir),
+            "--n-games", "8",
+            "--max-ply", "24",
+            "--seq-len", "32",
+            "--batch-size", "4",
+            "--compound-legality",
+            "--output", str(out_path),
+        ])
+    assert rc == 0
+    payload = json.loads(out_path.read_text())
+    assert payload["n_games"] == 8
+    assert 0.0 <= payload["legal_move_rate"] <= 1.0
+    assert 0.0 <= payload["game_completion_rate"] <= 1.0
+    assert np.isfinite(payload["loss"])
+
+
 def test_factored_targets_never_out_of_vocab() -> None:
     batch = _v1_batch(batch_size=16, seq_len=128)
     sup = np.asarray(batch.loss_mask)
