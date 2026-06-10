@@ -857,7 +857,8 @@ class PAWNModel(eqx.Module):
     inside :meth:`__call__` per forward call and constant-folded by
     JIT when ``cfg`` is static.
 
-    ``lm_head`` is ``None`` when ``cfg.tie_embeddings`` (the default) —
+    ``lm_head`` is ``None`` when ``cfg.tie_embeddings`` (non-default;
+    untied is the v2 default since 18a0047) —
     logits then reuse ``embed_tokens`` via the transpose. ``None`` is an
     empty PyTree subtree, so a tied model carries one fewer trainable
     leaf than an untied one and the optimizer never sees a phantom head.
@@ -1384,7 +1385,7 @@ def init_model(cfg: ModelConfig, key: jax.Array | int) -> PAWNModel:
     convention for ``dim > 1`` params). RMSNorm weights are
     one-initialised so the norm acts as identity at step 0.
     ``embed_tokens`` is the single ``[V, d]`` token table. ``lm_head``
-    is ``None`` when ``cfg.tie_embeddings`` (the default) and a separate
+    is ``None`` when ``cfg.tie_embeddings`` (non-default) and a separate
     ``Normal(0, 0.02)`` ``[d, V]`` head otherwise. ``decomp_table`` is
     built from the engine vocab. RoPE phase tables are *not* stored on
     the model — :meth:`PAWNModel.__call__` recomputes them per forward

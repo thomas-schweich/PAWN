@@ -323,6 +323,164 @@ def test_factored_train_step_loss_decreases() -> None:
     assert all(bool(jnp.isfinite(leaf).all()) for leaf in leaves)
 
 
+def test_factored_resume_restores_opt_state(tmp_path) -> None:
+    """save_model(optimizer_state=…) → load_resume_state roundtrip on the
+    FACTORED PyTree: the leaf paths differ from the uniform model
+    (embed_src/dst/promo/pad/outcome vs embed_tokens), so flatten/unflatten
+    of the Optax state takes an untested path that must hold before the
+    400k run's first real resume (round-1 review, test-risk)."""
+    from pawn.lifecycle import load_resume_state
+    from pawn.trainer import flatten_opt_state
+
+    cfg = PretrainConfig(
+        run_type="pretrain", total_steps=20, batch_size=4, seq_len=64,
+        lr=1e-3, arch="factored-v1", supernet="tiny", local_checkpoints=True,
+    )
+    assert cfg.total_steps is not None
+    optimizer = make_optimizer(cfg, make_lr_schedule(cfg, cfg.total_steps))
+    model = _tiny_factored()
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    state = TrainState(
+        model=model, opt_state=opt_state, step=jnp.int32(0),
+        key=jax.random.key(0),
+    )
+    train_step = make_train_step(optimizer, _factored_spec())
+    corpus = to_v1_contract(generate_corpus(
+        n_games=8, max_ply=64, seq_len=64, seed=11, conditioning=(),
+    ))
+    for i in range(2):  # two steps so Adam moments are non-trivial
+        state, _ = train_step(state, slice_batch(corpus, np.arange(4) + i * 4))
+
+    out = save_model(
+        state.model, tmp_path / "step_00000002",
+        run_config=cfg.model_dump(),
+        optimizer_state=flatten_opt_state(state.opt_state),
+        training_state={"step": 2},
+    )
+    resumed = load_resume_state(out, optimizer, jax.random.key(0),
+                                conditioning=cfg.conditioning)
+    assert isinstance(resumed.model, FactoredPAWNModel)
+    assert int(resumed.step) == 2
+    for a, b in zip(
+        jax.tree_util.tree_leaves(eqx.filter(state.opt_state, eqx.is_inexact_array)),
+        jax.tree_util.tree_leaves(eqx.filter(resumed.opt_state, eqx.is_inexact_array)),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_factored_train_step_with_accumulation() -> None:
+    """accumulation_steps=2 (the production config's shape): batches gain a
+    leading microbatch axis and the factored model runs under the nested
+    accumulation scan (round-1 review, test-risk)."""
+    cfg = PretrainConfig(
+        run_type="pretrain", total_steps=10, batch_size=4, seq_len=64,
+        lr=1e-3, arch="factored-v1", supernet="tiny", local_checkpoints=True,
+        accumulation_steps=2,
+    )
+    assert cfg.total_steps is not None
+    optimizer = make_optimizer(cfg, make_lr_schedule(cfg, cfg.total_steps))
+    model = _tiny_factored()
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    state = TrainState(
+        model=model, opt_state=opt_state, step=jnp.int32(0),
+        key=jax.random.key(0),
+    )
+    train_step = make_train_step(
+        optimizer, _factored_spec(), accumulation_steps=2,
+    )
+    corpus = to_v1_contract(generate_corpus(
+        n_games=8, max_ply=64, seq_len=64, seed=13, conditioning=(),
+    ))
+    flat = slice_batch(corpus, np.arange(8))
+    micro = jax.tree_util.tree_map(
+        lambda x: x.reshape(2, 4, *x.shape[1:]), flat
+    )
+    state, loss = train_step(state, micro)
+    assert bool(jnp.isfinite(loss))
+    assert int(state.step) == 1
+
+
+def test_factored_rejects_use_flash() -> None:
+    """Pallas flash drops the PAD mask (right-pad invariant); the v1
+    contract's masked slot-0 LEADING pad violates it, so the factored model
+    must hard-reject rather than silently attend to it (round-1 review,
+    codex P2). The config layer neutralises the default-True flag too."""
+    m = _tiny_factored()
+    batch = _v1_batch(batch_size=2, seq_len=32)
+    with pytest.raises(ValueError, match="use_flash"):
+        m(batch.tokens, batch.attn_mask, use_flash=True)
+    cfg = PretrainConfig(
+        run_type="pretrain", total_steps=10, arch="factored-v1",
+        local_checkpoints=True,
+    )
+    assert cfg.use_flash is False  # neutralised from the default True
+
+
+def test_converted_v1_model_roundtrips_through_v2_checkpoint(tmp_path) -> None:
+    """End-to-end converter contract on a synthetic tiny v1 checkpoint: the
+    loaded model's cfg must carry factored_embeddings=True so the v2
+    checkpoint layer's cfg-driven dispatch can save AND re-load the
+    converted object (round-1 review, codex P2 — previously the cfg said
+    uniform, so save_model wrote factored tensors under a uniform config,
+    an unloadable checkpoint)."""
+    import json
+
+    from safetensors.numpy import save_file as st_save_np
+
+    from pawn._legacy.legacy import load_v1_factored_model
+
+    d, d_ff, n_layers, V, n_out = 8, 16, 2, 1980, 11
+    rng = np.random.default_rng(0)
+
+    def t(*shape):
+        return rng.standard_normal(shape).astype(np.float32)
+
+    state = {
+        "embed.src_embed.weight": t(64, d),
+        "embed.dst_embed.weight": t(64, d),
+        "embed.promo_embed.weight": t(5, d),
+        "embed.pad_embed": t(d),
+        "embed.outcome_embed.weight": t(n_out, d),
+        "final_norm.weight": t(d),
+        "lm_head.weight": t(V, d),  # v1 stores (out, in)
+    }
+    for i in range(n_layers):
+        state[f"layers.{i}.attn_norm.weight"] = t(d)
+        state[f"layers.{i}.attn.wq.weight"] = t(d, d)
+        state[f"layers.{i}.attn.wk.weight"] = t(d, d)
+        state[f"layers.{i}.attn.wv.weight"] = t(d, d)
+        state[f"layers.{i}.attn.wo.weight"] = t(d, d)
+        state[f"layers.{i}.ffn_norm.weight"] = t(d)
+        state[f"layers.{i}.ffn.w_gate.weight"] = t(d_ff, d)
+        state[f"layers.{i}.ffn.w_up.weight"] = t(d_ff, d)
+        state[f"layers.{i}.ffn.w_down.weight"] = t(d, d_ff)
+    ckpt = tmp_path / "v1_ckpt"
+    ckpt.mkdir()
+    st_save_np(state, str(ckpt / "model.safetensors"))
+    (ckpt / "config.json").write_text(json.dumps({
+        "format_version": 1,
+        "model_config": {
+            "d_model": d, "n_layers": n_layers, "n_heads": 2, "d_ff": d_ff,
+            "vocab_size": V, "max_seq_len": 64, "n_outcomes": n_out,
+            "rope_base": 10000.0,
+        },
+    }))
+
+    model, cfg = load_v1_factored_model(str(ckpt))
+    assert isinstance(model, FactoredPAWNModel)
+    assert cfg.factored_embeddings and not cfg.tie_embeddings
+
+    # The whole point: a converted model must survive the v2 checkpoint
+    # layer's cfg-driven save→load dispatch.
+    out = save_model(model, tmp_path / "step_00000001")
+    reloaded, _ = load_model(out)
+    assert isinstance(reloaded, FactoredPAWNModel)
+    np.testing.assert_array_equal(
+        np.asarray(reloaded.lm_head), np.asarray(model.lm_head)
+    )
+
+
 def test_factored_targets_never_out_of_vocab() -> None:
     batch = _v1_batch(batch_size=16, seq_len=128)
     sup = np.asarray(batch.loss_mask)

@@ -3,9 +3,11 @@
 ## Question
 
 v2-large@400k underperforms v1-large on compound legality — teacher-forced
-game-completion 97.71% vs 99.76%, and autoregressive game-completion **34.6%
-vs 65.9%** (the AR numbers measured by `scripts/eval_ar_legality.py` /
-`scripts/eval_v1_ar_legality.py`). Two confounded explanations:
+game-completion 97.71% vs 99.90% (the converted v1-large re-measured under
+our eval; its published figure is 99.76%), and autoregressive
+game-completion **34.6% vs 65.9%** (the AR numbers measured by
+`scripts/eval_ar_legality.py` / `scripts/eval_v1_ar_legality.py`). Two
+confounded explanations:
 
 1. **Architecture** — v1's factored `src+dst+promo` move embeddings (square-
    aware, plausibly more sample-efficient for legality) + larger dims

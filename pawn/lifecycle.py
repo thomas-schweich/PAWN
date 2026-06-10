@@ -47,7 +47,6 @@ import numpy as np
 import optax
 
 from pawn.checkpoint import load_model, load_model_config
-from pawn.model import PAWNModel
 from pawn.trainer import TrainState
 
 __all__ = [

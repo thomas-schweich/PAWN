@@ -654,6 +654,17 @@ class PretrainConfig(BaseRunConfig):
                 # (BaseRunConfig is not frozen — plain assignment is the
                 # pydantic-v2 after-validator pattern.)
                 self.stochastic_variants = False
+            if self.use_flash:
+                # Pallas flash deliberately ignores the PAD mask — safe only
+                # under the engine's strict right-pad invariant (see
+                # pawn.model._pallas_attn). The factored arch trains under
+                # the v1 bare-moves contract, whose to_v1_contract transform
+                # puts a masked PAD at slot 0 (a LEADING pad): under flash,
+                # every real position would silently attend to it. use_flash
+                # defaults True on GPU, so neutralise it here (the model
+                # also hard-rejects use_flash defensively). Round-1 review,
+                # codex P2.
+                self.use_flash = False
         if self.patience is not None and self.val_every is None:
             raise ValueError(
                 "patience requires val_every (early stopping keys on the "

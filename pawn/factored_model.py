@@ -29,8 +29,9 @@ Sequence contract: v1's native bare-moves layout — no BOS (1980 is
 out-of-vocab here). Corpora built by the v2 pipeline are adapted via
 :func:`pawn.corpus.to_v1_contract` (slot 0 becomes a masked, unsupervised
 PAD), the transform validated against the published v1 checkpoints
-(``scripts/eval_v1_legality.py`` reproduces v1-large's 99.9990% per-move
-legal / 99.76% game-completion through it).
+(``scripts/eval_v1_legality.py`` through it measures the converted v1-large
+at 99.9997% per-move legal / 99.90% game-completion, matching its published
+99.9990% / 99.76%).
 
 Save schema: :data:`FACTORED_SAVED_FIELDS` (16 tensors).
 ``pawn.checkpoint`` dispatches on ``ModelConfig.factored_embeddings``.
@@ -156,14 +157,25 @@ class FactoredPAWNModel(eqx.Module):
                 f"sequence length {T} exceeds cfg.max_seq_len "
                 f"{self.cfg.max_seq_len}"
             )
+        if use_flash:
+            # Pallas flash drops the PAD mask entirely (safe only under the
+            # strict right-pad invariant — see pawn.model._pallas_attn). The
+            # factored model's v1 bare-moves contract places a masked PAD at
+            # slot 0 (a LEADING pad), which flash would let every real
+            # position attend to — a silent contract violation. Hard-reject
+            # rather than compute the wrong thing (round-1 review, codex P2;
+            # PretrainConfig neutralises the flag upstream too).
+            raise ValueError(
+                "FactoredPAWNModel does not support use_flash=True: the v1 "
+                "bare-moves contract's masked slot-0 PAD violates the "
+                "right-pad invariant the Pallas path relies on. Use the "
+                "plain path (use_flash=False)."
+            )
         with jax.named_scope("embed"):
             x = self._embed(input_ids)
             if compute_dtype is not None:
                 x = x.astype(compute_dtype)
         rope_cos, rope_sin = _build_rope(self.cfg.head_dim, T, self.cfg.rope_base)
-        # The materialised mask is only consumed by the plain and SDPA
-        # paths; the Pallas-flash path uses segment_ids derived from
-        # ``attention_mask`` (see pawn.model._pallas_attn).
         mask: Bool[Array, "B 1 T T"] | None
         if use_flash:
             mask = None

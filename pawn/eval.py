@@ -470,6 +470,15 @@ def compute_val_metrics(
     the host. Returns a :class:`ValMetrics` carrying the ``val/*`` scalar
     schema plus the per-phase breakdown.
 
+    Note on ``val_loss`` vs ``train/loss``: the val CE normalises over the
+    move-token support (``[0, NUM_ACTIONS)`` = 1968 columns) while the
+    training CE normalises over the full logit width minus the reserved
+    columns (1980 effective for the uniform V=2000 vocab; all 1980 for the
+    factored v1 vocab, where the reserved mask is a no-op). ``val_loss``
+    therefore reads slightly lower than ``train/loss`` at equal quality.
+    The discrepancy follows v1's eval contract and is identical across
+    architectures, so cross-run comparisons stay apples-to-apples.
+
     ``late_ply`` is the legality late-game threshold (v1's
     ``legality_late_ply`` — positions predicting ply ``>= late_ply`` count
     toward ``late_legal_move_rate``).

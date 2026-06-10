@@ -44,11 +44,13 @@ import numpy as np
 
 import chess_engine as engine
 from pawn.config import BOS_TOKEN, NUM_ACTIONS, PAD_TOKEN
+from pawn.factored_model import FactoredPAWNModel
 from pawn.generation import _map_term_code_to_outcome_name
+from pawn.model import PAWNModel
 
 
 def _ar_complete(
-    model,
+    model: PAWNModel | FactoredPAWNModel,
     *,
     n_games: int,
     max_seq_len: int,
@@ -186,7 +188,8 @@ def _ar_complete(
 
 
 def _run_batched(
-    model, *, n_games: int, batch_size: int, max_seq_len: int,
+    model: PAWNModel | FactoredPAWNModel, *,
+    n_games: int, batch_size: int, max_seq_len: int,
     temperature: float, seed: int, use_bos: bool,
 ) -> dict[str, np.ndarray]:
     """Chunk ``n_games`` into ``batch_size`` decodes (bounds the live logits /
@@ -204,9 +207,10 @@ def _run_batched(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkpoint", required=True,
-                    help="v1 HF repo id (e.g. thomas-schweich/pawn-large) or "
-                         "local v1 checkpoint dir. With --use-bos, a v2 "
-                         "checkpoint id for loop validation.")
+                    help="v1 HF repo id (e.g. thomas-schweich/pawn-large), a "
+                         "v2-format factored checkpoint dir (an --arch "
+                         "factored-v1 run's step_NNNN), or — with --use-bos — "
+                         "a uniform v2 checkpoint for loop validation.")
     ap.add_argument("--n-games", type=int, default=1024)
     ap.add_argument("--max-seq-len", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=1.0)
@@ -219,9 +223,33 @@ def main() -> None:
     ap.add_argument("--output", type=Path, default=None)
     args = ap.parse_args()
 
+    model: PAWNModel | FactoredPAWNModel
     if args.use_bos:
-        from pawn.checkpoint import load_model, resolve_checkpoint_source
-        model, _ = load_model(resolve_checkpoint_source(args.checkpoint))
+        from pawn.checkpoint import (
+            load_model,
+            require_uniform,
+            resolve_checkpoint_source,
+        )
+        loaded, _ = load_model(resolve_checkpoint_source(args.checkpoint))
+        # BOS=1980 is out-of-vocab for factored models — their `_embed`
+        # would silently map it to the last outcome embedding and the
+        # number would be quietly wrong (review round-1, type lane).
+        model = require_uniform(loaded, "--use-bos (v2 BOS contract)")
+        cfg = model.cfg
+    elif (Path(args.checkpoint) / ".complete").is_file():
+        # A v2-format checkpoint dir (e.g. an `--arch factored-v1` run's
+        # step_NNNN). Loads through the sentinel-verified v2 loader; the
+        # bare-moves contract below requires the factored architecture.
+        from pawn.checkpoint import load_model
+        loaded, _ = load_model(Path(args.checkpoint))
+        if not isinstance(loaded, FactoredPAWNModel):
+            raise SystemExit(
+                "the bare-moves (no-BOS) contract requires a factored "
+                f"(v1-architecture) checkpoint; {args.checkpoint} holds a "
+                f"{type(loaded).__name__}. For uniform v2 checkpoints use "
+                "--use-bos (their native contract) instead."
+            )
+        model = loaded
         cfg = model.cfg
     else:
         from pawn._legacy.legacy import load_v1_factored_model

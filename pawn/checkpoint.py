@@ -1,15 +1,19 @@
-"""Atomic safetensors save/load for :class:`pawn.model.PAWNModel`.
+"""Atomic safetensors save/load for :class:`pawn.model.PAWNModel` and
+:class:`pawn.factored_model.FactoredPAWNModel`.
 
 The on-disk layout for one checkpoint directory ``step_<N>/`` is:
 
-- ``model.safetensors`` — the trainable arrays listed in
-  :func:`pawn.model.saved_fields` for the config's ``tie_embeddings``,
-  in declaration order. A tied model omits ``lm_head`` (logits reuse
-  ``embed_tokens.T``); an untied model includes it. The
-  :class:`pawn.model.PAWNModel` :attr:`decomp_table` buffer is *not*
-  saved — it's rebuilt at load time from the engine vocab. RoPE phase
-  tables aren't stored at all (they're a function of cfg, recomputed
-  inside the forward pass).
+- ``model.safetensors`` — the trainable arrays in declaration order. The
+  schema is selected by architecture: for the uniform model,
+  :func:`pawn.model.saved_fields` for the config's ``tie_embeddings`` (a
+  tied model omits ``lm_head``; logits reuse ``embed_tokens.T``); for the
+  factored (v1-architecture) model — ``ModelConfig.factored_embeddings``
+  — :data:`pawn.factored_model.FACTORED_SAVED_FIELDS` (16 tensors:
+  ``embed_src/dst/promo/pad/outcome`` + the shared trunk + an
+  always-present ``lm_head``). Either way the :attr:`decomp_table`
+  buffer is *not* saved — it's rebuilt at load time from the engine
+  vocab. RoPE phase tables aren't stored at all (they're a function of
+  cfg, recomputed inside the forward pass).
 - ``config.json`` — ``{"version": 1, "mask_version": M,
   "model": {ModelConfig fields}, "run": {optional user-supplied dict}}``.
   The ``model`` block (which carries ``tie_embeddings`` + ``vocab_size``)
@@ -58,7 +62,9 @@ Read workflow:
    mismatch.
 2. Parse ``config.json`` → :class:`ModelConfig` + run block.
 3. Load the per-config tensors from ``model.safetensors`` and rebuild
-   :class:`PAWNModel` with them + the recomputed decomp table.
+   the architecture the config names — :class:`PAWNModel`, or
+   :class:`FactoredPAWNModel` when ``factored_embeddings`` — with them
+   + the recomputed decomp table.
 
 :mod:`pawn.model` asserts ``len(SAVED_FIELDS) == 12`` (the untied
 superset) at its own import, and :func:`pawn.model.saved_fields`

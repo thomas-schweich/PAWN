@@ -26,16 +26,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Sequence
 from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
 from safetensors.numpy import load_file as st_load
-from safetensors.numpy import save_file as st_save
 
 from pawn.config import (
-    HEAD_DIM,
     MAX_SEQ_LEN,
     NUM_ACTIONS,
     ROPE_BASE,
@@ -258,5 +255,12 @@ def load_v1_factored_model(source: str) -> tuple[FactoredPAWNModel, ModelConfig]
         n_outcomes=int(
             v1_config.get("n_outcomes", v1_vocab - NUM_ACTIONS - 1)
         ),
+        # The converted model IS the factored architecture — the flag must
+        # say so or every cfg-driven dispatch downstream (above all the
+        # checkpoint save/load schema selection) would treat this factored
+        # object as uniform and write an unloadable checkpoint (round-1
+        # review, codex P2). v1 never tied embeddings.
+        tie_embeddings=False,
+        factored_embeddings=True,
     )
     return _build_v2_model(v1_state, cfg), cfg

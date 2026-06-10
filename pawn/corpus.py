@@ -489,9 +489,9 @@ def to_v1_contract(corpus: Corpus) -> Corpus:
     still *live* at slots ``[1, …)``.
 
     Validated against the published v1 checkpoints: a converted v1-large
-    evaluated through this transform reproduces its published 99.9990%
-    per-move legal rate and 99.76% teacher-forced game-completion
-    (``scripts/eval_v1_legality.py``).
+    evaluated through this transform measures 99.9997% per-move legal /
+    99.90% teacher-forced game-completion, matching its published 99.9990%
+    / 99.76% (``scripts/eval_v1_legality.py``).
 
     Requires the corpus to be at prefix width ``C = 1`` (no conditioning
     slots) — a wider prefix would leave out-of-vocab control tokens at

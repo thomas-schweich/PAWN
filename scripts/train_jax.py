@@ -473,6 +473,22 @@ def main(argv: list[str] | None = None) -> int:
             Path(cfg.resume), optimizer, jax.random.key(0),
             conditioning=cfg.conditioning,
         )
+        # Arch ↔ checkpoint cross-check (review round-1: type-correctness +
+        # test-risk both flagged it). Resuming a factored checkpoint under
+        # --arch v2 would skip to_v1_contract, feeding BOS=1980 into the
+        # factored _embed where `ids >= OUTCOME_TOKEN_BASE` silently maps it
+        # to the last outcome embedding — the run would keep training on a
+        # corrupted layout with no error. The reverse direction (uniform
+        # checkpoint under --arch factored-v1) is equally silent. Make both
+        # directions a load-boundary hard error.
+        resumed_factored = isinstance(state.model, FactoredPAWNModel)
+        if resumed_factored != (cfg.arch == "factored-v1"):
+            raise SystemExit(
+                f"--arch {cfg.arch!r} does not match the resumed "
+                f"checkpoint's architecture "
+                f"({type(state.model).__name__}); pass the run's original "
+                "--arch / --config so the corpus contract matches the model"
+            )
     else:
         import equinox as eqx
         # PretrainConfig doesn't carry a runtime seed field — the model

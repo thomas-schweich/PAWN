@@ -23,9 +23,10 @@ pawn/
 ├── engine/                  # Rust chess engine with PyO3 bindings (via shakmaty)
 ├── pawn/                    # Core Python package
 │   ├── _sentinel.py         # stdlib-only SHA-256 .complete sentinel helpers
-│   ├── config.py            # ModelConfig, SUPERNET, VARIANTS, TINY_*, validate_nested
-│   ├── model.py             # Equinox PAWNModel (RMSNorm + RoPE + SwiGLU + uniform tied embeddings)
-│   ├── run_config.py        # pydantic configs: BaseRunConfig / PretrainConfig / AdapterConfig / SpecializedCLMConfig
+│   ├── config.py            # ModelConfig, SUPERNET, VARIANTS, TINY_*, FACTORED_V1_LARGE, validate_nested
+│   ├── model.py             # Equinox PAWNModel (RMSNorm + RoPE + SwiGLU + uniform untied embeddings)
+│   ├── factored_model.py    # FactoredPAWNModel — v1-arch factored src+dst+promo embeddings (LR-confound experiment; shares model.py's trunk)
+│   ├── run_config.py        # pydantic configs: BaseRunConfig / PretrainConfig (incl. arch=factored-v1) / AdapterConfig / DistillConfig / SpecializedCLMConfig
 │   ├── logging.py           # MetricsLogger (JSONL, type-discriminated, NaN-sanitised)
 │   ├── checkpoint.py        # Atomic safetensors save/load + async HF push
 │   ├── corpus.py            # Rust-engine random games → Corpus (JAX arrays)
@@ -113,10 +114,12 @@ extraction happen in Rust. No Python chess libraries.
   reserved control slots = 2,000 total. (The engine's emission space is a
   narrower 1,980; the model's uniform input/output vocab is 2,000.)
 - Uniform token embeddings: a single `embed_tokens[V, d]` table over the
-  whole `VOCAB_SIZE = 2000` vocab, tied to the output head by default
-  (`tie_embeddings`; logits are `x @ embed_tokens.T`, no separate `lm_head`).
-  The Phase-A redesign replaced the old factored `src+dst+promo`
-  decomposition with this un-factored table.
+  whole `VOCAB_SIZE = 2000` vocab, with a standalone untied `lm_head` by
+  default (`tie_embeddings=False` since 18a0047 — a tied head with no logit
+  regularisation collapses pretraining). The Phase-A redesign replaced the
+  old factored `src+dst+promo` decomposition with this un-factored table.
+  (`pawn/factored_model.py` deliberately resurrects the factored
+  architecture as an isolated experiment — see `docs/factored_v1_experiment.md`.)
 - Sequence format: a fixed-width `[BOS][cond...]` conditioning prefix (width
   `C`, NULL-filled) followed by `[ply_1] ... [ply_N] [PAD] ... [PAD]` —
   the conditioning kind is set by the `conditioning` field in
@@ -457,10 +460,14 @@ entrypoint.
 - **PAD-token init in the engine.** Every PGN-token-init site initialises
   with `vocab::PAD_TOKEN`, not `0` — the vocab assigns `0` to a legal move,
   so a 0-initialised tail looks like real moves downstream.
-- **Un-factored tied embeddings.** A single `embed_tokens[V=2000, d_model]`
-  table covers the whole vocab; the output head reuses it transposed when
-  `tie_embeddings` (the default). The Phase-A redesign retired the earlier
-  factored `src+dst+promo` decomposition — don't reintroduce it in prose.
+- **Un-factored embeddings, untied head.** A single
+  `embed_tokens[V=2000, d_model]` table covers the whole vocab; the output
+  head is a standalone `lm_head` by default (`tie_embeddings=False`; the
+  transposed-table head only when explicitly tied). The Phase-A redesign
+  retired the earlier factored `src+dst+promo` decomposition from the v2
+  architecture — don't describe v2 as factored. The factored architecture
+  exists ONLY in `pawn/factored_model.py` (`--arch factored-v1`) as the
+  v1-architecture control experiment (`docs/factored_v1_experiment.md`).
 - **WSL2 + ROCm.** JAX-on-ROCm works on WSL2 but emits a benign
   "sysfs nodes path does not exist" warning at import time; ignore it. The
   RocmDevice still resolves and jit'd kernels run normally.

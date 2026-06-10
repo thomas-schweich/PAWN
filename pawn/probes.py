@@ -663,6 +663,22 @@ def _extract_all_layers_probe_dataset(
     valid_move = move_positions < game_lengths[:, None].astype(np.int32)
     tokens[:, C:] = np.where(valid_move, move_ids.astype(np.int32), PAD_TOKEN)
     attn = (tokens != PAD_TOKEN).astype(np.int32)
+    # Factored (v1-architecture) models probe under v1's bare-moves
+    # contract: BOS=1980 is out-of-vocab for them — the factored `_embed`'s
+    # `ids >= OUTCOME_TOKEN_BASE` override would silently map it to the
+    # last outcome embedding and corrupt every hidden state's slot-0
+    # context (review round-1, test-risk). Mirror
+    # :func:`pawn.corpus.to_v1_contract`: slot 0 becomes a masked PAD.
+    # Move slots and the (g_idx, p_idx, slot_idx) bookkeeping below are
+    # C-relative and unchanged.
+    if isinstance(model, FactoredPAWNModel):
+        if conditioning:
+            raise ValueError(
+                "factored models probe under the bare-moves contract; "
+                f"conditioning must be empty (got {conditioning!r})"
+            )
+        tokens[:, 0] = PAD_TOKEN
+        attn[:, 0] = 0
 
     # Per-batch forward → collect the FULL per-layer hidden-state stack in
     # one scan per batch. hidden[l] is layer l's (n, seq_len, d) stream.
