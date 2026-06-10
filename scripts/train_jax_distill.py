@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float
 
-from pawn.checkpoint import load_model, resolve_checkpoint_source, save_model
+from pawn.checkpoint import load_model, resolve_checkpoint_source, save_model, require_uniform
 from pawn.config import SUPERNET, TINY_SUPERNET, ModelConfig
 from pawn.corpus import (
     conditioning_from_run_block,
@@ -210,7 +210,8 @@ def main(argv: list[str] | None = None) -> int:
     # move at a different absolute RoPE offset (silent drift), so cross-check
     # and fail loudly (Phase-A load-time C-assert).
     ckpt_dir = resolve_checkpoint_source(cfg.distill_from)
-    teacher, teacher_run_block = load_model(ckpt_dir)
+    teacher_loaded, teacher_run_block = load_model(ckpt_dir)
+    teacher = require_uniform(teacher_loaded, "distillation (teacher)")
     teacher_conditioning = conditioning_from_run_block(teacher_run_block)
     teacher_C = conditioning_to_C(teacher_conditioning)
     run_C = conditioning_to_C(cfg.conditioning)
@@ -264,7 +265,8 @@ def main(argv: list[str] | None = None) -> int:
         # The student checkpoint's own model.safetensors is the trained
         # student; load it and assert its conditioning matches the run's C
         # (same load-time guard as the teacher load above).
-        student, student_run_block = load_model(resume_dir)
+        student_loaded, student_run_block = load_model(resume_dir)
+        student = require_uniform(student_loaded, "distillation (student resume)")
         student_C = conditioning_to_C(
             conditioning_from_run_block(student_run_block)
         )

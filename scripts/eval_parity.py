@@ -28,7 +28,7 @@ import json
 import sys
 from pathlib import Path
 
-from pawn.checkpoint import load_model, resolve_checkpoint_source
+from pawn.checkpoint import load_model, resolve_checkpoint_source, require_uniform
 from pawn.corpus import conditioning_from_run_block, generate_corpus
 from pawn.parity import ReferenceLoRASpec, run_parity_harness
 
@@ -63,12 +63,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--output", type=Path, default=None)
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
-    supernet, sup_run = load_model(
+    supernet_loaded, sup_run = load_model(
         resolve_checkpoint_source(args.supernet_checkpoint)
     )
-    canonical, can_run = load_model(
+    supernet = require_uniform(supernet_loaded, "the parity harness")
+    canonical_loaded, can_run = load_model(
         resolve_checkpoint_source(args.canonical_checkpoint)
     )
+    canonical = require_uniform(canonical_loaded, "the parity harness")
 
     # Both models must share a conditioning layout so the move positions land
     # at the same absolute offset; the canonical's layout is authoritative

@@ -47,6 +47,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from pawn.config import ModelConfig, NULL_TOKEN, PAD_TOKEN
 from pawn.corpus import Corpus
+from pawn.factored_model import FactoredPAWNModel
 from pawn.model import EffectiveCallable, PAWNModel, sliced
 from pawn.run_config import BaseRunConfig
 
@@ -144,7 +145,7 @@ class TrainState(eqx.Module):
     every iteration.
     """
 
-    model: PAWNModel
+    model: PAWNModel | FactoredPAWNModel
     opt_state: optax.OptState
     step: Int[Array, ""]
     key: jax.Array
@@ -467,7 +468,7 @@ def top1_accuracy(
 
 
 def supernet_joint_loss(
-    model: PAWNModel,
+    model: PAWNModel | FactoredPAWNModel,
     batch: Batch,
     variants: tuple[VariantSpec, ...],
     *,
@@ -520,12 +521,27 @@ def supernet_joint_loss(
             "supernet_joint_loss requires at least one VariantSpec; "
             "got an empty tuple"
         )
+    # Width-slicing (`sliced`) only exists for the uniform supernet — the
+    # factored (v1-architecture) model trains as a single standalone
+    # `is_supernet=True` variant (`--arch factored-v1` builds exactly that
+    # spec). Reject a factored model paired with sliceable variants up
+    # front so the per-branch `assert isinstance` narrows safely below.
+    if not isinstance(model, PAWNModel) and any(
+        not v.is_supernet for v in variants
+    ):
+        raise TypeError(
+            "non-supernet (width-sliced) variants require the uniform "
+            f"PAWNModel; got {type(model).__name__} with variants "
+            f"{[v.name for v in variants]}"
+        )
     if stochastic_key is None:
         total = jnp.array(0.0, dtype=jnp.float32)
         for spec in variants:
+            sub_model: PAWNModel | FactoredPAWNModel
             if spec.is_supernet:
                 sub_model = model
             else:
+                assert isinstance(model, PAWNModel)  # guarded above
                 sub_model = sliced(model, spec.cfg)
             total = total + cross_entropy_loss(
                 sub_model, batch,
@@ -552,6 +568,7 @@ def supernet_joint_loss(
 
         def _make_branch(spec: VariantSpec):
             def _branch(_: Any) -> Float[Array, ""]:
+                assert isinstance(model, PAWNModel)  # guarded above
                 sub = sliced(model, spec.cfg)
                 return cross_entropy_loss(
                     sub, batch,
@@ -1162,8 +1179,11 @@ def make_train_step(
             f"accumulation_steps must be ≥ 1, got {accumulation_steps}"
         )
 
-    def _loss_for(model: PAWNModel, batch: Batch, sub_key: jax.Array | None
-                  ) -> Float[Array, ""]:
+    def _loss_for(
+        model: PAWNModel | FactoredPAWNModel,
+        batch: Batch,
+        sub_key: jax.Array | None,
+    ) -> Float[Array, ""]:
         return supernet_joint_loss(
             model, batch, variants,
             compute_dtype=compute_dtype,
@@ -1255,7 +1275,9 @@ def make_scan_step(
     ],
     *,
     emit_grad_norms: bool = False,
-    accuracy_fn: Callable[[PAWNModel, Batch], Float[Array, ""]] | None = None,
+    accuracy_fn: Callable[
+        [PAWNModel | FactoredPAWNModel, Batch], Float[Array, ""]
+    ] | None = None,
 ) -> Callable[..., tuple]:
     """Wrap a single train step into a K-step :func:`jax.lax.scan`.
 

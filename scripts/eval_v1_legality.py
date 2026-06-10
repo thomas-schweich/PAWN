@@ -19,28 +19,11 @@ Validated: converted ``thomas-schweich/pawn-large`` reproduces its published
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 
 from pawn._legacy.legacy import load_v1_factored_model
-from pawn.config import PAD_TOKEN
-from pawn.corpus import Corpus, generate_corpus
+from pawn.corpus import generate_corpus, to_v1_contract
 from pawn.eval import compute_compound_legality, compute_val_metrics
-
-
-def to_v1_contract(corpus: Corpus) -> Corpus:
-    """v2 ``[BOS, m1, m2, …]`` → v1 native contract: slot 0 becomes a masked,
-    unsupervised PAD (so real moves attend causally only to real moves, and the
-    first move is not supervised — v1 never predicted it)."""
-    tokens = corpus.tokens.copy()
-    tokens[:, 0] = PAD_TOKEN
-    attn = corpus.attn_mask.copy()
-    attn[:, 0] = False
-    loss = corpus.loss_mask.copy()
-    loss[:, 0] = False
-    return dataclasses.replace(
-        corpus, tokens=tokens, attn_mask=attn, loss_mask=loss
-    )
 
 
 def main() -> None:

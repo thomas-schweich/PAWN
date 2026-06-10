@@ -76,6 +76,9 @@ __all__ = [
     "VARIANTS",
     "TINY_SUPERNET",
     "TINY_VARIANTS",
+    "V1_VOCAB_SIZE",
+    "FACTORED_V1_LARGE",
+    "TINY_FACTORED",
     "validate_nested",
 ]
 
@@ -224,6 +227,15 @@ class ModelConfig:
     # ``tie_embeddings=True`` only with a logit scale + z-loss (GPT-2/PaLM
     # recipe), which this code does not yet add.
     tie_embeddings: bool = False
+    # v1-architecture factored embeddings (``src+dst+promo`` summed per move
+    # token + standalone PAD/outcome rows) instead of the uniform
+    # ``embed_tokens[V, d]`` table. Selects
+    # :class:`pawn.factored_model.FactoredPAWNModel` in the checkpoint layer
+    # and the trainer. Requires ``tie_embeddings=False`` — the factored input
+    # path has no ``[V, d]`` table to tie the output head against. Default
+    # False keeps every existing config / checkpoint byte-compatible
+    # (``config.json`` files without the key parse to False).
+    factored_embeddings: bool = False
 
     def __post_init__(self) -> None:
         if self.d_model <= 0:
@@ -253,6 +265,12 @@ class ModelConfig:
             raise ValueError(f"n_outcomes must be non-negative, got {self.n_outcomes}")
         if self.rope_base <= 0:
             raise ValueError(f"rope_base must be positive, got {self.rope_base}")
+        if self.factored_embeddings and self.tie_embeddings:
+            raise ValueError(
+                "factored_embeddings is incompatible with tie_embeddings: the "
+                "factored input path has no [V, d] table to tie the output "
+                "head against"
+            )
 
 
 class NestingError(ValueError):
@@ -327,6 +345,13 @@ def validate_nested(variant: ModelConfig, supernet: ModelConfig) -> None:
             f"tie_embeddings mismatch: variant={variant.tie_embeddings} "
             f"supernet={supernet.tie_embeddings}"
         )
+    # Factored vs uniform embeddings are different field sets entirely —
+    # no nested-slice relationship exists across the two architectures.
+    if variant.factored_embeddings != supernet.factored_embeddings:
+        raise NestingError(
+            f"factored_embeddings mismatch: variant={variant.factored_embeddings} "
+            f"supernet={supernet.factored_embeddings}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +409,52 @@ TINY_VARIANTS: Final[Mapping[str, ModelConfig]] = MappingProxyType(
         "base": ModelConfig(d_model=128, n_layers=4, n_heads=2, d_ff=512),
         "large": TINY_SUPERNET,
     }
+)
+
+
+# ---------------------------------------------------------------------------
+# Factored (v1-architecture) configs — the LR-schedule confound experiment.
+# FACTORED_V1_LARGE reproduces v1-large's published architecture exactly
+# (thomas-schweich/pawn-large config.json: d=640, 10 layers, 8 heads ×
+# head_dim 80, d_ff=2560, vocab 1980, max_seq_len 512, rope_base 10000,
+# 11 outcomes; lm_head untied). 66.91M params. Trained by
+# `scripts/train_jax.py --arch factored-v1` under the v2 recipe so the
+# architecture is the only variable vs. the v2-large teacher run.
+# ---------------------------------------------------------------------------
+
+# v1's emission-space vocabulary: 1,968 actions + PAD + 11 outcomes. No
+# BOS / NULL / reserved rows — v1 trained on bare move sequences.
+V1_VOCAB_SIZE: Final[int] = NUM_ACTIONS + 1 + N_TOTAL_OUTCOMES  # = 1980
+
+FACTORED_V1_LARGE: Final[ModelConfig] = ModelConfig(
+    d_model=640,
+    n_layers=10,
+    n_heads=8,
+    d_ff=2560,
+    head_dim=80,  # v1's native head_dim (640 / 8), not the v2 nesting 64
+    vocab_size=V1_VOCAB_SIZE,
+    max_seq_len=MAX_SEQ_LEN,
+    rope_base=ROPE_BASE,
+    n_outcomes=N_TOTAL_OUTCOMES,
+    tie_embeddings=False,
+    factored_embeddings=True,
+)
+
+# Tiny factored config for unit tests / smoke runs (same head_dim:d_model
+# ratio family as the tiny supernet; dims chosen so a CPU/GPU test forward
+# is fast).
+TINY_FACTORED: Final[ModelConfig] = ModelConfig(
+    d_model=96,
+    n_layers=2,
+    n_heads=2,
+    d_ff=192,
+    head_dim=48,
+    vocab_size=V1_VOCAB_SIZE,
+    max_seq_len=MAX_SEQ_LEN,
+    rope_base=ROPE_BASE,
+    n_outcomes=N_TOTAL_OUTCOMES,
+    tie_embeddings=False,
+    factored_embeddings=True,
 )
 
 

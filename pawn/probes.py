@@ -32,6 +32,7 @@ from jaxtyping import Array, Float, Int
 import chess_engine as engine
 from pawn.config import PAD_TOKEN
 from pawn.corpus import build_prefix, conditioning_to_C
+from pawn.factored_model import FactoredPAWNModel
 from pawn.model import PAWNModel
 
 __all__ = [
@@ -619,7 +620,7 @@ PROBE_FEATURES: dict[str, ProbeFeature] = {
 
 
 def _extract_all_layers_probe_dataset(
-    model: PAWNModel,
+    model: PAWNModel | FactoredPAWNModel,
     move_ids: np.ndarray,
     game_lengths: np.ndarray,
     *,
@@ -728,7 +729,7 @@ def _extract_all_layers_probe_dataset(
 
 
 def extract_probe_dataset(
-    model: PAWNModel,
+    model: PAWNModel | FactoredPAWNModel,
     move_ids: np.ndarray,
     game_lengths: np.ndarray,
     *,
@@ -777,7 +778,7 @@ def extract_probe_dataset(
 
 
 def run_layer_probes(
-    model: PAWNModel,
+    model: PAWNModel | FactoredPAWNModel,
     move_ids: np.ndarray,
     game_lengths: np.ndarray,
     *,

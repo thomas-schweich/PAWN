@@ -583,6 +583,268 @@ class TransformerLayer(eqx.Module):
     w_down: Float[Array, "n_layers d_ff d"]
 
 
+# ---------------------------------------------------------------------------
+# Shared transformer trunk (used by PAWNModel and FactoredPAWNModel)
+# ---------------------------------------------------------------------------
+
+
+def _run_layers_impl(
+    layers: TransformerLayer,
+    cfg: ModelConfig,
+    x: Float[Array, "B T d"],
+    rope_cos: Float[Array, "T half"],
+    rope_sin: Float[Array, "T half"],
+    mask: Bool[Array, "B 1 T T"] | None,
+    attention_mask: Int[Array, "B T"] | None,
+    compute_dtype: jnp.dtype | None = None,
+    *,
+    attn_hook: Callable[[Float[Array, "B T d"], Any], Float[Array, "B T d"]]
+    | None = None,
+    ffn_hook: Callable[[Float[Array, "B T d"], Any], Float[Array, "B T d"]]
+    | None = None,
+    hook_data: Any = None,
+    use_sdpa: bool = False,
+    use_flash: bool = False,
+) -> Float[Array, "B T d"]:
+    """Apply all ``n_layers`` transformer blocks via :func:`jax.lax.scan`.
+
+    ``layers`` is one :class:`TransformerLayer` whose leaves
+    have a leading ``n_layers`` axis. :func:`jax.lax.scan` iterates
+    layer-by-layer; each iteration sees a per-layer slice of every
+    weight tensor.
+
+    ``compute_dtype`` controls activation precision. When set, each
+    per-layer weight is cast to ``compute_dtype`` just before its
+    einsum — XLA fuses the cast into the matmul kernel where it
+    can. `_rmsnorm` and `softmax` upcast to fp32 internally for
+    numerical stability and downcast back.
+
+    ``attn_hook`` / ``ffn_hook`` / ``hook_data`` inject adapter
+    residuals after each sublayer; see :meth:`__call__` for the
+    contract.
+    """
+    head_dim = cfg.head_dim
+    n_heads = cfg.n_heads
+    # Compile-time constant — hoist out of the scan body so we don't
+    # re-allocate a 0-d scalar and dispatch a sqrt kernel on every layer.
+    inv_scale = head_dim ** -0.5
+    has_hooks = (
+        attn_hook is not None or ffn_hook is not None
+    ) and hook_data is not None
+
+    def step(
+        carry: Float[Array, "B T d"],
+        layer_and_hook: Any,
+    ) -> tuple[Float[Array, "B T d"], None]:
+        if has_hooks:
+            layer, hook_slice = layer_and_hook
+        else:
+            layer = layer_and_hook
+            hook_slice = None
+        h = carry
+        # ---- attention block (pre-norm + residual) ----
+        # `_rmsnorm` upcasts to fp32 internally and downcasts to
+        # `h.dtype` — so `normed` is the compute dtype when AMP is on.
+        with jax.named_scope("attn_norm"):
+            normed = _rmsnorm(h, layer.attn_norm_w)
+        B, T, D = normed.shape  # noqa: N806
+        # Cast Q/K/V/O weights to compute_dtype just before each
+        # einsum. XLA fuses the cast into the kernel; the master
+        # weight stays fp32 in `layers.wq` etc., so backward
+        # accumulates in fp32 via standard JAX autograd.
+        #
+        # Note: a QKV-pack variant (concat W along the out axis,
+        # one bigger matmul, jnp.split after) was tested empirically
+        # and is shape-dependent — wins ~2% at BASE B=64 but **loses
+        # ~6% at LARGE B=64** on RTX 5090. The supernet trains at
+        # LARGE shape, so the unpacked 3-matmul form ships.
+        wq = layer.wq if compute_dtype is None else layer.wq.astype(compute_dtype)
+        wk = layer.wk if compute_dtype is None else layer.wk.astype(compute_dtype)
+        wv = layer.wv if compute_dtype is None else layer.wv.astype(compute_dtype)
+        wo = layer.wo if compute_dtype is None else layer.wo.astype(compute_dtype)
+        with jax.named_scope("qkv_proj"):
+            q = jnp.einsum("btd,de->bte", normed, wq)
+            k = jnp.einsum("btd,de->bte", normed, wk)
+            v = jnp.einsum("btd,de->bte", normed, wv)
+            q = q.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+            k = k.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+            v = v.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+        with jax.named_scope("rope"):
+            q = _apply_rope(q, rope_cos, rope_sin)
+            k = _apply_rope(k, rope_cos, rope_sin)
+        if use_flash:
+            # Pallas Triton-flavoured fused attention; consumes the
+            # (B, H, T, D) tensors after RoPE and emits (B, T, D)
+            # ready for the output projection. PAD-masking comes
+            # from `attention_mask` via segment_ids inside
+            # `_pallas_attn`; causal is unconditional.
+            with jax.named_scope("attn_pallas"):
+                attn_out = _pallas_attn(q, k, v, attention_mask, inv_scale)
+        elif use_sdpa:
+            # `jax.nn.dot_product_attention` expects (B, T, H, D)
+            # layout, not the (B, H, T, D) we computed above. The
+            # transpose is free under XLA fusion. SDPA's `mask`
+            # argument is broadcastable to (B, H, T, T) — the
+            # existing `mask` already has shape (B, 1, T, T) which
+            # broadcasts cleanly. `is_causal=False` because we pass
+            # an explicit mask that already encodes causality + the
+            # per-batch PAD mask.
+            q_bthd = q.transpose(0, 2, 1, 3)
+            k_bthd = k.transpose(0, 2, 1, 3)
+            v_bthd = v.transpose(0, 2, 1, 3)
+            attn_out = jax.nn.dot_product_attention(
+                q_bthd, k_bthd, v_bthd,
+                mask=mask, scale=inv_scale,
+                implementation="xla",
+            )
+            # SDPA returns (B, T, H, D); flatten back to (B, T, D).
+            attn_out = attn_out.reshape(B, T, D)
+        else:
+            # Attention scores: matmul in compute dtype, then upcast to
+            # fp32 for the softmax (the fp32 score tensor is the
+            # numerically-sensitive intermediate). Downcast attn weights
+            # back to compute dtype for the value matmul. ``mask`` is
+            # only ``None`` on the ``use_flash`` path (handled above) —
+            # narrow it for pyright.
+            assert mask is not None
+            scores = jnp.einsum("bhid,bhjd->bhij", q, k) * inv_scale
+            scores_f32 = scores.astype(jnp.float32)
+            mask_neg_inf = jnp.finfo(jnp.float32).min
+            scores_f32 = jnp.where(mask, scores_f32, mask_neg_inf)
+            attn = jax.nn.softmax(scores_f32, axis=-1)
+            if compute_dtype is not None:
+                attn = attn.astype(compute_dtype)
+            attn_out = jnp.einsum("bhij,bhjd->bhid", attn, v)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, D)
+        with jax.named_scope("attn_out_proj"):
+            h = h + jnp.einsum("btd,de->bte", attn_out, wo)
+        if attn_hook is not None:
+            h = attn_hook(h, hook_slice)
+
+        # ---- ffn block (pre-norm + residual) ----
+        with jax.named_scope("ffn_norm"):
+            normed = _rmsnorm(h, layer.ffn_norm_w)
+        # Gate+up pack variant (concat W along out axis, one bigger
+        # matmul, jnp.split after) was tested and behaves like the
+        # QKV-pack experiment above — wins at BASE but loses at
+        # LARGE. Keeping unpacked for production parity.
+        w_gate = (
+            layer.w_gate
+            if compute_dtype is None
+            else layer.w_gate.astype(compute_dtype)
+        )
+        w_up = (
+            layer.w_up
+            if compute_dtype is None
+            else layer.w_up.astype(compute_dtype)
+        )
+        w_down = (
+            layer.w_down
+            if compute_dtype is None
+            else layer.w_down.astype(compute_dtype)
+        )
+        with jax.named_scope("ffn_gate_up"):
+            gate = jnp.einsum("btd,df->btf", normed, w_gate)
+            up = jnp.einsum("btd,df->btf", normed, w_up)
+        with jax.named_scope("ffn_down"):
+            ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, w_down)
+        h = h + ffn_out
+        if ffn_hook is not None:
+            h = ffn_hook(h, hook_slice)
+        return h, None
+
+    scan_input: Any = (layers, hook_data) if has_hooks else layers
+    # Unrolling the layer loop trades HLO size for cross-layer
+    # fusion (e.g., layer-i residual add into layer-i+1 RMSNorm
+    # read) — the same kind of cross-iteration fusion that
+    # `torch.compile`'s Inductor gets from an explicit Python
+    # for-loop in v1. Full ``unroll=n_layers`` is best at
+    # compile-bound shapes; partial unrolls (2 or 4) leave more
+    # opportunity for XLA to schedule activation memory tighter,
+    # which helps at high batch / long seq where activation
+    # checkpoints dominate. ``PAWN_SCAN_UNROLL`` overrides for
+    # benching; leaving it unset keeps the default (full unroll).
+    unroll_str = os.environ.get("PAWN_SCAN_UNROLL")
+    unroll = (
+        int(unroll_str) if unroll_str else cfg.n_layers
+    )
+    # ``PAWN_USE_REMAT=1`` wraps the per-layer ``step`` body in
+    # ``jax.checkpoint`` (with the dot-no-batch-dims policy that
+    # saves matmul outputs and recomputes RMSNorm / RoPE /
+    # residuals on backward). Trades ~18% backward FLOPs for ~3-5×
+    # activation memory headroom — the only way to fit B=256 at
+    # LARGE inside the 5090's 32 GB VRAM. Validated empirically:
+    # round-3 review (Sonnet conv + Opus conv + Opus OOB) flagged
+    # it as the largest-impact remaining lever specifically
+    # because it unlocks larger batches, not because it makes
+    # B=64 faster.
+    if os.environ.get("PAWN_USE_REMAT"):
+        step = jax.checkpoint(  # type: ignore[assignment]
+            step,
+            policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+        )
+    x, _ = jax.lax.scan(step, x, scan_input, unroll=unroll)
+    return x
+
+
+def _run_layers_collect_impl(
+    layers: TransformerLayer,
+    cfg: ModelConfig,
+    x: Float[Array, "B T d"],
+    rope_cos: Float[Array, "T half"],
+    rope_sin: Float[Array, "T half"],
+    mask: Bool[Array, "B 1 T T"],
+    attention_mask: Int[Array, "B T"] | None,
+) -> Float[Array, "L B T d"]:
+    """Per-layer output stack — the probe-only sibling of
+    :meth:`_run_layers`.
+
+    Runs the plain fp32 materialised-``QK^T`` attention path (no AMP,
+    no adapter hooks, no SDPA/Pallas) and emits the post-FFN residual
+    of every block via :func:`jax.lax.scan`'s ``ys`` channel, giving a
+    ``(n_layers, B, T, d)`` stack. Kept separate from
+    :meth:`_run_layers` so the hot training/eval path never threads an
+    extra output through its scan; the precision and masking exactly
+    mirror the ``compute_dtype is None`` branch of :meth:`_run_layers`,
+    so probe states match what the final-logit forward sees.
+    """
+    head_dim = cfg.head_dim
+    n_heads = cfg.n_heads
+    inv_scale = head_dim ** -0.5
+
+    def step(
+        carry: Float[Array, "B T d"],
+        layer: TransformerLayer,
+    ) -> tuple[Float[Array, "B T d"], Float[Array, "B T d"]]:
+        h = carry
+        normed = _rmsnorm(h, layer.attn_norm_w)
+        B, T, D = normed.shape  # noqa: N806
+        q = jnp.einsum("btd,de->bte", normed, layer.wq)
+        k = jnp.einsum("btd,de->bte", normed, layer.wk)
+        v = jnp.einsum("btd,de->bte", normed, layer.wv)
+        q = q.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+        k = k.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
+        q = _apply_rope(q, rope_cos, rope_sin)
+        k = _apply_rope(k, rope_cos, rope_sin)
+        scores = jnp.einsum("bhid,bhjd->bhij", q, k) * inv_scale
+        mask_neg_inf = jnp.finfo(jnp.float32).min
+        scores = jnp.where(mask, scores.astype(jnp.float32), mask_neg_inf)
+        attn = jax.nn.softmax(scores, axis=-1)
+        attn_out = jnp.einsum("bhij,bhjd->bhid", attn, v)
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, D)
+        h = h + jnp.einsum("btd,de->bte", attn_out, layer.wo)
+        normed = _rmsnorm(h, layer.ffn_norm_w)
+        gate = jnp.einsum("btd,df->btf", normed, layer.w_gate)
+        up = jnp.einsum("btd,df->btf", normed, layer.w_up)
+        ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, layer.w_down)
+        h = h + ffn_out
+        return h, h
+
+    _, per_layer = jax.lax.scan(step, x, layers)
+    return per_layer
+
+
 class PAWNModel(eqx.Module):
     """Decoder-only transformer over the move + outcome vocabulary.
 
@@ -836,183 +1098,19 @@ class PAWNModel(eqx.Module):
     ) -> Float[Array, "B T d"]:
         """Apply all ``n_layers`` transformer blocks via :func:`jax.lax.scan`.
 
-        ``self.layers`` is one :class:`TransformerLayer` whose leaves
-        have a leading ``n_layers`` axis. :func:`jax.lax.scan` iterates
-        layer-by-layer; each iteration sees a per-layer slice of every
-        weight tensor.
-
-        ``compute_dtype`` controls activation precision. When set, each
-        per-layer weight is cast to ``compute_dtype`` just before its
-        einsum — XLA fuses the cast into the matmul kernel where it
-        can. `_rmsnorm` and `softmax` upcast to fp32 internally for
-        numerical stability and downcast back.
-
-        ``attn_hook`` / ``ffn_hook`` / ``hook_data`` inject adapter
-        residuals after each sublayer; see :meth:`__call__` for the
-        contract.
+        Thin delegate to the module-level :func:`_run_layers_impl`, which
+        holds the actual scan body. The impl is shared with
+        :class:`pawn.factored_model.FactoredPAWNModel` so both
+        architectures run the *same* trunk numerics (fp32 RoPE, fp32
+        softmax, per-einsum AMP weight casts) — see that module's
+        docstring for why the sharing is load-bearing.
         """
-        head_dim = self.cfg.head_dim
-        n_heads = self.cfg.n_heads
-        # Compile-time constant — hoist out of the scan body so we don't
-        # re-allocate a 0-d scalar and dispatch a sqrt kernel on every layer.
-        inv_scale = head_dim ** -0.5
-        has_hooks = (
-            attn_hook is not None or ffn_hook is not None
-        ) and hook_data is not None
-
-        def step(
-            carry: Float[Array, "B T d"],
-            layer_and_hook: Any,
-        ) -> tuple[Float[Array, "B T d"], None]:
-            if has_hooks:
-                layer, hook_slice = layer_and_hook
-            else:
-                layer = layer_and_hook
-                hook_slice = None
-            h = carry
-            # ---- attention block (pre-norm + residual) ----
-            # `_rmsnorm` upcasts to fp32 internally and downcasts to
-            # `h.dtype` — so `normed` is the compute dtype when AMP is on.
-            with jax.named_scope("attn_norm"):
-                normed = _rmsnorm(h, layer.attn_norm_w)
-            B, T, D = normed.shape  # noqa: N806
-            # Cast Q/K/V/O weights to compute_dtype just before each
-            # einsum. XLA fuses the cast into the kernel; the master
-            # weight stays fp32 in `self.layers.wq` etc., so backward
-            # accumulates in fp32 via standard JAX autograd.
-            #
-            # Note: a QKV-pack variant (concat W along the out axis,
-            # one bigger matmul, jnp.split after) was tested empirically
-            # and is shape-dependent — wins ~2% at BASE B=64 but **loses
-            # ~6% at LARGE B=64** on RTX 5090. The supernet trains at
-            # LARGE shape, so the unpacked 3-matmul form ships.
-            wq = layer.wq if compute_dtype is None else layer.wq.astype(compute_dtype)
-            wk = layer.wk if compute_dtype is None else layer.wk.astype(compute_dtype)
-            wv = layer.wv if compute_dtype is None else layer.wv.astype(compute_dtype)
-            wo = layer.wo if compute_dtype is None else layer.wo.astype(compute_dtype)
-            with jax.named_scope("qkv_proj"):
-                q = jnp.einsum("btd,de->bte", normed, wq)
-                k = jnp.einsum("btd,de->bte", normed, wk)
-                v = jnp.einsum("btd,de->bte", normed, wv)
-                q = q.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
-                k = k.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
-                v = v.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
-            with jax.named_scope("rope"):
-                q = _apply_rope(q, rope_cos, rope_sin)
-                k = _apply_rope(k, rope_cos, rope_sin)
-            if use_flash:
-                # Pallas Triton-flavoured fused attention; consumes the
-                # (B, H, T, D) tensors after RoPE and emits (B, T, D)
-                # ready for the output projection. PAD-masking comes
-                # from `attention_mask` via segment_ids inside
-                # `_pallas_attn`; causal is unconditional.
-                with jax.named_scope("attn_pallas"):
-                    attn_out = _pallas_attn(q, k, v, attention_mask, inv_scale)
-            elif use_sdpa:
-                # `jax.nn.dot_product_attention` expects (B, T, H, D)
-                # layout, not the (B, H, T, D) we computed above. The
-                # transpose is free under XLA fusion. SDPA's `mask`
-                # argument is broadcastable to (B, H, T, T) — the
-                # existing `mask` already has shape (B, 1, T, T) which
-                # broadcasts cleanly. `is_causal=False` because we pass
-                # an explicit mask that already encodes causality + the
-                # per-batch PAD mask.
-                q_bthd = q.transpose(0, 2, 1, 3)
-                k_bthd = k.transpose(0, 2, 1, 3)
-                v_bthd = v.transpose(0, 2, 1, 3)
-                attn_out = jax.nn.dot_product_attention(
-                    q_bthd, k_bthd, v_bthd,
-                    mask=mask, scale=inv_scale,
-                    implementation="xla",
-                )
-                # SDPA returns (B, T, H, D); flatten back to (B, T, D).
-                attn_out = attn_out.reshape(B, T, D)
-            else:
-                # Attention scores: matmul in compute dtype, then upcast to
-                # fp32 for the softmax (the fp32 score tensor is the
-                # numerically-sensitive intermediate). Downcast attn weights
-                # back to compute dtype for the value matmul. ``mask`` is
-                # only ``None`` on the ``use_flash`` path (handled above) —
-                # narrow it for pyright.
-                assert mask is not None
-                scores = jnp.einsum("bhid,bhjd->bhij", q, k) * inv_scale
-                scores_f32 = scores.astype(jnp.float32)
-                mask_neg_inf = jnp.finfo(jnp.float32).min
-                scores_f32 = jnp.where(mask, scores_f32, mask_neg_inf)
-                attn = jax.nn.softmax(scores_f32, axis=-1)
-                if compute_dtype is not None:
-                    attn = attn.astype(compute_dtype)
-                attn_out = jnp.einsum("bhij,bhjd->bhid", attn, v)
-                attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, D)
-            with jax.named_scope("attn_out_proj"):
-                h = h + jnp.einsum("btd,de->bte", attn_out, wo)
-            if attn_hook is not None:
-                h = attn_hook(h, hook_slice)
-
-            # ---- ffn block (pre-norm + residual) ----
-            with jax.named_scope("ffn_norm"):
-                normed = _rmsnorm(h, layer.ffn_norm_w)
-            # Gate+up pack variant (concat W along out axis, one bigger
-            # matmul, jnp.split after) was tested and behaves like the
-            # QKV-pack experiment above — wins at BASE but loses at
-            # LARGE. Keeping unpacked for production parity.
-            w_gate = (
-                layer.w_gate
-                if compute_dtype is None
-                else layer.w_gate.astype(compute_dtype)
-            )
-            w_up = (
-                layer.w_up
-                if compute_dtype is None
-                else layer.w_up.astype(compute_dtype)
-            )
-            w_down = (
-                layer.w_down
-                if compute_dtype is None
-                else layer.w_down.astype(compute_dtype)
-            )
-            with jax.named_scope("ffn_gate_up"):
-                gate = jnp.einsum("btd,df->btf", normed, w_gate)
-                up = jnp.einsum("btd,df->btf", normed, w_up)
-            with jax.named_scope("ffn_down"):
-                ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, w_down)
-            h = h + ffn_out
-            if ffn_hook is not None:
-                h = ffn_hook(h, hook_slice)
-            return h, None
-
-        scan_input: Any = (self.layers, hook_data) if has_hooks else self.layers
-        # Unrolling the layer loop trades HLO size for cross-layer
-        # fusion (e.g., layer-i residual add into layer-i+1 RMSNorm
-        # read) — the same kind of cross-iteration fusion that
-        # `torch.compile`'s Inductor gets from an explicit Python
-        # for-loop in v1. Full ``unroll=n_layers`` is best at
-        # compile-bound shapes; partial unrolls (2 or 4) leave more
-        # opportunity for XLA to schedule activation memory tighter,
-        # which helps at high batch / long seq where activation
-        # checkpoints dominate. ``PAWN_SCAN_UNROLL`` overrides for
-        # benching; leaving it unset keeps the default (full unroll).
-        unroll_str = os.environ.get("PAWN_SCAN_UNROLL")
-        unroll = (
-            int(unroll_str) if unroll_str else self.cfg.n_layers
+        return _run_layers_impl(
+            self.layers, self.cfg, x, rope_cos, rope_sin, mask,
+            attention_mask, compute_dtype,
+            attn_hook=attn_hook, ffn_hook=ffn_hook, hook_data=hook_data,
+            use_sdpa=use_sdpa, use_flash=use_flash,
         )
-        # ``PAWN_USE_REMAT=1`` wraps the per-layer ``step`` body in
-        # ``jax.checkpoint`` (with the dot-no-batch-dims policy that
-        # saves matmul outputs and recomputes RMSNorm / RoPE /
-        # residuals on backward). Trades ~18% backward FLOPs for ~3-5×
-        # activation memory headroom — the only way to fit B=256 at
-        # LARGE inside the 5090's 32 GB VRAM. Validated empirically:
-        # round-3 review (Sonnet conv + Opus conv + Opus OOB) flagged
-        # it as the largest-impact remaining lever specifically
-        # because it unlocks larger batches, not because it makes
-        # B=64 faster.
-        if os.environ.get("PAWN_USE_REMAT"):
-            step = jax.checkpoint(  # type: ignore[assignment]
-                step,
-                policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
-            )
-        x, _ = jax.lax.scan(step, x, scan_input, unroll=unroll)
-        return x
 
     def _run_layers_collect(
         self,
@@ -1023,52 +1121,13 @@ class PAWNModel(eqx.Module):
         attention_mask: Int[Array, "B T"] | None,
     ) -> Float[Array, "L B T d"]:
         """Per-layer output stack — the probe-only sibling of
-        :meth:`_run_layers`.
-
-        Runs the plain fp32 materialised-``QK^T`` attention path (no AMP,
-        no adapter hooks, no SDPA/Pallas) and emits the post-FFN residual
-        of every block via :func:`jax.lax.scan`'s ``ys`` channel, giving a
-        ``(n_layers, B, T, d)`` stack. Kept separate from
-        :meth:`_run_layers` so the hot training/eval path never threads an
-        extra output through its scan; the precision and masking exactly
-        mirror the ``compute_dtype is None`` branch of :meth:`_run_layers`,
-        so probe states match what the final-logit forward sees.
+        :meth:`_run_layers`. Thin delegate to
+        :func:`_run_layers_collect_impl` (shared with the factored model).
         """
-        head_dim = self.cfg.head_dim
-        n_heads = self.cfg.n_heads
-        inv_scale = head_dim ** -0.5
-
-        def step(
-            carry: Float[Array, "B T d"],
-            layer: TransformerLayer,
-        ) -> tuple[Float[Array, "B T d"], Float[Array, "B T d"]]:
-            h = carry
-            normed = _rmsnorm(h, layer.attn_norm_w)
-            B, T, D = normed.shape  # noqa: N806
-            q = jnp.einsum("btd,de->bte", normed, layer.wq)
-            k = jnp.einsum("btd,de->bte", normed, layer.wk)
-            v = jnp.einsum("btd,de->bte", normed, layer.wv)
-            q = q.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
-            k = k.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
-            v = v.reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3)
-            q = _apply_rope(q, rope_cos, rope_sin)
-            k = _apply_rope(k, rope_cos, rope_sin)
-            scores = jnp.einsum("bhid,bhjd->bhij", q, k) * inv_scale
-            mask_neg_inf = jnp.finfo(jnp.float32).min
-            scores = jnp.where(mask, scores.astype(jnp.float32), mask_neg_inf)
-            attn = jax.nn.softmax(scores, axis=-1)
-            attn_out = jnp.einsum("bhij,bhjd->bhid", attn, v)
-            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, T, D)
-            h = h + jnp.einsum("btd,de->bte", attn_out, layer.wo)
-            normed = _rmsnorm(h, layer.ffn_norm_w)
-            gate = jnp.einsum("btd,df->btf", normed, layer.w_gate)
-            up = jnp.einsum("btd,df->btf", normed, layer.w_up)
-            ffn_out = jnp.einsum("btf,fd->btd", jax.nn.silu(gate) * up, layer.w_down)
-            h = h + ffn_out
-            return h, h
-
-        _, per_layer = jax.lax.scan(step, x, self.layers)
-        return per_layer
+        return _run_layers_collect_impl(
+            self.layers, self.cfg, x, rope_cos, rope_sin, mask,
+            attention_mask,
+        )
 
     # -----------------------------------------------------------------------
     # KV-cached generation path

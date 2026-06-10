@@ -30,13 +30,15 @@ from jaxtyping import Array, Float
 from pawn.checkpoint import save_model
 from pawn.config import (
     CONDITIONING_KINDS,
+    FACTORED_V1_LARGE,
     PRETRAIN_BUCKETS,
     SUPERNET,
+    TINY_FACTORED,
     TINY_SUPERNET,
     VARIANTS,
     TINY_VARIANTS,
 )
-from pawn.corpus import Corpus, generate_corpus
+from pawn.corpus import Corpus, generate_corpus, to_v1_contract
 from pawn.eval import compute_val_metrics
 from pawn.jax_setup import require_accelerator, resolve_device, setup_jax_caching
 from pawn.lifecycle import (
@@ -60,6 +62,7 @@ from pawn.wandb_utils import (
     log_metrics,
     require_wandb_available,
 )
+from pawn.factored_model import FactoredPAWNModel, init_factored_model
 from pawn.model import PAWNModel, init_model, sliced
 from pawn.run_config import PretrainConfig
 from pawn.trainer import (
@@ -105,6 +108,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="train_jax")
     ap.add_argument("--config", type=Path, default=None, help="JSON run config")
     ap.add_argument("--supernet", choices=("tiny", "production"), default=None)
+    ap.add_argument("--arch", choices=("v2", "factored-v1"), default=None,
+                    help="model architecture. `v2` (default) is the uniform-"
+                         "embedding supernet path; `factored-v1` trains the "
+                         "v1-architecture factored-embedding model "
+                         "(FACTORED_V1_LARGE / TINY_FACTORED by --supernet) "
+                         "as a single standalone variant under v1's native "
+                         "bare-moves contract — the LR-schedule-confound "
+                         "experiment.")
     ap.add_argument("--total-steps", type=int, default=None)
     ap.add_argument("--accumulation-steps", type=int, default=None,
                     help="(B2) micro-batches accumulated per optimizer step. "
@@ -286,6 +297,7 @@ def _build_config(args: argparse.Namespace) -> PretrainConfig:
     # CLI flags override config-file values.
     for flag, val in (
         ("supernet", args.supernet),
+        ("arch", args.arch),
         ("total_steps", args.total_steps),
         ("accumulation_steps", args.accumulation_steps),
         ("batch_size", args.batch_size),
@@ -377,7 +389,20 @@ def build_variants(cfg: PretrainConfig) -> tuple[VariantSpec, ...]:
     ladder (plan §7). ``is_supernet`` is True only for ``"large"`` so the
     full model goes through the forward unsliced; any other selected
     variant is a width-slice of the supernet.
+
+    ``arch="factored-v1"`` has no supernet/variant structure at all: the
+    factored model trains as exactly one standalone ``is_supernet=True``
+    spec (so :func:`pawn.trainer.supernet_joint_loss` reduces to a single
+    :func:`cross_entropy_loss` on the full model and ``sliced`` is never
+    invoked).
     """
+    if cfg.arch == "factored-v1":
+        factored_cfg = (
+            TINY_FACTORED if cfg.supernet == "tiny" else FACTORED_V1_LARGE
+        )
+        return (
+            VariantSpec("factored-v1-large", factored_cfg, is_supernet=True),
+        )
     variants_dict = TINY_VARIANTS if cfg.supernet == "tiny" else VARIANTS
     selected = cfg.variants if cfg.variants is not None else ("small", "base", "large")
     return tuple(
@@ -398,7 +423,9 @@ def widest_trained_variant(variants: tuple[VariantSpec, ...]) -> VariantSpec:
     return max(variants, key=lambda s: s.cfg.d_model)
 
 
-def accuracy_model(model: PAWNModel, widest: VariantSpec) -> PAWNModel:
+def accuracy_model(
+    model: PAWNModel | FactoredPAWNModel, widest: VariantSpec
+) -> PAWNModel | FactoredPAWNModel:
     """The model the ``train/accuracy`` forward runs on.
 
     When ``widest`` is the supernet itself (``is_supernet``) the full model
@@ -408,10 +435,13 @@ def accuracy_model(model: PAWNModel, widest: VariantSpec) -> PAWNModel:
     ``[d_widest:d_supernet]`` dims stay at init, so we ``sliced`` down to the
     widest trained width; the forward then never mixes trained inner dims
     with untrained outer dims (which would report near-random accuracy for a
-    healthy run).
+    healthy run). The factored arch always trains as a single
+    ``is_supernet=True`` spec, so it takes the no-slice branch (and
+    ``supernet_joint_loss`` rejects any other pairing up front).
     """
     if widest.is_supernet:
         return model
+    assert isinstance(model, PAWNModel)  # non-supernet variants are v2-only
     return sliced(model, widest.cfg)
 
 
@@ -445,11 +475,17 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         import equinox as eqx
-        # PretrainConfig doesn't carry a runtime seed field — the supernet
+        # PretrainConfig doesn't carry a runtime seed field — the model
         # init key is fixed at 0 for reproducibility. The training stream's
         # randomness comes from the Rust engine's per-batch seed, not from
         # the model-init key.
-        model = init_model(supernet_cfg, key=0)
+        model: PAWNModel | FactoredPAWNModel
+        if cfg.arch == "factored-v1":
+            # `build_variants` produced exactly one is_supernet spec whose
+            # cfg IS the factored model config — init from it directly.
+            model = init_factored_model(variants[0].cfg, key=0)
+        else:
+            model = init_model(supernet_cfg, key=0)
         opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
         state = TrainState(
             model=model, opt_state=opt_state, step=jnp.int32(0),
@@ -557,7 +593,9 @@ def main(argv: list[str] | None = None) -> int:
         # batch. Equinox `Batch` is a PyTree, so a leaf-wise index works.
         return jax.tree_util.tree_map(lambda x: x[0], batch)
 
-    def _supernet_accuracy(model: PAWNModel, batch: Batch) -> Float[Array, ""]:
+    def _supernet_accuracy(
+        model: PAWNModel | FactoredPAWNModel, batch: Batch
+    ) -> Float[Array, ""]:
         b = batch if accumulation_steps == 1 else _first_micro(batch)
         # `is_supernet` ⇒ full model is the variant (slice is a no-op);
         # otherwise slice down to the widest trained width so the forward
@@ -654,6 +692,12 @@ def main(argv: list[str] | None = None) -> int:
             mate_boost=cfg.mate_boost,
             discard_ply_limit=cfg.discard_ply_limit,
         )
+        if cfg.arch == "factored-v1":
+            # v1's native bare-moves contract: slot 0 (BOS in the v2
+            # layout — out-of-vocab for the factored model) becomes a
+            # masked, unsupervised PAD. Applied before bucketing so every
+            # bucket's slices carry the transformed layout.
+            corpus = to_v1_contract(corpus)
         if edges == (cfg.seq_len,):
             # Unbucketed path: one bucket at full seq_len.
             buckets = {cfg.seq_len: corpus}
@@ -920,6 +964,10 @@ def main(argv: list[str] | None = None) -> int:
             seed=VAL_DATA_SEED, conditioning=cfg.conditioning,
             mate_boost=cfg.mate_boost, discard_ply_limit=cfg.discard_ply_limit,
         )
+        if cfg.arch == "factored-v1":
+            # Same v1-contract transform as the training stream so the
+            # held-out metrics measure the layout the model actually sees.
+            val_corpus = to_v1_contract(val_corpus)
     # legality late-ply threshold: explicit override, else seq_len // 2 (v1
     # `legality_late_ply` default).
     legality_late_ply = (

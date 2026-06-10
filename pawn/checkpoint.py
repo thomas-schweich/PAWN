@@ -91,6 +91,7 @@ from pawn._sentinel import (
     write_sentinel,
 )
 from pawn.config import MASK_VERSION, ModelConfig
+from pawn.factored_model import FACTORED_SAVED_FIELDS, FactoredPAWNModel
 from pawn.model import (
     EffectiveCallable,
     PAWNModel,
@@ -121,6 +122,7 @@ __all__ = [
     "load_model",
     "load_eval_model",
     "load_model_config",
+    "require_uniform",
     "save_adapter_resume_state",
     "load_adapter_resume_state",
     "find_best_adapter_step",
@@ -162,17 +164,24 @@ ADAPTER_SAFETENSORS: Final[str] = "adapter.safetensors"
 # ---------------------------------------------------------------------------
 
 
-def _model_to_tensor_dict(model: PAWNModel) -> dict[str, np.ndarray]:
-    """Flatten a :class:`PAWNModel` into a name → numpy-array dict for
-    safetensors.
+def _model_to_tensor_dict(
+    model: PAWNModel | FactoredPAWNModel,
+) -> dict[str, np.ndarray]:
+    """Flatten a model into a name → numpy-array dict for safetensors.
 
     Keys are the dotted paths from :func:`saved_fields` for the model's
-    ``tie_embeddings`` setting (tied models omit ``lm_head``). Arrays are
-    materialised via :func:`numpy.asarray` (block until device transfer
-    completes).
+    ``tie_embeddings`` setting (tied models omit ``lm_head``), or
+    :data:`pawn.factored_model.FACTORED_SAVED_FIELDS` for the factored
+    (v1-architecture) model. Arrays are materialised via
+    :func:`numpy.asarray` (block until device transfer completes).
     """
+    field_names = (
+        FACTORED_SAVED_FIELDS
+        if isinstance(model, FactoredPAWNModel)
+        else saved_fields(model.cfg.tie_embeddings)
+    )
     tensors: dict[str, np.ndarray] = {}
-    for path in saved_fields(model.cfg.tie_embeddings):
+    for path in field_names:
         node: Any = model
         for piece in path.split("."):
             node = getattr(node, piece)
@@ -183,22 +192,34 @@ def _model_to_tensor_dict(model: PAWNModel) -> dict[str, np.ndarray]:
 def _tensor_dict_to_model(
     tensors: dict[str, np.ndarray],
     cfg: ModelConfig,
-) -> PAWNModel:
-    """Rebuild a :class:`PAWNModel` from its loaded tensors + config.
+) -> PAWNModel | FactoredPAWNModel:
+    """Rebuild a model from its loaded tensors + config.
 
-    Validates that every name in :func:`saved_fields` (for ``cfg``'s
-    ``tie_embeddings``) is present in the dict, and that every tensor's
-    shape matches the expected ``cfg``-derived shape (catches a checkpoint
-    produced by a model of a different size before the array is silently
-    broadcast somewhere).
+    Validates that every name in the config's save schema
+    (:func:`saved_fields` for the uniform architecture,
+    :data:`FACTORED_SAVED_FIELDS` when ``cfg.factored_embeddings``) is
+    present in the dict, and that every tensor's shape matches the expected
+    ``cfg``-derived shape (catches a checkpoint produced by a model of a
+    different size before the array is silently broadcast somewhere).
 
     Tied↔untied cross-load is a hard error: a tied checkpoint omits
     ``lm_head`` while an untied one includes it, so the missing/extra-tensor
     guards below already fire on a mismatch — but we raise an explicit,
     actionable message first so the failure mode is obvious rather than
-    surfacing as a bare "missing lm_head".
+    surfacing as a bare "missing lm_head". (Factored models are always
+    untied — ``ModelConfig.__post_init__`` rejects the combination — so the
+    tied guard below can never fire for them.)
+
+    Uniform↔factored cross-load is likewise caught structurally: the two
+    schemas differ in their embedding field names (``embed_tokens`` vs
+    ``embed_src``/...), so a config/payload mismatch surfaces via the
+    missing/extra-tensor errors below.
     """
-    expected_fields = saved_fields(cfg.tie_embeddings)
+    expected_fields = (
+        FACTORED_SAVED_FIELDS
+        if cfg.factored_embeddings
+        else saved_fields(cfg.tie_embeddings)
+    )
     saved_set = set(expected_fields)
     tensor_set = set(tensors.keys())
 
@@ -253,6 +274,19 @@ def _tensor_dict_to_model(
         w_up=jnp_at("layers.w_up"),
         w_down=jnp_at("layers.w_down"),
     )
+    if cfg.factored_embeddings:
+        return FactoredPAWNModel(
+            embed_src=jnp_at("embed_src"),
+            embed_dst=jnp_at("embed_dst"),
+            embed_promo=jnp_at("embed_promo"),
+            embed_pad=jnp_at("embed_pad"),
+            embed_outcome=jnp_at("embed_outcome"),
+            layers=layers,
+            final_norm_w=jnp_at("final_norm_w"),
+            lm_head=jnp_at("lm_head"),
+            decomp_table=_build_decomp_table(),
+            cfg=cfg,
+        )
     lm_head = None if cfg.tie_embeddings else jnp_at("lm_head")
     return PAWNModel(
         embed_tokens=jnp_at("embed_tokens"),
@@ -269,17 +303,18 @@ def _expected_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
     to the shape implied by ``cfg``.
 
     Used at load time to refuse a tensor whose shape doesn't match the
-    ``ModelConfig`` we just parsed from ``config.json``. The factored
-    embedding tables (``embed_src/dst/promo``) are gone — the uniform
-    ``embed_tokens[V, d]`` table replaces them, so the 64/64/5 literals
-    no longer appear here. ``lm_head`` is only expected for untied configs.
+    ``ModelConfig`` we just parsed from ``config.json``. For the uniform
+    architecture the single ``embed_tokens[V, d]`` table carries every
+    token and ``lm_head`` is only expected for untied configs; for the
+    factored (v1) architecture (``cfg.factored_embeddings``) the schema
+    swaps in the ``src/dst/promo/pad/outcome`` tables and ``lm_head`` is
+    always present.
     """
     d = cfg.d_model
     d_ff = cfg.d_ff
     L = cfg.n_layers
     V = cfg.vocab_size
     shapes: dict[str, tuple[int, ...]] = {
-        "embed_tokens": (V, d),
         "layers.attn_norm_w": (L, d),
         "layers.wq": (L, d, d),
         "layers.wk": (L, d, d),
@@ -291,6 +326,15 @@ def _expected_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
         "layers.w_down": (L, d_ff, d),
         "final_norm_w": (d,),
     }
+    if cfg.factored_embeddings:
+        shapes["embed_src"] = (64, d)
+        shapes["embed_dst"] = (64, d)
+        shapes["embed_promo"] = (5, d)
+        shapes["embed_pad"] = (d,)
+        shapes["embed_outcome"] = (cfg.n_outcomes, d)
+        shapes["lm_head"] = (d, V)
+        return shapes
+    shapes["embed_tokens"] = (V, d)
     if not cfg.tie_embeddings:
         shapes["lm_head"] = (d, V)
     return shapes
@@ -327,14 +371,20 @@ def _cfg_from_dict(raw: dict[str, Any]) -> ModelConfig:
 
 
 def save_model(
-    model: PAWNModel,
+    model: PAWNModel | FactoredPAWNModel,
     target_dir: Path | str,
     *,
     run_config: dict[str, Any] | None = None,
     optimizer_state: dict[str, np.ndarray] | None = None,
     training_state: dict[str, Any] | None = None,
 ) -> Path:
-    """Atomically write a :class:`PAWNModel` checkpoint to ``target_dir``.
+    """Atomically write a model checkpoint to ``target_dir``.
+
+    Accepts either the uniform :class:`PAWNModel` or the factored
+    :class:`FactoredPAWNModel` — the save schema is selected by the model
+    type and the architecture is recorded via
+    ``ModelConfig.factored_embeddings`` inside ``config.json``, so
+    :func:`load_model` rebuilds the right class without a separate tag.
 
     Returns the final ``target_dir`` :class:`Path`.
 
@@ -426,6 +476,26 @@ def save_model(
     return final
 
 
+def require_uniform(
+    model: PAWNModel | FactoredPAWNModel, context: str
+) -> PAWNModel:
+    """Narrow a loaded model to the uniform :class:`PAWNModel`, or raise.
+
+    The supernet-slicing, adapter, distillation, and parity paths only
+    operate on the uniform architecture; a factored (v1-architecture)
+    checkpoint reaching them is a caller error. This helper turns that
+    into a loud, actionable :class:`TypeError` at the load boundary
+    instead of an attribute error deep inside the consumer.
+    """
+    if not isinstance(model, PAWNModel):
+        raise TypeError(
+            f"{context} requires the uniform PAWNModel; got "
+            f"{type(model).__name__} (factored v1-architecture checkpoints "
+            "are not supported on this path)"
+        )
+    return model
+
+
 def _verify_and_read_config(target_dir: Path | str) -> dict[str, Any]:
     """Verify the sentinel + manifest coverage and return the parsed
     ``config.json`` dict.
@@ -506,8 +576,12 @@ def _require_payloads_in_manifest(
 
 def load_model(
     target_dir: Path | str,
-) -> tuple[PAWNModel, dict[str, Any] | None]:
-    """Verify the sentinel and load a :class:`PAWNModel` from disk.
+) -> tuple[PAWNModel | FactoredPAWNModel, dict[str, Any] | None]:
+    """Verify the sentinel and load a model from disk.
+
+    The concrete class is selected by the saved config's
+    ``factored_embeddings`` flag — :class:`FactoredPAWNModel` for the
+    v1-architecture experiment checkpoints, :class:`PAWNModel` otherwise.
 
     Returns ``(model, run_block)`` — ``run_block`` is the persisted run
     config dict (``config.json``'s ``run`` block) or ``None`` if the
@@ -595,6 +669,17 @@ def load_eval_model(
     if strategy is None or not sidecar.is_file():
         return model, run_block
     assert isinstance(run_block, dict)
+    # Sidecar-bearing adapters (bottleneck / FiLM / retro-bottleneck RoSA)
+    # are only ever trained against the uniform PAWNModel backbone — the
+    # factored (v1-architecture) experiment has no adapter path. A factored
+    # checkpoint with an adapter sidecar is therefore malformed; refuse it
+    # loudly rather than letting the apply_* calls fail on a field mismatch.
+    if isinstance(model, FactoredPAWNModel):
+        raise CheckpointIntegrityError(
+            f"checkpoint at {directory} pairs a factored_embeddings model "
+            f"with an {ADAPTER_SAFETENSORS} sidecar (strategy={strategy!r}); "
+            "adapters are only supported on the uniform PAWNModel backbone"
+        )
 
     if strategy == "bottleneck":
         from pawn.adapters.bottleneck import (

@@ -545,6 +545,18 @@ class PretrainConfig(BaseRunConfig):
     run_type: Literal["pretrain"] = "pretrain"
     variant: VariantName = "base"
 
+    # Model architecture. ``"v2"`` (default) is the uniform-embedding
+    # supernet path. ``"factored-v1"`` trains the v1-architecture
+    # :class:`pawn.factored_model.FactoredPAWNModel`
+    # (``pawn.config.FACTORED_V1_LARGE`` at ``supernet="production"``,
+    # ``TINY_FACTORED`` at ``supernet="tiny"``) under the same trainer —
+    # the LR-schedule-confound experiment: same recipe, only the
+    # architecture differs. The factored arch trains as a single
+    # standalone variant (no supernet slicing) under v1's native
+    # bare-moves contract (the corpus is passed through
+    # :func:`pawn.corpus.to_v1_contract`).
+    arch: Literal["v2", "factored-v1"] = "v2"
+
     # Pretrain-specific
     accumulation_steps: int = 1
     checkpoint_interval: int = 5000
@@ -615,6 +627,33 @@ class PretrainConfig(BaseRunConfig):
             raise ValueError(
                 f"patience must be positive when set, got {self.patience}"
             )
+        if self.arch == "factored-v1":
+            # The factored model has no BOS/NULL/control rows (vocab 1980),
+            # so a conditioning prefix (whose slots carry those tokens)
+            # cannot be embedded. `to_v1_contract` likewise only handles
+            # the C=1 layout.
+            if self.conditioning:
+                raise ValueError(
+                    "arch='factored-v1' requires conditioning=[] — the v1 "
+                    "architecture has no BOS/NULL/control vocabulary rows "
+                    f"to embed a prefix with (got {self.conditioning!r})"
+                )
+            # No supernet slicing exists for the factored arch; it always
+            # trains as the single standalone model. Reject an explicit
+            # variant subset so the flag can't silently no-op.
+            if self.variants is not None and self.variants != ("large",):
+                raise ValueError(
+                    "arch='factored-v1' trains a single standalone model; "
+                    "--variants is not applicable (got "
+                    f"{list(self.variants)!r})"
+                )
+            if self.stochastic_variants:
+                # Harmless with a single variant (no non-supernet variants
+                # to sample) but explicit is better: the flag defaults True
+                # for the v2 path, so just neutralise rather than reject.
+                # (BaseRunConfig is not frozen — plain assignment is the
+                # pydantic-v2 after-validator pattern.)
+                self.stochastic_variants = False
         if self.patience is not None and self.val_every is None:
             raise ValueError(
                 "patience requires val_every (early stopping keys on the "

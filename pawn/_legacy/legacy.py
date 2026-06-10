@@ -6,7 +6,7 @@ measurements: :func:`load_v1_factored_model` reads a v1 torch
 transposes linear weights from ``(out, in)`` to JAX's ``(in, out)``
 convention, builds a :class:`pawn.config.ModelConfig` at the v1
 dimensions (native ``head_dim`` / ``vocab_size``), and assembles the
-factored :class:`pawn._legacy.factored_model.PAWNModel` directly in
+factored :class:`pawn.factored_model.FactoredPAWNModel` directly in
 memory — no disk round-trip / ``save_model`` (the current un-factored
 ``save_model`` can't serialise the factored ``src+dst+promo``
 embedding). The embeddings are **not** un-factored: a v1 model with
@@ -42,11 +42,8 @@ from pawn.config import (
     VOCAB_SIZE,
     ModelConfig,
 )
-from pawn._legacy.factored_model import (
-    PAWNModel,
-    TransformerLayer,
-    _build_decomp_table,
-)
+from pawn.factored_model import FactoredPAWNModel
+from pawn.model import TransformerLayer, _build_decomp_table
 
 __all__ = [
     "load_v1_factored_model",
@@ -174,8 +171,8 @@ def _transpose_linear(weight: np.ndarray) -> np.ndarray:
 
 def _build_v2_model(
     state: dict[str, np.ndarray], cfg: ModelConfig
-) -> PAWNModel:
-    """Assemble a v2 PAWNModel from the v1 state dict.
+) -> FactoredPAWNModel:
+    """Assemble a FactoredPAWNModel from the v1 state dict.
 
     Per-layer fields are stacked + (where needed) transposed. The
     decomp_table is rebuilt from the engine vocab; RoPE phase tables
@@ -207,7 +204,7 @@ def _build_v2_model(
     )
 
     # Embeddings + final norm + lm_head.
-    return PAWNModel(
+    return FactoredPAWNModel(
         embed_src=jnp.asarray(state["embed.src_embed.weight"]),
         embed_dst=jnp.asarray(state["embed.dst_embed.weight"]),
         embed_promo=jnp.asarray(state["embed.promo_embed.weight"]),
@@ -221,7 +218,7 @@ def _build_v2_model(
     )
 
 
-def load_v1_factored_model(source: str) -> tuple[PAWNModel, ModelConfig]:
+def load_v1_factored_model(source: str) -> tuple[FactoredPAWNModel, ModelConfig]:
     """Download a v1 PyTorch checkpoint and build the in-memory factored JAX
     model — no disk round-trip / ``save_model`` (the current un-factored
     ``save_model`` can't serialise the factored model).

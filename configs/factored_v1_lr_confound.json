@@ -1,0 +1,37 @@
+{
+  "run_type": "pretrain",
+  "arch": "factored-v1",
+  "supernet": "production",
+
+  "total_steps": 400000,
+  "batch_size": 32,
+  "accumulation_steps": 2,
+  "seq_len": 512,
+  "k": 50,
+
+  "lr": 0.0003,
+  "lr_schedule": "infinite",
+  "warmup_frac": 0.05,
+  "decay_frac": 0.1,
+  "cooldown_frac": 0.2,
+  "stable_lr_ratio": 0.5,
+  "wsd_decay_shape": "linear",
+  "optimizer": "adamw",
+  "weight_decay": 0.0,
+  "max_grad_norm": 1.0,
+
+  "amp_dtype": "bfloat16",
+  "use_sdpa": false,
+  "use_flash": false,
+
+  "conditioning": [],
+  "mate_boost": 0.0,
+  "discard_ply_limit": false,
+
+  "val_every": 10000,
+  "val_games": 2048,
+  "checkpoint_interval": 10000,
+  "log_interval": 100,
+
+  "local_checkpoints": true
+}

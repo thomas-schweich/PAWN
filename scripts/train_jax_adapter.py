@@ -42,7 +42,7 @@ from pawn.adapters import (
     SpecializedCLMConfig as AdapterSpecializedCLMConfig,
     UnfreezeConfig,
 )
-from pawn.checkpoint import resolve_checkpoint_source, save_model
+from pawn.checkpoint import resolve_checkpoint_source, save_model, require_uniform
 from pawn.config import SUPERNET, TINY_SUPERNET, VARIANTS, TINY_VARIANTS
 from pawn.corpus import Corpus, generate_corpus, legal_mask_for_games
 from pawn.jax_setup import require_accelerator, resolve_device, setup_jax_caching
@@ -709,7 +709,8 @@ def main(argv: list[str] | None = None) -> int:
             conditioning_to_C,
         )
         ckpt_dir = resolve_checkpoint_source(cfg.checkpoint)
-        backbone, backbone_run_block = load_model(ckpt_dir)
+        backbone_loaded, backbone_run_block = load_model(ckpt_dir)
+        backbone = require_uniform(backbone_loaded, "adapter training")
         # Load-time C-mismatch guard (Phase-A spec Chunk 4): the corpus is
         # built below with `cfg.conditioning`, so a backbone trained under a
         # different conditioning width would place every move at a different
@@ -783,7 +784,8 @@ def main(argv: list[str] | None = None) -> int:
         # deserialise templates for the resume sidecar. Read the folded
         # `model.safetensors` separately for the run block + the
         # wrapper-adapter (bottleneck/FiLM) frozen-backbone restore.
-        loaded_backbone, backbone_run_block = load_model(ckpt_dir)
+        loaded_backbone_any, backbone_run_block = load_model(ckpt_dir)
+        loaded_backbone = require_uniform(loaded_backbone_any, "adapter resume")
         # Same load-time C-mismatch guard as the initial-load path: the
         # corpus below is built with `cfg.conditioning`, so the resumed
         # backbone's persisted conditioning must agree or moves drift.

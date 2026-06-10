@@ -37,6 +37,7 @@ which positions count toward per-move accuracy vs v1.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -68,6 +69,7 @@ __all__ = [
     "assert_conditioning_C",
     "conditioning_from_run_block",
     "legal_mask_for_games",
+    "to_v1_contract",
 ]
 
 
@@ -467,6 +469,48 @@ def build_loss_mask(
     # capped==0 so hi == lo-1 < lo and the mask is all-False for that row.
     hi = (lo + capped - 1)[:, None]
     return (seq_positions >= lo) & (seq_positions <= hi)
+
+
+def to_v1_contract(corpus: Corpus) -> Corpus:
+    """Adapt a v2-packed ``[BOS, m1, m2, …]`` corpus to v1's native
+    bare-moves contract: slot 0 becomes a **masked, unsupervised PAD**.
+
+    v1-architecture models (``factored_embeddings``, vocab 1980) have no
+    BOS row — ``BOS_TOKEN = 1980`` is out-of-vocab for them — and v1 never
+    supervised the first move (its bare ``[m_1, m_2, …]`` sequences have no
+    slot whose target is ``m_1``). Setting ``tokens[:, 0] = PAD`` with
+    ``attn_mask[:, 0] = loss_mask[:, 0] = False`` reproduces that contract
+    exactly while keeping the v2 pipeline's ``C = 1`` slot alignment: real
+    moves then attend causally only to real moves, and RoPE being relative
+    makes the +1 position shift invariant.
+
+    ``targets`` are untouched (they only depend on ``tokens[:, 1:]``, which
+    the transform doesn't modify), and ``outcome_offset`` stays 1 — moves
+    still *live* at slots ``[1, …)``.
+
+    Validated against the published v1 checkpoints: a converted v1-large
+    evaluated through this transform reproduces its published 99.9990%
+    per-move legal rate and 99.76% teacher-forced game-completion
+    (``scripts/eval_v1_legality.py``).
+
+    Requires the corpus to be at prefix width ``C = 1`` (no conditioning
+    slots) — a wider prefix would leave out-of-vocab control tokens at
+    slots ``1..C-1``.
+    """
+    if not bool(np.all(corpus.outcome_offset == 1)):
+        raise ValueError(
+            "to_v1_contract requires a C=1 corpus (conditioning=()); got "
+            f"outcome_offset values {np.unique(corpus.outcome_offset)!r}"
+        )
+    tokens = corpus.tokens.copy()
+    tokens[:, 0] = PAD_TOKEN
+    attn = corpus.attn_mask.copy()
+    attn[:, 0] = False
+    loss = corpus.loss_mask.copy()
+    loss[:, 0] = False
+    return dataclasses.replace(
+        corpus, tokens=tokens, attn_mask=attn, loss_mask=loss
+    )
 
 
 # ---------------------------------------------------------------------------
