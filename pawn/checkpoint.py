@@ -181,9 +181,22 @@ def _model_to_tensor_dict(
     (v1-architecture) model. Arrays are materialised via
     :func:`numpy.asarray` (block until device transfer completes).
     """
+    # Class ↔ config consistency: the schema is selected by the runtime
+    # class but config.json records cfg.factored_embeddings, and load_model
+    # dispatches on the latter. A mismatched pair (e.g. a hand-constructed
+    # uniform PAWNModel carrying a factored config) would write an
+    # unloadable checkpoint — refuse at save time (round-4 review, codex
+    # P2; init_model/init_factored_model also guard at construction).
+    is_factored_cls = isinstance(model, FactoredPAWNModel)
+    if is_factored_cls != model.cfg.factored_embeddings:
+        raise CheckpointIntegrityError(
+            f"model class {type(model).__name__} is inconsistent with its "
+            f"config (factored_embeddings={model.cfg.factored_embeddings}); "
+            "refusing to write a checkpoint that load_model cannot read"
+        )
     field_names = (
         FACTORED_SAVED_FIELDS
-        if isinstance(model, FactoredPAWNModel)
+        if is_factored_cls
         else saved_fields(model.cfg.tie_embeddings)
     )
     tensors: dict[str, np.ndarray] = {}

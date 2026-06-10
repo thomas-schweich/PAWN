@@ -155,6 +155,30 @@ def test_init_factored_model_rejects_uniform_cfg() -> None:
         init_factored_model(TINY_SUPERNET, key=0)
 
 
+def test_init_model_rejects_factored_cfg() -> None:
+    """Symmetric guard: a uniform PAWNModel carrying a factored config
+    would write an unloadable checkpoint (schema from class, flag from
+    config) — both construction and save refuse (round-4 review, codex)."""
+    with pytest.raises(ValueError, match="factored_embeddings"):
+        init_model(TINY_FACTORED, key=0)
+
+
+def test_save_model_rejects_class_config_mismatch(tmp_path) -> None:
+    import dataclasses as _dc
+
+    from pawn.checkpoint import CheckpointIntegrityError as _CIE
+
+    uniform = init_model(TINY_SUPERNET, key=0)
+    lying_cfg = _dc.replace(
+        TINY_SUPERNET, tie_embeddings=False, factored_embeddings=True
+    )
+    # cfg is a static eqx field — swap it via dataclasses.replace on the
+    # module (eqx.Modules are frozen dataclasses).
+    lying = _dc.replace(uniform, cfg=lying_cfg)
+    with pytest.raises(_CIE, match="inconsistent"):
+        save_model(lying, tmp_path / "step_00000001")
+
+
 def test_factored_forward_shape_and_dtype() -> None:
     m = _tiny_factored()
     batch = _v1_batch()

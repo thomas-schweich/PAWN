@@ -1391,7 +1391,20 @@ def init_model(cfg: ModelConfig, key: jax.Array | int) -> PAWNModel:
     the model — :meth:`PAWNModel.__call__` recomputes them per forward
     pass from ``cfg.head_dim`` / ``cfg.max_seq_len`` / ``cfg.rope_base``,
     and JIT constant-folds them when ``cfg`` is static.
+
+    Rejects ``cfg.factored_embeddings`` configs — those belong to
+    :func:`pawn.factored_model.init_factored_model` (the symmetric guard).
+    A uniform model carrying a factored config would lie to every
+    cfg-driven dispatch downstream: ``save_model`` selects the tensor
+    schema from the runtime class but records the config's flag, so the
+    written checkpoint would be unloadable (round-4 review, codex P2).
     """
+    if cfg.factored_embeddings:
+        raise ValueError(
+            "init_model builds the uniform architecture; cfg has "
+            "factored_embeddings=True — use "
+            "pawn.factored_model.init_factored_model for factored configs"
+        )
     if isinstance(key, int):
         key = jax.random.key(key)
     sub = jax.random.split(key, 9)

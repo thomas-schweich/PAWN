@@ -312,6 +312,16 @@ class FactoredPAWNModel(eqx.Module):
         :meth:`pawn.model.PAWNModel.forward_with_cache` (same math
         invariant vs. the full forward, same plain-attention-only cache
         path); only ``_embed`` and the head weight differ.
+
+        Head-matmul dtype (reviewed and adjudicated, rounds 1/2/4): under
+        a low-precision ``compute_dtype`` the head runs in compute dtype
+        here — *unlike* :meth:`__call__`'s always-fp32 head — because that
+        is exactly what the uniform model's cached path does
+        (``PAWNModel.forward_with_cache`` → ``_head_weight(compute_dtype)``)
+        and cross-architecture parity is this experiment's invariant. The
+        fp32-head rule is a TRAINING-stability recipe; the cached path is
+        generation-only, and the eval/AR harnesses drive it at the fp32
+        default (``compute_dtype=None``), where the two recipes coincide.
         """
         del use_sdpa  # cached path is plain-attention only (API parity).
         T_new = input_ids.shape[-1]  # noqa: N806
