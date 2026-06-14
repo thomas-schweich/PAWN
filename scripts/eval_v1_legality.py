@@ -6,15 +6,13 @@ round-trip) and runs per-move legal rate + compound (game-completion) legality
 under v1's NATIVE sequence contract.
 
 v1 (``prepend_outcome=False``) trained on bare ``[m_1, m_2, …]`` sequences — no
-BOS, no prefix (C=0) — whereas the v2 corpus always prepends ``[BOS][cond…]``
-(C≥1, BOS=1980 which is out-of-vocab for v1). We bridge that by taking a v2
-corpus and turning slot 0 into a **masked, unsupervised PAD**: real moves then
-attend causally only to real moves (RoPE is relative, so the +1 position shift
-is invariant), reproducing v1's exact context while keeping the v2 eval
-pipeline's C=1 alignment intact.
+BOS, no prefix (C=0). We pack that contract directly via
+:func:`pawn.corpus.generate_corpus(bare_moves=True)` (no BOS, strictly
+right-padded, v1 loss mask: first move unsupervised, end-of-game PAD
+supervised) — the same contract the factored arch now trains under.
 
 Validated: converted ``thomas-schweich/pawn-large`` reproduces its published
-99.9990% per-move legal / 99.76% game-completion under this transform.
+99.9990% per-move legal / 99.76% game-completion under this contract.
 """
 from __future__ import annotations
 
@@ -22,7 +20,7 @@ import argparse
 import json
 
 from pawn._legacy.legacy import load_v1_factored_model
-from pawn.corpus import generate_corpus, to_v1_contract
+from pawn.corpus import generate_corpus
 from pawn.eval import compute_compound_legality, compute_val_metrics
 
 
@@ -41,11 +39,11 @@ def main() -> None:
     args = ap.parse_args()
 
     model, cfg = load_v1_factored_model(args.checkpoint)
-    corpus = generate_corpus(
+    # v1's native C=0 bare-moves contract, packed directly (no BOS).
+    v1c = generate_corpus(
         n_games=args.n_games, max_ply=args.max_ply, seq_len=args.seq_len,
-        seed=args.seed, conditioning=(),
+        seed=args.seed, conditioning=(), bare_moves=True,
     )
-    v1c = to_v1_contract(corpus)
     vm = compute_val_metrics(
         model, v1c, batch_size=args.batch_size, min_eval_ply=args.min_eval_ply,
     )

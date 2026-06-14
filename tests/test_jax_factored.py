@@ -47,7 +47,7 @@ from pawn.config import (
 from pawn.corpus import generate_corpus, to_v1_contract
 from pawn.factored_model import FactoredPAWNModel, init_factored_model
 from pawn.model import PAWNModel, init_model
-from pawn.run_config import PretrainConfig
+from pawn.run_config import PretrainConfig, VariantName
 from pawn.trainer import (
     Batch,
     TrainState,
@@ -71,11 +71,13 @@ def _tiny_factored() -> FactoredPAWNModel:
 
 
 def _v1_batch(batch_size: int = 4, seq_len: int = 64) -> Batch:
+    # Native C=0 bare-moves contract — the layout the factored arch trains
+    # and evals under (no BOS, strictly right-padded).
     corpus = generate_corpus(
         n_games=batch_size, max_ply=seq_len, seq_len=seq_len, seed=0,
-        conditioning=(),
+        conditioning=(), bare_moves=True,
     )
-    return slice_batch(to_v1_contract(corpus), np.arange(batch_size))
+    return slice_batch(corpus, np.arange(batch_size))
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +119,8 @@ def test_pretrain_config_factored_guards() -> None:
     # explicit variant selections are not applicable — including
     # ("large",), which names the UNIFORM supernet, not the factored
     # config (round-2 review: an earlier carve-out let it no-op silently).
-    for variants in (("small",), ("large",)):
+    bad_variants: list[tuple[VariantName, ...]] = [("small",), ("large",)]
+    for variants in bad_variants:
         with pytest.raises(ValueError, match="variants"):
             PretrainConfig(
                 run_type="pretrain", total_steps=10, arch="factored-v1",
@@ -247,6 +250,72 @@ def test_to_v1_contract_rejects_wider_prefix() -> None:
     )
     with pytest.raises(ValueError, match="C=1"):
         to_v1_contract(corpus)
+
+
+# ---------------------------------------------------------------------------
+# Native C=0 bare-moves packing (the contract the factored arch trains under)
+# ---------------------------------------------------------------------------
+
+
+def test_bare_moves_packing_contract() -> None:
+    """generate_corpus(bare_moves=True) = v1's native C=0 contract: no BOS,
+    strictly right-padded (flash-valid), all tokens in [0, 1980)."""
+    corpus = generate_corpus(
+        n_games=16, max_ply=48, seq_len=64, seed=5, conditioning=(),
+        bare_moves=True,
+    )
+    # C=0 everywhere.
+    assert (corpus.outcome_offset == 0).all()
+    # No BOS / out-of-vocab token anywhere.
+    assert int(corpus.tokens.max()) < V1_VOCAB_SIZE
+    for r in range(len(corpus.tokens)):
+        L = int(corpus.game_lengths[r])
+        if L == 0:
+            continue
+        # Slot 0 is a real move (an action id), NOT a BOS or PAD.
+        assert int(corpus.tokens[r, 0]) < NUM_ACTIONS
+        # Strictly right-padded: attn mask is monotone non-increasing (no
+        # interior/leading PAD) — the invariant the Pallas flash path needs.
+        attn = corpus.attn_mask[r].astype(int)
+        assert (np.diff(attn) <= 0).all()
+        assert int(attn.sum()) == min(L, 64)
+
+
+def test_bare_moves_loss_mask_is_v1_convention() -> None:
+    """v1 bare-moves mask: first move UNsupervised, end-of-game PAD slot
+    SUPERVISED — the mirror image of the uniform v2 mask. Pin both edges."""
+    corpus = generate_corpus(
+        n_games=32, max_ply=40, seq_len=64, seed=7, conditioning=(),
+        bare_moves=True,
+    )
+    for r in range(len(corpus.tokens)):
+        L = int(corpus.game_lengths[r])
+        if L == 0 or L >= 64:
+            continue  # only fitting games have a clean end-PAD slot
+        sup = np.where(corpus.loss_mask[r])[0]
+        # Supervised positions are exactly [0 .. L-1].
+        np.testing.assert_array_equal(sup, np.arange(L))
+        # The first move m1 (token at slot 0) is never a TARGET — no slot
+        # predicts it (v1 "first move unsupervised").
+        # The last supervised slot (L-1) predicts the end-of-game PAD.
+        assert int(corpus.targets[r, L - 1]) == PAD_TOKEN
+        # And m1 itself sits at an unsupervised-as-target position only via
+        # being slot 0's input — confirm slot L (first PAD) is NOT supervised.
+        assert not corpus.loss_mask[r, L]
+
+
+def test_build_loss_mask_bare_truncated_game() -> None:
+    """A game that fills the buffer (L >= seq_len) must NOT supervise its
+    final slot (it would predict a shifted-in PAD while the game continues),
+    so the supervised count is seq_len-1, not seq_len."""
+    from pawn.corpus import build_loss_mask_bare
+
+    gl = np.array([8, 64, 100], dtype=np.int32)  # fits, exactly-full, truncated
+    mask = build_loss_mask_bare(gl, seq_len=64)
+    assert int(mask[0].sum()) == 8       # fitting: [0..7]
+    assert int(mask[1].sum()) == 63      # exactly full: [0..62]
+    assert int(mask[2].sum()) == 63      # truncated: [0..62]
+    assert not mask[1, 63] and not mask[2, 63]  # final slot excluded
 
 
 # ---------------------------------------------------------------------------
@@ -443,20 +512,39 @@ def test_factored_train_step_with_accumulation() -> None:
     )
 
 
-def test_factored_rejects_use_flash() -> None:
-    """Pallas flash drops the PAD mask (right-pad invariant); the v1
-    contract's masked slot-0 LEADING pad violates it, so the factored model
-    must hard-reject rather than silently attend to it (round-1 review,
-    codex P2). The config layer neutralises the default-True flag too."""
-    m = _tiny_factored()
-    batch = _v1_batch(batch_size=2, seq_len=32)
-    with pytest.raises(ValueError, match="use_flash"):
-        m(batch.tokens, batch.attn_mask, use_flash=True)
+def test_factored_use_flash_allowed_for_native_c0() -> None:
+    """Flash is now ENABLED for the factored arch: its native C=0 bare-moves
+    contract (generate_corpus(bare_moves=True)) is strictly right-padded, so
+    the Pallas right-pad invariant holds. The config must NOT neutralise the
+    default-True flag any more, and the model must not reject it (the call
+    runs the flash kernel on GPU, or the plain path on CPU — either way no
+    ValueError)."""
     cfg = PretrainConfig(
         run_type="pretrain", total_steps=10, arch="factored-v1",
         local_checkpoints=True,
     )
-    assert cfg.use_flash is False  # neutralised from the default True
+    assert cfg.use_flash is True  # default preserved, not neutralised
+    # The model accepts use_flash without raising (head_dim 48 → padded to
+    # 64 by the kernel). On CPU the trunk's flash path falls back to plain.
+    m = _tiny_factored()
+    batch = _v1_batch(batch_size=2, seq_len=32)
+    logits = m(batch.tokens, batch.attn_mask, use_flash=True)
+    assert logits.shape == (2, 32, V1_VOCAB_SIZE)
+    assert bool(jnp.isfinite(logits).all())
+
+
+def test_factored_flash_matches_plain_within_fp32_noise() -> None:
+    """On GPU, the factored model's flash forward is algebraically equivalent
+    to the plain materialised path within fp32 noise — the correctness gate
+    for training the factored arch with a fused kernel. Skipped on CPU."""
+    if jax.default_backend() != "gpu":
+        pytest.skip("Pallas flash attention requires a GPU backend")
+    m = _tiny_factored()
+    batch = _v1_batch(batch_size=2, seq_len=32)
+    plain = m(batch.tokens, batch.attn_mask)
+    flash = m(batch.tokens, batch.attn_mask, use_flash=True)
+    assert plain.shape == flash.shape
+    assert jnp.allclose(plain, flash, atol=1e-3, rtol=1e-3)
 
 
 def test_converted_v1_model_roundtrips_through_v2_checkpoint(tmp_path) -> None:
@@ -614,7 +702,14 @@ def test_eval_jax_scores_factored_checkpoint(tmp_path) -> None:
 
 def test_factored_targets_never_out_of_vocab() -> None:
     batch = _v1_batch(batch_size=16, seq_len=128)
-    sup = np.asarray(batch.loss_mask)
     tgt = np.asarray(batch.targets)
-    assert tgt[sup].max() < NUM_ACTIONS  # supervised targets are moves only
-    assert tgt.max() <= PAD_TOKEN  # nothing above PAD anywhere (no BOS)
+    # No BOS (1980) / NULL / reserved leaks anywhere — every token and target
+    # is in the factored vocab [0, 1980); nothing exceeds PAD.
+    assert int(np.asarray(batch.tokens).max()) < V1_VOCAB_SIZE
+    assert int(tgt.max()) <= PAD_TOKEN
+    # Supervised targets are real moves OR the end-of-game PAD: v1's bare
+    # contract supervises the predict-PAD ("stop") slot, so PAD is an
+    # expected supervised target here (it is excluded from the move metrics
+    # by pawn.eval, not from the loss mask).
+    sup = np.asarray(batch.loss_mask)
+    assert int(tgt[sup].max()) <= PAD_TOKEN

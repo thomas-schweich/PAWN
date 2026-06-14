@@ -150,6 +150,17 @@ class FactoredPAWNModel(eqx.Module):
         Returns logits of shape ``(batch, seq, vocab_size)`` — fp32, with
         the head matmul ALWAYS accumulated in fp32 (the v2 stability
         recipe), even under bf16 AMP.
+
+        ``use_flash`` behaves exactly as on :class:`pawn.model.PAWNModel`:
+        the Pallas path drops the PAD mask and relies on the engine's
+        **strict right-pad invariant** (causal attention already keeps real
+        tokens from seeing trailing PAD). The factored model's native v1
+        contract — :func:`pawn.corpus.generate_corpus(bare_moves=True)`,
+        C=0, no BOS — is strictly right-padded, so flash is valid (this is
+        how the factored arch trains with a fused kernel, like v1 did). Do
+        NOT pass ``use_flash=True`` with the masked-C1 eval transform
+        (:func:`pawn.corpus.to_v1_contract`), whose slot-0 PAD is a *leading*
+        pad — use the plain path there (eval already runs plain/fp32).
         """
         T = input_ids.shape[-1]  # noqa: N806
         if T > self.cfg.max_seq_len:
@@ -157,40 +168,30 @@ class FactoredPAWNModel(eqx.Module):
                 f"sequence length {T} exceeds cfg.max_seq_len "
                 f"{self.cfg.max_seq_len}"
             )
-        if use_flash:
-            # Pallas flash drops the PAD mask entirely (safe only under the
-            # strict right-pad invariant — see pawn.model._pallas_attn). The
-            # factored model's v1 bare-moves contract places a masked PAD at
-            # slot 0 (a LEADING pad), which flash would let every real
-            # position attend to — a silent contract violation. Hard-reject
-            # rather than compute the wrong thing (round-1 review, codex P2;
-            # PretrainConfig neutralises the flag upstream too).
-            raise ValueError(
-                "FactoredPAWNModel does not support use_flash=True: the v1 "
-                "bare-moves contract's masked slot-0 PAD violates the "
-                "right-pad invariant the Pallas path relies on. Use the "
-                "plain path (use_flash=False)."
-            )
         with jax.named_scope("embed"):
             x = self._embed(input_ids)
             if compute_dtype is not None:
                 x = x.astype(compute_dtype)
         rope_cos, rope_sin = _build_rope(self.cfg.head_dim, T, self.cfg.rope_base)
-        # The flash path was hard-rejected above, so the materialised mask
-        # is built unconditionally (plain + SDPA paths both consume it).
-        causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-        mask: Bool[Array, "B 1 T T"]
-        if attention_mask is None:
-            mask = causal[None, None, :, :]
+        # The materialised mask is only consumed by the plain and SDPA
+        # paths; the Pallas-flash path derives segment_ids from
+        # ``attention_mask`` and ignores ``mask`` (see pawn.model._pallas_attn).
+        mask: Bool[Array, "B 1 T T"] | None
+        if use_flash:
+            mask = None
         else:
-            pad = attention_mask.astype(jnp.bool_)[:, None, None, :]
-            mask = causal[None, None, :, :] & pad
+            causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+            if attention_mask is None:
+                mask = causal[None, None, :, :]
+            else:
+                pad = attention_mask.astype(jnp.bool_)[:, None, None, :]
+                mask = causal[None, None, :, :] & pad
         with jax.named_scope("transformer_layers"):
             x = _run_layers_impl(
                 self.layers, self.cfg, x, rope_cos, rope_sin, mask,
                 attention_mask, compute_dtype,
                 attn_hook=attn_hook, ffn_hook=ffn_hook, hook_data=hook_data,
-                use_sdpa=use_sdpa, use_flash=False,
+                use_sdpa=use_sdpa, use_flash=use_flash,
             )
         with jax.named_scope("final_norm"):
             x = _rmsnorm(x, self.final_norm_w)

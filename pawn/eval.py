@@ -446,11 +446,21 @@ def _legal_token_grid(corpus: Corpus) -> np.ndarray:
         chess_engine.compute_legal_token_masks(move_ids, game_lengths, 1980),
         dtype=np.bool_,
     )
-    # Shift ply p into sequence slot t = p + (C - 1) and keep only the
-    # move-token columns.
+    # Ply ``p``'s legal set aligns to sequence slot ``t = p + (C - 1)`` (slot
+    # t predicts ply p's move) and we keep only the move-token columns.
+    # ``shift = C - 1`` is ``-1`` for the bare C=0 contract: ply 0 (the first
+    # move) is predicted by NO slot — v1's "first move unsupervised" — so its
+    # mask is dropped, and plies ``>= 1`` land at slots ``>= 0``. Handle the
+    # negative shift explicitly (a raw ``grid[:, -1:...]`` would wrap to an
+    # empty slice).
     shift = C - 1
-    p_count = min(dense.shape[1], seq_len - shift)
-    grid[:, shift : shift + p_count, :] = dense[:, :p_count, :NUM_ACTIONS]
+    src_start = max(0, -shift)        # drop plies mapping to negative slots
+    dst_start = max(0, shift)
+    count = min(dense.shape[1] - src_start, seq_len - dst_start)
+    if count > 0:
+        grid[:, dst_start : dst_start + count, :] = (
+            dense[:, src_start : src_start + count, :NUM_ACTIONS]
+        )
     return grid
 
 
@@ -530,6 +540,13 @@ def compute_val_metrics(
         targets = jnp.asarray(corpus.targets[start:end])
         attn = jnp.asarray(corpus.attn_mask[start:end])
         loss = jnp.asarray(corpus.loss_mask[start:end])
+        # Restrict the supervised mask to MOVE-prediction slots. v1's bare
+        # C=0 contract also supervises the end-of-game predict-PAD slot
+        # (target = PAD, no legal moves) — it's a "when to stop" signal, not
+        # a move, so exclude it from every move metric (loss / top-k /
+        # legality). No-op for the C>=1 layout, whose supervised targets are
+        # all real moves.
+        loss = loss & (targets < NUM_ACTIONS)
         legal = jnp.asarray(legal_grid[start:end])
         late_b = jnp.broadcast_to(late_pos, loss.shape) & loss
         # Overall metrics gate on the MAIA opening-skip; late-legality
@@ -684,6 +701,10 @@ def compute_compound_legality(
         tokens = jnp.asarray(corpus.tokens[start:end])
         attn = jnp.asarray(corpus.attn_mask[start:end])
         loss = jnp.asarray(corpus.loss_mask[start:end])
+        targets = jnp.asarray(corpus.targets[start:end])
+        # Exclude the v1 bare contract's end-of-game predict-PAD slot
+        # (target = PAD, no legal set) — it's not a move. No-op for C>=1.
+        loss = loss & (targets < NUM_ACTIONS)
         legal = jnp.asarray(legal_grid[start:end])
         sup = loss & jnp.broadcast_to(keep_pos, loss.shape)
         complete, evaluated, legal_sup, sup_count = _batch_game_legal(

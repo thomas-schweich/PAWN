@@ -38,7 +38,7 @@ from pawn.config import (
     VARIANTS,
     TINY_VARIANTS,
 )
-from pawn.corpus import Corpus, generate_corpus, to_v1_contract
+from pawn.corpus import Corpus, generate_corpus
 from pawn.eval import compute_val_metrics
 from pawn.jax_setup import require_accelerator, resolve_device, setup_jax_caching
 from pawn.lifecycle import (
@@ -475,12 +475,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         # Arch ↔ checkpoint cross-check (review round-1: type-correctness +
         # test-risk both flagged it). Resuming a factored checkpoint under
-        # --arch v2 would skip to_v1_contract, feeding BOS=1980 into the
-        # factored _embed where `ids >= OUTCOME_TOKEN_BASE` silently maps it
-        # to the last outcome embedding — the run would keep training on a
-        # corrupted layout with no error. The reverse direction (uniform
-        # checkpoint under --arch factored-v1) is equally silent. Make both
-        # directions a load-boundary hard error.
+        # --arch v2 would pack the uniform [BOS][cond…] corpus, feeding
+        # BOS=1980 into the factored _embed where `ids >= OUTCOME_TOKEN_BASE`
+        # silently maps it to the last outcome embedding — the run would keep
+        # training on a corrupted layout with no error. The reverse direction
+        # (uniform checkpoint under --arch factored-v1, fed the bare C=0
+        # corpus) is equally silent. Make both a load-boundary hard error.
         resumed_factored = isinstance(state.model, FactoredPAWNModel)
         if resumed_factored != (cfg.arch == "factored-v1"):
             raise SystemExit(
@@ -702,18 +702,16 @@ def main(argv: list[str] | None = None) -> int:
         batch_size`` games and is shaped ``(K, accum, B, T)`` so the
         trainer's accumulation scan can sum ``accum`` micro-grads per
         optimizer step."""
+        # arch=factored-v1 packs v1's native C=0 bare-moves contract (no
+        # BOS, strictly right-padded so the Pallas flash path is valid, v1
+        # loss mask). The uniform v2 path keeps the [BOS][cond…] layout.
         corpus = generate_corpus(
             n_games=n_games, max_ply=cfg.seq_len, seq_len=cfg.seq_len, seed=seed,
             conditioning=cfg.conditioning,
             mate_boost=cfg.mate_boost,
             discard_ply_limit=cfg.discard_ply_limit,
+            bare_moves=(cfg.arch == "factored-v1"),
         )
-        if cfg.arch == "factored-v1":
-            # v1's native bare-moves contract: slot 0 (BOS in the v2
-            # layout — out-of-vocab for the factored model) becomes a
-            # masked, unsupervised PAD. Applied before bucketing so every
-            # bucket's slices carry the transformed layout.
-            corpus = to_v1_contract(corpus)
         if edges == (cfg.seq_len,):
             # Unbucketed path: one bucket at full seq_len.
             buckets = {cfg.seq_len: corpus}
@@ -975,15 +973,14 @@ def main(argv: list[str] | None = None) -> int:
     val_every = cfg.val_every
     val_corpus: Corpus | None = None
     if val_every is not None:
+        # Same bare-moves contract as the training stream so the held-out
+        # metrics measure the layout the model actually sees.
         val_corpus = generate_corpus(
             n_games=cfg.val_games, max_ply=cfg.seq_len, seq_len=cfg.seq_len,
             seed=VAL_DATA_SEED, conditioning=cfg.conditioning,
             mate_boost=cfg.mate_boost, discard_ply_limit=cfg.discard_ply_limit,
+            bare_moves=(cfg.arch == "factored-v1"),
         )
-        if cfg.arch == "factored-v1":
-            # Same v1-contract transform as the training stream so the
-            # held-out metrics measure the layout the model actually sees.
-            val_corpus = to_v1_contract(val_corpus)
     # legality late-ply threshold: explicit override, else seq_len // 2 (v1
     # `legality_late_ply` default).
     legality_late_ply = (

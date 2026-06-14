@@ -70,6 +70,7 @@ __all__ = [
     "conditioning_from_run_block",
     "legal_mask_for_games",
     "to_v1_contract",
+    "build_loss_mask_bare",
 ]
 
 
@@ -471,18 +472,65 @@ def build_loss_mask(
     return (seq_positions >= lo) & (seq_positions <= hi)
 
 
+def build_loss_mask_bare(
+    game_lengths: NDArray[np.int32],
+    seq_len: int,
+) -> NDArray[np.bool_]:
+    """``(n, seq_len)`` supervised-slot mask for the **v1 bare-moves
+    contract** (``C = 0``, no BOS): ``[m_1, m_2, … m_L, PAD …]``.
+
+    This is v1's original (pre-Chunk-4) convention, the mirror image of
+    :func:`build_loss_mask`: the **first move is never supervised** (no slot
+    has ``m_1`` as its target — there is no position ``-1``) and the
+    **predict-PAD / end-of-game slot IS supervised** (the position holding
+    ``m_L`` predicts the trailing PAD, teaching the model to *stop*). The
+    uniform v2 mask made the opposite choice (first move supervised,
+    predict-PAD excluded); matching v1 here is load-bearing for the
+    factored experiment because end-of-game supervision is exactly what the
+    autoregressive game-completion metric exercises.
+
+    Supervised positions are ``[0 .. min(L, seq_len-1) - 1]``:
+    - For a game that fits (``L < seq_len``): positions ``0 .. L-1`` —
+      predicting ``m_2 … m_L`` (real moves) and, at slot ``L-1``, the
+      legitimate end-of-game PAD.
+    - For a truncated game (``L >= seq_len``): positions ``0 .. seq_len-2``
+      — the final slot predicts a shifted-in PAD while the game actually
+      continues, so it is excluded (no spurious "stop" signal).
+    A zero-length game supervises nothing.
+    """
+    game_lengths = np.asarray(game_lengths, dtype=np.int32)
+    # Last supervised slot: the position holding the last placed move.
+    # ``min(L, seq_len-1)`` caps a truncated game one slot short so its
+    # final (shifted-in PAD) prediction isn't supervised.
+    last = np.minimum(game_lengths, seq_len - 1)
+    seq_positions = np.arange(seq_len, dtype=np.int32)[None, :]
+    hi = (last - 1)[:, None]
+    return (seq_positions >= 0) & (seq_positions <= hi)
+
+
 def to_v1_contract(corpus: Corpus) -> Corpus:
-    """Adapt a v2-packed ``[BOS, m1, m2, …]`` corpus to v1's native
-    bare-moves contract: slot 0 becomes a **masked, unsupervised PAD**.
+    """Adapt a v2-packed ``[BOS, m1, m2, …]`` corpus to the factored model's
+    contract by turning slot 0 into a **masked, unsupervised PAD**.
+
+    Eval-only adapter. The factored arch now *trains* (and evals random
+    games) under the native C=0 bare-moves contract
+    (:func:`generate_corpus(bare_moves=True)`), which is strictly
+    right-padded and flash-compatible. This transform stays for sources
+    that only emit the C=1 ``[BOS][…]`` layout — chiefly the Lichess loader
+    in :mod:`scripts.eval_jax` — where it is logit-equivalent to native C0
+    by RoPE relative-invariance (eval runs plain/fp32, so the resulting
+    *leading* PAD is harmless without flash). It does NOT reproduce v1's
+    loss mask (it leaves the predict-PAD slot unsupervised), so it is for
+    inference, not training.
 
     v1-architecture models (``factored_embeddings``, vocab 1980) have no
     BOS row — ``BOS_TOKEN = 1980`` is out-of-vocab for them — and v1 never
     supervised the first move (its bare ``[m_1, m_2, …]`` sequences have no
     slot whose target is ``m_1``). Setting ``tokens[:, 0] = PAD`` with
-    ``attn_mask[:, 0] = loss_mask[:, 0] = False`` reproduces that contract
-    exactly while keeping the v2 pipeline's ``C = 1`` slot alignment: real
-    moves then attend causally only to real moves, and RoPE being relative
-    makes the +1 position shift invariant.
+    ``attn_mask[:, 0] = loss_mask[:, 0] = False`` reproduces that context
+    while keeping the v2 pipeline's ``C = 1`` slot alignment: real moves
+    then attend causally only to real moves, and RoPE being relative makes
+    the +1 position shift invariant.
 
     ``targets`` are untouched (they only depend on ``tokens[:, 1:]``, which
     the transform doesn't modify), and ``outcome_offset`` stays 1 — moves
@@ -525,6 +573,7 @@ def _pack_clm(
     *,
     seq_len: int,
     conditioning: Sequence[str] = (),
+    bare_moves: bool = False,
 ) -> Corpus:
     """Shared packing helper — turns engine / parquet output into a Corpus.
 
@@ -534,11 +583,20 @@ def _pack_clm(
     token for the game, used to resolve the ``"outcome"`` conditioning
     kind when present).
 
-    Output sequence width is always ``seq_len``. The sequence is laid
-    out as ``[BOS][cond…][ply…][PAD…]`` via the shared
-    :func:`build_prefix` / :func:`build_loss_mask` helpers, so moves
-    start at slot ``C = 1 + len(conditioning)`` and the first move is
-    supervised by the last prefix slot.
+    Output sequence width is always ``seq_len``. By default the sequence
+    is laid out as ``[BOS][cond…][ply…][PAD…]`` via the shared
+    :func:`build_prefix` / :func:`build_loss_mask` helpers, so moves start
+    at slot ``C = 1 + len(conditioning)`` and the first move is supervised
+    by the last prefix slot.
+
+    ``bare_moves=True`` selects v1's native **C=0** contract instead:
+    ``[m_1 … m_L][PAD…]`` with NO BOS/conditioning prefix, the v1
+    loss mask (:func:`build_loss_mask_bare` — first move unsupervised,
+    end-of-game PAD supervised), and ``outcome_offset = 0``. Because there
+    is no leading prefix the sequence is *strictly right-padded*, which is
+    what the Pallas flash-attention path requires — this is how the
+    factored (v1-architecture) model trains with flash. ``conditioning``
+    must be empty in this mode (the factored vocab has no BOS/control rows).
     """
     move_ids = np.asarray(move_ids, dtype=np.int32)
     game_lengths = np.asarray(game_lengths, dtype=np.int32)
@@ -560,7 +618,13 @@ def _pack_clm(
         raise ValueError(f"seq_len must be positive, got {seq_len}")
 
     n, max_ply = move_ids.shape
-    C = conditioning_to_C(conditioning)
+    if bare_moves and conditioning:
+        raise ValueError(
+            "bare_moves=True is the C=0 v1 contract and takes no "
+            f"conditioning prefix; got conditioning={list(conditioning)!r}"
+        )
+    # C=0 for the bare contract (no BOS); else 1 + len(conditioning).
+    C = 0 if bare_moves else conditioning_to_C(conditioning)
     if seq_len <= C:
         raise ValueError(
             f"seq_len ({seq_len}) must exceed the conditioning prefix width "
@@ -569,10 +633,11 @@ def _pack_clm(
         )
     n_move_slots = seq_len - C
 
-    # 1. Initial tokens buffer — all PAD, then lay the BOS+conditioning
-    # prefix into slots 0..C-1 via the shared assembler.
+    # 1. Initial tokens buffer — all PAD, then (unless bare) lay the
+    # BOS+conditioning prefix into slots 0..C-1 via the shared assembler.
     tokens = np.full((n, seq_len), PAD_TOKEN, dtype=np.int32)
-    tokens[:, :C] = build_prefix(conditioning, outcome_tokens, n)
+    if not bare_moves:
+        tokens[:, :C] = build_prefix(conditioning, outcome_tokens, n)
 
     # 2. Clean move IDs (PAD past game_length so trailing junk from the
     # engine doesn't leak into the sequence).
@@ -585,7 +650,8 @@ def _pack_clm(
     tokens[:, C : C + n_to_copy] = clean_moves[:, :n_to_copy]
 
     # 4. attn_mask: True where tokens != PAD. The BOS/conditioning prefix
-    # is real (no interior PAD — preserves the right-pad invariant).
+    # is real (no interior PAD — preserves the right-pad invariant); the
+    # bare contract has no prefix at all, so slot 0 is the first real move.
     attn_mask = tokens != PAD_TOKEN
 
     # 5. targets: tokens shifted left by 1, with PAD on the trailing slot.
@@ -594,12 +660,16 @@ def _pack_clm(
     targets = np.full_like(tokens, PAD_TOKEN)
     targets[:, :-1] = tokens[:, 1:]
 
-    # 6. loss_mask: True on [C-1 .. C-1 + game_length - 1] via the shared
-    # helper (first move supervised, predict-PAD slot excluded).
-    loss_mask = build_loss_mask(C, game_lengths, seq_len)
+    # 6. loss_mask: bare contract uses v1's mask (first move unsupervised,
+    # end-PAD supervised); the prefixed contract supervises the first move
+    # and excludes the predict-PAD slot.
+    if bare_moves:
+        loss_mask = build_loss_mask_bare(game_lengths, seq_len)
+    else:
+        loss_mask = build_loss_mask(C, game_lengths, seq_len)
 
     # outcome_offset carries the constant prefix width C (the slot where
-    # moves start) — see the Corpus field docstring.
+    # moves start) — see the Corpus field docstring. C=0 for bare moves.
     outcome_offset = np.full(n, C, dtype=np.int32)
 
     # Stay on host. The trainer's prefetch loop is responsible for
@@ -623,6 +693,7 @@ def pack_corpus(
     *,
     seq_len: int,
     conditioning: Sequence[str] = (),
+    bare_moves: bool = False,
 ) -> Corpus:
     """Pack pre-tokenised games into a :class:`Corpus`.
 
@@ -633,6 +704,10 @@ def pack_corpus(
     / etc. constants). ``conditioning`` is the ordered list of control
     kinds to prepend (see :data:`pawn.config.CONDITIONING_KINDS`);
     the default ``()`` prepends only BOS (``C = 1``).
+
+    ``bare_moves=True`` packs v1's native C=0 bare-moves contract instead
+    (no BOS, strictly right-padded, flash-compatible) — see
+    :func:`_pack_clm`.
     """
     return _pack_clm(
         move_ids,
@@ -640,6 +715,7 @@ def pack_corpus(
         outcome_tokens,
         seq_len=seq_len,
         conditioning=conditioning,
+        bare_moves=bare_moves,
     )
 
 
@@ -652,9 +728,15 @@ def generate_corpus(
     conditioning: Sequence[str] = (),
     mate_boost: float = 0.0,
     discard_ply_limit: bool = False,
+    bare_moves: bool = False,
 ) -> Corpus:
     """Generate ``n_games`` random self-play games via the Rust engine and
     pack them into a :class:`Corpus`.
+
+    ``bare_moves=True`` packs the v1 native C=0 bare-moves contract (no
+    BOS, strictly right-padded so the Pallas flash path is valid) with
+    v1's loss mask — used by ``arch=factored-v1`` training/eval. Requires
+    ``conditioning=()``. See :func:`_pack_clm`.
 
     ``max_ply`` is the per-game length cap inside the engine; the
     engine truncates with a ``PlyLimit`` termination code if a game
@@ -690,4 +772,5 @@ def generate_corpus(
         outcome_tokens,
         seq_len=seq_len,
         conditioning=conditioning,
+        bare_moves=bare_moves,
     )

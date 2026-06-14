@@ -97,6 +97,13 @@ def main(argv: list[str] | None = None) -> int:
     # the conditioning prefix → the BOS-only ``[]`` layout (C=1).
     conditioning = conditioning_from_run_block(run_block)
 
+    # Factored (v1-architecture) checkpoints eval under v1's native C=0
+    # bare-moves contract (no BOS — BOS=1980 is out-of-vocab for them and
+    # would trip the factored _embed's loud OOV guard). This matches the
+    # contract they trained under; for the random-games path we pack it
+    # directly via ``bare_moves``.
+    is_factored = isinstance(model, FactoredPAWNModel)
+
     if args.pgn is not None:
         from pawn.lichess_data import load_lichess_corpus
 
@@ -107,22 +114,18 @@ def main(argv: list[str] | None = None) -> int:
             seq_len=args.seq_len, max_games=args.n_games,
             conditioning=conditioning,
         )
+        if is_factored:
+            # The Lichess loader packs the C=1 [BOS][…] layout; adapt it to
+            # the factored contract via the masked-C1 transform (logit-
+            # equivalent to native C0 by RoPE relative-invariance; eval runs
+            # plain/fp32 so the leading PAD is harmless without flash).
+            corpus = to_v1_contract(corpus)
     else:
         corpus = generate_corpus(
             n_games=args.n_games, max_ply=args.max_ply, seq_len=args.seq_len,
             seed=0, conditioning=conditioning,
+            bare_moves=is_factored,
         )
-
-    # Factored (v1-architecture) checkpoints eval under v1's bare-moves
-    # contract: BOS=1980 is out-of-vocab for them — the packed corpus's
-    # slot-0 BOS would trip the factored _embed's loud OOV guard before any
-    # metric is produced (round-3 review, codex P2). Apply the same
-    # validated transform the trainer / probes use. `to_v1_contract`
-    # requires C=1, which is guaranteed here: factored checkpoints can only
-    # be trained with conditioning=[] (PretrainConfig validator), and the
-    # corpus above was built from the checkpoint's own conditioning.
-    if isinstance(model, FactoredPAWNModel):
-        corpus = to_v1_contract(corpus)
 
     vm = compute_val_metrics(
         model, corpus,
